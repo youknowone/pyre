@@ -2890,6 +2890,15 @@ pub struct MIFrame {
     /// eval-breaker poll and `GuardFutureCondition` emits; it is `None`
     /// outside that window.
     pub(crate) loop_close_marker_jit_pc: Option<usize>,
+    /// Operand-stack depth of the merge point the closing JUMP targets,
+    /// when it exceeds the depth the concrete `PyFrame` still advertises.
+    /// `close_loop_args_at` sets and clears it around the JUMP-arg
+    /// derivation; `concrete_valuestackdepth` returns it while set, so the
+    /// flush and the arg derivation share one depth. `None` outside that
+    /// window and whenever the concrete frame already covers the merge
+    /// point — see `close_loop_args_at` for why a walk-driven close can
+    /// read a depth belonging to a different bytecode offset.
+    pub(crate) close_merge_point_vsd: Option<usize>,
 }
 
 pub(crate) fn instruction_consumes_comparison_truth(instruction: Instruction) -> bool {
@@ -4350,6 +4359,29 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     let nlocals = code.varnames.len();
     let ncells = pyre_interpreter::pyframe::ncells(code);
     Some(nlocals + ncells)
+}
+
+/// Static operand-stack depth at `target_pc`, but only when it exceeds the
+/// depth `frame` still advertises — the depth a closing JUMP must not fall
+/// below when it retargets a merge point at a different bytecode offset.
+///
+/// `None` means "keep reading the frame": the frame or its code object cannot
+/// answer, the code has no liveness entry for `target_pc`, the depth would
+/// overrun `locals_cells_stack_w`, or the frame already covers the merge
+/// point. Never narrows — see `close_loop_args_at` for why only the widening
+/// direction is a correction.
+pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize) -> Option<usize> {
+    let concrete = concrete_stack_depth(frame)?;
+    let w_code = unsafe {
+        *((frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const usize)
+    };
+    let depth = depth_based_vsd_for_wcode(w_code, target_pc)?;
+    // `store_live_frame_static_int`'s bound: a depth past the array is not a
+    // depth this frame can describe.
+    if concrete_frame_array_len(frame).is_none_or(|len| depth > len) {
+        return None;
+    }
+    (depth > concrete).then_some(depth)
 }
 
 /// Return the absolute valuestackdepth.
@@ -12593,6 +12625,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -12633,6 +12666,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -12688,6 +12722,7 @@ mod tests {
                 pending_inline_frame: None,
                 residual_call_pc: None,
                 loop_close_marker_jit_pc: None,
+                close_merge_point_vsd: None,
                 orgpc: 0,
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
@@ -13387,6 +13422,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -13500,6 +13536,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: frame_ptr,
             pre_opcode_registers_r: None,
@@ -13521,6 +13558,67 @@ mod tests {
         unsafe {
             let _ = Box::from_raw(jc_ptr);
         }
+    }
+
+    /// A walk that resumed from a guard leaves `PyFrame.valuestackdepth` at
+    /// the resume PC's depth. Closing on a merge point at a different offset
+    /// must recover that offset's own depth, or every operand-stack slot the
+    /// header binds is force-nulled into the JUMP.
+    #[test]
+    fn merge_point_stack_depth_recovers_a_deeper_header_and_never_narrows() {
+        use pyre_interpreter::pyframe::PyFrame;
+
+        ensure_test_callbacks();
+        let code = compile_exec("for i in x:\n    pass\n").expect("test code should compile");
+        let mut frame = PyFrame::new(code);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let w_code = frame.pycode as usize;
+        let base = concrete_nlocals(frame_ptr).expect("frame should expose a stack base");
+        let array_len =
+            concrete_frame_array_len(frame_ptr).expect("frame should expose locals_cells_stack_w");
+
+        // A `for` body puts the iterator on the stack, so some offset has a
+        // deeper static depth than the empty-stack base.
+        let (deep_pc, deep_vsd) = (0..array_len * 64)
+            .find_map(|pc| {
+                depth_based_vsd_for_wcode(w_code, pc)
+                    .filter(|&vsd| vsd > base)
+                    .map(|vsd| (pc, vsd))
+            })
+            .expect("a for-loop body must have an offset with a non-empty operand stack");
+        let shallow_pc = (0..array_len * 64)
+            .find(|&pc| depth_based_vsd_for_wcode(w_code, pc) == Some(base))
+            .expect("a for-loop must have an offset with an empty operand stack");
+
+        // Stale frame (resumed at an empty-stack offset), closing on the
+        // deeper header: recover the header's depth.
+        frame.valuestackdepth = base;
+        assert_eq!(
+            merge_point_stack_depth_to_recover(frame_ptr, deep_pc),
+            Some(deep_vsd),
+        );
+
+        // Same frame, header at its own depth: nothing to recover.
+        assert_eq!(
+            merge_point_stack_depth_to_recover(frame_ptr, shallow_pc),
+            None,
+        );
+
+        // Frame already deeper than the header's static depth: never narrow —
+        // dropping a slot would lose a value the JUMP must carry.
+        frame.valuestackdepth = deep_vsd + 1;
+        assert_eq!(merge_point_stack_depth_to_recover(frame_ptr, deep_pc), None);
+
+        // An offset the code object has no liveness entry for keeps the frame.
+        frame.valuestackdepth = base;
+        assert_eq!(
+            merge_point_stack_depth_to_recover(frame_ptr, usize::MAX),
+            None,
+        );
+
+        // A null frame cannot answer either.
+        assert_eq!(merge_point_stack_depth_to_recover(0, deep_pc), None);
     }
 }
 

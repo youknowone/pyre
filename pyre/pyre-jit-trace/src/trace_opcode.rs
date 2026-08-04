@@ -855,6 +855,7 @@ impl MIFrame {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            close_merge_point_vsd: None,
         }
     }
 
@@ -927,6 +928,12 @@ impl MIFrame {
     /// Production tracer paths always seed `concrete_frame_addr` from the
     /// live `PyFrame` for the top frame.
     pub(crate) fn concrete_valuestackdepth(&self) -> Option<usize> {
+        // `close_loop_args_at` publishes the merge point's own depth here for
+        // the duration of the JUMP-arg derivation; outside that window the
+        // concrete frame is the reader.
+        if let Some(depth) = self.close_merge_point_vsd {
+            return Some(depth);
+        }
         crate::state::concrete_stack_depth(self.concrete_frame_addr)
     }
 
@@ -2035,6 +2042,27 @@ impl MIFrame {
         // PyFrame's `locals_cells_stack_w` length + `valuestackdepth`
         // — no symbolic mirror in the loop.
         let concrete_nlocals = self.sym().nlocals;
+        // The concrete `PyFrame` is only stepped by the interpreter. A walk
+        // that resumed from a guard keeps the `valuestackdepth` the resume
+        // wrote at the resume PC and never advances it, so a close that lands
+        // on a DIFFERENT bytecode offset — a cross-loop retarget, where
+        // `cut_trace_from` re-heads the trace at the merge point it walked
+        // into — reads a depth belonging to the offset it started from. Every
+        // operand-stack slot at or above that depth is then treated as dead
+        // capacity and force-nulled into the JUMP, while the target LABEL
+        // (built from the merge point's own `virtualizable_boxes`) binds them:
+        // the loop body reads a null where the entry reload put a live value.
+        //
+        // A bytecode offset has exactly one operand-stack depth, so the merge
+        // point's depth is available statically from the same liveness table
+        // `maybe_compile_and_run` gates interpreter entry on. Take it when it
+        // exceeds what the frame advertises — never carry fewer slots than the
+        // target header requires. Narrowing is deliberately not done: a close
+        // whose frame is deeper than the header's static depth keeps its
+        // slots, since dropping one would lose a value the JUMP must carry.
+        self.close_merge_point_vsd = target_pc.and_then(|pc| {
+            crate::state::merge_point_stack_depth_to_recover(self.concrete_frame_addr, pc)
+        });
         let concrete_vsd = self
             .concrete_valuestackdepth()
             .unwrap_or_else(|| self.sym().valuestackdepth)
@@ -2651,6 +2679,7 @@ impl MIFrame {
             }
         }
         self.loop_close_marker_jit_pc = None;
+        self.close_merge_point_vsd = None;
         args
     }
 
@@ -3488,6 +3517,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -3690,6 +3720,7 @@ mod tests {
             // marker so `get_list_of_active_boxes` reads liveness at offset 0
             // instead of declining on an unset marker.
             loop_close_marker_jit_pc: Some(0),
+            close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -3781,6 +3812,7 @@ mod tests {
             // [(0, 0)]`); seed the jitcode resume marker so the snapshot reads
             // liveness at offset 0 rather than declining on an unset marker.
             loop_close_marker_jit_pc: Some(0),
+            close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
