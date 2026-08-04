@@ -768,26 +768,48 @@ pub struct RegisterManager {
 
 /// Resolve a constant `OpRef` to its `i64` bit pattern.
 ///
+/// Every caller is an operand slot that RPython reads with `.getint()` —
+/// a GC_LOAD offset (aarch64/regalloc.py:535), a GC_LOAD_INDEXED scale
+/// (:566), an itemsize (:568). Upstream can spell those as bare `getint()`
+/// calls because the rewrite pass guarantees the slot holds a `ConstInt`
+/// before the backend ever sees the op (rewrite.py:199-205 builds every one
+/// of them out of `ConstInt(...)`).
+///
 /// Inline-Const variants (history.py:227/268/314 `ConstXxx.value`) carry the
-/// value directly. The legacy pool-indexed variants (`ConstInt(u32)` etc.)
-/// must be present in the optimizer's `constants` snapshot. A legacy const
-/// absent from `constants` means the optimizer producer never seeded it —
-/// `ConstInt.value` is always present in RPython, so the backend must never
-/// silently substitute `0`, which would miscompile the constant as zero.
-/// Panic at the parity hole instead, matching the Cranelift backend's
+/// value directly. The legacy pool-indexed variants must be present in the
+/// optimizer's `constants` snapshot. Either way the backend must never
+/// silently substitute `0`, which would miscompile the constant as zero, so
+/// this panics at the parity hole instead — matching the Cranelift backend's
 /// `missing_legacy_constant`.
+///
+/// The two failures it separates are different bugs and want different fixes:
+/// a *constant-namespace* raw that is missing means the producer never seeded
+/// the pool, while a *body* OpRef arriving at all means the slot was filled
+/// with a runtime value — an op that should have been lowered upstream of the
+/// backend and was not. `#[track_caller]` reports which slot, because the
+/// `consider_*` body is the only thing that identifies the op.
+#[track_caller]
 fn const_bits_or_panic(v: OpRef, constants: &indexmap::IndexMap<u32, i64>, where_: &str) -> i64 {
     if let Some(bits) = v.inline_const_bits() {
         return bits;
     }
-    constants.get(&v.raw()).copied().unwrap_or_else(|| {
-        panic!(
-            "dynasm {where_}: legacy pool-indexed const OpRef (raw={}) is absent \
-             from the constants snapshot — the optimizer producer must seed it \
-             (or mint an inline Const) instead of the backend baking 0. RPython \
-             ConstInt.value (history.py:227) is always present.",
-            v.raw()
-        )
+    let caller = std::panic::Location::caller();
+    let raw = v.raw();
+    constants.get(&raw).copied().unwrap_or_else(|| {
+        let diagnosis = if OpRef::raw_is_constant(raw) {
+            "legacy pool-indexed const absent from the constants snapshot — the \
+             optimizer producer must seed it (or mint an inline Const) instead of \
+             the backend baking 0; RPython ConstInt.value (history.py:227) is \
+             always present"
+        } else {
+            "a BODY OpRef, not a constant at all — this operand slot is one \
+             RPython reads with `.getint()`, so a runtime value reaching it means \
+             the op was never lowered. Upstream guarantees the slot by rewriting \
+             before assembly (aarch64/regalloc.py:188 -> gc.py:109-112), e.g. \
+             RAW_LOAD_I becomes GC_LOAD_INDEXED_I with ConstInt scale/offset/size \
+             (rewrite.py:228-232)"
+        };
+        panic!("dynasm {where_} at {caller}: {v:?} (raw={raw}) is {diagnosis}.")
     })
 }
 
@@ -2361,6 +2383,7 @@ impl<'a> RegAlloc<'a> {
     /// CONST_BIT tag preserved) — see `convert_to_imm` at regalloc.rs
     /// line 1475 and the fail-args handling at line 2079. This helper
     /// must use the same key convention.
+    #[track_caller]
     pub(crate) fn const_value(&self, v: OpRef) -> i64 {
         const_bits_or_panic(v, &self.constants, "const_value")
     }

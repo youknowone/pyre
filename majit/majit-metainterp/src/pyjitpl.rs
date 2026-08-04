@@ -6861,10 +6861,20 @@ impl<M: Clone> MetaInterp<M> {
             std::panic::resume_unwind(payload);
         }
         self.internal_compile_panics += 1;
-        eprintln!(
+        let msg = format!(
             "[jit] internal compile panic in {where_} at key={green_key}: JIT \
              disabled for this trace (set MAJIT_STRICT=1 to fail hard)"
         );
+        eprintln!("{msg}");
+        // This is the one compilation failure that disables the JIT outright,
+        // and it was the only one not reaching the "compilation failed" hook —
+        // so an embedder watching `on_compile_error` saw every recoverable
+        // failure and missed the unrecoverable one. A degraded trace then reads
+        // as `compiles=0 aborts=0` on any dashboard fed by the hooks, which is
+        // indistinguishable from "this loop was never hot".
+        if let Some(ref cb) = self.hooks.on_compile_error {
+            cb(green_key, &msg);
+        }
         false
     }
 

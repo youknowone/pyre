@@ -8200,17 +8200,35 @@ impl CraneliftBackend {
     // `compile_tmp_callback` and other backend-agnostic consumers can
     // reach them through `&mut dyn Backend`.
 
-    fn gc_rewriter(&self) -> Option<GcRewriterImpl> {
-        with_cranelift_gc(|gc| GcRewriterImpl {
-            nursery_free_addr: gc.nursery_free_addr(),
-            nursery_top_addr: gc.nursery_top_addr(),
-            max_nursery_size: gc.max_nursery_object_size(),
+    /// Built unconditionally, for the reasons spelled out on the dynasm
+    /// backend's `gc_rewriter`: `x86/regalloc.py:187` calls
+    /// `cpu.gc_ll_descr.rewrite_assembler` straight through and `gc.py:109-112`
+    /// defines it on the base `GcLLDescription`, so the pass runs even for a
+    /// configuration with no nursery and no write barrier. Only four fields are
+    /// collector-derived; with no collector they take the upstream base values
+    /// (`can_use_nursery_malloc -> False`, gc.py:81-82, spelled
+    /// `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156).
+    fn gc_rewriter(&self) -> GcRewriterImpl {
+        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
+            with_cranelift_gc(|gc| {
+                (
+                    gc.nursery_free_addr(),
+                    gc.nursery_top_addr(),
+                    gc.max_nursery_object_size(),
+                    gc.get_write_barrier_descr(),
+                )
+            })
+            .unwrap_or((0, 0, 0, None));
+        GcRewriterImpl {
+            nursery_free_addr,
+            nursery_top_addr,
+            max_nursery_size,
             // gc.py:401 `gc_ll_descr.write_barrier_descr` — the collector
             // answers (gc.py:259-283 WriteBarrierDescr parity, card marking
             // included), and `None` from one that needs no barrier
             // (`gc.py:156 GcLLDescr_boehm`) keeps `rewrite.py:393` from
             // emitting `COND_CALL_GC_WB*` the backend could not assemble.
-            wb_descr: gc.get_write_barrier_descr(),
+            wb_descr,
             jitframe_info: JITFRAME_LAYOUT
                 .get()
                 .and_then(|info| info.jitframe_descrs.clone()),
@@ -8303,7 +8321,7 @@ impl CraneliftBackend {
                     }
                 })
             })),
-        })
+        }
     }
 
     fn prepare_ops_for_compile(
@@ -8314,7 +8332,8 @@ impl CraneliftBackend {
     ) -> (Vec<Op>, Vec<GcRef>) {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
-        if let Some(rewriter) = self.gc_rewriter() {
+        {
+            let rewriter = self.gc_rewriter();
             // The rewriter takes the typed `Const` pool directly; each box
             // variant carries its own type (`Const::get_type`).
             let (result, new_constants, gcrefs) =
@@ -8327,8 +8346,6 @@ impl CraneliftBackend {
                 self.constants.entry(k).or_insert(c);
             }
             (result, gcrefs)
-        } else {
-            (normalized, Vec::new())
         }
     }
 
@@ -12346,7 +12363,7 @@ impl CraneliftBackend {
 
                     // Load flag byte from object header.
                     let rw = self.gc_rewriter();
-                    let wb = rw.as_ref().and_then(|r| r.wb_descr.as_ref());
+                    let wb = rw.wb_descr.as_ref();
                     let wb_byteofs = wb.map(|d| d.jit_wb_if_flag_byteofs as i32).unwrap_or(0);
                     let wb_mask_raw = wb.map(|d| d.jit_wb_if_flag_singlebyte).unwrap_or(0);
                     let wb_cards_set = wb.map(|d| d.jit_wb_cards_set).unwrap_or(0);

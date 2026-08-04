@@ -1610,96 +1610,135 @@ impl DynasmBackend {
     // reach them through `&mut dyn Backend`.
 
     /// gc.py:525-531 parity: build a GcRewriterImpl from the active GC.
-    fn gc_rewriter(&self) -> Option<majit_gc::rewrite::GcRewriterImpl> {
-        with_dynasm_active_gc(|gc| {
-            majit_gc::rewrite::GcRewriterImpl {
-                nursery_free_addr: gc.nursery_free_addr(),
-                nursery_top_addr: gc.nursery_top_addr(),
-                max_nursery_size: gc.max_nursery_object_size(),
-                // gc.py:401 `gc_ll_descr.write_barrier_descr` — ask the active
-                // collector rather than assuming the MiniMark layout, so the
-                // rewriter and `emit_write_barrier_fastpath_for_base` agree on
-                // whether barriers exist at all. A collector that needs none
-                // reports `None` (`gc.py:156 GcLLDescr_boehm`), and
-                // `rewrite.py:393` then emits no `COND_CALL_GC_WB*`.
-                wb_descr: gc.get_write_barrier_descr(),
-                jitframe_info: crate::jitframe_layout().and_then(|info| info.jitframe_descrs),
-                // rewrite.py:673 — read compiled_loop_token._ll_initial_locs +
-                // ptr2int(compiled_loop_token.frame_info), both sourced from the
-                // CLT Arc on the registered DynasmCaTarget (model.py:292-338).
-                call_assembler_callee_locs: Some(Box::new(|token_number| {
-                    lookup_call_assembler_callee_locs(token_number)
-                })),
-                // x86/runner.py:31 `load_supported_factors = (1, 2, 4, 8)`
-                // vs llmodel.py:39 default `(1,)` used by the aarch64
-                // backend (which has no scaled store addressing mode and
-                // asserts boxes[3].getint() == 1 in its regalloc — see
-                // `consider_gc_store_indexed` cfg(target_arch = "aarch64")).
-                load_supported_factors: gc_store_supported_factors(),
-                // x86/runner.py:22 overrides model.py:22 base default
-                // `False` to `True`.  aarch64/runner.py inherits the
-                // base `False`, so the rewriter expands LEA to
-                // INT_LSHIFT + INT_ADD + INT_ADD (rewrite.py:1089-1098)
-                // even though the aarch64 backend has a native
-                // `genop_load_effective_address` lowering.
-                supports_load_effective_address: supports_load_effective_address(),
-                // incminimark.py:211 `malloc_zero_filled = False`:
-                // clear_gc_fields / clear_varsize_gc_fields emit only the
-                // per-object GC-pointer initialization required by
-                // rewrite.py:498-535.
-                malloc_zero_filled: false,
-                // gc.py:39 `self.memcpy_fn = memcpy_fn` cast through
-                // `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py:1046-1047).
-                memcpy_fn: majit_ir::memcpy_fn_addr(),
-                // gc.py:40-43 `self.memcpy_descr = get_call_descr(...)`.
-                memcpy_descr: majit_ir::make_memcpy_calldescr(),
-                // gc.py:46 `self.str_descr = get_array_descr(self, rstr.STR)`.
-                str_descr: builtin_string_array_descr(majit_ir::OpCode::Newstr)
-                    .expect("Newstr must produce a str ArrayDescr"),
-                // gc.py:47 `self.unicode_descr = get_array_descr(self, rstr.UNICODE)`.
-                unicode_descr: builtin_string_array_descr(majit_ir::OpCode::Newunicode)
-                    .expect("Newunicode must produce a unicode ArrayDescr"),
-                // gc.py:48 `self.str_hash_descr = get_field_descr(self, rstr.STR, 'hash')`.
-                str_hash_descr: builtin_string_hash_field_descr(majit_ir::OpCode::Strhash)
-                    .expect("Strhash must produce a str hash FieldDescr"),
-                // gc.py:49 `self.unicode_hash_descr = get_field_descr(self, rstr.UNICODE, 'hash')`.
-                unicode_hash_descr: builtin_string_hash_field_descr(majit_ir::OpCode::Unicodehash)
-                    .expect("Unicodehash must produce a unicode hash FieldDescr"),
-                // gc.py:33-37 `self.fielddescr_vtable = get_field_descr(
-                // self, rclass.OBJECT, 'typeptr')`.  pyre always emits
-                // a typeptr slot (no `gcremovetypeptr` build), so we
-                // install Some unconditionally.
-                fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
-                // gc.py:394 `self.fielddescr_tid = get_field_descr(self,
-                // self.GCClass.HDR, 'tid')` — framework GC.  pyre's GC
-                // is always framework-style; gen_initialize_tid translates
-                // the descr's offset by `-HDR_SIZE` because pyre's HDR
-                // sits before the object pointer.
-                fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
-                malloc_array_fn: dynasm_malloc_array as *const () as i64,
-                malloc_array_nonstandard_fn: dynasm_malloc_array_nonstandard as *const () as i64,
-                malloc_array_oldgen_fn: dynasm_malloc_array_oldgen as *const () as i64,
-                malloc_array_nonstandard_oldgen_fn: dynasm_malloc_array_nonstandard_oldgen
-                    as *const () as i64,
-                malloc_str_fn: dynasm_malloc_str as *const () as i64,
-                malloc_unicode_fn: dynasm_malloc_unicode as *const () as i64,
-                malloc_big_fixedsize_fn: dynasm_malloc_big_fixedsize as *const () as i64,
-                malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
-                malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
-                malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
-                malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
-                malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
-                standard_array_basesize: std::mem::size_of::<usize>(),
-                standard_array_length_ofs: 0,
-            }
-        })
+    ///
+    /// Built unconditionally. Upstream never asks whether a collector
+    /// exists before rewriting: `aarch64/regalloc.py:188` (and
+    /// `x86/regalloc.py:187`) call `cpu.gc_ll_descr.rewrite_assembler`
+    /// straight through, and `gc.py:109-112` defines it on the base
+    /// `GcLLDescription`, so `GcLLDescr_boehm` — a configuration with no
+    /// nursery and no write barrier — still runs the whole pass. The
+    /// collector decides which *arms* fire inside `rewrite()`, never
+    /// whether the pass runs.
+    ///
+    /// That distinction is load-bearing because the pass is not only about
+    /// the GC. `transform_to_gc_load` (rewrite.py:212-342) is the memory-op
+    /// lowering, and it reads only descrs and CPU addressing capability:
+    /// skip it and `RAW_LOAD_I` never becomes `GC_LOAD_INDEXED_I`
+    /// (rewrite.py:228-232 via :199-205), so a variable index box reaches a
+    /// backend whose only surviving load op wants a *constant* offset
+    /// (`aarch64/regalloc.py:535` `op.getarg(1).getint()`).
+    ///
+    /// Exactly four fields come from the collector. With none installed
+    /// they take upstream's base-class values: `can_use_nursery_malloc`
+    /// returns False (gc.py:81-82, inherited by `GcLLDescr_boehm`), spelled
+    /// here as `max_nursery_size: 0`, and `write_barrier_descr = None`
+    /// (gc.py:156). Allocation then declines to the `dynasm_malloc_*`
+    /// helpers, which already answer without a collector by falling back to
+    /// a raw alloc (`dynasm_alloc_oldgen_typed_or_raw`). Note this default
+    /// differs deliberately from `dynasm_write_barrier_descr`, which
+    /// substitutes the MiniMark layout when the *mutator thread* is not the
+    /// one compiling; here `None` from `with_dynasm_active_gc` means no
+    /// collector is registered at all (the `gc_sync` singleton arm has
+    /// already been consulted), and emitting barriers for a program that
+    /// has no collector would call through an absent helper.
+    fn gc_rewriter(&self) -> majit_gc::rewrite::GcRewriterImpl {
+        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
+            with_dynasm_active_gc(|gc| {
+                (
+                    gc.nursery_free_addr(),
+                    gc.nursery_top_addr(),
+                    gc.max_nursery_object_size(),
+                    gc.get_write_barrier_descr(),
+                )
+            })
+            .unwrap_or((0, 0, 0, None));
+        majit_gc::rewrite::GcRewriterImpl {
+            nursery_free_addr,
+            nursery_top_addr,
+            max_nursery_size,
+            // gc.py:401 `gc_ll_descr.write_barrier_descr` — ask the active
+            // collector rather than assuming the MiniMark layout, so the
+            // rewriter and `emit_write_barrier_fastpath_for_base` agree on
+            // whether barriers exist at all. A collector that needs none
+            // reports `None` (`gc.py:156 GcLLDescr_boehm`), and
+            // `rewrite.py:393` then emits no `COND_CALL_GC_WB*`.
+            wb_descr,
+            jitframe_info: crate::jitframe_layout().and_then(|info| info.jitframe_descrs),
+            // rewrite.py:673 — read compiled_loop_token._ll_initial_locs +
+            // ptr2int(compiled_loop_token.frame_info), both sourced from the
+            // CLT Arc on the registered DynasmCaTarget (model.py:292-338).
+            call_assembler_callee_locs: Some(Box::new(|token_number| {
+                lookup_call_assembler_callee_locs(token_number)
+            })),
+            // x86/runner.py:31 `load_supported_factors = (1, 2, 4, 8)`
+            // vs llmodel.py:39 default `(1,)` used by the aarch64
+            // backend (which has no scaled store addressing mode and
+            // asserts boxes[3].getint() == 1 in its regalloc — see
+            // `consider_gc_store_indexed` cfg(target_arch = "aarch64")).
+            load_supported_factors: gc_store_supported_factors(),
+            // x86/runner.py:22 overrides model.py:22 base default
+            // `False` to `True`.  aarch64/runner.py inherits the
+            // base `False`, so the rewriter expands LEA to
+            // INT_LSHIFT + INT_ADD + INT_ADD (rewrite.py:1089-1098)
+            // even though the aarch64 backend has a native
+            // `genop_load_effective_address` lowering.
+            supports_load_effective_address: supports_load_effective_address(),
+            // incminimark.py:211 `malloc_zero_filled = False`:
+            // clear_gc_fields / clear_varsize_gc_fields emit only the
+            // per-object GC-pointer initialization required by
+            // rewrite.py:498-535.
+            malloc_zero_filled: false,
+            // gc.py:39 `self.memcpy_fn = memcpy_fn` cast through
+            // `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py:1046-1047).
+            memcpy_fn: majit_ir::memcpy_fn_addr(),
+            // gc.py:40-43 `self.memcpy_descr = get_call_descr(...)`.
+            memcpy_descr: majit_ir::make_memcpy_calldescr(),
+            // gc.py:46 `self.str_descr = get_array_descr(self, rstr.STR)`.
+            str_descr: builtin_string_array_descr(majit_ir::OpCode::Newstr)
+                .expect("Newstr must produce a str ArrayDescr"),
+            // gc.py:47 `self.unicode_descr = get_array_descr(self, rstr.UNICODE)`.
+            unicode_descr: builtin_string_array_descr(majit_ir::OpCode::Newunicode)
+                .expect("Newunicode must produce a unicode ArrayDescr"),
+            // gc.py:48 `self.str_hash_descr = get_field_descr(self, rstr.STR, 'hash')`.
+            str_hash_descr: builtin_string_hash_field_descr(majit_ir::OpCode::Strhash)
+                .expect("Strhash must produce a str hash FieldDescr"),
+            // gc.py:49 `self.unicode_hash_descr = get_field_descr(self, rstr.UNICODE, 'hash')`.
+            unicode_hash_descr: builtin_string_hash_field_descr(majit_ir::OpCode::Unicodehash)
+                .expect("Unicodehash must produce a unicode hash FieldDescr"),
+            // gc.py:33-37 `self.fielddescr_vtable = get_field_descr(
+            // self, rclass.OBJECT, 'typeptr')`.  pyre always emits
+            // a typeptr slot (no `gcremovetypeptr` build), so we
+            // install Some unconditionally.
+            fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
+            // gc.py:394 `self.fielddescr_tid = get_field_descr(self,
+            // self.GCClass.HDR, 'tid')` — framework GC.  pyre's GC
+            // is always framework-style; gen_initialize_tid translates
+            // the descr's offset by `-HDR_SIZE` because pyre's HDR
+            // sits before the object pointer.
+            fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
+            malloc_array_fn: dynasm_malloc_array as *const () as i64,
+            malloc_array_nonstandard_fn: dynasm_malloc_array_nonstandard as *const () as i64,
+            malloc_array_oldgen_fn: dynasm_malloc_array_oldgen as *const () as i64,
+            malloc_array_nonstandard_oldgen_fn: dynasm_malloc_array_nonstandard_oldgen as *const ()
+                as i64,
+            malloc_str_fn: dynasm_malloc_str as *const () as i64,
+            malloc_unicode_fn: dynasm_malloc_unicode as *const () as i64,
+            malloc_big_fixedsize_fn: dynasm_malloc_big_fixedsize as *const () as i64,
+            malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
+            malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
+            malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
+            malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+            malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
+            standard_array_basesize: std::mem::size_of::<usize>(),
+            standard_array_length_ofs: 0,
+        }
     }
 
     /// rewrite.py:345 parity: run GC rewriter on ops before assembly.
     /// Returns the rewritten ops plus the per-loop reference-constant
     /// list (`rewrite.py:352 gcrefs_output_list`) the caller turns into a
-    /// `GcTable`. The list is empty when no rewriter is configured or the
-    /// trace references no reference constants.
+    /// `GcTable`. The list is empty when the trace references no reference
+    /// constants.
     fn prepare_ops_for_compile(
         &mut self,
         inputargs: &[InputArg],
@@ -1725,7 +1764,8 @@ impl DynasmBackend {
             .collect();
         // rewrite.py:489 parity: inject str_descr/unicode_descr for NEWSTR/NEWUNICODE
         inject_builtin_string_descrs(&mut normalized);
-        if let Some(rewriter) = self.gc_rewriter() {
+        {
+            let rewriter = self.gc_rewriter();
             use majit_gc::GcRewriter;
             // The rewriter takes the typed `Const` pool directly; each box
             // variant carries its own type (`Const::get_type`).
@@ -1741,8 +1781,6 @@ impl DynasmBackend {
             // like aheui's logo).
             self.constants = new_constants;
             (result, gcrefs)
-        } else {
-            (normalized, Vec::new())
         }
     }
 
