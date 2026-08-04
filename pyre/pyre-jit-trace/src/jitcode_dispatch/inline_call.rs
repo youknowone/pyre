@@ -2937,6 +2937,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         .unwrap_or(u16::MAX);
     let strict_inlinable =
         callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
+    // `typeobject.py descr_call` discards `__init__`'s result and returns the
+    // instance.  Pyre flattens that frame for constructor inlining, so a guard
+    // pause inside a branchy `__init__` would have no frame to reconstruct that
+    // discard.  Keep such constructors residual so replay re-enters the whole
+    // instantiation call at the caller boundary.
+    if constructor_result.is_some() && !strict_inlinable {
+        return Ok(None);
+    }
     // A zero-param callee has no positional argument to seed, so the register
     // convention above holds vacuously and the strict path serves it like any
     // other straight-line leaf.  The residual it would otherwise fall back to
@@ -3051,10 +3059,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // callee needing fresh cellvar allocation is not seeded — the seed block
     // below breaks out to the ordinary single-frame inline for it — so exclude
     // it here too, or the preflight would decline a CALL that path still
-    // serves.
+    // serves.  Constructor inlining also stays out of the seed: `typeobject.py
+    // descr_call` owns the discard of `__init__`'s result, and the flattened
+    // frame shape cannot reconstruct that discard from a two-frame in-callee
+    // guard pause.
     let strict_seed = strict_inlinable
         && inline_depth < fbw_max_multiframe_depth()
-        && callee_code.cellvars.is_empty();
+        && callee_code.cellvars.is_empty()
+        && constructor_result.is_none();
     // Preflight the caller frame BEFORE the seed below records a virtual
     // PyFrame.  A CALL covered by a try/catch marker must remain residual so
     // its post-call catch resume routes an exception; returning after frame
