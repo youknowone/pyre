@@ -10618,9 +10618,12 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     // parity: `metainterp.last_exc_value = ...` is metainterp-level
     // state that survives across opimpl invocations.
     use crate::state::PyreSym;
+    use pyre_object::interp_exceptions::{ExcKind, w_exception_new};
 
     let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
-    let exc_oprep = tc.const_ref(0xDEAD_BEEF);
+    let exc = w_exception_new(ExcKind::ValueError, "boom");
+    // The walk now reads the concrete exception's traceback head.
+    let exc_oprep = tc.const_ref(exc as i64);
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
     *sym.registers_r_mut() = vec![OpRef::NONE; 8];
     sym.registers_r_mut()[3] = exc_oprep;
