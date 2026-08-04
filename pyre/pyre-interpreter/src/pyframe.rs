@@ -1080,11 +1080,15 @@ unsafe fn alloc_frame_block(
     allocation: FrameLocalsArrayAllocation,
 ) -> *mut FrameBlock {
     if allocation == FrameLocalsArrayAllocation::OldGenGc {
-        if let Some(raw) = pyre_object::gc_hook::try_gc_alloc(
-            FRAME_BLOCK_GC_TYPE_ID,
-            std::mem::size_of::<FrameBlock>(),
+        // `FRAME_BLOCK_GC_TYPE_ID` registers `previous` as a traced edge, so
+        // the walker forwards the rest of the chain unconditionally once it
+        // reaches a managed block. A `malloc_raw` block spliced in after a
+        // failed managed allocation would be forwarded without a header.
+        let payload_size = std::mem::size_of::<FrameBlock>();
+        if let Some(raw) = pyre_object::gc_hook::GcAllocOutcome::from_hook(
+            pyre_object::gc_hook::try_gc_alloc(FRAME_BLOCK_GC_TYPE_ID, payload_size),
         )
-        .filter(|raw| !raw.is_null())
+        .allocated_or_abort(payload_size)
         {
             unsafe { std::ptr::write(raw as *mut FrameBlock, block) };
             return raw as *mut FrameBlock;

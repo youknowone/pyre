@@ -586,15 +586,18 @@ pub(crate) fn alloc_rbigint_nursery_impl(
     }
     let tid = rbigint_gc_type_id();
     let mut needs_write_barrier = true;
+    // A `Some(null)` here means the GC owns the heap and could not satisfy the
+    // request; `malloc_raw` below would then leave `_digits` — this payload's
+    // one traced edge — unreachable to the collector.
     if tid != 0
-        && let Some(raw) = unsafe {
+        && let Some(raw) = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
             crate::gc_hook::try_gc_alloc_fast_with_placement(
                 tid,
                 RBIGINT_PAYLOAD_SIZE,
                 &mut needs_write_barrier,
             )
-        }
-        .filter(|pointer| !pointer.is_null())
+        })
+        .allocated_or_abort(RBIGINT_PAYLOAD_SIZE)
     {
         unsafe {
             std::ptr::write(raw as *mut RBigInt, value);
@@ -638,15 +641,20 @@ fn alloc_rbigint_nursery_collecting_impl(
         // selects.
         let digit_slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>();
         let mut needs_write_barrier = true;
-        let raw = unsafe {
+        // `NoRoute` falls through to the no-collect path below, which has its
+        // own hook to try. A failure does not: this allocation already ran a
+        // minor collection, so retrying the no-collect path would only reach
+        // its `malloc_raw` fallback and hide the failure behind an untraced
+        // payload.
+        let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
             crate::gc_hook::try_gc_alloc_fast_collecting_rooted(
                 tid,
                 RBIGINT_PAYLOAD_SIZE,
                 digit_slot,
                 &mut needs_write_barrier,
             )
-        }
-        .filter(|pointer| !pointer.is_null());
+        })
+        .allocated_or_abort(RBIGINT_PAYLOAD_SIZE);
         if let Some(raw) = raw {
             unsafe {
                 std::ptr::write(raw as *mut RBigInt, value);
@@ -687,7 +695,7 @@ pub fn alloc_rbigint_stable(value: RBigInt) -> *mut RBigInt {
     }
     let tid = rbigint_gc_type_id();
     if tid != 0 {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, RBIGINT_PAYLOAD_SIZE);
+        let raw = crate::gc_hook::try_gc_alloc_stable_or_abort(tid, RBIGINT_PAYLOAD_SIZE);
         if !raw.is_null() {
             unsafe {
                 std::ptr::write(raw as *mut RBigInt, value);

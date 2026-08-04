@@ -13,11 +13,18 @@
 //! the same pointer to every thread, and a collector running on an arbitrary
 //! thread must see it even if that thread never ran the install path.
 //!
-//! Callers use [`try_gc_alloc`] which returns `None` when no hook is
-//! installed — they fall back to the `Box::into_raw` path in
-//! that case. Incremental migration drops the `Box::into_raw`
-//! fallback at each call site as the hook's reliability is verified
-//! under the full bench suite.
+//! Callers use [`try_gc_alloc`], whose two non-pointer answers mean
+//! different things: `None` is *no GC owns the heap*, `Some(null)` is *a GC
+//! owns the heap and this allocation failed*. Only the first licenses the
+//! `Box::into_raw` path. [`GcAllocOutcome`] names the two so a call site
+//! cannot collapse them: substituting a raw object for a failed managed one
+//! puts a headerless payload into the traced graph, where an owner field
+//! registered as a gc-pointer offset forwards it as though it had a header.
+//!
+//! Dropping the `Box::into_raw` fallback at a call site is therefore a
+//! question of whether that site can still run before `init_gc_subsystem`,
+//! not of how reliable the hook has proven under a bench suite: the state
+//! that matters is `Some(null)`, which a green benchmark never exercises.
 //!
 //! Layering: this module defines the function-pointer slots only. Wire-up
 //! lives in `pyre-jit`.
@@ -127,6 +134,70 @@ pub fn clear_gc_alloc_hook() {
 #[inline]
 pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<*mut u8> {
     GC_ALLOC_HOOK.get().map(|f| f(type_id, payload_size))
+}
+
+/// What an allocation hook answered, with the two non-pointer states kept
+/// apart.
+///
+/// `malloc_fixedsize` (incminimark.py:640-693) has neither state. The GC is a
+/// prebuilt constant (framework.py:254), so a route always exists, and a
+/// nursery that cannot satisfy the request reaches `collect_and_reserve`
+/// (incminimark.py:981-985), which raises MemoryError rather than handing a
+/// null back. Both states are pyre's own, and they are not interchangeable:
+///
+/// * [`NoRoute`](Self::NoRoute) — nothing owns the heap yet: a bare unit
+///   test, the pre-`init_gc_subsystem` bootstrap, or a build with no backend.
+///   The caller's `malloc_raw` path *is* the whole heap there, so taking it
+///   keeps the object graph consistent.
+/// * [`Failed`](Self::Failed) — a GC owns the heap and could not satisfy the
+///   request. `malloc_raw` is the wrong answer now: the object would hold
+///   managed references the collector never traces or forwards, and its
+///   missing header lets a type-id witness misread the words before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcAllocOutcome {
+    Allocated(*mut u8),
+    Failed,
+    NoRoute,
+}
+
+impl GcAllocOutcome {
+    /// Classify a hook result: `None` is [`NoRoute`](Self::NoRoute),
+    /// `Some(null)` is [`Failed`](Self::Failed).
+    #[inline]
+    pub fn from_hook(result: Option<*mut u8>) -> Self {
+        match result {
+            Some(raw) if !raw.is_null() => Self::Allocated(raw),
+            Some(_) => Self::Failed,
+            None => Self::NoRoute,
+        }
+    }
+
+    /// The allocated pointer, or `None` for [`NoRoute`](Self::NoRoute) so the
+    /// caller takes its own non-GC path. A [`Failed`](Self::Failed) does not
+    /// return: see [`gc_alloc_failed`].
+    #[inline]
+    pub fn allocated_or_abort(self, payload_size: usize) -> Option<*mut u8> {
+        match self {
+            Self::Allocated(raw) => Some(raw),
+            Self::Failed => gc_alloc_failed(payload_size),
+            Self::NoRoute => None,
+        }
+    }
+}
+
+/// A GC that owns the heap could not satisfy an allocation.
+///
+/// `collect_and_reserve` (incminimark.py:981-985) raises MemoryError at this
+/// point, so no caller of `malloc_fixedsize` observes a null. The pyre callers
+/// return a bare pointer and run under JIT frames that cannot unwind, so the
+/// failure aborts instead — the answer `alloc_typed_items_block_nursery`
+/// (`object_array.rs`) already gives for a digit array whose allocation fails.
+#[cold]
+#[inline(never)]
+pub fn gc_alloc_failed(payload_size: usize) -> ! {
+    let layout = std::alloc::Layout::from_size_align(payload_size, std::mem::align_of::<usize>())
+        .unwrap_or_else(|_| std::alloc::Layout::new::<usize>());
+    std::alloc::handle_alloc_error(layout)
 }
 
 /// Install the `malloc_fast` allocation callback.
@@ -242,6 +313,19 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8>
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
     try_gc_alloc_stable(type_id, payload_size).unwrap_or(core::ptr::null_mut())
+}
+
+/// [`try_gc_alloc_stable_raw`] for a caller whose fallback is `malloc_raw`.
+///
+/// Returns null only for [`GcAllocOutcome::NoRoute`]; a GC that owns the heap
+/// and then fails aborts rather than letting the caller substitute an untraced
+/// object. Keeps the raw return so the residualised call carries no
+/// discriminant, for the reason [`try_gc_alloc_stable_raw`] documents.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_alloc_stable_or_abort(type_id: u32, payload_size: usize) -> *mut u8 {
+    GcAllocOutcome::from_hook(try_gc_alloc_stable(type_id, payload_size))
+        .allocated_or_abort(payload_size)
+        .unwrap_or(core::ptr::null_mut())
 }
 
 majit_gc::global_hook!(static GC_ALLOC_COLLECTING_HOOK: GcAllocHookFn);
@@ -879,6 +963,41 @@ mod tests {
         assert!(ptr.is_some());
         assert!(ptr.unwrap().is_null());
         clear_gc_alloc_hook();
+    }
+
+    #[test]
+    fn outcome_separates_no_route_from_failure() {
+        let mut probe = 0u8;
+        assert_eq!(GcAllocOutcome::from_hook(None), GcAllocOutcome::NoRoute);
+        assert_eq!(
+            GcAllocOutcome::from_hook(Some(std::ptr::null_mut())),
+            GcAllocOutcome::Failed
+        );
+        assert_eq!(
+            GcAllocOutcome::from_hook(Some(&mut probe as *mut u8)),
+            GcAllocOutcome::Allocated(&mut probe as *mut u8)
+        );
+    }
+
+    #[test]
+    fn only_no_route_returns_the_caller_to_its_raw_path() {
+        // `Failed` does not return at all, so the surviving `None` is the sole
+        // licence for a `malloc_raw` fallback.
+        assert!(GcAllocOutcome::NoRoute.allocated_or_abort(24).is_none());
+        let mut probe = 0u8;
+        assert_eq!(
+            GcAllocOutcome::Allocated(&mut probe as *mut u8).allocated_or_abort(24),
+            Some(&mut probe as *mut u8)
+        );
+    }
+
+    #[test]
+    fn installed_hook_returning_null_classifies_as_failure_not_no_route() {
+        let _hook_lock = hook_test_guard();
+        register_gc_alloc_hook(null_hook);
+        let outcome = GcAllocOutcome::from_hook(unsafe { try_gc_alloc_fast(1, 8) });
+        clear_gc_alloc_hook();
+        assert_eq!(outcome, GcAllocOutcome::Failed);
     }
 
     #[test]
