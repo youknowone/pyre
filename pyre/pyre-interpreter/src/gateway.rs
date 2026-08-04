@@ -1605,9 +1605,11 @@ pub fn fsencode_bytes_w_with_kind(
             let result_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(result);
             let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
-            if pyre_object::bytesobject::is_bytes_like(result) {
+            // interp_posix.py:3049-3051 accepts only `str` or `bytes` back from
+            // `__fspath__`; a `bytearray` is a readable buffer but not a path.
+            if pyre_object::bytesobject::is_bytes(result) {
                 (
-                    pyre_object::bytesobject::bytes_like_data(result).to_vec(),
+                    pyre_object::bytesobject::w_bytes_data(result).to_vec(),
                     true,
                 )
             } else if pyre_object::is_str(result) {
