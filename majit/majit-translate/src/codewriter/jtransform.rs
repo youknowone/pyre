@@ -338,6 +338,37 @@ enum JitMarkerKey {
 /// JitDriver receiver types whose `jit_merge_point`/`can_enter_jit`/`loop_header` markers are recognized; each becomes its own portal via `portal_jd_index`.
 const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &["PyPyJitDriver", "UnpackIterableJitDriver"];
 
+/// The null-pointer builtins `HostEnv::bootstrap` registers
+/// (`flowspace/model.rs`), spelled as `HostObject::qualname`.
+const NULL_PTR_BUILTIN_QUALNAMES: &[&str] = &[
+    "core.ptr.null",
+    "core.ptr.null_mut",
+    "std.ptr.null",
+    "std.ptr.null_mut",
+];
+
+/// Whether a 0-arg `FunctionPath` call names one of those builtins.
+///
+/// A guest const-global defined as `std::ptr::null_mut()` is bound to the SAME
+/// `HostObject` as the spelled-out call (`flowspace/model.rs` binds the attr to
+/// `core.ptr.null_mut` rather than minting a second callable), which is how
+/// `flowspace_adapter`'s Branch 3b types the two identically. The surviving
+/// model graph still carries whichever path the source spelled, so resolve it
+/// through that same registry instead of listing the guest's spellings here —
+/// the alias keeps one owner, and no guest name is repeated in the codewriter.
+fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
+    let Some((leaf, module_path)) = segments.split_last() else {
+        return false;
+    };
+    if module_path.is_empty() {
+        return false;
+    }
+    crate::flowspace::model::HOST_ENV
+        .import_module(&module_path.join("."))
+        .and_then(|module| module.module_get(leaf))
+        .is_some_and(|attr| NULL_PTR_BUILTIN_QUALNAMES.contains(&attr.qualname()))
+}
+
 fn jit_marker_key_from_target(target: &CallTarget) -> Option<JitMarkerKey> {
     let CallTarget::Method {
         name,
@@ -3055,13 +3086,7 @@ impl<'a> Transformer<'a> {
         if let CallTarget::FunctionPath { segments } = target
             && args.is_empty()
             && matches!(result_ty, ValueType::Ref(_))
-            && matches!(
-                segments.as_slice(),
-                [owner, ptr, leaf]
-                    if matches!(owner.as_str(), "core" | "std")
-                        && ptr == "ptr"
-                        && matches!(leaf.as_str(), "null" | "null_mut")
-            )
+            && resolves_to_null_ptr_builtin(segments)
         {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
@@ -9198,32 +9223,37 @@ mod tests {
 
     #[test]
     fn ptr_null_builtin_rewrites_to_null_ref_constant() {
-        let config = GraphTransformConfig::default();
-        let mut graph = FunctionGraph::new("ptr_null_constant");
-        let entry = graph.startblock;
-        let result_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::function_path(["core", "ptr", "null_mut"]),
-                    args: vec![],
-                    result_ty: ValueType::Ref(None),
-                },
-                true,
-            )
-            .unwrap();
-        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
-        graph.set_return(entry, Some(result_var.clone()));
+        for path in [
+            vec!["core", "ptr", "null_mut"],
+            vec!["pyre_object", "pyobject", "PY_NULL"],
+        ] {
+            let config = GraphTransformConfig::default();
+            let mut graph = FunctionGraph::new("ptr_null_constant");
+            let entry = graph.startblock;
+            let result_var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(path),
+                        args: vec![],
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .unwrap();
+            FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+            graph.set_return(entry, Some(result_var.clone()));
 
-        let result = transform_graph(&graph, &config);
-        let folded = result
-            .graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .find(|op| op.result.as_ref() == Some(&result_var))
-            .expect("null result must survive as a constant definition");
-        assert!(matches!(folded.kind, OpKind::ConstRefNull));
+            let result = transform_graph(&graph, &config);
+            let folded = result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find(|op| op.result.as_ref() == Some(&result_var))
+                .expect("null result must survive as a constant definition");
+            assert!(matches!(folded.kind, OpKind::ConstRefNull));
+        }
     }
 
     /// `rtuple.py:153-169 TupleRepr.newtuple`: a non-empty tuple lowers to
