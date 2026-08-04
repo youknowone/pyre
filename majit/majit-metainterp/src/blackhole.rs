@@ -3954,7 +3954,7 @@ mod tests {
 
         /// The two `fnaddr` classifiers agree with the walker's gate.
         ///
-        /// `residual_call.rs:1117` declines a funcptr with any bit ≥ 47 set;
+        /// A symbolic hash carries the `SYMBOLIC_FNADDR_BASE` high-16-bit tag;
         /// `0` is upstream's "no address" spelling (`jitcode.py:14`) and is a
         /// no-op — not a decline — for `residual_call`, whose backend
         /// `bh_call_*` returns `0`/null for it.
@@ -3964,12 +3964,17 @@ mod tests {
             assert!(!super::is_symbolic_fnaddr(real));
             assert!(super::is_callable_fnaddr(real));
 
-            // `symbolic_fnaddr_for_path` is a `DefaultHasher` finish() cast to
-            // i64, so its high bits are set with overwhelming probability; the
-            // gate's contract is the bit-47 test, not the hash function.
-            let symbolic = 0x1234_5678_9abc_def0_u64 as i64;
+            let symbolic = majit_translate::codewriter::call::SYMBOLIC_FNADDR_BASE as i64
+                | 0x1234_5678_9abc_i64;
             assert!(super::is_symbolic_fnaddr(symbolic));
             assert!(!super::is_callable_fnaddr(symbolic));
+
+            // aarch64 Linux 48-bit-VA funcptrs set bit 47 (PIE base 0xaaab…,
+            // mmap 0xffff…); they are real addresses, not symbolic hashes.
+            for real_high in [0x0000_ffff_7122_b9c0_i64, 0x0000_aaab_1234_5678_i64] {
+                assert!(!super::is_symbolic_fnaddr(real_high));
+                assert!(super::is_callable_fnaddr(real_high));
+            }
 
             assert!(!super::is_symbolic_fnaddr(0));
             assert!(!super::is_callable_fnaddr(0));
@@ -10641,14 +10646,15 @@ fn read_inline_call_jitcode(
 /// did not publish through `jit_trace_fnaddrs()`; `patch_constants_i_fnaddrs`
 /// is keyed on the build-time address, so a hash is never rebound.
 ///
-/// User-space code addresses occupy the canonical low half on every target pyre
-/// builds for, so the top bits separate the two. This is the same discriminator
-/// the walker's residual-call path already uses to decline a symbolic funcptr —
-/// `(func_ptr as u64) >> 47 != 0` → `ResidualDecline::Symbolic`
-/// (`jitcode_dispatch/residual_call.rs:1117`).
+/// Symbolic hashes carry the `SYMBOLIC_FNADDR_BASE` high-16-bit tag stamped
+/// at generation, which no real user-space funcptr can carry on any target
+/// pyre builds for (aarch64 Linux maps code with bit 47 set, so a bit-range
+/// heuristic would misclassify every real funcptr there).  Same discriminator
+/// the walker's residual-call path uses to decline a symbolic funcptr →
+/// `ResidualDecline::Symbolic`.
 #[inline]
 pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
-    (fnaddr as u64) >> 47 != 0
+    majit_translate::codewriter::call::is_symbolic_fnaddr(fnaddr)
 }
 
 /// Whether a jitcode's `fnaddr` can be called as a function pointer.

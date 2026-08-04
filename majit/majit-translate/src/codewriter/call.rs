@@ -5971,12 +5971,31 @@ impl CallControl {
     }
 }
 
+/// High-16-bit tag stamped on every symbolic fnaddr hash so consumers can
+/// discriminate a placeholder from a real code address by an exact bit
+/// pattern instead of a range heuristic.  User-space addresses keep bits
+/// 48..64 clear on every 64-bit target pyre builds for, and wasm32 addresses
+/// are 32-bit, so no real funcptr can carry the tag.  (A bit-47 range test is
+/// NOT enough: aarch64 Linux uses a 48-bit VA and maps PIE code and mmap
+/// regions with bit 47 set — 0xaaab…/0xffff… — so every real funcptr there
+/// would read as symbolic.)  Same scheme as
+/// `assembler::STR_CONST_SENTINEL_BASE`.
+pub const SYMBOLIC_FNADDR_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
+pub const SYMBOLIC_FNADDR_BASE: u64 = 0xFADD_0000_0000_0000;
+
+/// Whether `fnaddr` is a `symbolic_fnaddr_for_path` placeholder rather than a
+/// callable code address.
+#[inline]
+pub fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
+    (fnaddr as u64) & SYMBOLIC_FNADDR_HIGH_MASK == SYMBOLIC_FNADDR_BASE
+}
+
 fn stable_symbolic_fnaddr<T: std::hash::Hash>(value: &T) -> i64 {
     use std::hash::Hasher;
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
-    hasher.finish() as i64
+    ((hasher.finish() & !SYMBOLIC_FNADDR_HIGH_MASK) | SYMBOLIC_FNADDR_BASE) as i64
 }
 
 pub(crate) fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {

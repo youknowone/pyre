@@ -2185,12 +2185,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // state; but a sub-walk's recorded trace is committed and compiled, so the
     // backend bakes the hash as a code address and the trace branches straight
     // to it -> SIGSEGV.  Decline the whole descent so it aborts gracefully at
-    // the first un-lowered helper.  A user-space code address fits in 47 bits
-    // on 64-bit macOS/Linux; symbolic hashes set bits >= 47.
+    // the first un-lowered helper.  Symbolic hashes carry the
+    // `SYMBOLIC_FNADDR_BASE` high-16-bit tag no real funcptr can carry.
     if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
-        && (addr as u64) >> 47 != 0
+        && majit_translate::codewriter::call::is_symbolic_fnaddr(addr)
     {
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op_pc });
     }
@@ -2268,13 +2268,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // these to real runtime addresses only when the path appears in
     // both the build-time and runtime registries; helpers absent from
     // the runtime registry retain the hash and dereferencing it as a
-    // code address SIGBUSes.  Valid user-space code addresses fit in
-    // 47 bits on macOS/Linux 64-bit (canonical low half); hash values
-    // typically have bits ≥ 47 set.  Reject anything outside that
-    // range — both the symbolic-hash leak class AND any other stray
-    // non-fnptr value (e.g. an int constant mistakenly routed through
-    // the funcbox slot).
-    if (func_ptr as u64) >> 47 != 0 {
+    // code address SIGBUSes.  Hashes carry the `SYMBOLIC_FNADDR_BASE`
+    // high-16-bit tag no real funcptr can carry on any target (a bit-47
+    // range test would misclassify every real funcptr on aarch64 Linux,
+    // whose 48-bit VA maps code at 0xaaab…/0xffff…).
+    if majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
         return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     // A residual whose funcptr is a `PyFrame` operand-stack accessor
