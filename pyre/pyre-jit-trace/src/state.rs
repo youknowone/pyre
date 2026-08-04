@@ -920,15 +920,6 @@ pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<
     })
 }
 
-/// Resolve a stored JitCode offset back to its Python instruction coordinate.
-pub fn python_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Option<i32> {
-    let payload = pyjitcode_for_jitcode_index(jitcode_index)?;
-    Some(
-        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, offset as usize)
-            as i32,
-    )
-}
-
 /// `majit_metainterp::blackhole::LiveMarkerHook` implementation: stamp the
 /// instruction the blackhole is about to replay into the frame's `last_instr`.
 ///
@@ -1002,7 +993,7 @@ pub fn publish_last_instr_at_live_marker(
         if raw_code as *const CodeObject != jitcode.payload.code_ptr {
             return;
         }
-        let py_pc = crate::jitcode_dispatch::python_pc_for_jitcode_pc(metadata, marker_pc);
+        let py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(metadata, marker_pc);
         // SAFETY: same frame, and `last_instr` carries the same compile-time
         // offset assertion.
         unsafe {
@@ -1019,87 +1010,15 @@ pub fn jitcode_pc_is_bare_reraise(jitcode_index: i32, offset: i32) -> bool {
     let Some(raw_code) = raw_code_for_jitcode_index(jitcode_index) else {
         return false;
     };
-    let Some(py_pc) = python_pc_for_jitcode_pc_public(jitcode_index, offset) else {
+    let Some(py_pc) =
+        crate::py_coord::containing_py_pc_for_jitcode_pc_public(jitcode_index, offset)
+    else {
         return false;
     };
     match unsafe { pyre_interpreter::decode_instruction_at(&*raw_code, py_pc as usize) } {
         Some((Instruction::RaiseVarargs { .. }, op_arg)) => u32::from(op_arg) == 0,
         Some((Instruction::Reraise { .. }, _)) => true,
         _ => false,
-    }
-}
-
-/// Advance a Python instruction coordinate past resume trivia when code is available.
-pub fn skip_python_trivia_forward_public(
-    jitcode_index: i32,
-    raw_py_pc: i32,
-) -> Option<(i32, bool)> {
-    let payload = pyjitcode_for_jitcode_index(jitcode_index)?;
-    if payload.code_ptr.is_null() {
-        return Some((raw_py_pc, false));
-    }
-    let code = unsafe { &*payload.code_ptr };
-    Some((
-        crate::jitcode_dispatch::skip_python_trivia_forward(code, raw_py_pc as usize) as i32,
-        true,
-    ))
-}
-
-/// Translate a resume-frame pc word to a Python instruction coordinate.
-///
-/// A negative word (sentinel / branch-orgpc tag) has no Python coordinate; it
-/// passes through so the caller's `pc < 0` screen rejects it (the internal
-/// metadata lookups below are bounds-checked and never index with the word, so
-/// no wrap results).
-pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
-    let fallback = pc_word;
-    match python_pc_for_jitcode_pc_public(jitcode_index, pc_word)
-        .and_then(|raw_py_pc| skip_python_trivia_forward_public(jitcode_index, raw_py_pc))
-        .map(|(py_pc, _)| py_pc)
-    {
-        Some(py_pc) => py_pc,
-        None => fallback,
-    }
-}
-
-/// `PYRE_M73_BACKXLAT_TWIN_AUDIT` asserts the codewriter-built forward py_pc
-/// twin equals the [`backxlat_py_pc`] inversion at every non-negative resume
-/// word before [`forward_py_pc_or_backxlat`] trusts the twin. Off in
-/// production; the gated assert is the only added work.
-fn m73_backxlat_twin_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_BACKXLAT_TWIN_AUDIT").is_some())
-}
-
-/// Forward Python instruction coordinate for a carried resume JitCode word.
-///
-/// Reads the codewriter-built `forward_py_pc` twin — a by-construction mirror
-/// of [`backxlat_py_pc`]'s block-head/floor resolution plus its
-/// `skip_python_trivia_forward` normalization — keeping the inversion only for
-/// the empty-twin class (skeleton / fixture jitcodes) and for negative words.
-///
-/// Negative words (`NO_JITCODE_PC` `-1`, tagged branch-orgpc words `<= -2`)
-/// cast to a huge `usize` twin key and would floor-resolve to a bogus
-/// predecessor entry, so they are delegated straight to `backxlat_py_pc`, which
-/// resolves them identically to the pre-cutover call.
-pub fn forward_py_pc_or_backxlat(jitcode_index: i32, pc_word: i32) -> i32 {
-    if pc_word < 0 {
-        return backxlat_py_pc(jitcode_index, pc_word);
-    }
-    match pyjitcode_for_jitcode_index(jitcode_index)
-        .and_then(|pjc| pjc.forward_py_pc_for_jitcode_pc(pc_word as usize))
-    {
-        Some(twin) => {
-            if m73_backxlat_twin_audit_enabled() {
-                assert_eq!(
-                    twin as i32,
-                    backxlat_py_pc(jitcode_index, pc_word),
-                    "PYRE_M73_BACKXLAT_TWIN_AUDIT: forward py_pc twin diverged at jitcode {jitcode_index} pc {pc_word}"
-                );
-            }
-            twin as i32
-        }
-        None => backxlat_py_pc(jitcode_index, pc_word),
     }
 }
 
@@ -1877,7 +1796,7 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             // non-decodable path uses below), keeping liveness and pcdep on one
             // coordinate. A portal bridge is uncolored, so `via_py_pc` returns
             // `(0, empty)` for any resolved py; the merge-target fallback is
-            // identical to the retired `python_pc_for_jitcode_pc` re-inversion.
+            // identical to the containing JitCode-PC coordinate lookup.
             match (
                 payload.depth_for_jitcode_pc_pred(jp),
                 payload.pcdep_for_jitcode_pc(jp),
@@ -5268,6 +5187,11 @@ impl CapturedFrameStack {
     pub(crate) fn roots_mut(&mut self) -> &mut [i64] {
         self.roots.as_mut_slice()
     }
+
+    /// Diagnostic copy of the captured slots.
+    pub(crate) fn roots_snapshot(&self) -> Vec<i64> {
+        self.roots.clone()
+    }
 }
 
 fn frame_stack_transfer_shape(
@@ -5331,6 +5255,66 @@ pub(crate) fn capture_frame_stack_for_publish(
             .iter()
             .map(|&value| value as i64)
             .collect(),
+    })
+}
+
+/// Build the same carrier from the walker's operand-stack MIRROR instead of
+/// the tracing snapshot's slot array.
+///
+/// [`capture_frame_stack_for_publish`] reads the detached snapshot frame, which
+/// only describes the walk for a coordinate the walk's vable writes reached:
+/// `setarrayitem_vable_via_metainterp` mirrors into a concrete frame through
+/// `current_inline_vable_target`, i.e. only for the frame an INLINE level owns.
+/// A root walk keeps its virtualizable symbolic, so that array still holds the
+/// pre-walk stack, and publishing it resumes the blackhole on a stack from
+/// before the walk ran.  Locals are unaffected — `write_back_outer_locals`
+/// takes those from the virtualizable shadow.
+///
+/// The mirror reflects the depth ON ENTRY to the opcode at `py_pc`, so it pairs
+/// with `last_instr = py_pc - 1`, the same coordinate
+/// [`flush_walk_end_state_to_frame_with_full_stack`] stores for its own
+/// full-stack override.  The height is checked against the forward analysis for
+/// the same reason that override is: a mirror describing another coordinate
+/// must decline, not publish a shifted stack.
+pub(crate) fn capture_frame_stack_from_mirror(
+    live_frame: usize,
+    py_pc: usize,
+    stack: &[PyObjectRef],
+) -> Option<CapturedFrameStack> {
+    let stack_base = concrete_nlocals(live_frame)?;
+    let valuestackdepth = stack_base.checked_add(stack.len())?;
+    let live_arr = unsafe {
+        *((live_frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *const pyre_object::FixedObjectArray)
+    };
+    if live_arr.is_null() || unsafe { &*live_arr }.as_slice().len() < valuestackdepth {
+        return None;
+    }
+    let w_code = unsafe {
+        *((live_frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET)
+            as *const *const ())
+    };
+    if w_code.is_null() {
+        return None;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    let depth = crate::liveness::liveness_for(raw_code)
+        .depth_at_py_pc()
+        .get(py_pc)
+        .copied()?;
+    if depth as usize != stack.len() {
+        return None;
+    }
+    Some(CapturedFrameStack {
+        stack_base,
+        scalars: FrameScalars {
+            last_instr: py_pc as isize - 1,
+            valuestackdepth,
+        },
+        roots: stack.iter().map(|&value| value as i64).collect(),
     })
 }
 
@@ -7225,7 +7209,8 @@ fn reconstruct_inline_recipe(
     if frame.pc < 0 {
         decline!("NoSnapshotPc");
     }
-    let py_pc = forward_py_pc_or_backxlat(frame.jitcode_index, frame.pc) as usize;
+    let py_pc =
+        crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;
     let Some(w_code) = code_for_jitcode_index(frame.jitcode_index) else {
         decline!("NoCodeForJitcodeIndex");
     };

@@ -832,6 +832,20 @@ mod host_abi {
         pack_into_guest(super::take_stderr())
     }
 
+    /// The walker's decline census (`[fbw-census] <name>: <count>` lines) as
+    /// the same packed pair, for the host to print under
+    /// `PYRE_WASM_FBW_CENSUS`.
+    ///
+    /// `PYRE_FBW_DEBUG_ABORT` selects that dump on a native build, but the
+    /// guest reads no environment and writes to no descriptor, so neither the
+    /// switch nor the `eprintln!` exists here. The counters are accumulated
+    /// either way; this is the only way to read them off a wasm run. Reading,
+    /// not draining, unlike `pyre_take_stderr`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_fbw_census() -> u64 {
+        pack_into_guest(pyre_jit_trace::jitcode_dispatch::census_report().into_bytes())
+    }
+
     /// Status the last `pyre_run_python` ended with: `SystemExit`'s code, 1 for
     /// an uncaught exception or a `SyntaxError`, else 0. The host exits with
     /// it, as `pyrex` does with `targetpypystandalone.py:37 entry_point`'s

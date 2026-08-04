@@ -5305,6 +5305,12 @@ impl TraceCtx {
     /// `u64`, losing the per-header identity, so the explicit `header_pc`
     /// disambiguator restores it for re-entrant loop headers within one
     /// code object.
+    /// See [`TraceCtx::merge_point_resumed`] — pyjitpl.py:1570/1577
+    /// `saved_pc`. Read-and-clear: the skip applies to exactly one visit.
+    pub fn take_merge_point_resumed(&mut self) -> bool {
+        std::mem::take(&mut self.merge_point_resumed)
+    }
+
     pub fn has_merge_point_at(&self, key: u64, header_pc: usize) -> bool {
         self.current_merge_points
             .iter()
@@ -5336,6 +5342,25 @@ impl TraceCtx {
             .rev()
             .find(|mp| mp.header_pc == header_pc && mp.position._pos > 0)
             .map(|mp| mp.green_boxes.iter().map(|green| green.ty).collect())
+    }
+
+    /// `pyjitpl.py:3021 same_greenkey(original_boxes, live_arg_boxes,
+    /// num_green_args)` — the loop header the trace is closing ON, read from
+    /// the greens it closes WITH.
+    ///
+    /// `close_greens` is `live_arg_boxes[:num_green_args]` for the close the
+    /// walk just performed; its first green is the guest pc, which is what
+    /// [`MergePoint::header_pc`] records. `header_pc` is the header the walk
+    /// last registered and a close on a different loop leaves it stale, so
+    /// merge-point matching has to go through here rather than read it
+    /// directly. Falls back to `header_pc` when the walk recorded no close
+    /// greens (nothing to compare against, so the session's own header is
+    /// the only candidate).
+    pub fn close_header_pc(&self) -> usize {
+        self.close_greens
+            .as_ref()
+            .and_then(|greens| greens.0.first().copied())
+            .map_or(self.header_pc, |pc| pc as usize)
     }
 
     pub fn get_merge_point_at(&self, key: u64, header_pc: usize) -> Option<&MergePoint> {

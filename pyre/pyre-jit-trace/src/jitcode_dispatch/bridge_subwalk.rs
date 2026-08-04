@@ -1010,7 +1010,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         call_jitcode_pc: call_jit_pc,
         call_stack_overrides: Vec::new(),
         blackhole,
-        // The recipe's resolved word was `backxlat_py_pc(jitcode_index,
+        // The recipe's resolved word was `trivia_normalized_py_pc_for_jitcode_pc(jitcode_index,
         // jitcode_pc)` by construction, exactly the bridge-root flavor.
         resume_coord: ParentResumeCoord::Backxlat(recipe.jitcode_pc as usize),
         resume_marker_jit_pc,

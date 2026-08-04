@@ -1531,6 +1531,12 @@ pub fn fsencode_bytes_w(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate:
     Ok(fsencode_bytes_w_with_kind(obj)?.0)
 }
 
+/// `objspace.py:438 newfilename(s) = fsdecode(newbytes(s))`: expose the
+/// application-level filename spelling derived from its filesystem bytes.
+pub fn fsdecode_filename_bytes(data: &[u8]) -> pyre_object::PyObjectRef {
+    crate::typedef::charp2uni(data)
+}
+
 /// [`fsencode_bytes_w`] paired with the `bytes`-ness of the resolved object;
 /// see [`fsencode_w_with_kind`] for why the two are produced together.
 pub fn fsencode_bytes_w_with_kind(

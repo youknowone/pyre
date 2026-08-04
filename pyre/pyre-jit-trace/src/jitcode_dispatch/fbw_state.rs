@@ -1692,9 +1692,10 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
         let session = ctx.session.borrow();
         (session.recording_frame_ptr, session.recording_jitcode_index)
     };
-    let Some(py_pc) =
-        crate::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position as i32)
-    else {
+    let Some(py_pc) = crate::py_coord::containing_py_pc_for_jitcode_pc_public(
+        jitcode_index,
+        opcode_position as i32,
+    ) else {
         return;
     };
     let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() else {
@@ -1802,7 +1803,10 @@ pub(crate) fn fbw_abort_resume_py_pc<Sym: WalkSym>(
     if jc.payload.code_ptr.is_null() {
         return None;
     }
-    Some(python_pc_for_jitcode_pc(&jc.payload.metadata, abort_jit_pc) as usize)
+    Some(
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, abort_jit_pc)
+            as usize,
+    )
 }
 
 /// Every pc in `body_code` that some op can branch to: the `goto` family and

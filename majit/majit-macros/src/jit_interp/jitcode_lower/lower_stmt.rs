@@ -945,7 +945,8 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_ref_binding_setfield(expr) {
             return Some(());
         }
-        // Raw native-memory store: `majit_raw_store_i64(base, ea, val);` →
+        // Raw native-memory store: `majit_raw_store_{i,u}{8,16,32,64}(base,
+        // ea, val);` →
         // raw_store_i (jtransform.py:1156-1163 rewrite_op_raw_store).  Runs
         // before the residual-call path so the store lowers to an inline
         // side-effecting IR op instead of an opaque helper call.
@@ -1788,24 +1789,36 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Lower a raw native-memory store intrinsic
-    /// `majit_raw_store_i64(base, ea, val)` to a `raw_store_i` op.
+    /// `majit_raw_store_{i,u}{8,16,32,64}(base, ea, val)` to a `raw_store_i`
+    /// op (the write-side analogue of `lower_raw_load_call`).
     ///
     /// RPython parity: an `rffi.raw_storage_setitem(base, offset, value)`
     /// in the interpreter source is rewritten by
     /// `jtransform.py:1156-1163 rewrite_op_raw_store` to
-    /// `raw_store_i(base, offset, value, arraydescrof(CArray(T)))`.  Here
-    /// the macro recognizes the kernel's `unsafe` intrinsic by name and
-    /// emits the same op with an 8-byte raw-int array descr
-    /// (`add_raw_int_array_descr`).  The three operands are all int-kind
-    /// (raw address, byte offset, stored value); the op has no result.
+    /// `raw_store_i(base, offset, value, arraydescrof(CArray(T)))`, where `T`
+    /// is the STORED VALUE's own type — so the access width and signedness
+    /// come off the descr and any width upstream can store, this can.  The
+    /// three operands are all int-kind (raw address, byte offset, stored
+    /// value); the op has no result.
     fn lower_raw_store_stmt(&mut self, expr: &Expr) -> Option<()> {
         let Expr::Call(call) = expr else {
             return None;
         };
         let segments = canonical_expr_segments(&call.func)?;
-        if segments.last().map(String::as_str) != Some("majit_raw_store_i64") {
-            return None;
-        }
+        let (item_size, is_signed) = match segments.last().map(String::as_str)? {
+            "majit_raw_store_i8" => (1usize, true),
+            "majit_raw_store_u8" => (1usize, false),
+            "majit_raw_store_i16" => (2usize, true),
+            "majit_raw_store_u16" => (2usize, false),
+            "majit_raw_store_i32" => (4usize, true),
+            "majit_raw_store_u32" => (4usize, false),
+            "majit_raw_store_i64" => (8usize, true),
+            // At 8 bytes the signedness cannot change which bits are written,
+            // but the intrinsic is documented as supported, so accept it for
+            // parity — as the load side does.
+            "majit_raw_store_u64" => (8usize, false),
+            _ => return None,
+        };
         if call.args.len() != 3 {
             return None;
         }
@@ -1824,7 +1837,7 @@ impl<'c> Lowerer<'c> {
                 vec![],
             ),
             quote! {
-                let __raw_descr = __builder.add_raw_int_array_descr(8);
+                let __raw_descr = __builder.add_raw_int_array_descr_signed(#item_size, #is_signed);
                 __builder.raw_store_i(
                     #base_reg as u16,
                     #ea_reg as u16,

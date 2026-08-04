@@ -641,7 +641,7 @@ pub(crate) fn drain_backend_jit_exc() {
 
 /// #73 measurement gate. When `PYRE_M73_LASTINSTR_AUDIT` is set, the three
 /// blackhole traceback sites compare the production inversion
-/// `python_pc_for_jitcode_pc_public(last_opcode_position)` (= `orgpc`, the
+/// `containing_py_pc_for_jitcode_pc_public(last_opcode_position)` (= `orgpc`, the
 /// raising op's python pc) against the forward candidate `frame.last_instr + 1`
 /// (the JIT-vable resume convention normalized to `orgpc`). Divergence means the
 /// forward datum is stale/off-by-one and cannot yet replace the inversion; a
@@ -666,7 +666,7 @@ fn m73_lastinstr_audit(
     static DIVERGE: AtomicU64 = AtomicU64::new(0);
     static NONE: AtomicU64 = AtomicU64::new(0);
     let inv = jitcode_index.and_then(|index| {
-        pyre_jit_trace::state::python_pc_for_jitcode_pc_public(index, opcode_position)
+        pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(index, opcode_position)
     });
     let fwd = unsafe { (*frame_ptr).last_instr as i64 } + 1;
     let hits = HITS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -712,9 +712,11 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     if frame_ptr.is_null() || exc_value == 0 {
         return;
     }
-    let last_instruction =
-        pyre_jit_trace::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position)
-            .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
+    let last_instruction = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
+        jitcode_index,
+        opcode_position,
+    )
+    .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
     // One catch can be reached by two recorders: this hook, emitted into the
     // loop trace by the in-trace handler-entry arm, and the IR-virtual node the
     // bridge handler-entry arm builds when the exception edge deopts into a
@@ -770,10 +772,11 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     if exc_value == 0 || w_code_value == 0 {
         return;
     }
-    let Some(last_instruction) =
-        pyre_jit_trace::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position)
-            .map(i64::from)
-    else {
+    let Some(last_instruction) = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
+        jitcode_index,
+        opcode_position,
+    )
+    .map(i64::from) else {
         return;
     };
     let w_exc = exc_value as PyObjectRef;
@@ -2464,7 +2467,7 @@ pub fn blackhole_resume_via_rd_numb(
                 let qualname = raw_code
                     .map(|raw| unsafe { &*raw }.qualname.as_str())
                     .unwrap_or("<null>");
-                let py_pc = pyre_jit_trace::state::python_pc_for_jitcode_pc_public(
+                let py_pc = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
                     frame.jitcode.index() as i32,
                     frame.position as i32,
                 );
@@ -2583,7 +2586,7 @@ pub fn blackhole_resume_via_rd_numb(
                     if !frame_ptr.is_null() {
                         let last_instruction = jitcode_index
                             .and_then(|index| {
-                                pyre_jit_trace::state::python_pc_for_jitcode_pc_public(
+                                pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
                                     index,
                                     last_opcode_position as i32,
                                 )
@@ -3506,7 +3509,6 @@ pub fn trace_and_compile_from_bridge(
     // point rather than mid-body or past a dropped loop iteration (a
     // value-stack underflow / off-by-one-iteration result otherwise).
     let resume_state = frame.snapshot_for_tracing();
-    let trace_frame = frame.snapshot_for_tracing();
     let live_frame_addr = frame as *const PyFrame as usize;
     let mut adopted_walk_end_state = false;
     // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
@@ -3546,6 +3548,14 @@ pub fn trace_and_compile_from_bridge(
             &env,
             || {},
             |meta, sym| {
+                // pyjitpl.py:1571-1578: a merge point that only appends to
+                // `current_merge_points` restores `self.pc` and goes on
+                // interpreting, so the driver re-enters this walk instead of
+                // handing the guest back.  Each entry starts from the frame
+                // as the previous segment left it, so the snapshot is taken
+                // here rather than once outside — `FrameBox` owns a shadow
+                // stack root guard and cannot be cloned.
+                let trace_frame = bridge_frame_root.frame().snapshot_for_tracing();
                 let (action, executed) = trace_bytecode(
                     meta,
                     sym,

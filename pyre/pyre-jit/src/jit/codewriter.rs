@@ -1630,24 +1630,41 @@ fn handler_entry_state_from_catch_sites(
     merged
 }
 
-/// True for a handler whose reconstructed entry stack carries both a
-/// `push_lasti` box and an exception slot (`handler_entry_state_from_catch_site`
-/// pushes the lasti box below a `fresh_ref_value` exception slot). That
-/// exception slot has no defining op, so under the inline splice regalloc —
-/// which sources interference only from per-PC resume snapshots — it never
-/// interferes with the lasti box and coalesces onto its register, making the
-/// cleanup RERAISE raise the stale lasti integer. The caller gives the slot a
-/// `last_exc_value` producer so it enters the snapshots and earns a distinct
-/// colour.
-fn handler_entry_has_lasti_exception_slots(
+/// Whether an exception handler must retain values below the exception slot.
+///
+/// Exception-table `depth > 0` is CPython's protected operand-stack prefix
+/// (for example the saved outer-comprehension local restored by
+/// `SWAP; STORE_FAST; RERAISE`). Those values already arrive through the
+/// catch EggBlocks and `mergeblock` inputargs. Reconstructing the handler
+/// state creates fresh Variables for the prefix after the block inputargs have
+/// been fixed, leaving the cleanup ops with no producer.
+fn handler_entry_has_protected_prefix(
     catch_sites: &[ExceptionCatchSite],
     handler_py_pc: usize,
 ) -> bool {
-    catch_sites.iter().any(|site| {
-        site.handler_py_pc == handler_py_pc
-            && site.push_lasti
-            && site.landing.framestate().is_some()
-    })
+    catch_sites
+        .iter()
+        .any(|site| site.handler_py_pc == handler_py_pc && site.stack_depth > 0)
+}
+
+/// True for a handler whose reconstructed entry stack carries an exception slot
+/// (`handler_entry_state_from_catch_site` always pushes one, below it a
+/// `push_lasti` box when the table entry is lasti-marked). That exception slot
+/// has no defining op, so under the inline splice regalloc — which sources
+/// interference only from per-PC resume snapshots — it never interferes with
+/// the values live across the handler and coalesces onto one of their
+/// registers, making the cleanup RERAISE raise whatever that register held: the
+/// stale lasti integer on a lasti-marked handler, and on any other handler
+/// whichever operand shares the colour. The caller gives the slot a
+/// `last_exc_value` producer so it enters the snapshots and earns a distinct
+/// colour.
+fn handler_entry_has_exception_slot(
+    catch_sites: &[ExceptionCatchSite],
+    handler_py_pc: usize,
+) -> bool {
+    catch_sites
+        .iter()
+        .any(|site| site.handler_py_pc == handler_py_pc && site.landing.framestate().is_some())
 }
 
 /// True when an explicit raise can enter this cleanup handler.  Its
@@ -4375,7 +4392,7 @@ fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usi
 ///
 /// `compute_liveness` supplies that union only where the stream makes the edge
 /// explicit — `catch_exception L` carries `TLabel(L)`, so the backward pass
-/// folds the handler's alive set into the markers before it (`liveness.py:19-23`).
+/// folds `label2alive[L]` into the markers before it (`liveness.py:19-23`).
 /// The coordinate a bridge actually resumes at is the one the guard recorded,
 /// which for an after-residual-call guard sits PAST the `catch_exception` and so
 /// describes the no-exception arm alone.  Re-pointing that walk at the handler
@@ -4385,14 +4402,19 @@ fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usi
 /// Upstream needs no equivalent: `finishframe_exception` moves the pc of the
 /// SAME MIFrame, so the handler reads the register bank the raise left behind.
 /// A pyre bridge rebuilds its bank from one coordinate's resume data, so that
-/// coordinate must name what the handler reads.  Widening a `-live-` set is the
-/// conservative direction — the snapshot carries boxes the no-exception arm does
-/// not consume, which costs a slot and never mis-restores.
+/// coordinate must name what the explicit catch edge reads.  Widening a
+/// `-live-` set is the conservative direction — the snapshot carries boxes the
+/// no-exception arm does not consume, which costs a slot and never mis-restores.
 ///
 /// Returns `marker insn index -> extra Ref colors`.
 fn catch_target_extra_ref_colors(
     ssarepr: &super::flatten::SSARepr,
     live_markers: &[usize],
+    after_call_markers: &[Option<usize>],
+    label2alive: &std::collections::HashMap<
+        String,
+        std::collections::HashSet<super::flatten::Register>,
+    >,
     code: &CodeObject,
 ) -> std::collections::BTreeMap<usize, std::collections::BTreeSet<u16>> {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
@@ -4401,38 +4423,40 @@ fn catch_target_extra_ref_colors(
     if code.exceptiontable.is_empty() {
         return out;
     }
-    let marker_ref_colors = |py: usize| -> std::collections::BTreeSet<u16> {
-        live_markers
-            .get(py)
-            .and_then(|&idx| ssarepr.insns.get(idx))
-            .and_then(|insn| insn.live_args())
-            .map(|args| {
-                args.iter()
-                    .filter_map(|op| match op {
-                        SsaOperand::Register(reg) if reg.kind == SsaKind::Ref => Some(reg.index),
-                        _ => None,
-                    })
-                    .collect()
+    let catch_ref_colors = |anchor: usize| -> std::collections::BTreeSet<u16> {
+        let Some(super::flatten::Insn::Op { opname, args, .. }) = ssarepr.insns.get(anchor + 1)
+        else {
+            return std::collections::BTreeSet::new();
+        };
+        if opname != "catch_exception" {
+            return std::collections::BTreeSet::new();
+        }
+        args.iter()
+            .filter_map(|op| match op {
+                SsaOperand::TLabel(label) => label2alive.get(&label.name),
+                _ => None,
             })
-            .unwrap_or_default()
+            .flat_map(|alive| alive.iter())
+            .filter_map(|reg| (reg.kind == SsaKind::Ref).then_some(reg.index))
+            .collect()
     };
-    // `handler py -> live-in`, memoized: a try body of N PCs shares one handler.
-    let mut handler_refs: std::collections::HashMap<usize, std::collections::BTreeSet<u16>> =
+    // `catch_exception` anchor -> label live-in, memoized: a try body of N PCs
+    // can share one catch edge in the flattened stream.
+    let mut anchor_refs: std::collections::HashMap<usize, std::collections::BTreeSet<u16>> =
         std::collections::HashMap::new();
     for py in 0..live_markers.len() {
         let offset = u32::try_from(py * 2).expect("Python PC must fit an instruction offset");
-        let Some((target, _, _)) =
+        let Some((_target, _, _)) =
             pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, offset)
         else {
             continue;
         };
-        let handler_py = target as usize / 2;
-        if handler_py == py || handler_py >= live_markers.len() {
+        let Some(anchor) = after_call_markers.get(py).and_then(|entry| *entry) else {
             continue;
-        }
-        let refs = handler_refs
-            .entry(handler_py)
-            .or_insert_with(|| marker_ref_colors(handler_py));
+        };
+        let refs = anchor_refs
+            .entry(anchor)
+            .or_insert_with(|| catch_ref_colors(anchor));
         if refs.is_empty() {
             continue;
         }
@@ -4558,7 +4582,7 @@ fn filter_liveness_in_place(
             first_insn_pre_merge[py_pc as usize] = Some(pos);
         }
     }
-    let (live_markers, after_call_post_merge, remap) =
+    let (live_markers, after_call_post_merge, remap, label2alive) =
         super::liveness::compute_liveness_with_pc_anchors(
             ssarepr,
             walker_tracked,
@@ -4583,7 +4607,13 @@ fn filter_liveness_in_place(
             .enumerate()
             .map(|(py_pc, &i)| (py_pc, i)),
     );
-    let catch_extra_refs = catch_target_extra_ref_colors(ssarepr, &live_markers, code);
+    let catch_extra_refs = catch_target_extra_ref_colors(
+        ssarepr,
+        &live_markers,
+        &after_call_post_merge,
+        &label2alive,
+        code,
+    );
 
     // The after-residual-call `-live-` is a resume coordinate of exactly the
     // same class as the per-PC marker: `get_list_of_active_boxes` reads the
@@ -7943,15 +7973,16 @@ impl CodeWriter {
                         if start_pc != py_pc {
                             break;
                         }
-                        if preserve_exception_edge_states {
+                        if preserve_exception_edge_states
+                            || handler_entry_has_protected_prefix(&catch_sites, py_pc)
+                        {
                             // Each catch landing is the exception edge's
                             // EggBlock: it constructs the handler stack from
                             // its own link inputs, then `mergeblock` joins
                             // those states through ordinary link arguments.
                             // Keep that joined pending state while a caught
-                            // `raise value` can flow through this exception
-                            // graph, so PUSH_EXC_INFO retains the edge's
-                            // previous-exception identity.
+                            // `raise value` or a protected stack prefix must
+                            // retain its identity through handler cleanup.
                             current_depth = current_state.stack.len() as u16;
                             needs_fallthrough = false;
                         } else if let Some(handler_state) = handler_entry_state_from_catch_sites(
@@ -7960,11 +7991,8 @@ impl CodeWriter {
                             &catch_sites,
                             py_pc,
                         ) {
-                            // Non-explicit edges do not carry a raised
-                            // operand whose identity must survive the handler
-                            // cleanup. Their reconstructed state is equivalent
-                            // to the incoming EggBlock values and preserves
-                            // the established bare-reraise graph shape.
+                            // Implicit edges with no protected prefix retain
+                            // the established cross-site reconstruction.
                             current_depth = handler_state.stack.len() as u16;
                             current_state = handler_state;
                             needs_fallthrough = false;
@@ -7999,9 +8027,18 @@ impl CodeWriter {
                     if block_switch_pending {
                         break;
                     }
-                    if start_pc == py_pc
-                        && handler_entry_has_lasti_exception_slots(&catch_sites, py_pc)
-                    {
+                    if start_pc == py_pc && handler_entry_has_exception_slot(&catch_sites, py_pc) {
+                        // A sentinel top means the `handler_depth_at` fallback
+                        // above rebuilt the stack from the depth alone, so there
+                        // is no slot Variable to define; mint one for the
+                        // producer below to write.
+                        if !matches!(
+                            current_state.stack.last(),
+                            Some(super::flow::FlowValue::Variable(_))
+                        ) && let Some(top) = current_state.stack.last_mut()
+                        {
+                            *top = fresh_ref_value(&mut graph);
+                        }
                         if let Some(exc_value) = current_state.stack.last().cloned() {
                             if matches!(
                                 pyre_interpreter::decode_instruction_at(code, py_pc),
@@ -13179,13 +13216,25 @@ impl CodeWriter {
                 // `last_exc_value` SSARepr op at flatten time only — there
                 // is no graph SpaceOperation counterpart, the Variable
                 // flows through `link.last_exc_value` and is materialised
-                // by the flatten-time emission.  Allocate a fresh Ref
-                // Variable to carry the catch-landing's exception value
-                // through `current_state.stack` and the subsequent vable
-                // push, matching the variable-lifecycle shape upstream
-                // produces — without recording a graph `last_exc_value`
-                // SpaceOp the flatten driver would have to filter.
-                let exc_value: super::flow::FlowValue = fresh_ref_value(&mut graph);
+                // by the flatten-time emission.  Reuse the landing's own
+                // `last_exception` value Variable — the edge pair set by
+                // `exception_landing_state`, whose colour `generate_last_exc`
+                // writes into — as the pushed exception value, instead of a
+                // producerless fresh Ref.  A fresh Ref has no defining op, so
+                // regalloc treats it as dead-until-first-use and coalesces it
+                // onto a body colour (e.g. a local live across the `try`); on
+                // a guard-failure bridge that re-walks the handler the body
+                // colour's def sits in the skipped prefix, so the pushed value
+                // is read unbound (`RegisterReadUnbound`).  The landing value
+                // is produced by `generate_last_exc`, is re-derived on any
+                // bridge, and interferes with the surrounding live ranges so
+                // it earns a distinct colour.  Same fix as the PUSH_EXC_INFO
+                // handler at the `last_exc_value` re-read above.
+                let exc_value: super::flow::FlowValue = current_state
+                    .last_exception
+                    .as_ref()
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
                 current_state.stack.push(exc_value.clone());
                 // pyframe.py:503-510 + eval.rs:155-158 `dropvaluesuntil` parity:
                 //
@@ -14187,6 +14236,13 @@ impl CodeWriter {
         // and is stored here.  Sorted by py_pc for binary search; sparse (the
         // trivia-forward-carry majority derives, so only the jump-target /
         // re-key residual remains).
+        //
+        // ⚠ Keeping only the trace-entry greens is NOT sound, however small the
+        // rest looks: `resolve_marker` below is also called on `skipped_py` and
+        // fallthrough coordinates, which are exactly the trivia / jump PCs this
+        // residual is made of.  Restricting the table to greens leaves every
+        // green resolving identically and still costs fannkuch ~1000x (0.6s →
+        // >10min) — measured, not hypothesised.
         let carryfwd_resume_pc: Vec<(u32, usize)> = pc_map_bytes
             .iter()
             .enumerate()
@@ -14199,6 +14255,54 @@ impl CodeWriter {
             })
             .map(|(py, &dense)| (py as u32, dense))
             .collect();
+
+        // `PYRE_PCMAP_RESIDUAL_CENSUS=1`: name every py_pc the derivation cannot
+        // reproduce, so the classes standing between `derive_resume_marker` and
+        // the dense map's retirement can be counted instead of guessed.  A
+        // derivation that covered them all would leave `pc_map_bytes` with a
+        // single consumer (`block_head_py_by_jit_pc`).  Build-time only; off by
+        // default.
+        //
+        // Synth corpus at the time of writing: 815 jitcodes / 68,322 py PCs /
+        // 1,410 residual (2.1%).  Every residual PC emitted no op of its own —
+        // the "own first op" tier reproduces the dense marker exactly, corpus
+        // wide.  By opcode: Cache 729, EndFor 266, ToBool 176, JumpForward 146,
+        // JumpBackwardNoInterrupt 74, rest <15.
+        if std::env::var_os("PYRE_PCMAP_RESIDUAL_CENSUS").is_some() {
+            eprintln!(
+                "[pcmap-residual-sum] code={} n_py={} residual={}",
+                code.obj_name,
+                pc_map_bytes.len(),
+                carryfwd_resume_pc.len()
+            );
+            let mut scan_state = OpArgState::default();
+            let mut op_at: Vec<String> = Vec::with_capacity(code.instructions.len());
+            for i in 0..code.instructions.len() {
+                let (instr, _) = scan_state.get(code.instructions[i]);
+                op_at.push(format!("{instr:?}"));
+            }
+            for &(py, dense) in &carryfwd_resume_pc {
+                let py = py as usize;
+                let own = first_jit_pc_by_py_pc
+                    .get(py)
+                    .copied()
+                    .is_some_and(|v| v != usize::MAX);
+                let derived = pyre_jit_trace::pyjitcode::derive_resume_marker(
+                    &first_jit_pc_by_py_pc,
+                    &block_head_py_by_jit_pc,
+                    py,
+                );
+                eprintln!(
+                    "[pcmap-residual] code={} py={} op={} own={} derived={:?} dense={}",
+                    code.obj_name,
+                    py,
+                    op_at.get(py).map_or("?", String::as_str),
+                    own as u8,
+                    derived,
+                    dense
+                );
+            }
+        }
 
         // Per-trace-entry green → walk-entry sidecar. Resolve each entry
         // with the runtime translator's exact precedence while the codewriter
@@ -14273,14 +14377,14 @@ impl CodeWriter {
 
         // Predecessor-keyed jitcode-pc twins of
         // `pcdep_color_slots` and `depth_at_pc`, resolving a JitCode byte
-        // offset the way `python_pc_for_jitcode_pc` does — the block-head marker
+        // offset the way `containing_py_pc_for_jitcode_pc` does — the block-head marker
         // match first, else the largest `first_jit_pc_by_py_pc[py]` at-or-before
         // the offset (predecessor op containment).  Both tiers are baked into
         // ONE table: seed every op-start offset with its own py's value, then
         // OVERRIDE each block-head marker offset with the block-head py's value
-        // (marker precedence, `python_pc_for_jitcode_pc` :9009-9024).  A
+        // (marker precedence, `containing_py_pc_for_jitcode_pc` :9009-9024).  A
         // predecessor binary search (largest offset <= jit_pc) then reproduces
-        // `table[python_pc_for_jitcode_pc(jit_pc)]` for the carried resume
+        // `table[containing_py_pc_for_jitcode_pc(jit_pc)]` for the carried resume
         // coordinates that reach the decode re-inversion at `state.rs`
         // (`bridge_semantic_maps_at_with_jitcode_pc`), which are the guard's own
         // op offset or a block-head marker — never a mid-op byte.  Both sides
@@ -14304,14 +14408,14 @@ impl CodeWriter {
         // static depth.  A predecessor lookup then equals
         // `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(inv(jit_pc))]`.
         // The trivia twin is split into the SAME two tiers as
-        // `python_pc_for_jitcode_pc` — a marker table matched EXACTLY (the block
+        // `containing_py_pc_for_jitcode_pc` — a marker table matched EXACTLY (the block
         // -head precedence tier, `block_head_py_by_jit_pc`'s depth analog) and an
         // op-start table matched by PREDECESSOR (`first_jit_pc_by_py_pc`'s depth
         // analog).  A single merged predecessor table is WRONG for an interior
         // query: a marker byte sits inside a preceding op's emitted region, so a
         // predecessor search for a coordinate past the op-start but before the
         // next op would land on that interior marker instead of the op-start.
-        // `python_pc_for_jitcode_pc` never returns a marker py for a non-exact
+        // `containing_py_pc_for_jitcode_pc` never returns a marker py for a non-exact
         // coordinate, so the marker tier must stay OUT of the predecessor scan.
         // The decode/bridge readers only ever query exact coordinates (guard op
         // offset or exact marker), which is why the phase-1 merged twins pass;
@@ -14376,7 +14480,7 @@ impl CodeWriter {
             }
             // Marker tier: exact-match, block-head precedence. Source the
             // corrected block-entry PC from the inversion table so the direct
-            // depth twin and `python_pc_for_jitcode_pc` cannot diverge.
+            // depth twin and `containing_py_pc_for_jitcode_pc` cannot diverge.
             for &(off, py) in &block_head_py_by_jit_pc {
                 let skipped_py =
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
@@ -14475,7 +14579,7 @@ impl CodeWriter {
                 after_residual_marker_marker_by_jit_pc.push((off, value));
                 // The retired runtime read took the fallthrough of the RAW
                 // block-head py (no trivia skip); match it exactly so the twin
-                // reproduces `result_color_at_pc[fallthrough(python_pc_for_jitcode_pc(off))]`.
+                // reproduces `result_color_at_pc[fallthrough(containing_py_pc_for_jitcode_pc(off))]`.
                 let ft_rc = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py as usize);
                 result_color_after_residual_marker_by_jit_pc
                     .push((off, result_color_at_pc.get(ft_rc).copied()));
@@ -15356,6 +15460,23 @@ mod tests {
             lasti_py_pc: 0,
             landing: landing.clone(),
         }
+    }
+
+    #[test]
+    fn protected_handler_prefix_uses_joined_eggblock_state() {
+        let graph = FunctionGraph::new("handler-prefix", Block::shared(Vec::new()), None);
+        let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
+        let mut protected = synthetic_catch_site(&landing);
+        protected.handler_py_pc = 12;
+        protected.stack_depth = 2;
+
+        let mut empty_prefix = synthetic_catch_site(&landing);
+        empty_prefix.handler_py_pc = 20;
+
+        let sites = vec![protected, empty_prefix];
+        assert!(handler_entry_has_protected_prefix(&sites, 12));
+        assert!(!handler_entry_has_protected_prefix(&sites, 20));
+        assert!(!handler_entry_has_protected_prefix(&sites, 99));
     }
 
     fn fresh_variable_factory(start: u32) -> impl FnMut(Option<Kind>) -> Variable {

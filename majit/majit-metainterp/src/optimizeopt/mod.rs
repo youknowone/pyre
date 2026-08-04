@@ -448,8 +448,12 @@ impl ImportedShortPureOp {
         // The body-visible `op` and the replay `preamble_op` are distinct
         // RPython Box objects for every PureOp, not only invented aliases.
         // Keep their OpRef identities distinct as well: `source` names
-        // self.res, while `result` names the replay operation.
-        replay.pos.set(if invented_name { result } else { source });
+        // self.res, while `result` names the replay operation — including
+        // the non-invented arm, where `add_op_to_short` (shortpreamble.py:140
+        // `op.copy_and_change(opnum, args=arglist)`) still hands
+        // `ProducedShortOp` a freshly allocated replay op rather than
+        // `self.res` itself.
+        replay.pos.set(result);
         if let Some(d) = descr.clone() {
             replay.setdescr(d);
         }
@@ -2119,8 +2123,21 @@ impl OptContext {
         let idx = opref.raw() as usize;
         match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                // `inputarg_refs` is grown with `resize_with(.., new_int(0))`
+                // (see `materialize_operand_at`), so a slot past the last
+                // bound inputarg holds a placeholder whose `index` is 0, not
+                // `idx`. Returning it hands the caller a box for a DIFFERENT
+                // position — and `new_int(0)` also retypes the read, so a Ref
+                // position resolves to an Int box. The write path already
+                // repairs such a slot before use; the read path must instead
+                // report "no binding", which makes `get_replacement_opref`
+                // return the position itself — `resoperation.py:57-68
+                // get_box_replacement`, where a box with no `_forwarded`
+                // resolves to itself.
                 if let Some(ia) = self.inputarg_refs.get(idx) {
-                    return Some(Operand::from_bound_inputarg(ia));
+                    if ia.index as usize == idx {
+                        return Some(Operand::from_bound_inputarg(ia));
+                    }
                 }
             }
             _ => {}
@@ -3139,8 +3156,7 @@ impl OptContext {
         // allocated before the constructor, so all emit-capable kinds use it.
         let replay_pos = |source: OpRef, produced_op: &ProducedShortOp| -> OpRef {
             let installs_replace_op = match produced_op.kind {
-                PreambleOpKind::Pure => produced_op.invented_name,
-                PreambleOpKind::Heap | PreambleOpKind::LoopInvariant => true,
+                PreambleOpKind::Pure | PreambleOpKind::Heap | PreambleOpKind::LoopInvariant => true,
                 PreambleOpKind::InputArg | PreambleOpKind::Guard => false,
             };
             if installs_replace_op {

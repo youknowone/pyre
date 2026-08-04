@@ -60,14 +60,14 @@ use std::ops::{Deref, DerefMut};
 pub struct PyJitCodeMetadata {
     /// Codewrite-time forward Python-PC twin for resume data.  The exact
     /// block-head and predecessor-op-start tiers mirror
-    /// `python_pc_for_jitcode_pc` and already include the forward trivia
+    /// `containing_py_pc_for_jitcode_pc` and already include the forward trivia
     /// normalization.  It is populated from Python keys while codewriting;
     /// snapshot capture must not invert a resolved JitCode PC to obtain it.
     pub forward_py_pc_marker_by_jit_pc: Vec<(usize, u32)>,
     pub forward_py_pc_pred_by_jit_pc: Vec<(usize, u32)>,
     /// Post-residual-call catch resume twin, split into the exact
     /// block-head-marker and predecessor op-start tiers used by
-    /// `python_pc_for_jitcode_pc`. Empty for skeleton / fixture metadata.
+    /// `containing_py_pc_for_jitcode_pc`. Empty for skeleton / fixture metadata.
     pub after_residual_call_resume_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
     pub after_residual_call_resume_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
     /// Number of Python instructions in the source CodeObject. Empty skeleton
@@ -79,7 +79,7 @@ pub struct PyJitCodeMetadata {
     /// control-flow entries, so the dense-map owner is the block entry.
     /// Sorted ascending by jitcode offset for binary search.  Replaces the
     /// former dense-map block-head scan in
-    /// `python_pc_for_jitcode_pc` (a coordinate landing exactly on a marker is
+    /// `containing_py_pc_for_jitcode_pc` (a coordinate landing exactly on a marker is
     /// a block head — branch/catch target — and belongs to the first opcode
     /// resuming there). Empty for skeleton / fixture metadata.
     pub block_head_py_by_jit_pc: Vec<(usize, u32)>,
@@ -100,10 +100,10 @@ pub struct PyJitCodeMetadata {
     pub merge_entry_by_green: Vec<(u32, u32)>,
     /// Predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
-    /// color→slot list of the py_pc that `python_pc_for_jitcode_pc(off)` returns
+    /// color→slot list of the py_pc that `containing_py_pc_for_jitcode_pc(off)` returns
     /// (block-head marker precedence, else the predecessor op-start boundary).
     /// A PREDECESSOR binary search (largest offset ≤ jit_pc)
-    /// then reproduces `pcdep_color_slots[python_pc_for_jitcode_pc(jit_pc)]` for
+    /// then reproduces `pcdep_color_slots[containing_py_pc_for_jitcode_pc(jit_pc)]` for
     /// the carried resume coordinates reaching the decode re-inversion at
     /// `bridge_semantic_maps_at_with_jitcode_pc`. Both sides are compile-time
     /// derivations of the same resume-marker / `first_jit` coordinates, so the
@@ -111,14 +111,14 @@ pub struct PyJitCodeMetadata {
     /// skeleton / fixture.
     pub pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
     /// Predecessor-keyed jitcode-pc twin of `depth_at_py_pc`,
-    /// built alongside `pcdep_by_jit_pc` with the same `python_pc_for_jitcode_pc`
+    /// built alongside `pcdep_by_jit_pc` with the same `containing_py_pc_for_jitcode_pc`
     /// resolution (marker precedence + op-start predecessor). Predecessor-covers
     /// op offsets, so it agrees with the depth read at the decode seam for every
     /// carried coordinate: it equals
-    /// `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction.
+    /// `depth_at_py_pc[containing_py_pc_for_jitcode_pc(jit_pc)]` by construction.
     pub depth_pred_by_jit_pc: Vec<(usize, u16)>,
     /// Trivia-aware STATIC-liveness depth twin, split into the
-    /// SAME two tiers as `python_pc_for_jitcode_pc` — an EXACT-match marker table
+    /// SAME two tiers as `containing_py_pc_for_jitcode_pc` — an EXACT-match marker table
     /// (`depth_trivia_marker_by_jit_pc`, block-head precedence) and a PREDECESSOR
     /// op-start table (`depth_trivia_pred_by_jit_pc`, markers EXCLUDED). Each
     /// records `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(py)]`
@@ -149,7 +149,7 @@ pub struct PyJitCodeMetadata {
     /// Empty for skeleton / fixture metadata.
     pub depth_block_head_by_jit_pc: Vec<(usize, u16)>,
     /// Reproduces `pcdep_color_slots[skip_python_trivia_forward(
-    /// python_pc_for_jitcode_pc(jit_pc))]`, resolved with the same exact-marker
+    /// containing_py_pc_for_jitcode_pc(jit_pc))]`, resolved with the same exact-marker
     /// and predecessor-op-start tiers as the trivia-aware depth twin.
     pub pcdep_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
     /// Predecessor-op-start tier of the trivia-aware `pcdep_color_slots` twin.
@@ -168,7 +168,7 @@ pub struct PyJitCodeMetadata {
     pub result_color_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
     pub result_color_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
     /// Resume-marker twin split into the SAME two tiers as
-    /// `python_pc_for_jitcode_pc` — an EXACT-match marker table
+    /// `containing_py_pc_for_jitcode_pc` — an EXACT-match marker table
     /// (`resume_marker_marker_by_jit_pc`, block-head precedence) and a
     /// PREDECESSOR op-start table (`resume_marker_pred_by_jit_pc`, markers
     /// EXCLUDED). Each records the block-head `-live-` resume-marker JitCode byte
@@ -251,7 +251,7 @@ pub struct PyJitCodeMetadata {
     pub max_stackdepth: usize,
     /// Predecessor-keyed jitcode-pc const Ref operand-stack slots.
     /// Each entry `(off, slots)` maps a JitCode byte offset to the const
-    /// operand-stack slot list of the py_pc that `python_pc_for_jitcode_pc(off)`
+    /// operand-stack slot list of the py_pc that `containing_py_pc_for_jitcode_pc(off)`
     /// returns (block-head marker precedence, else the predecessor op-start
     /// boundary at-or-before `off`). A PREDECESSOR binary search (largest
     /// offset ≤ jit_pc) returns the slots for a carried resume coordinate.
@@ -585,7 +585,7 @@ impl PyJitCode {
 
     /// Predecessor index into a jitcode-pc twin — the entry
     /// with the largest offset at-or-before `jit_pc`, reproducing
-    /// `python_pc_for_jitcode_pc`'s marker-then-first_jit resolution baked into
+    /// `containing_py_pc_for_jitcode_pc`'s marker-then-first_jit resolution baked into
     /// the twin at build time. `None` when the table is empty (skeleton /
     /// fixture) or `jit_pc` precedes the first entry.
     fn predecessor_index(search: Result<usize, usize>) -> Option<usize> {
@@ -598,7 +598,7 @@ impl PyJitCode {
 
     /// The pcdep color→slot list keyed directly by a JitCode byte
     /// offset via the `pcdep_by_jit_pc` predecessor twin. Equals
-    /// `pcdep_color_slots[python_pc_for_jitcode_pc(jit_pc)]` by construction for
+    /// `pcdep_color_slots[containing_py_pc_for_jitcode_pc(jit_pc)]` by construction for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Scaffolding for the decode-side pc_map re-inversion retirement.
     pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
@@ -612,7 +612,7 @@ impl PyJitCode {
 
     /// Value-stack depth keyed by a JitCode byte offset via the
     /// `depth_pred_by_jit_pc` predecessor twin. Equals
-    /// `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction for a
+    /// `depth_at_py_pc[containing_py_pc_for_jitcode_pc(jit_pc)]` by construction for a
     /// carried resume coordinate; `None` when the twin is empty. Predecessor
     /// index (largest offset ≤ jit_pc).
     pub fn depth_for_jitcode_pc_pred(&self, jit_pc: usize) -> Option<u16> {
@@ -674,10 +674,10 @@ impl PyJitCode {
 
     /// Trivia-aware STATIC-liveness depth keyed by a JitCode
     /// byte offset, resolved with the SAME two tiers as
-    /// `python_pc_for_jitcode_pc`: an EXACT marker match first (block-head
+    /// `containing_py_pc_for_jitcode_pc`: an EXACT marker match first (block-head
     /// precedence), else a PREDECESSOR scan of the op-start table (markers
     /// excluded). Equals
-    /// `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(python_pc_for_jitcode_pc(jit_pc))]`
+    /// `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(jit_pc))]`
     /// by construction for ANY jitcode coordinate — including an interior
     /// not-taken offset the branch-resume readers query (which a single merged
     /// predecessor table mis-resolves onto an interior marker) and a
@@ -730,9 +730,9 @@ impl PyJitCode {
     }
 
     /// Trivia-aware result color keyed by a JitCode byte offset,
-    /// resolved with the SAME two tiers as `python_pc_for_jitcode_pc`.
+    /// resolved with the SAME two tiers as `containing_py_pc_for_jitcode_pc`.
     /// Equals
-    /// `result_color_at_pc[skip_python_trivia_forward(python_pc_for_jitcode_pc(jit_pc))]`
+    /// `result_color_at_pc[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(jit_pc))]`
     /// by construction, including a trailing-trivia overshoot as `None`.
     /// `None` when the twin is empty (skeleton / fixture) — distinguish that
     /// from an in-table `None` via [`Self::result_color_trivia_populated`].
@@ -750,7 +750,7 @@ impl PyJitCode {
     }
 
     /// Codewrite-time resume marker keyed by a JitCode byte
-    /// offset, resolved with the SAME two tiers as `python_pc_for_jitcode_pc`:
+    /// offset, resolved with the SAME two tiers as `containing_py_pc_for_jitcode_pc`:
     /// an EXACT marker match first (block-head precedence), else a PREDECESSOR
     /// scan of the op-start table (markers excluded).
     pub fn resume_marker_for_jitcode_pc(&self, jit_pc: usize) -> Option<usize> {
@@ -767,7 +767,7 @@ impl PyJitCode {
     }
 
     /// Forward Python PC paired with a carried resume JitCode PC. This is a
-    /// codewriter-built twin of `backxlat_py_pc`'s result, including its
+    /// codewriter-built twin of `trivia_normalized_py_pc_for_jitcode_pc`'s result, including its
     /// forward trivia normalization, not an encode-time inverse projection.
     pub fn forward_py_pc_for_jitcode_pc(&self, jit_pc: usize) -> Option<u32> {
         let marker = &self.metadata.forward_py_pc_marker_by_jit_pc;
@@ -792,7 +792,7 @@ impl PyJitCode {
 
     /// Codewrite-time after-residual fallthrough marker
     /// keyed by a JitCode byte offset, resolved with the SAME two tiers as
-    /// `python_pc_for_jitcode_pc`: an EXACT marker match first (block-head
+    /// `containing_py_pc_for_jitcode_pc`: an EXACT marker match first (block-head
     /// precedence), else a PREDECESSOR scan of the op-start table (markers
     /// excluded).
     pub fn after_residual_marker_for_jitcode_pc(&self, jit_pc: usize) -> Option<usize> {
@@ -812,7 +812,7 @@ impl PyJitCode {
     /// fallthrough PC, keyed by a JitCode byte offset with the SAME exact-marker
     /// / predecessor-op-start tiers as `after_residual_marker_for_jitcode_pc`.
     /// Equals the legacy
-    /// `result_color_at_pc[semantic_fallthrough_pc(python_pc_for_jitcode_pc(jit_pc))]`
+    /// `result_color_at_pc[semantic_fallthrough_pc(containing_py_pc_for_jitcode_pc(jit_pc))]`
     /// for a call-op coordinate; `u16::MAX` where the return stack is empty;
     /// `None` when the twin is empty (skeleton / fixture) or the fallthrough is
     /// past the table end.
@@ -833,7 +833,7 @@ impl PyJitCode {
     /// PC, keyed by a JitCode byte offset with the SAME exact-marker /
     /// predecessor-op-start tiers as `after_residual_marker_for_jitcode_pc`.
     /// Equals the raw
-    /// `liveness_for(code).depth_at_py_pc().get(semantic_fallthrough_pc(python_pc_for_jitcode_pc(jit_pc))).copied()`
+    /// `liveness_for(code).depth_at_py_pc().get(semantic_fallthrough_pc(containing_py_pc_for_jitcode_pc(jit_pc))).copied()`
     /// by construction for a call-op coordinate, including a fallthrough overshoot
     /// as an in-table `None`. `None` also when the twin is empty (skeleton /
     /// fixture) — distinguish via [`Self::depth_after_residual_populated`].
@@ -863,7 +863,7 @@ impl PyJitCode {
 
     /// After-residual-call resume python pc for the inline-caller frame,
     /// resolved by JitCode byte offset with the same exact-marker /
-    /// predecessor-op-start tiers as `python_pc_for_jitcode_pc`. `None` when the
+    /// predecessor-op-start tiers as `containing_py_pc_for_jitcode_pc`. `None` when the
     /// twin is empty (skeleton / fixture) — distinguish via
     /// [`Self::after_residual_fallthrough_py_pc_populated`].
     pub fn after_residual_fallthrough_py_pc_for_jitcode_pc(&self, jit_pc: usize) -> Option<u32> {
@@ -898,7 +898,7 @@ impl PyJitCode {
 
     /// Post-`residual_call` catch resume marker keyed by a JitCode byte
     /// offset, resolved with the SAME exact-marker / predecessor-op-start
-    /// tiers as `python_pc_for_jitcode_pc`.
+    /// tiers as `containing_py_pc_for_jitcode_pc`.
     pub fn after_residual_call_resume_for_jitcode_pc(&self, jit_pc: usize) -> Option<usize> {
         let marker = &self.metadata.after_residual_call_resume_marker_by_jit_pc;
         let pred = &self.metadata.after_residual_call_resume_pred_by_jit_pc;

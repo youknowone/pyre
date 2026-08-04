@@ -236,7 +236,7 @@ impl ExcKind {
     /// an address computed from garbage.  Anything reading the tag out of a
     /// value whose provenance is not proven must go through
     /// `w_exception_kind_checked`, which range-checks against this.
-    pub const MAX_DISCRIMINANT: u8 = ExcKind::StopAsyncIteration as u8;
+    pub const MAX_DISCRIMINANT: u8 = ExcKind::EOFError as u8;
 
     /// True when this kind's constructor is the trivial
     /// `W_BaseException.descr_init` (`self.args_w = args_w`) — i.e. it
@@ -1703,11 +1703,10 @@ mod tests {
 
     #[test]
     fn test_kind_checked_accepts_real_exception() {
-        let obj = w_exception_new(ExcKind::ValueError, "bad value");
-        assert_eq!(
-            unsafe { w_exception_kind_checked(obj) },
-            Some(ExcKind::ValueError)
-        );
+        for kind in [ExcKind::ValueError, ExcKind::EOFError] {
+            let obj = w_exception_new(kind, "bad value");
+            assert_eq!(unsafe { w_exception_kind_checked(obj) }, Some(kind));
+        }
         assert_eq!(
             unsafe { w_exception_kind_checked(std::ptr::null_mut()) },
             None

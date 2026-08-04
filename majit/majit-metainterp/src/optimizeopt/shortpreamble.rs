@@ -1585,11 +1585,7 @@ impl ProducedShortOp {
             Some(p) => {
                 debug_assert_eq!(
                     p.preamble_op.pos.get(),
-                    if self.invented_name {
-                        result_opref
-                    } else {
-                        source
-                    },
+                    result_opref,
                     "builder replay pos diverged from produce_pure replay rule"
                 );
                 crate::optimizeopt::ImportedShortPureOp {
@@ -1739,11 +1735,27 @@ impl ProducedShortOp {
         // them only through `PreambleOp(self.res, preamble_op, ...)`.
         //
         // DEVIATION: the forwarding below collapses the two onto one position.
-        // It is load-bearing as long as it stands — `force_op_from_preamble_op`
-        // keys `potential_extra_ops` off the forwarded box, and both the
-        // `force_box` pop and the post-hoc force sweep in unroll.rs carry a
-        // second lookup for the cases where the two resolutions disagree. The
-        // forwarding and those compensations have to come out together.
+        // It is what gives the imported field a body-namespace identity at all,
+        // so it cannot be lifted on its own. `self.res` names a Phase-1
+        // (preamble) OpRef; RPython has no such split, because `self.res` is one
+        // Box that both the preamble and the peeled body hold. Forwarding it to
+        // the Phase-2 replay slot is what makes the peeled body re-export the
+        // field as its own short box, which is in turn what extends the body
+        // JUMP with the slot the extended LABEL declares.
+        //
+        // Measured: dropping just this `make_equal_to` (and the GETARRAYITEM /
+        // LoopInvariant siblings) leaves the body JUMP one arg short, and
+        // `assemble_peeled_trace_with_jump_args`'s `unwrap_or(label_arg)`
+        // fallback then feeds the LABEL slot back to itself — a loop-carried
+        // `s -= 1` freezes at its entry value (`synth/unary_int_loop_carried`
+        // prints -44 instead of -29000). Removing the `force_box` dual-key pop
+        // and the unroll.rs force sweep alongside it does not address that;
+        // closing this needs the imported short box to carry a body-namespace
+        // position by construction.
+        //
+        // The non-invented Pure sibling of this collapse (the replay op sharing
+        // `source`) was a separate defect and is fixed — see mod.rs
+        // `ImportedShortPureOp::new`.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1887,7 +1899,8 @@ impl ProducedShortOp {
         // carried body result and the replayed GETARRAYITEM result stay
         // distinct upstream, joined only by PreambleOp bookkeeping. The same
         // DEVIATION as the GETFIELD path applies — the forwarding below
-        // collapses them.
+        // collapses them, and `produce_heap_field` records why it cannot be
+        // lifted on its own.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1933,7 +1946,8 @@ impl ProducedShortOp {
         // shortpreamble.py:152-159 stores `self.res` as the body-visible Box
         // and the replay call separately in PreambleOp. As with HeapOp the two
         // identities stay distinct upstream, and as with HeapOp the forwarding
-        // below is the DEVIATION that collapses them.
+        // below is the DEVIATION that collapses them; `produce_heap_field`
+        // records why it cannot be lifted on its own.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
         let op_source = ctx
@@ -2624,14 +2638,18 @@ impl ExtendedShortPreambleBuilder {
     /// For each base op, ensures missing deps from produced_short_boxes are
     /// inserted before the consumer (RPython use_box arg-handling parity).
     ///
-    /// Returns `true` on success; `false` if any op references an
-    /// unresolvable Phase 1 OpRef. RPython equivalent: `produce_arg`
-    /// returning None propagates up to `add_op_to_short` returning None,
-    /// and the entire short_op is dropped (shortpreamble.py:283-296,
-    /// 311-341). Pyre's structural counterpart is to bail out of `setup`
-    /// so the caller (`jump_to_existing_trace`) can fall back to
-    /// `jump_to_preamble` instead of attempting to inline a broken short
-    /// preamble.
+    /// Upstream's `setup` (shortpreamble.py:460-463) is three field
+    /// assignments and cannot fail, because the filtering happened at EXPORT:
+    /// `produce_arg` returning None makes `add_op_to_short` return None and
+    /// THAT ONE short_op is left out (shortpreamble.py:283-296, 311-341). The
+    /// loop below reproduces that per-op drop here, where pyre first learns an
+    /// arg is unresolvable — its short boxes are exported against one
+    /// label-arg set and replayed against another.
+    ///
+    /// Returns `false` only for the one case the per-op drop cannot express: a
+    /// dropped op whose result the short preamble's own JUMP carries, which
+    /// would leave `inline_short_preamble`'s `_map_args` (unroll.py:404) with
+    /// an unmapped key. The caller then falls back to `jump_to_preamble`.
     pub fn setup(
         &mut self,
         short_preamble: &ShortPreamble,
@@ -2678,13 +2696,97 @@ impl ExtendedShortPreambleBuilder {
             }
             // RPython use_box arg loop: insert missing deps before this op.
             // Recursive: deps of deps are also inserted (transitive closure).
-            for arg in op.getarglist().iter() {
-                let arg = arg.to_opref();
-                if !self.insert_dep_recursive(arg, &inputargs_set, &constants_set) {
+            //
+            // shortpreamble.py:128-139 `PureOp.add_op_to_short` (and the
+            // HeapOp/LoopInvariantOp siblings):
+            //
+            //     for arg in op.getarglist():
+            //         newarg = sb.produce_arg(arg)
+            //         if newarg is None:
+            //             return None
+            //
+            // and `add_op_to_short` (:311-341) then leaves THAT ONE op out of
+            // `produced_short_boxes`. Every other op still goes into the short
+            // preamble, and an op that depended on the dropped one drops in
+            // turn because its own `produce_arg` now misses — the transitive
+            // closure this loop reproduces through `short_results`.
+            //
+            // That filtering is an EXPORT-time rule, and it is the only drop
+            // upstream has. By the time upstream reaches the inline it is done:
+            // `ExtendedShortPreambleBuilder.setup` (:460-463) is three field
+            // assignments and cannot fail, and `inline_short_preamble`
+            // (unroll.py:372-410) then replays EVERY op in `short` — guards
+            // included, through their own `sop.is_guard()` arm — with
+            // `_map_args` (unroll.py:364-370) raising KeyError rather than
+            // dropping anything. So there is no upstream counterpart for a drop
+            // HERE, at inline time, against a body already optimized under the
+            // exported facts.
+            //
+            // Pyre needs one anyway: its short boxes are exported against one
+            // label-arg set and replayed against another (a retrace runs no
+            // Phase 1 and imports the partial trace's exported state), so an arg
+            // that was produce-able at export can be unresolvable here. The drop
+            // is therefore bounded to the only case where it changes nothing the
+            // target body can observe — a PURE producer whose result the short
+            // preamble's own JUMP does not carry. Anything else declines the
+            // whole inline, which is what this loop used to do unconditionally,
+            // so `jump_to_existing_trace` falls back to `jump_to_preamble`
+            // (unroll.py:154/167).
+            let resolvable = op.getarglist().iter().all(|arg| {
+                self.insert_dep_recursive(arg.to_opref(), &inputargs_set, &constants_set)
+            });
+            if !resolvable {
+                // A GUARD carries the target body's assumption, not a value.
+                // `short_preamble.ops` holds `is_guard() || is_always_pure()`
+                // ops (see the inclusion rule where this list is built), and
+                // upstream replays the guards explicitly at
+                // `unroll.py:405-409`, restamping each with a
+                // `ResumeAtPositionDescr`. Dropping one lets the JUMP enter a
+                // body that was optimized under that guard's fact without ever
+                // checking it — a miscompile, not a lost optimization. A guard
+                // has no result box, so it can never appear in `jump_args` and
+                // the arity test below cannot catch it.
+                //
+                // An OVF PRODUCER carries a guard positionally rather than in
+                // its own arg list, so the `is_guard()` arm cannot see it.
+                // Upstream never separates the two: `use_box`
+                // (shortpreamble.py:398-400) SYNTHESIZES the
+                // `GUARD_NO_OVERFLOW` immediately after appending an
+                // `is_ovf()` op, so an orphan cannot exist. Pyre stores them
+                // as two entries — `extract_short_preamble` admits an
+                // `is_guard_overflow()` entry only as the paired successor of
+                // an included `is_ovf()` producer, and pushes the producer
+                // first — and that successor is ARGLESS, so it is vacuously
+                // resolvable and survives its producer's drop. What the
+                // orphan then does is worse than being lost:
+                // `optimize_GUARD_NO_OVERFLOW` (intbounds.py:210-220) reads
+                // `last_emitted_operation`, and either kills the guard
+                // outright, or — if an unrelated ovf op happens to precede it
+                // — mis-attaches and registers that op's inverse pure
+                // operations (intbounds.py:222-228) as facts. Either way the
+                // body's assumptions enter unchecked, which is the same class
+                // the `is_guard()` arm above closes.
+                //
+                // A PRODUCER whose result the short preamble's own JUMP carries
+                // has no per-op answer either: `short_preamble.ops` and
+                // `short_preamble.jump_args` are filled in lockstep, leaving it
+                // unmapped is what `_map_args` (unroll.py:364-370) raises
+                // KeyError on, and shortening the JUMP instead would disagree
+                // with the already-compiled target LABEL's arity.
+                let decline = if op.opcode.is_guard() {
+                    Some("guard")
+                } else if op.opcode.is_ovf() {
+                    Some("ovf producer")
+                } else if short_preamble.jump_args.contains(&op.pos.get()) {
+                    Some("jump-arg producer")
+                } else {
+                    None
+                };
+                if let Some(reason) = decline {
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
-                            "[jit] short_preamble setup: dropping inline (unresolved arg {:?} in op pos={:?} opcode={:?})",
-                            arg,
+                            "[jit] short_preamble setup: dropping inline (unresolved arg in \
+                             {reason} pos={:?} opcode={:?})",
                             op.pos.get(),
                             op.opcode
                         );
@@ -2694,6 +2796,14 @@ impl ExtendedShortPreambleBuilder {
                     self.label_args = label_args.to_vec();
                     return false;
                 }
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] short_preamble setup: dropping op pos={:?} opcode={:?} (unresolved arg)",
+                        op.pos.get(),
+                        op.opcode
+                    );
+                }
+                continue;
             }
             self.short_results.insert(op.pos.get());
             self.short.push(op);
@@ -2745,11 +2855,10 @@ impl ExtendedShortPreambleBuilder {
     /// Applies phase1_to_inputarg remap when reading from produced_short_boxes.
     ///
     /// Returns `true` if `arg` was resolved (or was already known); `false`
-    /// if it was an unresolvable Phase 1 reference. Mirrors RPython
-    /// `produce_arg → None` semantics (shortpreamble.py:283-296): a missing
-    /// dep means the entire short preamble cannot be inlined cleanly, so
-    /// the caller should bail out instead of leaving dangling args that
-    /// later trip `inline_short_preamble`'s `_map_args` (unroll.py:404).
+    /// if it was an unresolvable Phase 1 reference. This IS RPython's
+    /// `produce_arg → None` (shortpreamble.py:283-296): the consuming op is
+    /// left out of the short preamble, so it can never leave a dangling arg
+    /// for `inline_short_preamble`'s `_map_args` (unroll.py:404) to trip on.
     fn insert_dep_recursive(
         &mut self,
         arg: OpRef,

@@ -294,7 +294,17 @@ pub fn w_member_new_with_doc(
         crate::lltype::malloc_raw(doc) as *const String
     });
     let w_cls = crate::gc_roots::shadow_stack_get(root_base);
-    W_MemberDescr::allocate(W_MemberDescr {
+    // Managed (`allocate_stable`), not the movable `malloc_typed` immortal a
+    // bare `allocate` would give: a `__slots__` member outlives the statement
+    // that created it (`d = C.x` keeps the descriptor after `C` is dropped),
+    // and `w_cls` is then its only reference to the owning type.  An immortal
+    // is outside the collector's sweep set, so the marker takes GCFLAG_VISITED
+    // on it during the first major and never clears it again; from the second
+    // major on it is skipped, `w_cls` is never re-marked, and the type is swept
+    // while the descriptor still points at it.  A stable managed allocation
+    // keeps the address fixed for the raw `*mut W_MemberDescr` accessors below
+    // while putting the object under the ordinary mark-and-clear cycle.
+    W_MemberDescr::allocate_stable(W_MemberDescr {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -350,9 +360,16 @@ pub unsafe fn w_member_get_cls(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// Fill a descriptor owner after the built-in type registry is published.
+///
+/// Two remembered-set notifications, because the descriptor can be either
+/// shape: the prebuilt-family bit covers a descriptor that predates the
+/// managed-allocation hooks and so fell back to `malloc_typed`, and the write
+/// barrier covers the ordinary `allocate_stable` case, where an old descriptor
+/// gaining a young or unmarked `w_cls` must re-enter the collector's worklist.
 pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
     crate::gc_roots::mark_prebuilt_roots_dirty();
-    unsafe { (*(obj as *mut W_MemberDescr)).w_cls = w_cls }
+    unsafe { (*(obj as *mut W_MemberDescr)).w_cls = w_cls };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// `typedef.py:446 Member.index` — the slot index (`base_nslots + position`),

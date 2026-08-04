@@ -1345,7 +1345,23 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 __driver.dispatch_jitcode().cloned();
             __driver.merge_point(|__meta, __sym| {
                 use majit_metainterp::JitCodeSym;
-                if __sym.trace_started && __pc == __sym.loop_header_pc() {
+                // pyjitpl.py:1577 `self.pc = saved_pc`: a merge point whose
+                // `reached_loop_header` returned without closing (the
+                // `current_merge_points.append` path, :3058-3060) resumes the
+                // walk at the SAME guest pc. This closure is re-run for that,
+                // so the header-revisit fast path below — which exists to close
+                // a trace that came back round to its header — must not fire on
+                // the resumption: it would return CloseLoop before the walk ran
+                // a single step, and the retrace would compile an empty body.
+                //
+                // PEEK only. The dispatch merge-point arm is the consumer
+                // (`take_merge_point_resumed`); taking it here would let the
+                // resumed walk's own first merge-point visit close instantly.
+                let __resumed = __meta
+                    .trace_ctx()
+                    .map(|__ctx| __ctx.merge_point_resumed)
+                    .unwrap_or(false);
+                if !__resumed && __sym.trace_started && __pc == __sym.loop_header_pc() {
                     if let Some(__ctx) = __meta.trace_ctx() {
                         __ctx.walk_final_pc = Some(__pc);
                     }

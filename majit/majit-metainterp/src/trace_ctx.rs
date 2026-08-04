@@ -401,6 +401,16 @@ pub struct TraceCtx {
     /// jump), consumed and reset by the following `jit_merge_point`
     /// (pyjitpl.py:1559-1562).  `-1` = not seen.
     pub seen_loop_header_for_jdindex: i32,
+    /// pyjitpl.py:1570/1577 `saved_pc = self.pc` / `self.pc = saved_pc`.
+    ///
+    /// Upstream consults a merge point once per visit and then resumes the
+    /// frame just after it, so the loop body runs before the next consult.
+    /// Pyre fuses the merge point onto the guest instruction hosting it, so a
+    /// walk re-entered at the same guest pc — the `current_merge_points.append`
+    /// path, which keeps tracing instead of ending the trace — would re-consult
+    /// it with nothing recorded in between. Set on that re-entry and consumed
+    /// by the next `BC_JIT_MERGE_POINT`, which then falls straight through.
+    pub merge_point_resumed: bool,
     /// pyjitpl.py: `metainterp.staticdata.callinfocollection`. Needed by
     /// `ResumeDataBoxReader.concat_strings` / `slice_string` / `concat_unicodes`
     /// / `slice_unicode` (resume.py:1143-1188) which look up the
@@ -1446,6 +1456,7 @@ impl TraceCtx {
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
+            merge_point_resumed: false,
             callinfocollection: None,
             call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -1529,6 +1540,7 @@ impl TraceCtx {
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
+            merge_point_resumed: false,
             callinfocollection: None,
             call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -2152,6 +2164,49 @@ impl TraceCtx {
         for (slot, (opref, _)) in boxes.iter_mut().zip(typed) {
             *slot = opref;
         }
+    }
+
+    /// Write a normalized element block back over
+    /// `virtualizable_boxes[..len-1]`.
+    ///
+    /// pyjitpl.py:2985-2988 normalizes the list IN PLACE and only then appends
+    /// it:
+    ///
+    /// ```python
+    /// self.remove_consts_and_duplicates(self.virtualizable_boxes,
+    ///                                   len(self.virtualizable_boxes)-1,
+    ///                                   duplicates)
+    /// live_arg_boxes += self.virtualizable_boxes
+    /// ```
+    ///
+    /// so the rewrite is visible to every later reader of
+    /// `virtualizable_boxes`, not just to this merge point's JUMP.
+    /// `collect_jump_args_with_boxes` splices a COPY of the element block into
+    /// the loop-carried list, so the normalization has to be handed back
+    /// explicitly for the two to stay the same list.
+    ///
+    /// They must: the LABEL a later cut mints declares one inputarg per
+    /// element position, while the compiled entry supplies one value per
+    /// element position. A repeat collapses the LABEL by one arg and every
+    /// position after it is fed its predecessor's value.
+    ///
+    /// `elements` is `virtualizable_boxes[..len-1]` after normalization — the
+    /// identity sits outside the `endindex = len - 1` window and is never
+    /// rewritten.
+    pub fn adopt_normalized_virtualizable_elements(&mut self, elements: &[OpRef]) {
+        let Some(boxes) = self.virtualizable_boxes.as_mut() else {
+            return;
+        };
+        let Some(end) = boxes.len().checked_sub(1) else {
+            return;
+        };
+        assert_eq!(
+            end,
+            elements.len(),
+            "adopt_normalized_virtualizable_elements: element block is \
+             virtualizable_boxes[..len-1]",
+        );
+        boxes[..end].copy_from_slice(elements);
     }
 
     /// [`collect_virtualizable_boxes`] with each slot paired with its declared

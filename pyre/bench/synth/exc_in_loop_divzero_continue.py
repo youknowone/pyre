@@ -16,7 +16,10 @@
 # bench pins that a residual-call raise caught on a resume path that RE-ENTERS
 # the loop returns byte-identically (the merge-point re-entry drains the
 # backend exception cells).
-N = 120000
+# Sized so the pypy leg's startup-subtracted exec sits well above
+# `check.py EXEC_TIME_FLOOR_S`; at 120000 it measured 0.0018s, i.e. the
+# ratio gate was dividing by the floor rather than by real work.
+N = 6000000
 M = 997
 
 

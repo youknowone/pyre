@@ -6859,6 +6859,22 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `Option::<&T>::copied` / `Option::<T>::cloned` on an `Option`
+                // receiver — reading the referent value out of an `Option<&T>`
+                // is an identity in the lifted value model (`&T` and `T` are one
+                // GC pointer word, and `Option<&T>` / `Option<T>` share the
+                // niche discriminant + word layout), so alias the destination to
+                // the receiver instead of emitting a `copied` method call the
+                // rtyper cannot route on the classdef-less `Option` receiver.
+                if args.len() == 1
+                    && self.is_option_copied_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Workspace `Index::index` / `IndexMut::index_mut`
                 // impls (`FixedObjectArray` and friends) bottom out at
                 // raw-slice construction (`as_mut_slice` →
@@ -7185,14 +7201,16 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `RBigInt::digits{,_mut}` and `W_ListObject::object_items_slice
-                // {,_mut}` are Rust view adapters around an `ItemsBlock` /
+                // `RBigInt::digits{,_mut}` is a Rust view adapter around a
                 // typed-items GcArray:
-                // `slice::from_raw_parts(items_base(block), len)`.  The items-base
-                // call above already aliases the header pointer so the gcarray
-                // descr re-applies `base_size`; the resulting slice is therefore
-                // the same array value in the translated model. Fold only these
-                // enclosing accessors, not arbitrary raw slices.
+                // `slice::from_raw_parts(items_base(block), capacity)`.  The
+                // items-base call above already aliases the header pointer so the
+                // gcarray descr re-applies `base_size`; the resulting slice is
+                // therefore the same array value in the translated model, and its
+                // length is the block capacity the descr reports.  Fold only these
+                // capacity-length enclosing accessors, not arbitrary raw slices
+                // (`object_items_slice` uses the logical list length, not the
+                // capacity — see [`is_container_items_view_from_raw_parts`]).
                 if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -9508,25 +9526,25 @@ impl<'a> Lowering<'a> {
     }
 
     /// `slice::from_raw_parts{,_mut}` inside a container's items-view adapter:
-    /// `RBigInt::digits{,_mut}` and `W_ListObject::object_items_slice{,_mut}`.
-    /// The base argument is an `items_block_items_base` / typed-items accessor,
+    /// `RBigInt::digits{,_mut}`.  The base argument is a typed-items accessor,
     /// already aliased to the block header (`graph_is_items_block_base_accessor`)
-    /// so the object/digit gcarray descr re-applies `base_size`; the resulting
-    /// slice is that same array value in the translated model.  Both back an
-    /// `ItemsBlock`, whose consumers index through a descr (the offset-mediated
-    /// case), so the receiver alias is sound.  Fold only these enclosing
-    /// accessors, not arbitrary raw slices.
+    /// so the digit gcarray descr re-applies `base_size`; the resulting slice is
+    /// that same array value in the translated model.  It backs an `ItemsBlock`,
+    /// whose consumers index through a descr, so the receiver alias is sound.
+    ///
+    /// Only capacity-length views qualify: `digits` builds its slice with
+    /// `from_raw_parts(base, capacity)` (the block header's own length), so the
+    /// header-alias descr (which reports capacity) preserves the length exactly.
+    /// `W_ListObject::object_items_slice{,_mut}` is deliberately EXCLUDED — it
+    /// uses `from_raw_parts(base, self.length)`, the *logical* list length,
+    /// which is `< capacity` when the block is over-allocated (e.g. after
+    /// `pop`).  Aliasing it to the header would make `items.len()` report
+    /// capacity, so `w_list_getitem` would accept an index in
+    /// `[length, capacity)` and return a stale slot instead of raising.  Fold
+    /// only the capacity-length enclosing accessors, not arbitrary raw slices.
     fn is_container_items_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
         if !(self.graph.name.ends_with("rbigint::<Impl>::digits")
-            || self.graph.name.ends_with("rbigint::<Impl>::digits_mut")
-            || self
-                .graph
-                .name
-                .ends_with("listobject::<Impl>::object_items_slice")
-            || self
-                .graph
-                .name
-                .ends_with("listobject::<Impl>::object_items_slice_mut"))
+            || self.graph.name.ends_with("rbigint::<Impl>::digits_mut"))
         {
             return false;
         }
@@ -9773,6 +9791,48 @@ impl<'a> Lowering<'a> {
         first_arg_ty.is_some_and(|ty| {
             tyref_is_string_adt(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc)
         })
+    }
+
+    /// `Option::<&T>::copied` / `Option::<T: Clone>::cloned` — reads the
+    /// referent value out of an `Option<&T>` to yield an `Option<T>`.  In the
+    /// lifted value model a `&T` and a `T` are the same one GC pointer word
+    /// (`slice_first`'s payload note: the front has no pointer-to-slot op, so a
+    /// `.first()` payload is already the element VALUE, and `Option<&T>` /
+    /// `Option<T>` share the niche discriminant + one-word representation), so
+    /// `.copied()` / `.cloned()` is an identity on the receiver.  Without the
+    /// intercept the call keeps a `CallTarget::Method` `copied` getattr the
+    /// rtyper cannot route on the classdef-less `Option` receiver (the `getattr
+    /// (opt, "copied")` census wall — e.g. `_codecs::lookup_codec`'s
+    /// `args.first().copied()`, `split_builtin_kwargs`'s
+    /// `positional.first().copied()`).  Bind the destination to the receiver
+    /// instead, the same alias shape as `to_string` / `NonNull::as_ptr`.
+    ///
+    /// Gated on BOTH the receiver and the destination being `Option`: a
+    /// slice/iterator `.copied()` or a `Vec::clone` — a real copy, not an
+    /// identity — has a non-`Option` receiver/dest and keeps its ordinary
+    /// lowering.  (`Option::clone` on a `Copy` payload is itself an identity, so
+    /// the `cloned` arm is sound for the `Option` family.)
+    fn is_option_copied_identity(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let np = fd.item_meta.name_path();
+        let Some(leaf) = np.rsplit("::").next() else {
+            return false;
+        };
+        if !matches!(leaf, "copied" | "cloned") {
+            return false;
+        }
+        first_arg_ty.is_some_and(|ty| crate::front::result_exc::tyref_is_option(ty, self.llbc))
+            && crate::front::result_exc::tyref_is_option(dest_ty, self.llbc)
     }
 
     /// `alloc::fmt::format(args)` (the `format!` macro's String producer)
@@ -11425,8 +11485,9 @@ impl<'a> Lowering<'a> {
             .is_some_and(type_decl_is_fieldless_enum)
     }
 
-    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>` or
-    /// `Option<&mut T>`. Rust encodes each in ONE pointer
+    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>`,
+    /// `Option<&mut T>`, or `Option<&T>` with a thin (Sized) ADT pointee.
+    /// Rust encodes each in ONE pointer
     /// word (`None` = null, `Some(p)` = the non-null pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
     /// `Some` payload read is the identity on that pointer — no aggregate
@@ -11440,7 +11501,33 @@ impl<'a> Lowering<'a> {
     /// as the payload. Mutable references are included explicitly: Rust
     /// guarantees their non-null representation, and generated
     /// `#[pyre_class]::from_obj` returns `Option<&mut Self>`. Shared
-    /// references are not — see [`type_node_is_mut_ref`].
+    /// references `&T` are included when the pointee is a thin (Sized)
+    /// nominal ADT — equally a one-word null niche — via
+    /// [`type_node_shared_ref_pointee`] gated on the pointee's resolved layout
+    /// size being concrete. Fat shared references are excluded: `&str` / `&[T]`
+    /// / `&dyn` carry no ADT def-id, and an unsized nominal newtype (a DST such
+    /// as `Wtf8 { bytes: [u8] }`) DOES carry a def-id but has no concrete layout
+    /// size — both are two-word references with no one-word niche payload.
+    ///
+    /// `front::iter_next` interaction (shared arm only). `Iterator::next()`
+    /// returns `Option<&T>`, and `front::iter_next` rewrites its
+    /// `__discriminant` match diamond into the native `[__iter_next]` op by
+    /// matching a literal `FieldRead __discriminant` + `Value` exitswitch
+    /// (`iter_next.rs` `rewire_one_next_site`). The `Discriminant` fold below
+    /// (`Rvalue::Discriminant`, this file) turns that into a pointer-null
+    /// `ne` bool switch when the recognizer accepts the receiver — for a
+    /// shared thin-ADT ref that would fire BEFORE iter_next runs and leave it
+    /// no diamond to match, so the residual `next()` call would survive as an
+    /// unregistered callee (a census Skip, not a miscompile). Currently
+    /// unreached: every `.iter()` for-loop that reaches iter_next iterates a
+    /// raw `*mut PyObject` / tuple / int element (none a thin nominal ADT), so
+    /// the shared arm never fires on a `next()` result — verified by a clean
+    /// census (0 `slice::iter::Iter::next` heads) and 370/370 check.py. The
+    /// `&mut` arm never had this exposure: iterator receivers come from
+    /// `.iter()` (`core::slice::…::iter`, a SHARED borrow), never `iter_mut`.
+    /// If a `.iter()` loop over `&[SizedStruct]` ever appears, teach
+    /// iter_next the null-test shape (its matcher must accept the
+    /// `niche_disc_vars` bool switch) BEFORE relying on the fold there.
     fn tyref_is_niche_option_ptr(&self, ty: &TyRef) -> bool {
         if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
             return false;
@@ -11459,6 +11546,31 @@ impl<'a> Lowering<'a> {
             return false;
         };
         if type_node_is_mut_ref(payload, self.llbc) {
+            return true;
+        }
+        // A shared reference `&T` is equally a one-word null-pointer niche
+        // (`Option<&T>` = nullable pointer, `Some(&T)` = the non-null pointer),
+        // but ONLY when the pointee is thin (Sized). A fat reference — `&str` /
+        // `&[T]` / `&dyn Trait`, and crucially an unsized nominal newtype like
+        // `rustpython_wtf8::Wtf8 { bytes: [u8] }` (`&Wtf8` = data + length word) —
+        // is two words, so aliasing the payload to the base pointer would read
+        // the metadata word. A def-id alone does NOT imply thin: a DST newtype
+        // is a nominal ADT with a def-id. Gate on the pointee's RESOLVED layout
+        // size being concrete (`Some`) — `None` is the DST/unsized signature.
+        // Read-only `#[pyre_class]` accessors reach here via
+        // `from_obj(...).map(|m| &*m) -> Option<&Self>` and
+        // `getdebug_data() -> Option<&FrameDebugData>`; every such `W_*` /
+        // `FrameDebugData` pointee is Sized (carries a concrete layout size).
+        if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, self.llbc)
+            && let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc)
+            && let Some(def_id) = adt_node_def_id(stripped)
+            && self
+                .llbc
+                .type_by_id(def_id)
+                .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
+                .and_then(|l| l.size)
+                .is_some()
+        {
             return true;
         }
         let Some(payload) = strip_ty_wrappers(payload, self.llbc) else {
@@ -15457,13 +15569,11 @@ fn cast_pointer_marker_op(root: String, arg: Variable) -> OpKind {
 /// itself: callers use the result to distinguish Rust's guaranteed non-null
 /// `&mut T` representation from nullable raw pointers.
 ///
-/// Shared references carry the same null niche, but are deliberately excluded.
-/// `Option<&T>` is the `Iterator::next` result shape, and `front::iter_next`
-/// rewrites its `__discriminant` match diamond into the `[__iter_next]` op —
-/// folding that discriminant to a pointer null test leaves the rewrite with no
-/// diamond to match, so the residual `Iterator::next()` call survives as the
-/// unregistered callee the rewrite exists to remove. Teach `front::iter_next`
-/// the null-test shape before widening this to shared references.
+/// Shared `&T` references carry the same null niche and are now recognised too,
+/// but separately — by [`type_node_shared_ref_pointee`] gated to a thin (Sized)
+/// ADT pointee inside `tyref_is_niche_option_ptr`, not by this helper (which
+/// stays `&mut`-only). See that recognizer's doc for the `front::iter_next`
+/// interaction the shared arm introduces.
 fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
     for _ in 0..24 {
         let Some(obj) = node.as_object() else {
@@ -15493,6 +15603,40 @@ fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> 
             .is_some_and(|kind| kind.to_ascii_lowercase().contains("mut"));
     }
     false
+}
+
+/// The pointee type node of a shared reference `&T` (`{"Ref": [region, ty,
+/// "Shared"]}`), after unwrapping `Deduplicated` / `HashConsedValue`
+/// indirection — or `None` when `node` is not a shared reference. The
+/// companion of [`type_node_is_mut_ref`]: that answers "is this `&mut`?",
+/// this returns the `&T` pointee so the caller can gate on its shape.
+fn type_node_shared_ref_pointee<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        // `{"Ref": [region, ty, kind]}` — `kind` is `"Shared" | "Mut" | …`.
+        let arr = obj.get("Ref").and_then(serde_json::Value::as_array)?;
+        let kind = arr.get(2).and_then(serde_json::Value::as_str)?;
+        if kind.eq_ignore_ascii_case("shared") {
+            return arr.get(1);
+        }
+        return None;
+    }
+    None
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
@@ -23362,6 +23506,269 @@ mod tests {
                 .count(),
             1,
             "the discriminant comparison lowers to one int `BinOp(eq)`"
+        );
+    }
+
+    /// `get_w_locals` is `getdebug_data().map_or(PY_NULL, |data| data.w_locals)`
+    /// over `Option<&FrameDebugData>` — a SHARED-reference niche Option. Its
+    /// `Some` payload must alias the base pointer (no aggregate `__pos_0`
+    /// FieldRead), the same fold the `&mut`/`NonNull` niche arms already apply.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn shared_ref_niche_option_get_w_locals_no_pos0_read() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "get_w_locals").expect("lower get_w_locals");
+        let pos0_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0"),
+            )
+            .count();
+        assert_eq!(
+            pos0_reads, 0,
+            "get_w_locals: shared-ref niche Option<&FrameDebugData> Some payload \
+             must alias the base pointer, not read an aggregate __pos_0"
+        );
+    }
+
+    /// Regression: a `&mut self` setter's niche `Option<&mut Self>` must STILL
+    /// fold (the widening must not perturb the pre-existing mut arm). Ignored
+    /// (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn mut_ref_niche_option_set_chunk_size_still_no_pos0_read() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        // Any &mut-self __pyre_wrap setter; set__CHUNK_SIZE takes `&mut self`.
+        let graph =
+            super::lower_function(&llbc, "__pyre_wrap_set__CHUNK_SIZE").expect("lower setter");
+        let pos0_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0"),
+            )
+            .count();
+        assert_eq!(
+            pos0_reads, 0,
+            "the &mut niche arm must keep folding __pos_0"
+        );
+    }
+
+    /// `W_ListObject::object_items_slice` builds its slice with
+    /// `from_raw_parts(base, self.length)` (the LOGICAL list length, `<`
+    /// capacity for an over-allocated block), so it must NOT fold to the
+    /// items-block header (whose gcarray descr reports capacity). The residual
+    /// `from_raw_parts` call must survive. Loads the pyre-object LLBC (the
+    /// accessor lives in `pyre_object::listobject`), so ignored by default.
+    #[test]
+    #[ignore]
+    fn object_items_slice_keeps_residual_from_raw_parts_not_header_alias() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph =
+            super::lower_function(&llbc, "object_items_slice").expect("lower object_items_slice");
+        let from_raw_parts_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("from_raw_parts")
+                )
+            })
+            .count();
+        assert!(
+            from_raw_parts_calls >= 1,
+            "object_items_slice must keep its residual from_raw_parts (logical \
+             length != capacity), not alias to the items-block header"
+        );
+    }
+
+    /// Regression: `RBigInt::digits` uses `from_raw_parts(base, capacity)` — the
+    /// block's own length — so its header alias IS sound and must STILL fold
+    /// (the P1 fix removes only the object-list arm). The residual
+    /// `from_raw_parts` must be gone. Loads the pyre-object LLBC, ignored.
+    #[test]
+    #[ignore]
+    fn rbigint_digits_still_folds_capacity_length_view() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "rbigint::<Impl>::digits")
+            .or_else(|_| super::lower_function(&llbc, "digits"))
+            .expect("lower digits");
+        let from_raw_parts_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("from_raw_parts")
+                )
+            })
+            .count();
+        assert_eq!(
+            from_raw_parts_calls, 0,
+            "rbigint digits (capacity-length view) must still fold to the \
+             items-block header, leaving no residual from_raw_parts"
+        );
+    }
+
+    /// The Sized gate: a shared reference to a fat pointee (`&[T]`, spelled
+    /// `{"Ref":[_, {"Slice": elem}, "Shared"]}`) has no ADT def-id, so
+    /// `type_node_shared_ref_pointee` + `adt_node_def_id` must NOT accept it;
+    /// while a shared ref to a nominal `{"Adt": {"id": {"Adt": N}}}` pointee
+    /// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
+    /// (mir.rs:22218 `llbc_with_trait_impls`), no real corpus.
+    #[test]
+    fn shared_ref_sized_gate_accepts_adt_rejects_slice() {
+        // Minimal Llbc: `type_node_shared_ref_pointee` only walks the node it
+        // is handed (no dedup ids in these inline fixtures), so an empty
+        // translated section suffices.
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [], "fun_decls": [], "global_decls": [],
+                "trait_decls": [], "trait_impls": [],
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+
+        // &[i64] — fat pointer, Slice pointee, no ADT def-id → rejected.
+        let slice_ref = serde_json::json!({
+            "Ref": ["'_", { "Slice": { "Literal": { "Int": "I64" } } }, "Shared"]
+        });
+        let slice_pointee = super::type_node_shared_ref_pointee(&slice_ref, &llbc)
+            .expect("shared-ref pointee extracted");
+        assert!(
+            super::adt_node_def_id(slice_pointee).is_none(),
+            "a &[T] fat-pointer pointee must not pass the Sized ADT gate"
+        );
+
+        // &SomeAdt — thin pointer, nominal ADT pointee, def-id present → accepted.
+        let adt_ref = serde_json::json!({
+            "Ref": ["'_", { "Adt": { "id": { "Adt": 196 }, "generics": {} } }, "Shared"]
+        });
+        let adt_pointee = super::type_node_shared_ref_pointee(&adt_ref, &llbc)
+            .expect("shared-ref pointee extracted");
+        assert_eq!(
+            super::adt_node_def_id(adt_pointee),
+            Some(196),
+            "a &SizedAdt pointee must pass the Sized ADT gate"
+        );
+
+        // &mut — the shared-ref helper must NOT match a Mut ref.
+        let mut_ref = serde_json::json!({
+            "Ref": ["'_", { "Adt": { "id": { "Adt": 196 }, "generics": {} } }, "Mut"]
+        });
+        assert!(
+            super::type_node_shared_ref_pointee(&mut_ref, &llbc).is_none(),
+            "type_node_shared_ref_pointee must not match a &mut ref"
+        );
+    }
+
+    /// The Sized gate must reject an UNSIZED nominal ADT: a DST newtype
+    /// (`rustpython_wtf8::Wtf8 { bytes: [u8] }`) IS a nominal ADT with a def-id,
+    /// but `&Wtf8` is a two-word fat pointer. The layout for such a type carries
+    /// `size: null`, so the layout-size predicate the recognizer composes must
+    /// see `None` (reject), while a sized `W_*` pointee carries a concrete size
+    /// (accept). Loads the real LLBC (needs Charon-resolved layouts), ignored.
+    #[test]
+    #[ignore]
+    fn sized_gate_rejects_unsized_wtf8_accepts_sized_wstruct() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let target = std::env::var("TARGET").unwrap_or_default();
+
+        // Resolve a type's layout size by its flattened name (as the recognizer
+        // does after `adt_node_def_id`): find its def-id, read layout.size.
+        let size_of = |suffix: &str| -> Option<Option<u64>> {
+            llbc.iter_type_decls()
+                .find(|td| td.item_meta.name_path().ends_with(suffix))
+                .map(|td| td.layout_for_target(&target).and_then(|l| l.size))
+        };
+
+        // Wtf8: a DST newtype → layout size is `None` → the gate rejects it.
+        assert_eq!(
+            size_of("rustpython_wtf8::Wtf8"),
+            Some(None),
+            "Wtf8 is an unsized DST newtype; its layout size must be None so the \
+             shared-ref niche gate rejects Option<&Wtf8>"
+        );
+        // FrameDebugData: a sized struct → concrete layout size → gate accepts.
+        assert!(
+            matches!(size_of("pyframe::FrameDebugData"), Some(Some(_))),
+            "FrameDebugData is Sized; its layout size must be Some so the \
+             shared-ref niche win keeps folding"
+        );
+    }
+
+    /// End-to-end: `str_slice_args -> Result<Option<&Wtf8>, PyError>` (matched by
+    /// `startswith`/`endswith`). Because `Wtf8` is an unsized DST, its
+    /// `Option<&Wtf8>` must NOT niche-fold — no pointer-null `ne` discriminant
+    /// against a `null_mut()` may appear, or the fat pointer's length word is
+    /// lost. The residual/aggregate Option handling must survive. Loads the real
+    /// LLBC, ignored.
+    #[test]
+    #[ignore]
+    fn str_slice_args_option_wtf8_not_niche_folded() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "str_slice_args").expect("lower str_slice_args");
+        // The niche discriminant fold emits `ne(base, null_mut())`; a declined
+        // Option keeps a `null_mut` builtin ONLY when genuinely niche. Assert no
+        // `null_mut` call is synthesised for this graph's Option<&Wtf8> — the fat
+        // ref must not be treated as a one-word niche.
+        let null_mut_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("null_mut")
+                )
+            })
+            .count();
+        assert_eq!(
+            null_mut_calls, 0,
+            "Option<&Wtf8> is a fat-ref DST option and must not niche-fold to a \
+             pointer-null test (no null_mut discriminant)"
         );
     }
 }

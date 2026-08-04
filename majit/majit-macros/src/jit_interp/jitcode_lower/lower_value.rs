@@ -2353,7 +2353,7 @@ mod tests {
     fn raw_store_intrinsic_lowers_to_raw_store_i() {
         // `majit_raw_store_i64(base, ea, val)` lowers to a single RawStore
         // op reading the three int operands (base, ea, val) and emitting a
-        // `raw_store_i` with an 8-byte raw-int array descr.
+        // `raw_store_i` with an 8-byte signed raw-int array descr.
         let mut lowerer = Lowerer::new(None);
         lowerer
             .bindings
@@ -2382,7 +2382,41 @@ mod tests {
             .map(ToString::to_string)
             .collect::<String>();
         assert!(emitted.contains("raw_store_i"));
-        assert!(emitted.contains("add_raw_int_array_descr"));
+        assert!(emitted.contains("add_raw_int_array_descr_signed"));
+        assert!(emitted.contains("8usize"));
+        assert!(emitted.contains("true"));
+    }
+
+    #[test]
+    fn raw_store_intrinsics_lower_with_width_and_sign() {
+        // `jtransform.py:1156-1163 rewrite_op_raw_store` takes the descr from
+        // the STORED value's own type, so a sub-word store carries its own
+        // width and signedness exactly as the load side does.
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("base".to_string(), binding(3, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("ea".to_string(), binding(4, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("val".to_string(), binding(5, BindingKind::Int));
+        let stmt: syn::Stmt =
+            syn::parse_str("majit_raw_store_u16(base, ea, val);").expect("parse raw store");
+
+        lowerer.lower_stmt(&stmt).expect("raw store lowers");
+
+        let kinds: Vec<_> = lowerer.op_metadata.iter().map(|m| m.kind).collect();
+        assert_eq!(kinds, vec![OpKind::RawStore]);
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("add_raw_int_array_descr_signed"));
+        assert!(emitted.contains("2usize"));
+        assert!(emitted.contains("false"));
     }
 
     #[test]

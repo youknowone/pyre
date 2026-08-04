@@ -1188,15 +1188,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// A filesystem name reported back to the caller: `bytes` when the path
     /// argument was `bytes` (`posixmodule.c path_converter`), else `str`.
     ///
-    /// The name arrives as raw bytes because bytes mode exists precisely for
-    /// entries the filesystem encoding cannot round-trip: `readdir`'s `d_name`
-    /// is handed back unchanged, so a name like `b"bad_\xff"` stays openable
-    /// instead of decoding to U+FFFD first.
+    /// The name arrives as raw bytes because `readdir`'s `d_name` is handed
+    /// back unchanged. Both arms keep it openable: bytes mode returns it
+    /// verbatim, and the `str` arm takes the filesystem decoding
+    /// (`interp_posix.py:1121 space.newfilename(f)`), so a name like
+    /// `b"bad_\xff"` still names the file on disk instead of carrying U+FFFD.
     fn fs_name_obj(bytes_mode: bool, name: &[u8]) -> PyObjectRef {
         if bytes_mode {
             pyre_object::bytesobject::w_bytes_from_bytes(name)
         } else {
-            pyre_object::w_str_new(&String::from_utf8_lossy(name))
+            crate::gateway::fsdecode_filename_bytes(name)
         }
     }
 
@@ -4251,16 +4252,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("system() requires 1 argument"));
                     }
-                    let cmd = unsafe {
-                        if pyre_object::is_str(args[0]) {
-                            crate::baseobjspace::str_utf8_w(args[0])?.to_string()
-                        } else {
-                            return Err(crate::PyError::type_error(
-                                "system(): command must be a string",
-                            ));
-                        }
-                    };
-                    let c_cmd = std::ffi::CString::new(cmd.as_bytes())
+                    // `interp_posix.py:815 command='fsencode'`, which
+                    // `gateway.py:365` unwraps with `space.fsencode_w`: the
+                    // shell gets the filesystem bytes, so a command naming a
+                    // byte with no UTF-8 spelling survives instead of being
+                    // refused, and `bytes` / `__fspath__` are accepted as the
+                    // converter accepts them.
+                    let cmd = crate::gateway::fsencode_bytes_w(args[0])?;
+                    let c_cmd = std::ffi::CString::new(cmd)
                         .map_err(|_| crate::PyError::value_error("embedded null in command"))?;
                     let rc = rustpython_host_env::os::system(&c_cmd);
                     Ok(pyre_object::w_int_new(rc as i64))
@@ -4526,27 +4525,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "{fn_name}(): {arg_name} must be a list or tuple",
                     )));
                 };
-                items
-                    .into_iter()
-                    .map(|s| {
-                        let bytes = unsafe {
-                            if pyre_object::is_str(s) {
-                                crate::baseobjspace::str_utf8_w(s)?.as_bytes().to_vec()
-                            } else if pyre_object::is_bytes(s) {
-                                pyre_object::w_bytes_data(s).to_vec()
-                            } else {
-                                return Err(crate::PyError::type_error(format!(
-                                    "{fn_name}(): {arg_name} entries must be str or bytes",
-                                )));
-                            }
-                        };
-                        std::ffi::CString::new(bytes).map_err(|_| {
-                            crate::PyError::value_error(format!(
-                                "{fn_name}(): embedded null in {arg_name}",
-                            ))
-                        })
-                    })
-                    .collect()
+                // `interp_posix.py:1742 args = [space.fsencode_w(w_arg)
+                // for w_arg in args_w]`: every argv/envp entry crosses
+                // to the new process as filesystem bytes, and the same
+                // converter decides what an entry may be.
+                // `fsencode_bytes_w` reaches `__fspath__` for a non-str, non-bytes entry, so
+                // encoding one entry can collect and move the entries not yet converted.
+                // Publish the sequence once and read each entry back per iteration.
+                let _seq_roots = pyre_object::gc_roots::push_roots();
+                let items_base = pyre_object::gc_roots::pin_roots(&items);
+                let mut out = Vec::with_capacity(items.len());
+                for i in 0..items.len() {
+                    let bytes = crate::gateway::fsencode_bytes_w(
+                        pyre_object::gc_roots::shadow_stack_get(items_base + i),
+                    )?;
+                    out.push(std::ffi::CString::new(bytes).map_err(|_| {
+                        crate::PyError::value_error(format!(
+                            "{fn_name}(): embedded null in {arg_name}",
+                        ))
+                    })?);
+                }
+                Ok(out)
             }
             fn decode_file_actions(
                 obj: pyre_object::PyObjectRef,

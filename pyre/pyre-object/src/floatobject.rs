@@ -53,7 +53,9 @@ impl crate::lltype::GcType for W_FloatObject {
 /// matching `gct_fv_gc_malloc`'s `c_type_id` / `c_size` constants
 /// (`framework.py:807-811`).
 ///
-/// `lltype::malloc_typed` is currently `Box::into_raw`. Future GC
+/// `lltype::malloc_typed` prepends a `GcHeader` (`alloc_with_gc_header`)
+/// but allocates outside the collector's heap, so the box carries a
+/// readable type id while staying off the sweep set. Future GC
 /// integration replaces only that body; this constructor stays
 /// unchanged.
 pub fn w_float_new(value: f64) -> PyObjectRef {

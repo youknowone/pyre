@@ -115,16 +115,38 @@ pub(crate) struct EscapeFlushUndo {
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
 }
 
+/// The operand stack an abort image publishes, resolved from the walker's
+/// OpRef mirror while the walk's concrete side tables are still live.
+///
+/// The detached tracing snapshot cannot supply it.  A root walk keeps its
+/// virtualizable purely symbolic — `setarrayitem_vable_via_metainterp` mirrors
+/// into a concrete frame only through `current_inline_vable_target`, i.e. only
+/// for the frame an INLINE level owns — so the root snapshot's
+/// `locals_cells_stack_w` still holds the stack from before the walk ran.  The
+/// locals half has no such gap: `write_back_outer_locals` publishes those from
+/// the virtualizable shadow.
+pub(crate) struct MirrorStackImage {
+    /// Python pc of the opcode the walk stopped inside.  Pairs with the slots:
+    /// the mirror reflects the depth ON ENTRY to this opcode, which is the
+    /// `last_instr = py_pc - 1` coordinate the codewriter stores for it.
+    pub(crate) py_pc: usize,
+    pub(crate) slots: Vec<pyre_object::PyObjectRef>,
+}
+
 pub(crate) struct LatchedSingleFrameBlackhole {
     pub(crate) miframe: majit_metainterp::MIFrame,
     pub(crate) last_exc_value: i64,
     pub(crate) raising_exception: bool,
+    /// `None` for the `ABORT_TOO_LONG` latch, whose post-step coordinate is an
+    /// opcode boundary the snapshot array does describe.
+    pub(crate) mirror_stack: Option<MirrorStackImage>,
 }
 
 pub(crate) struct LatchedMultiFrameBlackhole {
     pub(crate) framestack: majit_metainterp::MIFrameStack,
     pub(crate) last_exc_value: i64,
     pub(crate) raising_exception: bool,
+    pub(crate) mirror_stack: Option<MirrorStackImage>,
     /// `ABORT_TOO_LONG` stops at an arbitrary post-step coordinate, so frame
     /// 0's active operand stack must cross from the detached tracing snapshot
     /// to the live red frame before the blackhole runs.  The vable-force path
@@ -148,6 +170,20 @@ pub(crate) fn multi_frame_blackhole_cell_ptr()
 
 pub(crate) fn take_multi_frame_blackhole() -> Option<LatchedMultiFrameBlackhole> {
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| slot.borrow_mut().take())
+}
+
+/// True when an abort-recovery image is already staged.
+///
+/// The INNERMOST abort owns the handoff: its [`WalkContext`] is the one holding
+/// the concrete banks of the frame the walk actually stopped in, and
+/// `build_multi_frame_miframe` already appends every paused caller from
+/// [`WalkSession::framestack`].  As the error propagates back out through the
+/// enclosing `walk()` frames, each would otherwise re-latch and overwrite that
+/// image with one rooted at the caller — resuming the blackhole above the frame
+/// whose opcode was left half-executed.
+pub(crate) fn abort_blackhole_latched() -> bool {
+    FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| slot.borrow().is_some())
+        || FBW_MULTI_FRAME_BLACKHOLE.with(|slot| slot.borrow().is_some())
 }
 
 pub(crate) fn reset_single_frame_blackhole() {
@@ -200,6 +236,49 @@ macro_rules! latchdbg {
 /// unresolved.  A zero-effect walk may then use the legacy entry replay;
 /// an effectful walk must keep recording until a complete image can be built,
 /// because replaying it would apply the effect twice.
+/// Resolve `WalkContext::vstack_boxes` — the walker's counterpart of
+/// `MIFrame.registers_r` snapshotted by `get_list_of_active_boxes`
+/// (`pyjitpl.py`) — into the concrete operand stack an abort image publishes.
+///
+/// Same resolution [`flush_escape_state_with_latched_stack`] performs for the
+/// escape flush, and for the same reason: a walk-abort coordinate sits inside
+/// a Python opcode, where no other source describes the operand stack.  The
+/// tracing snapshot's array is not it — a root walk mirrors nothing into that
+/// frame (see [`MirrorStackImage`]).
+///
+/// A recorded concrete NULL is a REAL operand — it is `PUSH_NULL`'s
+/// `self_or_null` sentinel — so only `GcRef::NO_CONCRETE`, which is what
+/// "unavailable" looks like, rejects a slot.  Any unresolved slot declines the
+/// whole image, leaving the abort on the legacy entry replay.
+fn capture_vstack_mirror_image<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<MirrorStackImage> {
+    if !ctx.vstack_valid {
+        latchdbg!("mirror-invalid");
+        return None;
+    }
+    let mut slots = Vec::with_capacity(ctx.vstack_boxes.len());
+    for &opref in ctx.vstack_boxes.iter() {
+        match ctx.trace_ctx.concrete_of_opref(opref) {
+            Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
+                slots.push(value.as_usize() as pyre_object::PyObjectRef);
+            }
+            other => {
+                latchdbg!(
+                    "mirror-slot {}/{} unresolved opref={opref:?} concrete={other:?}",
+                    slots.len(),
+                    ctx.vstack_boxes.len(),
+                );
+                return None;
+            }
+        }
+    }
+    Some(MirrorStackImage {
+        py_pc: ctx.vstack_cur_pypc as usize,
+        slots,
+    })
+}
+
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
@@ -283,11 +362,18 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // to the matching live frame before driving the blackhole. Replacing
         // the register with the snapshot address would collapse those two
         // identities and fail the live-root check.
+        // `ctx` IS the root walk on this arm (`framestack.is_empty() &&
+        // !inline_subwalk`), so its mirror describes the very frame whose
+        // operand stack the adopter publishes.  `ABORT_TOO_LONG` stops at an
+        // opcode boundary and keeps the snapshot-array source; a capability-gap
+        // abort stops mid-opcode and needs this.
+        let mirror_stack = capture_vstack_mirror_image(ctx);
         FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
             *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
                 miframe,
                 last_exc_value,
                 raising_exception: false,
+                mirror_stack,
             });
         });
         true
@@ -308,6 +394,15 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
                 last_exc_value,
                 raising_exception: false,
                 publish_root_stack: true,
+                // `ctx` is the INNERMOST callee here, so its mirror describes
+                // that callee, not frame 0 whose stack the adopter publishes.
+                // Frame 0's own stack is recorded per level in
+                // `InlineParentFrame::call_stack_overrides`, but sparsely (only
+                // the slots the caller CALL touched), so it cannot stand in for
+                // a complete image.  Left `None`: the `WalkAbort` adopt then
+                // declines and the abort keeps the legacy entry replay, which
+                // is exactly the pre-leg behaviour.
+                mirror_stack: None,
             });
         });
         true
@@ -1868,7 +1963,8 @@ pub(crate) fn probe_resid_decline_ctx<Sym: WalkSym>(
         let s = unsafe { &*sym };
         if !s.jitcode().is_null() {
             let jc = unsafe { &*s.jitcode() };
-            let pc = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc) as usize;
+            let pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op_pc)
+                as usize;
             let op = if !jc.payload.code_ptr.is_null() {
                 pyre_interpreter::decode_instruction_at(unsafe { &*jc.payload.code_ptr }, pc)
                     .map(|(i, _)| format!("{i:?}"))
@@ -2910,6 +3006,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                                 miframe,
                                 last_exc_value,
                                 raising_exception,
+                                // The escape leg resumes at a call resume
+                                // marker and publishes no root stack.
+                                mirror_stack: None,
                             });
                         });
                     }
@@ -2950,6 +3049,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                             last_exc_value,
                             raising_exception,
                             publish_root_stack: false,
+                            mirror_stack: None,
                         });
                     });
                 }

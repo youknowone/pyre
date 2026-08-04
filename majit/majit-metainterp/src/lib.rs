@@ -631,17 +631,21 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// since upstream spends that one reason id on every generic bail: 47 = the
 /// optimizer deferred an `InvalidLoop` on the root trace, 48 = the root
 /// `compile_loop` returned `Err`, 49 = a bridge compile came back `Aborted`.
-pub static MC_DIAG: [std::sync::atomic::AtomicU64; 50] = {
+///
+/// 50 = `close_bridge` declined while closing a bridge, 51 = bridge close found
+/// no compiled target, 52 = abort after a declined bridge attempt, 53 =
+/// `compile_trace` called `compile_bridge` and it returned false.
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; 54] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [
         Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
     ]
 };
 
 /// Short label per [`MC_DIAG`] slot, in index order, so a tally cannot be added
 /// without naming it. Readers join these with the counter values.
-pub const MC_DIAG_LABELS: [&str; 50] = [
+pub const MC_DIAG_LABELS: [&str; 54] = [
     "mc_entered",
     "decl_shortcircuit",
     "descr0_skip",
@@ -692,6 +696,10 @@ pub const MC_DIAG_LABELS: [&str; 50] = [
     "giveup_invalidloop",
     "giveup_compileloop_err",
     "giveup_bridge_aborted",
+    "bridge_declined_close",
+    "bridge_no_targets_close",
+    "abort_after_declined",
+    "ct_compile_bridge_false",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

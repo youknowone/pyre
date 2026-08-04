@@ -266,6 +266,15 @@ pub struct UnrollOptimizer {
     /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
     /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
     pub imported_state: Option<ExportedState>,
+    /// compile.py:327-328 vs compile.py:381-382: `compile_loop` assembles
+    /// `[start_label] + preamble_ops + ... + [label_op] + loop_ops`, but
+    /// `compile_retrace` assembles `loop.operations + extra_same_as +
+    /// [label_op] + loop_ops` — a retrace has NO start label, because its
+    /// entry is the failing guard the resumekey attaches it to, not a fresh
+    /// loop header. RPython splits this by having the two callers assemble
+    /// the op list themselves; majit's optimizer returns it pre-assembled,
+    /// so `compile_retrace` clears this flag instead.
+    pub emit_start_label: bool,
     /// Phase 1's finalized ExportedState, retained across the Phase 2 run
     /// so the caller of `optimize_trace_*` can consult the renamed inputarg
     /// types that the optimizer decided on. RPython does not need this
@@ -378,6 +387,7 @@ impl UnrollOptimizer {
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
+            emit_start_label: true,
             final_exported_state: None,
             final_exported_label_source_positions: None,
             snapshot_boxes: Vec::new(),
@@ -827,6 +837,7 @@ impl UnrollOptimizer {
                         short_inputarg_refs: Vec::new(),
                         runtime_boxes: Vec::new(),
                         patchguardop: None,
+                        quasi_immutable_deps: state.quasi_immutable_deps.clone(),
                         phase1_emit_high_water: self.next_global_opref,
                         partial_trace_inputargs: Vec::new(),
                         partial_trace_operations: Vec::new(),
@@ -1891,6 +1902,7 @@ impl UnrollOptimizer {
             &consts_p2,
             self.target_tokens
                 .first()
+                .filter(|_| self.emit_start_label)
                 .map(|target| target.as_jump_target_descr()),
             self.target_tokens
                 .last()
@@ -2000,7 +2012,7 @@ impl Default for UnrollOptimizer {
     }
 }
 
-fn merge_quasi_immutable_deps(dst: &mut Vec<(u64, u32)>, src: &[(u64, u32)]) {
+pub(crate) fn merge_quasi_immutable_deps(dst: &mut Vec<(u64, u32)>, src: &[(u64, u32)]) {
     for dep in src {
         if !dst.contains(dep) {
             dst.push(*dep);
@@ -2079,6 +2091,10 @@ pub struct ExportedState {
     /// Phase 2's extra_guards (from virtualstate) need rd_resume_position
     /// from this patchguardop (unroll.py:333-336).
     pub patchguardop: Option<majit_ir::Op>,
+    /// unroll.py:234 `exported_state.quasi_immutable_deps` — deps collected
+    /// while optimizing the preamble, merged into retrace deps at
+    /// compile.py:384-390.
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
     /// `OptContext::next_pos` at end of Phase 1 — strict upper bound of
     /// every OpRef Phase 1 allocated, including intermediates folded /
     /// forwarded away. `reserve_pos_typed` skips `materialize_operand_at` on the
@@ -2199,6 +2215,7 @@ impl ExportedState {
             short_inputarg_refs,
             runtime_boxes: Vec::new(),
             patchguardop: None,
+            quasi_immutable_deps: Vec::new(),
             phase1_emit_high_water: 0,
             partial_trace_inputargs: Vec::new(),
             partial_trace_operations: Vec::new(),
@@ -2694,6 +2711,7 @@ impl Clone for ExportedState {
             short_inputarg_refs: self.short_inputarg_refs.clone(),
             runtime_boxes: self.runtime_boxes.clone(),
             patchguardop: self.patchguardop.clone(),
+            quasi_immutable_deps: self.quasi_immutable_deps.clone(),
             phase1_emit_high_water: self.phase1_emit_high_water,
             partial_trace_inputargs: self.partial_trace_inputargs.clone(),
             partial_trace_operations: self.partial_trace_operations.clone(),
@@ -3000,6 +3018,9 @@ impl OptUnroll {
         // #173: install the Phase-1 producer roots captured above. Kept off the
         // positional `new` ctor (callers write fields post-construct).
         state.short_box_producer_roots = short_box_producer_roots;
+        // unroll.py:234: carry deps collected while optimizing the exported
+        // preamble state so compile.py:384-390 can merge them on retrace.
+        state.quasi_immutable_deps = optimizer.quasi_immutable_deps.clone();
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded
         // away before any structure-stored field could observe them.

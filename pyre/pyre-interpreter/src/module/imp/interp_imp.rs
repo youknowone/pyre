@@ -1073,13 +1073,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         type_name(args[1])
                     )));
                 }
-                // `co_filename` is stored as UTF-8, so the name is encoded
-                // strictly: one carrying a lone surrogate has no such spelling
-                // and is reported the way encoding the string itself reports
-                // it.  The encode succeeded, so the bytes are valid UTF-8 and
-                // the lossy decode below cannot substitute anything.
-                let encoded = crate::type_methods::encode_utf8_with_errors(args[1], "strict")?;
-                let newname = String::from_utf8_lossy(&encoded).into_owned();
+                // `interp_imp.py:157 pathname='fsencode'`: preserve the raw
+                // filesystem spelling before storing it on the code object.
+                let newname = crate::gateway::fsencode_bytes_w(args[1])?;
                 unsafe { crate::pycode::fix_co_filename(args[0], &newname) };
                 Ok(pyre_object::w_none())
             },

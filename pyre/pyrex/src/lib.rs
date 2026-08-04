@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use lexopt::Arg::*;
 use lexopt::ValueExt;
@@ -534,6 +535,7 @@ fn read_stdin_source() -> std::io::Result<String> {
 }
 
 pub fn main_entry(binary_name: &'static str) {
+    configure_root_only_jit_stats();
     // The sandboxed child runs single-threaded like pypy-c-sandbox: it neither
     // manages signals (the controller does) nor spawns a worker thread, so it
     // issues no sigprocmask/clone syscalls. Run `real_main` directly.
@@ -567,6 +569,31 @@ pub fn main_entry(binary_name: &'static str) {
             .expect("spawn main thread")
             .join()
             .unwrap();
+    }
+}
+
+/// Keep test-runner diagnostics on the pyre process the runner launched.
+///
+/// `test_asyncio` deliberately starts `sys.executable` children and asserts
+/// their stdout/stderr protocol byte-for-byte. The CPython-suite runner still
+/// needs `MAJIT_STATS` from its direct child to detect a silently recovered JIT
+/// compile panic, but passing that variable through to grandchildren changes
+/// the Python program's observable subprocess output. The runner opts into
+/// this process-tree policy with `PYRE_MAJIT_STATS_ROOT_ONLY`; the inherited
+/// marker distinguishes its direct child from later pyre descendants.
+static PRINT_ROOT_ONLY_JIT_STATS: OnceLock<bool> = OnceLock::new();
+
+fn configure_root_only_jit_stats() {
+    let root_only = std::env::var_os("PYRE_MAJIT_STATS_ROOT_ONLY").is_some();
+    let descendant = std::env::var_os("PYRE_MAJIT_STATS_ANCESTOR").is_some();
+    let print_here = !root_only || !descendant;
+    PRINT_ROOT_ONLY_JIT_STATS
+        .set(print_here)
+        .expect("JIT stats process policy configured twice");
+    if root_only && !descendant {
+        // main_entry runs before pyre starts its interpreter thread, so no
+        // other thread can concurrently read or mutate the process environment.
+        unsafe { std::env::set_var("PYRE_MAJIT_STATS_ANCESTOR", "1") };
     }
 }
 
@@ -919,6 +946,9 @@ fn run_interact(
 /// `check.py` asserts it stays 0. Must be called before any `process::exit`
 /// since exits skip destructors.
 fn maybe_print_jit_stats() {
+    if !PRINT_ROOT_ONLY_JIT_STATS.get().copied().unwrap_or(true) {
+        return;
+    }
     // warmspot.py finish helper: `if profiler.initialized:
     // profiler.finish()` — emits the PYPYLOG `jit-summary` section on
     // stderr, visible under `MAJIT_LOG` (the `[jit-stats]` line below

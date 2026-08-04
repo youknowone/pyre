@@ -12,7 +12,9 @@
 # (`get_current_exception()` + raise), as the `Reraise` no-catch arm
 # already does.  This bench pins that such functions compile and run
 # byte-identically to CPython.
-N = 2000000
+# Sized so the pypy leg's startup-subtracted exec sits well above
+# `check.py EXEC_TIME_FLOOR_S` (0.0025s at 2000000 — a floored denominator).
+N = 32000000
 
 
 def finally_bare_raise_cold(n):

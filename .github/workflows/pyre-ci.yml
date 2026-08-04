@@ -538,7 +538,11 @@ jobs:
     - name: Build pyre-dynasm
       run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
     - name: Run CPython suite (gate regressions, JIT on)
-      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 4 --timeout 120
+      # The runner has 3 cores, so `--jobs 4` oversubscribes them and stretches
+      # the wall time of whichever module is running when the extra job lands.
+      # `--timeout` is per module: `test.test_asyncio` alone takes ~117s of CPU
+      # and ~2m47s of wall time, which does not fit the former 120s limit.
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
 
   wasm-build:
     name: wasm build (pyre-wasm, ${{ matrix.binding }})
