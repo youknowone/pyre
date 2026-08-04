@@ -48,10 +48,25 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// `wasm_unsupported_trace_reason` (the #62 loop-callee CALL_ASSEMBLER gap),
 /// 26 = the wasm host rejected the emitted module (`func_handle == 0`).
 /// Indices 2 and 4 double as compile_loop's other two declines.
-pub static BRIDGE_DIAG: [AtomicU64; 27] = {
+///
+/// 27-28 ask 12-13's question of EVERY accepted bridge rather than only the
+/// CALL_ASSEMBLER ones: 27 = the source guard's dispatch cell was written, so
+/// the loop epilogue now tail-calls this bridge in-module; 28 = it was not,
+/// because the owning trace reserved no cell array, so the guard keeps
+/// round-tripping to the host and the bridge is compiled but unreachable.
+/// `BRIDGE_OK` (5) only says the backend accepted a bridge, which is strictly
+/// weaker than "the guard can reach it"; without this split the two are
+/// indistinguishable from outside the guest.
+///
+/// 29 = the cell written at 27 was ALREADY non-zero, i.e. this guard had a
+/// reachable bridge and kept failing anyway. One of those is ordinary (a guard
+/// re-bridged after its first bridge was outgrown); a count that tracks
+/// `BRIDGE_OK` says the epilogue dispatch is not taking the cell at all and
+/// every bridge after the first is dead weight.
+pub static BRIDGE_DIAG: [AtomicU64; 30] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
     ]
 };
 
@@ -2842,11 +2857,21 @@ impl majit_backend::Backend for WasmBackend {
                 diag_bump(13);
             }
         }
+        // The same question for every accepted bridge (slots 27/28): a bridge
+        // whose source guard has no cell is compiled and then unreachable.
+        if source_cells_base != 0 && bridge_slot != 0 {
+            diag_bump(27);
+        } else {
+            diag_bump(28);
+        }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         if source_cells_base != 0 && bridge_slot != 0 {
             // cells[source_fail_index] = bridge_slot — the loop epilogue now
             // tails into this bridge instead of returning to the host.
             let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
+            if unsafe { core::ptr::read(cell) } != 0 {
+                diag_bump(29); // this guard already had a reachable bridge
+            }
             unsafe {
                 core::ptr::write(cell, bridge_slot);
             }

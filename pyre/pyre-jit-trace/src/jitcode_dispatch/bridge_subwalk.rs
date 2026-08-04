@@ -341,7 +341,11 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // typeptr at offset 0 (`_store_exception` invariant): the expected class the
     // bridge-entry GUARD_EXCEPTION checks the restored pending exception against.
     let exc_edge_class = if exc_edge_catch_target.is_some() && !exc_edge_concrete.is_null() {
-        unsafe { *(exc_edge_concrete as *const i64) }
+        // One machine word, so read it at pointer width: an i64 read on a
+        // 32-bit target pulls the adjacent header word into the high half, and
+        // the guard then compares against a class value the pending-exception
+        // cell (`jit_exc_raise`, pointer-width) can never hold.
+        unsafe { *(exc_edge_concrete as *const usize) as i64 }
     } else {
         0
     };

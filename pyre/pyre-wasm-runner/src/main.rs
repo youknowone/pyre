@@ -544,6 +544,9 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 "cl_ok",
                 "cl_decl_unsupported",
                 "cl_decl_host_reject",
+                "cell_set",
+                "cell_missing",
+                "cell_rebridge",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

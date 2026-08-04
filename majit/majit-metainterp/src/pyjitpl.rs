@@ -9468,7 +9468,12 @@ impl<M: Clone> MetaInterp<M> {
         let exc_class = if result.exception_value.is_null() {
             0
         } else {
-            unsafe { *(result.exception_value.0 as *const i64) }
+            // `typeptr` is one machine word at offset 0, so read it at
+            // pointer width: an i64 read on a 32-bit target would pull the
+            // adjacent header word into the high half and the class value
+            // would never compare equal to a pointer-width one
+            // (`Cpu::cls_of_gcref`, `jit_exc_raise`).
+            unsafe { *(result.exception_value.0 as *const usize) as i64 }
         };
         let exception = ExceptionState {
             exc_class,
@@ -9638,7 +9643,8 @@ impl<M: Clone> MetaInterp<M> {
         let exc_class = if exc_value_ref.is_null() {
             0
         } else {
-            unsafe { *(exc_value_ref.0 as *const i64) }
+            // Pointer-width read — see the `result.exception_value` site.
+            unsafe { *(exc_value_ref.0 as *const usize) as i64 }
         };
         let exception = ExceptionState {
             exc_class,
@@ -9816,7 +9822,8 @@ impl<M: Clone> MetaInterp<M> {
         let exc_class = if exc_value_ref.is_null() {
             0
         } else {
-            unsafe { *(exc_value_ref.0 as *const i64) }
+            // Pointer-width read — see the `result.exception_value` site.
+            unsafe { *(exc_value_ref.0 as *const usize) as i64 }
         };
         let exception = ExceptionState {
             exc_class,

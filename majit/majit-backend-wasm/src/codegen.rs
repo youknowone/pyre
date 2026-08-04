@@ -3068,8 +3068,46 @@ fn build_function(
             }
 
             // ── Exception handling ──
-            OpCode::SaveException | OpCode::SaveExcClass | OpCode::RestoreException => {
-                // No-op in wasm MVP — exception state is managed by the host.
+            OpCode::SaveException => {
+                // x86/assembler.py:1820-1821 genop_save_exception:
+                //   _store_and_reset_exception → resloc = [pos_exc_value];
+                //   [pos_exception] = 0; [pos_exc_value] = 0.
+                // The result is the caught exception the resumed handler reads,
+                // so it must be written even though the slots themselves are
+                // shared with the host: skipping the op leaves the local null.
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    sink.i32_const(crate::jit_exc_value_addr() as i32);
+                    sink.i64_load(mem64(0));
+                    sink.local_set(1 + vi);
+                }
+                sink.i32_const(crate::jit_exc_type_addr() as i32);
+                sink.i64_const(0);
+                sink.i64_store(mem64(0));
+                sink.i32_const(crate::jit_exc_value_addr() as i32);
+                sink.i64_const(0);
+                sink.i64_store(mem64(0));
+            }
+            OpCode::SaveExcClass => {
+                // x86/assembler.py:1817-1818 genop_save_exc_class:
+                //   MOV resloc, [pos_exception]
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    sink.i32_const(crate::jit_exc_type_addr() as i32);
+                    sink.i64_load(mem64(0));
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::RestoreException => {
+                // x86/assembler.py:1845-1850 _restore_exception:
+                //   MOV [pos_exc_value], excvalloc
+                //   MOV [pos_exception], exctploc
+                sink.i32_const(crate::jit_exc_value_addr() as i32);
+                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                sink.i64_store(mem64(0));
+                sink.i32_const(crate::jit_exc_type_addr() as i32);
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                sink.i64_store(mem64(0));
             }
 
             // ── Conditional calls ──
