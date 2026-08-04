@@ -459,9 +459,6 @@ pub enum PyErrorKind {
     /// Not a subclass of Exception, so `except Exception` does not catch it.
     GeneratorExit,
     RecursionError,
-    /// Internal: RETURN_GENERATOR unwind signal (not a real exception).
-    /// Carries the generator PyObjectRef as message.
-    GeneratorReturn,
     /// Internal parity marker for pypy/interpreter/pycode.py:25
     /// `BytecodeCorruption`. This should not be raised as a user-level
     /// Python exception; it signals malformed bytecode in the interpreter.
@@ -1496,7 +1493,6 @@ impl PyError {
             PyErrorKind::ReferenceError => ExcKind::ReferenceError,
             PyErrorKind::GeneratorExit => ExcKind::GeneratorExit,
             PyErrorKind::RecursionError => ExcKind::RecursionError,
-            PyErrorKind::GeneratorReturn => ExcKind::RuntimeError,
             // Internal-only marker. If it escapes to object-space conversion,
             // degrade to RuntimeError rather than inventing a new exception type.
             PyErrorKind::BytecodeCorruption => ExcKind::RuntimeError,
