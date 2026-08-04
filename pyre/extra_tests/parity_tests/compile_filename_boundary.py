@@ -87,6 +87,11 @@ replaced = code.replace(co_filename="\udcff.py")
 assert replaced.co_filename == "\udcff.py"
 assert 'file "\udcff.py"' in repr(replaced), ascii(repr(replaced))
 
+# `pycode.py:570-572` reports the zero sentinel as line -1.
+assert 'line -1>' in repr(code.replace(co_firstlineno=0)), ascii(
+    repr(code.replace(co_firstlineno=0))
+)
+
 # and a filename that never had a UTF-8 spelling reaches repr() the same way.
 from_bytes = compile(SOURCE, b"\xff.py", "exec")
 assert 'file "\udcff.py"' in repr(from_bytes), ascii(repr(from_bytes))

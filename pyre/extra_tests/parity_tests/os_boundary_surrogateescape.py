@@ -17,6 +17,7 @@ if sys.platform == "win32":
     raise SystemExit
 
 import socket
+import subprocess
 import tempfile
 
 
@@ -133,5 +134,59 @@ with tempfile.TemporaryDirectory() as d:
                 assert exc.filename == arg, (ascii(exc.filename), ascii(arg))
             else:
                 raise AssertionError("an absent path was found")
+
+
+class _Spelled:
+    """An `os.PathLike` that is not itself a path."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __fspath__(self):
+        return self.name
+
+
+# `interp_posix.py:211-219 _unwrap_path` calls `__fspath__` and keeps its
+# result, so the name a failure reports is the path the object spelled, never
+# the object that spelled it.
+with tempfile.TemporaryDirectory() as d:
+    for spelled in (
+        os.path.join(d, "absent\udcff"),
+        os.path.join(os.fsencode(d), b"absent\xff"),
+    ):
+        for call in (os.stat, os.listdir, open):
+            try:
+                call(_Spelled(spelled))
+            except OSError as exc:
+                assert exc.filename == spelled, (ascii(exc.filename), ascii(spelled))
+            else:
+                raise AssertionError("an absent path was found")
+
+# `interp_posix.py:1814-1817` wraps a failed exec with no filename at all.
+try:
+    os.execv("/nonexistent-pyre-boundary", ["x"])
+except OSError as exc:
+    assert exc.filename is None, ascii(exc.filename)
+else:
+    raise AssertionError("execv of an absent program returned")
+
+# `interp_posix.py:1762-1769` rejects `=` only after index zero, so the `=C:`
+# form Windows uses for a working directory is a legal key.
+os.waitpid(os.posix_spawn(TRUE, [TRUE], {"=C:": "v"}), 0)
+
+# `os.putenv` takes its two halves through the same converter, and
+# `posix.environ` hands entries back as bytes, so a value spelling a byte with
+# no UTF-8 form has to survive the write rather than folding to U+FFFD.
+NAME = "PYRE_OS_BOUNDARY_%d" % os.getpid()
+os.putenv(NAME, "v\udcff")
+try:
+    read_back = subprocess.run(
+        [sys.executable, "-c", "import os,sys; sys.stdout.buffer.write(os.environb[b'%s'])" % NAME],
+        capture_output=True,
+    )
+    if read_back.returncode == 0:
+        assert read_back.stdout == b"v\xff", read_back.stdout
+finally:
+    os.unsetenv(NAME)
 
 print("OK")

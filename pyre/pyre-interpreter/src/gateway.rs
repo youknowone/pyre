@@ -1521,7 +1521,7 @@ mod tests {
 /// as itself. Folding it into a Rust `String` first replaces it with U+FFFD,
 /// which both loses the name and makes distinct names alias onto one another.
 pub fn fsencode_bytes_w(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-    Ok(fsencode_bytes_w_with_kind(obj)?.0)
+    Ok(fsencode_path_w(obj)?.as_bytes)
 }
 
 /// `objspace.py:438 newfilename(s) = fsdecode(newbytes(s))`: expose the
@@ -1538,22 +1538,31 @@ pub fn fsdecode_filename_wtf8(data: &[u8]) -> rustpython_wtf8::Wtf8Buf {
     crate::typedef::charp2uni_wtf8(data)
 }
 
-/// [`fsencode_bytes_w`] paired with the discriminator `posixmodule.c
-/// path_converter` derives from the same resolution: `true` when the path
-/// resolved to `bytes`, which makes the names the call reports back `bytes`
-/// too.  Callers that need both must use this rather than re-resolving,
-/// because `path_converter` calls `__fspath__` exactly **once** — a second
-/// call would let a stateful implementation observe duplicate side effects, or
-/// answer `str` first and `bytes` second and leave the reported names
-/// describing a different path than the one that was listed.
-pub fn fsencode_bytes_w_with_kind(
-    obj: pyre_object::PyObjectRef,
-) -> Result<(Vec<u8>, bool), crate::PyError> {
-    let _roots = pyre_object::gc_roots::push_roots();
+/// `interp_posix.py:194-219 Path`: the syscall spelling and the resolved path
+/// object travel together. For `os.PathLike`, `w_path` is the result of the
+/// single `__fspath__` call, not the wrapper that supplied it.
+pub struct FsEncodedPath {
+    pub as_bytes: Vec<u8>,
+    w_path_slot: usize,
+    _roots: pyre_object::gc_roots::RootScope,
+}
+
+impl FsEncodedPath {
+    pub fn w_path(&self) -> pyre_object::PyObjectRef {
+        pyre_object::gc_roots::shadow_stack_get(self.w_path_slot)
+    }
+
+    pub unsafe fn is_bytes(&self) -> bool {
+        unsafe { pyre_object::bytesobject::is_bytes_like(self.w_path()) }
+    }
+}
+
+pub fn fsencode_path_w(obj: pyre_object::PyObjectRef) -> Result<FsEncodedPath, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);
 
-    let (data, is_bytes) = unsafe {
+    let (data, w_path_slot) = unsafe {
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if pyre_object::bytesobject::is_bytes_like(obj) {
             // baseobjspace.py:1975-1977: pyre's readable-buffer set here is
@@ -1567,10 +1576,10 @@ pub fn fsencode_bytes_w_with_kind(
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             (
                 pyre_object::bytesobject::bytes_like_data(obj).to_vec(),
-                true,
+                obj_slot,
             )
         } else if pyre_object::is_str(obj) {
-            (fsencode(obj)?, false)
+            (fsencode(obj)?, obj_slot)
         } else {
             // `type(path).__fspath__(path)` — the descriptor read off the type is
             // unbound, so `path` is supplied as the sole argument.
@@ -1596,10 +1605,10 @@ pub fn fsencode_bytes_w_with_kind(
             if pyre_object::bytesobject::is_bytes(result) {
                 (
                     pyre_object::bytesobject::w_bytes_data(result).to_vec(),
-                    true,
+                    result_slot,
                 )
             } else if pyre_object::is_str(result) {
-                (fsencode(result)?, false)
+                (fsencode(result)?, result_slot)
             } else {
                 // interp_posix.py:3053-3058 names both the object that was asked
                 // and the type its `__fspath__` answered with.
@@ -1616,7 +1625,11 @@ pub fn fsencode_bytes_w_with_kind(
     if data.contains(&0) {
         return Err(crate::PyError::value_error("embedded null byte"));
     }
-    Ok((data, is_bytes))
+    Ok(FsEncodedPath {
+        as_bytes: data,
+        w_path_slot,
+        _roots: roots,
+    })
 }
 
 /// `baseobjspace.py:1962 space.fsencode` — the plain filesystem encode of a

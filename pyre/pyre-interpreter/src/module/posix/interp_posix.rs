@@ -489,18 +489,21 @@ mod win_nt {
 
     /// Read argument 0 as a filesystem path; the flag reports whether the
     /// input was bytes so the result can be encoded back to match.
-    fn arg_path(args: &[PyObjectRef], func: &str) -> Result<(String, bool), crate::PyError> {
+    fn arg_path(
+        args: &[PyObjectRef],
+        func: &str,
+    ) -> Result<(String, bool, crate::gateway::FsEncodedPath), crate::PyError> {
         let Some(&arg) = args.first() else {
             return Err(crate::PyError::type_error(format!(
                 "{func}() missing required argument 'path'"
             )));
         };
-        let as_bytes = unsafe { pyre_object::bytesobject::is_bytes_like(arg) };
-        let bytes = crate::gateway::fsencode_bytes_w(arg)?;
+        let resolved = crate::gateway::fsencode_path_w(arg)?;
+        let as_bytes = unsafe { resolved.is_bytes() };
         // Windows names files in UTF-16, so there is no byte spelling to keep
         // here the way there is on a unix path; the host API takes text.
-        let path = String::from_utf8_lossy(&bytes).into_owned();
-        Ok((path, as_bytes))
+        let path = String::from_utf8_lossy(&resolved.as_bytes).into_owned();
+        Ok((path, as_bytes, resolved))
     }
 
     fn wrap_path(s: &std::ffi::OsStr, as_bytes: bool) -> PyObjectRef {
@@ -515,23 +518,23 @@ mod win_nt {
     /// ntpath.abspath helper — resolves `.`/`..` and the drive without
     /// requiring the path to exist.
     pub fn _getfullpathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (path, as_bytes) = arg_path(args, "_getfullpathname")?;
+        let (path, as_bytes, resolved) = arg_path(args, "_getfullpathname")?;
         match host_nt::getfullpathname(Path::new(&path)) {
             Ok(result) => Ok(wrap_path(&result, as_bytes)),
-            Err(error) => Err(io_err_with_filename(&error, args[0])),
+            Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
     }
 
     /// ntpath.realpath helper — the canonical `\\?\`-prefixed path, via a
     /// backup-semantics handle so directories open too.
     pub fn _getfinalpathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (path, as_bytes) = arg_path(args, "_getfinalpathname")?;
+        let (path, as_bytes, resolved) = arg_path(args, "_getfinalpathname")?;
         if path.contains('\0') {
             return Err(crate::PyError::value_error("embedded null character"));
         }
         match host_nt::getfinalpathname(Path::new(&path)) {
             Ok(result) => Ok(wrap_path(&result, as_bytes)),
-            Err(error) => Err(io_err_with_filename(&error, args[0])),
+            Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
     }
 
@@ -564,7 +567,7 @@ mod win_nt {
     /// retries against the parent directory when the path names a file
     /// (ERROR_DIRECTORY).
     pub fn _getdiskusage(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (path, _) = arg_path(args, "_getdiskusage")?;
+        let (path, _, resolved) = arg_path(args, "_getdiskusage")?;
         if path.contains('\0') {
             return Err(crate::PyError::value_error("embedded null character"));
         }
@@ -573,7 +576,7 @@ mod win_nt {
                 pyre_object::w_int_new(total as i64),
                 pyre_object::w_int_new(free as i64),
             ])),
-            Err(error) => Err(io_err_with_filename(&error, args[0])),
+            Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
     }
 
@@ -613,13 +616,13 @@ mod win_nt {
     /// no AddDllDirectory wrapper, so call windows-sys directly.
     pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
-        let (path, _) = arg_path(args, "_add_dll_directory")?;
+        let (path, _, resolved) = arg_path(args, "_add_dll_directory")?;
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
         if cookie.is_null() {
             return Err(io_err_with_filename(
                 &std::io::Error::last_os_error(),
-                args[0],
+                resolved.w_path(),
             ));
         }
         Ok(pyre_object::w_int_new(cookie as usize as i64))
@@ -747,18 +750,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     {
         /// The environment block is a list of NUL-terminated `NAME=VALUE`
         /// strings, so neither half may embed a NUL.
-        fn env_str(arg: PyObjectRef) -> Result<String, crate::PyError> {
+        ///
+        /// Bytes, like the path boundary: an entry the process was started with
+        /// can hold a byte with no UTF-8 spelling, and `posix.environ` already
+        /// hands those back as bytes, so writing one must not fold it first.
+        fn env_bytes(arg: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
             let bytes = crate::gateway::fsencode_bytes_w(arg)?;
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            if text.contains('\0') {
+            if bytes.contains(&0) {
                 return Err(crate::PyError::value_error("embedded null byte"));
             }
-            Ok(text)
+            Ok(bytes)
         }
         /// A name that is empty or contains `=` cannot be expressed in the
         /// environment block.
-        fn illegal_name(name: &str) -> bool {
-            name.is_empty() || name.contains('=')
+        fn illegal_name(name: &[u8]) -> bool {
+            name.is_empty() || name.contains(&b'=')
         }
         crate::module_ns_store(
             ns,
@@ -767,14 +773,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "putenv",
                 |args| {
                     // interp_posix.py putenv_impl rejects the name itself...
-                    let name = env_str(args[0])?;
+                    let name = env_bytes(args[0])?;
                     if illegal_name(&name) {
                         return Err(crate::PyError::value_error(
                             "illegal environment variable name",
                         ));
                     }
-                    let value = env_str(args[1])?;
-                    unsafe { host_os::set_var(&name, &value) };
+                    let value = env_bytes(args[1])?;
+                    unsafe {
+                        host_os::set_var(os_str_from_bytes(&name), os_str_from_bytes(&value))
+                    };
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -786,7 +794,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "unsetenv",
                 |args| {
-                    let name = env_str(args[0])?;
+                    let name = env_bytes(args[0])?;
                     // ...while unsetenv leaves the same rejection to the
                     // syscall, which reports EINVAL.
                     if illegal_name(&name) {
@@ -795,7 +803,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             pyre_object::PY_NULL,
                         ));
                     }
-                    unsafe { host_os::remove_var(&name) };
+                    unsafe { host_os::remove_var(os_str_from_bytes(&name)) };
                     Ok(pyre_object::w_none())
                 },
                 1,
@@ -1187,19 +1195,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // boundaries must not pass through a Rust `String`.
     use crate::gateway::fsencode_bytes_w as extract_path;
 
-    fn path_from_bytes(path: &[u8]) -> std::borrow::Cow<'_, std::path::Path> {
+    /// The host-API view of OS bytes — a filename, or a half of an environment
+    /// entry. Unix spells both in bytes and takes them back unchanged.
+    fn os_str_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            std::borrow::Cow::Borrowed(std::path::Path::new(std::ffi::OsStr::from_bytes(path)))
+            std::borrow::Cow::Borrowed(std::ffi::OsStr::from_bytes(bytes))
         }
         #[cfg(not(unix))]
         {
-            // This platform has no byte spelling for paths, so the host API
-            // necessarily receives its best text representation.
-            std::borrow::Cow::Owned(std::path::PathBuf::from(
-                String::from_utf8_lossy(path).into_owned(),
+            // This platform has no byte spelling, so the host API necessarily
+            // receives the best text representation of these bytes.
+            std::borrow::Cow::Owned(std::ffi::OsString::from(
+                String::from_utf8_lossy(bytes).into_owned(),
             ))
+        }
+    }
+
+    fn path_from_bytes(path: &[u8]) -> std::borrow::Cow<'_, std::path::Path> {
+        match os_str_from_bytes(path) {
+            std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(std::path::Path::new(s)),
+            std::borrow::Cow::Owned(s) => std::borrow::Cow::Owned(std::path::PathBuf::from(s)),
         }
     }
 
@@ -1213,8 +1230,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::PyError::os_error_syscall(errno, w_filename)
     }
 
-    // `interp_posix.py:332 wrap_oserror2(space, e, w_path)` keeps the exact
-    // object supplied by the caller as `OSError.filename`.
+    // `interp_posix.py:211-219,332` keeps the resolved `Path.w_path` as
+    // `OSError.filename`.
     fn errno_err_with_filename(errno: i32, w_path: PyObjectRef) -> crate::PyError {
         crate::PyError::os_error_syscall(errno, w_path)
     }
@@ -1292,7 +1309,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "open() requires at least 2 arguments",
                 ));
             }
-            let path = extract_path(args[0])?;
+            let path = crate::gateway::fsencode_path_w(args[0])?;
             let flags = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
             let mode: u32 = if args.len() >= 3 {
                 crate::baseobjspace::c_int_w(args[2])? as u32
@@ -1310,7 +1327,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let flags = flags | libc::O_CLOEXEC;
                 #[cfg(windows)]
                 let flags = flags | libc::O_NOINHERIT;
-                let c_path = std::ffi::CString::new(path.as_slice())
+                let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 // Opening a FIFO without O_NONBLOCK waits for a peer.
                 let (fd, errno) = crate::module::thread::call_external_function(|| unsafe {
@@ -1319,14 +1336,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if fd < 0 {
                     return Err(io_err_with_filename(
                         std::io::Error::from_raw_os_error(errno),
-                        args[0],
+                        path.w_path(),
                     ));
                 }
                 fd
             };
             #[cfg(feature = "sandbox")]
-            let fd = crate::host_seam::ops::open(&path, flags, mode)
-                .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, args[0]))?;
+            let fd = crate::host_seam::ops::open(&path.as_bytes, flags, mode)
+                .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path.w_path()))?;
             Ok(pyre_object::w_int_new(fd as i64))
         }),
     );
@@ -1536,22 +1553,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         if args.is_empty() {
             return Err(crate::PyError::type_error("unlink() requires 1 argument"));
         }
-        let path = extract_path(args[0])?;
+        let path = crate::gateway::fsencode_path_w(args[0])?;
         #[cfg(not(feature = "sandbox"))]
         {
-            let c_path = std::ffi::CString::new(path.as_slice())
+            let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
             let ret = unsafe { libc::unlink(c_path.as_ptr()) };
             if ret < 0 {
                 return Err(io_err_with_filename(
                     std::io::Error::last_os_error(),
-                    args[0],
+                    path.w_path(),
                 ));
             }
         }
         #[cfg(feature = "sandbox")]
-        crate::host_seam::ops::unlink(&path)
-            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, args[0]))?;
+        crate::host_seam::ops::unlink(&path.as_bytes)
+            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path.w_path()))?;
         Ok(pyre_object::w_none())
     }
     crate::module_ns_store(
@@ -1580,13 +1597,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 .first()
                 .copied()
                 .ok_or_else(|| crate::PyError::type_error("readlink() requires 1 argument"))?;
-            let (path, bytes_mode) = crate::gateway::fsencode_bytes_w_with_kind(arg)?;
-            match std::fs::read_link(path_from_bytes(&path).as_ref()) {
+            let path = crate::gateway::fsencode_path_w(arg)?;
+            let bytes_mode = unsafe { path.is_bytes() };
+            match std::fs::read_link(path_from_bytes(&path.as_bytes).as_ref()) {
                 Ok(target) => {
                     let target = target.as_os_str().as_encoded_bytes();
                     Ok(fs_name_obj(bytes_mode, target))
                 }
-                Err(e) => Err(io_err_with_filename(e, arg)),
+                Err(e) => Err(io_err_with_filename(e, path.w_path())),
             }
         }),
     );
@@ -1599,7 +1617,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if args.is_empty() {
                 return Err(crate::PyError::type_error("mkdir() requires 1 argument"));
             }
-            let path = extract_path(args[0])?;
+            let path = crate::gateway::fsencode_path_w(args[0])?;
             let _mode: u32 = if args.len() >= 2 {
                 crate::baseobjspace::c_int_w(args[1])? as u32
             } else {
@@ -1607,7 +1625,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             };
             #[cfg(not(feature = "sandbox"))]
             {
-                let c_path = std::ffi::CString::new(path.as_slice())
+                let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 #[cfg(unix)]
                 let ret = unsafe { libc::mkdir(c_path.as_ptr(), _mode as libc::mode_t) };
@@ -1616,13 +1634,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if ret < 0 {
                     return Err(io_err_with_filename(
                         std::io::Error::last_os_error(),
-                        args[0],
+                        path.w_path(),
                     ));
                 }
             }
             #[cfg(feature = "sandbox")]
-            crate::host_seam::ops::mkdir(&path, _mode)
-                .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, args[0]))?;
+            crate::host_seam::ops::mkdir(&path.as_bytes, _mode)
+                .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path.w_path()))?;
             Ok(pyre_object::w_none())
         }),
     );
@@ -1640,14 +1658,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("rmdir() requires 1 argument"));
                 }
-                let path = extract_path(args[0])?;
-                let c_path = std::ffi::CString::new(path.as_slice())
+                let path = crate::gateway::fsencode_path_w(args[0])?;
+                let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 let ret = unsafe { libc::rmdir(c_path.as_ptr()) };
                 if ret < 0 {
                     return Err(io_err_with_filename(
                         std::io::Error::last_os_error(),
-                        args[0],
+                        path.w_path(),
                     ));
                 }
                 Ok(pyre_object::w_none())
@@ -1684,8 +1702,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             )));
         }
         crate::builtins::kwarg_reject_unknown(kwargs, &["src_dir_fd", "dst_dir_fd"], name)?;
-        let src = extract_path(pos[0])?;
-        let dst = extract_path(pos[1])?;
+        let src = crate::gateway::fsencode_path_w(pos[0])?;
+        let dst = crate::gateway::fsencode_path_w(pos[1])?;
         let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
             match crate::builtins::kwarg_get(kwargs, name) {
                 // interp_posix.py:274-278 `_unwrap_dirfd` — a non-`None` value
@@ -1716,8 +1734,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             (None, None)
         };
-        let src_path = path_from_bytes(&src);
-        let dst_path = path_from_bytes(&dst);
+        let src_path = path_from_bytes(&src.as_bytes);
+        let dst_path = path_from_bytes(&dst.as_bytes);
         let result = if name == "replace" {
             host_os::replace(src_path.as_ref(), src_b, dst_path.as_ref(), dst_b)
         } else {
@@ -1725,9 +1743,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         };
         result.map_err(|e| {
             let errno = crate::builtins::io_error_posix_errno(&e, 0);
-            // interp_posix.py:654 hands both original objects to
-            // `wrap_oserror2`, preserving bytes and path-like arguments.
-            crate::PyError::os_error_syscall2(errno, pos[0], pos[1])
+            // interp_posix.py:654 hands both resolved `Path.w_path` objects to
+            // `wrap_oserror2`.
+            crate::PyError::os_error_syscall2(errno, src.w_path(), dst.w_path())
         })?;
         Ok(pyre_object::w_none())
     }
@@ -1764,7 +1782,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             &["ns", "dir_fd", "follow_symlinks"],
             "utime",
         )?;
-        let path = extract_path(pos[0])?;
+        let path = crate::gateway::fsencode_path_w(pos[0])?;
 
         let present = |v: PyObjectRef| (!unsafe { pyre_object::is_none(v) }).then_some(v);
         let times = pos.get(1).copied().and_then(present);
@@ -1837,13 +1855,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "utime: dir_fd and follow_symlinks=False are unavailable on this platform",
                 ));
             }
-            host_os::set_file_times(path_from_bytes(&path).as_ref(), access, modified)
-                .map_err(|e| io_err_with_filename(e, pos[0]))?;
+            host_os::set_file_times(path_from_bytes(&path.as_bytes).as_ref(), access, modified)
+                .map_err(|e| io_err_with_filename(e, path.w_path()))?;
             return Ok(pyre_object::w_none());
         }
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            let c_path = std::ffi::CString::new(path.as_slice())
+            let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null character"))?;
             rustpython_host_env::posix::set_file_times_at(
                 dir_fd.unwrap_or(libc::AT_FDCWD),
@@ -1852,7 +1870,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 modified,
                 follow_symlinks,
             )
-            .map_err(|e| io_err_with_filename(e, pos[0]))?;
+            .map_err(|e| io_err_with_filename(e, path.w_path()))?;
             return Ok(pyre_object::w_none());
         }
         #[allow(unreachable_code)]
@@ -1941,18 +1959,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function("listdir", |args| {
             // One resolution yields both the path and its bytes-ness, so
             // `__fspath__` runs exactly once.
-            let (path, bytes_mode) = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
-                (b".".to_vec(), false)
+            let resolved = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
+                None
             } else {
-                crate::gateway::fsencode_bytes_w_with_kind(args[0])?
+                Some(crate::gateway::fsencode_path_w(args[0])?)
             };
+            let bytes_mode = unsafe { resolved.as_ref().is_some_and(|path| path.is_bytes()) };
+            let path = resolved
+                .as_ref()
+                .map(|path| path.as_bytes.as_slice())
+                .unwrap_or(b".");
             // The omitted argument defaults to `"."` but reports no filename,
             // since there was no path object for the failure to name.
-            let w_path = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            let w_path = || {
+                resolved
+                    .as_ref()
+                    .map(|path| path.w_path())
+                    .unwrap_or(pyre_object::PY_NULL)
+            };
             #[cfg(feature = "sandbox")]
             {
-                let names = crate::host_seam::ops::listdir(&path)
-                    .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, w_path))?;
+                let names = crate::host_seam::ops::listdir(path)
+                    .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, w_path()))?;
                 let items = names
                     .into_iter()
                     .map(|n| fs_name_obj(bytes_mode, &n))
@@ -1961,11 +1989,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             #[cfg(not(feature = "sandbox"))]
             {
-                let entries = host_fs::read_dir(path_from_bytes(&path).as_ref())
-                    .map_err(|e| io_err_with_filename(e, w_path))?;
+                let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
+                    .map_err(|e| io_err_with_filename(e, w_path()))?;
                 let mut items = Vec::new();
                 for entry in entries {
-                    let entry = entry.map_err(|e| io_err_with_filename(e, w_path))?;
+                    let entry = entry.map_err(|e| io_err_with_filename(e, w_path()))?;
                     let name = entry.file_name();
                     items.push(fs_name_obj(bytes_mode, name.as_encoded_bytes()));
                 }
@@ -2416,38 +2444,37 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         if args.is_empty() {
             return Err(crate::PyError::type_error("stat() missing argument"));
         }
-        let path_obj = args[0];
-        let path = crate::gateway::fsencode_bytes_w(path_obj).map_err(|_| {
+        let path = crate::gateway::fsencode_path_w(args[0]).map_err(|_| {
             crate::PyError::type_error("stat: path should be string, bytes, os.PathLike")
         })?;
         #[cfg(feature = "sandbox")]
         {
             let buf = if follow_symlinks {
-                crate::host_seam::ops::stat(&path)
+                crate::host_seam::ops::stat(&path.as_bytes)
             } else {
-                crate::host_seam::ops::lstat(&path)
+                crate::host_seam::ops::lstat(&path.as_bytes)
             }
-            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path_obj))?;
+            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path.w_path()))?;
             return Ok(make_stat_result_from_statbuf(&buf));
         }
         #[cfg(not(feature = "sandbox"))]
         {
             let meta = if follow_symlinks {
-                host_fs::metadata(path_from_bytes(&path).as_ref())
+                host_fs::metadata(path_from_bytes(&path.as_bytes).as_ref())
             } else {
-                host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
+                host_fs::symlink_metadata(path_from_bytes(&path.as_bytes).as_ref())
             };
             match meta {
                 Ok(m) => {
                     #[cfg(target_os = "macos")]
-                    let st_flags = macos_path_st_flags(&path, follow_symlinks);
+                    let st_flags = macos_path_st_flags(&path.as_bytes, follow_symlinks);
                     #[cfg(not(target_os = "macos"))]
                     let st_flags = 0u32;
                     Ok(make_stat_result(&m, st_flags))
                 }
                 Err(e) => Err(errno_err_with_filename(
                     crate::builtins::io_error_posix_errno(&e, 2),
-                    path_obj,
+                    path.w_path(),
                 )),
             }
         }
@@ -2648,19 +2675,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn scandir_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // One resolution yields both the path and its bytes-ness, so
         // `__fspath__` runs exactly once.
-        let (path, bytes_mode) = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
-            (b".".to_vec(), false)
+        let resolved = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
+            None
         } else {
-            crate::gateway::fsencode_bytes_w_with_kind(args[0])?
+            Some(crate::gateway::fsencode_path_w(args[0])?)
         };
+        let bytes_mode = unsafe { resolved.as_ref().is_some_and(|path| path.is_bytes()) };
+        let path = resolved
+            .as_ref()
+            .map(|path| path.as_bytes.as_slice())
+            .unwrap_or(b".");
         // The omitted argument defaults to `"."` but reports no filename,
         // since there was no path object for the failure to name.
-        let w_path = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-        let entries = host_fs::read_dir(path_from_bytes(&path).as_ref())
-            .map_err(|e| io_err_with_filename(e, w_path))?;
+        let w_path = || {
+            resolved
+                .as_ref()
+                .map(|path| path.w_path())
+                .unwrap_or(pyre_object::PY_NULL)
+        };
+        let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
+            .map_err(|e| io_err_with_filename(e, w_path()))?;
         let list = pyre_object::w_list_new(Vec::new());
         for entry in entries {
-            let entry = entry.map_err(|e| io_err_with_filename(e, w_path))?;
+            let entry = entry.map_err(|e| io_err_with_filename(e, w_path()))?;
             let name = entry.file_name();
             let full = entry.path().into_os_string();
             let de = pyre_object::w_instance_new(dir_entry_type());
@@ -3082,7 +3119,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let argv_ptrs = exec_pointer_array(&argv);
                     let errno =
                         host_posix::exec_replace(&[command_c], argv_ptrs.as_ptr(), None) as i32;
-                    Err(errno_err_with_filename(errno, args[0]))
+                    // interp_posix.py:1814-1817 uses `wrap_oserror`, which does
+                    // not attach the command path.
+                    Err(errno_err(errno, ""))
                 },
                 2,
             ),
@@ -3349,11 +3388,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("chdir() requires 1 argument"));
                     }
-                    let path = extract_path(args[0])?;
-                    let c_path = std::ffi::CString::new(path.as_slice())
+                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     host_posix::chdir(&c_path)
-                        .map_err(|e| errno_err_with_filename(e as i32, args[0]))?;
+                        .map_err(|e| errno_err_with_filename(e as i32, path.w_path()))?;
                     Ok(pyre_object::w_none())
                 },
                 1,
@@ -3782,20 +3821,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("mkfifo() requires 1 argument"));
                 }
-                let path = extract_path(args[0])?;
+                let path = crate::gateway::fsencode_path_w(args[0])?;
                 // interp_posix.py:1322 `@unwrap_spec(mode=c_int, ...)`.
                 let mode = if args.len() >= 2 {
                     crate::baseobjspace::c_int_w(args[1])? as libc::mode_t
                 } else {
                     0o666
                 };
-                let c_path = std::ffi::CString::new(path.as_slice())
+                let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 let r = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
                 if r < 0 {
                     return Err(io_err_with_filename(
                         std::io::Error::last_os_error(),
-                        args[0],
+                        path.w_path(),
                     ));
                 }
                 Ok(pyre_object::w_none())
@@ -3885,11 +3924,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("statvfs() requires 1 argument"));
                     }
-                    let path = extract_path(args[0])?;
-                    let c_path = std::ffi::CString::new(path.as_slice())
+                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     let info = host_posix::statvfs_path(&c_path)
-                        .map_err(|e| io_err_with_filename(e, args[0]))?;
+                        .map_err(|e| io_err_with_filename(e, path.w_path()))?;
                     Ok(statvfs_to_obj(info))
                 },
                 1,
@@ -3958,11 +3997,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("symlink() requires 2 arguments"));
                 }
-                let src = extract_path(args[0])?;
-                let dst = extract_path(args[1])?;
-                let c_src = std::ffi::CString::new(src)
+                let src = crate::gateway::fsencode_path_w(args[0])?;
+                let dst = crate::gateway::fsencode_path_w(args[1])?;
+                let c_src = std::ffi::CString::new(src.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
-                let c_dst = std::ffi::CString::new(dst)
+                let c_dst = std::ffi::CString::new(dst.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in dst"))?;
                 // host_env::posix only exposes symlinkat on non-redox unices;
                 // call libc::symlink directly so we don't need an at-cwd dance.
@@ -3970,7 +4009,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if ret < 0 {
                     return Err(io_err_with_filename(
                         std::io::Error::last_os_error(),
-                        args[1],
+                        dst.w_path(),
                     ));
                 }
                 Ok(pyre_object::w_none())
@@ -3988,17 +4027,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("chmod() requires 2 arguments"));
                     }
-                    let path = extract_path(args[0])?;
+                    let path = crate::gateway::fsencode_path_w(args[0])?;
                     // `posix.chmod` unwraps `mode` as `c_int`, so a non-integer
                     // raises TypeError instead of reinterpreting its layout.
                     let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
-                    let c_path = std::ffi::CString::new(path.as_slice())
+                    let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     let ret = unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) };
                     if ret < 0 {
                         return Err(io_err_with_filename(
                             std::io::Error::last_os_error(),
-                            args[0],
+                            path.w_path(),
                         ));
                     }
                     Ok(pyre_object::w_none())
@@ -4078,7 +4117,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // object's error, not a statement that the argument was the wrong
             // type.  Rewriting every failure into a `TypeError` here would also
             // swallow the `UnicodeEncodeError` a lone surrogate produces.
-            let path = extract_path(path_obj)?;
+            let path = crate::gateway::fsencode_path_w(path_obj)?;
             // `_Py_Uid_Converter` / `_Py_Gid_Converter`: `uid_t` is unsigned, yet
             // -1 is always accepted as the "leave unchanged" sentinel.  Only
             // that one value means unchanged; every other id is judged by
@@ -4130,12 +4169,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             let cwd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
             host_posix::fchownat(
                 cwd,
-                path_from_bytes(&path).as_os_str(),
+                path_from_bytes(&path.as_bytes).as_os_str(),
                 uid,
                 gid,
                 follow_symlinks,
             )
-            .map_err(|e| io_err_with_filename(e, path_obj))?;
+            .map_err(|e| io_err_with_filename(e, path.w_path()))?;
             Ok(pyre_object::w_none())
         }
         crate::module_ns_store(
@@ -4249,9 +4288,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("chroot() requires 1 argument"));
                     }
-                    let path = extract_path(args[0])?;
-                    host_posix::chroot(path_from_bytes(&path).as_ref())
-                        .map_err(|e| io_err_with_filename(e, args[0]))?;
+                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    host_posix::chroot(path_from_bytes(&path.as_bytes).as_ref())
+                        .map_err(|e| io_err_with_filename(e, path.w_path()))?;
                     Ok(pyre_object::w_none())
                 },
                 1,
@@ -4487,8 +4526,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "posix_spawn() requires path, argv, env",
                     ));
                 }
-                let path = extract_path(positional[0])?;
-                let c_path = std::ffi::CString::new(path).map_err(|_| {
+                let path = crate::gateway::fsencode_path_w(positional[0])?;
+                let c_path = std::ffi::CString::new(path.as_bytes.as_slice()).map_err(|_| {
                     crate::PyError::value_error("posix_spawn: embedded null in path")
                 })?;
                 let argv = collect_cstring_seq(positional[1], "posix_spawn", "argv")?;
@@ -4521,7 +4560,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     spawnp,
                 };
                 let pid = host_posix::posix_spawn(config)
-                    .map_err(|e| io_err_with_filename(e, positional[0]))?;
+                    .map_err(|e| io_err_with_filename(e, path.w_path()))?;
                 Ok(pyre_object::w_int_new(pid as i64))
             }
             fn collect_spawn_env(
@@ -4576,7 +4615,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let value = crate::gateway::fsencode_bytes_w(
                         pyre_object::gc_roots::shadow_stack_get(value_slot),
                     )?;
-                    if key.is_empty() || key.contains(&b'=') {
+                    // interp_posix.py:1762-1769 permits the Windows `=C:`
+                    // spelling and rejects `=` only after the first byte.
+                    if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
                         return Err(crate::PyError::value_error(
                             "illegal environment variable name",
                         ));
@@ -4995,13 +5036,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("pathconf() requires path, name"));
                     }
-                    let path = extract_path(args[0])?;
-                    let cpath = std::ffi::CString::new(path).map_err(|_| {
+                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    let cpath = std::ffi::CString::new(path.as_bytes.as_slice()).map_err(|_| {
                         crate::PyError::value_error("pathconf: embedded null in path")
                     })?;
                     let name = confname_arg(args[1])?;
                     match host_posix::pathconf(&cpath, name)
-                        .map_err(|e| io_err_with_filename(e, args[0]))?
+                        .map_err(|e| io_err_with_filename(e, path.w_path()))?
                     {
                         Some(v) => Ok(pyre_object::w_int_new(v as i64)),
                         None => Ok(pyre_object::w_none()),

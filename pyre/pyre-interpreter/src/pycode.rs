@@ -1166,7 +1166,9 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 
 pub unsafe fn code_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "__repr__")? };
-    let line = (*(obj as *const PyCode)).co_firstlineno_raw as i64;
+    // pycode.py:570-572 represents the internal zero sentinel as line -1.
+    let raw_line = (*(obj as *const PyCode)).co_firstlineno_raw as i64;
+    let line = if raw_line == 0 { -1 } else { raw_line };
     let mut repr = rustpython_wtf8::Wtf8Buf::from_string(format!(
         "<code object {} at {obj:p}, file \"",
         code.obj_name,

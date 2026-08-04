@@ -14882,7 +14882,8 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
     // Keep the encoded bytes: surrogateescape code points can spell bytes
     // that are not valid UTF-8, and the OS seam must receive them verbatim.
-    let path_bytes = crate::gateway::fsencode_bytes_w(path_obj)?;
+    let resolved_path = crate::gateway::fsencode_path_w(path_obj)?;
+    let path_bytes = &resolved_path.as_bytes;
     // `host_env::fs` takes a `Path`; only the seam consumes the raw bytes.
     #[cfg(unix)]
     let path = std::ffi::OsString::from_vec(path_bytes.clone());
@@ -14914,7 +14915,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 return Err(crate::PyError::value_error(format!("opener returned {fd}")));
             }
             #[cfg(unix)]
-            if let Err(error) = fileio_validate_fd(fd, path_obj) {
+            if let Err(error) = fileio_validate_fd(fd, resolved_path.w_path()) {
                 fileio_close_owned_fd(fd);
                 return Err(error);
             }
@@ -14940,11 +14941,11 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     {
         let _ = (reading, writing);
         let flags = open_flags_for_mode(&mode);
-        // The failure names the path object the call was given, not a spelling
-        // rebuilt from the bytes: `interp_fileio.py` wraps `w_name`.
-        let fd = crate::host_seam::ops::open(&path_bytes, flags, 0o666)
-            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path_obj))?;
-        if let Err(error) = fileio_validate_fd(fd, path_obj) {
+        // `interp_fileio.py` wraps the resolved `w_name`, not the PathLike
+        // wrapper from which it came.
+        let fd = crate::host_seam::ops::open(path_bytes, flags, 0o666)
+            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, resolved_path.w_path()))?;
+        if let Err(error) = fileio_validate_fd(fd, resolved_path.w_path()) {
             fileio_close_owned_fd(fd);
             return Err(error);
         }
@@ -14970,11 +14971,11 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // close(), which is not the W_FileIO storage shape.
         let _ = (reading, writing);
         let flags = open_flags_for_mode(&mode);
-        // The failure names the path object the call was given, not a spelling
-        // rebuilt from the bytes: `interp_fileio.py` wraps `w_name`.
-        let fd = crate::host_seam::ops::open(&path_bytes, flags, 0o666)
-            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path_obj))?;
-        if let Err(error) = fileio_validate_fd(fd, path_obj) {
+        // `interp_fileio.py` wraps the resolved `w_name`, not the PathLike
+        // wrapper from which it came.
+        let fd = crate::host_seam::ops::open(path_bytes, flags, 0o666)
+            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, resolved_path.w_path()))?;
+        if let Err(error) = fileio_validate_fd(fd, resolved_path.w_path()) {
             fileio_close_owned_fd(fd);
             return Err(error);
         }
@@ -15014,12 +15015,11 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 Ok(bytes) => bytes,
                 Err(_e) if writing => Vec::new(),
                 Err(e) => {
-                    // Report the original path object as `.filename`, keeping a
-                    // bytes path a bytes object (`interp_fileio.py` wraps the raw
-                    // `w_name`, not the decoded buffer).
+                    // Keep the resolved `w_name` as `.filename`, including a
+                    // bytes result from `__fspath__`.
                     return Err(crate::PyError::os_error_syscall(
                         io_error_posix_errno(&e, 2),
-                        path_obj,
+                        resolved_path.w_path(),
                     ));
                 }
             }
@@ -15057,7 +15057,10 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     std::io::ErrorKind::PermissionDenied => libc::EACCES,
                     _ => io_error_posix_errno(&e, libc::EACCES),
                 };
-                return Err(crate::PyError::os_error_syscall(errno, path_obj));
+                return Err(crate::PyError::os_error_syscall(
+                    errno,
+                    resolved_path.w_path(),
+                ));
             }
         }
 
