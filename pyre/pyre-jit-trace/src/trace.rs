@@ -4856,34 +4856,64 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         .find(|pc| !marker_is_load_fast_check_null_arm(w_code, &pjc, *pc))
 }
 
-/// True when the `abort_permanent` at `marker_jit_pc` is the dead-end arm
-/// `LOAD_FAST_CHECK` emits for a conditionally-bound slot (`codewriter.rs`
-/// `Instruction::LoadFastCheck`, the `emit_abort_permanent!(py_pc,
-/// closes_block)` leg).
+/// The Python PC and decoded opcode that emitted the `abort_permanent` at
+/// `marker_jit_pc`, via the exact `abort_permanent_py_pc_by_jit_pc` inverse.
 ///
-/// `false` whenever the owning opcode cannot be named — a jitcode whose
-/// metadata carries no marker inverse (skeleton / fixture) keeps declining,
-/// which is the conservative direction.
-fn marker_is_load_fast_check_null_arm(
+/// `None` whenever the owning opcode cannot be named — a jitcode whose metadata
+/// carries no marker inverse (skeleton / fixture), or a `marker_jit_pc` that is
+/// not a marker at all.  Every caller treats that as "keep declining", the
+/// conservative direction.
+fn abort_permanent_owner(
     w_code: *const (),
     pjc: &crate::pyjitcode::PyJitCodePayload,
     marker_jit_pc: usize,
-) -> bool {
+) -> Option<(usize, pyre_interpreter::Instruction)> {
     let table = &pjc.metadata.abort_permanent_py_pc_by_jit_pc;
-    let Ok(idx) = table.binary_search_by_key(&(marker_jit_pc as u32), |&(off, _)| off) else {
-        return false;
-    };
+    let idx = table
+        .binary_search_by_key(&(marker_jit_pc as u32), |&(off, _)| off)
+        .ok()?;
     let py_pc = table[idx].1 as usize;
     let raw_code = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const CodeObject
     };
     if raw_code.is_null() {
-        return false;
+        return None;
     }
+    let (instr, _) = pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, py_pc)?;
+    Some((py_pc, instr))
+}
+
+/// True when the `abort_permanent` at `marker_jit_pc` is the dead-end arm
+/// `LOAD_FAST_CHECK` emits for a conditionally-bound slot (`codewriter.rs`
+/// `Instruction::LoadFastCheck`, the `emit_abort_permanent!(py_pc,
+/// closes_block)` leg).
+fn marker_is_load_fast_check_null_arm(
+    w_code: *const (),
+    pjc: &crate::pyjitcode::PyJitCodePayload,
+    marker_jit_pc: usize,
+) -> bool {
     matches!(
-        pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, py_pc),
-        Some((pyre_interpreter::Instruction::LoadFastCheck { .. }, _))
+        abort_permanent_owner(w_code, pjc, marker_jit_pc),
+        Some((_, pyre_interpreter::Instruction::LoadFastCheck { .. }))
     )
+}
+
+/// `"py_pc=47 LoadFastCheck"` for the `PYRE_FBW_DEBUG_ABORT` line, or
+/// `"owner=?"` when the inverse cannot name it.
+///
+/// A bare jitcode offset does not say which opcode declined the frame, and the
+/// floor/block-head tables answer a different question (they key a *resume*
+/// coordinate, and a marker in a block emitted after the body floors to
+/// whichever PC last opened a segment).  Naming it here is what turns a
+/// `loops_aborted` row into an opcode to port.
+fn describe_abort_permanent_owner(w_code: *const (), marker_jit_pc: usize) -> String {
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
+        return "owner=?".to_string();
+    };
+    match abort_permanent_owner(w_code, &pjc, marker_jit_pc) {
+        Some((py_pc, instr)) => format!("py_pc={py_pc} {instr:?}"),
+        None => "owner=?".to_string(),
+    }
 }
 
 struct CalleeAbortPermanentHit {
@@ -5336,7 +5366,8 @@ fn full_body_walk_trace<Sym: WalkSym>(
         // invisible to the census.
         crate::jitcode_dispatch::census_record("FullBodyWalk::LoopBodyAbortPermanent");
         if std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some() {
-            eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc}");
+            let owner = describe_abort_permanent_owner(w_code, abort_pc);
+            eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc} {owner}");
         }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return TraceAction::Decline;
