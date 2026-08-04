@@ -2407,6 +2407,24 @@ impl<'a> RegAlloc<'a> {
                 continue;
             }
 
+            // aarch64/assembler.py:1191-1195 `_walk_operations`: an
+            // `INT_*_OVF` op publishes its overflow answer in the condition
+            // flags, and the guard that reads them is `operations[i + 1]`.
+            // Anything emitted in between overwrites NZCV, so the guard would
+            // branch on the wrong comparison. Upstream asserts the adjacency
+            // rather than tolerating it; so do we — `compile_loop` catches the
+            // panic and declines the trace, which beats a silent wrong answer.
+            assert!(
+                !op.opcode.is_ovf()
+                    || matches!(
+                        operations.get(i + 1).map(|n| n.opcode),
+                        Some(OpCode::GuardOverflow) | Some(OpCode::GuardNoOverflow)
+                    ),
+                "{:?} at {i} is not followed by GUARD_[NO_]OVERFLOW (got {:?})",
+                op.opcode,
+                operations.get(i + 1).map(|n| n.opcode),
+            );
+
             // x86/regalloc.py:390 dispatch to consider_* method.
             // The dynasm backend now enters through the j2-style lowered
             // operation. The legacy opcode dispatch below is only a guard
@@ -2919,9 +2937,14 @@ impl<'a> RegAlloc<'a> {
             OpCode::CastFloatToInt if !args.is_empty() => {
                 self.consider_cast_float_to_int_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
             }
-            OpCode::ConvertFloatBytesToLonglong
-            | OpCode::ConvertLonglongBytesToFloat
-            | OpCode::CastPtrToInt
+            // Same bank split as the non-j2 arm — see the citation there.
+            OpCode::ConvertFloatBytesToLonglong if !args.is_empty() => {
+                self.consider_cast_float_to_int_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+            }
+            OpCode::ConvertLonglongBytesToFloat if !args.is_empty() => {
+                self.consider_cast_int_to_float_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+            }
+            OpCode::CastPtrToInt
             | OpCode::CastIntToPtr
             | OpCode::CastOpaquePtr
             | OpCode::SameAsI
@@ -3132,8 +3155,21 @@ impl<'a> RegAlloc<'a> {
             OpCode::CastFloatToSinglefloat | OpCode::CastSinglefloatToFloat => {
                 self.consider_float_unary(op, i, output);
             }
-            OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
-                self.consider_same_as(op, i, output);
+            // aarch64/regalloc.py:515-516 aliases both converts to the same
+            // `prepare_unary` (:456-462) as `prepare_op_cast_float_to_int` /
+            // `prepare_op_cast_int_to_float` (:502-503): the argument is read
+            // through the manager owning the ARGUMENT's type and the result is
+            // allocated through the manager owning the OP's type. x86 spells
+            // the same split out at x86/regalloc.py:719-727 / :730-738
+            // (`xrm.make_sure_var_in_reg` + `rm.force_allocate_reg`, and the
+            // mirror image). These ops REINTERPRET the bits across the two
+            // register files, so `consider_same_as` — which reads the argument
+            // out of the RESULT's bank — reads the wrong register file.
+            OpCode::ConvertFloatBytesToLonglong => {
+                self.consider_cast_float_to_int(op, i, output);
+            }
+            OpCode::ConvertLonglongBytesToFloat => {
+                self.consider_cast_int_to_float(op, i, output);
             }
             OpCode::CastPtrToInt | OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
                 self.consider_same_as(op, i, output);
@@ -6335,6 +6371,59 @@ mod tests {
             "deopt-only failarg should be captured from a register: {:?}",
             faillocs
         );
+    }
+
+    /// Build `[IntMulOvf -> i2, <optional interposed IntGt>, GuardNoOverflow,
+    /// Finish(i2)]` and walk it. The `Finish` use keeps the OVF result live so
+    /// the dead-op skip does not swallow the OVF op before the adjacency check.
+    fn walk_ovf_trace(interpose_comparison: bool) {
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let i2 = OpRef::int_op(2);
+        let i3 = OpRef::int_op(3);
+
+        let inputargs = vec![
+            InputArg::from_type(Type::Int, i0.raw()),
+            InputArg::from_type(Type::Int, i1.raw()),
+        ];
+
+        let mul_ovf = Op::new(OpCode::IntMulOvf, &[rb(i0), rb(i1)]);
+        mul_ovf.pos.set(i2);
+        let guard = Op::new(OpCode::GuardNoOverflow, &[]);
+        guard.pos.set(OpRef::int_op(4));
+        guard.setfailargs(vec![rb(i2)].into());
+        let finish = Op::new(OpCode::Finish, &[rb(i2)]);
+        finish.pos.set(OpRef::int_op(5));
+        finish.setfailargs(vec![].into());
+        finish.set_fail_arg_types(vec![]);
+
+        let mut ops = vec![mul_ovf];
+        if interpose_comparison {
+            let gt = Op::new(OpCode::IntGt, &[rb(i0), rb(i1)]);
+            gt.pos.set(i3);
+            ops.push(gt);
+        }
+        ops.push(guard);
+        ops.push(finish);
+
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        ra.walk_operations();
+    }
+
+    /// aarch64/assembler.py:1191-1195: the OVF op's answer lives in NZCV, so
+    /// its guard must be `operations[i + 1]`. Adjacent is accepted.
+    #[test]
+    fn test_ovf_op_adjacent_to_its_guard_walks() {
+        walk_ovf_trace(false);
+    }
+
+    /// ...and an op emitted between them — which overwrites NZCV — is rejected
+    /// rather than silently compiled into a guard on the wrong comparison.
+    #[test]
+    #[should_panic(expected = "is not followed by GUARD_[NO_]OVERFLOW")]
+    fn test_ovf_op_separated_from_its_guard_is_rejected() {
+        walk_ovf_trace(true);
     }
 
     #[test]

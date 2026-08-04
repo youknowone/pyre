@@ -715,6 +715,23 @@ impl OptPure {
         true
     }
 
+    /// Hand a released `postponed_op` to the passes AFTER OptPure.
+    ///
+    /// pure.py:139-155 releases the postponed OVF op as the
+    /// `DefaultOptimizationResult.op`, so `send_extra_operation`
+    /// (optimizer.py:594-612) carries it to `opt.next_optimization` —
+    /// OptEarlyForce and then OptHeap — exactly like any other op OptPure
+    /// passes on. Emitting it straight into `new_operations` would skip
+    /// OptHeap, whose own `emit()` override (heap.py:417-424) postpones
+    /// comparisons and flushes the pending one before the next op. Skipping
+    /// it strands a preceding comparison in `OptHeap::postponed_op`, which
+    /// then flushes BETWEEN the OVF op and its GUARD_NO_OVERFLOW — breaking
+    /// the adjacency `aarch64/assembler.py:1191-1195 _walk_operations`
+    /// asserts and the backends rely on to read the overflow flags.
+    fn emit_postponed_downstream(&mut self, postponed: Op, ctx: &mut OptContext) {
+        ctx.emit_extra(ctx.current_pass_idx, postponed);
+    }
+
     /// pure.py:240-247 _same_args
     ///
     /// Compare two argument lists with optional skip-prefixes on each side
@@ -962,10 +979,9 @@ impl Optimization for OptPure {
                     }
                 }
 
-                // RPython emits the postponed op through Optimizer.emit(),
-                // which force_box()es every arg before final emission.
-                // ctx.emit() bypasses that optimizer path, so mirror the
-                // force_box step here before recording the postponed op.
+                // Resolve the args to their forwarded terminals before the op
+                // is recorded in `self.cache` under its arg identities
+                // (optimizer.py:623-625 force_box loop).
                 for i in 0..postponed.num_args() {
                     let forced = self.force_box(&postponed.arg(i), ctx);
                     postponed.setarg(i, ctx.materialize_operand_at(forced));
@@ -978,7 +994,7 @@ impl Optimization for OptPure {
                 // replays it and a loop-invariant overflow-checked op is computed
                 // once in the peeled preamble instead of every iteration.
                 self.short_preamble_pure_ops.push(postponed.clone());
-                ctx.emit(postponed);
+                self.emit_postponed_downstream(postponed, ctx);
                 return OptimizationResult::PassOn; // guard passes through
             } else {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
@@ -986,7 +1002,7 @@ impl Optimization for OptPure {
                     let forced = self.force_box(&postponed.arg(i), ctx);
                     postponed.setarg(i, ctx.materialize_operand_at(forced));
                 }
-                ctx.emit(postponed);
+                self.emit_postponed_downstream(postponed, ctx);
             }
         }
 

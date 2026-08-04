@@ -1353,6 +1353,37 @@ impl OptHeap {
         }
     }
 
+    /// Run a guard's `force_lazy_sets_for_guard` at heap's OWN `emit()` point
+    /// (heap.py:417-418: `emitting_operation(op)` precedes `emit_postponed_op()`)
+    /// instead of waiting for the deferred `emitting_operation` callback that
+    /// `Optimizer::emit_operation` fires at final emission. A guard that pairs
+    /// with a postponed op — GUARD_NOT_FORCED with its CALL_MAY_FORCE,
+    /// GUARD_[NO_]OVERFLOW with its INT_*_OVF — must not get a lazy SETFIELD_GC
+    /// scheduled between the two.
+    ///
+    /// The virtual-valued sets `force_lazy_sets_for_guard` hands back are put
+    /// straight back into the caches, so the later `emitting_operation` call
+    /// re-collects them into `ctx.pending_for_guard` and the guard's
+    /// `rd_pendingfields` is unchanged.
+    fn force_lazy_sets_for_guard_early(&mut self, ctx: &mut OptContext) {
+        let pending_virtual = self.force_lazy_sets_for_guard(ctx.current_pass_idx, ctx);
+        for pending_op in pending_virtual {
+            let descr = pending_op.getdescr().unwrap().clone();
+            if pending_op.opcode == OpCode::SetarrayitemGc {
+                // A non-constant index has no `arrayitem_cache` slot to hold
+                // it, so it cannot be re-collected — emit it here.
+                match ctx.get_constant_int_box(&pending_op.arg(1).get_box_replacement(false)) {
+                    Some(index) => self.arrayitem_cache(&descr, index).lazy_set = Some(pending_op),
+                    None => {
+                        ctx.emit(pending_op);
+                    }
+                }
+            } else {
+                self.field_cache(&descr).lazy_set = Some(pending_op);
+            }
+        }
+    }
+
     /// heap.py:608-637 force_lazy_sets_for_guard()
     ///
     /// Returns pendingfields: SetfieldGc/SetarrayitemGc ops where the stored
@@ -3222,24 +3253,7 @@ impl OptHeap {
                 // its paired guard, breaking the backend's strict
                 // guard_not_forced-at-+1 invariant
                 // (x86/assembler.py:2225-2244 _store_force_index).
-                let pending_virtual = self.force_lazy_sets_for_guard(ctx.current_pass_idx, ctx);
-                for pending_op in pending_virtual {
-                    if pending_op.opcode == OpCode::SetarrayitemGc {
-                        let descr = pending_op.getdescr().unwrap().clone();
-                        if let Some(index) =
-                            ctx.get_constant_int_box(&pending_op.arg(1).get_box_replacement(false))
-                        {
-                            let cai = self.arrayitem_cache(&descr, index);
-                            cai.lazy_set = Some(pending_op);
-                        } else {
-                            ctx.emit(pending_op);
-                        }
-                    } else {
-                        let descr = pending_op.getdescr().unwrap().clone();
-                        let cf = self.field_cache(&descr);
-                        cf.lazy_set = Some(pending_op);
-                    }
-                }
+                self.force_lazy_sets_for_guard_early(ctx);
                 if let Some(postponed) = self.postponed_op.take() {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -3260,6 +3274,21 @@ impl OptHeap {
                     );
                 }
                 return OptimizationResult::Emit(op.clone());
+            }
+
+            // heap.py: GUARD_OVERFLOW / GUARD_NO_OVERFLOW — same ordering rule
+            // as GUARD_NOT_FORCED above, for the same reason. The postponed op
+            // here is the INT_*_OVF that OptPure released (pure.py:139-155),
+            // and its overflow answer lives in the condition flags, so a lazy
+            // SETFIELD_GC flushed after it lands BETWEEN the arithmetic and its
+            // guard. `aarch64/assembler.py:1191-1195 _walk_operations` asserts
+            // that pair is `operations[i]` / `operations[i + 1]`.
+            OpCode::GuardOverflow | OpCode::GuardNoOverflow => {
+                self.force_lazy_sets_for_guard_early(ctx);
+                // The generic `emit()` wrapper below flushes `postponed_op`
+                // for every op it downstreams (heap.py:418), which now runs
+                // after the lazy-set flush — the upstream order.
+                OptimizationResult::Emit(op.clone())
             }
 
             // ── heap.py: COND_CALL handling ──
