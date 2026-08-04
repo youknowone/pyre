@@ -535,6 +535,23 @@ impl WalkSession {
     }
 }
 
+/// Apply a walk-time concrete `record_application_traceback` with the undo log
+/// armed.
+///
+/// The authoritative walk attaches this iteration's node to the LIVE exception
+/// while it records, so a walk that does not commit has left a node the
+/// interpreter's replay then records again.  On a freshly raised exception that
+/// is invisible — the replay builds a new object and the discarded one is
+/// unreachable — but a raise that re-uses one exception object accumulates both
+/// deliveries, and the handler reads the whole chain twice over.
+/// `fbw_store_journal_rollback` splices the journaled link back out; the commit
+/// path keeps it, because a committed walk's node IS this iteration's.
+fn journaled_concrete_traceback_attach(exc_ptr: pyre_object::PyObjectRef, attach: impl FnOnce()) {
+    let previous_head = crate::jitcode_dispatch::fbw_traceback_journal_head(exc_ptr);
+    attach();
+    crate::jitcode_dispatch::fbw_traceback_journal_push_if_attached(exc_ptr, previous_head);
+}
+
 fn record_top_level_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
@@ -557,12 +574,14 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
         (session.recording_frame_ptr, session.recording_jitcode_index)
     };
     if execute_concrete {
-        majit_metainterp::record_application_traceback_for_recording(
-            exc_ptr as usize as i64,
-            frame_ptr as i64,
-            jitcode_index,
-            opcode_position as i32,
-        );
+        journaled_concrete_traceback_attach(exc_ptr, || {
+            majit_metainterp::record_application_traceback_for_recording(
+                exc_ptr as usize as i64,
+                frame_ptr as i64,
+                jitcode_index,
+                opcode_position as i32,
+            );
+        });
     }
     let hook = majit_metainterp::record_application_traceback_hook_address();
     let frame = crate::state::pyjitcode_for_jitcode_index(jitcode_index)
@@ -620,11 +639,13 @@ fn record_exc_edge_discarded_tracebacks<Sym: WalkSym>(
     }
     let hook = majit_metainterp::record_discarded_level_traceback_hook_address();
     for &(w_code, py_pc) in levels.iter().rev() {
-        majit_metainterp::record_discarded_level_traceback_for_recording(
-            exc_ptr as usize as i64,
-            w_code as i64,
-            py_pc as i64,
-        );
+        journaled_concrete_traceback_attach(exc_ptr, || {
+            majit_metainterp::record_discarded_level_traceback_for_recording(
+                exc_ptr as usize as i64,
+                w_code as i64,
+                py_pc as i64,
+            );
+        });
         if hook.is_null() || exc.is_none() {
             continue;
         }
@@ -704,7 +725,7 @@ fn record_inline_application_traceback<Sym: WalkSym>(
         .and_then(|py_pc| {
             concrete_portal_frame(ctx, consts.jitcode_index).map(|frame| (frame, py_pc))
         });
-        match node_frame {
+        journaled_concrete_traceback_attach(exc_ptr, || match node_frame {
             Some((frame_ptr, py_pc)) => {
                 // `dispatch_bytecode` (pyopcode.py) writes `self.last_instr`
                 // before every opcode so a frame read while it runs answers for
@@ -736,7 +757,7 @@ fn record_inline_application_traceback<Sym: WalkSym>(
                 consts.jitcode_index,
                 opcode_position as i32,
             ),
-        }
+        });
     }
     let hook = majit_metainterp::record_inline_application_traceback_hook_address();
     if emit_runtime && !hook.is_null() && !exc.is_none() {

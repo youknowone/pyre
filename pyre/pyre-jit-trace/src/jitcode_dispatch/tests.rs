@@ -11733,3 +11733,67 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
         Err(DispatchError::MayForceNullRefArgUnsupported { pc: 186 }),
     ));
 }
+
+#[test]
+fn traceback_journal_rollback_unwinds_every_walk_node() {
+    // A recording walk attaches one node per frame it delivers the exception
+    // through, so by the time the walk ends the exception carries SEVERAL
+    // journaled nodes — the bridge handler entry that introduced the log only
+    // ever pushed one. A non-commit exit has to splice all of them back out, or
+    // the interpreter's replay records the same frames again and a raise that
+    // re-uses one exception object hands out a doubled chain.
+    use pyre_interpreter::pytraceback::{w_pytraceback_get_lasti, w_pytraceback_get_w_next,
+                                        w_pytraceback_new};
+    use pyre_object::interp_exceptions::{ExcKind, w_exception_get_traceback, w_exception_new,
+                                         w_exception_set_traceback};
+
+    // `frame` is only ever compared by identity here, and `w_code` only has to
+    // be a chain-terminating slot, so both stay NULL — the splice walks
+    // `w_next` and nothing dereferences either.
+    fn prepend(exc: pyre_object::PyObjectRef, lasti: i64) {
+        unsafe {
+            let head = w_exception_get_traceback(exc);
+            let node =
+                w_pytraceback_new(std::ptr::null_mut(), lasti, head, 1, pyre_object::PY_NULL);
+            w_exception_set_traceback(exc, node);
+        }
+    }
+
+    fn chain(exc: pyre_object::PyObjectRef) -> Vec<i64> {
+        let mut out = Vec::new();
+        let mut node = unsafe { w_exception_get_traceback(exc) };
+        while !node.is_null() {
+            out.push(unsafe { w_pytraceback_get_lasti(node) });
+            node = unsafe { w_pytraceback_get_w_next(node) };
+        }
+        out
+    }
+
+    super::fbw_store_journal_reset();
+    let exc = w_exception_new(ExcKind::ValueError, "boom");
+    // The node the raise itself already attached before the walk got here.
+    prepend(exc, 1);
+    assert_eq!(chain(exc), vec![1]);
+
+    // Callee level first, catching level last — the order the walk records in,
+    // and the reverse of the order the rollback has to undo.
+    for lasti in [2i64, 3] {
+        super::journaled_concrete_traceback_attach(exc, || prepend(exc, lasti));
+    }
+    assert_eq!(chain(exc), vec![3, 2, 1]);
+
+    super::fbw_store_journal_rollback();
+    assert_eq!(
+        chain(exc),
+        vec![1],
+        "a non-commit walk must unwind EVERY node it attached, not just the last"
+    );
+
+    // Commit keeps them: a committed walk's nodes ARE this delivery's.
+    for lasti in [4i64, 5] {
+        super::journaled_concrete_traceback_attach(exc, || prepend(exc, lasti));
+    }
+    super::fbw_store_journal_commit();
+    super::fbw_store_journal_rollback();
+    assert_eq!(chain(exc), vec![5, 4, 1], "a committed walk keeps its nodes");
+}

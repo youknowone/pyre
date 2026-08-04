@@ -40,25 +40,13 @@ fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
     // interpreter's `handle_exception` could record a node from — hence the
     // runtime emit when the IR-virtual prepend declines.
     //
-    // The concrete leg of the record mutates the live exception, and a walk
-    // that is later discarded would leave that mutation behind while the
-    // metainterp's own delivery attaches the node again. Journal the attach so
-    // a rollback restores `exception.w_traceback` to the head recorded here.
-    let traceback_exception = match exc_concrete {
-        ConcreteValue::Ref(exception) => Some(exception),
-        _ => None,
-    };
-    let traceback_before =
-        traceback_exception.and_then(crate::jitcode_dispatch::fbw_traceback_journal_head);
+    // The concrete leg of each record mutates the live exception; both
+    // recorders journal their own attach, so a walk that is later discarded
+    // does not leave the node behind for the metainterp's own delivery to
+    // record on top of.
     let emit_runtime = !record_prepend_application_traceback(wc, exc, exc_concrete, position);
     record_inline_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
     record_top_level_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
-    if let Some(exception) = traceback_exception {
-        crate::jitcode_dispatch::fbw_traceback_journal_push_if_attached(
-            exception,
-            traceback_before,
-        );
-    }
 }
 
 /// `executioncontext.py:91-107 leave` for a frame the bridge resumed into
