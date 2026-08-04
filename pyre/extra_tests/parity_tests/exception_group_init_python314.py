@@ -22,3 +22,5 @@ except TypeError as exc:
     assert str(exc) == "BaseExceptionGroup() takes no keyword arguments"
 else:
     raise AssertionError("BaseExceptionGroup.__init__ accepted a keyword")
+
+print("OK")

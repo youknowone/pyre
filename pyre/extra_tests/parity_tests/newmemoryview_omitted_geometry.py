@@ -5,7 +5,11 @@ the host-level default, so an explicitly passed `None` is a supplied argument
 that reaches `space.listview` and fails there.
 """
 
-import __pypy__
+try:
+    import __pypy__
+except ImportError:  # the CPython reference runner has no __pypy__
+    print("OK")
+    raise SystemExit
 
 source = memoryview(bytearray(b"abcdefgh"))
 

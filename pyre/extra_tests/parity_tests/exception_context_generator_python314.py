@@ -97,4 +97,4 @@ except IndexError:
 assert isinstance(nested, IndexError) and nested.args == ("inner",), nested
 assert nested.__context__ is None, nested.__context__
 
-print("ok")
+print("OK")

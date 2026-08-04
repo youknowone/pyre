@@ -30,3 +30,5 @@ except TypeError:
     pass
 else:
     raise AssertionError("type.__sizeof__ accepted a non-type receiver")
+
+print("OK")

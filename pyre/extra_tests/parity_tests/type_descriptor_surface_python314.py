@@ -46,3 +46,5 @@ class WithMeta(metaclass=Meta):
 
 assert WithMeta.__abstractmethods__ == "metaclass override"
 assert Meta.__abstractmethods__ is Meta.__dict__["__abstractmethods__"]
+
+print("OK")

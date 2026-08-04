@@ -28,3 +28,5 @@ for _ in range(3_000):
         traceback.tb_frame.clear()
     else:
         raise AssertionError("raises() returned")
+
+print("OK")

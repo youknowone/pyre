@@ -83,3 +83,5 @@ for name, expected in EXPECTED.items():
 
 assert IOError is OSError
 assert EnvironmentError is OSError
+
+print("OK")
