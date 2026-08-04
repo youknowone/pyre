@@ -5466,12 +5466,48 @@ where
                                 .as_ref()
                                 .is_some_and(|f| f(inner_key));
                             if already_compiled_here {
-                                if crate::majit_log_enabled() {
-                                    eprintln!(
-                                        "[jit] merge point pc={pc} already has compiled loop \
-                                         key={inner_key} — declining the cross-loop cut \
-                                         (pyjitpl.py:3005)"
-                                    );
+                                // pyjitpl.py:3004-3007 — the merge point just reached already owns a
+                                // procedure token, so upstream JUMPs into it rather than deriving a second
+                                // copy of that loop by cutting this trace.  `compile_trace` raises on
+                                // success (`raise_if_successful`, pyjitpl.py:3119-3123), which is why the
+                                // `current_merge_points` scan below is never reached in that case.
+                                //
+                                // The dispatcher holds no `&mut MetaInterp`, so the attempt is published to
+                                // the driver: `close_jump_into_key` names the token, `close_greens` /
+                                // `close_green_pc` name the greens it is keyed by (pyjitpl.py:3005
+                                // `get_procedure_token(greenboxes)` reads the greens of the merge point just
+                                // reached, not the trace-start header's).
+                                //
+                                // A key whose attempt already ran and did not compile keeps today's
+                                // behaviour — decline and keep tracing.  Re-attempting would re-run the
+                                // optimizer over a growing trace-so-far for a deterministic decline; the
+                                // same latch (`TraceCtx::declined_cross_loop_closes`) guards the equivalent
+                                // site in the other frontend.
+                                if ctx.cross_loop_close_declined(inner_key) {
+                                    if crate::majit_log_enabled() {
+                                        eprintln!(
+                                            "[jit] merge point pc={pc} already has compiled loop \
+                                             key={inner_key} — declining the cross-loop cut \
+                                             (pyjitpl.py:3005)"
+                                        );
+                                    }
+                                } else {
+                                    ctx.close_greens = Some(mp_greens.clone());
+                                    ctx.close_green_pc = Some(pc);
+                                    ctx.close_jump_into_key = Some(inner_key);
+                                    if capture_walk_reds {
+                                        ctx.walk_final_pc = Some(pc as usize);
+                                        ctx.walk_final_reds = std::mem::take(&mut walk_reds);
+                                    }
+                                    if crate::majit_log_enabled() {
+                                        eprintln!(
+                                            "[jit] merge point pc={pc} has compiled loop key={inner_key} \
+                                             — compile_trace JUMP (pyjitpl.py:3005)"
+                                        );
+                                    }
+                                    // GUARD_FUTURE_CONDITION was already emitted unconditionally at the
+                                    // reached_loop_header entry above (pyjitpl.py:2993).
+                                    return TraceAction::CloseLoop;
                                 }
                             } else if ctx.has_merge_point_at(inner_key, header_pc) {
                                 if crate::jitdriver::spdiag_enabled() {

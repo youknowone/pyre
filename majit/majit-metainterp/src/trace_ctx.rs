@@ -320,6 +320,11 @@ pub struct TraceCtx {
     /// greens, so reconstructing the interpreter-entered key for a close needs
     /// this target in addition to the merge-point green tuple.
     pub(crate) close_green_pc: Option<i64>,
+    /// pyjitpl.py:3005-3007 `compile_trace(live_arg_boxes, ptoken)`: the procedure
+    /// token key of the merge point the trace just reached, set when that merge point
+    /// already has compiled targets.  A close carrying this JUMPs into the existing
+    /// loop instead of compiling a new one, and is read-and-cleared by the driver.
+    pub(crate) close_jump_into_key: Option<u64>,
     /// pyjitpl.py:2979 reached_loop_header parity: callback to check
     /// has_compiled_targets(ptoken) for a given green key. Bridge traces
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
@@ -1444,6 +1449,7 @@ impl TraceCtx {
             header_greens: None,
             close_greens: None,
             close_green_pc: None,
+            close_jump_into_key: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -1529,6 +1535,7 @@ impl TraceCtx {
             header_greens: None,
             close_greens: None,
             close_green_pc: None,
+            close_jump_into_key: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -1925,6 +1932,12 @@ impl TraceCtx {
         }
     }
 
+    /// See [`TraceCtx::close_jump_into_key`].  Read-and-clear: the answer is only
+    /// meaningful to the close that just set it.
+    pub fn take_close_jump_into_key(&mut self) -> Option<u64> {
+        self.close_jump_into_key.take()
+    }
+
     /// Mark that the current back-edge was reached inside an inline callee
     /// frame and must not be unrolled (opimpl_jit_merge_point
     /// portal_call_depth>0). The trace step drains this via
@@ -2044,7 +2057,9 @@ impl TraceCtx {
             );
             key.types.get(1..)?.to_vec()
         } else {
-            self.driver_descriptor.as_ref().map(|d| d.green_args_spec())?
+            self.driver_descriptor
+                .as_ref()
+                .map(|d| d.green_args_spec())?
         };
 
         let mut values = Vec::with_capacity(spec.len() + 1);

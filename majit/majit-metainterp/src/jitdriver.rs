@@ -2782,6 +2782,107 @@ impl<S: JitState> JitDriver<S> {
                         }
                         None => Vec::new(),
                     };
+                    // pyjitpl.py:3001-3007 reached_loop_header:
+                    //
+                    //     if not self.partial_trace:
+                    //         ptoken = self.get_procedure_token(greenboxes)
+                    //         if has_compiled_targets(ptoken):
+                    //             self.compile_trace(live_arg_boxes, ptoken)
+                    //     # raises in case it works
+                    //
+                    // The walker published the token key it reached (`close_jump_into_key`); this is
+                    // the `compile_trace` call, and its success ends the trace exactly the way
+                    // `raise_if_successful` (pyjitpl.py:3119-3123) does.
+                    if let Some(target_key) = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.take_close_jump_into_key())
+                    {
+                        let mut compiled = false;
+                        let mut continue_running_normally_values = None;
+                        // pyjitpl.py:3003 `if not self.partial_trace:` — a retrace must not bridge
+                        // into the very loop it exists to respecialize.
+                        if self.meta.partial_trace().is_none()
+                            && self.meta.has_compiled_targets(target_key)
+                        {
+                            continue_running_normally_values = {
+                                let trace_meta = self.meta.trace_meta().cloned();
+                                match (trace_meta, self.sym.as_ref()) {
+                                    (Some(meta), Some(sym)) => {
+                                        self.meta.trace_ctx().and_then(|ctx| {
+                                            S::close_loop_live_values(
+                                                ctx,
+                                                sym,
+                                                &meta,
+                                                &live_arg_boxes,
+                                            )
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            // pyjitpl.py:3211 `compile.compile_trace(self, self.resumekey, ...)`:
+                            // the resumekey decides the bridge shape.  A guard origin is a
+                            // ResumeGuardDescr (`close_bridge` patches the failing guard); no bridge
+                            // origin is a ResumeFromInterpDescr entry bridge
+                            // (`compile_trace_from_interp`, compile.py:1002-1021).
+                            let bridge_origin =
+                                self.meta.bridge_info().map(|b| (b.trace_id, b.fail_index));
+                            compiled = match bridge_origin {
+                                Some((trace_id, fail_index)) => matches!(
+                                    self.meta.close_bridge(
+                                        target_key,
+                                        trace_id,
+                                        fail_index,
+                                        &live_arg_boxes,
+                                    ),
+                                    crate::pyjitpl::BridgeCompileResult::Compiled
+                                ),
+                                None => match self.compile_trace_entry_data() {
+                                    Some((original_green_key, entry_meta)) => matches!(
+                                        self.meta.compile_trace_from_interp(
+                                            target_key,
+                                            &live_arg_boxes,
+                                            original_green_key,
+                                            entry_meta,
+                                        ),
+                                        crate::CompileOutcome::Compiled { .. }
+                                    ),
+                                    None => false,
+                                },
+                            };
+                        }
+                        if compiled {
+                            // pyjitpl.py:3220 raise_if_successful → raise_continue_running_normally:
+                            // the trace is over, the interpreter enters the loop it jumped into.
+                            self.sym = None;
+                            self.meta.clear_trace_session();
+                            self.note_continue_running_normally(
+                                continue_running_normally_values,
+                                None,
+                            );
+                            self.meta.finish_trace_live();
+                            self.meta.clear_pending_abort();
+                            return;
+                        }
+                        // pyjitpl.py:3009-3010: `compile_trace` returned without raising, so the
+                        // trace is NOT given up — tracing continues.  Latch the decline so the walk
+                        // does not re-run the optimizer over the same key, and re-enter the walk at
+                        // the merge point's own pc (pyjitpl.py:1577 `self.pc = saved_pc`).
+                        if let Some(ctx) = self.meta.trace_ctx() {
+                            ctx.note_cross_loop_close_declined(target_key);
+                            ctx.close_greens = None;
+                            ctx.close_green_pc = None;
+                            ctx.merge_point_resumed = true;
+                        }
+                        // The walk-final handoff staged at the top of this arm describes a trace
+                        // that ENDED; discard it, same as the `take_keep_tracing_after_close` path
+                        // at the bottom of this arm.
+                        self.meta.single_pass_outcome = None;
+                        self.meta.single_pass_scalar_values = None;
+                        self.meta.single_pass_virt_array_values = None;
+                        continue;
+                    }
                     // pyjitpl.py:2979-3036 reached_loop_header parity.
                     // Path 1: bridge — only if has_compiled_targets (line 2982).
                     //
