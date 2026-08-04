@@ -2798,7 +2798,7 @@ impl<S: JitState> JitDriver<S> {
                         .trace_ctx()
                         .and_then(|ctx| ctx.take_close_jump_into_key())
                     {
-                        let mut compiled = false;
+                        let mut result = crate::pyjitpl::BridgeCompileResult::Declined;
                         let mut continue_running_normally_values = None;
                         // pyjitpl.py:3003 `if not self.partial_trace:` — a retrace must not bridge
                         // into the very loop it exists to respecialize.
@@ -2828,15 +2828,12 @@ impl<S: JitState> JitDriver<S> {
                             // (`compile_trace_from_interp`, compile.py:1002-1021).
                             let bridge_origin =
                                 self.meta.bridge_info().map(|b| (b.trace_id, b.fail_index));
-                            compiled = match bridge_origin {
-                                Some((trace_id, fail_index)) => matches!(
-                                    self.meta.close_bridge(
-                                        target_key,
-                                        trace_id,
-                                        fail_index,
-                                        &live_arg_boxes,
-                                    ),
-                                    crate::pyjitpl::BridgeCompileResult::Compiled
+                            result = match bridge_origin {
+                                Some((trace_id, fail_index)) => self.meta.close_bridge(
+                                    target_key,
+                                    trace_id,
+                                    fail_index,
+                                    &live_arg_boxes,
                                 ),
                                 // compile.py:269-270: a cross-loop CUT keeps its cut prefix
                                 // in `front_target_tokens[0]`, where a loop closed at its own
@@ -2858,51 +2855,71 @@ impl<S: JitState> JitDriver<S> {
                                 // need not be reached — and declining the guard origin too
                                 // makes `pi/pi.jinseo` at `MAJIT_THRESHOLD=50` compute wrong
                                 // digits from byte 865, same length, no crash.
-                                None if self.meta.is_cross_loop_cut_key(target_key) => false,
+                                None if self.meta.is_cross_loop_cut_key(target_key) => {
+                                    crate::pyjitpl::BridgeCompileResult::Declined
+                                }
                                 None => match self.compile_trace_entry_data() {
-                                    Some((original_green_key, entry_meta)) => matches!(
-                                        self.meta.compile_trace_from_interp(
+                                    Some((original_green_key, entry_meta)) => {
+                                        let outcome = self.meta.compile_trace_from_interp(
                                             target_key,
                                             &live_arg_boxes,
                                             original_green_key,
                                             entry_meta,
-                                        ),
-                                        crate::CompileOutcome::Compiled { .. }
-                                    ),
-                                    None => false,
+                                        );
+                                        self.meta.classify_compile_outcome(outcome)
+                                    }
+                                    None => crate::pyjitpl::BridgeCompileResult::Declined,
                                 },
                             };
                         }
-                        if compiled {
-                            // pyjitpl.py:3220 raise_if_successful → raise_continue_running_normally:
-                            // the trace is over, the interpreter enters the loop it jumped into.
-                            self.sym = None;
-                            self.meta.clear_trace_session();
-                            self.note_continue_running_normally(
-                                continue_running_normally_values,
-                                None,
-                            );
-                            self.meta.finish_trace_live();
-                            self.meta.clear_pending_abort();
-                            return;
+                        match result {
+                            crate::pyjitpl::BridgeCompileResult::Compiled => {
+                                // pyjitpl.py:3220 raise_if_successful → raise_continue_running_normally:
+                                // the trace is over, the interpreter enters the loop it jumped into.
+                                self.sym = None;
+                                self.meta.clear_trace_session();
+                                self.note_continue_running_normally(
+                                    continue_running_normally_values,
+                                    None,
+                                );
+                                self.meta.finish_trace_live();
+                                self.meta.clear_pending_abort();
+                                return;
+                            }
+                            crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
+                                // pyjitpl.py:3003 and the sibling RetraceNeeded
+                                // arm below: `compile_trace` armed
+                                // `partial_trace`, so fall through to the
+                                // reached_loop_header path that routes
+                                // compile_loop -> compile_retrace in this call.
+                                self.bridge_attempt_declined = true;
+                            }
+                            crate::pyjitpl::BridgeCompileResult::Declined => {
+                                // pyjitpl.py:3009-3010: `compile_trace` returned without raising, so the
+                                // trace is NOT given up — tracing continues.  Latch the decline so the walk
+                                // does not re-run the optimizer over the same key, and re-enter the walk at
+                                // the merge point's own pc (pyjitpl.py:1577 `self.pc = saved_pc`).
+                                if let Some(ctx) = self.meta.trace_ctx() {
+                                    ctx.note_cross_loop_close_declined(target_key);
+                                    ctx.close_greens = None;
+                                    ctx.close_green_pc = None;
+                                    ctx.merge_point_resumed = true;
+                                }
+                                // The walk-final handoff staged at the top of this arm describes a trace
+                                // that ENDED; discard it, same as the `take_keep_tracing_after_close` path
+                                // at the bottom of this arm.
+                                self.meta.single_pass_outcome = None;
+                                self.meta.single_pass_scalar_values = None;
+                                self.meta.single_pass_virt_array_values = None;
+                                continue;
+                            }
+                            crate::pyjitpl::BridgeCompileResult::Failed => {
+                                self.meta.abort_trace(false);
+                                self.sym = None;
+                                self.meta.clear_trace_session();
+                                return;
+                            }
                         }
-                        // pyjitpl.py:3009-3010: `compile_trace` returned without raising, so the
-                        // trace is NOT given up — tracing continues.  Latch the decline so the walk
-                        // does not re-run the optimizer over the same key, and re-enter the walk at
-                        // the merge point's own pc (pyjitpl.py:1577 `self.pc = saved_pc`).
-                        if let Some(ctx) = self.meta.trace_ctx() {
-                            ctx.note_cross_loop_close_declined(target_key);
-                            ctx.close_greens = None;
-                            ctx.close_green_pc = None;
-                            ctx.merge_point_resumed = true;
-                        }
-                        // The walk-final handoff staged at the top of this arm describes a trace
-                        // that ENDED; discard it, same as the `take_keep_tracing_after_close` path
-                        // at the bottom of this arm.
-                        self.meta.single_pass_outcome = None;
-                        self.meta.single_pass_scalar_values = None;
-                        self.meta.single_pass_virt_array_values = None;
-                        continue;
                     }
                     // pyjitpl.py:2979-3036 reached_loop_header parity.
                     // Path 1: bridge — only if has_compiled_targets (line 2982).
@@ -3504,6 +3521,10 @@ impl<S: JitState> JitDriver<S> {
                     }
                     let meta = self.meta.take_trace_meta().unwrap();
                     if let Some(green_key) = self.meta.compile_simple_loop(meta) {
+                        // pyjitpl.py:2760 reads the greenkey from
+                        // current_merge_points; without staging the key here,
+                        // the segmented-loop abort hook reports key 0.
+                        self.meta.pending_abort_green_key = Some(green_key);
                         // pyjitpl.py:1662-1663 line-by-line: pass the compiled
                         // `target_token` returned by `compile_simple_loop` to
                         // `attach_procedure_to_interp`, NOT a fresh synthetic

@@ -11013,16 +11013,12 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// pyjitpl.py:2982-2983: close_bridge — compile_trace wrapper that
-    /// maps CompileOutcome to BridgeCompileResult.
-    pub fn close_bridge(
-        &mut self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        finish_args: &[OpRef],
-    ) -> BridgeCompileResult {
-        let outcome = self.compile_trace(green_key, finish_args, Some((trace_id, fail_index)));
+    /// pyjitpl.py:2982-2983: the `compile_trace` outcome classification shared by
+    /// every close that goes through `compile_trace_inner` — the guard-origin
+    /// bridge (`close_bridge`) and the interp-origin entry bridge
+    /// (`compile_trace_from_interp`) alike, since `retrace_after_bridge` is armed
+    /// inside the shared compile path rather than per origin.
+    pub(crate) fn classify_compile_outcome(&self, outcome: CompileOutcome) -> BridgeCompileResult {
         match outcome {
             CompileOutcome::Compiled { .. } => BridgeCompileResult::Compiled,
             _ if self.retrace_after_bridge => {
@@ -11038,6 +11034,19 @@ impl<M: Clone> MetaInterp<M> {
             CompileOutcome::Cancelled if self.tracing.is_some() => BridgeCompileResult::Declined,
             CompileOutcome::Cancelled | CompileOutcome::Aborted => BridgeCompileResult::Failed,
         }
+    }
+
+    /// pyjitpl.py:2982-2983: close_bridge — compile_trace wrapper that
+    /// maps CompileOutcome to BridgeCompileResult.
+    pub fn close_bridge(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        finish_args: &[OpRef],
+    ) -> BridgeCompileResult {
+        let outcome = self.compile_trace(green_key, finish_args, Some((trace_id, fail_index)));
+        self.classify_compile_outcome(outcome)
     }
 
     /// RPython-compatible helper name from compile.py.
