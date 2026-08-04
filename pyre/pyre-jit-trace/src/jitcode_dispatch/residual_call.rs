@@ -3554,7 +3554,10 @@ pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
 fn inline_callee_py_pc<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, jit_pc: usize) -> Option<u32> {
     let consts = ctx.inline_callee_consts?;
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
-    Some(python_pc_for_jitcode_pc(&pjc.metadata, jit_pc))
+    Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
+        &pjc.metadata,
+        jit_pc,
+    ))
 }
 
 /// Convenience wrapper for [`walker_vable_and_vrefs_before_residual_call`].
@@ -3579,7 +3582,7 @@ fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
         return;
     }
 
-    let callee_py_pc = python_pc_for_jitcode_pc(&pjc.metadata, jit_pc);
+    let callee_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, jit_pc);
     let last_instr = ctx.trace_ctx.const_int(callee_py_pc as i64);
     let last_instr_descr = crate::descr::pyframe_next_instr_descr();
     let last_instr_idx = last_instr_descr.index();
