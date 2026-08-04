@@ -3031,22 +3031,20 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // Evaluated only behind the three cheaper terms, so the short-circuit order
     // is the same one the single condition had.  Keeping the class lets the
     // decline census say which admission would widen it.
-    let branchy_handler_safety = if contains_raise
-        && !strict_inlinable
-        && jitcode_has_exception_handler(body.code)
-    {
-        Some(fbw_callee_body_replay_safety(
-            body.code,
-            &exact_numeric_args,
-            body.num_regs_i,
-            body.constants_i,
-            body.num_regs_r,
-            body.constants_r,
-            callee_descr_refs,
-        ))
-    } else {
-        None
-    };
+    let branchy_handler_safety =
+        if contains_raise && !strict_inlinable && jitcode_has_exception_handler(body.code) {
+            Some(fbw_callee_body_replay_safety(
+                body.code,
+                &exact_numeric_args,
+                body.num_regs_i,
+                body.constants_i,
+                body.num_regs_r,
+                body.constants_r,
+                callee_descr_refs,
+            ))
+        } else {
+            None
+        };
     if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean) {
         // A branchy callee with its own exception handler can take a structural
         // abort after an earlier effectful Python opcode. The current

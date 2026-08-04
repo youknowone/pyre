@@ -8651,6 +8651,11 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
     }
     unsafe {
+        // A class object is an instance of its metaclass, so `space.str`
+        // resolves `__str__` there before the `<class ...>` representation.
+        if let Some(r) = crate::display::type_metaclass_dunder_obj(obj, "__str__")? {
+            return Ok(r);
+        }
         if !obj.is_null() && std::ptr::eq((*obj).ob_type, &INSTANCE_TYPE as *const PyType) {
             if let Some(r) = crate::display::try_call_dunder_obj_above_object(obj, "__str__")? {
                 return Ok(r);

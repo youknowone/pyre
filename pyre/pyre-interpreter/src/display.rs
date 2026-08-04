@@ -1040,6 +1040,16 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__str__")? {
             return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
         }
+        // A class object is an instance of its metaclass, so `space.str`
+        // resolves `__str__` on that metaclass before falling back to the
+        // `<class ...>` representation.  `type` defines no `__str__`, so a
+        // metaclass without an override resolves to `object`'s and declines
+        // here, leaving `py_repr_wtf8` below to produce the native text.  The
+        // override may return a lone surrogate, so read it as WTF-8 rather
+        // than folding to `&str`.
+        if let Some(result) = type_metaclass_dunder_obj(obj, "__str__")? {
+            return Ok(pyre_object::w_str_get_wtf8(result).to_wtf8_buf());
+        }
         // A `types.ModuleType` subclass `__str__` override wins; without one,
         // `str` falls back to `__repr__` through `py_repr`.
         if pyre_object::is_module(obj) {

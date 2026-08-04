@@ -287,8 +287,7 @@ pub const CODE_W_QUALNAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_qualnam
 /// Field offset of `w_name` within `PyCode`.
 pub const CODE_W_NAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_name);
 /// Field offset of `co_firstlineno_raw` within `PyCode`.
-pub const CODE_CO_FIRSTLINENO_RAW_OFFSET: usize =
-    std::mem::offset_of!(PyCode, co_firstlineno_raw);
+pub const CODE_CO_FIRSTLINENO_RAW_OFFSET: usize = std::mem::offset_of!(PyCode, co_firstlineno_raw);
 
 /// The `co_firstlineno` slot, exactly as [`code_get_field`] reads it.
 ///
