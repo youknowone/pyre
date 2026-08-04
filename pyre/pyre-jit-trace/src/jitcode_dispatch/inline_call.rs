@@ -4916,6 +4916,19 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     if init_override.is_none() && r_args.len() != 2 {
         return type_call_decline("surplus args without __init__");
     }
+    // PyPy `typeobject.py:descr_call` keeps `w_newobject` in its own live
+    // frame while it invokes `__init__`, checks that the latter returned
+    // None, and finally returns `w_newobject`.  The direct-allocation shortcut
+    // below has no corresponding `descr_call` MIFrame.  If a guard fails in
+    // the inlined `__init__`, blackhole therefore connects `__init__`'s None
+    // return directly to the Python caller's CALL result and loses the newly
+    // allocated instance.  Keep an overridden initializer on the ordinary
+    // residual constructor path until that owner frame is represented; the
+    // no-override leaf remains safe to fold because no intermediate return
+    // crosses the caller boundary.
+    if init_override.is_some() {
+        return type_call_decline("overridden __init__ requires descr_call frame");
+    }
     let inlinable_init = match init_override {
         Some(init) => match unsafe { resolve_inlinable_callee(init) } {
             Some(resolved) => Some((init, resolved)),

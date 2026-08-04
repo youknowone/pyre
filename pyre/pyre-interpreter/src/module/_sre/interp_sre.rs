@@ -1080,11 +1080,18 @@ fn sre_pattern_search(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// Read an optional positional int argument (pos/endpos/count), using
 /// `default` only when the argument is absent.  A supplied argument is
 /// converted with `__index__` (`@unwrap_spec(pos=int, ...)` →
-/// `space.getindex_w`); a non-integer value raises TypeError rather than
-/// silently falling back.
+/// `space.index` + machine-int unwrapping); a non-integer value raises
+/// TypeError and an out-of-range value raises OverflowError.  PyPy's
+/// `@unwrap_spec(pos=int)` uses `int_w`, not the clamping
+/// `getindex_w(..., w_exception=None)` variant.
+fn sre_index_int(w: PyObjectRef) -> Result<i64, crate::PyError> {
+    let indexed = crate::baseobjspace::space_index(w)?;
+    crate::baseobjspace::int_w(indexed)
+}
+
 fn arg_int(args: &[PyObjectRef], idx: usize, default: i64) -> Result<i64, crate::PyError> {
     match args.get(idx) {
-        Some(&w) if !w.is_null() => crate::baseobjspace::getindex_w(w),
+        Some(&w) if !w.is_null() => sre_index_int(w),
         _ => Ok(default),
     }
 }
@@ -1102,7 +1109,7 @@ fn arg_int_kw(
     default: i64,
 ) -> Result<i64, crate::PyError> {
     if let Some(w) = crate::builtins::kwarg_get(kwargs, name) {
-        return crate::baseobjspace::getindex_w(w);
+        return sre_index_int(w);
     }
     arg_int(pos_args, idx, default)
 }

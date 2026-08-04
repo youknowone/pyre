@@ -555,6 +555,13 @@ pub(crate) fn cdata_bytes(obj: PyObjectRef) -> Option<&'static [u8]> {
 /// null-niche `Option<PyObjectRef>` crosses it.
 #[majit_macros::dont_look_inside]
 pub(crate) fn cdata_bytes_object(obj: PyObjectRef) -> Option<PyObjectRef> {
+    // PyPy's CData buffer path is reached only through a CData instance's
+    // buffer implementation.  `buffer_as_bytes_like` probes this helper for
+    // arbitrary objects, so preserve that owner check here before any CData
+    // dict field (`_b_`, `_b_addr_`, ...) is read.
+    if !is_cdata_instance(obj) {
+        return None;
+    }
     cdata_bytes(obj).map(pyre_object::bytesobject::w_bytes_from_bytes)
 }
 

@@ -717,6 +717,7 @@ pub fn install_builtin_modules() {
         crate::module::array::startup_array_module,
     );
     register_builtin_module("_csv", crate::module::_csv::init);
+    register_builtin_module("_json", crate::module::_json::init);
     register_builtin_module("_tokenize", crate::module::_tokenize::init);
     register_builtin_module("_scproxy", init_scproxy);
     register_builtin_module("_string", init_string_module);
