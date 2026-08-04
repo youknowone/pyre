@@ -1678,6 +1678,28 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::pyobject::TUPLE_TYPE as *const _ as usize,
         w_tuple_tid,
     );
+    // Each arity-2 specialisation gets its own `ob_type`, so bind each to its
+    // own typeid. `cls_of_gcref` reads that `ob_type`, and without a binding
+    // `subclass_range` cannot answer for it — which makes
+    // `protect_speculative_field` reject any pure field fold on a constant
+    // specialised tuple and invalidate the loop rather than decline the fold.
+    for (pytype_ptr, tid) in [
+        (
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE as *const _ as usize,
+            spec_tuple_ii_tid,
+        ),
+        (
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE as *const _ as usize,
+            spec_tuple_ff_tid,
+        ),
+        (
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE as *const _ as usize,
+            spec_tuple_oo_tid,
+        ),
+    ] {
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype_ptr, tid);
+        pytype_to_tid.insert(pytype_ptr, tid);
+    }
     // BuiltinCode is pre-registered (rather than picked up by the
     // foreign-pytype loop below) because the loop hard-codes
     // `size_of::<PyObject>()` as the payload size, while the
