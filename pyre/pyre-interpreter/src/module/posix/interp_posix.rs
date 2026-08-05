@@ -2514,6 +2514,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 )));
             }
         };
+        // The three arguments are unwrapped in signature order — `path`,
+        // `dir_fd`, `follow_symlinks` (`interp_posix.py:610-614`) — because
+        // `gateway.py:705` applies the unwrap specs in that order and each can
+        // both raise and run user code: `__fspath__` for `path`, `__index__`
+        // for `dir_fd`, `__bool__` for `follow_symlinks`.
+        //
+        // interp_posix.py:611,659 — `stat` takes `path_or_fd(allow_fd=True)`
+        // and `lstat` takes `allow_fd=False`, which is also what makes their
+        // type errors name different allowed types.
+        let path = crate::gateway::fsencode_path_or_fd_w(path, name, default_follow)?;
         // `stat`/`lstat` type `dir_fd` as `DirFD(rposix.HAVE_FSTATAT)`
         // (`interp_posix.py:612,660`), whose `unwrap` is `_unwrap_dirfd`
         // (:274-278).
@@ -2527,15 +2537,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Some(v) => crate::baseobjspace::is_true(v)?,
             None => default_follow,
         };
-        // interp_posix.py:611,659 — `stat` takes `path_or_fd(allow_fd=True)`
-        // and `lstat` takes `allow_fd=False`, which is also what makes their
-        // type errors name different allowed types.
-        let path = crate::gateway::fsencode_path_or_fd_w(path, name, default_follow)?;
         // interp_posix.py:634-644 `do_stat` tests the descriptor first: with one
         // in hand neither other argument has anything to apply to, and both
         // rejections precede the platform's dir_fd availability.
         if path.as_fd != -1 {
             if dir_fd.is_some() {
+                // 3.14 words this "can't specify dir_fd without matching
+                // path"; `interp_posix.py:639` says "can't specify both
+                // dir_fd and fd". The parity suite's oracle is CPython.
                 return Err(crate::PyError::value_error(format!(
                     "{name}: can't specify dir_fd without matching path"
                 )));

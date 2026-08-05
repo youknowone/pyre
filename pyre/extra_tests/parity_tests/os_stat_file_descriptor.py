@@ -80,6 +80,39 @@ try:
     else:
         raise AssertionError("lstat accepted a float")
 
+    # The arguments are unwrapped in signature order, so with more than one of
+    # them bad it is the leftmost that answers. Each can also run user code —
+    # `__fspath__`, `__index__`, `__bool__` — so the order is observable even
+    # when nothing raises.
+    try:
+        os.stat(1.5, dir_fd=1.5)
+    except TypeError as exc:
+        expected = "stat: path should be string, bytes, os.PathLike or integer, not float"
+        assert str(exc) == expected, str(exc)
+    else:
+        raise AssertionError("stat accepted a float path")
+
+    order = []
+
+    class Spy:
+        def __fspath__(self):
+            order.append("path")
+            return tmp
+
+    class Truthy:
+        def __bool__(self):
+            order.append("follow_symlinks")
+            return True
+
+    try:
+        os.stat(Spy(), dir_fd=1.5, follow_symlinks=Truthy())
+    except TypeError as exc:
+        assert str(exc) == "argument should be integer or None, not float", str(exc)
+    else:
+        raise AssertionError("stat accepted a float dir_fd")
+    # `path` was resolved, `dir_fd` then rejected, `follow_symlinks` never read.
+    assert order == ["path"], order
+
     # A descriptor no call can serve reports the descriptor, not the type: -1
     # is an OSError either way. Which errno it carries is a property of the
     # libc path taken and differs between the two entry points even upstream
