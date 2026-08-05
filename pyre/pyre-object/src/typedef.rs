@@ -376,6 +376,10 @@ pub const MEMBER_TYPE_ITEMSIZE: u32 = MEMBER_DIRECT_FLAG | 58;
 pub const MEMBER_TYPE_WEAKREFOFFSET: u32 = MEMBER_DIRECT_FLAG | 59;
 /// CPython 3.14 `type_members.__dictoffset__`.
 pub const MEMBER_TYPE_DICTOFFSET: u32 = MEMBER_DIRECT_FLAG | 60;
+/// CPython 3.14 `OSError_members.winerror`, backed by PyPy's `w_winerror`.
+/// Declared on every platform, registered on `OSError` only where the
+/// platform has Windows error codes (`interp_exceptions.py:723-728`).
+pub const MEMBER_OS_ERROR_WINERROR: u32 = MEMBER_DIRECT_FLAG | 61;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

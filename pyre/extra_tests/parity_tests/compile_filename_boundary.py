@@ -16,7 +16,21 @@ A `bytearray` filename is deliberately absent: it is a readable buffer that
 and this suite has to pass under CPython too.
 """
 
+import sys
+
 SOURCE = "x = 1"
+
+# The filename the filesystem encoding carries but plain UTF-8 text cannot, and
+# the bytes that spell it.  Windows encodes with `surrogatepass` (PEP 529), so
+# the lone surrogate is spelled by its own three UTF-8 bytes and a byte that
+# begins no sequence has no spelling at all; every other platform uses
+# `surrogateescape`, where that same byte is what the surrogate stands for.
+if sys.platform == "win32":
+    NAME_BYTES, NAME_TEXT = b"\xed\xb3\xbf.py", "\udcff.py"
+    UNSPELLABLE = b"\xff.py"
+else:
+    NAME_BYTES, NAME_TEXT = b"\xff.py", "\udcff.py"
+    UNSPELLABLE = None
 
 
 class Path:
@@ -33,14 +47,23 @@ assert compile(SOURCE, "plain.py", "exec").co_filename == "plain.py"
 # bytes decode with the filesystem encoding.  The ASCII case matters on its own:
 # it needs no surrogate to expose a filename that never reaches the code object.
 assert compile(SOURCE, b"ascii.py", "exec").co_filename == "ascii.py"
-assert compile(SOURCE, b"\xff.py", "exec").co_filename == "\udcff.py"
+assert compile(SOURCE, NAME_BYTES, "exec").co_filename == NAME_TEXT
 
-# A str already carrying a surrogate escape encodes back to that same byte
-# instead of raising UnicodeEncodeError.
-assert compile(SOURCE, "\udcff.py", "exec").co_filename == "\udcff.py"
+# A str the encoding can only spell as a surrogate encodes back to the same
+# bytes instead of raising UnicodeEncodeError.
+assert compile(SOURCE, NAME_TEXT, "exec").co_filename == NAME_TEXT
+
+# Bytes the encoding cannot spell are reported, not renamed.
+if UNSPELLABLE is not None:
+    try:
+        compile(SOURCE, UNSPELLABLE, "exec")
+    except UnicodeDecodeError:
+        pass
+    else:
+        raise AssertionError("compile() invented a spelling for %r" % (UNSPELLABLE,))
 
 # `__fspath__` is honoured, and may answer with either str or bytes.
-assert compile(SOURCE, Path(b"\xff.py"), "exec").co_filename == "\udcff.py"
+assert compile(SOURCE, Path(NAME_BYTES), "exec").co_filename == NAME_TEXT
 assert compile(SOURCE, Path("spelled.py"), "exec").co_filename == "spelled.py"
 
 # An object that is neither a path nor a string is a TypeError, not a filename
@@ -75,9 +98,9 @@ else:
 # The filename a SyntaxError reports is the same one the successful compile
 # would have recorded.
 try:
-    compile("(", b"\xff.py", "exec")
+    compile("(", NAME_BYTES, "exec")
 except SyntaxError as exc:
-    assert exc.filename == "\udcff.py", ascii(exc.filename)
+    assert exc.filename == NAME_TEXT, ascii(exc.filename)
 else:
     raise AssertionError("compile() accepted an unterminated '('")
 
@@ -87,26 +110,29 @@ else:
 code = compile(SOURCE, "before.py", "exec")
 assert 'file "before.py"' in repr(code), repr(code)
 
-replaced = code.replace(co_filename="\udcff.py")
-assert replaced.co_filename == "\udcff.py"
-assert 'file "\udcff.py"' in repr(replaced), ascii(repr(replaced))
+replaced = code.replace(co_filename=NAME_TEXT)
+assert replaced.co_filename == NAME_TEXT
+assert 'file "%s"' % NAME_TEXT in repr(replaced), ascii(repr(replaced))
 
 # `pycode.py:570-572` reports the zero sentinel as line -1.
 assert 'line -1>' in repr(code.replace(co_firstlineno=0)), ascii(
     repr(code.replace(co_firstlineno=0))
 )
 
-# and a filename that never had a UTF-8 spelling reaches repr() the same way.
-from_bytes = compile(SOURCE, b"\xff.py", "exec")
-assert 'file "\udcff.py"' in repr(from_bytes), ascii(repr(from_bytes))
+# and a filename that has no plain-text spelling reaches repr() the same way.
+from_bytes = compile(SOURCE, NAME_BYTES, "exec")
+assert 'file "%s"' % NAME_TEXT in repr(from_bytes), ascii(repr(from_bytes))
 
 
 # Every reader of a code object agrees on the filename, so a frame built from
 # one points at the real file rather than at "<string>".
 namespace = {}
-exec(compile("def f():\n    import sys\n    return sys._getframe()\n", b"\xff.py", "exec"), namespace)
+exec(
+    compile("def f():\n    import sys\n    return sys._getframe()\n", NAME_BYTES, "exec"),
+    namespace,
+)
 frame = namespace["f"]()
-assert frame.f_code.co_filename == "\udcff.py", ascii(frame.f_code.co_filename)
+assert frame.f_code.co_filename == NAME_TEXT, ascii(frame.f_code.co_filename)
 assert "�" not in repr(frame), ascii(repr(frame))
 
 print("OK")

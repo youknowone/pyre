@@ -13,6 +13,7 @@ round-trips back to the bytes it came from.
 """
 
 import collections
+import sys
 
 
 class C:
@@ -50,9 +51,13 @@ try:
 except ValueError as exc:
     assert repr(exc.args) == "(s\udcff,)", ascii(repr(exc.args))
 
-# a code object names a file that never had a UTF-8 spelling, and stays exact
-# when a container formats it
-code = compile("x = 1", b"\xff.py", "exec")
+# a code object names a file that plain text cannot spell, and stays exact when
+# a container formats it.  The bytes that name it follow the filesystem
+# encoding: `surrogatepass` on Windows spells the surrogate with its own three
+# UTF-8 bytes, `surrogateescape` elsewhere stands it in for a byte that begins
+# no sequence.
+FILENAME_BYTES = b"\xed\xb3\xbf.py" if sys.platform == "win32" else b"\xff.py"
+code = compile("x = 1", FILENAME_BYTES, "exec")
 assert repr(code).count("\udcff") == 1, ascii(repr(code))
 assert repr([code]).count("\udcff") == 1, ascii(repr([code]))
 

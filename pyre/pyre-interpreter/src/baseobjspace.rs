@@ -7043,6 +7043,22 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(w_none());
             }
         }
+        // `interp_exceptions.py:723-728`: the attribute exists only where the
+        // platform has a Windows error code, and it has no `args_w` fallback —
+        // nothing but the fourth constructor argument ever fills it.
+        #[cfg(windows)]
+        "winerror" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::OSError
+                    | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+            ) {
+                let stored =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_winerror(obj) };
+                return Ok(if stored.is_null() { w_none() } else { stored });
+            }
+        }
         "filename" | "filename2" => {
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
             if matches!(
@@ -11044,6 +11060,21 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
                         _ => pyre_object::interp_exceptions::w_exception_set_filename2(obj, value),
                     }
                 };
+                return Ok(w_none());
+            }
+        }
+        // `interp_exceptions.py:723-728`: the `winerror` descriptor is
+        // installed only where the platform has Windows error codes, so
+        // elsewhere the name falls through to the ordinary instance dict.
+        #[cfg(windows)]
+        "winerror" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::OSError
+                    | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+            ) {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_winerror(obj, value) };
                 return Ok(w_none());
             }
         }

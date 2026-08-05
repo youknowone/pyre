@@ -162,7 +162,10 @@ fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {
         if pyre_object::is_str(arg) {
             arg
         } else if pyre_object::is_bytes(arg) {
-            crate::typedef::charp2uni(pyre_object::bytesobject::bytes_like_data(arg))
+            // The filename takes the filesystem decode, so a byte the encoding
+            // cannot spell is reported here rather than renamed.
+            let data = pyre_object::bytesobject::bytes_like_data(arg);
+            pyre_object::w_str_from_wtf8_managed(crate::typedef::fsdecode_wtf8(data)?)
         } else {
             return Err(crate::PyError::type_error(format!(
                 "expected str, got {} object",

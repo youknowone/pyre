@@ -4,6 +4,7 @@
 # member) and `BaseExceptionGroup.__basicsize__` 88 on macOS arm64.
 """CPython 3.14 member-descriptor surface for values backed by PyPy type state."""
 
+import sys
 import types
 
 
@@ -101,7 +102,9 @@ expected_layouts = {
     BaseExceptionGroup: (96, 0, 0, 16),
     ExceptionGroup: (96, 0, -32, 16),
     SyntaxError: (144, 0, 0, 16),
-    OSError: (112, 0, 0, 16),
+    # An `OSError` holds a `winerror` where the platform has Windows error
+    # codes, one pointer more than the layout everywhere else.
+    OSError: (120, 0, 0, 16) if sys.platform == "win32" else (112, 0, 0, 16),
     ImportWarning: (72, 0, 0, 16),
     SyntaxWarning: (72, 0, 0, 16),
     types.FunctionType: (152, 0, 96, 88),

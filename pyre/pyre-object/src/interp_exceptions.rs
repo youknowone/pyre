@@ -366,6 +366,13 @@ pub struct W_BaseException {
     /// unset (the internal-constructor path that bypasses the public
     /// setter), so a later `e.errno = x` write persists here.
     pub w_errno: PyObjectRef,
+    /// `interp_exceptions.py:524 W_OSError.w_winerror` — the Windows error
+    /// code, exposed as the writable `winerror` attribute only on the platform
+    /// that has one (`:723-728` gates the attrproperty on `rwin32.WIN32`).
+    /// PyPy declares the slot everywhere and reads it only under that gate;
+    /// keeping it unconditional here leaves one exception layout for every
+    /// target instead of a Windows-only field ordering.
+    pub w_winerror: PyObjectRef,
     /// `interp_exceptions.py:525 W_OSError.w_strerror` /
     /// `:740 readwrite_attrproperty_w('w_strerror', W_OSError)`.
     pub w_strerror: PyObjectRef,
@@ -465,6 +472,7 @@ pub const EXC_W_END_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_end)
 pub const EXC_W_REASON_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_reason);
 pub const EXC_W_ENCODING_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_encoding);
 pub const EXC_W_ERRNO_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_errno);
+pub const EXC_W_WINERROR_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_winerror);
 pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_strerror);
 pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_filename);
 pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_filename2);
@@ -507,8 +515,8 @@ pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_
 /// plus the five Unicode*Error per-class slots (w_object / w_start /
 /// w_end / w_reason / w_encoding) that PyPy distributes across the
 /// W_UnicodeTranslateError / W_UnicodeDecodeError / W_UnicodeEncodeError
-/// subclasses, plus the four W_OSError per-class slots (w_errno /
-/// w_strerror / w_filename / w_filename2), plus the W_SystemExit
+/// subclasses, plus the five W_OSError per-class slots (w_errno /
+/// w_winerror / w_strerror / w_filename / w_filename2), plus the W_SystemExit
 /// `w_code` slot, the W_StopIteration `w_value` slot, plus the shared
 /// `w_exc_name` slot (ImportError /
 /// NameError / AttributeError) and the W_AttributeError `w_attr_obj`
@@ -522,7 +530,7 @@ pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_
 /// (interp_exceptions.py:113/222-231).  `kind` is a `u8` tag, `message`
 /// is a `*mut String` (raw heap), and `suppress_context` is a bool —
 /// none of those are GC-traced.
-pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 34] = [
+pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 35] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -533,6 +541,7 @@ pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 34] = [
     EXC_W_REASON_OFFSET,
     EXC_W_ENCODING_OFFSET,
     EXC_W_ERRNO_OFFSET,
+    EXC_W_WINERROR_OFFSET,
     EXC_W_STRERROR_OFFSET,
     EXC_W_FILENAME_OFFSET,
     EXC_W_FILENAME2_OFFSET,
@@ -684,8 +693,9 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         w_reason: PY_NULL,
         w_encoding: PY_NULL,
         // `interp_exceptions.py:523-527` W_OSError class defaults
-        // `w_errno = w_strerror = w_filename = w_filename2 = None`.
+        // `w_errno = w_winerror = w_strerror = w_filename = w_filename2 = None`.
         w_errno: PY_NULL,
+        w_winerror: PY_NULL,
         w_strerror: PY_NULL,
         w_filename: PY_NULL,
         w_filename2: PY_NULL,
@@ -1256,6 +1266,31 @@ pub unsafe fn w_exception_get_errno(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_errno(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_errno = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// `interp_exceptions.py:725 readwrite_attrproperty_w('w_winerror', ...)`
+/// — `e.winerror` reader.  `PY_NULL` means no Windows error code was
+/// supplied, which is every instance off Windows and the ones built from
+/// an errno on it.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException`.
+#[inline]
+pub unsafe fn w_exception_get_winerror(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BaseException)).w_winerror }
+}
+
+/// `interp_exceptions.py:725 readwrite_attrproperty_w('w_winerror', ...)`
+/// — `e.winerror = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException`.
+#[inline]
+pub unsafe fn w_exception_set_winerror(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_BaseException)).w_winerror = value;
         exception_write_barrier(obj);
     }
 }

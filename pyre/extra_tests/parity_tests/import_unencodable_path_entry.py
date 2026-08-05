@@ -9,6 +9,10 @@ an entry like `'\\ud800'` on `sys.path` or in a package's `__path__` names no
 file and cannot be passed over: the import reports the encoding failure rather
 than searching on and blaming a missing module.
 
+Windows encodes with `surrogatepass` (PEP 529) instead, which gives that same
+entry a spelling — its own three UTF-8 bytes — so there the entry is searched
+like any other and names a file that is simply not there.
+
 No filesystem support is needed to reach this, unlike the sibling
 `os_undecodable_name_boundaries.py` — the entry never gets as far as a syscall.
 """
@@ -18,22 +22,28 @@ import sys
 import tempfile
 
 UNENCODABLE = "\ud800"
+SPELLED = sys.platform == "win32"
 
-try:
-    os.fsencode(UNENCODABLE)
-except UnicodeEncodeError:
-    pass
+if SPELLED:
+    assert os.fsencode(UNENCODABLE) == b"\xed\xa0\x80", ascii(os.fsencode(UNENCODABLE))
 else:
-    raise AssertionError("fsencode accepted a lone surrogate")
+    try:
+        os.fsencode(UNENCODABLE)
+    except UnicodeEncodeError:
+        pass
+    else:
+        raise AssertionError("fsencode accepted a lone surrogate")
 
 # sys.path
 sys.path.insert(0, UNENCODABLE)
 try:
     import pyre_absent_module_for_path_test
 except UnicodeEncodeError:
-    pass
+    if SPELLED:
+        raise AssertionError("the entry has a spelling here and must be searched")
 except ImportError as exc:
-    raise AssertionError("entry was skipped instead of reported: %r" % (exc,))
+    if not SPELLED:
+        raise AssertionError("entry was skipped instead of reported: %r" % (exc,))
 else:
     raise AssertionError("imported a module that does not exist")
 finally:
@@ -53,9 +63,11 @@ with tempfile.TemporaryDirectory() as d:
         try:
             import pyre_pathtest_pkg.absent
         except UnicodeEncodeError:
-            pass
+            if SPELLED:
+                raise AssertionError("the entry has a spelling here and must be searched")
         except ImportError as exc:
-            raise AssertionError("__path__ entry was skipped: %r" % (exc,))
+            if not SPELLED:
+                raise AssertionError("__path__ entry was skipped: %r" % (exc,))
         else:
             raise AssertionError("imported a submodule that does not exist")
     finally:

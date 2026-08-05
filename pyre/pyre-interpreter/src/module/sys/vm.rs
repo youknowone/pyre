@@ -2293,12 +2293,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "getfilesystemencoding",
         make_builtin_function_with_arity("getfilesystemencoding", |_| Ok(w_str_new("utf-8")), 0),
     );
+    // `interp_encoding.py:8-12 base_error` — PEP 529 puts Windows on
+    // `surrogatepass`, every other platform on `surrogateescape`. `os.fsencode`
+    // reads this at import, so it decides the app-level conversion the same way
+    // `gateway::fsencode` decides the interpreter's.
     module_ns_store(
         ns,
         "getfilesystemencodeerrors",
         make_builtin_function_with_arity(
             "getfilesystemencodeerrors",
-            |_| Ok(w_str_new("surrogateescape")),
+            |_| Ok(w_str_new(crate::typedef::FS_ERRORS)),
             0,
         ),
     );

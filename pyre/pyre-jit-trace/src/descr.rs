@@ -2211,7 +2211,8 @@ use pyre_object::interp_exceptions::{
     EXC_W_SYNTAX_FILENAME_OFFSET, EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET,
     EXC_W_SYNTAX_MSG_OFFSET, EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
     EXC_W_SYNTAX_TEXT_OFFSET, EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET,
-    ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
+    EXC_W_WINERROR_OFFSET, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE,
+    exc_kind_to_pytype,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::W_CLASS_OFFSET;
@@ -3335,6 +3336,15 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
+                "W_BaseException.w_winerror",
+                EXC_W_WINERROR_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
                 "W_BaseException.w_strerror",
                 EXC_W_STRERROR_OFFSET,
                 8,
@@ -3755,36 +3765,44 @@ pub fn pytraceback_lineno_descr() -> DescrRef {
 }
 
 /// Cached field descriptor for a raw reference slot selected by the
-/// exception attribute fold.  Indices are those of `build_w_exception_group`;
-/// no parallel descriptor is constructed.
+/// exception attribute fold.  The field is located by its `W_BaseException`
+/// offset, so a slot added to `build_w_exception_group` cannot silently
+/// renumber the ones after it; no parallel descriptor is constructed.
 pub fn w_exception_slot_descr(
     kind: ExcKind,
     slot: pyre_interpreter::baseobjspace::ExceptionAttrSlot,
 ) -> DescrRef {
+    use pyre_interpreter::baseobjspace::ExceptionAttrSlot as Slot;
     let idx = kind as u8 as usize;
     let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
-    let field_index = match slot {
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args => 2,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Context => 3,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Cause => 4,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Errno => 11,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Strerror => 12,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename => 13,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename2 => 14,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code => 15,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Traceback => 5,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeObject => 6,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeStart => 7,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeEnd => 8,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeReason => 9,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::UnicodeEncoding => 10,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Name => 16,
-        pyre_interpreter::baseobjspace::ExceptionAttrSlot::AttrObj => 17,
+    let offset = match slot {
+        Slot::Args => EXC_ARGS_W_OFFSET,
+        Slot::Context => EXC_W_CONTEXT_OFFSET,
+        Slot::Cause => EXC_W_CAUSE_OFFSET,
+        Slot::Errno => EXC_W_ERRNO_OFFSET,
+        Slot::Strerror => EXC_W_STRERROR_OFFSET,
+        Slot::Filename => EXC_W_FILENAME_OFFSET,
+        Slot::Filename2 => EXC_W_FILENAME2_OFFSET,
+        Slot::Code => EXC_W_CODE_OFFSET,
+        Slot::Traceback => EXC_W_TRACEBACK_OFFSET,
+        Slot::UnicodeObject => EXC_W_OBJECT_OFFSET,
+        Slot::UnicodeStart => EXC_W_START_OFFSET,
+        Slot::UnicodeEnd => EXC_W_END_OFFSET,
+        Slot::UnicodeReason => EXC_W_REASON_OFFSET,
+        Slot::UnicodeEncoding => EXC_W_ENCODING_OFFSET,
+        Slot::Name => EXC_W_NAME_OFFSET,
+        Slot::AttrObj => EXC_W_ATTR_OBJ_OFFSET,
     };
-    field_descr_from_group(cache[idx].as_ref().unwrap(), field_index)
+    let group = cache[idx].as_ref().unwrap();
+    let field_index = group
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == offset)
+        .expect("W_BaseException descr group has no field at the selected slot offset");
+    field_descr_from_group(group, field_index)
 }
 
 /// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT

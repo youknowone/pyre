@@ -3,11 +3,12 @@ import sys
 
 
 filenames = (b"\xff", "\udcff")
-if sys.implementation.name == "cpython" and sys.platform == "win32":
-    # CPython's Windows filesystem codec rejects both surrogateescaped
-    # spellings before the compiler can preserve the filename. PyPy/pyre use
-    # the byte-preserving route on every platform.
-    filenames = ()
+if sys.platform == "win32":
+    # PEP 529 spells a filename as UTF-8 with `surrogatepass`, so the byte has
+    # no spelling at all and the filename converter reports it before the
+    # compiler is reached.  The surrogate keeps its own three-byte encoding and
+    # still reaches the compiler as itself.
+    filenames = ("\udcff",)
 
 for filename in filenames:
     try:

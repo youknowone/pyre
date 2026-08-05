@@ -1540,7 +1540,7 @@ pub fn fsencode_bytes_w(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate:
 /// `objspace.py:438 newfilename(s) = fsdecode(newbytes(s))`: expose the
 /// application-level filename spelling derived from its filesystem bytes.
 pub fn fsdecode_filename_bytes(data: &[u8]) -> pyre_object::PyObjectRef {
-    crate::typedef::charp2uni(data)
+    pyre_object::w_str_from_wtf8_managed(fsdecode_filename_wtf8(data))
 }
 
 /// [`fsdecode_filename_bytes`]'s buffer, for a caller that assembles the
@@ -1548,7 +1548,15 @@ pub fn fsdecode_filename_bytes(data: &[u8]) -> pyre_object::PyObjectRef {
 /// object. A Rust `String` cannot hold the lone surrogate a non-UTF-8 path byte
 /// decodes to, so that text has to be built as WTF-8 throughout.
 pub fn fsdecode_filename_wtf8(data: &[u8]) -> rustpython_wtf8::Wtf8Buf {
-    crate::typedef::charp2uni_wtf8(data)
+    crate::typedef::fsdecode_wtf8_total(data)
+}
+
+/// [`fsdecode_filename_bytes`] where the caller can still report a failure:
+/// the point a filename first crosses from bytes into text. Under
+/// `surrogatepass` a byte with no UTF-8 spelling has nowhere to go, and the
+/// call that supplied it is the place that says so.
+pub fn fsdecode_filename_checked(data: &[u8]) -> Result<(), crate::PyError> {
+    crate::typedef::fsdecode_wtf8(data).map(|_| ())
 }
 
 /// The application-level spelling of a string the host handed us, for a caller
@@ -1747,6 +1755,13 @@ fn path_or_fd_w(
     if as_fd == -1 && data.contains(&0) {
         return Err(crate::PyError::value_error("embedded null byte"));
     }
+    // Where the filesystem encoding is `surrogatepass`, the byte spelling of a
+    // path is UTF-8 and a byte that begins no sequence names nothing at all.
+    // Report it here, at the call that supplied it: the host takes UTF-16, so
+    // carrying such bytes further would mean inventing a spelling for them and
+    // addressing some other file.
+    #[cfg(windows)]
+    fsdecode_filename_checked(&data)?;
     Ok(FsEncodedPath {
         as_fd,
         as_bytes: data,
@@ -1760,6 +1775,12 @@ fn path_or_fd_w(
 /// rejection. The caller must already have established that `obj` is a `str`.
 pub fn fsencode(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(obj) };
+    if crate::typedef::FS_ERRORS == "surrogatepass" {
+        // The string's own WTF-8 spelling is the encoding: a surrogate keeps
+        // its three bytes instead of folding to the one byte an escape names,
+        // and nothing is out of range, so no `str` fails to encode.
+        return Ok(wtf8.as_bytes().to_vec());
+    }
     let mut out = Vec::with_capacity(wtf8.len());
     for (pos, cp) in wtf8.code_points().enumerate() {
         if let Some(ch) = cp.to_char() {
@@ -1792,9 +1813,11 @@ pub fn fsencode(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError
 /// names the same file it was read from.
 ///
 /// A str the filesystem encoding cannot spell raises rather than resolving to
-/// some other path: `sys.path.insert(0, '\ud800')` followed by an import
-/// answers `UnicodeEncodeError: surrogates not allowed`, and dropping the entry
-/// instead would search on and report the wrong failure.
+/// some other path: under `surrogateescape`, `sys.path.insert(0, '\ud800')`
+/// followed by an import answers `UnicodeEncodeError: surrogates not allowed`,
+/// and dropping the entry instead would search on and report the wrong failure.
+/// Under `surrogatepass` every `str` has a spelling, so the same entry reaches
+/// the host as itself and names a file that is simply not there.
 pub fn fspath_buf(obj: pyre_object::PyObjectRef) -> Result<std::path::PathBuf, crate::PyError> {
     #[cfg(unix)]
     {
@@ -1804,7 +1827,21 @@ pub fn fspath_buf(obj: pyre_object::PyObjectRef) -> Result<std::path::PathBuf, c
             bytes,
         )))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        // The host takes UTF-16, and an unpaired surrogate is a code unit it
+        // carries: hand the name over as spelled. Going through `str_utf8_w`
+        // would reject it, and a lossy re-decode would substitute U+FFFD,
+        // which addresses a different name and aliases distinct entries.
+        let units: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(obj) }
+            .encode_wide()
+            .collect();
+        Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+            &units,
+        )))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         // No byte spelling on this platform, so the host API receives the text
         // itself and a surrogate has nowhere to go: `str_utf8_w` reports it as

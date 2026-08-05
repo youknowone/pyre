@@ -1213,6 +1213,41 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     pyre_object::interp_exceptions::w_exception_get_strerror(obj),
                     1,
                 );
+                // `interp_exceptions.py:676-689`: a Windows error code takes
+                // priority over the errno, but only where there is something
+                // to render it with — a filename, which spells a missing
+                // strerror as `None`, or a strerror on its own.  With neither,
+                // the code is not reported at all and the errno arms below
+                // answer, exactly as they do without one.
+                let w_winerror = pyre_object::interp_exceptions::w_exception_get_winerror(obj);
+                let w_filename = slot_or_arg(
+                    pyre_object::interp_exceptions::w_exception_get_filename(obj),
+                    2,
+                )
+                .filter(|&f| !pyre_object::is_none(f));
+                if !w_winerror.is_null() && (w_filename.is_some() || w_strerror.is_some()) {
+                    let mut out = Wtf8Buf::new();
+                    out.push_str("[WinError ");
+                    out.push_wtf8(&py_str_wtf8(w_winerror)?);
+                    out.push_str("] ");
+                    out.push_wtf8(&py_str_wtf8(
+                        w_strerror.unwrap_or_else(pyre_object::w_none),
+                    )?);
+                    if let Some(fname) = w_filename {
+                        out.push_str(": ");
+                        out.push_wtf8(&py_repr_wtf8(fname)?);
+                        let w_filename2 = slot_or_arg(
+                            pyre_object::interp_exceptions::w_exception_get_filename2(obj),
+                            4,
+                        )
+                        .filter(|&f| !pyre_object::is_none(f));
+                        if let Some(fname2) = w_filename2 {
+                            out.push_str(" -> ");
+                            out.push_wtf8(&py_repr_wtf8(fname2)?);
+                        }
+                    }
+                    return Ok(Some(out));
+                }
                 if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
                     let errno = py_str_wtf8(w_errno)?;
                     let strerror = py_str_wtf8(w_strerror)?;
@@ -1221,11 +1256,6 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     out.push_wtf8(&errno);
                     out.push_str("] ");
                     out.push_wtf8(&strerror);
-                    let w_filename = slot_or_arg(
-                        pyre_object::interp_exceptions::w_exception_get_filename(obj),
-                        2,
-                    )
-                    .filter(|&f| !pyre_object::is_none(f));
                     if let Some(fname) = w_filename {
                         let w_filename2 = slot_or_arg(
                             pyre_object::interp_exceptions::w_exception_get_filename2(obj),

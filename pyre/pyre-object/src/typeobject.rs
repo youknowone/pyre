@@ -639,10 +639,12 @@ fn cpython314_builtin_abi(name: &str) -> (i64, i64, i64, i64) {
         "SyntaxError" | "IndentationError" | "TabError" | "_IncompleteInputError" => {
             (144, 0, 0, 16)
         }
-        "UnicodeDecodeError"
-        | "UnicodeEncodeError"
-        | "UnicodeTranslateError"
-        | "OSError"
+        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => (112, 0, 0, 16),
+        // The OSError family carries one member more where the platform has a
+        // Windows error code to hold (`interp_exceptions.py:723-728` gates the
+        // `winerror` attrproperty on `rwin32.WIN32`), so its instances are a
+        // word wider there.
+        "OSError"
         | "BlockingIOError"
         | "BrokenPipeError"
         | "ChildProcessError"
@@ -657,7 +659,13 @@ fn cpython314_builtin_abi(name: &str) -> (i64, i64, i64, i64) {
         | "NotADirectoryError"
         | "PermissionError"
         | "ProcessLookupError"
-        | "TimeoutError" => (112, 0, 0, 16),
+        | "TimeoutError" => {
+            if cfg!(windows) {
+                (120, 0, 0, 16)
+            } else {
+                (112, 0, 0, 16)
+            }
+        }
         "BaseException"
         | "Exception"
         | "ArithmeticError"

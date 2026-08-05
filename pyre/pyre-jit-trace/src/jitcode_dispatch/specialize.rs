@@ -8897,6 +8897,14 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // Where the platform reads the fourth argument, `_parse_init_args` derives
+    // the errno and the retagged class from it and stores it in its own slot.
+    // Both depend on a value this emit neither guards nor writes, so those
+    // instances stay on the runtime path.
+    if cfg!(windows) && fills_os_error_slots && args.len() >= 4 {
+        return Ok(None);
+    }
+
     let has_filename = fills_os_error_slots
         && args.len() >= 3
         && !unsafe { pyre_object::is_none(concrete_args[2]) };

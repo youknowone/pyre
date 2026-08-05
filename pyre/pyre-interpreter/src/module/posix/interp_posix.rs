@@ -1209,7 +1209,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             use std::os::unix::ffi::OsStrExt;
             std::borrow::Cow::Borrowed(std::ffi::OsStr::from_bytes(bytes))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            // PEP 529 spells a name as UTF-8 over the host's UTF-16, so the
+            // bytes decode back to the code units the API takes — including an
+            // unpaired surrogate, which is a unit a name may carry.  A lossy
+            // decode would substitute U+FFFD, addressing a different name and
+            // making distinct entries alias onto one another.
+            let units: Vec<u16> = crate::typedef::fsdecode_wtf8_total(bytes)
+                .encode_wide()
+                .collect();
+            std::borrow::Cow::Owned(std::ffi::OsString::from_wide(&units))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             // This platform has no byte spelling, so the host API necessarily
             // receives the best text representation of these bytes.

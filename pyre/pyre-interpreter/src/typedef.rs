@@ -12082,6 +12082,14 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
                 value
             })
         }
+        pyre_object::MEMBER_OS_ERROR_WINERROR => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_winerror(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
         pyre_object::MEMBER_OS_ERROR_STRERROR => {
             let value = unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(obj) };
             Ok(if value.is_null() {
@@ -12359,6 +12367,10 @@ pub(crate) unsafe fn direct_member_set(
             unsafe { pyre_object::interp_exceptions::w_exception_set_errno(obj, value) };
             Ok(pyre_object::w_none())
         }
+        pyre_object::MEMBER_OS_ERROR_WINERROR => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_winerror(obj, value) };
+            Ok(pyre_object::w_none())
+        }
         pyre_object::MEMBER_OS_ERROR_STRERROR => {
             unsafe { pyre_object::interp_exceptions::w_exception_set_strerror(obj, value) };
             Ok(pyre_object::w_none())
@@ -12568,6 +12580,17 @@ pub(crate) unsafe fn direct_member_delete(
         pyre_object::MEMBER_OS_ERROR_ERRNO => {
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_errno(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        // Emptying this slot restores `PY_NULL`, not `None`: the reader turns
+        // both into `None`, but `str(e)` prints the `[WinError ...]` prefix for
+        // a filled slot, so a deleted code has to leave the `[Errno ...]`
+        // spelling behind.  The neighbouring slots have an `args_w` fallback
+        // that `PY_NULL` would re-enable, which is why they store `None`.
+        pyre_object::MEMBER_OS_ERROR_WINERROR => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_winerror(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
@@ -21899,6 +21922,43 @@ pub(crate) fn charp2uni_wtf8(data: &[u8]) -> Wtf8Buf {
 
 pub(crate) fn charp2uni(data: &[u8]) -> PyObjectRef {
     pyre_object::w_str_from_wtf8_managed(charp2uni_wtf8(data))
+}
+
+/// The filesystem codec's error handler (`interp_encoding.py:8-12
+/// base_error`): `surrogatepass` on Windows, where PEP 529 spells a name as
+/// UTF-8 and a surrogate keeps its own three-byte encoding, and
+/// `surrogateescape` everywhere else, where a byte with no UTF-8 spelling
+/// becomes a `0xDC00 + byte` escape. `sys.getfilesystemencodeerrors` reports
+/// this same value, so an app-level `os.fsencode` and the interpreter's own
+/// conversions agree on one contract.
+pub(crate) const FS_ERRORS: &str = if cfg!(windows) {
+    "surrogatepass"
+} else {
+    "surrogateescape"
+};
+
+/// `unicodehelper.py:62-89 fsdecode` — filesystem bytes to text.
+///
+/// `surrogateescape` rescues every byte, so this only ever fails under
+/// `surrogatepass`, where a byte that begins no UTF-8 sequence has no spelling
+/// at all and the name is reported rather than invented.
+pub(crate) fn fsdecode_wtf8(data: &[u8]) -> Result<Wtf8Buf, crate::PyError> {
+    decode_utf8_with_errors(data, FS_ERRORS)
+}
+
+/// [`fsdecode_wtf8`] for a reader that cannot raise — a `co_filename` read, a
+/// traceback line.
+///
+/// Every writer of stored filesystem bytes has already taken the decode:
+/// `compile()` decodes its `bytes` filename at the call, and a `str` filename
+/// round-trips through `fsencode`. The escape spelling is therefore the
+/// unreachable arm, kept because rendering a frame is not a place that can
+/// report an encoding failure.
+pub(crate) fn fsdecode_wtf8_total(data: &[u8]) -> Wtf8Buf {
+    fsdecode_wtf8(data).unwrap_or_else(|_| {
+        decode_utf8_with_errors(data, "surrogateescape")
+            .expect("surrogateescape rescues every byte, so the decode never fails")
+    })
 }
 
 /// unicodehelper.py:377-537 _str_decode_utf8_slowpath
