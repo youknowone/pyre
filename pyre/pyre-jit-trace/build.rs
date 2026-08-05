@@ -133,6 +133,12 @@ fn emit_llbc_extraction_placeholders() {
     }
 }
 
+/// Crates whose Charon artefact this build consumes.  The `.ullbc` and its
+/// `.fingerprint` stamp are both named after the crate.  Pyre production
+/// configures the exact `eval::eval_loop_jit` portal, so unlike generic
+/// two-artefact consumers it requires `pyre-jit` too.
+const LLBC_CRATES: &[&str] = &["pyre-object", "pyre-interpreter", "pyre-jit"];
+
 /// Pre-flight the LLBC prerequisite, mirroring the resolution order in
 /// `majit-translate` (`build_semantic_program_via_active_frontend`):
 /// honour the `PYRE_MIR_FRONTEND_LLBC` override, else require the canonical
@@ -147,6 +153,11 @@ fn emit_llbc_extraction_placeholders() {
 /// `cargo build`, which would block on the outer build's target-directory
 /// lock (deadlock), and a build script that downloads a toolchain breaks
 /// hermetic / offline / CI builds.
+///
+/// That ban does not cover the stamp comparison in `warn_if_llbc_stale`:
+/// `scripts/extract-llbc.py --fingerprint` returns before `extract` runs and
+/// only performs a `cargo metadata` walk plus `git ls-files`, so it starts no
+/// nested build and takes no target-directory lock.
 fn preflight_llbc_or_fail() {
     // Explicit override: trust it and let the translator validate the
     // individual paths (its loader panics per-file with the bad path).
@@ -161,17 +172,10 @@ fn preflight_llbc_or_fail() {
         .join("..")
         .join("..");
     let llbc_dir = repo_root.join("build").join("llbc");
-    // Pyre production configures the exact `eval::eval_loop_jit` portal, so
-    // unlike generic two-artifact consumers it requires pyre-jit.ullbc too.
-    const REQUIRED: &[&str] = &[
-        "pyre-object.ullbc",
-        "pyre-interpreter.ullbc",
-        "pyre-jit.ullbc",
-    ];
-    let mut missing: Vec<String> = REQUIRED
+    let mut missing: Vec<String> = LLBC_CRATES
         .iter()
+        .map(|crate_name| format!("{crate_name}.ullbc"))
         .filter(|name| !llbc_dir.join(name).exists())
-        .map(|name| (*name).to_string())
         .collect();
     // Cross-compiling additionally needs this target's layout sidecars:
     // Charon resolves struct layouts per target, and the artefacts above
@@ -184,6 +188,10 @@ fn preflight_llbc_or_fail() {
         }
     }
     if missing.is_empty() {
+        // Present is not the same as current: the artefacts are frozen
+        // snapshots (AGENTS.md:48) and nothing above compares them to the
+        // sources they were extracted from.
+        warn_if_llbc_stale(&repo_root);
         return;
     }
 
@@ -258,6 +266,164 @@ fn preflight_llbc_or_fail() {
     );
 
     std::process::exit(1);
+}
+
+/// Read one `key=value` line out of a `.fingerprint` stamp.
+///
+/// `scripts/llbc_extract.py:449-476` (`stamp_for`) writes the stamp as one
+/// `key=value` per line, so a prefix match is the whole parse.  `key` includes
+/// the `=`.
+fn stamp_field(stamp: &str, key: &str) -> Option<String> {
+    stamp
+        .lines()
+        .find_map(|line| line.strip_prefix(key).map(str::to_string))
+}
+
+/// Wait for the fingerprint oracle with a deadline.
+///
+/// A build script that blocks forever is strictly worse than a missing
+/// warning, and `std` has no `wait_timeout`, so the wait runs on a helper
+/// thread and a timeout abandons the child.  Every non-answer — spawn failure,
+/// non-zero exit, unparseable stdout — collapses to `None`, i.e. silence: an
+/// unavailable oracle must not break offline, hermetic or vendored builds.
+fn llbc_fingerprint_output(child: std::process::Child) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    // A bare lowercase sha256 and nothing else; anything else means the driver
+    // printed something this code does not model.
+    let is_hash = value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit());
+    is_hash.then_some(value)
+}
+
+/// Ask the extraction driver what the current sources hash to.
+///
+/// `scripts/llbc_extract.py:815-817` prints exactly the value the stamp's
+/// `source=` line holds — same `source_fingerprint()` call, same single-crate
+/// list as `stamp_for` at `:474` — so there is one implementation of the
+/// digest and it is not this one.
+///
+/// `CARGO_FEATURES` and `LLBC_LAYOUT_TARGETS` are replayed out of the stamp:
+/// `fingerprint_inputs` (`scripts/llbc_extract.py:255-360`) walks the
+/// dependency closure under the feature set and the cross-target layout set in
+/// force at extraction time, so recomputing under this build's defaults would
+/// report a difference the sources do not have.
+fn llbc_source_fingerprint(
+    repo_root: &std::path::Path,
+    driver: &std::path::Path,
+    crate_name: &str,
+    features: &str,
+    layout_targets: &str,
+) -> Option<String> {
+    for python in ["python3", "python"] {
+        let spawned = std::process::Command::new(python)
+            .arg(driver)
+            .arg("--fingerprint")
+            .arg(crate_name)
+            .current_dir(repo_root)
+            .env("CARGO_FEATURES", features)
+            .env("LLBC_LAYOUT_TARGETS", layout_targets)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(child) = spawned else {
+            continue;
+        };
+        return llbc_fingerprint_output(child);
+    }
+    None
+}
+
+/// Compare every `.ullbc` against the sources it was extracted from.
+///
+/// The prepass reads `build/llbc/*.ullbc`, never the Rust sources
+/// (AGENTS.md:48), so a field inserted anywhere but last in a `#[repr(C)]`
+/// struct shifts every following descr offset while the build stays green.
+/// The existence test in `preflight_llbc_or_fail` cannot see this, and
+/// `codegen_cache_key` makes it worse rather than better: it hashes every
+/// `<crate>/src`, so a source edit reliably invalidates the codegen cache and
+/// re-runs the prepass — over the same unchanged artefact.
+///
+/// The oracle is the extractor's own stamp.  `scripts/llbc_extract.py:643-652`
+/// already skips a crate whose stamp still matches, so this is the comparison
+/// the producer trusts, evaluated by the consumer.
+///
+/// Warning-only by default: a stale artefact still yields a working build for
+/// everything whose layout did not move, and the remedy is a multi-minute
+/// re-extraction.  `PYRE_LLBC_STRICT=1` promotes the same finding to a hard
+/// failure for callers that want a gate, and
+/// `PYRE_LLBC_SKIP_FINGERPRINT_CHECK` opts out entirely.
+fn warn_if_llbc_stale(repo_root: &std::path::Path) {
+    println!("cargo::rerun-if-env-changed=PYRE_LLBC_STRICT");
+    println!("cargo::rerun-if-env-changed=PYRE_LLBC_SKIP_FINGERPRINT_CHECK");
+    if std::env::var_os("PYRE_LLBC_SKIP_FINGERPRINT_CHECK").is_some() {
+        return;
+    }
+    let driver = repo_root.join("scripts").join("extract-llbc.py");
+    if !driver.is_file() {
+        return;
+    }
+    let llbc_dir = repo_root.join("build").join("llbc");
+    let mut stale: Vec<(&str, String, String)> = Vec::new();
+    for &crate_name in LLBC_CRATES {
+        let stamp_path = llbc_dir.join(format!("{crate_name}.ullbc.fingerprint"));
+        let Ok(stamp) = std::fs::read_to_string(&stamp_path) else {
+            continue;
+        };
+        let Some(recorded) = stamp_field(&stamp, "source=") else {
+            continue;
+        };
+        let features = stamp_field(&stamp, "features=").unwrap_or_default();
+        let layout_targets = stamp_field(&stamp, "layout_targets=").unwrap_or_default();
+        let current =
+            llbc_source_fingerprint(repo_root, &driver, crate_name, &features, &layout_targets);
+        let Some(current) = current else {
+            continue;
+        };
+        if current != recorded {
+            stale.push((crate_name, recorded, current));
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+    // The directive string is the only difference between the two modes, so it
+    // is chosen once and the same lines go through it.  `cargo::warning=` and
+    // `cargo::error=` each carry a single line with no embedded newline.
+    let strict = std::env::var_os("PYRE_LLBC_STRICT").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let directive = if strict {
+        "cargo::error"
+    } else {
+        "cargo::warning"
+    };
+    for (crate_name, recorded, current) in &stale {
+        println!(
+            "{directive}=LLBC STALE: {crate_name}.ullbc was extracted at source={recorded}, \
+             sources now hash to {current}"
+        );
+    }
+    let crates = stale
+        .iter()
+        .map(|(crate_name, _, _)| *crate_name)
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "{directive}=Field offsets read out of these artefacts may name the wrong bytes; \
+         re-extract with: python3 scripts/extract-llbc.py {crates}"
+    );
+    if strict {
+        std::process::exit(1);
+    }
 }
 
 /// Run the codegen worker on a large-stack thread, propagating any panic so
