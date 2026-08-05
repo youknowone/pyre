@@ -2575,9 +2575,9 @@ pub const BH_PROBE_ORIGIN_PROMOTED: u8 = 2;
 /// Whether the blackhole-object probe is enabled.
 pub fn bh_probe_enabled() -> bool {
     // wasm32-unknown-unknown has no process environment, so the guest cannot
-    // read a gate; force it on there for the duration of the investigation.
+    // read MAJIT_GC_BH_PROBE; the compile-time feature is its gate instead.
     if cfg!(target_arch = "wasm32") {
-        return true;
+        return cfg!(feature = "bh_probe");
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAJIT_GC_BH_PROBE").is_some())
