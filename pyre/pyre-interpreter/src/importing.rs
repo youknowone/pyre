@@ -1936,32 +1936,35 @@ enum FindInfo {
 }
 
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindInfo> {
+fn find_module(
+    partname: &str,
+    parent_dirs: Option<&[PathBuf]>,
+) -> Result<Option<FindInfo>, crate::PyError> {
     // Submodule import: search ONLY the parent package's `__path__`, never
     // sys.path or builtins by leaf name.  `_bootstrap._find_and_load` resolves
     // `pkg.sub` against `pkg.__path__`; routing through sys.path lets a
     // same-leaf module from an unrelated package on sys.path shadow it (e.g.
     // `concurrent.futures` resolving to `asyncio/futures.py`).
     if let Some(dirs) = parent_dirs {
-        return find_in_dirs(partname, dirs);
+        return Ok(find_in_dirs(partname, dirs));
     }
 
     // Check builtin modules first (PyPy: space.builtin_modules check in find_module)
     let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(partname);
     if is_builtin {
-        return Some(FindInfo::Builtin);
+        return Ok(Some(FindInfo::Builtin));
     }
 
     // Try sys.path first
-    if let Some(info) = find_in_sys_path(partname) {
-        return Some(info);
+    if let Some(info) = find_in_sys_path(partname)? {
+        return Ok(Some(info));
     }
 
     // Fallback stdlib detection. `create_sys_path_list` already forces this at
     // sys-module creation, so the `DONE` guard normally makes this a no-op; it
     // stays as a defensive retry for any miss reached before sys exists.
     ensure_stdlib_path();
-    return find_in_sys_path(partname);
+    find_in_sys_path(partname)
 }
 
 // wasm has no current_exe / python3 spawn, so there is no `ensure_stdlib_path`
@@ -1971,24 +1974,30 @@ fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindIn
 // `__path__`, top-level names check builtins then sys.path — all FS probes go
 // through the installed `SourceProvider`.
 #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
-fn find_module(partname: &str, parent_dirs: Option<&[PathBuf]>) -> Option<FindInfo> {
+fn find_module(
+    partname: &str,
+    parent_dirs: Option<&[PathBuf]>,
+) -> Result<Option<FindInfo>, crate::PyError> {
     if let Some(dirs) = parent_dirs {
-        return find_in_dirs(partname, dirs);
+        return Ok(find_in_dirs(partname, dirs));
     }
     let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(partname);
     if is_builtin {
-        return Some(FindInfo::Builtin);
+        return Ok(Some(FindInfo::Builtin));
     }
     find_in_sys_path(partname)
 }
 
 #[cfg(not(feature = "host_env"))]
-fn find_module(partname: &str, _parent_dirs: Option<&[PathBuf]>) -> Option<FindInfo> {
+fn find_module(
+    partname: &str,
+    _parent_dirs: Option<&[PathBuf]>,
+) -> Result<Option<FindInfo>, crate::PyError> {
     let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(partname);
     if is_builtin {
-        return Some(FindInfo::Builtin);
+        return Ok(Some(FindInfo::Builtin));
     }
-    None
+    Ok(None)
 }
 
 /// Detect and add CPython stdlib to sys.path (once).
@@ -2047,17 +2056,22 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
 /// empty vec before `sys` / its `path` list exists (the pre-`sync` bootstrap
 /// window). Only `str` entries are collected — path hooks (zipimporter keys
 /// and the like) are not resolvable by the native file search.
+///
+/// An entry the filesystem encoding cannot spell raises out of the import
+/// rather than being passed over.
 #[cfg(feature = "host_env")]
-fn python_sys_path_dirs() -> Option<Vec<PathBuf>> {
+fn python_sys_path_dirs() -> Result<Option<Vec<PathBuf>>, crate::PyError> {
     // `None` means the `sys` module does not exist yet (the pre-`sys` bootstrap
     // window) — the caller falls back to the native seed. Once `sys` exists the
     // Python list is authoritative even when empty: a missing / non-list / empty
     // `sys.path` searches nothing, so `del sys.path` and `sys.path.clear()` break
     // imports exactly as they do under CPython, rather than resurrecting the seed.
-    let sys_mod = get_sys_module("sys")?;
+    let Some(sys_mod) = get_sys_module("sys") else {
+        return Ok(None);
+    };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
     if w_dict.is_null() {
-        return None;
+        return Ok(None);
     }
     // Copy the entries up front so no Python borrow is held across the
     // filesystem probes in `find_in_dirs` (which never invoke user code).
@@ -2073,16 +2087,14 @@ fn python_sys_path_dirs() -> Option<Vec<PathBuf>> {
                     // Non-str entries are skipped: pyre's only path hook is the
                     // native filesystem probe, and CPython also skips an entry no
                     // hook accepts.
-                    if unsafe { pyre_object::is_str(item) }
-                        && let Some(dir) = crate::gateway::fspath_buf(item)
-                    {
-                        dirs.push(dir);
+                    if unsafe { pyre_object::is_str(item) } {
+                        dirs.push(crate::gateway::fspath_buf(item)?);
                     }
                 }
             }
         }
     }
-    Some(dirs)
+    Ok(Some(dirs))
 }
 
 /// Search the import path for a top-level `partname`.
@@ -2093,8 +2105,8 @@ fn python_sys_path_dirs() -> Option<Vec<PathBuf>> {
 /// side of a pre-`sys` staging seed (flushed into `sys.path` at sys-module
 /// creation) and is consulted here solely in that pre-`sys` window.
 #[cfg(feature = "host_env")]
-fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
-    match python_sys_path_dirs() {
+fn find_in_sys_path(partname: &str) -> Result<Option<FindInfo>, crate::PyError> {
+    Ok(match python_sys_path_dirs()? {
         Some(dirs) => {
             let found = find_in_dirs(partname, &dirs);
             // Windows: pyre still registers the `posix` builtin (never `nt`),
@@ -2113,7 +2125,7 @@ fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
             let path = SYS_PATH.lock().unwrap();
             find_in_dirs(partname, &path)
         }
-    }
+    })
 }
 
 /// Build the initial Python `sys.path` list from the native `SYS_PATH` seed.
@@ -2151,27 +2163,29 @@ pub(crate) fn create_sys_path_list() -> PyObjectRef {
 /// Returns `None` when `__path__` is absent or is not a plain list of `str`.
 /// `absolute_import` rejects the absent case up front ("'<parent>' is not a
 /// package"), so a `None` reaching the caller means a package whose `__path__`
-/// yielded no usable directories.
-fn parent_package_path(parent: PyObjectRef) -> Option<Vec<PathBuf>> {
+/// yielded no usable directories. An entry the filesystem encoding cannot spell
+/// raises, the same as one on `sys.path`.
+fn parent_package_path(parent: PyObjectRef) -> Result<Option<Vec<PathBuf>>, crate::PyError> {
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(parent) };
     if w_dict.is_null() || !unsafe { pyre_object::is_dict(w_dict) } {
-        return None;
+        return Ok(None);
     }
-    let path_obj = unsafe { pyre_object::w_dict_getitem_str(w_dict, "__path__") }?;
+    let Some(path_obj) = (unsafe { pyre_object::w_dict_getitem_str(w_dict, "__path__") }) else {
+        return Ok(None);
+    };
     if path_obj.is_null() || !unsafe { pyre_object::is_list(path_obj) } {
-        return None;
+        return Ok(None);
     }
     let n = unsafe { pyre_object::listobject::w_list_len(path_obj) };
     let mut dirs = Vec::with_capacity(n);
     for i in 0..n {
         if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(path_obj, i as i64) }
             && unsafe { pyre_object::is_str(item) }
-            && let Some(dir) = crate::gateway::fspath_buf(item)
         {
-            dirs.push(dir);
+            dirs.push(crate::gateway::fspath_buf(item)?);
         }
     }
-    Some(dirs)
+    Ok(Some(dirs))
 }
 
 // ── parse_source_module ──────────────────────────────────────────────
@@ -2829,8 +2843,7 @@ fn load_part(
     }
 
     // Find the module on disk
-    let find_info = find_module(partname, parent_dirs);
-    let Some(info) = find_info else {
+    let Some(info) = find_module(partname, parent_dirs)? else {
         return Ok(None);
     };
 
@@ -2955,7 +2968,7 @@ fn absolute_import(
                         &full_name,
                     ));
                 }
-                parent_package_path(parent_mod)
+                parent_package_path(parent_mod)?
             }
         };
         let w_mod = load_part(&full_name, part, parent_dirs.as_deref(), execution_context)?;
@@ -4201,7 +4214,7 @@ mod tests {
     fn test_find_module_nonexistent() {
         // Should not find a module that doesn't exist
         let result = find_module("__nonexistent_pyre_test_module__", None);
-        assert!(result.is_none());
+        assert!(matches!(result, Ok(None)));
     }
 
     #[cfg(feature = "wasm_vfs")]
