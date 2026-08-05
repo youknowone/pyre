@@ -130,6 +130,12 @@ fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
 }
 
+/// Fresh `types.SimpleNamespace` instance — `type(sys.implementation)`, the
+/// attribute bag `time.get_clock_info` fills in and returns.
+pub fn new_simple_namespace_instance() -> PyObjectRef {
+    w_instance_new(simple_namespace_type())
+}
+
 /// CPython 3.14 `namespace_init`: accept at most one positional mapping or
 /// iterable of pairs, validate that its resulting dict has only string keys,
 /// merge it into the instance, then overlay keyword arguments.  This is the

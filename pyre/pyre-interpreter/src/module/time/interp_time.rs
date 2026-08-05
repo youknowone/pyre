@@ -1353,3 +1353,76 @@ pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Ok(w_str_new(s))
     }
 }
+
+/// `app_time.py:26-34 strptime` — parse `string` per `format`, delegating to
+/// the shared `_strptime` module.  A non-descriptor when stored on a class.
+pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `strptime(string[, format])` is positional-only (`PyArg_ParseTuple "s|s"`).
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if kwargs.is_some() {
+        return Err(crate::PyError::type_error(
+            "strptime() takes no keyword arguments",
+        ));
+    }
+    let Some(&string) = positional.first() else {
+        return Err(crate::PyError::type_error(
+            "strptime() takes at least 1 argument (0 given)",
+        ));
+    };
+    if positional.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "strptime() takes at most 2 arguments ({} given)",
+            positional.len()
+        )));
+    }
+    let format = positional
+        .get(1)
+        .copied()
+        .unwrap_or_else(|| w_str_new("%a %b %d %H:%M:%S %Y"));
+    // `string`/`format` are native locals held across the import, which allocates
+    // and can move young objects; pin and re-read them for the delegated call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let string_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(string);
+    let format_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(format);
+    let w_mod = match crate::importing::get_sys_module("_strptime") {
+        Some(m) => m,
+        None => crate::importing::importhook(
+            "_strptime",
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            0,
+            crate::call::getexecutioncontext(),
+        )?,
+    };
+    let w_fn = crate::baseobjspace::getattr_str(w_mod, "_strptime_time")?;
+    crate::call::call_function_impl_result(
+        w_fn,
+        &[
+            pyre_object::gc_roots::shadow_stack_get(string_slot),
+            pyre_object::gc_roots::shadow_stack_get(format_slot),
+        ],
+    )
+}
+
+/// `app_time.py:36-44 get_clock_info` — a `types.SimpleNamespace` filled by
+/// `_get_time_info`.  A non-descriptor when stored on a class.
+pub fn get_clock_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // Registered `/ 1`: the framework enforced exactly one positional arg and
+    // rejected keywords before this body runs.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let info = crate::module::sys::vm::new_simple_namespace_instance();
+    let info_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(info);
+    // `_get_time_info` overwrites implementation/monotonic/adjustable/resolution
+    // on success and raises `ValueError("unknown clock")` otherwise, so the
+    // app-level default fields are redundant.
+    get_time_info(&[
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+        pyre_object::gc_roots::shadow_stack_get(info_slot),
+    ])?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(info_slot))
+}
