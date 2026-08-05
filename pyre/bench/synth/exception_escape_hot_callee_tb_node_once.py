@@ -1,11 +1,15 @@
-# pyre-check: max-pypy-ratio=200
+# pyre-check: max-pypy-ratio=73
+# pyre-check: min-pypy-ratio=3.22
 # A hot compiled CALLEE holding a try block the exception does not stay in used
 # to record its own traceback node TWICE.
 #
-# The ceiling is loose on purpose: every iteration of every driver raises and
-# unwinds, so the ratio measures exception throughput rather than the contract
-# under test.  It reads 17.7x (dynasm) / 19.0x (cranelift) here, against the
-# 9.8x the sibling `exception_escape_caller_frame_tb_node` reads for its 116.
+# Every iteration of every driver raises and unwinds, so the ratio measures
+# exception throughput rather than the contract under test, and it varies 2.5x
+# across hosts -- hence the explicit floor beside the ceiling.
+#
+# N is 4000 because the witness needs the callee compiled: the duplicate node
+# first appears at N=2500 and never at N=1500, and 4000 reproduces every one of
+# the five shapes below with the same compiled structure N=20000 gave.
 #
 # `handle_operation_error` attaches one node per frame per delivery, at the
 # RAISE instruction, and only then looks the handler table up -- a frame whose
@@ -30,7 +34,7 @@
 # caught object by name is the one shape whose frame legitimately owns two
 # adjacent nodes, so a screen that dropped every repeat of an already-recorded
 # frame instead of only the ones that follow it would lose the outer node here.
-N = 20000
+N = 4000
 
 
 def chain(e):
