@@ -10561,11 +10561,15 @@ pub(crate) unsafe fn get(
         // typedef.py:512-516: if w_result is None: raise
         // AttributeError("'%T' object has no attribute '%s'")
         if found.is_none() {
-            // `%T` is `space.type(w_obj).name`, the bare type name — the same
-            // miss reached through the descriptor's own `__get__` already
-            // reports it that way.
+            // An unset slot names the type by its `module.__qualname__`, which
+            // is what `test_descr.test_slots` pins; the bare `%T` name belongs
+            // to the misses `raiseattrerror` reports.
             let slot_name = pyre_object::w_member_get_name(descr);
-            return Err(raiseattrerror(obj, slot_name, None, false));
+            return Err(PyError::attribute_error(format!(
+                "'{}' object has no attribute '{}'",
+                getfulltypename(obj),
+                slot_name,
+            )));
         }
         return Ok(found);
     }

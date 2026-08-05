@@ -7760,7 +7760,7 @@ result = C.__dict__['f'](Proxy(C()))";
     }
 
     #[test]
-    fn test_empty_member_slot_error_uses_bare_type_name() {
+    fn test_empty_member_slot_error_uses_fully_qualified_type_name() {
         let source = "\
 def make_type():
     class X:
@@ -7777,7 +7777,7 @@ except AttributeError as exc:
             let value = w_dict_getitem_str(frame.w_globals, "result").unwrap();
             assert_eq!(
                 w_str_get_wtf8(value).as_str(),
-                Ok("'X' object has no attribute 'a'")
+                Ok("'__main__.make_type.<locals>.X' object has no attribute 'a'")
             );
         }
     }
