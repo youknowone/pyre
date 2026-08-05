@@ -4214,6 +4214,176 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     Some(())
 }
 
+/// Opt-in until the `ForceQuasiImmutable` flush leg in `trace.rs` re-delivers
+/// an in-flight FOR_ITER item on its decline paths. `obj.attr = v` inside a
+/// loop is the most common statement in the corpus, so turning this on by
+/// default would make that dropped-iteration defect reachable.
+fn mapdict_qmut_force_enabled() -> bool {
+    std::env::var_os("PYRE_QMUT_MAPDICT_FORCE").is_some()
+}
+
+fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    plain: *const pyre_interpreter::objspace::std::mapdict::PlainAttribute,
+) -> Result<(), DispatchError> {
+    if plain.is_null() {
+        return Ok(());
+    }
+    let owner = ctx.trace_ctx.const_ref(plain as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::plain_attribute_ever_mutated_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
+/// Tracer-side pyjitpl.py:1105-1120
+/// `opimpl_jit_force_quasi_immutable` for mapdict writes hidden in residuals.
+/// The target predicate is side-effect-free; record comes before the installed
+/// test because pyjitpl.py:1074-1085 `opimpl_record_quasiimmut_field` creates
+/// the hidden instance when it is null. Recording also preserves
+/// `AbstractAttribute.write`'s `if not attr.ever_mutated` read
+/// (mapdict.py:72).
+///
+/// Deliberately no `GUARD_ISNULL` arm after the installed test. Upstream's
+/// guard (pyjitpl.py:1117-1118) licenses a traced INLINE setfield that bypasses
+/// invalidation; pyre's write stays inside the residual and performs its own
+/// notify. This is sound while compiled traces emit no store to these four
+/// fields: `jit_mapdict_boxed_write`, `jit_mapdict_unboxed_write_raw`, and
+/// `jit_mapdict_unboxed_write_f` reach only `write_boxed_storage` /
+/// `write_unboxed_storage_raw`, while the add-transition inline emits only map
+/// and storage stores.
+fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    helper: majit_ir::PyreHelperKind,
+    i_args: &[OpRef],
+    r_args: &[OpRef],
+) -> Option<()> {
+    use majit_ir::PyreHelperKind as K;
+    let is_store = matches!(helper, K::StoreAttr);
+    if !is_store && !matches!(helper, K::DeleteAttr) {
+        return None;
+    }
+
+    let &obj_opref = r_args.first()?;
+    let &code_opref = r_args.get(if is_store { 2 } else { 1 })?;
+    let &name_opref = i_args.first()?;
+    let (
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(w_obj_ptr))),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+        Some(majit_ir::Value::Int(name_idx)),
+    ) = (
+        ctx.trace_ctx.box_value(obj_opref),
+        ctx.trace_ctx.box_value(code_opref),
+        ctx.trace_ctx.box_value(name_opref),
+    )
+    else {
+        return None;
+    };
+    if w_obj_ptr == 0 || w_code_ptr == 0 {
+        return None;
+    }
+    let code = unsafe {
+        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
+        if code_ptr.is_null() {
+            return None;
+        }
+        &*(code_ptr as *const pyre_interpreter::CodeObject)
+    };
+    let name = pyre_interpreter::pyframe::load_name_from_code(code, name_idx as usize)?;
+    let (attrkind, is_slot) = unsafe {
+        pyre_interpreter::objspace::std::mapdict::classify_mapdict_write_attr(
+            w_obj_ptr as pyre_object::PyObjectRef,
+            name,
+        )
+    }?;
+    if attrkind == pyre_interpreter::objspace::std::mapdict::INVALID {
+        return None;
+    }
+    let attrname = rustpython_wtf8::Wtf8::new(if is_slot { "slot" } else { name });
+    let target = if is_store {
+        let &value_opref = r_args.get(1)?;
+        let Some(majit_ir::Value::Ref(majit_ir::GcRef(w_value_ptr))) =
+            ctx.trace_ctx.box_value(value_opref)
+        else {
+            return None;
+        };
+        if w_value_ptr == 0 {
+            return None;
+        }
+        unsafe {
+            pyre_interpreter::objspace::std::mapdict::setattr_would_force_quasi_immut(
+                w_obj_ptr as pyre_object::PyObjectRef,
+                attrname,
+                attrkind,
+                w_value_ptr as pyre_object::PyObjectRef,
+            )
+        }
+    } else {
+        unsafe {
+            pyre_interpreter::objspace::std::mapdict::delattr_would_force_quasi_immut(
+                w_obj_ptr as pyre_object::PyObjectRef,
+                attrname,
+                attrkind,
+            )
+        }
+    }?;
+
+    use pyre_interpreter::objspace::std::mapdict::MapdictQmutTarget as T;
+    // `op_pc` is the walker's jit pc — the resume coordinate
+    // `walker_capture_snapshot_for_last_guard` stamps on the drained
+    // `GUARD_NOT_INVALIDATED`, the same one every other fold guard uses. It is
+    // not the Python pc the operand-stack latch below carries.
+    match target {
+        T::PlainEverMutated(plain) => walker_pin_plain_ever_mutated(ctx, op_pc, plain).ok()?,
+        T::TerminatorAllowUnboxing(term) => {
+            crate::jitcode_dispatch::walker_pin_terminator_allow_unboxing(ctx, op_pc, term).ok()?
+        }
+        T::HolderTyp(holder) => {
+            crate::jitcode_dispatch::walker_pin_holder_typ(ctx, op_pc, holder).ok()?
+        }
+        T::HolderAttr(holder) => {
+            crate::jitcode_dispatch::walker_pin_holder_attr(ctx, op_pc, holder).ok()?
+        }
+    }
+    let installed = unsafe {
+        match target {
+            T::PlainEverMutated(plain) => pyre_interpreter::objspace::std::mapdict::plain_attribute_ever_mutated_qmut_installed(plain),
+            T::TerminatorAllowUnboxing(term) => pyre_interpreter::objspace::std::mapdict::terminator_allow_unboxing_qmut_installed(term),
+            T::HolderTyp(holder) => pyre_interpreter::objspace::std::mapdict::holder_typ_qmut_installed(holder),
+            T::HolderAttr(holder) => pyre_interpreter::objspace::std::mapdict::holder_attr_qmut_installed(holder),
+        }
+    };
+    if !installed {
+        return None;
+    }
+    unsafe {
+        match target {
+            T::PlainEverMutated(plain) => {
+                pyre_interpreter::objspace::std::mapdict::plain_attribute_force_ever_mutated_qmut(
+                    plain,
+                )
+            }
+            T::TerminatorAllowUnboxing(term) => {
+                pyre_interpreter::objspace::std::mapdict::terminator_force_allow_unboxing_qmut(term)
+            }
+            T::HolderTyp(holder) => {
+                pyre_interpreter::objspace::std::mapdict::holder_force_typ_qmut(holder)
+            }
+            T::HolderAttr(holder) => {
+                pyre_interpreter::objspace::std::mapdict::holder_force_attr_qmut(holder)
+            }
+        }
+    }
+    if ctx.vstack_valid && !ctx.fbw_mode.inline_subwalk && !ctx.trace_ctx.is_bridge_trace {
+        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
+    }
+    Some(())
+}
+
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -5249,6 +5419,32 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         &argbox_types,
         original_call_descr.arg_types(),
     );
+
+    // pyjitpl.py:1105-1120 `opimpl_jit_force_quasi_immutable` must run before
+    // any fold or residual applies the opcode. In particular,
+    // `try_walker_specialize_store_attr` mutates `?` fields while resolving,
+    // so moving this below the STORE_ATTR fold would hide the force. The abort
+    // resumes by re-running the whole opcode, so no part of its write may have
+    // happened yet.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'v'
+        && mapdict_qmut_force_enabled()
+        && try_walker_force_quasi_immut_mapdict_write(
+            ctx,
+            op.pc,
+            pyre_helper_kind,
+            &i_args,
+            &r_args,
+        )
+        .is_some()
+    {
+        // A sub-walk abort's resume coordinate names the callee's code object;
+        // `self.x = v` inside an inlined callee is reachable, and the flush
+        // leg's guard reads this flag.
+        ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
+        crate::state::note_force_quasi_immut_abort();
+        return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
+    }
 
     // STORE_ATTR fold (mapdict.py): recognize an existing unboxed
     // integer slot and replace only the generic setattr residual's helper,

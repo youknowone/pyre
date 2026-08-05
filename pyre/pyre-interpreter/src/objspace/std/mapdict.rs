@@ -3624,6 +3624,168 @@ unsafe fn find_branch_to_move_into(
     }
 }
 
+/// Side-effect-free twin of mapdict.py:170-193
+/// `AbstractAttribute._find_branch_to_move_into` for the tracer's
+/// `opimpl_jit_force_quasi_immutable` predicate.
+///
+/// The ordinary resolver interns a missing transition through `get_new_attr`.
+/// This resolver instead returns `None` at exactly that point, making the
+/// caller decline rather than changing later `CachedAttributeHolder.order`
+/// assignments merely because a trace was attempted. Each `cache_attrs` lock
+/// is released before the chain walk continues; no `QuasiImmutField` lock may
+/// be taken while a `cache_attrs` mutex or an `INSTANCE_LOCKS` stripe is held.
+/// In particular, moving the force check inside `add_attr` would recursively
+/// take the non-reentrant `cache_attrs` mutex and deadlock.
+///
+/// # Safety
+/// `self_node` and its chain must point to live map nodes.
+unsafe fn find_branch_to_move_into_readonly(
+    self_node: MapRef,
+    name: &Wtf8,
+    attrkind: u16,
+    _unbox_type: Option<UnboxType>,
+) -> Option<(usize, *const CachedAttributeHolder)> {
+    let mut current_order = usize::MAX; // sys.maxint
+    let mut number_to_readd = 0usize;
+    let mut current = self_node;
+    loop {
+        let holder = {
+            let cache = unsafe { (*current).cache_attrs() }
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cache
+                .iter()
+                .find(|((cached_name, cached_kind), _)| {
+                    cached_kind == &attrkind && &**cached_name == name
+                })
+                .map(|(_, &holder)| holder)
+        };
+        let reached_top = match holder {
+            None => true,
+            Some(h) => (unsafe { (*h).order }) > current_order,
+        };
+        if reached_top {
+            if !unsafe { (*current).is_plain() } {
+                // `find_branch_to_move_into` would call `get_new_attr` here.
+                return None;
+            }
+        } else {
+            return Some((number_to_readd, holder.unwrap()));
+        }
+        number_to_readd += 1;
+        let p = unsafe { (*current).as_plain() };
+        current_order = p.order;
+        current = p.back;
+    }
+}
+
+/// The first mapdict quasi-immutable field a write would change.
+#[derive(Clone, Copy)]
+pub enum MapdictQmutTarget {
+    PlainEverMutated(*const PlainAttribute),
+    TerminatorAllowUnboxing(*const Terminator),
+    HolderTyp(*const CachedAttributeHolder),
+    HolderAttr(*const CachedAttributeHolder),
+}
+
+/// Resolve STORE_ATTR's mapdict.py:1618-1627 attribute classification without
+/// applying the write. `bool` selects the `"slot"` attrname.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn classify_mapdict_write_attr(w_obj: PyObjectRef, name: &str) -> Option<(u16, bool)> {
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    Some(unsafe { classify_attr(w_type, w_descr, true) })
+}
+
+/// Return the first `?` field mapdict.py:68-75 `AbstractAttribute.write` would
+/// flip, without performing the write or interning a transition.
+///
+/// Watcher installation belongs to the tracer. This predicate never reads an
+/// `*_qmut_installed` flag and never holds a `cache_attrs` mutex or an
+/// `INSTANCE_LOCKS` stripe while a `QuasiImmutField` lock can be taken.
+///
+/// # Safety
+/// `w_obj` and `w_value` must be live objects.
+pub unsafe fn setattr_would_force_quasi_immut(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+    attrkind: u16,
+    w_value: PyObjectRef,
+) -> Option<MapdictQmutTarget> {
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    if let Some(attr) = unsafe { find_map_attr(map, name, attrkind) } {
+        let p = unsafe { (*attr).as_plain() };
+        if !p.ever_mutated.get() {
+            return Some(MapdictQmutTarget::PlainEverMutated(p));
+        }
+        if let Some(unboxed) = &p.unboxed {
+            let term = unsafe { (*p.terminator).as_terminator() };
+            if !unsafe { value_has_unbox_type(unboxed.typ, w_value) } && term.allow_unboxing.get() {
+                return Some(MapdictQmutTarget::TerminatorAllowUnboxing(term));
+            }
+        }
+        return None;
+    }
+
+    let term = unsafe { (*(*map).terminator()).as_terminator() };
+    if attrkind == DICT && term.kind != TerminatorKind::Dict {
+        return None;
+    }
+    let unbox_type = unsafe { pick_unbox_type(map, w_value) };
+    let (_, holder) =
+        unsafe { find_branch_to_move_into_readonly(map, name, attrkind, unbox_type) }?;
+    let typ = unsafe { (*holder).typ.get() };
+    if typ.is_some() && typ != unbox_type {
+        Some(MapdictQmutTarget::HolderTyp(holder))
+    } else {
+        None
+    }
+}
+
+/// Return the first `?` field mapdict.py:77-78 / 461-470 delete would flip,
+/// without applying the deletion.
+///
+/// The `PlainAttribute.delete` → `_copy_attr` → `add_attr` → `pick_attr`
+/// re-add chain (mapdict.py:461-470) is deliberately not modelled: simulating
+/// that rebuild side-effect-free is not tractable against the current
+/// `node_copy` / `add_attr` shape. The optimizer's
+/// `quasiimmut_field_still_valid` revalidation (heap.py:798-804, ported in
+/// majit-metainterp's `optimizeopt/heap.rs`) discards a loop whose recorded `?`
+/// value moved during tracing, so a missed force costs a wasted trace, never
+/// correctness. Watcher installation belongs to the tracer; this predicate
+/// reads no `*_qmut_installed` flag and takes no `QuasiImmutField` lock while a
+/// `cache_attrs` mutex or an `INSTANCE_LOCKS` stripe is held.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn delattr_would_force_quasi_immut(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+    attrkind: u16,
+) -> Option<MapdictQmutTarget> {
+    let mut current = unsafe { mapdict_map_or_null(w_obj) };
+    while !current.is_null() && unsafe { (*current).is_plain() } {
+        let p = unsafe { (*current).as_plain() };
+        if p.attrkind == attrkind && &*p.name == name {
+            return (!p.ever_mutated.get()).then_some(MapdictQmutTarget::PlainEverMutated(p));
+        }
+        current = p.back;
+    }
+    None
+}
+
 /// mapdict.py:195-202 `AbstractAttribute._pick_unbox_type`.
 ///
 /// Returns the unbox type when the terminator allows unboxing and the value is
