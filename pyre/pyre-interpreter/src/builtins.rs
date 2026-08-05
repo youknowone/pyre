@@ -4926,12 +4926,19 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         }
     }
     if pos.len() == 1 && unsafe { pyre_object::is_type(pos[0]) } {
-        return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
+        // `type.__new__(metatype)` — no name, bases or namespace follows.
+        return Err(crate::PyError::type_error(new_arity_message(pos[0])));
     }
     if pos.len() == 1 {
         return type_descr_new_without_metaclass(pos, kwargs);
     }
     if pos.len() == 2 {
+        // typeobject.py:901-908 — the one-argument form belongs to `type`
+        // alone: `type(x)` reports the type of `x`, while `Metaclass(x)` is a
+        // class statement missing its bases and its namespace.
+        if !unsafe { std::ptr::eq(pos[0], crate::typedef::w_type()) } {
+            return Err(crate::PyError::type_error(new_arity_message(pos[0])));
+        }
         return type_descr_new_without_metaclass(&pos[1..], kwargs);
     }
     // `descr__new__` (typeobject.py:885) keys the one-vs-three form on the
@@ -4948,6 +4955,18 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     }
     Err(crate::PyError::type_error("type() takes 1 or 3 arguments"))
 }
+/// typeobject.py:888-895 `descr__new__` — the wording for a `type.__new__`
+/// call whose argument count is neither one nor three.  `type` itself names
+/// both accepted counts; any other metatype names only the three-argument
+/// form, under the count upstream writes as a literal.
+fn new_arity_message(w_metatype: PyObjectRef) -> String {
+    if unsafe { std::ptr::eq(w_metatype, crate::typedef::w_type()) } {
+        return "type.__new__() takes 1 or 3 arguments".to_string();
+    }
+    let name = unsafe { pyre_object::w_type_get_name(w_metatype) };
+    format!("{name}.__new__() takes exactly 3 arguments (1 given)")
+}
+
 fn type_descr_new_without_metaclass(
     args: &[PyObjectRef],
     kwargs: Option<PyObjectRef>,
@@ -6890,10 +6909,11 @@ fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// `PyError::type_error`.
 fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 5 {
-        // first arg is `self`; PyPy reports argcount excluding `self`.
-        return Err(crate::PyError::type_error(
-            "function takes exactly 4 arguments",
-        ));
+        // first arg is `self`; the count reported excludes it.
+        return Err(crate::PyError::type_error(format!(
+            "function takes exactly 4 arguments ({} given)",
+            args.len() - 1
+        )));
     }
     let w_self = args[0];
     let w_object = args[1];
@@ -6942,9 +6962,10 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
 /// `bytes` so reads of `e.object` round-trip as `bytes` per PyPy.
 fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 6 {
-        return Err(crate::PyError::type_error(
-            "function takes exactly 5 arguments",
-        ));
+        return Err(crate::PyError::type_error(format!(
+            "function takes exactly 5 arguments ({} given)",
+            args.len() - 1
+        )));
     }
     let w_self = args[0];
     let w_encoding = args[1];
@@ -7034,9 +7055,10 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 /// `str` (`space.realutf8_w`).
 fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 6 {
-        return Err(crate::PyError::type_error(
-            "function takes exactly 5 arguments",
-        ));
+        return Err(crate::PyError::type_error(format!(
+            "function takes exactly 5 arguments ({} given)",
+            args.len() - 1
+        )));
     }
     let w_self = args[0];
     let w_encoding = args[1];
@@ -8047,7 +8069,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if !unsafe { crate::baseobjspace::isinstance_str_w(message) } {
         let type_name = crate::baseobjspace::object_functionstr_type_name(message);
         return Err(crate::PyError::type_error(format!(
-            "argument 1 must be str, not {type_name}"
+            "BaseExceptionGroup.__new__() argument 1 must be str, not {type_name}"
         )));
     }
     let is_list_or_tuple = unsafe {

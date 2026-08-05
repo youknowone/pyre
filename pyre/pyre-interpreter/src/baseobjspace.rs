@@ -510,6 +510,10 @@ fn abstract_isclass_w(w_obj: PyObjectRef) -> Result<bool, PyError> {
 
 /// abstractinst.py:36-38 `check_class(space, w_obj, msg)`. Raises
 /// `TypeError(msg)` when `w_obj` lacks a tuple-valued `__bases__`.
+///
+/// The `, got %T` suffix upstream appends is deliberately dropped: every
+/// caller passes the 3.14 message text, which names the accepted kinds
+/// instead of the rejected argument's type.
 fn check_class(w_obj: PyObjectRef, msg: &str) -> Result<(), PyError> {
     if !abstract_isclass_w(w_obj)? {
         return Err(PyError::type_error(msg.to_string()));
@@ -724,7 +728,7 @@ pub(crate) unsafe fn p_recursive_issubclass_w(
     check_class(w_derived, "issubclass() arg 1 must be a class")?;
     check_class(
         w_cls,
-        "issubclass() arg 2 must be a class or tuple of classes",
+        "issubclass() arg 2 must be a class, a tuple of classes, or a union",
     )?;
     p_abstract_issubclass_w(w_derived, w_cls)
 }

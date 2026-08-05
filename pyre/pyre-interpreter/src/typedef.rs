@@ -10794,15 +10794,21 @@ fn init_type_type(ns: PyObjectRef) {
     // `type.mro(cls)` — typeobject.c `mro_external` / `type.mro`: the method
     // form returns the MRO as a fresh list (the `__mro__` getset above
     // returns the tuple).  Bound as a regular method, so `cls` is at args[0].
-    let mro_method = make_builtin_function("mro", |args| {
-        let cls = args[0];
-        // typeobject.py:1081-1084 `descr_mro` computes the default C3 MRO
-        // afresh. In particular this is callable from `Meta.mro()` while the
-        // nascent class has not installed its final MRO yet.
-        Ok(pyre_object::w_list_new(unsafe {
-            crate::baseobjspace::compute_default_mro(cls)
-        }))
-    });
+    // `mro()` takes its receiver and nothing else; the declared count is what
+    // rejects a surplus argument before the body indexes `args[0]`.
+    let mro_method = make_builtin_function_with_arity(
+        "mro",
+        |args| {
+            let cls = args[0];
+            // typeobject.py:1081-1084 `descr_mro` computes the default C3 MRO
+            // afresh. In particular this is callable from `Meta.mro()` while the
+            // nascent class has not installed its final MRO yet.
+            Ok(pyre_object::w_list_new(unsafe {
+                crate::baseobjspace::compute_default_mro(cls)
+            }))
+        },
+        1,
+    );
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "mro", mro_method) };
 
     // typeobject.py:1274-1275 `descr___prepare__` —
@@ -17046,9 +17052,18 @@ fn init_int_type(ns: PyObjectRef) {
                     pos.get(2).is_some(),
                 )?;
                 if pos.len() > 3 {
+                    let given = pos.len() - 1;
+                    // `_PyArg_UnpackKeywords` names the total parameter count
+                    // once the call passes every parameter, and the positional
+                    // limit while it is only past the positional ones —
+                    // `signed` is keyword-only.
+                    let limit = if given > 3 {
+                        "at most 3 arguments"
+                    } else {
+                        "at most 2 positional arguments"
+                    };
                     return Err(crate::PyError::type_error(format!(
-                        "to_bytes() takes at most 2 positional arguments ({} given)",
-                        pos.len() - 1
+                        "to_bytes() takes {limit} ({given} given)"
                     )));
                 }
                 let owned_val;
@@ -17834,9 +17849,12 @@ fn init_float_type(ns: PyObjectRef) {
                 let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
                     unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
                 } else {
-                    return Err(crate::PyError::type_error(
-                        "fromhex() requires a string argument",
-                    ));
+                    // `@unwrap_spec(s='text')` — the operand is rejected by
+                    // `space.text_w`, which words it this way.
+                    return Err(crate::PyError::type_error(format!(
+                        "expected str, got {} object",
+                        crate::type_methods::arg_type_name(args[1])
+                    )));
                 };
                 // Delegate parsing to the shared hex-float reader, which rounds
                 // round-half-even over the full exponent range (subnormals down to
@@ -21440,9 +21458,16 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `bytes` and `byteorder` are the only positional parameters; `signed`
     // is keyword-only, so a third positional is an error.
     if pos.len() > 3 {
+        let given = pos.len() - 1;
+        // `_PyArg_UnpackKeywords` — see `to_bytes`; `signed` is keyword-only,
+        // so the total is one past the positional limit.
+        let limit = if given > 3 {
+            "at most 3 arguments"
+        } else {
+            "at most 2 positional arguments"
+        };
         return Err(crate::PyError::type_error(format!(
-            "from_bytes() takes at most 2 positional arguments ({} given)",
-            pos.len() - 1
+            "from_bytes() takes {limit} ({given} given)"
         )));
     }
     // `bytes` and `byteorder` are positional-or-keyword; supplying one both
@@ -22241,7 +22266,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     // `space.text_w` and is refused unless it is a str.
     if let Some(enc) = w_encoding {
         if !unsafe { pyre_object::is_str(enc) } {
-            let tn = unsafe { pyre_object::type_name_of(enc) };
+            let tn = crate::type_methods::clinic_arg_type_name(enc);
             return Err(crate::PyError::type_error(format!(
                 "decode() argument 'encoding' must be str, not {tn}",
             )));
@@ -22249,7 +22274,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     }
     if let Some(err) = w_errors {
         if !unsafe { pyre_object::is_str(err) } {
-            let tn = unsafe { pyre_object::type_name_of(err) };
+            let tn = crate::type_methods::clinic_arg_type_name(err);
             return Err(crate::PyError::type_error(format!(
                 "decode() argument 'errors' must be str, not {tn}",
             )));

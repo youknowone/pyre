@@ -2615,6 +2615,15 @@ pub fn format_value_dispatch_w(
 
 /// The type name of `obj` for a TypeError message — the `w_class` name
 /// for instances, else the storage type name.
+/// `_PyArg_BadArgument`'s rendering of a rejected argument: `None` names
+/// itself where every other value names its type.
+pub(crate) fn clinic_arg_type_name(obj: PyObjectRef) -> String {
+    if unsafe { pyre_object::is_none(obj) } {
+        return "None".to_string();
+    }
+    arg_type_name(obj)
+}
+
 pub(crate) fn arg_type_name(obj: PyObjectRef) -> String {
     if obj.is_null() {
         return "object".to_string();
@@ -5164,14 +5173,20 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `convert_arg_to_w_unicode`, which decodes a buffer operand into a fill
 /// char rather than refusing it. That acceptance is a PyPy-only divergence
 /// (CPython refuses a memoryview/array/bytearray fill for all three) and is
-/// deliberately not imported, so all three share one rejection here.
+/// deliberately not imported, so all three share one rejection here — and
+/// with the acceptance goes the wording it comes with, leaving the rejection
+/// to name the offending type the way the three refusals uniformly do.
+///
+/// A str of the wrong length is a separate refusal, and the one upstream
+/// words per method.
 fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::PyError> {
     if args.len() <= 2 {
         return Ok(CodePoint::from_char(' '));
     }
     if !unsafe { pyre_object::is_str(args[2]) } {
+        let type_name = arg_type_name(args[2]);
         return Err(crate::PyError::type_error(format!(
-            "{method}() argument 2 must be a single character"
+            "The fill character must be a unicode character, not {type_name}"
         )));
     }
     let raw = unsafe { w_str_get_wtf8(args[2]) };

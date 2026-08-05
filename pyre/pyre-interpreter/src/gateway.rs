@@ -894,18 +894,21 @@ fn no_keyword_arguments(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> cr
     crate::PyError::type_error(format!("{subject}() takes no keyword arguments"))
 }
 
-/// The name a builtin reports itself under (`_PyObject_FunctionStr` of the
-/// `__module__` and `__qualname__` a `builtin_function_or_method` carries): a
-/// module-level builtin `module.name` — bare for `builtins`, whose module
-/// prefix is left off — and a descriptor `TYPE.name`.
+/// The name a builtin reports itself under: a module-level builtin
+/// `module.name` — bare for `builtins`, whose module prefix is left off — and
+/// a descriptor `TYPE.name`.
 ///
-/// TYPE is the receiver itself when the receiver IS a type
-/// (`int.__subclasses__`) and otherwise the receiver's type — the rule a
-/// bound `builtin_function_or_method` follows (`type(__self__).__qualname__`),
-/// which is the callable kind pyre hands out for every builtin method.  A
-/// `method_descriptor` reports the class that declares it instead, a
-/// distinction pyre cannot draw with one callable kind; the descriptors whose
-/// declaring class is fixed (`object.__sizeof__`) name it themselves.
+/// TYPE is the receiver itself when the receiver IS a type: `int.mro` is a
+/// bound `builtin_function_or_method` over a method of `type`, and a bound
+/// builtin reports the qualname of the class it is bound to
+/// (`int.mro() takes no arguments`).
+///
+/// Otherwise TYPE is the class that *declares* the method, which is what a
+/// `method_descriptor` reports — `MyList([1]).append()` is `list.append()`,
+/// naming `list` and not the receiver's own class.  Binding a method to a
+/// name first (`f = MyList([1]).append`) produces the other callable kind and
+/// reports `MyList.append()`; pyre hands out one callable kind and so takes
+/// the declaring class, the form both call syntaxes reach.
 fn builtin_names(
     code: &BuiltinCode,
     receiver: Option<PyObjectRef>,
@@ -916,11 +919,10 @@ fn builtin_names(
         None => format!("{}.{}", code.module, code.name),
         Some(owner) => {
             let ty = match receiver {
-                Some(r) if unsafe { pyre_object::typeobject::is_type(r) } => {
-                    unsafe { pyre_object::w_type_get_name(r) }.to_string()
-                }
-                Some(r) => crate::baseobjspace::object_functionstr_type_name(r),
-                None => owner.type_name.to_string(),
+                Some(r) if unsafe { pyre_object::typeobject::is_type(r) } => unsafe {
+                    pyre_object::w_type_get_name(r)
+                },
+                _ => owner.type_name,
             };
             format!("{ty}.{}", code.name)
         }

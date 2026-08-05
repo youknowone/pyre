@@ -1527,8 +1527,11 @@ pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError>
             return Ok(cause);
         }
     }
+    // `error.py:376-385 set_cause` validates through
+    // `_exception_getclass(space, w_cause, "exception causes")`, whose wording
+    // is not the one `descr_setcause` uses for `e.__cause__ = x`.
     Err(PyError::type_error(
-        "exception cause must be None or derive from BaseException",
+        "exception causes must derive from BaseException",
     ))
 }
 
@@ -5056,7 +5059,7 @@ mod tests {
         assert_eq!(err.kind, PyErrorKind::TypeError);
         assert_eq!(
             err.message,
-            "exception cause must be None or derive from BaseException"
+            "exception causes must derive from BaseException"
         );
     }
 
