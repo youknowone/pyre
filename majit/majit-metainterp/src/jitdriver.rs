@@ -2984,6 +2984,13 @@ impl<S: JitState> JitDriver<S> {
                                 // false now and true at the next visit of this header.
                                 if let Some(ctx) = self.meta.trace_ctx() {
                                     if attempted {
+                                        // The two sibling close sites report a declined
+                                        // attempt under the same tally; this one is the
+                                        // third.  Bump it on the same condition the latch
+                                        // uses, so the census counts closes an optimizer
+                                        // pass actually rejected and not headers the gate
+                                        // above skipped.
+                                        crate::mc_diag_bump(50); // bridge_declined_close
                                         ctx.note_cross_loop_close_declined(target_key);
                                     }
                                     ctx.close_greens = None;
