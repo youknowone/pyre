@@ -1313,7 +1313,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
         // through `next_value_pos`, let `remove_ref_constants` reuse its id for
         // a `LoadFromGcTable` — whose store then lands after the read, so the
         // read returns the zero wasm initializes the local to.
-        let mut widen = |a: OpRef, max_var: &mut u32| {
+        let widen = |a: OpRef, max_var: &mut u32| {
             if a != OpRef::NONE && !a.is_constant() && a.raw() + 1 > *max_var {
                 *max_var = a.raw() + 1;
             }

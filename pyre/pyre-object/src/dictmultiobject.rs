@@ -4394,6 +4394,76 @@ pub unsafe fn w_dict_nth_item_object_strategy(
     entries.get_index(index).map(|(k, &v)| (k.obj, v))
 }
 
+/// `rordereddict.py:46-48 ll_call_lookup_function` — the `dict.lookup` oopspec
+/// residual, answering the entry index for `w_key` (or -1 for a miss) under a
+/// hash the caller already computed.
+///
+/// `flag` is the `FLAG_LOOKUP` / `FLAG_STORE` / `FLAG_DELETE` selector
+/// `ll_dict_lookup` takes (`rordereddict.py:1041-1060`).  An `IndexMap` keeps no
+/// free-slot bookkeeping, so every flag answers the same index; the argument
+/// exists because the optimizer reads it off `arg(4)` (`heap.py:497-500`).
+///
+/// Only a Unicode-strategy dict reaches here, so every stored key is an exact
+/// `str` and the probe's comparisons are WTF-8 byte equality.  The
+/// callback-free probe bracket enforces that: a pair that would need user code
+/// breaks the probe and reports a miss, which side-exits the compiled trace to
+/// the generic residual rather than running `__eq__` inside a call the recorder
+/// promised cannot raise.
+///
+/// The object parameters are spelled `*mut PyObject` rather than
+/// [`PyObjectRef`]: `dont_look_inside` decides syntactically whether it can
+/// emit the `__majit_call_target_*` word-ABI trampoline, and an alias path is
+/// not a raw-pointer token, so the alias spelling silently yields no
+/// trampoline — which is what the wasm backend's `call_indirect` needs.
+///
+/// The table read holds the dict's own lock, like every other reader of
+/// `dstorage`, so a concurrent `setitem` cannot resize the `IndexMap` under the
+/// scan.  Holding it across the probe cannot deadlock: `dict_keys_equal` runs no
+/// user code while the bracket is active — a pair the builtin ladder cannot
+/// decide breaks the probe instead — so nothing under the lock can re-enter a
+/// dict operation.
+///
+/// # Safety
+/// `w_dict` must be a live `W_DictObject` on a strategy whose storage is an
+/// `ObjectDictStorage`, and `hash` the digest `object_key_for` produces for
+/// `w_key`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_unicode_lookup_index(
+    w_dict: *mut PyObject,
+    w_key: *mut PyObject,
+    hash: i64,
+    _flag: i64,
+) -> i64 {
+    lock_dict_refs!(_dict_guard, w_dict, w_key);
+    let dict = &*(w_dict as *const W_DictObject);
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    crate::dict_eq_hook::take_eq_error();
+    crate::dict_eq_hook::begin_callback_free_probe();
+    let found = entries.get_index_of(&ObjectKey { hash, obj: w_key });
+    let probe_needed_user_code = crate::dict_eq_hook::end_callback_free_probe();
+    match found {
+        Some(i) if !probe_needed_user_code => i as i64,
+        _ => -1,
+    }
+}
+
+/// `rstr.ll_strhash` — the digest [`object_key_for`] caches for an exact `str`
+/// key, isolated so a recorder that has already guarded the key's exact type
+/// can emit it as one elidable call and let the optimizer hoist it out of a
+/// loop.  Memoized on the string object, content-derived and identity-stable,
+/// which is what `@jit.elidable` asserts.
+///
+/// `w_key` is spelled `*mut PyObject` for [`w_dict_unicode_lookup_index`]'s
+/// reason.
+///
+/// # Safety
+/// `w_key` must be a live exact `str`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_unicode_key_hash(w_key: *mut PyObject) -> i64 {
+    crate::dict_eq_hook::try_hash_w(w_key)
+        .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook())
+}
+
 /// Internal helper: `ModuleDictStrategy::items` body for pyre's
 /// W_ModuleDictObject — branches on `is_object_strategy` and emits
 /// from whichever storage half is live.  Called only from the
@@ -6551,6 +6621,32 @@ mod tests {
             assert_eq!(w_int_get_value(str_entries[0].1), 1);
             assert_eq!(str_entries[1].0, "beta");
             assert_eq!(w_int_get_value(str_entries[1].1), 2);
+        }
+    }
+
+    #[test]
+    fn test_w_dict_unicode_lookup_index_helpers() {
+        install_test_hash_hook();
+        let dict = w_dict_new();
+        unsafe {
+            w_dict_setitem_str(dict, "alpha", w_int_new(1));
+            w_dict_setitem_str(dict, "beta", w_int_new(2));
+
+            let alpha = w_str_new("alpha");
+            let beta = w_str_new("beta");
+            let gamma = w_str_new("gamma");
+            assert_eq!(
+                w_dict_unicode_lookup_index(dict, alpha, w_dict_unicode_key_hash(alpha), 0),
+                0,
+            );
+            assert_eq!(
+                w_dict_unicode_lookup_index(dict, beta, w_dict_unicode_key_hash(beta), 0),
+                1,
+            );
+            assert_eq!(
+                w_dict_unicode_lookup_index(dict, gamma, w_dict_unicode_key_hash(gamma), 0),
+                -1,
+            );
         }
     }
 

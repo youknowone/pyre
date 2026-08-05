@@ -2020,6 +2020,31 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_entries_index_of_object",
         pyre_object::dictmultiobject::dict_entries_index_of_object as *const (),
     );
+    // The `dict.lookup` producer's two residuals bind the macro-emitted
+    // `__majit_call_target_*` trampoline, not the raw fn. The wasm backend
+    // lowers a Ref/Int-result residual to a `call_indirect` whose static type
+    // comes from the descr alone — `(i64 x n) -> i64` — so a raw
+    // `(*mut PyObject, *mut PyObject, i64, i64) -> i64`, which is
+    // `(i32, i32, i64, i64) -> i64` on wasm32, traps
+    // `indirect call type mismatch`. The trampoline takes and returns the
+    // uniform machine word on every target. The raw fn stays reachable as
+    // `__majit_call_policy_*`'s null-target fallback.
+    let w_dict_unicode_lookup_index: extern "C" fn(i64, i64, i64, i64) -> i64 =
+        pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_lookup_index;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_unicode_lookup_index",
+        "pyre_object::w_dict_unicode_lookup_index",
+        w_dict_unicode_lookup_index as *const (),
+    );
+    let w_dict_unicode_key_hash: extern "C" fn(i64) -> i64 =
+        pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_key_hash;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_unicode_key_hash",
+        "pyre_object::w_dict_unicode_key_hash",
+        w_dict_unicode_key_hash as *const (),
+    );
     // The module-dict storage's own `String`-keyed probe / store pair.
     push_alias_pair(
         &mut entries,
