@@ -48,11 +48,12 @@ pub(crate) fn scalar_size(ty: majit_ir::value::Type) -> usize {
 /// Which slot of `fields` a field descr occupies, keyed the way
 /// `heaptracker.py:60-72 get_fielddescr_index_in(STRUCT, fieldname)` keys it.
 ///
-/// Upstream has only the name, because upstream always has one. pyre's mint
-/// sites do not: `add_struct_field_descr` is handed `(offset, type, type_id)`
-/// and nothing else, and a field it could not place in the layout it saw keeps
-/// the empty-name fallback. So the name decides whenever there is one, and the
-/// byte offset stands in when there is not.
+/// Upstream has only the name, because upstream always has one. Every emit site
+/// here carries one too — `jitcode_lower` passes the same `stringify!(#member)`
+/// it hands `register_struct_layout`, and `newlist_clear` passes the `"length"`
+/// / `"items"` it registered — so the name arm is the normal path. The byte
+/// offset stands in for the residue: a name the layout *this* site saw does not
+/// list, and the empty name a caller outside those paths would supply.
 ///
 /// The offset arm is deliberately narrow. Offset is NOT an identity: measured on
 /// this tree, 7 of 1714 submitted field specs sit at an offset another field of
@@ -5630,10 +5631,10 @@ impl JitCodeBuilder {
     /// one.  Offset is not an identity: measured on this tree, 7 of 1714
     /// submitted field specs sit at an offset another field of the same parent
     /// also occupies, so `position(|fd| fd.offset == offset)` can name a
-    /// sibling.  It is used only as the fallback for the mint sites that have
-    /// no name to carry — `add_struct_field_descr` takes `(offset, type,
-    /// type_id)` and never sees a `fieldname`, which is a real gap against
-    /// `get_fielddescr_index_in` and not something this pass can close — and
+    /// sibling.  It is used only for the descrs whose recorded name the final
+    /// spec does not list — every emit site carries the declared member name
+    /// into `add_struct_field_descr`, so what reaches the offset arm is a field
+    /// the layout never enumerated, not a field that arrived anonymous — and
     /// then only when the offset is UNAMBIGUOUS.  Where it is not, this leaves
     /// the descr alone: `descr.rs find_index_in_parent` refuses to invent a
     /// position for exactly this reason, and a pass that guesses is worse than
