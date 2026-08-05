@@ -574,6 +574,11 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
         (session.recording_frame_ptr, session.recording_jitcode_index)
     };
     if execute_concrete {
+        // Attaching the live frame to a traceback escapes the virtualizable, so
+        // publish the walk's locals first.  `virtualizable.py:101-138
+        // write_boxes` makes that write unconditional, and `pyopcode.py:148`
+        // performs it before attaching the application traceback.
+        crate::state::flush_locals_region_to_frame(ctx.trace_ctx, frame_ptr);
         journaled_concrete_traceback_attach(exc_ptr, || {
             majit_metainterp::record_application_traceback_for_recording(
                 exc_ptr as usize as i64,
@@ -723,10 +728,13 @@ fn record_inline_application_traceback<Sym: WalkSym>(
             opcode_position as i32,
         )
         .and_then(|py_pc| {
-            concrete_portal_frame(ctx, consts.jitcode_index).map(|frame| (frame, py_pc))
+            let frame_reg = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?
+                .metadata
+                .portal_frame_reg;
+            concrete_portal_frame(ctx, consts.jitcode_index).map(|frame| (frame, py_pc, frame_reg))
         });
         journaled_concrete_traceback_attach(exc_ptr, || match node_frame {
-            Some((frame_ptr, py_pc)) => {
+            Some((frame_ptr, py_pc, frame_reg)) => {
                 // `dispatch_bytecode` (pyopcode.py) writes `self.last_instr`
                 // before every opcode so a frame read while it runs answers for
                 // the instruction executing.  The recording walk does not make
@@ -743,6 +751,12 @@ fn record_inline_application_traceback<Sym: WalkSym>(
                 unsafe {
                     (*frame_ptr).last_instr = py_pc as isize;
                 }
+                // Attaching the live frame to a traceback escapes the
+                // virtualizable, so publish this callee's walk-time locals
+                // first.  `virtualizable.py:101-138 write_boxes` makes that
+                // write unconditional before `pyopcode.py:148` attaches the
+                // application traceback.
+                flush_callee_locals_region_to_frame(ctx, frame_ptr, frame_reg);
                 majit_metainterp::record_application_traceback_for_recording(
                     exc_ptr as usize as i64,
                     frame_ptr as i64,
@@ -791,6 +805,62 @@ fn concrete_portal_frame<Sym: WalkSym>(
         return None;
     };
     (!frame.is_null()).then_some(frame as *mut pyre_interpreter::PyFrame)
+}
+
+/// [`crate::state::flush_locals_region_to_frame`]'s twin for an inlined level.
+///
+/// The top-level frame's slots come from the seeded `virtualizable_boxes`; a
+/// fresh inlined callee has no seeded frame and owns [`CalleeLocalsShadow`]
+/// instead, so the escape write reads the locals region out of that shadow.
+/// `frame_reg` is the level's portal frame register, and only entries written
+/// through it belong to `frame`.
+fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    frame: *mut pyre_interpreter::PyFrame,
+    frame_reg: u16,
+) -> bool {
+    if frame.is_null() {
+        return false;
+    }
+    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+        return false;
+    };
+    let Some(nlocals) = crate::state::concrete_nlocals(frame as usize) else {
+        return false;
+    };
+    // Validation pass first: a missing entry was never written through this
+    // shadow and leaves the frame's existing slot alone.  `Value::Void` is the
+    // shadow's "no concrete half" sentinel, not a NULL local: writing it back
+    // would box to `PY_NULL` and destroy the slot held in a walk register.
+    for abs in 0..nlocals {
+        let Some(concrete) = shadow.concrete.get(&(abs as i64)) else {
+            continue;
+        };
+        if concrete.frame_reg != frame_reg || matches!(concrete.value, Value::Void) {
+            return false;
+        }
+    }
+    let frame_ptr = frame as *const u8;
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
+        return false;
+    }
+    for abs in 0..nlocals {
+        let Some(concrete) = shadow.concrete.get(&(abs as i64)) else {
+            continue;
+        };
+        let boxed = crate::state::boxed_slot_value_for_type(Type::Ref, &concrete.value);
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = boxed;
+        }
+        // Boxing an Int/Float slot allocates, and each minor collection
+        // consumes the array's remembered-set entry, so re-arm per store.
+        crate::state::frame_array_write_barrier(frame as *mut u8, arr_ptr);
+    }
+    true
 }
 
 /// Publish `PyFrame.frame_finished_execution = True` on the current

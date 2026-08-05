@@ -1192,63 +1192,7 @@ impl OptHeap {
     /// carries it to `Optimizer::emit_operation`, whose force_box loop
     /// (optimizer.py:641-665) is the single force point that appends
     /// the materialization directly ahead of the store.
-    ///
-    /// `get_rhs`: polymorphic RHS extractor matching
-    /// `AbstractCachedEntry._get_rhs_from_set_op` (heap.py:169-170 /
-    /// :300). `Self::field_get_rhs` → `op.arg(1)` for SETFIELD_GC;
-    /// `Self::array_get_rhs` → `op.arg(2)` for SETARRAYITEM_GC.
-    /// True when `op` writes into the standard virtualizable frame: either a
-    /// SETFIELD_GC whose target object is the virtualizable, or a
-    /// SETARRAYITEM_GC whose array operand was read from the virtualizable's
-    /// array-pointer field (`GetfieldGc*`/`GetfieldRaw*` of the frame). Such
-    /// writes are deferred at the export flush — see `emit_lazy_setfield`.
-    fn writes_into_virtualizable(op: &Op, ctx: &OptContext) -> bool {
-        let Some(target) = ctx.resolve_operand_operand_opt(&op.arg(0)) else {
-            return false;
-        };
-        if ctx.is_virtualizable(&target) {
-            return true;
-        }
-        // `virtualizable.py:81-84` permits indirection only through an array
-        // field: SETARRAYITEM_GC on an array read from the standard frame.
-        // A SETFIELD_GC target merely read from the frame is a different
-        // object and must never inherit virtualizable ownership.
-        match ctx.get_producing_op(&target) {
-            Some(producer)
-                if op.opcode == OpCode::SetarrayitemGc
-                    && matches!(
-                        producer.opcode,
-                        OpCode::GetfieldGcI
-                            | OpCode::GetfieldGcR
-                            | OpCode::GetfieldGcF
-                            | OpCode::GetfieldRawI
-                            | OpCode::GetfieldRawR
-                            | OpCode::GetfieldRawF
-                    ) =>
-            {
-                ctx.resolve_operand_operand_opt(&producer.arg(0))
-                    .map_or(false, |frame| ctx.is_virtualizable(&frame))
-            }
-            _ => false,
-        }
-    }
-
-    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, get_rhs: fn(&Op) -> Operand) {
-        let rhs = get_rhs(op);
-        let rhs_is_virtual = ctx
-            .resolve_operand_operand_opt(&rhs)
-            .map_or(false, |b| ctx.is_virtual(&b));
-        // A virtual value stored into the standard virtualizable frame is
-        // deferred, not flushed: the frame is a tracked existing object whose
-        // fields are reconstructed at resume (guard pendingfields, via
-        // force_lazy_sets_for_guard) or carried as JUMP args into the target
-        // loop. Forcing+emitting here would box a loop-carried virtual —
-        // turning Virtual{W_IntObject} into KnownClass and breaking the
-        // VirtualState match at a peeled label — and write a redundant inline
-        // store. OptVirtualize already mirrored the element for read-folding.
-        if rhs_is_virtual && Self::writes_into_virtualizable(op, ctx) {
-            return;
-        }
+    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext) {
         // Resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
@@ -2287,7 +2231,7 @@ impl OptHeap {
                         }
                     }
                 }
-                Self::emit_lazy_setfield(&mut lazy_op, ctx, Self::field_get_rhs);
+                Self::emit_lazy_setfield(&mut lazy_op, ctx);
                 // can_cache=True: put_field_back_to_info
                 let final_value = lazy_op.arg(1);
                 let lazy_descr = lazy_op.getdescr().unwrap().clone();
@@ -2528,18 +2472,6 @@ impl OptHeap {
         OptimizationResult::Remove
     }
 
-    /// heap.py:169-170 CachedField._get_rhs_from_set_op — the new
-    /// value of a SETFIELD_GC is its second arg.
-    fn field_get_rhs(op: &Op) -> Operand {
-        op.arg(1)
-    }
-
-    /// heap.py:300 ArrayCachedItem._get_rhs_from_set_op — the new
-    /// value of a SETARRAYITEM_GC is its third arg.
-    fn array_get_rhs(op: &Op) -> Operand {
-        op.arg(2)
-    }
-
     /// heap.py:122-145 `AbstractCachedEntry.force_lazy_set(optheap,
     /// descr, can_cache=True)` array-side line-by-line. Body identical
     /// to `force_lazy_set_field` modulo:
@@ -2580,7 +2512,7 @@ impl OptHeap {
                 }
                 // heap.py:135 optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&mut lazy_op, ctx, Self::array_get_rhs);
+                Self::emit_lazy_setfield(&mut lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2732,7 +2664,7 @@ impl OptHeap {
                 }
                 // heap.py:135 optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&mut lazy_op, ctx, Self::field_get_rhs);
+                Self::emit_lazy_setfield(&mut lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2863,7 +2795,7 @@ impl OptHeap {
                             }
                         }
                     }
-                    Self::emit_lazy_setfield(&mut lazy_op, ctx, Self::array_get_rhs);
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx);
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
