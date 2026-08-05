@@ -7702,41 +7702,17 @@ impl<M: Clone> MetaInterp<M> {
         // `jump_to_existing_trace`, and the foreign-target fallback at
         // `unroll.rs:1797-1810` all reach it.
         //
-        // It is declined here for a BACKEND reason, and only one backend:
-        // `majit-backend-wasm` decides local-vs-external JUMP on `has_loop`
-        // (`codegen.rs:1983`), not on whether the descr resolves. A retrace has
-        // its own LABEL, so `find_loop_label_index`'s
-        // `.or_else(rposition(Label))` fallback (`codegen.rs:4785-4791`) makes
-        // `has_loop` true, the external arm at `codegen.rs:2195` is skipped,
-        // and `find_label_args` (`codegen.rs:4806-4810`) falls back to the
-        // trailing label — silently turning the preamble JUMP into a back-edge
-        // to this trace's own label. Cranelift has no such gap
-        // (`compiler.rs:13247-13302` resolves by descr and emits an external
-        // exit). Until the wasm dispatch is descr-driven, take
-        // `compile.py:368-371`'s cancel shape: declining costs the guard its
-        // retrace, compiling it would miscompile on wasm.
-        let closes_on_own_label = {
-            let jump_descr = combined_ops
-                .iter()
-                .rev()
-                .find(|op| op.opcode == OpCode::Jump)
-                .and_then(|op| op.getdescr())
-                .map(|descr| descr.index());
-            let label_descr = combined_ops
-                .iter()
-                .rev()
-                .find(|op| op.opcode == OpCode::Label)
-                .and_then(|op| op.getdescr())
-                .map(|descr| descr.index());
-            jump_descr.is_some() && jump_descr == label_descr
-        };
-        if !closes_on_own_label {
-            crate::debug::log_one(
-                "jit-abort",
-                "compile_retrace: closing JUMP does not target this trace's label",
-            );
-            return false;
-        }
+        // Both outcomes are compiled, as upstream does: `compile.py:341-394
+        // compile_retrace` declines only on `InvalidLoop` (:368-371), and both
+        // `jump_to_preamble` sites return a full `UnrollInfo`.
+        //
+        // This used to decline the retargeted outcome for a single backend's sake.
+        // All three now decide local-vs-external on the TOKEN, which is
+        // `x86/assembler.py:2461-2467 closing_jump`'s own test
+        // (`target_token in self.target_tokens_currently_compiling`): dynasm at
+        // `aarch64/assembler.rs:3129` / `x86/assembler.rs:4126`, cranelift at
+        // `compiler.rs:13244-13310`, and wasm at `codegen.rs find_loop_label_index`
+        // since the descr-strict dispatch landed.
 
         let num_combined_ops = combined_ops.len();
         let has_guard = combined_ops.iter().any(|op| op.opcode.is_guard());

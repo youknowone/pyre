@@ -599,7 +599,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 57;
+pub const MC_DIAG_SLOTS: usize = 58;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -673,11 +673,16 @@ pub const MC_DIAG_SLOTS: usize = 57;
 /// gated behind a non-zero `retrace_limit` (default 0, `warmstate.rs`
 /// DEFAULT_RETRACE_LIMIT / `rpython/rlib/jit.py:595`), so a default-parameter
 /// run reading 0 on them proves nothing.
+///
+/// 57 = the unroll pass abandoned a retrace because `jump_to_preamble` would
+/// have landed a body JUMP on a preamble LABEL of a different arity
+/// (`compile.py:334`). Non-zero means a retrace was built and discarded; see
+/// the preamble-arity item.
 pub static MC_DIAG: [std::sync::atomic::AtomicU64; MC_DIAG_SLOTS] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [
         Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
     ]
 };
 
@@ -741,6 +746,7 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     "mp_shape_filtered",
     "retrace_mp_untyped",
     "close_hdr_fallback",
+    "retrace_arity_giveup",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.
