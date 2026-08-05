@@ -3421,6 +3421,21 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_Bufferable
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // The RPython `tuple2` a two-result elidable returns — here `rbigint.divmod`
+    // / `int_divmod` (rbigint.py:1002/1050). Like W_DequeBlock it is GC-managed
+    // without being an rclass.OBJECT subclass, so it takes a bare `with_gc_ptrs`
+    // id rather than a `register_pyre_class` vtable. BOTH fields are traced
+    // edges: a pair holding a payload the collector cannot see through would
+    // reclaim it under the boxing that follows. Appended at the tail so no
+    // established id moves.
+    let bigint_pair_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        pyre_object::longobject::BIGINT_PAIR_SIZE,
+        vec![
+            pyre_object::longobject::BIGINT_PAIR_ITEM0_OFFSET,
+            pyre_object::longobject::BIGINT_PAIR_ITEM1_OFFSET,
+        ],
+    ));
+    pyre_object::longobject::set_bigint_pair_gc_type_id(bigint_pair_tid);
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children

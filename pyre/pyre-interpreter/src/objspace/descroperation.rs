@@ -350,6 +350,30 @@ pub extern "C" fn jit_bigint_int_mod_int_result(a: i64, b: i64) -> i64 {
     unsafe { (&*a).int_mod_int_result(b).expect("division by zero") }
 }
 
+/// Both halves of a machine-int divmod (`longobject.py:451 _int_divmod` →
+/// `rbigint.int_divmod`, rbigint.py:1050 `@jit.elidable`). `b` is a bare
+/// machine word, not a payload pointer.
+///
+/// One call produces both results: `//` and `%` each reach `_divmod`, so
+/// splitting this into two residuals would run the division twice. The result
+/// is the RPython `tuple2` the elidable returns, and the caller reads its two
+/// halves with `getfield_gc_r` before boxing each as a `W_LongObject` — the
+/// wrappers and the interpreter tuple stay in traced code, where they remain
+/// virtualizable.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_int_divmod(
+    a: i64,
+    b: i64,
+) -> pyre_object::longobject::JitBigIntPairResult {
+    let a = a as *const BigInt;
+    unsafe {
+        let (div, modulo) = (&*a).int_divmod(b).expect("division by zero");
+        pyre_object::longobject::encode_jit_bigint_pair_result(
+            pyre_object::longobject::alloc_bigint_pair_nursery_collecting(div, modulo),
+        )
+    }
+}
+
 /// `rbigint.divmod`'s floored modulus projection.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_mod_floor(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {

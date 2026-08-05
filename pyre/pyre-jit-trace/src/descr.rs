@@ -1635,6 +1635,42 @@ static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
     )
 });
 
+// The RPython `tuple2` returned by `rbigint.divmod` / `int_divmod`
+// (rbigint.py:1002/1050). Not a PyObject — no vtable and no allocation type id,
+// because the trace never NEWs one: it arrives as an elidable's result and is
+// only read. Both fields are `Type::Ref`, which is what puts them in
+// `gc_fielddescrs`, and both are immutable, so the two reads CSE the way
+// upstream's pair of `getfield_gc_r` off one `call_pure_r` does.
+static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_object::longobject::BIGINT_PAIR_SIZE,
+        0,
+        0,
+        &[
+            (
+                "item0",
+                pyre_object::longobject::BIGINT_PAIR_ITEM0_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "item1",
+                pyre_object::longobject::BIGINT_PAIR_ITEM1_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+        ],
+        "RBigIntPair",
+        "rbigint::RBigIntPair",
+    )
+});
+
 // `pypy/objspace/std/sliceobject.py:13` `W_SliceObject._immutable_fields_ =
 // ['w_start', 'w_stop', 'w_step']` — all three Ref fields are immutable
 // once `__init__` runs.  The `space.newslice(w_start, w_end, w_step)` JIT
@@ -2728,6 +2764,16 @@ pub fn float_floatval_descr() -> DescrRef {
 /// inline-NEW boxing of a `jit_w_long_*_raw` result.
 pub fn long_value_descr() -> DescrRef {
     field_descr_from_group(&W_LONG_DESCR_GROUP, 0)
+}
+
+/// `RBigIntPair.item0` — the quotient half of a divmod `tuple2`.
+pub fn rbigint_pair_item0_descr() -> DescrRef {
+    field_descr_from_group(&RBIGINT_PAIR_DESCR_GROUP, 0)
+}
+
+/// `RBigIntPair.item1` — the remainder half of a divmod `tuple2`.
+pub fn rbigint_pair_item1_descr() -> DescrRef {
+    field_descr_from_group(&RBIGINT_PAIR_DESCR_GROUP, 1)
 }
 
 pub fn str_len_descr() -> DescrRef {

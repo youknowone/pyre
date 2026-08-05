@@ -711,6 +711,145 @@ pub fn alloc_rbigint_stable(value: RBigInt) -> *mut RBigInt {
     crate::lltype::malloc_raw(value)
 }
 
+/// RPython's `tuple2` of two `rbigint`s — the return type of `rbigint.divmod`
+/// and `rbigint.int_divmod` (rbigint.py:1002 / 1050, both `@jit.elidable`).
+///
+/// RPython gives a multiple-return elidable a real GC struct, so the trace is
+/// one `call_pure_r` yielding this pointer plus two `getfield_gc_r`. Rust
+/// returns `(RBigInt, RBigInt)` by value, which has no address the JIT can name
+/// — hence this explicit struct, whose two fields are the traced edges.
+#[repr(C)]
+pub struct RBigIntPair {
+    pub item0: *mut RBigInt,
+    pub item1: *mut RBigInt,
+}
+
+pub const RBIGINT_PAIR_SIZE: usize = std::mem::size_of::<RBigIntPair>();
+pub const RBIGINT_PAIR_ITEM0_OFFSET: usize = std::mem::offset_of!(RBigIntPair, item0);
+pub const RBIGINT_PAIR_ITEM1_OFFSET: usize = std::mem::offset_of!(RBigIntPair, item1);
+
+/// Runtime GC id for the `tuple2` struct. Both fields are traced edges; a pair
+/// allocated before the id is published (bare tests, pre-init bootstrap) falls
+/// back to a leaked raw allocation, like the payload helpers above.
+static RBIGINT_PAIR_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_rbigint_pair_gc_type_id(id: u32) {
+    RBIGINT_PAIR_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[majit_macros::dont_look_inside]
+pub fn rbigint_pair_gc_type_id() -> u32 {
+    RBIGINT_PAIR_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Explicit root for an already-allocated GC pointer held in a host local.
+///
+/// RPython's stack map covers `div` and `mod` from the moment each is allocated
+/// until the `tuple2` malloc stores them. A Rust local has no generated map, so
+/// each payload pointer registers its own slot; the collector forwards through
+/// it exactly as it would through a shadow-stack entry.
+struct PendingPairItemRoot {
+    slot: *mut *mut u8,
+    registered: bool,
+}
+
+impl PendingPairItemRoot {
+    /// `slot` must outlive the guard and must not move while it is registered.
+    unsafe fn new(slot: *mut *mut RBigInt) -> Self {
+        let slot = slot.cast::<*mut u8>();
+        let registered = unsafe { crate::gc_hook::try_gc_add_root(slot) };
+        Self { slot, registered }
+    }
+}
+
+impl Drop for PendingPairItemRoot {
+    fn drop(&mut self) {
+        if self.registered {
+            crate::gc_hook::try_gc_remove_root(self.slot);
+        }
+    }
+}
+
+/// Allocate both halves and the `tuple2` that owns them.
+///
+/// The order is upstream's: `div` and `mod` become GC objects first, the pair
+/// last, so no store outlives the allocation that could move its target. Each
+/// step keeps everything already allocated reachable — the by-value handles via
+/// their `_digits` roots inside the payload allocator, the payload pointers via
+/// the guards here.
+pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> *mut RBigIntPair {
+    // Until a half has its own payload it is only a by-value handle, and the
+    // payload allocator roots the digits of the handle it was given — not the
+    // other one. Root both up front, as `_int_divmod`'s caller does around its
+    // two `newlong` calls.
+    let item0 = RBigIntGcRoot::new(item0);
+    let item1 = RBigIntGcRoot::new(item1);
+
+    let mut item0 = alloc_rbigint_nursery_collecting(item0.translated_alias());
+    let _item0_root = unsafe { PendingPairItemRoot::new(&mut item0) };
+    let mut item1 = alloc_rbigint_nursery_collecting(item1.translated_alias());
+    let _item1_root = unsafe { PendingPairItemRoot::new(&mut item1) };
+
+    let tid = rbigint_pair_gc_type_id();
+    if tid != 0 {
+        // The collecting hook is the one the JIT residual wants; backends
+        // without it fall through to the no-collect allocator, and only a
+        // pre-init heap reaches `malloc_raw`. An untraced pair would be an
+        // invisible edge to two GC-managed payloads, so this chain must not end
+        // in `malloc_raw` while the payloads themselves are GC-managed.
+        let raw = crate::gc_hook::GcAllocOutcome::from_hook(
+            crate::gc_hook::try_gc_alloc_collecting(tid, RBIGINT_PAIR_SIZE),
+        )
+        .allocated_or_abort(RBIGINT_PAIR_SIZE)
+        .or_else(|| {
+            crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
+                tid,
+                RBIGINT_PAIR_SIZE,
+            ))
+            .allocated_or_abort(RBIGINT_PAIR_SIZE)
+        });
+        if let Some(raw) = raw {
+            unsafe {
+                // Any collection the allocation above ran forwarded both roots,
+                // so these reads take the post-collection addresses.
+                std::ptr::write(raw as *mut RBigIntPair, RBigIntPair { item0, item1 });
+            }
+            // A nursery-full allocation can satisfy the pair from old-gen while
+            // both payloads stay young, so this is not the fresh fixed-size
+            // initialization whose field barriers framework.py:28-61
+            // `propagate_no_write_barrier_needed` removes.
+            crate::gc_hook::try_gc_write_barrier(raw);
+            return raw as *mut RBigIntPair;
+        }
+    }
+    crate::lltype::malloc_raw(RBigIntPair { item0, item1 })
+}
+
+/// Build the `tuple2` over two payloads that are already reachable.
+///
+/// The walker needs a concrete pair to attach to the `CallR` it records, but it
+/// runs on the host stack with no gcmap over its live set — which is the one
+/// thing [`alloc_rbigint_pair_nursery_collecting`] requires of its caller. This
+/// allocation therefore cannot collect, so the caller's live payloads keep the
+/// addresses it read them at.
+pub fn alloc_rbigint_pair_no_collect(item0: *mut RBigInt, item1: *mut RBigInt) -> *mut RBigIntPair {
+    let tid = rbigint_pair_gc_type_id();
+    if tid != 0
+        && let Some(raw) = crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
+            tid,
+            RBIGINT_PAIR_SIZE,
+        ))
+        .allocated_or_abort(RBIGINT_PAIR_SIZE)
+    {
+        unsafe {
+            std::ptr::write(raw as *mut RBigIntPair, RBigIntPair { item0, item1 });
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as *mut RBigIntPair;
+    }
+    crate::lltype::malloc_raw(RBigIntPair { item0, item1 })
+}
+
 impl Clone for RBigInt {
     fn clone(&self) -> Self {
         // Python assignment shares an immutable `rbigint` object.  A clone of

@@ -66,6 +66,59 @@ pub fn encode_jit_bigint_result(value: *mut BigInt) -> JitBigIntResult {
     value as usize as i64
 }
 
+/// Payload size and traced-field offsets of the `tuple2` of two rbigints.
+pub const BIGINT_PAIR_SIZE: usize = crate::rbigint::RBIGINT_PAIR_SIZE;
+pub const BIGINT_PAIR_ITEM0_OFFSET: usize = crate::rbigint::RBIGINT_PAIR_ITEM0_OFFSET;
+pub const BIGINT_PAIR_ITEM1_OFFSET: usize = crate::rbigint::RBIGINT_PAIR_ITEM1_OFFSET;
+
+/// Same GC-reference result ABI as [`JitBigIntResult`], for the `tuple2` a
+/// two-result elidable returns.
+#[cfg(not(target_arch = "wasm32"))]
+pub type JitBigIntPairResult = *mut crate::rbigint::RBigIntPair;
+#[cfg(target_arch = "wasm32")]
+pub type JitBigIntPairResult = i64;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+pub fn encode_jit_bigint_pair_result(
+    value: *mut crate::rbigint::RBigIntPair,
+) -> JitBigIntPairResult {
+    value
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+pub fn encode_jit_bigint_pair_result(
+    value: *mut crate::rbigint::RBigIntPair,
+) -> JitBigIntPairResult {
+    value as usize as i64
+}
+
+/// Record the GC type id registered for the `tuple2` of two rbigints (called
+/// once from `pyre-jit::eval` after `gc.register_type`).
+pub fn set_bigint_pair_gc_type_id(id: u32) {
+    crate::rbigint::set_rbigint_pair_gc_type_id(id);
+}
+
+/// Allocate the `tuple2` owning both halves of a divmod result.
+#[inline]
+pub fn alloc_bigint_pair_nursery_collecting(
+    item0: BigInt,
+    item1: BigInt,
+) -> *mut crate::rbigint::RBigIntPair {
+    crate::rbigint::alloc_rbigint_pair_nursery_collecting(item0, item1)
+}
+
+/// Non-collecting `tuple2` over two already-reachable payloads, for the
+/// walker's record-time shadow.
+#[inline]
+pub fn alloc_bigint_pair_no_collect(
+    item0: *mut BigInt,
+    item1: *mut BigInt,
+) -> *mut crate::rbigint::RBigIntPair {
+    crate::rbigint::alloc_rbigint_pair_no_collect(item0, item1)
+}
+
 /// GC type id for the raw `rbigint` payload, published at JitDriver init by
 /// `set_bigint_gc_type_id`. `0` until then, in which case the alloc helpers
 /// fall back to leaked raw allocations in bare tests / pre-init bootstrap.

@@ -130,6 +130,60 @@ def tuple_is_a_real_tuple():
     return out
 
 
+def int_min_divisor():
+    """`INT_MIN` is the one divisor `int_in_valid_range` rejects.
+
+    It leaves `_divrem1` for the full `divmod` against a converted operand, as
+    does every negative divisor of a non-negative dividend.
+    """
+    out = None
+    for _ in range(ROUNDS):
+        out = divmod(BIG, -(1 << 63))
+    q, r = out
+    return q * -(1 << 63) + r == BIG, r
+
+
+def negative_one_quotient():
+    """The correction arm that turns a zero quotient into the prebuilt -1.
+
+    Opposite signs with the dividend's magnitude below the divisor's, which
+    needs a long-typed dividend whose value is small.
+    """
+    tiny = (1 << 70) >> 70
+    out = None
+    for _ in range(ROUNDS):
+        out = (divmod(tiny, -7), divmod(tiny, -1), divmod(-tiny, 7))
+    return out
+
+
+def collects_between_halves():
+    """A collection lands while the halves and their pair are being built."""
+    import gc
+
+    held = []
+    for i in range(ROUNDS):
+        q, r = divmod(BIG + i, 97)
+        held.append((q, r))
+        if len(held) > 8:
+            held = held[-4:]
+        if i % 256 == 0:
+            gc.collect()
+    return [q * 97 + r == BIG + i for i, (q, r) in enumerate(held, ROUNDS - len(held))]
+
+
+def shadowed_divmod():
+    """A rebound global `divmod` must not keep the builtin's trace."""
+    global divmod
+    builtin_divmod = divmod
+    out = []
+    for i in range(ROUNDS):
+        if i == ROUNDS - 1:
+            divmod = lambda a, b: ("shadowed", b)  # noqa: E731
+        out = divmod(BIG, 97)
+    divmod = builtin_divmod
+    return out
+
+
 print(floored_pairs())
 print(exact_values())
 print(churn_keeps_earlier_results())
@@ -140,4 +194,8 @@ print(alternating_divisor())
 print(reflected_and_long_long())
 print(int_subclass_divisor())
 print(tuple_is_a_real_tuple())
+print(int_min_divisor())
+print(negative_one_quotient())
+print(collects_between_halves())
+print(shadowed_divmod())
 print("OK")

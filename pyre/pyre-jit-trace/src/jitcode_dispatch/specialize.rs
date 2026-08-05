@@ -6721,14 +6721,24 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
         return Ok(None);
     }
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let is_exact_int = |o: pyre_object::PyObjectRef| unsafe {
+        std::ptr::eq((*o).ob_type, &pyre_object::pyobject::INT_TYPE)
+            && std::ptr::eq((*o).w_class, int_typeobj)
+    };
+    if !is_exact_int(lhs_obj) || !is_exact_int(rhs_obj) {
+        // `_make_descr_binop(_divmod, _int_divmod)` (longobject.py:459) keeps a
+        // dedicated long/int arm; every other operand shape stays generic.
+        return try_walker_specialize_builtin_divmod_long_int(
+            ctx,
+            op,
+            r_args,
+            dst,
+            concrete_callable,
+            lhs_obj,
+            rhs_obj,
+        );
+    }
     let (la, rb) = unsafe {
-        let is_exact_int = |o: pyre_object::PyObjectRef| {
-            std::ptr::eq((*o).ob_type, &pyre_object::pyobject::INT_TYPE)
-                && std::ptr::eq((*o).w_class, int_typeobj)
-        };
-        if !is_exact_int(lhs_obj) || !is_exact_int(rhs_obj) {
-            return Ok(None);
-        }
         (
             pyre_object::w_int_get_value(lhs_obj),
             pyre_object::w_int_get_value(rhs_obj),
@@ -6743,18 +6753,7 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
     }
 
     // --- emit the specialized IR (walker-native) ---
-    // Pin the callable identity (LOAD_GLOBAL `divmod` is usually already a
-    // constant via the namespace cell fold).
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
     let (lhs_op, rhs_op) = (r_args[2], r_args[3]);
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     // `GuardClass` before the `w_class` read: it is the guard that proves the
@@ -6783,6 +6782,219 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
     let (mod_raw, mod_value) = walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, false);
     let tuple =
         walker_emit_specialised_tuple_ii(ctx, op.pc, div_raw, mod_raw, div_value, mod_value)?;
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
+    Ok(Some(()))
+}
+
+/// One element of a concrete `W_SpecialisedTupleObject_oo`, or `None` when the
+/// value is any other tuple layout. `newtuple` picks the representation, so a
+/// fold that emits the object-pair shape has to confirm the record-time value
+/// took the same one before reading it through those offsets.
+fn walker_specialised_tuple_oo_item(
+    tuple: pyre_object::PyObjectRef,
+    index: usize,
+) -> Option<pyre_object::PyObjectRef> {
+    if tuple.is_null() {
+        return None;
+    }
+    let ob_type = unsafe { (*(tuple as *const pyre_object::pyobject::PyObject)).ob_type };
+    if !std::ptr::eq(
+        ob_type,
+        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
+            as *const pyre_object::pyobject::PyType,
+    ) {
+        return None;
+    }
+    let item = unsafe {
+        pyre_object::specialisedtupleobject::w_specialised_tuple_oo_getvalue(tuple, index)
+    };
+    (!item.is_null()).then_some(item)
+}
+
+/// Pin a builtin's identity before folding its call away. `LOAD_GLOBAL divmod`
+/// is usually already a constant via the namespace cell fold, in which case the
+/// guard is unnecessary; a rebound global takes the side exit.
+fn walker_guard_builtin_callable_identity<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    callable_op: OpRef,
+    concrete_callable: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    if callable_op.is_constant() {
+        return Ok(());
+    }
+    let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(callable_op, expected);
+    Ok(())
+}
+
+/// `divmod(W_LongObject, W_IntObject)` — `longobject.py:451 _int_divmod`.
+///
+/// One `rbigint.int_divmod` (rbigint.py:1050 `@jit.elidable`) produces both
+/// halves, so the trace is the upstream shape: a single `CallR` returning the
+/// RPython `tuple2`, two `GetfieldGcR` off it, then `newlong` ×2 and the
+/// arity-2 tuple — all three allocations trace-visible, so the shipped oo
+/// unpack fold can virtualize the tuple away at an unpacking use.
+///
+/// Emitting `int_div_floor` and `int_mod_int_result` instead would run the
+/// division twice; `_int_divmod` exists precisely to avoid that.
+///
+/// `int % long` and `divmod(int, long)` are `descr_rdivmod`, which coerces the
+/// left operand and takes the bigint/bigint path — not this arm.
+fn try_walker_specialize_builtin_divmod_long_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+    concrete_callable: pyre_object::PyObjectRef,
+    long_obj: pyre_object::PyObjectRef,
+    int_obj: pyre_object::PyObjectRef,
+) -> Result<Option<()>, DispatchError> {
+    let (long_class, int_class, int_value) = unsafe {
+        if !pyre_object::is_long(long_obj) || !pyre_object::is_int(int_obj) {
+            return Ok(None);
+        }
+        let (Some(long_class), Some(int_class)) = (
+            walker_exact_builtin_class(long_obj),
+            walker_exact_builtin_class(int_obj),
+        ) else {
+            return Ok(None);
+        };
+        (long_class, int_class, pyre_object::w_int_get_value(int_obj))
+    };
+    // A zero divisor raises before reaching rbigint; the interpreter owns the
+    // authentic message.
+    if int_value == 0 {
+        return Ok(None);
+    }
+
+    // Take the concretes from the authentic builtin, not from the residual:
+    // the residual's payload allocator collects, and it is only safe to do so
+    // under a gcmap-carrying `CallR`, which the host-side walker is not. This
+    // is the `math.isqrt` fold's route, and it is also what makes the recorded
+    // tuple the one `newtuple` actually picked for these two operands.
+    let tuple_concrete = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[long_obj, int_obj])
+    };
+    let Ok(tuple_concrete) = tuple_concrete else {
+        return Ok(None);
+    };
+    // `_int_divmod` boxes both halves with `newlong`, which does not demote, so
+    // a pair of longs is the only shape this arm may emit — and two longs are
+    // what routes `newtuple` to the object-pair variant.
+    let (Some(w_div), Some(w_mod)) = (
+        walker_specialised_tuple_oo_item(tuple_concrete, 0),
+        walker_specialised_tuple_oo_item(tuple_concrete, 1),
+    ) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_long(w_div) && pyre_object::is_long(w_mod) } {
+        return Ok(None);
+    }
+    // The call above allocates, so the operand pointers this function was
+    // handed may have been forwarded. Re-fetch them from the walker's op cells,
+    // which the collector does update, before reading anything through them.
+    let (long_op, int_op) = (r_args[2], r_args[3]);
+    let (Some(long_obj), Some(int_obj)) = (
+        walker_concrete_ref_object(ctx, long_op),
+        walker_concrete_ref_object(ctx, int_op),
+    ) else {
+        return Ok(None);
+    };
+    let read_payload = |o: pyre_object::PyObjectRef| unsafe {
+        *((o as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET) as *const i64)
+            as *mut pyre_object::rbigint::RBigInt
+    };
+    let long_payload = read_payload(long_obj) as i64;
+    let (div_payload, mod_payload) = (read_payload(w_div), read_payload(w_mod));
+    // Both halves are already reachable from `tuple_concrete`, and this
+    // allocation cannot collect, so neither can move under it.
+    let pair = pyre_object::longobject::alloc_bigint_pair_no_collect(div_payload, mod_payload);
+    if pair.is_null() {
+        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
+    }
+
+    // --- emit ---
+    walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op.pc, long_op, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, long_op, long_class)?;
+    let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
+    let int_raw = walker_unbox_int_typed(ctx, op.pc, int_op, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op.pc, int_op, int_class)?;
+    let zero = ctx.trace_ctx.const_int(0);
+    let nonzero = ctx.trace_ctx.record_op(OpCode::IntNe, &[int_raw, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(nonzero, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[nonzero])?;
+
+    let long_pl = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[long_op],
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        long_pl,
+        majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
+    );
+
+    let helper = pyre_interpreter::objspace::descroperation::jit_bigint_int_divmod as *const ();
+    let pair_op = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+        OpCode::CallR,
+        helper,
+        &[long_pl, int_raw],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(helper as usize as i64),
+            majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
+            majit_ir::Value::Int(int_value),
+        ],
+        majit_ir::Value::Ref(majit_ir::GcRef(pair as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        pair_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(pair as usize)),
+    );
+    if pair_op.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+    }
+
+    let mut boxed = Vec::with_capacity(2);
+    for (descr, payload, wrapper) in [
+        (crate::descr::rbigint_pair_item0_descr(), div_payload, w_div),
+        (crate::descr::rbigint_pair_item1_descr(), mod_payload, w_mod),
+    ] {
+        let half = ctx
+            .trace_ctx
+            .record_op_with_descr(OpCode::GetfieldGcR, &[pair_op], descr);
+        ctx.trace_ctx.set_opref_concrete(
+            half,
+            majit_ir::Value::Ref(majit_ir::GcRef(payload as usize)),
+        );
+        let w = crate::helpers::emit_box_long_inline(
+            ctx.trace_ctx,
+            half,
+            crate::descr::w_long_size_descr(),
+            crate::descr::long_value_descr(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(w, majit_ir::Value::Ref(majit_ir::GcRef(wrapper as usize)));
+        boxed.push(w);
+    }
+
+    let tuple = crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, boxed[0], boxed[1]);
+    ctx.trace_ctx.set_opref_concrete(
+        tuple,
+        majit_ir::Value::Ref(majit_ir::GcRef(tuple_concrete as usize)),
+    );
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
     Ok(Some(()))
 }
