@@ -823,6 +823,16 @@ fn maybe_print_jit_stats() {
         pyre_jit::fbw_diag_counter(9),
         pyre_jit::fbw_diag_counter(10),
     );
+    // Walks that ended uncommitted after a residual had already run an
+    // irreversible effect: the store journal cannot undo a residual that wrote
+    // live heap or entered a Python frame, so the replay the caller falls back
+    // to applies those effects twice. `fbw_diag::ROLLED_BACK_WITH_EFFECTS`,
+    // which the wasm runner already exports; a nonzero value names a walk-abort
+    // variant that reaches `run_perfn_walk`'s epilogue without an adopt leg.
+    eprintln!(
+        "[jit-stats] fbw_rolled_back_with_effects={}",
+        pyre_jit::fbw_diag_counter(1),
+    );
     let stats = pyre_jit::eval::driver_pair().0.get_stats();
     eprintln!(
         "[jit-stats] loops_compiled={} bridges_compiled={} loops_aborted={} \

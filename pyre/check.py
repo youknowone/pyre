@@ -634,12 +634,28 @@ def _parse_jit_stats(snapshot):
 # expressed as a counter that must not rise off zero. A field absent from a
 # baseline reads as 0, so these gate from the first run without re-recording
 # anything.
+#
+# `fbw_rolled_back_with_effects` counts walks that ended UNCOMMITTED after a
+# residual had already run an irreversible effect — it wrote live heap outside
+# the journals, or it entered a Python frame. The store journal cannot undo
+# either, so the legacy replay the caller falls back to applies those effects a
+# second time. Upstream has no counterpart state: `_copy_data_from_miframe`
+# (blackhole.py) copies the register banks unconditionally and has no failing
+# path, so every abort there leaves a resumable image. Pyre's mirror is partial,
+# so an abort can arrive with no image to adopt, and the difference is a wrong
+# answer rather than a slow one — three such bugs (a locals-typed vable overlay,
+# an unpublished escape root stack, an unmodelled LOAD_SPECIAL) were each found
+# by reading this counter's population by hand. Gating it is what makes the
+# fourth one fail CI instead of surfacing as an intermittent asyncio failure.
+# Like `loops_aborted` it is not absolute: the baseline pins the instances that
+# exist today and a rise means a new one.
 JITSTATS_BADNESS_FIELDS = (
     "loops_aborted",
     "internal_compile_panics",
     "descr_set_absent",
     "descr_set_ambiguous",
     "descr_set_stale_absent",
+    "fbw_rolled_back_with_effects",
 )
 
 # The three count-valued counters, and what a move in either direction means:
