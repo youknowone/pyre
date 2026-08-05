@@ -4835,7 +4835,15 @@ pub(crate) fn collect_slot_names(
                     "__slots__ items must be strings, not type".to_string(),
                 ));
             }
-            let slot_name = pyre_object::w_str_get_value(w_slot_name).to_string();
+            // A name with no UTF-8 form is not an identifier, so it takes the
+            // same rejection as `('1a',)` rather than aborting for want of a
+            // `&str` view: `__slots__ = ('\udc80',)` is a `TypeError`.
+            let Some(slot_name) = (unsafe { pyre_object::w_str_get_value_opt(w_slot_name) }) else {
+                return Err(crate::PyError::type_error(
+                    "__slots__ must be identifiers".to_string(),
+                ));
+            };
+            let slot_name = slot_name.to_string();
             // typeobject.py:1208-1209 valid_slot_name
             if !valid_slot_name(&slot_name) {
                 return Err(crate::PyError::type_error(

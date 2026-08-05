@@ -16169,7 +16169,12 @@ unsafe fn property_no_accessor(
 ) -> Result<crate::PyError, crate::PyError> {
     let qualname = match crate::typedef::r#type(obj) {
         Some(w_type) => match getattr_str(w_type.as_ptr(), "__qualname__") {
-            Ok(q) if !q.is_null() && is_str(q) => pyre_object::w_str_get_value(q).to_string(),
+            // A `__qualname__` holding a lone surrogate is ordinary Python, and
+            // this message is only ever displayed, so escape what has no `&str`
+            // form rather than aborting. The escape is visible where CPython
+            // shows the raw surrogate — `PyError::message` is a `String`, so
+            // the exact spelling waits on that field becoming WTF-8.
+            Ok(q) if !q.is_null() && is_str(q) => unsafe { crate::display::py_str_display(q) },
             _ => pyre_object::w_type_get_name(w_type.as_ptr()).to_string(),
         },
         None => (*(*obj).ob_type).name.to_string(),
