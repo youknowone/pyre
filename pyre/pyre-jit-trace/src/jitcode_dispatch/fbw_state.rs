@@ -934,9 +934,7 @@ pub(crate) fn fbw_store_journal_rollback() {
                 // shrank the list after the store — a shape the replay
                 // already cannot undo (the residual re-runs).  Surface it
                 // under the debug gate instead of corrupting silently.
-                crate::trace::fbw_diag::bump(
-                    crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
-                );
+                crate::trace::fbw_diag::bump(crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED);
                 if fbw_debug_abort_enabled() {
                     eprintln!("[fbw-store-journal] rollback failed (index out of bounds)");
                 }
