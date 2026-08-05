@@ -1261,6 +1261,30 @@ pub fn w_dict_new() -> PyObjectRef {
     )
 }
 
+pub type MakeInstanceDictHookFn = fn() -> PyObjectRef;
+
+majit_gc::global_hook!(static MAKE_INSTANCE_DICT_HOOK: MakeInstanceDictHookFn);
+
+pub fn register_make_instance_dict_hook(hook: MakeInstanceDictHookFn) {
+    MAKE_INSTANCE_DICT_HOOK.set(Some(hook));
+}
+
+pub fn clear_make_instance_dict_hook() {
+    MAKE_INSTANCE_DICT_HOOK.set(None);
+}
+
+/// `dictmultiobject.py:56-73` `space.newdict(instance=True)`.
+///
+/// The interpreter installs the mapdict factory once its hooks are available.
+/// The plain-dict fallback keeps pyre-object-only users working before that
+/// initialization.
+pub fn w_dict_new_instance() -> PyObjectRef {
+    match MAKE_INSTANCE_DICT_HOOK.get() {
+        Some(factory) => factory(),
+        None => w_dict_new(),
+    }
+}
+
 /// `dictmultiobject.py:77-80 allocate_and_init_instance` kwargs
 /// branch — `strategy = space.fromcache(EmptyKwargsDictStrategy)`.
 /// Function-call sites that build a `**kwargs` dict route through

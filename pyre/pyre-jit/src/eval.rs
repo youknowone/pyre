@@ -6331,6 +6331,9 @@ pub fn init_jit_hooks() {
     pyre_object::dict_eq_hook::register_compares_by_identity_hook(
         pyre_object_compares_by_identity_trampoline,
     );
+    pyre_object::dictmultiobject::register_make_instance_dict_hook(
+        pyre_interpreter::objspace::std::mapdict::make_instance_dict,
+    );
 }
 
 #[repr(u8)]

@@ -201,7 +201,7 @@ pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let sm = obj as *mut StaticMethod;
         if (*sm).w_dict.is_null() {
-            (*sm).w_dict = crate::w_dict_new();
+            (*sm).w_dict = crate::dictmultiobject::w_dict_new_instance();
             crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
         }
         (*sm).w_dict
@@ -293,7 +293,7 @@ pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let cm = obj as *mut ClassMethod;
         if (*cm).w_dict.is_null() {
-            (*cm).w_dict = crate::w_dict_new();
+            (*cm).w_dict = crate::dictmultiobject::w_dict_new_instance();
             crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
         }
         (*cm).w_dict
