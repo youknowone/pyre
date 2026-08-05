@@ -749,8 +749,10 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
     //         raise TypeError("'%s' object cannot be interpreted as an integer"
     //                         % type(n).__name__)
     // The check is on `__index__` alone, so floats are rejected for the same
-    // reason strings are rather than by a numeric-value test.
-    if unsafe { crate::baseobjspace::lookup_special(args[0], "__index__") }?.is_none() {
+    // reason strings are rather than by a numeric-value test. `dir(n)` only
+    // reports membership, so the check must not bind the descriptor — the one
+    // binding belongs to `get_bigint` below.
+    if unsafe { crate::baseobjspace::lookup(args[0], "__index__") }.is_none() {
         return Err(crate::PyError::type_error(format!(
             "'{}' object cannot be interpreted as an integer",
             crate::baseobjspace::object_functionstr_type_name(args[0])
