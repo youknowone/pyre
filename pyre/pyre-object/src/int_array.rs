@@ -1,8 +1,9 @@
 use std::ops::{Index, IndexMut};
 
 use crate::object_array::{
-    GC_INT_ARRAY_GC_TYPE_ID, TypedItemsBlock, alloc_typed_items_block, dealloc_typed_items_block,
-    grow_typed_items_block, typed_items_block_capacity, typed_items_block_items_base,
+    GC_INT_ARRAY_GC_TYPE_ID, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock,
+    alloc_typed_items_block, dealloc_typed_items_block, grow_typed_items_block,
+    typed_items_block_capacity,
 };
 
 /// Small-buffer capacity constant retained for the append/pop inline-capacity
@@ -22,7 +23,9 @@ pub const INT_ARRAY_INLINE_CAP: usize = 8;
 /// (`GetfieldGcR(block) → GetarrayitemGcI`) that the gcmap relocates on a move.
 #[repr(C)]
 pub struct IntArray {
-    /// `Ptr(GcArray(Signed))` — the backing block (`l.items`). Always non-null.
+    /// `Ptr(GcArray(Signed))` — the backing block (`l.items`). Null in the
+    /// empty form ([`IntArray::empty`]), where the live length and the
+    /// allocated capacity are both zero.
     pub block: *mut TypedItemsBlock,
     /// Live length (rlist.py:116 `("length", Signed)`).
     len: usize,
@@ -33,9 +36,35 @@ pub const INT_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(IntArray, len);
 
 impl IntArray {
     /// Items base pointer (`&l.items[0]`), derived from `block`.
+    ///
+    /// `wrapping_add`, so the empty form's null `block` yields the items offset
+    /// itself — a non-null, 8-aligned address `as_slice` may hand to
+    /// `from_raw_parts` at length zero. No other caller reaches it: the empty
+    /// form's capacity is zero, so every write goes through [`Self::grow`]
+    /// first.
     #[inline]
     fn base(&self) -> *mut i64 {
-        unsafe { typed_items_block_items_base(self.block) as *mut i64 }
+        (self.block as *mut u8).wrapping_add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET) as *mut i64
+    }
+
+    /// Storage for a list whose strategy does not read this array: no block, no
+    /// live length, no allocated capacity.
+    ///
+    /// This is the shape traced code already builds — `emit_typed_list_inline`
+    /// writes one typed pair and leaves the other's `block` NULL from
+    /// `NewWithVtable`'s zero fill. `from_vec(Vec::new())` does not produce it:
+    /// `try_alloc_typed_items_block` clamps `cap` to 1 (rlist.py:251
+    /// overallocation) and takes the old-gen `try_gc_alloc_stable_raw`, so each
+    /// non-Integer list bought a block it never reads.
+    ///
+    /// The block helpers already read null as capacity zero, `grow` and
+    /// `dealloc` already special-case it, and `list_object_custom_trace`
+    /// forwards the owning slot only when the collector owns what it holds.
+    pub fn empty() -> Self {
+        Self {
+            block: std::ptr::null_mut(),
+            len: 0,
+        }
     }
 
     pub fn from_vec(values: Vec<i64>) -> Self {

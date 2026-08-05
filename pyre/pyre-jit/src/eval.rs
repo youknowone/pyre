@@ -943,12 +943,22 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     // every strategy so a collection keeps the slots valid even when the strategy
     // does not read them (`Drop` deallocs through them); a std::alloc block (gate
     // off) is not GC-owned and stays in place.
+    //
+    // The null test is not redundant with the ownership query: the strategy the
+    // list does not use carries the empty form (`IntArray::empty`), so a null
+    // slot is the common case, and reaching it through the query costs the whole
+    // hook chain — box lookup, reentrant borrow, dispatch — to learn what the
+    // pointer already says. `list.items` above is guarded the same way.
     let int_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).int_items.block) };
-    if pyre_object::gc_hook::try_gc_owns_object(unsafe { *int_block_slot } as *mut u8) {
+    if !unsafe { *int_block_slot }.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(unsafe { *int_block_slot } as *mut u8)
+    {
         f(int_block_slot as *mut majit_ir::GcRef);
     }
     let float_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).float_items.block) };
-    if pyre_object::gc_hook::try_gc_owns_object(unsafe { *float_block_slot } as *mut u8) {
+    if !unsafe { *float_block_slot }.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(unsafe { *float_block_slot } as *mut u8)
+    {
         f(float_block_slot as *mut majit_ir::GcRef);
     }
 }

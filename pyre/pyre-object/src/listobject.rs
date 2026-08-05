@@ -697,8 +697,10 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
         ListStrategy::Object | ListStrategy::Empty => Vec::new(),
     };
     list.set_object_items_from_vec(seed);
-    list.int_items.install(IntArray::from_vec(Vec::new()));
-    list.float_items.install(FloatArray::from_vec(Vec::new()));
+    // Object strategy reads neither typed array again, so drop both to the
+    // empty form instead of installing two fresh single-slot blocks.
+    list.int_items.install(IntArray::empty());
+    list.float_items.install(FloatArray::empty());
     list.strategy = ListStrategy::Object;
 }
 
@@ -869,22 +871,29 @@ pub fn w_list_new_empty() -> PyObjectRef {
 /// scope those pins live in and closes the bracket with
 /// [`ListStorage::reload_typed_blocks`] after its last allocation.
 unsafe fn build_list_storage(items: &[PyObjectRef], strategy: ListStrategy) -> ListStorage {
-    let int_seed: Vec<i64> = match strategy {
-        ListStrategy::Integer => items.iter().map(|&item| plain_int_w(item)).collect(),
-        ListStrategy::IntOrFloat => items
-            .iter()
-            .map(|&item| int_or_float_encode_item(item).unwrap())
-            .collect(),
-        _ => Vec::new(),
+    // Only the array matching `strategy` is ever read, so the other takes the
+    // empty form rather than a block it will never address — the shape
+    // `emit_typed_list_inline` / `emit_object_list_inline` already leave behind
+    // for traced code, where the unused typed fields stay null from
+    // `clear_gc_fields`.
+    let int_items = match strategy {
+        ListStrategy::Integer => {
+            IntArray::from_vec(items.iter().map(|&item| plain_int_w(item)).collect())
+        }
+        ListStrategy::IntOrFloat => IntArray::from_vec(
+            items
+                .iter()
+                .map(|&item| int_or_float_encode_item(item).unwrap())
+                .collect(),
+        ),
+        _ => IntArray::empty(),
     };
-    let int_items = IntArray::from_vec(int_seed);
     let int_block_root = int_items.pin_block();
-    let float_seed: Vec<f64> = if let ListStrategy::Float = strategy {
-        items.iter().map(|&item| w_float_get_value(item)).collect()
+    let float_items = if let ListStrategy::Float = strategy {
+        FloatArray::from_vec(items.iter().map(|&item| w_float_get_value(item)).collect())
     } else {
-        Vec::new()
+        FloatArray::empty()
     };
-    let float_items = FloatArray::from_vec(float_seed);
     let float_block_root = float_items.pin_block();
     let (length, block) = if let ListStrategy::Object = strategy {
         (items.len(), alloc_list_items_block_gc(items))
@@ -2195,8 +2204,10 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
         return;
     }
     list.drop_object_items();
-    list.int_items.install(IntArray::from_vec(Vec::new()));
-    list.float_items.install(FloatArray::from_vec(Vec::new()));
+    // Empty strategy reads neither typed array; the next append reinstalls the
+    // matching one through `switch_to_correct_strategy`.
+    list.int_items.install(IntArray::empty());
+    list.float_items.install(FloatArray::empty());
     list.strategy = ListStrategy::Empty;
     list.allocated = 0;
 }
@@ -2703,6 +2714,70 @@ mod tests {
             assert_eq!(crate::intobject::w_int_get_value(item), 10);
             let item = w_list_getitem(list, 2).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(item), 30);
+        }
+    }
+
+    #[test]
+    fn unused_typed_storage_holds_no_block() {
+        // An Object-strategy list reads neither typed array, and an
+        // Integer-strategy list reads only `int_items`: the other side must
+        // carry the empty form, not an allocated single-slot block. This is the
+        // shape `emit_typed_list_inline` already leaves for traced code.
+        let object_list = w_list_new(vec![crate::w_str_new("x")]);
+        let int_list = w_list_new(vec![w_int_new(1)]);
+        let float_list = w_list_new(vec![crate::floatobject::w_float_new(1.5)]);
+        unsafe {
+            let l = &*(object_list as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Object);
+            assert!(l.int_items.block.is_null());
+            assert!(l.float_items.block.is_null());
+            assert!(l.int_items.as_slice().is_empty());
+            assert!(l.float_items.as_slice().is_empty());
+
+            let l = &*(int_list as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Integer);
+            assert!(!l.int_items.block.is_null());
+            assert!(l.float_items.block.is_null());
+
+            let l = &*(float_list as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Float);
+            assert!(l.int_items.block.is_null());
+            assert!(!l.float_items.block.is_null());
+        }
+    }
+
+    #[test]
+    fn empty_typed_storage_grows_on_first_append() {
+        // The empty form has capacity 0, so the first write must reach `grow`
+        // rather than the no-resize leg.
+        let mut arr = IntArray::empty();
+        assert_eq!(arr.len(), 0);
+        assert_eq!(arr.heap_capacity(), 0);
+        assert_eq!(arr.spare_capacity(), 0);
+        arr.push(7);
+        assert!(!arr.block.is_null());
+        assert_eq!(arr.as_slice(), &[7]);
+
+        let mut arr = FloatArray::empty();
+        assert_eq!(arr.heap_capacity(), 0);
+        arr.push(2.5);
+        assert_eq!(arr.as_slice(), &[2.5]);
+    }
+
+    #[test]
+    fn clear_drops_typed_storage_to_the_empty_form() {
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        unsafe {
+            w_list_clear(list);
+            let l = &*(list as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Empty);
+            assert!(l.int_items.block.is_null());
+            assert!(l.float_items.block.is_null());
+            // The next append reinstalls the matching typed storage.
+            w_list_append(list, w_int_new(9));
+            let l = &*(list as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Integer);
+            assert_eq!(w_list_len(list), 1);
         }
     }
 
