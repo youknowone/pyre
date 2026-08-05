@@ -9550,7 +9550,7 @@ mod tests {
             "list".to_string(),
             vec![
                 ("length".to_string(), "i64".to_string()),
-                ("items".to_string(), "&[i64]".to_string()),
+                ("items".to_string(), "&()".to_string()),
             ],
         );
         cc.set_struct_fields(registry);

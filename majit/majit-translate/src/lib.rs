@@ -889,7 +889,11 @@ fn analyze_pipeline_from_module_paths(
     // natural word-sized GcStruct layout the backend's `build_ll_newlist`
     // malloc uses (length-first, items-second, both word-sized;
     // `rlist.rs:3444-3479`).  `.entry().or_insert_with` leaves a real "list"
-    // entry untouched if one ever exists.
+    // entry untouched if one ever exists.  The `items` type is a bare pointer
+    // spelling: the field only has to classify as `(Pointer, Ref, word)`, and
+    // the real element type is inert here — it lives on the op's `item_ty`
+    // (the `new_array_clear` / `newlist_clear` arraydescr), never in this
+    // struct layout, since the resized list header is element-uniform.
     program
         .struct_fields
         .fields
@@ -897,7 +901,7 @@ fn analyze_pipeline_from_module_paths(
         .or_insert_with(|| {
             vec![
                 ("length".to_string(), "i64".to_string()),
-                ("items".to_string(), "&[i64]".to_string()),
+                ("items".to_string(), "&()".to_string()),
             ]
         });
     let mut canonical_trait_impls = Vec::new();
