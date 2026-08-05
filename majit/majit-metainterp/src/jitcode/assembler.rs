@@ -4952,11 +4952,11 @@ impl JitCodeBuilder {
         self.patch_switch_descrs();
         self.patch_const_refs();
         self.patch_field_descr_parents();
-        debug_assert!(
-            self.field_descr_position_disagreement().is_none(),
-            "{}",
-            self.field_descr_position_disagreement().unwrap()
-        );
+        if cfg!(debug_assertions) {
+            if let Some(disagreement) = self.field_descr_position_disagreement() {
+                panic!("{disagreement}");
+            }
+        }
         self.patch_const_u8_refs();
         // RPython `jitcode.py:47 self._resulttypes = resulttypes`.
         // Upstream `assembler.py:217-219` records the result-kind
@@ -5595,9 +5595,11 @@ impl JitCodeBuilder {
     ///   `continue` above, which leaves the mint-time snapshot in place. Nothing
     ///   patched it, so nothing has established the invariant for it either.
     ///
-    /// Returns the first disagreement as a message, so the caller's
-    /// `debug_assert!` says which descr and both numbers. Release builds skip
-    /// the walk entirely.
+    /// Returns the first disagreement as a message, so the caller's panic says
+    /// which descr and both numbers. Gated on `cfg!(debug_assertions)` at the
+    /// call site rather than wrapped in `debug_assert!`, because the message
+    /// needs the same walk the predicate does and `debug_assert!` would run it
+    /// twice.
     ///
     /// [`patch_field_descr_parents`]: Self::patch_field_descr_parents
     fn field_descr_position_disagreement(&self) -> Option<String> {

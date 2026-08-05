@@ -3830,8 +3830,46 @@ fn fielddescrof(
             is_immutable = rank.is_immutable();
             is_quasi_immutable = rank.is_quasi_immutable();
         }
+        // Both fallbacks above take `offset` from a second source — the
+        // `struct_layout_for` registry or `heuristic_field_layout` — and neither
+        // touches `index_in_parent`, which is still its `0` initialiser while
+        // `parent` carries the whole flattened list.  Slot 0 of that list is
+        // some other field, and `all_fielddescrs()[index_in_parent]` is what
+        // `optimizeopt/info.rs force_box` indexes by, so the descr would name
+        // one field and address another.  Resolve the slot against the parent
+        // that is actually attached, the way `descr.py:228
+        // heaptracker.get_fielddescr_index_in` derives it from the STRUCT
+        // itself.  The `found_parent_field` arm is left alone: it picked its
+        // spec BY NAME, and re-resolving by offset would hand a struct with two
+        // fields at one offset back the wrong one.
+        if !found_parent_field
+            && let Some(parent_spec) = parent.as_ref()
+            && let Some(pos) = parent_spec
+                .all_fielddescrs
+                .iter()
+                .position(|spec| spec.offset == offset)
+        {
+            index_in_parent = pos;
+        }
     }
 
+    // The descr's two halves, counted where they are produced rather than at a
+    // reader that would repair them (`GcCache::derive_index_in_parent`
+    // re-derives by name and overwrites, so it can only report repairs it
+    // already applied — see `field_position_jit_stats`).
+    //
+    // Still meaningful after the re-resolution above, which only covers the
+    // fallback arms: the `found_parent_field` arm takes `index_in_parent` from
+    // the matched spec's STORED number, and nothing here guarantees that number
+    // equals the spec's position in the list it was stored in.
+    if let Some(parent_spec) = parent.as_ref()
+        && let Some(pos) = parent_spec
+            .all_fielddescrs
+            .iter()
+            .position(|spec| spec.offset == offset)
+    {
+        majit_ir::descr::census_attached_index(pos, index_in_parent);
+    }
     crate::jitcode::BhDescr::Field {
         offset,
         field_size,
@@ -4959,6 +4997,83 @@ mod tests {
         assert_eq!(
             parent_type_id("core::result::Result<i64,PyError>"),
             owner_id.as_u64(),
+        );
+    }
+
+    #[test]
+    fn fielddescrof_resolves_the_slot_when_the_offset_comes_from_the_layout_registry() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "assembler_fielddescrof_layout_registry_test::Owner";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        majit_ir::descr::register_struct_ids(HashMap::from([(owner.to_string(), Some(owner_id))]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("visible_zero".to_string(), "i64".to_string()),
+                ("visible_eight".to_string(), "i64".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 16,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "visible_zero".to_string(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "visible_eight".to_string(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    // `bh_size_spec_from_callcontrol` omits void fields from
+                    // its flattened list, leaving this layout-only name to
+                    // exercise fielddescrof's registry fallback.
+                    StructFieldLayout {
+                        name: "hidden".to_string(),
+                        offset: 8,
+                        size: 0,
+                        flag: majit_ir::descr::ArrayFlag::Void,
+                        field_type: majit_ir::value::Type::Void,
+                        rank: None,
+                    },
+                ],
+            },
+        );
+
+        let crate::jitcode::BhDescr::Field {
+            offset,
+            index_in_parent,
+            parent,
+            ..
+        } = fielddescrof(
+            &FieldDescriptor::new("hidden", Some(owner.to_string())),
+            &crate::model::ValueType::Int,
+            Some(&cc),
+        )
+        else {
+            panic!("fielddescrof must produce a field descriptor");
+        };
+
+        assert_eq!(offset, 8);
+        assert_eq!(index_in_parent, 1);
+        assert_eq!(
+            parent.as_ref().unwrap().all_fielddescrs[index_in_parent].offset,
+            offset
         );
     }
 
