@@ -2632,9 +2632,15 @@ impl SomeValue {
                 }
                 super::builtin::call_builtin(&bk, &sb.analyser_name, &args_s_opt, &kwds_s).map(Some)
             }
-            _ => Err(AnnotatorError::new(
-                "Cannot prove that the object is callable",
-            )),
+            // Upstream raises the bare message; the callee's lattice tag is
+            // added because pyre's panic path drops the graph/block context
+            // upstream's annotator attaches, and the tag is what localizes
+            // the producer (an `Integer`/`Bool` here means the callee
+            // position holds a *field* value, not a callable).
+            other => Err(AnnotatorError::new(format!(
+                "Cannot prove that the object is callable: {:?}",
+                other.tag()
+            ))),
         }
     }
 }
