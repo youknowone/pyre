@@ -2413,6 +2413,153 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         }
     }
 
+    // A user attribute on an exception instance. `mapdict.py:1483-1490
+    // LOAD_ATTR_caching` declines this receiver upstream too — an exception is
+    // not a `MapdictStorageMixin` and `_get_mapdict_map` answers None
+    // (`baseobjspace.py:204-205`) — and it reaches its speed by inlining
+    // `getdictvalue -> MapDictStrategy.getitem_str -> AbstractAttribute.read`
+    // (`mapdict.py:55-66`, `:442-444`) instead. The attribute lives in the
+    // `newdict(instance=True)` dictionary, two hops out: `w_dict` ->
+    // `W_DictObject.dstorage` -> the fake carrier that holds the map.
+    //
+    // `w_exception_get_kind` and `w_exception_peek_dict` both cast straight to
+    // `W_BaseException`, so the `is_exception` test is load-bearing: this
+    // function runs for every `LOAD_ATTR` receiver that reached it.
+    let exc_dict = unsafe {
+        pyre_object::is_exception(concrete_obj)
+            .then(|| pyre_object::interp_exceptions::w_exception_peek_dict(concrete_obj))
+            .filter(|dict| !dict.is_null())
+    };
+    if let Some(dict) = exc_dict
+        && let Some((w_type, _version_tag, carrier, map, storageindex, unboxed)) = unsafe {
+            pyre_interpreter::objspace::std::mapdict::instance_dict_attr_fast_path(
+                concrete_obj,
+                dict,
+                &name,
+            )
+        }
+        // An unboxed float slot keeps the `f64` bit pattern in the same
+        // longlong block as an int, so folding it needs a bits-to-float
+        // reinterpret the trace has no operation for; leave it on the residual.
+        && !matches!(
+            unboxed,
+            Some((pyre_interpreter::objspace::std::mapdict::UnboxType::Float, _))
+        )
+    {
+        let kind = unsafe { pyre_object::w_exception_get_kind(concrete_obj) };
+        let phys_type = unsafe { (*concrete_obj).ob_type as i64 };
+        if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+            let type_const = ctx.trace_ctx.const_int(phys_type);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardClass,
+                &[obj, type_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj, phys_type);
+        }
+        let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
+        let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[w_class, w_type_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(w_class, w_type_const);
+        walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+
+        let dict_op = walker_record_getfield_gc_r_uncached(
+            ctx,
+            obj,
+            crate::descr::w_exception_dict_descr(kind),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[dict_op])?;
+        ctx.trace_ctx.set_opref_concrete(
+            dict_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(dict as usize)),
+        );
+
+        // `instance_dict_attr_fast_path` declines a dictionary that is not
+        // `MapDictStrategy`-backed, and the carrier read below is out of bounds
+        // on a devolved one, so pin the strategy before dereferencing
+        // `dstorage`.
+        let strategy = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            dict_op,
+            crate::descr::dict_strategy_word_descr(),
+        );
+        let strategy_const = ctx.trace_ctx.const_int(
+            &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
+        );
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[strategy, strategy_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(strategy, strategy_const);
+
+        let carrier_op =
+            walker_record_getfield_gc_r_uncached(ctx, dict_op, crate::descr::dict_dstorage_descr());
+        ctx.trace_ctx.set_opref_concrete(
+            carrier_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(carrier as usize)),
+        );
+        let map_op =
+            walker_record_getfield_gc_i_uncached(ctx, carrier_op, crate::descr::object_map_descr());
+        let map_const = ctx.trace_ctx.const_int(map as i64);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(map_op, map_const);
+
+        let block = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            carrier_op,
+            crate::descr::object_storage_descr(),
+        );
+        let index = ctx.trace_ctx.const_int(storageindex as i64);
+        let slot = crate::state::trace_mapdict_storage_getitem(ctx.trace_ctx, block, index);
+        let value = match unboxed {
+            None => slot,
+            // `_prim_direct_read` (mapdict.py:600-601): the storage slot holds
+            // the shared longlong block, and the value is `items[listindex]`.
+            // Keeping the boxing in the trace lets an immediate integer
+            // consumer virtualize it away.
+            Some((_, listindex)) => {
+                let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
+                let live = unsafe {
+                    pyre_interpreter::objspace::std::mapdict::read_unboxed_storage_raw(
+                        carrier,
+                        storageindex,
+                        listindex,
+                    )
+                };
+                let raw = crate::state::trace_int_block_getitem_value(
+                    ctx.trace_ctx,
+                    slot,
+                    listindex_const,
+                );
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Int(live));
+                let boxed = walker_box_int(ctx, op_pc, raw, live)?;
+                let live_ptr = pyre_object::w_int_new(live) as i64;
+                ctx.trace_ctx
+                    .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+                boxed
+            }
+        };
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+        return Ok(Some(()));
+    }
+
     if let Some((slot, kind, w_type, version_tag, stored)) = unsafe {
         pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, &name, false)
     } {

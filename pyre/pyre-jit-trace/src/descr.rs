@@ -1211,8 +1211,8 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// identity-key lookup can therefore guard this field to pin the resolved
 /// entry index while continuing to read that entry's value live.
 ///
-/// The `dstrategy_word` and `dstorage_lookup_ns` keys deliberately do NOT match
-/// the Rust field names they cover.  `gc_cache().get_field_descr` is keyed by
+/// The `dstrategy_word`, `dstorage_lookup_ns` and `dstorage_as_gcref` keys
+/// deliberately do NOT match the Rust field names they cover.  `gc_cache().get_field_descr` is keyed by
 /// `(struct_key, field_name)` and a cache HIT returns the cached descriptor with
 /// the caller's declared type ignored, while the LLBC analyzer resolves a real
 /// struct field access by name — so a key spelled `dstrategy` would share one
@@ -1253,11 +1253,33 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // A second view of `dstorage`, typed `Ref`: the analyzer lowers the
+            // strategy dispatch and so types `dstorage` as the raw `*mut u8` it
+            // is declared as, while a fold that walks to the storage box needs
+            // to read it as a reference.  Two views of one word need two keys
+            // for the same reason the keys above avoid the Rust field names.
+            (
+                "dstorage_as_gcref",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstorage),
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_DictObject",
         "dictmultiobject::W_DictObject",
     )
 });
+
+/// Locate a `W_DictObject` field descr by offset rather than by a hand-counted
+/// index: the census above is edited by hand, and naming the wrong index does
+/// not fail to compile, it silently reads a neighbouring word.
+fn w_dict_field_descr(offset: usize) -> DescrRef {
+    let parent = W_DICT_DESCR_GROUP.size_descr.clone() as DescrRef;
+    majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
+}
 
 /// `Method` field layout — `w_function`, `w_self`, `w_class`, `w_module`.
 /// All four are Ref slots; the JIT only consumes `w_function` (for guarding
@@ -2448,12 +2470,31 @@ pub fn w_function_size_descr() -> DescrRef {
 }
 
 pub fn dict_keys_version_descr() -> DescrRef {
-    field_descr_from_group(&W_DICT_DESCR_GROUP, 0)
+    w_dict_field_descr(std::mem::offset_of!(
+        pyre_object::dictmultiobject::W_DictObject,
+        keys_version
+    ))
+}
+
+/// `W_DictObject.dstorage` — the strategy-erased storage box
+/// (`dictmultiobject.py:47`). Read as a `Ref` only after the trace has pinned
+/// the strategy through [`dict_strategy_word_descr`], because what the pointer
+/// addresses is whatever the live strategy erased into it.
+/// Reached by census index rather than by offset: `dstorage_lookup_ns` covers
+/// the same word as an `Int`, and `field_descr_from_parent_by_offset` returns
+/// the first descr at an offset, so the offset form would hand back the `Int`
+/// view and silently mis-type the read.
+pub fn dict_dstorage_descr() -> DescrRef {
+    field_descr_from_group(&W_DICT_DESCR_GROUP, 3)
 }
 
 /// `W_DictObject.dstrategy` as a raw word, for the `GuardValue` that pins a
 /// dict to one strategy singleton.  The census key is deliberately not the
 /// struct field name — see the group's doc comment.
+///
+/// `keys_version` is not an alternative for that guard — `MapDictStrategy`
+/// never bumps it, which is why the `dict.get` fold declines a Map-backed
+/// dictionary outright.
 pub fn dict_strategy_word_descr() -> DescrRef {
     field_descr_from_group(&W_DICT_DESCR_GROUP, 1)
 }

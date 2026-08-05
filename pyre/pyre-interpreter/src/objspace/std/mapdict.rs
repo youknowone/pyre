@@ -1621,6 +1621,95 @@ pub unsafe fn load_attr_fast_path(
     Some((w_type, version_tag, map, p.storageindex))
 }
 
+/// The [`load_attr_fast_path`] twin for a receiver that keeps its attributes in
+/// a `newdict(instance=True)` dictionary rather than in header mapdict storage
+/// (`mapdict.py:1299-1303 make_instance_dict`). It applies the same
+/// `load_attr_slowpath` gates (mapdict.py:1496-1527) and differs only in where
+/// the map comes from — the fake carrier the dictionary erases into rather than
+/// the receiver's own header. Returns the type and its version tag alongside
+/// the fold ingredients: the carrier, its map, the `storageindex`, and the
+/// `(typ, listindex)` pair when the attribute took an unboxed transition.
+///
+/// The carrier's map holds only dictionary attributes, so a `__slots__` member
+/// — which mapdict.py:1518 would resolve through the receiver's own map — is
+/// declined here rather than looked up under the `"slot"` name.
+///
+/// Declines a dictionary that is not `MapDictStrategy`-backed. The caller must
+/// still prove that at trace time before dereferencing `dstorage` as a carrier:
+/// a devolved dictionary erases a smaller storage box, and reading a carrier
+/// field off it is out of bounds.
+///
+/// # Safety
+/// `w_obj` must be live, and `w_dict` must point at its live `W_DictObject`.
+pub unsafe fn instance_dict_attr_fast_path(
+    w_obj: PyObjectRef,
+    w_dict: PyObjectRef,
+    name: &str,
+) -> Option<(
+    PyObjectRef,
+    u64,
+    PyObjectRef,
+    MapRef,
+    usize,
+    Option<(UnboxType, usize)>,
+)> {
+    // mapdict.py:1496 `w_type = map.terminator.w_cls` — the carrier's own
+    // terminator is the shared fake one, so the type comes off the receiver.
+    let w_type = unsafe { (*w_obj).w_class };
+    if w_type.is_null() {
+        return None;
+    }
+    // mapdict.py:1497-1499 — a custom `__getattribute__` handles the access.
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // mapdict.py:1504-1526 `_pure_lookup_where_with_method_cache` + classify.
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
+    if attrkind != DICT || is_slot {
+        return None;
+    }
+    let dict = unsafe { &*(w_dict as *const pyre_object::dictmultiobject::W_DictObject) };
+    if dict.dstrategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map {
+        return None;
+    }
+    let carrier = dict.dstorage as PyObjectRef;
+    if carrier.is_null() {
+        return None;
+    }
+    let map = unsafe { (*(carrier as *const pyre_object::W_ObjectObject)).map as MapRef };
+    if map.is_null() || unsafe { map_is_devolved(map) } {
+        return None;
+    }
+    // mapdict.py:1527 `attr = map.find_map_attr(attrname, attrkind)`.
+    let attr = unsafe { find_map_attr(map, Wtf8::new(name), DICT) }?;
+    let plain = unsafe { (*attr).as_plain() };
+    // `_direct_read` migrates the instance off unboxed storage once its class
+    // has frozen unboxing (mapdict.py:594-596); the fold performs
+    // `_prim_direct_read` alone, so a frozen class stays on the residual that
+    // still runs the migration.
+    if plain.unboxed.is_some()
+        && !unsafe { (*plain.terminator).as_terminator() }
+            .allow_unboxing
+            .get()
+    {
+        return None;
+    }
+    Some((
+        w_type,
+        version_tag,
+        carrier,
+        map,
+        plain.storageindex,
+        plain.unboxed.as_ref().map(|u| (u.typ, u.listindex)),
+    ))
+}
+
 /// Shared resolution for [`property_get_fast_path`] / [`property_set_fast_path`]:
 /// when `name` on `w_obj`'s type resolves to a `property` data descriptor,
 /// return the type, its cacheable version tag, and the property object.  Applies
@@ -4456,7 +4545,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         use pyre_object::dictmultiobject::DictStrategy;
 
         let copy = pyre_object::w_dict_new_with(
-            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY,
+            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
             pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage(),
         );
         for (w_key, w_value) in instance_node_dict_items(mapdict_strategy_unerase(w_dict)) {
@@ -5647,7 +5736,11 @@ mod tests {
             );
 
             // A non-str write devolves while retaining previous string keys.
-            MAP_DICT_STRATEGY.setitem(first, pyre_object::w_int_new(7), pyre_object::w_str_new("v"));
+            MAP_DICT_STRATEGY.setitem(
+                first,
+                pyre_object::w_int_new(7),
+                pyre_object::w_str_new("v"),
+            );
             assert_eq!(
                 (*(first as *const pyre_object::W_DictObject))
                     .dstrategy
