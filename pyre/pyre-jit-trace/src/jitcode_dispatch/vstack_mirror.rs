@@ -686,6 +686,18 @@ fn reseed_vstack_from_callee_shadow<Sym: WalkSym>(
         if *slot != OpRef::NONE {
             continue;
         }
+        // The NULL const-ptr rejection here is stricter than the shadow can
+        // justify: `opref` is a sparse map, so a PRESENT key is already the
+        // proof that this walk wrote the slot, and a present key holding
+        // CONST_NULL is a deliberately written NULL — PUSH_NULL's `self_or_null`
+        // ahead of a call inside the inlined callee.  `reseed_vstack_from_shadow`
+        // needed a per-slot live-NULL side table to draw that same distinction
+        // only because its source is a dense array, where absent and NULL are
+        // the same word.  Kept as-is regardless: dropping the clause leaves the
+        // whole dynasm corpus at 386/386 with NO jit-stats movement, so nothing
+        // measures the difference, and an unwitnessed widening of what counts as
+        // a resolved mirror slot is the direction that turns a decline into a
+        // wrong answer.
         match shadow.opref.get(&((stack_base + s) as i64)).copied() {
             Some(value) if value != OpRef::NONE && !opref_is_null_const_ptr(value) => {
                 *slot = value;
