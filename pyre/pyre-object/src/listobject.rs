@@ -1702,6 +1702,14 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
     let strategy = list_strategy_for(&items);
     let mut storage = build_list_storage(&items, strategy);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    // `w_list_clear` is the twin destructive re-installation and holds the
+    // stripe lock across its `drop_object_items`; a concurrent reader must not
+    // see the half-installed state this one writes either.  Take the lock after
+    // the allocating `build_list_storage` so the acquire cannot deadlock behind
+    // a collection, and reload `obj` behind it because a contended acquire
+    // blocks through `before_external_block`.
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     // `drop_object_items`' `try_gc_owns_object` query is a safepoint and the
     // fresh blocks have no heap edge until the stores below, so close their pin
