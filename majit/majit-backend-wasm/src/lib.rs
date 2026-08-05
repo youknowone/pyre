@@ -116,14 +116,11 @@ fn diag_bump(i: usize) {
 const FROZEN_CHAIN_VALUE_SLOTS: usize = 64;
 const FROZEN_CHAIN_REF_HOMES: usize = 64;
 
-/// An arithmetic op whose result advances a loop-carried numeric value (the
-/// `IntAdd`/`IntSub`/… and float-arithmetic block plus the overflow-checked
-/// variants and the unary `IntNeg`/`IntInvert`). Excludes copies (`SameAs*`),
-/// casts, comparisons, and allocations: those feed a JUMP arg without making
-/// the loop's induction walk toward its exit condition. Used to tell a
-/// state-advancing loop-closing bridge from a guard side-trace that re-presents
-/// the same loop state every pass.
-fn is_inductive_arith(opcode: majit_ir::OpCode) -> bool {
+/// An op whose result advances loop-carried state. A value produced inside the
+/// re-running region by arithmetic or by a heap load is fresh on each pass, so
+/// a JUMP carrying it advances the loop. Copies (`SameAs*`), casts,
+/// comparisons, and allocations do not.
+fn advances_loop_state(opcode: majit_ir::OpCode) -> bool {
     use majit_ir::OpCode::*;
     matches!(
         opcode,
@@ -153,16 +150,36 @@ fn is_inductive_arith(opcode: majit_ir::OpCode) -> bool {
             | IntAddOvf
             | IntSubOvf
             | IntMulOvf
+            | GetfieldGcR
+            | GetfieldGcI
+            | GetfieldGcF
+            | GetfieldRawI
+            | GetfieldRawR
+            | GetfieldRawF
+            | GetarrayitemGcR
+            | GetarrayitemGcI
+            | GetarrayitemGcF
+            | GetarrayitemRawI
+            | GetarrayitemRawR
+            | GetarrayitemRawF
+            | GcLoadI
+            | GcLoadR
+            | GcLoadF
+            | GcLoadIndexedI
+            | GcLoadIndexedR
+            | GcLoadIndexedF
+            | RawLoadI
+            | RawLoadF
     )
 }
 
 /// Per-guard (per-trace order), per-fail-arg: whether the value was produced
-/// by induction-advancing arithmetic in the part of the trace that re-runs on
-/// every pass — the ops after the loop-header (last) LABEL, or the WHOLE trace
-/// when it has no LABEL (a bridge, or a Label-less recursion loop, whose body
-/// runs in full each pass). Such a fail arg is fresh in the failing iteration,
-/// so a loop-closing bridge that JUMPs it verbatim still advances the chained
-/// loop⇄bridge cycle (`compile_bridge`'s livelock check).
+/// by loop-state-advancing arithmetic or a heap load in the part of the trace
+/// that re-runs on every pass — the ops after the loop-header (last) LABEL, or
+/// the WHOLE trace when it has no LABEL (a bridge, or a Label-less recursion
+/// loop, whose body runs in full each pass). Such a fail arg is fresh in the
+/// failing iteration, so a loop-closing bridge that JUMPs it verbatim still
+/// advances the chained loop⇄bridge cycle (`compile_bridge`'s livelock check).
 fn guard_fail_args_advanced(
     ops: &[majit_ir::Op],
     guard_exits: &[codegen::GuardExit],
@@ -173,7 +190,7 @@ fn guard_fail_args_advanced(
         .map_or(0, |p| p + 1);
     let advanced_ids: std::collections::HashSet<u32> = ops[start..]
         .iter()
-        .filter(|op| is_inductive_arith(op.opcode))
+        .filter(|op| advances_loop_state(op.opcode))
         .map(|op| op.pos.get())
         .filter(|r| *r != majit_ir::OpRef::NONE && !r.is_constant())
         .map(|r| r.raw())
@@ -2596,8 +2613,8 @@ impl majit_backend::Backend for WasmBackend {
 
         // A loop-closing bridge carries the source loop's loop-carried state in
         // its terminal JUMP args and tail-calls the loop to iterate again. If no
-        // JUMP arg is the result of an induction-advancing arithmetic op — i.e.
-        // every loop-carried value is a verbatim input reload, a fresh
+        // JUMP arg is the result of a loop-state-advancing arithmetic or load op
+        // — i.e. every loop-carried value is a verbatim input reload, a fresh
         // allocation, or a baked constant — the bridge re-presents byte-identical
         // induction/guard state on every pass, so the loop's exit guard never
         // flips and the loop⇄bridge cycle spins forever (a control-flow
@@ -2621,8 +2638,8 @@ impl majit_backend::Backend for WasmBackend {
             // verbatim reload of source fail arg `k`. The advance for such an
             // arg may have happened in the SOURCE loop's body before the guard
             // (an `i += 1` preceding the failing branch): the source recorded
-            // per-fail-arg whether the value was produced by induction-
-            // advancing arithmetic within the failing iteration
+            // per-fail-arg whether the value was produced by a loop-state-
+            // advancing op within the failing iteration
             // (`guard_fail_arg_advanced`), so consult that alongside the
             // in-bridge producers.
             let input_pos: std::collections::HashMap<u32, usize> = inputargs
@@ -2637,7 +2654,7 @@ impl majit_backend::Backend for WasmBackend {
                 .is_some_and(|jump| {
                     jump.getarglist().iter().any(|arg| match arg {
                         majit_ir::operand::Operand::Op(producer) => {
-                            is_inductive_arith(producer.opcode)
+                            advances_loop_state(producer.opcode)
                         }
                         majit_ir::operand::Operand::InputArg(ia) => {
                             input_pos.get(&ia.index).is_some_and(|&k| {
