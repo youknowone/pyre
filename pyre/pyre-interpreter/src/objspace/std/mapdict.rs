@@ -173,9 +173,13 @@ pub enum TerminatorKind {
 pub struct Terminator {
     /// mapdict.py:307 `w_cls`.
     pub w_cls: PyObjectRef,
-    /// mapdict.py:308 `allow_unboxing` (quasi-immutable; cleared when an
-    /// attribute that was unboxed is reassigned a differently-typed value,
-    /// mapdict.py:685).
+    /// mapdict.py:308 `allow_unboxing` — declared quasi-immutable upstream and
+    /// cleared when an unboxed attribute is reassigned a differently-typed
+    /// value (mapdict.py:685). Pyre installs no quasi-immutable watcher here;
+    /// as with the `Function` fields documented in `descr.rs`, it keeps the
+    /// field live/mutable and pairs each read with a `GuardValue` on the
+    /// instance map in `walker_guard_mapdict_instance_shape`, so a map-node
+    /// change deopts before a stale value can be folded.
     pub allow_unboxing: Cell<bool>,
     /// Which Terminator subclass this is.
     pub kind: TerminatorKind,
@@ -233,7 +237,10 @@ pub struct PlainAttribute {
     pub num_attributes: usize,
     /// mapdict.py:429 `back`.
     pub back: MapRef,
-    /// mapdict.py:430 `ever_mutated` (quasi-immutable).
+    /// mapdict.py:430 `ever_mutated` — declared quasi-immutable upstream; pyre
+    /// installs no watcher and uses the per-read instance-map `GuardValue`
+    /// described on `Terminator::allow_unboxing` (the `descr.rs` `Function`
+    /// precedent).
     pub ever_mutated: Cell<bool>,
     /// mapdict.py:431 `order`.
     pub order: usize,
@@ -3129,9 +3136,15 @@ unsafe fn materialize_dict(obj: PyObjectRef, w_dict: PyObjectRef) {
 pub struct CachedAttributeHolder {
     /// mapdict.py:670 `order` (= number of prior children of `back`).
     pub order: usize,
-    /// mapdict.py:675 `attr` (quasi-immutable).
+    /// mapdict.py:675 `attr` — the cached child map, declared quasi-immutable
+    /// upstream; pyre installs no watcher and uses the per-read instance-map
+    /// `GuardValue` described on `Terminator::allow_unboxing` (the `descr.rs`
+    /// `Function` precedent).
     pub attr: Cell<MapRef>,
-    /// mapdict.py:676 `typ` (quasi-immutable unbox type, `None` = boxed).
+    /// mapdict.py:676 `typ` — the unbox type (`None` = boxed), declared
+    /// quasi-immutable upstream; pyre installs no watcher and uses the per-read
+    /// instance-map `GuardValue` described on `Terminator::allow_unboxing` (the
+    /// `descr.rs` `Function` precedent).
     pub typ: Cell<Option<UnboxType>>,
 }
 
