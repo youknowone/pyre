@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=19
-# pyre-check: min-pypy-ratio=2
+# pyre-check: max-pypy-ratio=18
+# pyre-check: min-pypy-ratio=1.92
 # A `__slots__` entry naming a class variable raises ValueError at class
 # creation, while a duplicate `__slots__` entry is silently ignored.
 # Output verified against CPython/PyPy.

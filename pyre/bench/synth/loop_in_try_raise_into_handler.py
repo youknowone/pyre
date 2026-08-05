@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=600
+# pyre-check: max-pypy-ratio=31
+# pyre-check: min-pypy-ratio=2.28
 # A hot loop inside a `try` that raises out of the loop into a handler the SAME
 # frame owns, across the delivery flavours that reach the handler differently:
 # an operation that raises from a builtin container, an int-specialized

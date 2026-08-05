@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=18
+# pyre-check: min-pypy-ratio=2.62
 # CALL_KW and CALL_FUNCTION_EX inside a callee that is inlined into the hot
 # loop.  Both opcodes used to emit abort_permanent and decline the callee's
 # jitcode; the residual port lets them compile.  Guards output correctness and

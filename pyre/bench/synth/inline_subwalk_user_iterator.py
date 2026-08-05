@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=165
+# pyre-check: max-pypy-ratio=76
+# pyre-check: min-pypy-ratio=4.22
 # gh#495 guard: inlined callee consumes user iterator whose next mutates state.
 # FOR loop over user iterator INSIDE branch-bearing inlined callee; __next__ mutates shared counter
 N = 30000

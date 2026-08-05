@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=44
+# pyre-check: max-pypy-ratio=26
+# pyre-check: min-pypy-ratio=4.22
 # Three-argument `pow(base, exp, mod)` requires all operands to be integers.
 # A float base rejects the modulus with a TypeError, a complex base with a
 # ValueError ("complex modulo"), and the all-integer forms compute the modular

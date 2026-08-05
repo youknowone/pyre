@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=1794
+# pyre-check: max-pypy-ratio=118
+# pyre-check: min-pypy-ratio=7.52
 # An instance attribute shadows a same-named non-data-descriptor class
 # attribute on builtin-type subclasses (tuple/int/str), while a data descriptor
 # still wins over a competing instance-dict entry (injected directly, since the

@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=69
+# pyre-check: max-pypy-ratio=48
+# pyre-check: min-pypy-ratio=4.68
 # `lst.append(x)` on a builtin receiver: the name resolves to a builtin-code
 # function on the type, so LOAD_ATTR's method fast path declines (it only
 # pushes `[descr, self]` for `flag_method_descriptor` types) and `getattr`

@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=17
+# pyre-check: max-pypy-ratio=16
+# pyre-check: min-pypy-ratio=1.68
 # Builds a container (tuple / list / set / dict / str) AFTER a hot loop and
 # returns it.  The loop-exit guard failure resumes via the blackhole, which
 # then walks the forward path through the container-build residual

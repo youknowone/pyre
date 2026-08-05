@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=17
+# pyre-check: min-pypy-ratio=2.62
 # Multi-except dispatch + counter-only handler bodies on the blackhole
 # guard-failure resume path. The loop warms up exception-free (so the trace
 # compiles the no-exception path), then raises ZeroDivisionError and

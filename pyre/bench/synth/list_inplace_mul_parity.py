@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=39
+# pyre-check: max-pypy-ratio=18
+# pyre-check: min-pypy-ratio=1.35
 # In-place list repeat (`list *= n`) parity.  CPython and PyPy both mutate the
 # list in place (listobject descr_inplace_mul), so the list object identity is
 # preserved across `*=`; only `*` produces a fresh list.  check.py's oracle is

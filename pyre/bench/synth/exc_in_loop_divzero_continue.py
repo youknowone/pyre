@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=7.5
+# pyre-check: max-pypy-ratio=6.6
 # pyre-check: min-pypy-ratio=0.78
 # A try/except INSIDE a hot loop whose body raises through a may-force
 # residual call (`//`, `%`, `int("z")`) on some iterations and is CAUGHT,

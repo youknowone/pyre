@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=40
+# pyre-check: max-pypy-ratio=11
+# pyre-check: min-pypy-ratio=1.35
 # Exact, non-specialized tuples use the ordinary wrapped-items array.  Keep
 # fixed-length unpack on that storage visible to the trace while preserving
 # the generic path for tuple subclasses at the same call site.

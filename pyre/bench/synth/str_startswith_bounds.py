@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=30
+# pyre-check: max-pypy-ratio=17
+# pyre-check: min-pypy-ratio=1.15
 # startswith/endswith convert their code-point bounds to byte offsets: a
 # start past the end is not clamped, it inverts the window, so the match is
 # False even for an empty prefix. A start exactly at the end still yields a

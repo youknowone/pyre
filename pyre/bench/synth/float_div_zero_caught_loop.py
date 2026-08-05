@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=190
+# pyre-check: max-pypy-ratio=50
+# pyre-check: min-pypy-ratio=4.45
 # Float true-division by zero inside a try in a JIT-hot callee.  The walker
 # specializes `float / float` to a bare `FloatTrueDiv` llop (raw IEEE), which
 # would compute `inf` for a zero divisor instead of raising ZeroDivisionError.

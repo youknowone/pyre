@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=122
+# pyre-check: min-pypy-ratio=9.72
 # A single hot function whose int register + constant-pool slot count exceeds the
 # 256-entry ceiling of the single-byte JitCode operand encoding (assembler.py chr()).
 # Such a trace cannot be encoded as single-byte slot operands, so it must be

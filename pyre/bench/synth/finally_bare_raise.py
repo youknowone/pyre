@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=17
-# pyre-check: min-pypy-ratio=0.35
+# pyre-check: max-pypy-ratio=7.2
+# pyre-check: min-pypy-ratio=0.48
 # A hot loop FOLLOWED by a `finally` (or nested `finally`) containing a
 # bare `raise` (RAISE_VARARGS argc==0).  When such a bare re-raise is
 # reached by normal fall-through — no `PUSH_EXC_INFO` seeded the handler

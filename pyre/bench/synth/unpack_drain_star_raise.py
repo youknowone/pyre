@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=561
+# pyre-check: max-pypy-ratio=49
+# pyre-check: min-pypy-ratio=5.62
 # Star-unpack of an iterator of unknown length: `f(*it)` is the consumer that
 # routes through `_unpackiterable_unknown_length`, the drain loop jd1
 # (`unpackiterable_driver`) traces and compiles. `a, b, c = it` does NOT reach

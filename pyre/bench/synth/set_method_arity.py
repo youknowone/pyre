@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=5
+# pyre-check: min-pypy-ratio=0.68
 # set/frozenset methods with a fixed arity raise TypeError on a wrong
 # positional-argument count instead of silently accepting it. The exact message
 # text differs between CPython and PyPy, so only the exception type (which they

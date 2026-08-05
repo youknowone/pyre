@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=31
+# pyre-check: max-pypy-ratio=15
+# pyre-check: min-pypy-ratio=1.28
 # STORE_SLICE in a hot loop: `buf[a:b] = [i, i + 1]` with *variable* bounds
 # (a, b are locals, not literals) compiles to the STORE_SLICE opcode every
 # iteration — literal bounds would fold to a const slice + STORE_SUBSCR.  The

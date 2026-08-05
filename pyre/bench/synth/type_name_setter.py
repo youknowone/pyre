@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=11
-# pyre-check: min-pypy-ratio=1.05
+# pyre-check: max-pypy-ratio=9.7
+# pyre-check: min-pypy-ratio=1.22
 N = 80000
 
 # Exercises the writable type.__name__ setter under the JIT: a successful

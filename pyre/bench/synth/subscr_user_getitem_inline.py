@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=40
+# pyre-check: max-pypy-ratio=35
+# pyre-check: min-pypy-ratio=1.88
 # BINARY_SUBSCR whose receiver resolves `__getitem__` to a Python function.
 # Covers the two receiver shapes whose subscript the type's own MRO owns — a
 # user instance and a builtin sequence subclass that overrides `__getitem__` —

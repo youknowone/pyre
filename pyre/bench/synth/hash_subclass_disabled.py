@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=165
+# pyre-check: max-pypy-ratio=106
+# pyre-check: min-pypy-ratio=17
 # A tuple/frozenset subclass that sets __hash__ = None is unhashable: hash()
 # and set insertion both raise TypeError instead of the structural fast path
 # hashing by contents. Output verified against CPython/PyPy.

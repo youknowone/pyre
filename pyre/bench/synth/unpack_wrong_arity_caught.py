@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=38
+# pyre-check: max-pypy-ratio=35
+# pyre-check: min-pypy-ratio=1.55
 # A hot exact-length unpack specializes for the common arity.  The rare
 # mismatching tuple must deopt at the UNPACK_SEQUENCE validation call and
 # deliver ValueError through this frame's exception handler.

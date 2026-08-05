@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=53
+# pyre-check: max-pypy-ratio=30
+# pyre-check: min-pypy-ratio=3.15
 # Short-circuit and/or chains whose operands call side-effecting helpers,
 # inside a hot loop whose first operand flips truthiness after warm-up. The
 # helpers bump global counters; the computed totals were always correct, but

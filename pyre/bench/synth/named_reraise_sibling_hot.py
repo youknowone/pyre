@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=77
+# pyre-check: max-pypy-ratio=36
+# pyre-check: min-pypy-ratio=4.88
 # A named `except E as m:` handler whose body bare-re-raises compiles its
 # implicit cleanup to `DELETE_FAST m; RERAISE`, immediately followed by a
 # sibling `except` clause's type check. On the re-raise path the exception must

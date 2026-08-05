@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5.8
-# pyre-check: min-pypy-ratio=0.42
+# pyre-check: max-pypy-ratio=5.5
+# pyre-check: min-pypy-ratio=0.52
 # A bare re-raise caught in the same frame keeps the original traceback: no
 # node is attached at a re-raise coordinate (RaiseWithExplicitTraceback,
 # attach_tb=False). The module-level loop makes the recording iteration itself

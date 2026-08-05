@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=10
-# pyre-check: min-pypy-ratio=0.52
+# pyre-check: min-pypy-ratio=0.85
 # A branch inside an inlined callee (gh#343). `compute_branch` guard-fails on the
 # rare arm (`x % 7 == 0`); without a compiled bridge for the inlined callee's
 # continuation every crossing deopts to the blackhole (~34x slower on the native
