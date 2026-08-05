@@ -340,6 +340,30 @@ impl MIFrame {
         (struct_reg, value_reg, descr_idx)
     }
 
+    /// Decode a `newlist_clear/idddd>r` operand septuple, returning
+    /// `(length_reg, struct_descr_idx, length_descr_idx, items_descr_idx,
+    /// array_descr_idx, dest)`. Canonical layout: 1B length_reg + 2B
+    /// structdescr_idx + 2B lengthdescr_idx + 2B itemsdescr_idx + 2B
+    /// arraydescr_idx + 1B dest_reg — the exact read order
+    /// `handler_newlist_clear` (`blackhole.py:1173-1180`) and the
+    /// codewriter emit (`assembler.rs` NewListClear arm) agree on.
+    pub fn read_newlist_clear(&mut self) -> (usize, usize, usize, usize, usize, usize) {
+        let length_reg = self.next_u8() as usize;
+        let struct_descr = self.next_u16() as usize;
+        let length_descr = self.next_u16() as usize;
+        let items_descr = self.next_u16() as usize;
+        let array_descr = self.next_u16() as usize;
+        let dest = self.next_u8() as usize;
+        (
+            length_reg,
+            struct_descr,
+            length_descr,
+            items_descr,
+            array_descr,
+            dest,
+        )
+    }
+
     /// Decode a `getfield_gc_<kind>/rd>X` operand triple, returning
     /// `(struct_reg, descr_pool_idx, dest_reg)`. Canonical layout: 1B
     /// struct_reg + 2B descr_pool_idx + 1B dest_reg

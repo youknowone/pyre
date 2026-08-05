@@ -1704,6 +1704,94 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "new_array_clear dst");
     }
 
+    /// Emit `newlist_clear/idddd>r` (`handler_newlist_clear`,
+    /// `blackhole.py:1173-1180`): the compound resizable-list allocation
+    /// `do_resizable_newlist_clear` emits.  ONE opcode carrying the
+    /// element count (int register) plus FOUR descriptors in the exact
+    /// read order the handler and trace dispatch agree on —
+    /// structdescr (`list` header Size), lengthdescr (`list.length`
+    /// FieldDescr), itemsdescr (`list.items` FieldDescr), arraydescr
+    /// (the length-prefixed items block).  The list header layout is
+    /// `{ length: Signed @ length_offset, items: Ptr(GcArray) @
+    /// items_offset }`; the items block is `arraydescrof(item_type,
+    /// len_offset = Some(0))`.  Registers the header layout under
+    /// `struct_type_id` so the two setfield FieldDescrs carry a parent
+    /// SizeDescr (`descr.py:238`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn newlist_clear(
+        &mut self,
+        dest: u16,
+        length_reg: u16,
+        struct_type_id: u64,
+        struct_size: usize,
+        length_offset: usize,
+        items_offset: usize,
+        array_type_id: u64,
+        item_type: majit_ir::value::Type,
+    ) {
+        self.touch_int_reg_or_pool_slot(length_reg);
+        self.touch_ref_reg(dest);
+        // Register the `list` header layout so the length/items field
+        // descrs resolve a parent SizeDescr + index_in_parent.
+        self.register_struct_layout(
+            struct_size,
+            struct_type_id,
+            true,
+            false,
+            &[
+                (length_offset, false, "length"),
+                (items_offset, true, "items"),
+            ],
+        );
+        let all_fielddescrs = self
+            .struct_size_specs
+            .get(&struct_type_id)
+            .expect("register_struct_layout just inserted this type_id")
+            .all_fielddescrs
+            .clone();
+        // structdescr: the `list` header Size descr (resizable list, no vtable).
+        let struct_descr = self.add_bh_descr(CanonicalBhDescr::Size {
+            size: struct_size,
+            type_id: struct_type_id,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs,
+            is_gc_managed: true,
+        });
+        // lengthdescr / itemsdescr: parent-carrying field descrs.
+        let length_descr =
+            self.add_struct_field_descr(length_offset, majit_ir::value::Type::Int, struct_type_id);
+        let items_descr =
+            self.add_struct_field_descr(items_offset, majit_ir::value::Type::Ref, struct_type_id);
+        // arraydescr: length-prefixed items block (length word at offset 0).
+        let is_item_signed = !matches!(
+            item_type,
+            majit_ir::value::Type::Ref | majit_ir::value::Type::Float
+        );
+        let array_descr = self.add_array_descr(CanonicalBhDescr::Array {
+            base_size: std::mem::size_of::<usize>(),
+            itemsize: scalar_size(item_type),
+            len_offset: Some(0),
+            type_id: array_type_id,
+            gc_type_id: 0,
+            item_type,
+            is_array_of_pointers: matches!(item_type, majit_ir::value::Type::Ref),
+            is_array_of_structs: false,
+            is_item_signed,
+            ei_index: u32::MAX,
+            array_type_id: None,
+            interior_fields: Vec::new(),
+            is_gc_managed: true,
+        });
+        self.write_insn("newlist_clear/idddd>r");
+        self.push_reg_u8(length_reg, "newlist_clear length");
+        self.push_u16(struct_descr);
+        self.push_u16(length_descr);
+        self.push_u16(items_descr);
+        self.push_u16(array_descr);
+        self.push_reg_u8(dest, "newlist_clear dst");
+    }
+
     /// Store a Ref element into a GC-managed array.
     ///
     /// blackhole.py `bhimpl_setarrayitem_gc_r @arguments("cpu","r","i",

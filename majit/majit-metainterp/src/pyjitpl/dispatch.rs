@@ -7772,6 +7772,162 @@ where
             // (length reg + array descr -> ref) on the BC_NEW / BC_NEW_WITH_VTABLE
             // template above: execute the live allocation and record
             // OpCode::NewArray{,Clear} so the optimizer can still virtualize it.
+            jitcode::insns::BC_NEWLIST_CLEAR => {
+                // opimpl_newlist_clear (pyjitpl.py:792-798): decompose ONE
+                // opcode into New + SetfieldGc(length) + NewArrayClear +
+                // SetfieldGc(items).  The tracer both *records* all four
+                // resops (so the optimizer can virtualize the list header +
+                // its items block when they do not escape) and *executes* the
+                // two live allocations plus the two field stores (so the
+                // subsequent steps of this same trace read live memory), the
+                // same dual discipline BC_NEW / BC_SETFIELD_GC follow.
+                let (
+                    length_reg,
+                    struct_descr_idx,
+                    length_descr_idx,
+                    items_descr_idx,
+                    array_descr_idx,
+                    dest,
+                ) = self.frames.current_mut().read_newlist_clear();
+                // structdescr (`list` header SizeDescr): size + gc identity +
+                // the DescrRef the recorded New carries.
+                let (struct_size, struct_type_id, struct_headerless, struct_descr) = {
+                    let frame = self.frames.current_mut();
+                    let bh = frame.runtime_bh_descr(struct_descr_idx).unwrap_or_else(|| {
+                        panic!(
+                            "BC_NEWLIST_CLEAR: descrs[{struct_descr_idx}] is not a BhDescr entry"
+                        )
+                    });
+                    (
+                        bh.as_size(),
+                        bh.resolve_gc_tid(),
+                        bh.is_headerless(),
+                        size_descr_ref_from_bh(bh),
+                    )
+                };
+                // lengthdescr / itemsdescr: plain FieldDescrs — byte offset +
+                // the DescrRef the two recorded SetfieldGc ops carry.
+                let (length_offset, length_fielddescr) = {
+                    let frame = self.frames.current_mut();
+                    let bh = frame.runtime_bh_descr(length_descr_idx).unwrap_or_else(|| {
+                        panic!(
+                            "BC_NEWLIST_CLEAR: descrs[{length_descr_idx}] is not a BhDescr entry"
+                        )
+                    });
+                    field_descr_ref_from_bh(bh)
+                };
+                let (items_offset, items_fielddescr) = {
+                    let frame = self.frames.current_mut();
+                    let bh = frame.runtime_bh_descr(items_descr_idx).unwrap_or_else(|| {
+                        panic!("BC_NEWLIST_CLEAR: descrs[{items_descr_idx}] is not a BhDescr entry")
+                    });
+                    field_descr_ref_from_bh(bh)
+                };
+                // arraydescr: geometry for the live items-block allocation
+                // (`base_size + length*itemsize` bytes, cleared, length word
+                // at `len_offset`), matching `bh_new_array`
+                // (runner.rs `dynasm_alloc_oldgen_varsize_typed_and_set_len`).
+                let (array_base_size, array_itemsize, array_len_offset, array_type_id) = {
+                    let frame = self.frames.current_mut();
+                    let bh = frame.runtime_bh_descr(array_descr_idx).unwrap_or_else(|| {
+                        panic!("BC_NEWLIST_CLEAR: descrs[{array_descr_idx}] is not a BhDescr entry")
+                    });
+                    let (base_size, itemsize, _signed) = bh.unpack_arraydescr_size();
+                    (
+                        base_size,
+                        itemsize,
+                        bh.array_len_offset(),
+                        bh.resolve_gc_tid(),
+                    )
+                };
+                let Some(array_descr) = self.dispatch_array_descr_ref(ctx, array_descr_idx) else {
+                    return TraceAction::Abort;
+                };
+                // The length operand feeds both the length-field store and the
+                // items-block element count (opimpl_newlist_clear passes the
+                // same `sizebox` to `_opimpl_setfield_gc_any` and
+                // `opimpl_new_array_clear`).
+                let (length_opref, length_val) = self.read_int_reg(length_reg);
+
+                // ── 1. sbox: live-alloc the `list` header (BC_NEW no-collect
+                // discipline — the struct ptr is live in the register bank,
+                // which is no root set, so the array allocation that follows
+                // must not move it; old-gen is mark-sweep non-moving and both
+                // GC paths are no-collect). ──
+                let struct_size = struct_size.max(1);
+                let struct_gc_ptr = if struct_headerless {
+                    majit_gc::alloc_nursery_headerless_no_collect(struct_size).0
+                } else if struct_type_id != 0 {
+                    majit_gc::alloc_oldgen_typed(struct_type_id, struct_size).0
+                } else {
+                    0
+                };
+                let struct_ptr = if struct_gc_ptr != 0 {
+                    struct_gc_ptr as i64
+                } else {
+                    let layout = std::alloc::Layout::from_size_align(struct_size, 8)
+                        .expect("BC_NEWLIST_CLEAR: invalid list-header layout");
+                    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+                };
+                let sbox_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr);
+                ctx.set_opref_concrete(sbox_op, Value::Ref(majit_ir::GcRef(struct_ptr as usize)));
+
+                // ── 2. store the length into the header's `length` field. ──
+                ctx.record_op_with_descr(
+                    OpCode::SetfieldGc,
+                    &[sbox_op, length_opref],
+                    length_fielddescr,
+                );
+                if struct_ptr != 0 {
+                    unsafe {
+                        *((struct_ptr as *mut u8).add(length_offset) as *mut i64) = length_val
+                    };
+                }
+
+                // ── 3. abox: live-alloc the cleared items block.  Payload is
+                // `base_size + length*itemsize`, zero-filled by the old-gen
+                // allocator (`finish_alloc_in_oldgen` write_bytes 0 — the
+                // CLEAR), no-collect; the length word is written at
+                // `len_offset` for a length-prefixed array. ──
+                let length_count =
+                    usize::try_from(length_val).expect("BC_NEWLIST_CLEAR: negative list length");
+                let array_payload = array_itemsize
+                    .checked_mul(length_count)
+                    .and_then(|var| array_base_size.checked_add(var))
+                    .expect("BC_NEWLIST_CLEAR: items-block size overflow");
+                let array_payload = array_payload.max(1);
+                let array_gc_ptr = if array_type_id != 0 {
+                    majit_gc::alloc_oldgen_typed(array_type_id, array_payload).0
+                } else {
+                    0
+                };
+                let array_ptr = if array_gc_ptr != 0 {
+                    array_gc_ptr as i64
+                } else {
+                    let layout = std::alloc::Layout::from_size_align(array_payload, 8)
+                        .expect("BC_NEWLIST_CLEAR: invalid items-block layout");
+                    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+                };
+                if array_ptr != 0 {
+                    if let Some(len_ofs) = array_len_offset {
+                        unsafe { *((array_ptr as *mut u8).add(len_ofs) as *mut i64) = length_val };
+                    }
+                }
+                let abox_op = ctx.record_new_array_clear(length_opref, array_descr);
+                ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
+
+                // ── 4. store the items block into the header's `items` field.
+                // A ref store adds a heap edge header→items, so notify the GC
+                // on the container (mirrors BC_SETFIELD_GC_R / bh_setfield_gc_r).
+                ctx.record_op_with_descr(OpCode::SetfieldGc, &[sbox_op, abox_op], items_fielddescr);
+                if struct_ptr != 0 {
+                    unsafe { *((struct_ptr as *mut u8).add(items_offset) as *mut i64) = array_ptr };
+                    majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+                }
+
+                // ── 5. bind the list header to the destination ref register. ──
+                self.set_ref_reg(dest, Some(sbox_op), Some(struct_ptr));
+            }
             other => panic!("unknown jitcode bytecode {other}"),
         }
 
@@ -10498,6 +10654,76 @@ mod tests {
             op.getdescr()
                 .and_then(|d| d.as_size_descr().map(|s| s.size())),
             Some(16)
+        );
+    }
+
+    #[test]
+    fn jitcode_newlist_clear_records_new_setfield_newarrayclear_setfield() {
+        // opimpl_newlist_clear (pyjitpl.py:792-798): ONE opcode decomposes
+        // into New + SetfieldGc(length) + NewArrayClear + SetfieldGc(items).
+        // The `list` header is { length: i64 @0, items: ref @8 } (size 16)
+        // wrapping a length-prefixed items block of i64 elements.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 3); // int reg 0 = list length 3
+        builder.newlist_clear(
+            0,    // dest ref reg 0 = list header
+            0,    // length_reg = int reg 0
+            0x51, // struct_type_id (list header identity)
+            16,   // struct_size (length @0, items @8)
+            0,    // length_offset
+            8,    // items_offset
+            0xA1, // array_type_id (items block identity)
+            majit_ir::value::Type::Int,
+        );
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        // The leading int_copy const load records nothing; the four resops
+        // are the entire trace.
+        let opcodes: Vec<_> = recorder.ops().iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OpCode::New,
+                OpCode::SetfieldGc,
+                OpCode::NewArrayClear,
+                OpCode::SetfieldGc,
+            ]
+        );
+
+        // The New (sbox) result feeds BOTH SetfieldGc records as arg 0.
+        let new_pos = recorder.ops()[0].pos.get().raw();
+        assert_eq!(recorder.ops()[1].arg(0).position(), Some(new_pos));
+        assert_eq!(recorder.ops()[3].arg(0).position(), Some(new_pos));
+        // The NewArrayClear (abox) result feeds the items SetfieldGc as arg 1.
+        let arr_pos = recorder.ops()[2].pos.get().raw();
+        assert_eq!(recorder.ops()[3].arg(1).position(), Some(arr_pos));
+
+        // The recorded field descrs carry the resolved byte offsets.
+        let len_off = recorder.ops()[1]
+            .getdescr()
+            .and_then(|d| d.as_field_descr().map(|f| f.offset()));
+        let items_off = recorder.ops()[3]
+            .getdescr()
+            .and_then(|d| d.as_field_descr().map(|f| f.offset()));
+        assert_eq!(len_off, Some(0));
+        assert_eq!(items_off, Some(8));
+
+        // The New carries a SizeDescr sized like the list header.
+        let struct_size = recorder.ops()[0]
+            .getdescr()
+            .and_then(|d| d.as_size_descr().map(|s| s.size()));
+        assert_eq!(struct_size, Some(16));
+        // The sbox result is bound to a live (non-null) list-header pointer.
+        let sbox_val = recorder.ops()[0].get_value();
+        assert!(
+            matches!(sbox_val, Some(Value::Ref(r)) if r.as_usize() != 0),
+            "list header pointer must be a non-null ref, got {sbox_val:?}"
         );
     }
 
