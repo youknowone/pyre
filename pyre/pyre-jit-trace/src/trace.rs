@@ -2862,6 +2862,11 @@ fn try_adopt_multi_frame_blackhole(
                 continue;
             }
             saved_links.push((callee, (*callee).f_backref));
+            majit_gc::bh_probe_note_store(
+                callee as usize,
+                crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
+                5,
+            );
             (*callee).f_backref = f_back;
             relink_barrier(callee);
         }
@@ -2871,6 +2876,11 @@ fn try_adopt_multi_frame_blackhole(
         *mut pyre_interpreter::PyFrame,
     )]| {
         for &(callee, f_back) in saved {
+            majit_gc::bh_probe_note_store(
+                callee as usize,
+                crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
+                6,
+            );
             unsafe {
                 (*callee).f_backref = f_back;
             }

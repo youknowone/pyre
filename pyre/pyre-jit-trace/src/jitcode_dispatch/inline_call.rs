@@ -1830,6 +1830,11 @@ fn walker_ec_enter(
     // barrier and the concrete store has to carry it too.  This frame is an
     // old-gen `FrameBox` and the caller's vref can be young.
     pyre_object::gc_hook::try_gc_write_barrier(concrete_frame as *mut u8);
+    majit_gc::bh_probe_note_store(
+        concrete_frame as usize,
+        crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
+        4,
+    );
     unsafe {
         (*concrete_frame).f_backref = concrete_caller_topframeref;
         (*concrete_ec).topframeref = concrete_vref as *mut pyre_interpreter::PyFrame;

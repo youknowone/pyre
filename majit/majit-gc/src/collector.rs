@@ -1486,6 +1486,74 @@ impl MiniMarkGC {
         }
     }
 
+    /// TEMPORARY DIAGNOSTIC (`MAJIT_GC_BH_PROBE`).
+    ///
+    /// At the end of a minor every live nursery object has been forwarded and
+    /// every traced slot rewritten, so no surviving object may still name a
+    /// nursery address. Scan every old-generation block for one and accumulate
+    /// the distinct `(type, offset)` classes, then panic once with the whole
+    /// table — the wasm runner recovers a guest panic message out of linear
+    /// memory, so this is the one diagnostic channel that reaches the console
+    /// from inside the module.
+    fn bh_probe_check_no_young_refs(&mut self) {
+        if !crate::bh_probe_enabled() {
+            return;
+        }
+        // How many distinct classes to gather before reporting, and how many
+        // minors to keep scanning if fewer than that ever appear.
+        const CLASS_BUDGET: usize = 10;
+        const REPORT_AT_MINOR: usize = 120;
+        let mut fresh: Vec<crate::BhProbeViolation> = Vec::new();
+        crate::with_bh_objects(|objects| {
+            for &(addr, payload_size, origin) in objects {
+                if self.nursery.contains(addr) || !self.oldgen.contains(addr) {
+                    continue;
+                }
+                let tid = unsafe { (*header_of(addr)).type_id() };
+                if (tid as usize) >= self.types.len() || crate::bh_probe_tid_ignored(tid) {
+                    continue;
+                }
+                for offset in (0..payload_size).step_by(std::mem::size_of::<usize>()) {
+                    let word = unsafe { *((addr + offset) as *const usize) };
+                    if !self.nursery.contains(word) || self.pinned_objects.contains(&word) {
+                        continue;
+                    }
+                    if crate::bh_probe_violation_seen(tid, offset, origin) {
+                        continue;
+                    }
+                    let info = self.types.get(tid);
+                    fresh.push(crate::BhProbeViolation {
+                        minor: self.minor_collections,
+                        origin,
+                        holder: addr,
+                        tid,
+                        payload_size,
+                        offset,
+                        value: word,
+                        forwarded: unsafe { (*header_of(word)).is_forwarded() },
+                        type_size: info.size,
+                        item_size: info.item_size,
+                        length_offset: info.length_offset,
+                        gc_ptr_offsets: info.gc_ptr_offsets.to_vec(),
+                        custom_trace: info.custom_trace.is_some(),
+                        is_object: info.is_object,
+                        track_young_ptrs: unsafe {
+                            (*header_of(addr)).has_flag(flags::TRACK_YOUNG_PTRS)
+                        },
+                        remembered: self.remembered_set.contains(&addr),
+                        barriered_ever: crate::bh_probe_was_barriered(addr),
+                        traced_this_minor: crate::bh_probe_was_traced(addr),
+                        store_sites: crate::bh_probe_store_sites(addr, offset),
+                    });
+                }
+            }
+        });
+        let total = crate::bh_probe_record_violations(fresh);
+        if total >= CLASS_BUDGET || (total > 0 && self.minor_collections >= REPORT_AT_MINOR) {
+            panic!("{}", crate::bh_probe_violation_report(self.minor_collections));
+        }
+    }
+
     /// Allocate directly in old gen (for large objects or post-collection fallback).
     fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> GcRef {
         let ptr = self.oldgen.alloc(total_size);
@@ -1500,6 +1568,12 @@ impl MiniMarkGC {
     }
 
     fn finish_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize, ptr: *mut u8) -> GcRef {
+        if crate::bh_probe_enabled() {
+            let lo = self.nursery.start_ptr() as usize;
+            crate::BH_PROBE_NURSERY_LO.store(lo, std::sync::atomic::Ordering::Relaxed);
+            crate::BH_PROBE_NURSERY_HI
+                .store(lo + self.nursery.size(), std::sync::atomic::Ordering::Relaxed);
+        }
         // `do_malloc_fixedsize_clear` and the resume.py direct reader both
         // require a zero-filled payload.  In particular, resume
         // materialization writes only fields present in resumedata; omitted
@@ -1549,6 +1623,11 @@ impl MiniMarkGC {
                 self.old_objects_with_weakrefs.push(obj_addr);
             }
         }
+        crate::note_bh_object(
+            obj_addr,
+            total_size - GcHeader::SIZE,
+            crate::BH_PROBE_ORIGIN_BORN_OLD,
+        );
         // external_malloc (incminimark.py:987-994) tests the same threshold
         // here and drives `minor_collection_with_major_progress` before
         // handing the block back. Collecting at this point is what pyre cannot
@@ -1596,6 +1675,7 @@ impl MiniMarkGC {
         // paths that reset it all run after the sample is taken below.
         let drain_sample = crate::drain_census_enabled()
             .then(|| (self.nursery.used(), self.bytes_made_old_since_cycle));
+        crate::bh_probe_clear_traced();
         // Phase 1: Process roots — copy nursery objects they point to.
         // We use raw pointers to avoid borrow checker issues since
         // copy_nursery_object mutates oldgen/nursery.
@@ -1842,6 +1922,7 @@ impl MiniMarkGC {
                 self.nursery.size(),
             );
         }
+        self.bh_probe_check_no_young_refs();
 
         // Reset nursery for new allocations, preserving pinned objects.
         if self.pinned_objects.is_empty() {
@@ -2239,6 +2320,11 @@ impl MiniMarkGC {
                 self.gc_state
             );
         }
+        crate::note_bh_object(
+            new_obj_addr,
+            total_size - GcHeader::SIZE,
+            crate::BH_PROBE_ORIGIN_PROMOTED,
+        );
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
 
@@ -2346,6 +2432,7 @@ impl MiniMarkGC {
     /// Trace an object's GC pointer fields and update any that point
     /// into the nursery by copying the target.
     fn trace_and_update_object(&mut self, obj_addr: usize, site: &'static str) {
+        crate::bh_probe_note_traced(obj_addr);
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         self.validate_type_id(type_id, obj_addr, site);
         let custom_trace = self.types.get(type_id).custom_trace;
@@ -4070,6 +4157,7 @@ impl MiniMarkGC {
         let type_id = unsafe { (*header_of(obj.0)).type_id() };
         self.validate_type_id(type_id, obj.0, "remember_young_pointer_insert");
         self.remembered_set.push(obj.0);
+        crate::bh_probe_note_barriered(obj.0);
         let hdr = unsafe { header_of(obj.0) };
         if crate::gc_lifetime_log_enabled() {
             eprintln!(

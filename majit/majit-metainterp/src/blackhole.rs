@@ -1446,6 +1446,7 @@ impl BlackholeInterpreter {
     /// Returns `Some(args)` for `ContinueRunningNormally` (RPython: raise
     /// jitexc.ContinueRunningNormally propagates through run→_run_forever).
     pub fn run(&mut self) -> Option<MergePointArgs> {
+        let _bh_phase = majit_gc::BhProbePhase::enter("blackhole");
         // Root this frame's register bank AND every pending caller frame
         // reachable through `nextblackholeinterp`.  RPython keeps the whole
         // blackhole interpreter chain transitively GC-traced from the head for

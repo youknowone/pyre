@@ -552,6 +552,15 @@ impl ExecutionContext {
         if !self.space.is_null() && self.is_tracing > 0 {
             self._revdb_enter(frame);
         }
+        // `f_backref` is a traced `Type::Ref` field, so the store carries the
+        // generational barrier the JIT's `SetfieldGc` lowering emits for it.
+        // `frame` can be a non-moving old-generation frame while `topframeref`
+        // names a young one, and without the remembered-set entry the next
+        // minor collection leaves `f_backref` pointing at the pre-copy nursery
+        // address.  Same obligation as the inline-call push and the resumed
+        // chain's relink.
+        pyre_object::gc_hook::try_gc_write_barrier(frame as *mut u8);
+        majit_gc::bh_probe_note_store(frame as usize, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
         unsafe {
             (*frame).f_backref = self.topframeref;
         }

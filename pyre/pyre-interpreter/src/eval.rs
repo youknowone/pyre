@@ -156,6 +156,15 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
             top
         }
     };
+    // Barrier for the same reason as `ExecutionContext::enter`: this is a
+    // traced `Type::Ref` store and `frame` can be an old-generation frame
+    // taking a young predecessor.
+    pyre_object::gc_hook::try_gc_write_barrier(frame as *mut PyFrame as *mut u8);
+    majit_gc::bh_probe_note_store(
+        frame as *mut PyFrame as usize,
+        crate::pyframe::PYFRAME_F_BACKREF_OFFSET,
+        3,
+    );
     frame.f_backref = if ec.is_null() {
         previous
     } else {

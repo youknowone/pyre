@@ -1094,6 +1094,15 @@ impl ResidualFrameChainGuard {
             frame,
         );
         if entered {
+            // Same barrier obligation as the inline-call push: `f_backref` is
+            // a traced `Type::Ref` field, `frame` can be old-generation, and
+            // `saved_topframeref` can name a young frame.
+            pyre_object::gc_hook::try_gc_write_barrier(frame as *mut u8);
+            majit_gc::bh_probe_note_store(
+                frame as usize,
+                crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
+                2,
+            );
             unsafe {
                 (*frame).f_backref = saved_topframeref;
                 (*ec).topframeref = frame;

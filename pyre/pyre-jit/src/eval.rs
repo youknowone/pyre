@@ -3998,6 +3998,27 @@ fn install_pyre_object_hooks() {
     pyre_object::register_gc_write_barrier_managed_hook(
         pyre_object_gc_write_barrier_managed_trampoline,
     );
+    {
+        use pyre_jit_trace::frame_layout as fl;
+        const T: u32 = pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
+        majit_gc::bh_probe_set_field_names(&[
+            (T, 0, "ob_type"),
+            (T, fl::PYFRAME_EXECUTION_CONTEXT_OFFSET, "execution_context"),
+            (T, fl::PYFRAME_PYCODE_OFFSET, "pycode"),
+            (T, fl::PYFRAME_LOCALS_CELLS_STACK_OFFSET, "locals_cells_stack_w"),
+            (T, fl::PYFRAME_VALUESTACKDEPTH_OFFSET, "valuestackdepth"),
+            (T, fl::PYFRAME_LAST_INSTR_OFFSET, "last_instr"),
+            (T, fl::PYFRAME_FLAGS_OFFSET, "flags"),
+            (T, fl::PYFRAME_DEBUGDATA_OFFSET, "debugdata"),
+            (T, fl::PYFRAME_LASTBLOCK_OFFSET, "lastblock"),
+            (T, fl::PYFRAME_VABLE_TOKEN_OFFSET, "vable_token"),
+            (T, fl::PYFRAME_F_GENERATOR_NOWREF_OFFSET, "f_generator_nowref"),
+            (T, fl::PYFRAME_W_YIELDING_FROM_OFFSET, "w_yielding_from"),
+            (T, fl::PYFRAME_F_BACKREF_OFFSET, "f_backref"),
+            (T, fl::PYFRAME_W_BUILTIN_OFFSET, "w_builtin"),
+            (T, fl::PYFRAME_W_GLOBALS_OFFSET, "w_globals"),
+        ]);
+    }
     pyre_object::gc_hook::register_gc_identity_hash_hook(pyre_object_gc_identity_hash_trampoline);
     // Let a born-old allocation that crosses the next-major threshold request
     // a collection, the check `external_malloc` (incminimark.py:987-994) makes
@@ -11586,6 +11607,7 @@ fn bh_setfield_gc_byte_write(struct_ptr: i64, value: i64, descr_info: &majit_ir:
     if struct_ptr == 0 {
         return;
     }
+    majit_gc::bh_probe_note_store(struct_ptr as usize, field_offset, 8);
     unsafe {
         let ptr = (struct_ptr as *mut u8).add(field_offset);
         match descr_info.field_size {
@@ -11806,6 +11828,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         // collection reclaims the payload while the materialized struct still
         // points at it, and the following major mark reads a dangling header.
         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+        majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 7);
         unsafe {
             ((struct_ptr as *mut u8).add(descr_info.offset) as *mut usize).write(value as usize);
         }

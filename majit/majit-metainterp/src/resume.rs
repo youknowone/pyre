@@ -7725,6 +7725,7 @@ pub fn blackhole_from_resumedata<'a>(
 /// Returns (virtuals_cache_ptr, virtuals_cache_int) — RPython VirtualCache
 /// parity — plus the virtualizable the vable section named, which the caller
 /// needs as the cache key (see `MetaInterp::save_forced_virtuals`).
+#[allow(clippy::needless_lifetimes)]
 pub fn force_from_resumedata<'a>(
     profiler: &crate::jitprof::JitProfiler,
     rd_numb: &'a [u8],
@@ -7739,6 +7740,7 @@ pub fn force_from_resumedata<'a>(
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
 ) -> (Vec<i64>, Vec<i64>, i64) {
+    let _bh_phase = majit_gc::BhProbePhase::enter("resume");
     // resume.py:1346
     profiler.count(crate::pyjitpl::counters::FORCE_VIRTUALIZABLES, 1);
     // resume.py:1347-1348
