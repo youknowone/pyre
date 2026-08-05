@@ -45,6 +45,36 @@ pub(crate) fn scalar_size(ty: majit_ir::value::Type) -> usize {
     }
 }
 
+/// Which slot of `fields` a field descr occupies, keyed the way
+/// `heaptracker.py:60-72 get_fielddescr_index_in(STRUCT, fieldname)` keys it.
+///
+/// Upstream has only the name, because upstream always has one. pyre's mint
+/// sites do not: `add_struct_field_descr` is handed `(offset, type, type_id)`
+/// and nothing else, and a field it could not place in the layout it saw keeps
+/// the empty-name fallback. So the name decides whenever there is one, and the
+/// byte offset stands in when there is not.
+///
+/// The offset arm is deliberately narrow. Offset is NOT an identity: measured on
+/// this tree, 7 of 1714 submitted field specs sit at an offset another field of
+/// the same parent also occupies (a flattened inline aggregate and its first
+/// leaf share an address, `heaptracker.py:68-69`). Resolving against an
+/// ambiguous offset would silently name a sibling, so this returns `None` and
+/// leaves the caller's number alone — the same refusal `descr.rs
+/// find_index_in_parent` documents for the runtime lookup, for the same reason.
+fn field_slot_in(fields: &[BhFieldSpec], name: &str, offset: usize) -> Option<usize> {
+    if !name.is_empty()
+        && let Some(idx) = fields.iter().position(|fd| fd.name == name)
+    {
+        return Some(idx);
+    }
+    let mut at_offset = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, fd)| fd.offset == offset);
+    let (idx, _) = at_offset.next()?;
+    at_offset.next().is_none().then_some(idx)
+}
+
 #[derive(Default)]
 pub struct JitCodeBuilder {
     /// RPython `jitcode.py:15` `self.name = name`. Propagated to the
@@ -742,10 +772,17 @@ impl JitCodeBuilder {
         // (offset-ordered) layout `new_struct` registered, not the caller's
         // store order.  descr.py:227 name = '%s.%s' % (STRUCT._name,
         // fieldname): take it from the same layout so the repr matches.
-        let (index_in_parent, name) = parent_spec
-            .all_fielddescrs
-            .iter()
-            .position(|fd| fd.offset == offset)
+        //
+        // This site has no `fieldname` to key on — `getfield_gc_*` /
+        // `setfield_gc_*` reach it with `(offset, type, type_id)` — so the byte
+        // offset stands in, and it is not an identity: a flattened layout puts
+        // an inline aggregate and its first leaf at one address
+        // (`heaptracker.py:68-69`).  Where the offset names two fields, take
+        // the unresolved fallback rather than the first of them.  A guessed
+        // NAME is the damaging half: it becomes the descr's `_cache_field` key
+        // downstream, so naming the aggregate hands the leaf's access the
+        // aggregate's descr.
+        let (index_in_parent, name) = field_slot_in(&parent_spec.all_fielddescrs, "", offset)
             .map(|idx| (idx, parent_spec.all_fielddescrs[idx].name.clone()))
             .unwrap_or((0, String::new()));
         self.add_bh_descr(CanonicalBhDescr::Field {
@@ -5531,13 +5568,21 @@ impl JitCodeBuilder {
     /// spec, because `add_struct_field_descr` derived both from the snapshot
     /// this pass is replacing.  Swapping only the parent leaves the two halves
     /// of one descr disagreeing: the field is declared to sit at slot `i` of a
-    /// list whose slot `i` is a different offset.  The re-resolution is the
-    /// original mint's own `position(|fd| fd.offset == offset)` lookup, run
-    /// against the complete list instead of a prefix of it — not a new
-    /// identity basis.  (`descr.rs find_index_in_parent` rejects an offset
-    /// fallback, but that is the runtime lookup, where `parent` comes from a
-    /// cache key several structs can share; here the spec is the very entry
-    /// keyed by the `type_id` the mint site passed.)
+    /// list whose slot `i` is a different offset.
+    ///
+    /// The key is the FIELD NAME, `heaptracker.py:60-72
+    /// get_fielddescr_index_in(STRUCT, fieldname)`, whenever the mint recorded
+    /// one.  Offset is not an identity: measured on this tree, 7 of 1714
+    /// submitted field specs sit at an offset another field of the same parent
+    /// also occupies, so `position(|fd| fd.offset == offset)` can name a
+    /// sibling.  It is used only as the fallback for the mint sites that have
+    /// no name to carry — `add_struct_field_descr` takes `(offset, type,
+    /// type_id)` and never sees a `fieldname`, which is a real gap against
+    /// `get_fielddescr_index_in` and not something this pass can close — and
+    /// then only when the offset is UNAMBIGUOUS.  Where it is not, this leaves
+    /// the descr alone: `descr.rs find_index_in_parent` refuses to invent a
+    /// position for exactly this reason, and a pass that guesses is worse than
+    /// one that declines.
     ///
     /// A field still absent from the final spec keeps what the mint left it —
     /// `add_struct_field_descr`'s `unwrap_or((0, String::new()))`.  Those are
@@ -5561,7 +5606,7 @@ impl JitCodeBuilder {
                 continue;
             };
             *p = final_spec.clone();
-            let Some(idx) = p.all_fielddescrs.iter().position(|fd| fd.offset == *offset) else {
+            let Some(idx) = field_slot_in(&p.all_fielddescrs, name, *offset) else {
                 continue;
             };
             *index_in_parent = idx;
@@ -5585,15 +5630,21 @@ impl JitCodeBuilder {
     ///
     /// Three shapes, all of them real states this pass can leave behind:
     ///
-    /// * the offset resolves — index and name must be that slot's. This is the
-    ///   two lines above, so it guards future edits rather than today's tree.
-    /// * the offset does not resolve — the descr must still carry
+    /// * the field resolves by [`field_slot_in`] — index and name must be that
+    ///   slot's. This is the re-resolution above, so it guards future edits
+    ///   rather than today's tree.
+    /// * it does not resolve — the descr must still carry
     ///   `add_struct_field_descr`'s `(0, String::new())` fallback untouched.
     ///   Those are the inline aggregates (`ob_header`, `int_items`, an enum's
     ///   `__pos_0`) the flattened layout represents only through their leaves.
     /// * the parent's `type_id` is absent from `struct_size_specs` — the
     ///   `continue` above, which leaves the mint-time snapshot in place. Nothing
     ///   patched it, so nothing has established the invariant for it either.
+    ///
+    /// The claim is stated over [`field_slot_in`], not over a bare
+    /// `position(offset)`: the tree has parents with two fields at one offset,
+    /// so an offset-keyed claim would panic on a descr that names its field
+    /// correctly and merely shares an address with a sibling.
     ///
     /// Returns the first disagreement as a message, so the caller's panic says
     /// which descr and both numbers. Gated on `cfg!(debug_assertions)` at the
@@ -5614,7 +5665,7 @@ impl JitCodeBuilder {
             else {
                 continue;
             };
-            match p.all_fielddescrs.iter().position(|fd| fd.offset == *offset) {
+            match field_slot_in(&p.all_fielddescrs, name, *offset) {
                 Some(idx) => {
                     let slot = &p.all_fielddescrs[idx];
                     if *index_in_parent != idx || *name != slot.name {
@@ -5628,9 +5679,9 @@ impl JitCodeBuilder {
                 }
                 None if *index_in_parent != 0 || !name.is_empty() => {
                     return Some(format!(
-                        "field descr at offset {offset} is absent from type_id {:#x}'s layout \
-                         yet carries slot {index_in_parent} named {name:?} instead of the \
-                         unresolved fallback",
+                        "field descr at offset {offset} does not resolve in type_id {:#x}'s \
+                         layout yet carries slot {index_in_parent} named {name:?} instead of \
+                         the unresolved fallback",
                         p.type_id,
                     ));
                 }
@@ -6003,6 +6054,85 @@ mod tests {
                  (`heaptracker.py:60-72` / `:96-112` share one walker upstream)",
             );
         }
+    }
+
+    /// Two fields at one offset — a flattened inline aggregate and its first
+    /// leaf — must not be arbitrated by offset. Neither the re-resolution nor
+    /// the debug postcondition may name one of them; the mint's number stands.
+    ///
+    /// Measured on the real corpus: 7 of 1714 submitted field specs share an
+    /// offset with a sibling, so this is a reachable state and not a
+    /// hypothetical. An offset-keyed pass would rewrite `index_in_parent` to
+    /// whichever of the two happens to sort first, and the postcondition would
+    /// then panic on any descr correctly naming the other.
+    #[test]
+    fn an_ambiguous_offset_is_left_alone_rather_than_arbitrated() {
+        const TID: u64 = 0x414D_4249_4755;
+        let mut builder = JitCodeBuilder::new();
+        // One `register_struct_layout` call, so the merge's offset dedup does
+        // not apply and both fields survive at offset 8.
+        builder.register_struct_layout(
+            24,
+            TID,
+            false,
+            false,
+            &[(8, false, "agg"), (8, true, "leaf")],
+        );
+        builder.getfield_gc_i(0, 1, 8, TID);
+        // `finish` runs the postcondition under `cfg!(debug_assertions)`; a
+        // resolution that guessed here would trip it before this returns.
+        let jitcode = builder.finish();
+
+        let (index_in_parent, name, parent) = jitcode
+            .exec
+            .descrs
+            .iter()
+            .find_map(|entry| match entry {
+                RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+                    index_in_parent,
+                    parent,
+                    name,
+                    ..
+                }) => Some((*index_in_parent, name.clone(), parent.clone())),
+                _ => None,
+            })
+            .expect("one Field descr for the getfield site");
+        let parent = parent.expect("a registered type_id gives the field a parent");
+        assert_eq!(parent.all_fielddescrs.len(), 2, "both fields are listed");
+        assert_eq!(
+            parent.all_fielddescrs[0].offset, parent.all_fielddescrs[1].offset,
+            "the fixture's point is that one offset names two fields",
+        );
+        assert_eq!(
+            (index_in_parent, name.as_str()),
+            (0, ""),
+            "an ambiguous offset resolves to nothing, so the mint's \
+             `unwrap_or((0, String::new()))` fallback stands",
+        );
+    }
+
+    /// …but a name always wins, even when the offset it sits at is ambiguous.
+    /// That is `heaptracker.py:60-72 get_fielddescr_index_in(STRUCT, fieldname)`
+    /// — the offset is only a stand-in for the mint sites that carry no name.
+    #[test]
+    fn a_named_field_resolves_by_name_through_an_ambiguous_offset() {
+        const TID: u64 = 0x4E41_4D45_4B59;
+        let fields = [(0, false, "head"), (8, false, "agg"), (8, true, "leaf")];
+        assert_eq!(
+            super::field_slot_in(&JitCodeBuilder::field_specs_from_layout(&fields), "leaf", 8,),
+            Some(2),
+            "the name names the field; the shared offset does not",
+        );
+        assert_eq!(
+            super::field_slot_in(&JitCodeBuilder::field_specs_from_layout(&fields), "", 8),
+            None,
+            "without a name the shared offset arbitrates nothing",
+        );
+        assert_eq!(
+            super::field_slot_in(&JitCodeBuilder::field_specs_from_layout(&fields), "", 0),
+            Some(0),
+            "an unambiguous offset still resolves",
+        );
     }
 
     #[test]

@@ -3725,6 +3725,23 @@ fn heuristic_struct_size_for_bh(cc: &CallControl, owner: &str) -> Option<usize> 
     Some((offset + align - 1) & !(align - 1))
 }
 
+/// The one slot of `fields` at `offset`, or `None` when no field or more than
+/// one sits there.
+///
+/// A flattened layout puts an inline aggregate and its first leaf at the same
+/// address (`heaptracker.py:68-69` recurses into a nested `lltype.Struct`
+/// without minting a descr for the container), so an offset can name two
+/// fields. Where it does, there is no answer to give and inventing one names a
+/// sibling — `descr.rs find_index_in_parent` refuses the same way.
+fn unique_slot_at_offset(fields: &[crate::jitcode::BhFieldSpec], offset: usize) -> Option<usize> {
+    let mut at_offset = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.offset == offset);
+    let (idx, _) = at_offset.next()?;
+    at_offset.next().is_none().then_some(idx)
+}
+
 fn fielddescrof(
     field: &crate::model::FieldDescriptor,
     ty: &crate::model::ValueType,
@@ -3839,15 +3856,18 @@ fn fielddescrof(
         // one field and address another.  Resolve the slot against the parent
         // that is actually attached, the way `descr.py:228
         // heaptracker.get_fielddescr_index_in` derives it from the STRUCT
-        // itself.  The `found_parent_field` arm is left alone: it picked its
-        // spec BY NAME, and re-resolving by offset would hand a struct with two
-        // fields at one offset back the wrong one.
+        // itself.
+        //
+        // Only the byte offset is available here — reaching this arm means the
+        // name lookup above already missed — and offset is not an identity: a
+        // flattened inline aggregate shares an address with its first leaf
+        // (`heaptracker.py:68-69`).  So resolve only when exactly one field sits
+        // there, and otherwise leave the caller's number rather than name a
+        // sibling.  The `found_parent_field` arm is untouched for the converse
+        // reason: it picked its spec BY NAME, which is the better key.
         if !found_parent_field
             && let Some(parent_spec) = parent.as_ref()
-            && let Some(pos) = parent_spec
-                .all_fielddescrs
-                .iter()
-                .position(|spec| spec.offset == offset)
+            && let Some(pos) = unique_slot_at_offset(&parent_spec.all_fielddescrs, offset)
         {
             index_in_parent = pos;
         }
@@ -3862,11 +3882,16 @@ fn fielddescrof(
     // fallback arms: the `found_parent_field` arm takes `index_in_parent` from
     // the matched spec's STORED number, and nothing here guarantees that number
     // equals the spec's position in the list it was stored in.
+    //
+    // Name first, and an ambiguous offset is not counted at all — a descr that
+    // names its field correctly while sharing an address with a sibling is not
+    // misplaced, and counting it would put a false reading behind a gate.
     if let Some(parent_spec) = parent.as_ref()
         && let Some(pos) = parent_spec
             .all_fielddescrs
             .iter()
-            .position(|spec| spec.offset == offset)
+            .position(|spec| spec.field_key() == field_key)
+            .or_else(|| unique_slot_at_offset(&parent_spec.all_fielddescrs, offset))
     {
         majit_ir::descr::census_attached_index(pos, index_in_parent);
     }

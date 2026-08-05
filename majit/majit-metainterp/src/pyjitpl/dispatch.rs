@@ -151,13 +151,33 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     // once `_cache_size` already holds the parent, and it
                     // overwrites the number it disagrees with.
                     //
+                    // Keyed by field name, `heaptracker.py:60-72
+                    // get_fielddescr_index_in(STRUCT, fieldname)`; the byte
+                    // offset stands in only for the mint sites that carry no
+                    // name, and only when exactly one field sits there. A
+                    // flattened layout puts an inline aggregate and its first
+                    // leaf at one address, so an offset-keyed census would
+                    // report a correctly-named descr as misplaced and put a
+                    // false reading behind `JITSTATS_BADNESS_FIELDS`.
+                    //
                     // A miss is the inline-aggregate floor (`ob_header`,
                     // `int_items`, an enum's `__pos_0`) carrying the documented
                     // `(0, "")` fallback the branches below already describe,
                     // not this defect, so it is not counted either way.
-                    if let Some(expected) =
-                        p.all_fielddescrs.iter().position(|f| f.offset == *offset)
-                    {
+                    let expected = p
+                        .all_fielddescrs
+                        .iter()
+                        .position(|f| !name.is_empty() && f.name == *name)
+                        .or_else(|| {
+                            let mut at = p
+                                .all_fielddescrs
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, f)| f.offset == *offset);
+                            let (idx, _) = at.next()?;
+                            at.next().is_none().then_some(idx)
+                        });
+                    if let Some(expected) = expected {
                         majit_ir::descr::census_attached_index(expected, *index_in_parent);
                     }
                     let mut specs: Vec<_> =
