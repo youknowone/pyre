@@ -70,4 +70,24 @@ with tempfile.TemporaryDirectory() as d:
     else:
         raise AssertionError("an absent program was found")
 
+    # Reporting a SyntaxError names the file it was found in, so the traceback
+    # printer reads the undecodable name.  It has to render rather than abort;
+    # the escape has no `str` spelling, so it is shown backslashed.  The broken
+    # module is *imported* rather than run, which keeps the undecodable name off
+    # the command line — an argv element that is not valid UTF-8 is a separate
+    # boundary, at process entry rather than at a name read back from the disk.
+    with open(os.path.join(os.fsencode(d), RAW, b"pyre_broken_mod.py"), "wb") as fp:
+        fp.write(b"def (\n")
+    driver = os.path.join(d, "driver.py")
+    with open(driver, "w") as fp:
+        fp.write(
+            "import sys\n"
+            "sys.path.insert(0, %r)\n" % os.path.join(d, NAME)
+            + "import pyre_broken_mod\n"
+        )
+    done = subprocess.run([sys.executable, driver], capture_output=True)
+    assert done.returncode != 0, done
+    assert b"SyntaxError" in done.stderr, done.stderr
+    assert b"pyre_undecodable_" in done.stderr, done.stderr
+
 print("OK")

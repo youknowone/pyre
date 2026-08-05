@@ -1785,9 +1785,23 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
         let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         crate::baseobjspace::syntax_error_attr(exc, name)
     };
+    // `filename` is the compiled file's own name, so it carries whatever
+    // surrogate escapes the filesystem encoding produced, and `text` is a line
+    // of that file. Printing a traceback must not abort for want of a UTF-8
+    // view: escape what has no spelling, the way stderr already does.
     let str_of = |w: PyObjectRef| -> Option<String> {
-        (!w.is_null() && unsafe { pyre_object::is_str(w) })
-            .then(|| unsafe { pyre_object::w_str_get_value(w) }.to_string())
+        (!w.is_null() && unsafe { pyre_object::is_str(w) }).then(|| {
+            let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w) };
+            match wtf8.as_str() {
+                Ok(s) => s.to_owned(),
+                Err(_) => {
+                    let s_obj = pyre_object::w_str_from_wtf8(wtf8.to_owned());
+                    crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_else(|_| "<unprintable>".to_string())
+                }
+            }
+        })
     };
     let int_of = |w: PyObjectRef| -> Option<i64> {
         (!w.is_null() && unsafe { pyre_object::is_int(w) })

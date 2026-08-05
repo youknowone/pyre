@@ -2444,8 +2444,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         if args.is_empty() {
             return Err(crate::PyError::type_error("stat() missing argument"));
         }
-        let path = crate::gateway::fsencode_path_w(args[0]).map_err(|_| {
-            crate::PyError::type_error("stat: path should be string, bytes, os.PathLike")
+        // Only a wrong *type* is re-reported under `stat`'s own wording; the
+        // embedded-null ValueError and the surrogate UnicodeEncodeError say
+        // what actually went wrong and have to reach the caller as themselves.
+        // `os.stat('\ud800')` is a `UnicodeEncodeError`, not a `TypeError`.
+        let path = crate::gateway::fsencode_path_w(args[0]).map_err(|err| {
+            if matches!(err.kind, crate::error::PyErrorKind::TypeError) {
+                crate::PyError::type_error("stat: path should be string, bytes, os.PathLike")
+            } else {
+                err
+            }
         })?;
         #[cfg(feature = "sandbox")]
         {
