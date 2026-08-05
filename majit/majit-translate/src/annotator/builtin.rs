@@ -1431,6 +1431,16 @@ fn pyre_cast_address(
 /// rclass.py:1035 — its `r_ins1.classdef is None` arm already emits the
 /// root→concrete cast).  `args[0]` is the pointer operand; `args[1]` is
 /// the constant root name.
+///
+/// A root the bookkeeper deliberately models as a non-instance value —
+/// a `FixedObjectArray` projected to its `_items` element list, a
+/// `Wtf8Buf` to a byte string (`project_pyre_field_type`,
+/// bookkeeper.rs:2494/2620) — arrives with a `SomeList`/`SomeString`
+/// operand rather than a pointer.  Its access lowers through
+/// `getitem`/byte reads, not a named-field getattr, so the narrow is a
+/// no-op: the operand passes through unchanged, exactly as the erasure
+/// twin `pyre_cast_address` handles a `SomeList` for a `Vec` whose
+/// address was erased.
 fn pyre_cast_instance(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1445,19 +1455,6 @@ fn pyre_cast_instance(
             "__pyre_cast_instance expects (operand, constant_root) positional arguments",
         ));
     }
-    // Carry the operand's nullability onto the downcast result instead
-    // of unconditionally narrowing to non-None: a downcast of a nullable
-    // pointer is itself nullable.
-    let can_be_none = match arg_at(args_s, 0, "__pyre_cast_instance") {
-        SomeValue::Instance(inst) => inst.can_be_none,
-        SomeValue::None_(_) => true,
-        SomeValue::Ptr(_) | SomeValue::Address(_) => false,
-        other => {
-            return Err(AnnotatorError::new(format!(
-                "__pyre_cast_instance: non-pointer operand: {other:?}"
-            )));
-        }
-    };
     let root = match args_s
         .get(1)
         .and_then(|o| o.as_ref())
@@ -1469,6 +1466,35 @@ fn pyre_cast_instance(
             return Err(AnnotatorError::new(
                 "__pyre_cast_instance: target struct root must be a constant string",
             ));
+        }
+    };
+    // Carry the operand's nullability onto the downcast result instead
+    // of unconditionally narrowing to non-None: a downcast of a nullable
+    // pointer is itself nullable.
+    let operand = arg_at(args_s, 0, "__pyre_cast_instance");
+    let can_be_none = match operand {
+        SomeValue::Instance(inst) => inst.can_be_none,
+        SomeValue::None_(_) => true,
+        SomeValue::Ptr(_) | SomeValue::Address(_) => false,
+        other => {
+            // A root the bookkeeper models as a list or string (a
+            // `FixedObjectArray` projected to its `_items` element list,
+            // a `Wtf8Buf` projected to a byte string —
+            // `project_pyre_field_type`, bookkeeper.rs:2494/2620) reads
+            // through `getitem`/byte access, never a named field, so the
+            // pointer→instance narrow is a no-op for it: return the
+            // operand unchanged when its variant matches the model, the
+            // same operand-agnostic pass-through the erasure twin
+            // `pyre_cast_address` already performs.  `convert_from_to`
+            // (rclass.py:1035) constrains only the destination repr, not
+            // the operand shape.  A genuine variant mismatch is still a
+            // producer bug, surfaced with the root that was expected.
+            if bk.project_pyre_field_type(&root).tag() == other.tag() {
+                return Ok(operand.clone());
+            }
+            return Err(AnnotatorError::new(format!(
+                "__pyre_cast_instance: non-pointer operand for root {root:?}: {other:?}"
+            )));
         }
     };
     let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
