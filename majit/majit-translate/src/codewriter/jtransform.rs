@@ -10949,13 +10949,20 @@ mod tests {
         assert_eq!(ops[0].result, Some(result));
     }
 
-    /// `newlist_clear(count)` (`_ll_alloc_and_clear`, rlist.py:522-528)
-    /// lowers to a single `new_array_clear(count, arraydescr)`
-    /// (`do_fixed_newlist_clear`, jtransform.py:1858-1863). The `count`
-    /// operand is the initial length; the cleared items array holds GC
-    /// pointers, so the emitted `item_ty` is `Ref`.
+    /// Fallback arm: a `newlist_clear` result with no recoverable list
+    /// layout — a generic `OBJECTPTR` (`Ptr(GcStruct("object"))`) or a
+    /// missing concretetype — is neither the `"list"` header struct nor an
+    /// items array, so `newlist_clear_shape` returns `Fallback` and the arm
+    /// emits a conservative `new_array_clear(count, arraydescr)` with a
+    /// GC-pointer element (`Ref(None)`) and no array identity.  This input
+    /// does not occur in a real translation (the rtyper stamps the list
+    /// type on the `_ll_alloc_and_clear` result); it is only reachable from
+    /// synthetic graphs that leave the result untyped.  The recovered-shape
+    /// arms are covered by
+    /// `handle_list_call_newlist_clear_resized_lowers_to_newlist_clear` and
+    /// `handle_list_call_newlist_clear_fixed_recovers_int_item_ty`.
     #[test]
-    fn handle_list_call_newlist_clear_lowers_to_new_array_clear() {
+    fn handle_list_call_newlist_clear_untyped_result_falls_back_to_ref_array() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("newlist_clear");
         let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
@@ -11171,8 +11178,10 @@ mod tests {
             .operations
             .iter()
             .find_map(|op| match &op.kind {
+                // The GcRef result stamps a generic OBJECTPTR (not a
+                // `"list"` struct), so the fork lands on Fallback →
+                // NewArrayClear, never NewListClear.
                 OpKind::NewArrayClear { length, .. } => Some(length.clone()),
-                OpKind::NewListClear { length, .. } => Some(length.clone()),
                 _ => None,
             })
             .expect("marked newlist_clear must lower to new_array_clear");
@@ -11229,8 +11238,8 @@ mod tests {
             .operations
             .iter()
             .find_map(|op| match &op.kind {
+                // GcRef result → generic OBJECTPTR → Fallback → NewArrayClear.
                 OpKind::NewArrayClear { length, .. } => Some(length.clone()),
-                OpKind::NewListClear { length, .. } => Some(length.clone()),
                 _ => None,
             })
             .expect("minted _ll_alloc_and_clear must lower to new_array_clear");
@@ -11287,8 +11296,8 @@ mod tests {
             .operations
             .iter()
             .find_map(|op| match &op.kind {
+                // GcRef result → generic OBJECTPTR → Fallback → NewArrayClear.
                 OpKind::NewArrayClear { length, .. } => Some(length.clone()),
-                OpKind::NewListClear { length, .. } => Some(length.clone()),
                 _ => None,
             })
             .expect("minted _ll_fixed_alloc_and_clear must lower to new_array_clear");
