@@ -615,6 +615,31 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
 /// 1B r-reg(vable) + 1B i-reg(index) + 1B X-reg(value) + 2B
 /// fdescr(VableArray) + 2B adescr(Array). No dst byte.
 ///
+/// A folded store lands in a slot whose value survives the trace: the inline
+/// level materialized a real callee `PyFrame` and `slot` is in its LOCAL
+/// region.  Such a slot is readable after the call through a traceback,
+/// `f_locals` or `sys._getframe`, so the store must be recorded rather than
+/// mirrored.  Slots at or above `nlocals` are operand-stack cells, which no
+/// Python-level read can reach and which the resume snapshot reconstructs.
+fn folded_store_is_observable_local<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    slot: i64,
+) -> bool {
+    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+        return false;
+    };
+    if !shadow.frame_materialized {
+        return false;
+    }
+    let sym = ctx.fbw_mode.snapshot_sym;
+    if sym.is_null() {
+        return false;
+    }
+    // SAFETY: pointer live for the full-body walk; read-only.
+    let nlocals = unsafe { (*sym).nlocals() } as i64;
+    slot >= 0 && slot < nlocals
+}
+
 /// RPython parity: `pyjitpl.py _opimpl_setarrayitem_vable`.
 /// Delegates to `TraceCtx::vable_setarrayitem_indexed`
 /// (`trace_ctx.rs`) which implements the `_nonstandard_virtualizable`
@@ -636,7 +661,9 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         let index = read_int_reg(code, op, 1, ctx)?;
-        if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index) {
+        if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index)
+            && !folded_store_is_observable_local(ctx, slot)
+        {
             let value = match value_bank {
                 'i' => read_int_reg(code, op, 2, ctx)?,
                 'r' => read_ref_reg(code, op, 2, ctx)?,

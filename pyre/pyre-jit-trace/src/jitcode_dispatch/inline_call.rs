@@ -4228,7 +4228,22 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 shadow.frame_box = sub_wc.registers_r[callee_portal_frame_reg as usize];
             }
             if !try_multiframe {
-                sub_wc.callee_shadow.as_mut().unwrap().fold_frame_reg = callee_portal_frame_reg;
+                let shadow = sub_wc.callee_shadow.as_mut().unwrap();
+                shadow.fold_frame_reg = callee_portal_frame_reg;
+                // The fold's premise (`setarrayitem_vable_via_metainterp`) is
+                // that it writes away from an UNSEEDED portal frame — a pure
+                // SSA mirror with no heap array behind it.  The seed block
+                // above may have materialized a real callee `PyFrame`, whose
+                // `NewArrayClear` locals array is stored into only for the
+                // parameters and freevar cells; folding away the in-callee
+                // STORE_FASTs would leave every other local holding the
+                // zero-fill, and a frame reachable afterwards through a
+                // traceback, `f_locals` or `sys._getframe` reads them as
+                // unbound.  Record that here so the store handler demotes just
+                // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
+                // what `_opimpl_setarrayitem_vable` (`pyjitpl.py`) does for a
+                // `_nonstandard_virtualizable`.
+                shadow.frame_materialized = callee_frame_seeded;
             }
             for i in 0..nparams {
                 let slot = i as i64;

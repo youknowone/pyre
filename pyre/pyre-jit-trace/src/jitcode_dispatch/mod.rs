@@ -407,6 +407,12 @@ pub struct CalleeLocalsShadow {
     /// Box seeded into `fold_frame_reg`; `OpRef::NONE` means the frame register
     /// was not seeded, so the fold must not be disarmed into nonstandard ops.
     pub frame_box: OpRef,
+    /// The seed block emitted a real callee `PyFrame` for this inline level, so
+    /// the fold is writing away from a frame that has a heap locals array
+    /// behind it.  Its LOCAL region is then observable — through a traceback,
+    /// `f_locals` or `sys._getframe` — and must not be folded away; the operand
+    /// -stack region above `nlocals` is not reachable that way and still folds.
+    pub frame_materialized: bool,
 }
 
 impl Default for CalleeLocalsShadow {
@@ -417,6 +423,7 @@ impl Default for CalleeLocalsShadow {
             fold_frame_reg: u16::MAX,
             concrete_frame: 0,
             frame_box: OpRef::NONE,
+            frame_materialized: false,
         }
     }
 }
