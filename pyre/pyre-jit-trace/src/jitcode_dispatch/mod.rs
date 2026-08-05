@@ -10977,9 +10977,22 @@ fn handle<Sym: WalkSym>(
                                         entry_meta,
                                     )
                                 }
-                                None => driver
-                                    .meta_interp_mut()
-                                    .compile_trace(key, &live_args, None),
+                                // compile.py:1002-1021 — an interp-origin close is a
+                                // `ResumeFromInterpDescr` entry bridge, and with no
+                                // entry data there is no original green key to attach
+                                // it to. `compile_trace(key, args, None)` cannot serve
+                                // that state: its `None`-origin arm demands the
+                                // entry-bridge payload and answers `Cancelled` for
+                                // every input, after deep-cloning the whole
+                                // trace-so-far and lowering its snapshot pool. Decline
+                                // here instead, so the give-up reads as one.
+                                // `compile_trace_entry_data` reads
+                                // `trace_ctx().root_green_key()` and `trace_meta()`,
+                                // and every `JitDriver` trace start installs both
+                                // halves, so this is unreachable from a jd0 walk; only
+                                // `MetaInterp::force_start_tracing` opens a tracer with
+                                // no session envelope.
+                                None => majit_metainterp::CompileOutcome::Cancelled,
                             },
                         };
                         if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
