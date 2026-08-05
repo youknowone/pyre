@@ -6932,6 +6932,14 @@ fn unsupported_jit_shape(
     shape
 }
 
+/// The shape half of [`unsupported_jit_shape`], for the tests that assert only
+/// the classification. The tests that turn on *which* predicate fired assert
+/// the whole pair instead, since that is the half the census keys off.
+#[cfg(test)]
+fn unsupported_jit_shape_of(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
+    unsupported_jit_shape(code).0
+}
+
 fn unsupported_jit_shape_uncached(
     code: &pyre_interpreter::CodeObject,
 ) -> (UnsupportedJitShape, &'static str) {
@@ -12156,7 +12164,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12186,7 +12194,7 @@ mod tests {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
             assert!(for_iter_bodies_all_jit_safe(&code));
-            assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+            assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
 
@@ -12205,7 +12213,10 @@ mod tests {
             assert!(!for_iter_bodies_all_jit_safe(&code));
             assert_eq!(
                 unsupported_jit_shape(&code),
-                UnsupportedJitShape::CurrentFrameOnly
+                (
+                    UnsupportedJitShape::CurrentFrameOnly,
+                    "FrameShape::CurrentFrameOnly/ForIterBodyNotJitSafe"
+                )
             );
         }
     }
@@ -12219,7 +12230,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12246,7 +12257,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "g");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12260,7 +12271,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "k");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12276,7 +12287,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "s");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12305,7 +12316,7 @@ mod tests {
         let code = function_code_from_module(&module, "f");
 
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12347,7 +12358,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12360,7 +12371,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12374,7 +12385,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12393,7 +12404,7 @@ mod tests {
                 .any(|unit| { matches!(arg_state.get(unit).0, Instruction::StoreDeref { .. }) })
         );
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12407,7 +12418,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12421,7 +12432,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12433,7 +12444,7 @@ mod tests {
                 .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12445,7 +12456,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12462,7 +12473,7 @@ mod tests {
         let code = function_code_from_module(&module, "r");
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert!(!for_iter_frame_has_raising_named_handler(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12483,7 +12494,10 @@ mod tests {
         assert!(for_iter_frame_has_raising_named_handler(&code));
         assert_eq!(
             unsupported_jit_shape(&code),
-            UnsupportedJitShape::CurrentFrameOnly
+            (
+                UnsupportedJitShape::CurrentFrameOnly,
+                "FrameShape::CurrentFrameOnly/ForIterRaisingNamedHandler"
+            )
         );
     }
 
@@ -12500,7 +12514,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "r");
         assert!(!for_iter_frame_has_raising_named_handler(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12514,7 +12528,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "r");
         assert!(!for_iter_frame_has_raising_named_handler(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -12531,7 +12545,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "wf");
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     fn ensure_test_jit_callbacks() {
