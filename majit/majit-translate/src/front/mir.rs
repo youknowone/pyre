@@ -9247,6 +9247,18 @@ impl<'a> Lowering<'a> {
                 if matches!(td.kind, TypeDeclKind::Opaque) {
                     return None;
                 }
+                // A method whose name collides with a field of the owner ADT
+                // cannot route as `CallTarget::Method`: the adapter spells
+                // the call as `getattr(recv, leaf)` + `simple_call`, and
+                // `SomeInstance.getattr` answers the projected field row — a
+                // scalar — so the call walls at "Cannot prove that the
+                // object is callable" on an `Integer`/`Bool`.  Rust
+                // distinguishes `self.f` from `self.f()` syntactically; the
+                // flat attr namespace does not.  Route through the
+                // `FunctionPath` form, which resolves the callee by path.
+                if adt_declares_field(td, &leaf) {
+                    return None;
+                }
                 let owner = td
                     .item_meta
                     .name_path()
@@ -15309,6 +15321,19 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let node = strip_ty_wrappers(node, llbc)?;
     let id = adt_node_def_id(node)?;
     Some(llbc.type_by_id(id)?.item_meta.name_path())
+}
+
+/// Whether `td` declares a field named `name` — a struct field, or any
+/// enum variant's field (Model A flattens variant fields into the same
+/// class attr namespace).
+fn adt_declares_field(td: &TypeDecl, name: &str) -> bool {
+    match &td.kind {
+        TypeDeclKind::Struct(fields) => fields.iter().any(|f| f.name.as_deref() == Some(name)),
+        TypeDeclKind::Enum(variants) => variants
+            .iter()
+            .any(|v| v.fields.iter().any(|f| f.name.as_deref() == Some(name))),
+        _ => false,
+    }
 }
 
 /// The struct-root `class_root` for a `Ref`-typed input param: the bare
