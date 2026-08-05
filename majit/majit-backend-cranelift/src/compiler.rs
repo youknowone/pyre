@@ -8204,21 +8204,31 @@ impl CraneliftBackend {
     /// backend's `gc_rewriter`: `x86/regalloc.py:187` calls
     /// `cpu.gc_ll_descr.rewrite_assembler` straight through and `gc.py:109-112`
     /// defines it on the base `GcLLDescription`, so the pass runs even for a
-    /// configuration with no nursery and no write barrier. Only four fields are
-    /// collector-derived; with no collector they take the upstream base values
+    /// configuration with no nursery and no write barrier. Four fields come from
+    /// the collector and two more take their boehm values when there is none
+    /// (gc.py:151-162); with no collector they take the upstream base values
     /// (`can_use_nursery_malloc -> False`, gc.py:81-82, spelled
     /// `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156).
     fn gc_rewriter(&self) -> GcRewriterImpl {
+        let collector = with_cranelift_gc(|gc| {
+            (
+                gc.nursery_free_addr(),
+                gc.nursery_top_addr(),
+                gc.max_nursery_object_size(),
+                gc.get_write_barrier_descr(),
+            )
+        });
+        // gc.py:653-664 `get_ll_description(gcdescr)`: `gcdescr is None`
+        // selects `GcLLDescr_boehm`, so upstream has no "no collector" state
+        // at all — the configuration with none installed IS boehm, and
+        // gc.py:151-162 is its field block. Two of the four collector-sourced
+        // values already take the base-class answer here
+        // (`can_use_nursery_malloc -> False`, gc.py:81-82, spelled
+        // `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156);
+        // this flag carries the other two, below.
+        let is_boehm = collector.is_none();
         let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
-            with_cranelift_gc(|gc| {
-                (
-                    gc.nursery_free_addr(),
-                    gc.nursery_top_addr(),
-                    gc.max_nursery_object_size(),
-                    gc.get_write_barrier_descr(),
-                )
-            })
-            .unwrap_or((0, 0, 0, None));
+            collector.unwrap_or((0, 0, 0, None));
         GcRewriterImpl {
             nursery_free_addr,
             nursery_top_addr,
@@ -8243,11 +8253,15 @@ impl CraneliftBackend {
             // at the IR level), so the rewriter takes the single-LEA
             // path (rewrite.py:1083-1088).
             supports_load_effective_address: true,
-            // incminimark.py:211 `malloc_zero_filled = False`:
-            // clear_gc_fields / clear_varsize_gc_fields emit only the
-            // per-object GC-pointer initialization required by
-            // rewrite.py:498-535.
-            malloc_zero_filled: false,
+            // incminimark.py:211 `malloc_zero_filled = False` when a
+            // collector answers: clear_gc_fields / clear_varsize_gc_fields
+            // emit the per-object GC-pointer initialization
+            // rewrite.py:498-535 requires. With none installed the value is
+            // gc.py:153 `GcLLDescr_boehm.malloc_zero_filled = True` and both
+            // are inert (rewrite.py:499-500, :521-522), which is what this
+            // configuration's allocation actually does: every malloc reaches
+            // a raw fallback built on `libc::calloc`.
+            malloc_zero_filled: is_boehm,
             // gc.py:39 `self.memcpy_fn = memcpy_fn` cast through
             // `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py:1046-1047).
             memcpy_fn: majit_ir::memcpy_fn_addr(),
@@ -8271,12 +8285,15 @@ impl CraneliftBackend {
             // Some unconditionally.
             fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
             // gc.py:394 `self.fielddescr_tid = get_field_descr(self,
-            // self.GCClass.HDR, 'tid')` — framework GC.  pyre's GC is
-            // always framework-style (incminimark-shaped), so install
-            // Some unconditionally; the helper translates the descr's
-            // offset by `-HDR_SIZE` because pyre's HDR sits before the
-            // object pointer.
-            fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
+            // self.GCClass.HDR, 'tid')` — framework GC; the helper
+            // translates the descr's offset by `-HDR_SIZE` because pyre's HDR
+            // sits before the object pointer. gc.py:157
+            // `GcLLDescr_boehm.fielddescr_tid = None` makes
+            // gen_initialize_tid (rewrite.py:914-918) emit nothing, which is
+            // right with no collector: the raw malloc fallbacks stamp the
+            // header themselves, so a second tid GC_STORE has no producer to
+            // agree with.
+            fielddescr_tid: (!is_boehm).then(majit_ir::make_tid_field_descr),
             malloc_array_fn: gc_malloc_array_helper as *const () as i64,
             malloc_array_nonstandard_fn: gc_malloc_array_nonstandard_helper as *const () as i64,
             malloc_array_oldgen_fn: gc_malloc_array_oldgen_helper as *const () as i64,
