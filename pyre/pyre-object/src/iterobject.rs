@@ -185,6 +185,19 @@ pub unsafe fn is_memory_iter(obj: PyObjectRef) -> bool {
     !obj.is_null() && (*obj).ob_type == &MEMORY_ITER_TYPE as *const PyType
 }
 
+/// `bytearray_iterator` — the one producer-specific `W_SeqIterObject` identity
+/// that carries exhaustion in the cursor: `__setstate__` turns a negative state
+/// into the -1 exhausted sentinel instead of rewinding to the front, and no
+/// later `__setstate__` revives it.  Its immutable siblings (`str`, `bytes`)
+/// and `arrayiterator` clamp a negative state to zero.
+#[inline]
+pub unsafe fn is_bytearray_iter(obj: PyObjectRef) -> bool {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    !obj.is_null() && (*obj).ob_type == &BYTEARRAY_ITER_TYPE as *const PyType
+}
+
 /// `array.arrayiterator` — carries `__reduce__` / `__setstate__` but, unlike
 /// the str and bytes flavours, no `__length_hint__`.
 #[inline]

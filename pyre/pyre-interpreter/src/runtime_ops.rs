@@ -1425,8 +1425,9 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
             let si = &*(iter as *const W_SeqIterObject);
             // A cleared sequence (exhausted cursor, iterobject.py:90-98) has no
             // more items — a re-iteration of an exhausted iterator stops here
-            // without dereferencing the freed sequence.
-            if si.seq.is_null() {
+            // without dereferencing the freed sequence.  A negative cursor is
+            // `bytearray_iterator`'s exhausted sentinel and keeps its source.
+            if si.seq.is_null() || si.index < 0 {
                 return Ok(false);
             }
             // sequenceiterator re-reads the live sequence length and PyPy's
@@ -1463,8 +1464,9 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             let si = &mut *(iter as *mut W_SeqIterObject);
             // An exhausted cursor cleared its sequence (iterobject.py:90-98
             // `self.w_seq = None`); a re-entry stays exhausted without
-            // dereferencing the freed sequence.
-            if si.seq.is_null() {
+            // dereferencing the freed sequence.  A negative cursor is
+            // `bytearray_iterator`'s exhausted sentinel and keeps its source.
+            if si.seq.is_null() || si.index < 0 {
                 return Ok(PY_NULL);
             }
             let idx = si.index;

@@ -2452,19 +2452,77 @@ pub(crate) fn callable_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     ]))
 }
 
+/// The cursor argument shared by every builtin iterator's `__setstate__`.
+/// Python 3.14 reads it with `PyLong_AsSsize_t`, so an `int` (or a subclass) is
+/// the only accepted state — the `__index__` protocol is not consulted — and a
+/// value too wide for a machine word raises `OverflowError`.  PyPy unwraps with
+/// `space.int_w` (`iterobject.py:41`), which does run `__index__`; the
+/// observable behaviour target is 3.14.
+fn iter_setstate_index(state: PyObjectRef) -> Result<i64, PyError> {
+    if state.is_null()
+        || !unsafe {
+            pyre_object::is_int(state) || pyre_object::is_long(state) || pyre_object::is_bool(state)
+        }
+    {
+        return Err(PyError::type_error("an integer is required"));
+    }
+    if unsafe { pyre_object::is_long(state) } {
+        let big = unsafe { pyre_object::longobject::w_long_get_value(state) };
+        if pyre_object::longobject::jit_bigint_to_i64_fits(big) == 0 {
+            return Err(PyError::overflow_error(
+                "Python int too large to convert to C ssize_t",
+            ));
+        }
+    }
+    int_w(state)
+}
+
+/// The live length a `W_SeqIterObject` cursor is clamped against, for the
+/// producers whose `__setstate__` knows one.  The shared `sequenceiterator`
+/// identity reaches its elements through `__getitem__` alone, so it has no
+/// length to clamp with (`iter_setstate`, iterobject.c) and reports `None`;
+/// an out-of-range cursor there is absorbed by `next` raising StopIteration
+/// on the IndexError.
+unsafe fn seq_iter_clamp_length(seq: PyObjectRef) -> Option<i64> {
+    unsafe {
+        if is_str(seq) {
+            Some(pyre_object::unicodeobject::w_str_len(seq) as i64)
+        } else if pyre_object::bytesobject::is_bytes_like(seq) {
+            Some(pyre_object::bytesobject::bytes_like_len(seq) as i64)
+        } else if pyre_object::interp_array::is_array(seq) {
+            Some(pyre_object::interp_array::w_array_len(seq) as i64)
+        } else {
+            None
+        }
+    }
+}
+
 /// `sequenceiterator.__setstate__(index)` — `iterobject.py:40-45
 /// W_AbstractSeqIterObject.descr_setstate`: restore the cursor only while the
-/// sequence is live, clamping a negative index to 0.  There is no upper clamp —
-/// an out-of-range cursor is absorbed by `next` raising StopIteration on the
-/// IndexError.
+/// sequence is live, clamping a negative index to 0.
+///
+/// The producer-specific identities 3.14 splits this payload into each clamp
+/// the cursor to the sequence's *current* length, so a state past the end
+/// pickles as exhausted rather than verbatim; `bytearray_iterator` instead
+/// stores the -1 exhausted sentinel for a negative state, one-way, the way
+/// `list_iterator` does.  PyPy stores every state verbatim except in
+/// `W_FastUnicodeIterObject.descr_setstate` (`iterobject.py:129-140`), which
+/// clamps because it must recompute a byte offset from the cursor.
 pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut index = int_w(args[1])?;
+    let mut index = iter_setstate_index(args[1])?;
     unsafe {
-        if pyre_object::w_seq_iter_seq(args[0]).is_null() {
+        let seq = pyre_object::w_seq_iter_seq(args[0]);
+        if seq.is_null() || pyre_object::w_seq_iter_index(args[0]) < 0 {
             return Ok(w_none());
         }
         if index < 0 {
-            index = 0;
+            index = if pyre_object::iterobject::is_bytearray_iter(args[0]) {
+                -1
+            } else {
+                0
+            };
+        } else if let Some(length) = seq_iter_clamp_length(seq) {
+            index = index.min(length);
         }
         pyre_object::w_seq_iter_set_index(args[0], index);
     }
@@ -2486,7 +2544,9 @@ pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_seq_iter_seq(args[0]);
-        if seq.is_null() {
+        // A negative cursor is `bytearray_iterator`'s exhausted sentinel; it
+        // keeps its source referenced but reports nothing remaining.
+        if seq.is_null() || pyre_object::w_seq_iter_index(args[0]) < 0 {
             return Ok(w_int_new(0));
         }
         if is_instance(seq) && lookup(seq, "__len__").is_none() {
@@ -2523,7 +2583,7 @@ pub(crate) fn list_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// the generic sequence iterator does, and an index past the end is clamped to
 /// the length rather than stored verbatim.
 pub(crate) fn list_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut index = int_w(args[1])?;
+    let mut index = iter_setstate_index(args[1])?;
     unsafe {
         let seq = pyre_object::w_list_iter_seq(args[0]);
         if seq.is_null() {
@@ -2576,17 +2636,18 @@ pub(crate) fn tuple_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// `tuple_iterator.__setstate__(index)` — `tupleiter_setstate` clamps the
+/// cursor into `[0, len]`, so a state past the end restores an exhausted
+/// iterator rather than the verbatim cursor PyPy's
+/// `W_AbstractSeqIterObject.descr_setstate` keeps.
 pub(crate) fn tuple_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut index = int_w(args[1])?;
+    let mut index = iter_setstate_index(args[1])?;
     unsafe {
-        if pyre_object::w_tuple_iter_seq(args[0]).is_null() {
+        let seq = pyre_object::w_tuple_iter_seq(args[0]);
+        if seq.is_null() {
             return Ok(w_none());
         }
-        // PyPy W_AbstractSeqIterObject.descr_setstate and CPython 3.14's
-        // tuple iterator both clamp a negative cursor to zero.
-        if index < 0 {
-            index = 0;
-        }
+        index = index.clamp(0, pyre_object::w_tuple_len(seq) as i64);
         pyre_object::w_tuple_iter_set_index(args[0], index);
     }
     Ok(w_none())
@@ -2637,7 +2698,7 @@ pub(crate) fn list_reverse_iter_reduce_method(args: &[PyObjectRef]) -> PyResult 
 /// once it walks off the front.  The list outlives exhaustion, so this restores
 /// a spent iterator to a live cursor as well.
 pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut index = int_w(args[1])?;
+    let mut index = iter_setstate_index(args[1])?;
     unsafe {
         let seq = pyre_object::w_list_reverse_iter_seq(args[0]);
         if seq.is_null() {
@@ -2961,10 +3022,14 @@ pub(crate) fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
         pyre_object::gc_roots::pin_root(self_type);
         let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let seq = pyre_object::functional::w_reversed_get_sequence(self_);
-        if !seq.is_null() {
+        let remaining = pyre_object::functional::w_reversed_get_remaining(self_);
+        // A cursor that has walked off the front is exhausted even while the
+        // sequence is still referenced, so it pickles as `reversed(())` too.
+        // PyPy selects the empty form on the cleared sequence alone and reports
+        // the -1 cursor verbatim for a `__setstate__` that drove it negative.
+        if !seq.is_null() && remaining >= 0 {
             pyre_object::gc_roots::pin_root(seq);
             let seq_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let remaining = pyre_object::functional::w_reversed_get_remaining(self_);
             let state = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(seq_slot)]);
             pyre_object::gc_roots::pin_root(state);
             let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -2993,23 +3058,19 @@ pub(crate) fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
 
 /// `reversed.__setstate__(index)` — `functional.py:419-429
 /// descr___setstate__`: set `remaining` then clamp into `[-1, n-1]`
-/// (`n == len(sequence)`, or 0 once exhausted).
+/// (`n == len(sequence)`, or 0 once exhausted).  An already-exhausted cursor
+/// is left alone, so driving it negative is one-way; PyPy re-clamps from any
+/// cursor and lets a later state revive the iterator.
 pub(crate) fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let self_ = reversed_receiver(args, "__setstate__")?;
     let state = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    if state.is_null()
-        || !unsafe {
-            pyre_object::is_int(state) || pyre_object::is_long(state) || pyre_object::is_bool(state)
-        }
-    {
-        return Err(PyError::type_error("an integer is required"));
+    let mut remaining = iter_setstate_index(state)?;
+    if unsafe { pyre_object::functional::w_reversed_get_remaining(self_) } < 0 {
+        return Ok(w_none());
     }
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(self_);
     let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(state);
-    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let mut remaining = int_w(unsafe { pyre_object::gc_roots::shadow_stack_get(state_slot) })?;
     unsafe {
         let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
         let seq = pyre_object::functional::w_reversed_get_sequence(self_);
@@ -14336,12 +14397,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             // its writes go through a re-read pointer instead.
             let iter_ptr = obj as *mut pyre_object::W_SeqIterObject;
             let seq = (*iter_ptr).seq;
+            let idx = (*iter_ptr).index;
             // iterobject.py W_SeqIterObject.descr_next — a None (null) seq
             // marks an iterator already exhausted by an earlier IndexError.
-            if seq.is_null() {
+            // A negative cursor is `bytearray_iterator`'s exhausted sentinel,
+            // set by `__setstate__` while the source stays referenced.
+            if seq.is_null() || idx < 0 {
                 return Err(PyError::stop_iteration());
             }
-            let idx = (*iter_ptr).index;
             let item = if is_list(seq) {
                 pyre_object::w_list_getitem(seq, idx)
             } else if is_tuple(seq) {
