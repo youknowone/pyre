@@ -213,6 +213,19 @@ pub(crate) fn arity_at_most(
     Ok(())
 }
 
+/// TypeError for a method whose positional count after the receiver has to
+/// land in `min..=max` — the PyArg_UnpackTuple form with both bounds set
+/// (`bytes.center`, `bytes.ljust`).  Reports whichever bound the call missed.
+pub(crate) fn arity_between(
+    args: &[PyObjectRef],
+    name: &str,
+    min: usize,
+    max: usize,
+) -> Result<(), crate::PyError> {
+    arity_at_least(args, name, min)?;
+    arity_at_most(args, name, max)
+}
+
 /// TypeError for a method requiring exactly `n` positional arguments after
 /// the receiver, called with a different count — the PyArg_UnpackTuple
 /// min==max form "X expected N arguments, got M" (`list.insert`,
@@ -1362,6 +1375,12 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if pos.len() < 3 {
         return Err(crate::PyError::type_error(format!(
             "replace() takes at least 2 positional arguments ({} given)",
+            args_given(pos)
+        )));
+    }
+    if pos.len() > 4 {
+        return Err(crate::PyError::type_error(format!(
+            "replace() takes at most 3 arguments ({} given)",
             args_given(pos)
         )));
     }

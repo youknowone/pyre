@@ -1520,6 +1520,14 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["format", "shape"], "cast")?;
+    // `format` and `shape` are the whole signature; a third positional was
+    // being read past and dropped.
+    if positional.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "cast() takes at most 2 arguments ({} given)",
+            crate::type_methods::args_given(positional)
+        )));
+    }
     let mv = positional.first().copied().unwrap_or(w_none());
     let fmt_obj = resolve_pos_or_kw(positional.get(1).copied(), kwargs, "format", "cast", 1)?
         .ok_or_else(|| {
@@ -1544,7 +1552,10 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // format check below (with the replacement character `Wtf8`'s `Display`
         // substitutes) the same way any other unsupported format is.
         let fmt = unsafe { pyre_object::w_str_get_wtf8(fmt_obj) }.to_string();
-        let has_shape = shape_obj.is_some_and(|s| !pyre_object::is_none(s));
+        // `if w_shape:` tests the *slot*, not app-level truth: `w_shape=None`
+        // is the omitted argument, while a supplied `None` is an ordinary
+        // object that enters the branch and fails its list/tuple check.
+        let has_shape = shape_obj.is_some();
         let orig_ndim = w_memoryview_ndim(mv);
         // Casts are restricted to C-contiguous source views.
         if !memoryview_contiguity(mv).0 {
@@ -4923,6 +4934,18 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     if pos.len() == 2 {
         return type_descr_new_without_metaclass(&pos[1..], kwargs);
     }
+    // `descr__new__` (typeobject.py:885) keys the one-vs-three form on the
+    // argument *count*, and `_check_new_args` is what names an argument of
+    // the wrong type.  The scan above keys on a str being present instead,
+    // so `type(1, (), {})` arrives here with its three arguments intact;
+    // hand that unambiguous `[metatype, name, bases, dict]` shape on so the
+    // name gets reported rather than the arity.
+    if pos.len() == 4 {
+        if unsafe { pyre_object::is_type(pos[0]) } {
+            w_metaclass = pos[0];
+        }
+        return type_descr_new_with_metaclass(&pos[1..], w_metaclass, kwargs);
+    }
     Err(crate::PyError::type_error("type() takes 1 or 3 arguments"))
 }
 fn type_descr_new_without_metaclass(
@@ -5068,7 +5091,7 @@ fn type_descr_new_with_metaclass(
         // arguments before attempting to copy or normalise any of them.
         if !unsafe { crate::baseobjspace::isinstance_str_w(name_obj) } {
             return Err(crate::PyError::type_error(format!(
-                "type() argument 1 must be str, not {}",
+                "type() argument 1 must be string, not {}",
                 unsafe { pyre_object::type_name_of(name_obj) }
             )));
         }
@@ -8864,7 +8887,11 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 "decoding to str: need a bytes-like object, {tn} found"
             )));
         };
-        let mut decode_args = vec![src, w_encoding.unwrap_or_else(w_none)];
+        // `descr_decode` reads an omitted encoding as utf-8
+        // (stringmethods.py:200-201).  This positional shape cannot skip the
+        // slot when `errors` follows it, so spell the default out: `decode`
+        // refuses a literal `None` there like any other non-str.
+        let mut decode_args = vec![src, w_encoding.unwrap_or_else(|| w_str_new("utf-8"))];
         if let Some(e) = w_errors {
             decode_args.push(e);
         }

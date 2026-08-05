@@ -8598,8 +8598,24 @@ impl SimpleBufferBytes {
 /// `Ok(None)` is the `BufferInterfaceNotFound` path, so callers can spell
 /// their own operation-specific TypeError.
 pub(crate) fn simple_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>, PyError> {
+    buffer_bytes(obj, true)
+}
+
+/// `ObjSpace.buffer_w(w_obj, space.BUF_FULL_RO)`: the same acquisition without
+/// the C-contiguity requirement, so a strided export is linearised instead of
+/// refused.  `_convert_from_buffer_or_iterable` (bytesobject.py:110) reads the
+/// `bytes()` / `bytearray()` source this way, which is why
+/// `bytes(memoryview(b'abcd')[::2])` is a copy and not a `BufferError`.
+pub(crate) fn full_ro_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>, PyError> {
+    buffer_bytes(obj, false)
+}
+
+fn buffer_bytes(
+    obj: PyObjectRef,
+    require_contiguous: bool,
+) -> Result<Option<SimpleBufferBytes>, PyError> {
     if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
-        return simple_buffer_bytes(target?);
+        return buffer_bytes(target?, require_contiguous);
     }
     let roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(obj);
@@ -8608,7 +8624,7 @@ pub(crate) fn simple_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBuffe
     unsafe {
         if pyre_object::memoryview::is_w_memoryview(r_obj) {
             crate::builtins::memoryview_check_released(r_obj)?;
-            if !crate::builtins::memoryview_contiguity(r_obj).0 {
+            if require_contiguous && !crate::builtins::memoryview_contiguity(r_obj).0 {
                 return Err(PyError::new(
                     PyErrorKind::BufferError,
                     "memoryview: underlying buffer is not C-contiguous",
@@ -8658,7 +8674,7 @@ pub(crate) fn simple_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBuffe
         pyre_object::gc_roots::pin_root(w_view);
         let view_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let r_view = pyre_object::gc_roots::shadow_stack_get(view_slot);
-        if !crate::builtins::memoryview_contiguity(r_view).0 {
+        if require_contiguous && !crate::builtins::memoryview_contiguity(r_view).0 {
             let buffer = SimpleBufferBytes {
                 _roots: roots,
                 data: Vec::new(),
@@ -10541,12 +10557,11 @@ pub(crate) unsafe fn get(
         // typedef.py:512-516: if w_result is None: raise
         // AttributeError("'%T' object has no attribute '%s'")
         if found.is_none() {
+            // `%T` is `space.type(w_obj).name`, the bare type name — the same
+            // miss reached through the descriptor's own `__get__` already
+            // reports it that way.
             let slot_name = pyre_object::w_member_get_name(descr);
-            return Err(PyError::attribute_error(format!(
-                "'{}' object has no attribute '{}'",
-                getfulltypename(obj),
-                slot_name,
-            )));
+            return Err(raiseattrerror(obj, slot_name, None, false));
         }
         return Ok(found);
     }
