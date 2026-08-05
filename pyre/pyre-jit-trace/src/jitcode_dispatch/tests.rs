@@ -11745,10 +11745,12 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
     // ever pushed one. A non-commit exit has to splice all of them back out, or
     // the interpreter's replay records the same frames again and a raise that
     // re-uses one exception object hands out a doubled chain.
-    use pyre_interpreter::pytraceback::{w_pytraceback_get_lasti, w_pytraceback_get_w_next,
-                                        w_pytraceback_new};
-    use pyre_object::interp_exceptions::{ExcKind, w_exception_get_traceback, w_exception_new,
-                                         w_exception_set_traceback};
+    use pyre_interpreter::pytraceback::{
+        w_pytraceback_get_lasti, w_pytraceback_get_w_next, w_pytraceback_new,
+    };
+    use pyre_object::interp_exceptions::{
+        ExcKind, w_exception_get_traceback, w_exception_new, w_exception_set_traceback,
+    };
 
     // `frame` is only ever compared by identity here, and `w_code` only has to
     // be a chain-terminating slot, so both stay NULL — the splice walks
@@ -11798,5 +11800,9 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
     }
     super::fbw_store_journal_commit();
     super::fbw_store_journal_rollback();
-    assert_eq!(chain(exc), vec![5, 4, 1], "a committed walk keeps its nodes");
+    assert_eq!(
+        chain(exc),
+        vec![5, 4, 1],
+        "a committed walk keeps its nodes"
+    );
 }

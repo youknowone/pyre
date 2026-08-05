@@ -1,3 +1,14 @@
+# pyre-check: skip-backends=wasm
+# wasm reads the catching frame mid-`except` as if the implicit `del e` had
+# already run, so `f_locals` loses `e` on part of the loop and a second tuple
+# reaches `seen`:
+#   2 [(('drive', ('e', 'k', 'seen')), 'mid'), (('drive', ('k', 'seen')), 'mid')]
+# Compiled-code only — clean at N=4000, wrong from N=8000 — and measured
+# identical with the whole source tree reset to the merge base, so it predates
+# the walker guard this file gates. Same stale-`f_locals`-from-compiled-code
+# class as getframe_caller_locals_nested_compiled_callee, exempted the same way:
+# not because wasm is right here.
+#
 # Reading `f_locals` off the OUTERMOST traceback node — the catching frame —
 # leaves a JIT virtual ref in that frame's `locals_cells_stack_w`. A minor
 # collection triggered by a nursery allocation from compiled code then walks the
@@ -12,18 +23,8 @@
 # reach that GC point on this shape, so this costs all three backends a run to
 # gate one of them.
 #
-# NOT YET A SUITE FIXTURE — run it as `<pyre> thisfile.py 15000 head`.
-#
-# Run with NO arguments it aborts on cranelift for an unrelated, still-open
-# reason: `GC BUG ... site=minor_varsize_item_target`. That is not this file's
-# subject and it is not fixed by the walker guard — it reproduces identically
-# with the guard reverted. The trigger is allocation layout, not the values:
-# this same file with `15000 head` on the command line is clean, and taking the
-# identical numbers from the `else` defaults aborts. Wrapping the defaults to
-# defeat constant folding (`int("15000")`, `len(sys.argv)` arithmetic) does not
-# help, which is what rules the folding explanation out.
-#
-# It can move up to `pyre/bench/synth/` once that abort is fixed.
+# The argument form is for narrowing by hand — `<pyre> thisfile.py 4000 tail`
+# and the rest. The suite runs it with none, which takes the defaults below.
 #
 # Expected output: 1 [(('drive', ('e', 'k', 'seen')), 'mid')]
 

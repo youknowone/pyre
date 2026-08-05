@@ -2327,13 +2327,8 @@ impl MiniMarkGC {
         let pinned = self.pinned_objects.contains(&gcref.0);
         if self.is_nursery_object_start(gcref.0) && !pinned {
             let slot_addr = gcref as *mut GcRef as usize;
-            *gcref = self.copy_nursery_object(
-                gcref.0,
-                "minor_root_target",
-                "minor_root",
-                0,
-                slot_addr,
-            );
+            *gcref =
+                self.copy_nursery_object(gcref.0, "minor_root_target", "minor_root", 0, slot_addr);
         }
         // incminimark.py:2140-2143: append iff (VISITED | PINNED) == 0. pyre's
         // marking convention sets VISITED at push time (see `seed_major_root`
