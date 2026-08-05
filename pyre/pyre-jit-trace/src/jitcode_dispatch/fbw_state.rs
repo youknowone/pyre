@@ -89,39 +89,38 @@ pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, 
         .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
 }
 
-/// `PYRE_FBW_CALLEE_VSTACK` (default OFF) — maintain a callee-local
+/// `PYRE_FBW_CALLEE_VSTACK` (default ON) — maintain a callee-local
 /// operand-stack mirror while walking an inline sub-call.  The callee enters
 /// with an empty operand stack; subsequent boundaries must use the active
 /// callee jitcode metadata rather than the outer full-body tables.  Set to
-/// `1` to opt in.
+/// `0` to opt out.
 ///
-/// Measured on the whole `pyre/bench/synth` corpus (dynasm, 370 fixtures): ON
-/// is 2 failed / 368 passed, and both failures are jit-stats gates on the two
-/// fixtures below.  Every other fixture reads identically either way.
+/// A sub-walk that runs without the mirror carries `vstack_valid == false`,
+/// which is what several hazard predicates fall back to a register scan for;
+/// they then decline shapes the mirror can describe exactly.
 ///
-///   * `or_chain_fresh_alloc_arg` — `loops_compiled 2 -> 1`, which is the
-///     merge `JITSTATS_FALL_FIELDS` describes in `check.py` rather than a
-///     coverage loss.  OFF splits the program across two loops, one of them
-///     keeping `pick` as a residual (`call_may_force=1`), and aborts two
-///     traces, one of them permanently.  ON inlines the callee into a single
-///     164-op loop, aborts nothing (`loops_aborted 1 -> 0`), keeps the one
-///     bridge and the same ~200 guard failures, and runs the fixture in
-///     0.092s against OFF's 0.165s (min-of-7 child CPU time).
-///   * `getframe_inline_subwalk_multiframe` — `guard_failures 0 -> 8948`.
-///     This one is a real cost, and it belongs to `sys._getframe` being
-///     opaque to the tracer, not to the mirror: the trace carries three
-///     CALL_MAY_FORCE, and the guard after the middle one — the `_getframe(2)`
-///     itself — is what fails 8947 of those times.  A GUARD_NOT_FORCED
-///     failure is never compiled ("but always just blackholed",
-///     `compile.py:950-953 ResumeGuardForcedDescr.handle_fail`), so no bridge
-///     is reachable for it.  PyPy traces *through* `_getframe` instead of
-///     calling it residually and emits none of the three:
-///     `PYPYLOG=jit-summary` on this fixture reports `forcings: 0`,
-///     `virtualizables forced: 0`, one loop, no bridges and no aborts.  Until
-///     that call is transparent to the walker, ON only reaches the gap
-///     sooner — it compiles the loop OFF declines (`loops_compiled 0 -> 2`,
-///     `loops_aborted 15 -> 1`) and then blackholes out of it, for 0.136s
-///     against OFF's 0.129s.
+/// Measured across the whole `pyre/bench/synth` corpus, all three backends,
+/// against the default-OFF control:
+///
+///   * dynasm     OFF 361/361, ON 360 passed + `or_chain_fresh_alloc_arg`
+///   * cranelift  OFF 361/361, ON 360 passed + the same fixture, same counters
+///   * wasm       OFF 360/360, ON 360/360 — unaffected
+///
+/// `or_chain_fresh_alloc_arg` is the only fixture that moves, and it moves the
+/// way `JITSTATS_FALL_FIELDS` in `check.py` describes a MERGE rather than a
+/// coverage loss: `loops_compiled 2 -> 1`, `loops_aborted 1 -> 0`,
+/// `guard_failures 200 -> 201`, the one bridge kept.  OFF splits the program
+/// across two loops, one of them keeping `pick` as a residual
+/// (`call_may_force=1`), and aborts two traces, one permanently; ON inlines
+/// the callee into a single loop and aborts nothing.  Wall clock on that
+/// fixture is 0.19s OFF against 0.09s ON (best of five).  Its committed
+/// baselines were re-recorded for that reason, not to absorb a regression.
+///
+/// The second fixture this gate used to be blocked on,
+/// `getframe_inline_subwalk_multiframe`, no longer moves at all: it passes
+/// against its committed baseline (`loops_compiled=0`, `loops_aborted=15`,
+/// `guard_failures=0`) in BOTH settings.  The `guard_failures 0 -> 8948` the
+/// old note recorded is stale.
 pub(crate) fn fbw_callee_vstack_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_CALLEE_VSTACK") {
@@ -129,7 +128,7 @@ pub(crate) fn fbw_callee_vstack_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
