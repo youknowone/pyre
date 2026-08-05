@@ -166,6 +166,15 @@ pub extern "C" fn jit_dict_value_at(dict: i64, index: i64, key: i64, hash: i64) 
     }
 }
 
+pub extern "C" fn jit_exact_unicode_matches_stored_key(key: i64, stored_key: i64) -> i64 {
+    unsafe {
+        pyre_object::dictmultiobject::w_exact_unicode_matches_stored_key(
+            key as PyObjectRef,
+            stored_key as PyObjectRef,
+        ) as i64
+    }
+}
+
 pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
     ctx: &mut TraceCtx,
     helper: *const (),

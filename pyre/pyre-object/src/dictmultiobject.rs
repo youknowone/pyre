@@ -4168,6 +4168,67 @@ pub unsafe fn w_dict_index_of_int_strategy(obj: PyObjectRef, key: PyObjectRef) -
     w_dict_int_storage(obj).get_index_of(&crate::listobject::plain_int_w(key))
 }
 
+/// Return the insertion-order index selected by a Unicode-strategy lookup.
+///
+/// `dictmultiobject.py:1315-1318` routes exact-str keys through the raw
+/// string probe.  The trace-time caller declines when `w_str_get_value_opt`
+/// or the raw hash hook is unavailable, so this helper has no allocating
+/// object-key fallback.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on
+/// [`crate::dictmultiobject::UNICODE_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_index_of_unicode_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<usize> {
+    lock_dict_refs!(_dict_guard, obj, key);
+    if !crate::is_exact_type(key, &crate::STR_TYPE) {
+        return None;
+    }
+    let key = crate::w_str_get_value_opt(key)?;
+    let hash = crate::dict_eq_hook::try_hash_str(key.as_bytes())?;
+    crate::dict_eq_hook::take_eq_error();
+    let dict = &*(obj as *const W_DictObject);
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    dict_entries_index_of_str_hashed(entries, hash, key)
+}
+
+/// Exact-str content guard used by compiled exact-dict reads.
+///
+/// `dictmultiobject.py:1315-1318` hashes and compares the string contents,
+/// not the object identity.  The stored key is the trace constant; the live
+/// key is rechecked for exact type, hash, and bytes every iteration.
+///
+/// # Safety
+/// `key` and `stored_key` must be valid object references.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_exact_unicode_matches_stored_key(
+    key: PyObjectRef,
+    stored_key: PyObjectRef,
+) -> bool {
+    lock_dict_refs!(_guard, key, stored_key);
+    if !crate::is_exact_type(key, &crate::STR_TYPE)
+        || !crate::is_exact_type(stored_key, &crate::STR_TYPE)
+    {
+        return false;
+    }
+    let Some(key) = crate::w_str_get_value_opt(key) else {
+        return false;
+    };
+    let Some(stored_key) = crate::w_str_get_value_opt(stored_key) else {
+        return false;
+    };
+    let Some(key_hash) = crate::dict_eq_hook::try_hash_str(key.as_bytes()) else {
+        return false;
+    };
+    let Some(stored_hash) = crate::dict_eq_hook::try_hash_str(stored_key.as_bytes()) else {
+        return false;
+    };
+    key_hash == stored_hash && key.as_bytes() == stored_key.as_bytes()
+}
+
 /// Internal helper: `IntDictStrategy::delitem` body —
 /// `dictmultiobject.py:1083 del self.unerase(w_dict.dstorage)[self.unwrap(w_key)]`.
 /// Returns `true` if a key was removed.

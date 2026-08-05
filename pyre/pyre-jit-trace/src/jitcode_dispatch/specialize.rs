@@ -5345,6 +5345,12 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         return Ok(None);
     };
 
+    if let Some(hit) = walker_probe_exact_dict_hit(list_obj, key_obj)? {
+        return walker_emit_exact_dict_hit(
+            ctx, op_pc, list_op, key_op, list_obj, key_obj, hit, dst, dst_bank,
+        );
+    }
+
     // #171/#11 Approach C: canonical array-backed `W_TupleObject[i]`.  Two
     // gates, both required:
     //   * `ob_type == &TUPLE_TYPE` (tupleobject.py / tupleobject.rs) —
@@ -5928,6 +5934,260 @@ fn is_builtin_dict_get_function(callable: pyre_object::PyObjectRef) -> bool {
             == pyre_interpreter::type_methods::dict_method_get as *const () as usize
 }
 
+#[derive(Clone, Copy)]
+enum DictFoldKeyProbe {
+    Int,
+    Unicode {
+        stored_key: pyre_object::PyObjectRef,
+    },
+    Identity,
+}
+
+#[derive(Clone, Copy)]
+struct DictFoldHit {
+    index: usize,
+    concrete_value: pyre_object::PyObjectRef,
+    concrete_version: usize,
+    key_probe: DictFoldKeyProbe,
+}
+
+fn walker_probe_exact_dict_hit(
+    dict: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+) -> Result<Option<DictFoldHit>, DispatchError> {
+    let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
+    if canonical_dict.is_null()
+        || !unsafe {
+            std::ptr::eq((*dict).ob_type, &pyre_object::pyobject::DICT_TYPE)
+                && std::ptr::eq((*dict).w_class, canonical_dict)
+        }
+    {
+        return Ok(None);
+    }
+
+    let strategy_kind =
+        unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(dict).strategy_kind() };
+    // A mapdict-backed instance dict keeps its keys in the carrier's attribute
+    // map, and those adds/deletes never reach `w_dict_bump_keys_version`.
+    if strategy_kind == pyre_object::dictmultiobject::StrategyKind::Map {
+        return Ok(None);
+    }
+
+    let int_probe = strategy_kind == pyre_object::dictmultiobject::StrategyKind::Int
+        && unsafe { pyre_object::listobject::is_plain_int1(key) && pyre_object::is_int(key) };
+    let unicode_probe = strategy_kind == pyre_object::dictmultiobject::StrategyKind::Unicode
+        && unsafe {
+            pyre_object::is_exact_type(key, &pyre_object::pyobject::STR_TYPE)
+                && pyre_object::w_str_get_value_opt(key).is_some()
+                && pyre_object::dict_eq_hook::try_hash_str(
+                    pyre_object::w_str_get_value_opt(key).unwrap().as_bytes(),
+                )
+                .is_some()
+        };
+
+    let identity_probe = !int_probe
+        && !unicode_probe
+        // typeobject.py:353-371 — only object-default equality/hash makes an
+        // identity hit safe to fold; Python-level methods must keep the real
+        // lookup so their hash/equality effects remain observable.
+        && unsafe { pyre_object::dictmultiobject::key_compares_by_identity(key) };
+
+    let found = if int_probe {
+        let index =
+            unsafe { pyre_object::dictmultiobject::w_dict_index_of_int_strategy(dict, key) };
+        index.and_then(|index| {
+            unsafe { pyre_object::dictmultiobject::w_dict_nth_value(dict, index) }
+                .map(|value| (index, value, DictFoldKeyProbe::Int))
+        })
+    } else if unicode_probe {
+        let index =
+            unsafe { pyre_object::dictmultiobject::w_dict_index_of_unicode_strategy(dict, key) };
+        index.and_then(|index| {
+            unsafe { pyre_object::dictmultiobject::w_dict_nth_item(dict, index) }
+                .map(|(stored_key, value)| (index, value, DictFoldKeyProbe::Unicode { stored_key }))
+        })
+    } else if identity_probe {
+        let len = unsafe { pyre_object::w_dict_len(dict) };
+        let mut found = None;
+        for index in 0..len {
+            let Some((stored_key, value)) =
+                (unsafe { pyre_object::dictmultiobject::w_dict_nth_item(dict, index) })
+            else {
+                return Ok(None);
+            };
+            if std::ptr::eq(stored_key, key) {
+                found = Some((index, value, DictFoldKeyProbe::Identity));
+                break;
+            }
+        }
+        found
+    } else {
+        None
+    };
+
+    let Some((index, concrete_value, key_probe)) = found else {
+        return Ok(None);
+    };
+    let concrete_version = unsafe { pyre_object::dictmultiobject::w_dict_keys_version(dict) };
+    Ok(Some(DictFoldHit {
+        index,
+        concrete_value,
+        concrete_version,
+        key_probe,
+    }))
+}
+
+fn walker_emit_exact_dict_hit<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    dict_op: OpRef,
+    key_op: OpRef,
+    dict: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+    hit: DictFoldHit,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
+    walker_guard_class(
+        ctx,
+        op_pc,
+        dict_op,
+        &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+    )?;
+    walker_guard_exact_w_class(ctx, op_pc, dict_op, canonical_dict)?;
+
+    match hit.key_probe {
+        DictFoldKeyProbe::Int => {
+            walker_guard_class(
+                ctx,
+                op_pc,
+                key_op,
+                &pyre_object::pyobject::INT_TYPE as *const _ as i64,
+            )?;
+            walker_guard_exact_w_class(
+                ctx,
+                op_pc,
+                key_op,
+                pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
+            )?;
+            let (key_type, key_descr) = crate::state::int_or_bool_unbox_type_descr(key);
+            let raw_key = walker_unbox_int_typed(ctx, op_pc, key_op, key_type, key_descr)?;
+            let expected_key = ctx
+                .trace_ctx
+                .const_int(unsafe { pyre_object::w_int_get_value(key) });
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[raw_key, expected_key],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(raw_key, expected_key);
+        }
+        DictFoldKeyProbe::Unicode { stored_key } => {
+            walker_guard_class(
+                ctx,
+                op_pc,
+                key_op,
+                &pyre_object::pyobject::STR_TYPE as *const _ as i64,
+            )?;
+            walker_guard_exact_w_class(
+                ctx,
+                op_pc,
+                key_op,
+                pyre_object::get_instantiate(&pyre_object::pyobject::STR_TYPE),
+            )?;
+            let strategy = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                dict_op,
+                crate::descr::dict_strategy_word_descr(),
+            );
+            let strategy_const = ctx.trace_ctx.const_int(
+                &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
+            );
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[strategy, strategy_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(strategy, strategy_const);
+
+            let stored_key = ctx.trace_ctx.const_ref(stored_key as i64);
+            let matches = ctx.trace_ctx.call_int_typed_with_effect(
+                crate::helpers::jit_exact_unicode_matches_stored_key as *const (),
+                &[key_op, stored_key],
+                &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+                majit_ir::EffectInfo::new(
+                    majit_ir::ExtraEffect::CannotRaise,
+                    majit_ir::OopSpecIndex::None,
+                ),
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(matches, majit_ir::Value::Int(1));
+            walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[matches])?;
+        }
+        DictFoldKeyProbe::Identity => {
+            let key_expected = ctx.trace_ctx.const_ref(key as i64);
+            if !key_op.is_constant() {
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardValue,
+                    &[key_op, key_expected],
+                )?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .replace_box(key_op, key_expected);
+            }
+        }
+    }
+
+    let live_version = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        dict_op,
+        crate::descr::dict_keys_version_descr(),
+    );
+    let expected_version = ctx.trace_ctx.const_int(hit.concrete_version as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[live_version, expected_version],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(live_version, expected_version);
+
+    let index_op = ctx.trace_ctx.const_int(hit.index as i64);
+    let value = ctx.trace_ctx.call_ref_typed_with_effect(
+        crate::helpers::jit_dict_nth_value_versioned as *const (),
+        &[dict_op, index_op, expected_version],
+        &[
+            majit_ir::Type::Ref,
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+        ],
+        majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    // A key set that moved after the unlocked version guard, or an index the
+    // compacted table no longer holds, comes back as `PY_NULL`.
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[value])?;
+    ctx.trace_ctx.set_opref_concrete(
+        value,
+        majit_ir::Value::Ref(majit_ir::GcRef(hit.concrete_value as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+    Ok(Some(()))
+}
+
 /// `dict.get` on an exact dictionary and a safely probed promoted key.
 ///
 /// `dictmultiobject.py:1095-1098` probes an Int strategy with the unboxed key
@@ -5984,56 +6244,9 @@ pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
     if callable.is_null() || dict.is_null() || !is_builtin_dict_get_function(callable) {
         return Ok(None);
     }
-    let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
-    if canonical_dict.is_null()
-        || !unsafe {
-            std::ptr::eq((*dict).ob_type, &pyre_object::pyobject::DICT_TYPE)
-                && std::ptr::eq((*dict).w_class, canonical_dict)
-        }
-    {
-        return Ok(None);
-    }
-
-    let strategy_kind =
-        unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(dict).strategy_kind() };
-    // A mapdict-backed instance dict keeps its keys in the carrier's attribute
-    // map, and those adds/deletes never reach `w_dict_bump_keys_version` — the
-    // wrapper is only a view.  `keys_version` is therefore constant for a Map
-    // dict, so the guard below would certify an entry index that a `del
-    // o.attr` has already re-numbered.  Decline instead of certifying a
-    // version that cannot move.
-    if strategy_kind == pyre_object::dictmultiobject::StrategyKind::Map {
-        return Ok(None);
-    }
-    let value_probed_int = strategy_kind == pyre_object::dictmultiobject::StrategyKind::Int
-        && unsafe { pyre_object::listobject::is_plain_int1(key) && pyre_object::is_int(key) };
-    let found = if value_probed_int {
-        let index =
-            unsafe { pyre_object::dictmultiobject::w_dict_index_of_int_strategy(dict, key) };
-        index.and_then(|index| {
-            unsafe { pyre_object::dictmultiobject::w_dict_nth_value(dict, index) }
-                .map(|value| (index, value))
-        })
-    } else {
-        let len = unsafe { pyre_object::w_dict_len(dict) };
-        let mut found = None;
-        for index in 0..len {
-            let Some((stored_key, value)) =
-                (unsafe { pyre_object::dictmultiobject::w_dict_nth_item(dict, index) })
-            else {
-                return Ok(None);
-            };
-            if std::ptr::eq(stored_key, key) {
-                found = Some((index, value));
-                break;
-            }
-        }
-        found
-    };
-    let Some((index, concrete_value)) = found else {
+    let Some(hit) = walker_probe_exact_dict_hit(dict, key)? else {
         return Ok(None);
     };
-    let concrete_version = unsafe { pyre_object::dictmultiobject::w_dict_keys_version(dict) };
 
     let mut callable_op = r_args[0];
     let dict_op;
@@ -6073,95 +6286,7 @@ pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(callable_op, expected);
     }
-    walker_guard_class(
-        ctx,
-        op.pc,
-        dict_op,
-        &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
-    )?;
-    walker_guard_exact_w_class(ctx, op.pc, dict_op, canonical_dict)?;
-    let key_op = r_args[2];
-    if value_probed_int {
-        walker_guard_class(
-            ctx,
-            op.pc,
-            key_op,
-            &pyre_object::pyobject::INT_TYPE as *const _ as i64,
-        )?;
-        walker_guard_exact_w_class(
-            ctx,
-            op.pc,
-            key_op,
-            pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
-        )?;
-        let (key_type, key_descr) = crate::state::int_or_bool_unbox_type_descr(key);
-        let raw_key = walker_unbox_int_typed(ctx, op.pc, key_op, key_type, key_descr)?;
-        let expected_key = ctx
-            .trace_ctx
-            .const_int(unsafe { pyre_object::w_int_get_value(key) });
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[raw_key, expected_key],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(raw_key, expected_key);
-    } else {
-        let key_expected = ctx.trace_ctx.const_ref(key as i64);
-        if !key_op.is_constant() {
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op.pc,
-                OpCode::GuardValue,
-                &[key_op, key_expected],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(key_op, key_expected);
-        }
-    }
-    let live_version = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        dict_op,
-        crate::descr::dict_keys_version_descr(),
-    );
-    let expected_version = ctx.trace_ctx.const_int(concrete_version as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op.pc,
-        OpCode::GuardValue,
-        &[live_version, expected_version],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(live_version, expected_version);
-
-    let index_op = ctx.trace_ctx.const_int(index as i64);
-    let value = ctx.trace_ctx.call_ref_typed_with_effect(
-        crate::helpers::jit_dict_nth_value_versioned as *const (),
-        &[dict_op, index_op, expected_version],
-        &[
-            majit_ir::Type::Ref,
-            majit_ir::Type::Int,
-            majit_ir::Type::Int,
-        ],
-        majit_ir::EffectInfo::new(
-            majit_ir::ExtraEffect::CannotRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
-    );
-    // A key set that moved after the unlocked version guard, or an index the
-    // compacted table no longer holds, comes back as `PY_NULL`: side-exit to
-    // the generic `dict.get` residual instead of writing it to a Ref register.
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[value])?;
-    ctx.trace_ctx.set_opref_concrete(
-        value,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_value as usize)),
-    );
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', value)?;
-    Ok(Some(()))
+    walker_emit_exact_dict_hit(ctx, op.pc, dict_op, r_args[2], dict, key, hit, dst, 'r')
 }
 
 /// `len(x)` on an exact canonical `W_ListObject` / `W_UnicodeObject` /
