@@ -1670,6 +1670,13 @@ fn path_or_fd_w(
             // `__index__` and sits BEFORE the PathLike case, so an object
             // carrying both is taken as a descriptor and its `__fspath__` is
             // never called.
+            //
+            // Where `:202-207` wraps the probe in `except OperationError:
+            // pass` and falls through to `__fspath__`, 3.14 lets an
+            // `__index__` that raises propagate — measured, an object with a
+            // raising `__index__` and a working `__fspath__` reports that
+            // exception rather than being statted. The parity suite's oracle
+            // is CPython.
             let fd = crate::baseobjspace::c_int_w(obj)?;
             // interp_posix.py:269-271 `unwrap_fd` — `-1` is the sentinel for
             // "not a descriptor", so a caller naming it has to be turned away

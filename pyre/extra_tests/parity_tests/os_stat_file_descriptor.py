@@ -113,6 +113,26 @@ try:
     # `path` was resolved, `dir_fd` then rejected, `follow_symlinks` never read.
     assert order == ["path"], order
 
+    # The descriptor probe is `__index__`, and an object carrying both it and
+    # `__fspath__` is taken as a descriptor — so an `__index__` that raises
+    # reports its own exception instead of falling through to the path.
+    class BadIndex:
+        def __index__(self):
+            raise RuntimeError("boom")
+
+        def __fspath__(self):
+            return path
+
+    try:
+        os.stat(BadIndex())
+    except RuntimeError as exc:
+        assert str(exc) == "boom", str(exc)
+    else:
+        raise AssertionError("stat fell through a raising __index__ to __fspath__")
+
+    # lstat takes no descriptor, so it never probes __index__ at all.
+    assert os.lstat(BadIndex()).st_size == 10
+
     # A descriptor no call can serve reports the descriptor, not the type: -1
     # is an OSError either way. Which errno it carries is a property of the
     # libc path taken and differs between the two entry points even upstream

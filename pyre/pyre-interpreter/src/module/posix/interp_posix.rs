@@ -2530,7 +2530,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd")
             .filter(|&v| !unsafe { pyre_object::is_none(v) })
         {
-            Some(v) => Some(unwrap_fd(v, "integer or None")?),
+            Some(v) => {
+                let fd = unwrap_fd(v, "integer or None")?;
+                // `DirFD(available=False)` is `_DirFD_Unavailable`
+                // (:285-292), which turns a non-default `dir_fd` away while
+                // unwrapping — so where the platform has no `fstatat` the
+                // answer is this, not the descriptor conflict `do_stat`
+                // would reach first.
+                if !HAVE_FSTATAT {
+                    return Err(dir_fd_unavailable(name));
+                }
+                Some(fd)
+            }
             None => None,
         };
         let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
@@ -2586,6 +2597,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
     }
 
+    /// `rposix.HAVE_FSTATAT` — what `DirFD` is parameterised on
+    /// (`interp_posix.py:612,660`), and what `_have_functions` advertises.
+    const HAVE_FSTATAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+
+    fn dir_fd_unavailable(name: &str) -> crate::PyError {
+        crate::PyError::not_implemented(format!(
+            "{name}: dir_fd unavailable on this platform"
+        ))
+    }
+
     /// `do_stat` (`interp_posix.py:649`) resolves a name against an open
     /// directory descriptor with `fstatat`, where `AT_SYMLINK_NOFOLLOW`
     /// carries `follow_symlinks=False`. An absolute name ignores `dir_fd`,
@@ -2624,15 +2645,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 st_flags,
             ));
         }
-        // `DirFD(available=False)` (`interp_posix.py:285-292`): the platform
-        // has no `fstatat`, so a `dir_fd` that reached this far has nothing
-        // to resolve against.
+        // Unreachable in practice — `stat_entry` turns a `dir_fd` away at
+        // unwrap time wherever `HAVE_FSTATAT` is false — but the arm has to
+        // exist for those targets to compile.
         #[allow(unreachable_code)]
         {
             let _ = (path, dir_fd, follow_symlinks);
-            Err(crate::PyError::not_implemented(format!(
-                "{name}: dir_fd unavailable on this platform"
-            )))
+            Err(dir_fd_unavailable(name))
         }
     }
 
