@@ -597,6 +597,10 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
     let _ = STACK_ALMOST_FULL_FN.set(f);
 }
 
+/// Number of `MC_DIAG` slots. Declared once so the counter array and
+/// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
+pub const MC_DIAG_SLOTS: usize = 57;
+
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
 /// entered, 1 = declined_bridge_guards short-circuit, 2 = descr_addr==0 skip,
@@ -652,17 +656,34 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// 50 = `close_bridge` declined while closing a bridge, 51 = bridge close found
 /// no compiled target, 52 = abort after a declined bridge attempt, 53 =
 /// `compile_trace` called `compile_bridge` and it returned false.
-pub static MC_DIAG: [std::sync::atomic::AtomicU64; 54] = {
+///
+/// 54-56 are the merge-point path's three silent recovery rules, each counted
+/// where it FIRES rather than where it is called, so a slot reading 0 over the
+/// corpus is the evidence needed to replace the rule with a `debug_assert!`:
+/// 54 = `has_merge_point_with_shape_assert` rejected a SAME-green-key merge
+/// point because its `green_boxes` length differed from `live_args_len`, where
+/// `pyjitpl.py:3020 assert len(original_boxes) == len(live_arg_boxes)` asserts
+/// instead of filtering; 55 = `register_retrace_merge_point` declined to
+/// register because some jump arg carried no intrinsic type, where
+/// `pyjitpl.py:3059-3060 self.current_merge_points.append((live_arg_boxes,
+/// start))` appends unconditionally; 56 = `close_header_pc` fell back to
+/// `self.header_pc` because the walk recorded no close greens, where
+/// `pyjitpl.py:3021 same_greenkey(original_boxes, live_arg_boxes,
+/// num_green_args)` always compares the actual closing boxes. 55 and 56 are
+/// gated behind a non-zero `retrace_limit` (default 0, `warmstate.rs`
+/// DEFAULT_RETRACE_LIMIT / `rpython/rlib/jit.py:595`), so a default-parameter
+/// run reading 0 on them proves nothing.
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; MC_DIAG_SLOTS] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [
         Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
     ]
 };
 
 /// Short label per [`MC_DIAG`] slot, in index order, so a tally cannot be added
 /// without naming it. Readers join these with the counter values.
-pub const MC_DIAG_LABELS: [&str; 54] = [
+pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     "mc_entered",
     "decl_shortcircuit",
     "descr0_skip",
@@ -717,6 +738,9 @@ pub const MC_DIAG_LABELS: [&str; 54] = [
     "bridge_no_targets_close",
     "abort_after_declined",
     "ct_compile_bridge_false",
+    "mp_shape_filtered",
+    "retrace_mp_untyped",
+    "close_hdr_fallback",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

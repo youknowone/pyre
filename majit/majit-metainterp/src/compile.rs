@@ -5250,10 +5250,22 @@ impl TraceCtx {
         // by shape length instead of asserting — a shape mismatch means
         // the merge point was seeded under a different frame layout and
         // should not match.
-        self.current_merge_points
-            .iter()
-            .rev()
-            .any(|mp| mp.green_key == key && mp.green_boxes.len() == live_args_len)
+        // Same reverse scan, same short-circuit; the loop form exists only so
+        // the SHAPE REJECTION can be tallied. `pyjitpl.py:3020 assert
+        // len(original_boxes) == len(live_arg_boxes)` asserts here — upstream
+        // never filters. Slot 54 counts every same-green-key merge point this
+        // rule discards, so a corpus reading 0 can promote the filter to a
+        // `debug_assert!`.
+        for mp in self.current_merge_points.iter().rev() {
+            if mp.green_key != key {
+                continue;
+            }
+            if mp.green_boxes.len() == live_args_len {
+                return true;
+            }
+            crate::mc_diag_bump(54);
+        }
+        false
     }
 
     /// pyjitpl.py:3029-3030 — record a loop header visit with position
@@ -5365,10 +5377,22 @@ impl TraceCtx {
     /// greens (nothing to compare against, so the session's own header is
     /// the only candidate).
     pub fn close_header_pc(&self) -> usize {
-        self.close_greens
+        match self
+            .close_greens
             .as_ref()
             .and_then(|greens| greens.0.first().copied())
-            .map_or(self.header_pc, |pc| pc as usize)
+        {
+            Some(pc) => pc as usize,
+            None => {
+                // `pyjitpl.py:3021 same_greenkey(original_boxes,
+                // live_arg_boxes, num_green_args)` always compares the actual
+                // closing boxes; upstream has no header-pc fallback. Slot 56
+                // counts every firing so a corpus reading 0 can promote this
+                // fallback to a `debug_assert!`.
+                crate::mc_diag_bump(56);
+                self.header_pc
+            }
+        }
     }
 
     pub fn get_merge_point_at(&self, key: u64, header_pc: usize) -> Option<&MergePoint> {

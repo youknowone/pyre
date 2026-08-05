@@ -6956,6 +6956,14 @@ impl<M: Clone> MetaInterp<M> {
             .filter_map(|&op| op.ty().map(|ty| crate::trace_ctx::GreenBox::new(op, ty)))
             .collect();
         if green_boxes.len() != jump_args.len() {
+            // `pyjitpl.py:3059-3060 self.current_merge_points.append(
+            // (live_arg_boxes, start))` appends unconditionally. This decline
+            // is a pyre stand-in and it ALSO suppresses the
+            // `keep_tracing_after_close` write below, so the trace is
+            // abandoned without appearing in `loops_aborted`. Slot 55 counts
+            // every firing so a corpus (run with a non-zero `retrace_limit`)
+            // reading 0 can promote it to a `debug_assert!`.
+            crate::mc_diag_bump(55);
             return;
         }
         let key = ctx.green_key;
