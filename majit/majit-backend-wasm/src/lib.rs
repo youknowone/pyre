@@ -2214,7 +2214,18 @@ impl majit_backend::Backend for WasmBackend {
                 );
             }
         } else {
-            let publishable = label_descrs.first().is_some_and(|&id| id != 0)
+            // A LABEL with real work before it is not reachable through the plain
+            // entry: key 0 runs the function from its first op, so a bridge chaining
+            // there would re-run that work. Before the descr-strict dispatch every
+            // such trace was `is_resumable_peeled` and never reached this branch; a
+            // `jump_to_preamble` retrace (own LABEL, foreign closing JUMP) is not, so
+            // state the assumption the comment below already relies on.
+            let first_label_at_entry = ops
+                .iter()
+                .position(|op| op.opcode == majit_ir::OpCode::Label)
+                == Some(0);
+            let publishable = first_label_at_entry
+                && label_descrs.first().is_some_and(|&id| id != 0)
                 && label_num_args.first() == Some(&inputargs.len());
             if !publishable {
                 diag_bump(21);
