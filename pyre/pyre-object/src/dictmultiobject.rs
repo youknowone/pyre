@@ -3397,11 +3397,17 @@ pub unsafe fn w_dict_delitem_str_no_proxy(obj: PyObjectRef, key: &str) -> bool {
     w_dict_delitem_str(obj, key)
 }
 
-/// WTF-8 keyed sibling of `w_dict_getitem_str` — routes through the
-/// generic object-key lookup so a lone-surrogate key resolves on the
-/// `ObjectDictStrategy` entries map.  `w_str_get_value` (used by the
-/// Unicode strategy's str fast path) panics on a lone surrogate, so the
-/// str-keyed wrapper cannot be used for such names.
+/// WTF-8 keyed equivalent of `space.getitem_str` — `getitem_str` is itself
+/// a fast path of `space.getitem`, so a key that is valid UTF-8 takes the str
+/// fast path and a lone-surrogate key wraps into a `W_UnicodeObject` and
+/// routes through the general `w_dict_lookup` (`space.getitem`).
+///
+/// The lone-surrogate arm is a requirement, not a tuning choice: the str
+/// probe keys an `IndexMap` on `try_hash_str(key.as_bytes())`, and a name
+/// carrying a lone surrogate has no `&str` view to hash — `w_str_get_value`
+/// panics on one.  Stored keys are unaffected either way, since the probe
+/// compares WTF-8 bytes (`dict_entries_probe_str`) and never takes a `&str`
+/// view of an entry.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
@@ -3409,8 +3415,10 @@ pub unsafe fn w_dict_getitem_wtf8(
     obj: PyObjectRef,
     key: &rustpython_wtf8::Wtf8,
 ) -> Option<PyObjectRef> {
-    let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
-    w_dict_lookup(obj, w_key)
+    match key.as_str() {
+        Ok(s) => w_dict_getitem_str(obj, s),
+        Err(_) => w_dict_lookup(obj, crate::w_str_from_wtf8(key.to_wtf8_buf())),
+    }
 }
 
 /// WTF-8 keyed equivalent of `space.setitem_str` — `setitem_str` is itself
