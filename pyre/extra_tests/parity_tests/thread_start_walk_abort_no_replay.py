@@ -29,7 +29,17 @@ nothing.  Re-measure against such a build before simplifying anything here.
 
 Every acquire on the main thread is bounded so a lost release reports instead of
 hanging, and `die` uses `os._exit` so a failure cannot block on shutdown.
+
+⚠️ The `parity-env` line below is what keeps this file covering anything.  All
+three kept-stack decline hazards are scoped to `!ctx.vstack_valid`, so once the
+callee operand-stack mirror became the default an inline sub-walk describes its
+own stack and the aborting guard is never reached.  Measured on a binary WITHOUT
+the fix: 4/4 pass at the default setting, 4/4 fail with the mirror off (the same
+deterministic round 97 either way).  Drop the pin and this test goes green
+against the very defect it exists to catch.
 """
+
+# parity-env: PYRE_FBW_CALLEE_VSTACK=0
 
 import contextvars
 import os
