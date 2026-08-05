@@ -942,6 +942,23 @@ fn traceback_node_site<Sym: WalkSym>(
         .get(jitcode.metadata.portal_frame_reg as usize)
         .copied()
         .unwrap_or(OpRef::NONE);
+    // Storing this box into the node's `frame` field lets the traceback
+    // outlive the frame, so folded inline-callee locals have to reach the
+    // array first.  A `STORE_FAST` on the callee's own fresh frame is folded
+    // to an SSA register and emits no array store; without replaying that fold,
+    // the escaping frame carries only its seeded parameters and every
+    // `tb_frame.f_locals` consumer loses the callee's non-parameter locals.
+    // Upstream needs no replay because `STORE_FAST` writes
+    // `locals_cells_stack_w` itself and virtualization removes the store while
+    // the frame stays virtual (`pypy/interpreter/pyframe.py`,
+    // `rpython/jit/metainterp/virtualizable.py`).  Declining on `Err` leaves
+    // the node to the opaque fabricating hook, the same disposition both
+    // callers already take for an unresolved frame.
+    if !frame.is_none()
+        && residual_call::disarm_folded_inline_callee_after_escape(ctx, opcode_position).is_err()
+    {
+        return None;
+    }
     Some(TracebackNodeSite {
         frame,
         w_code,

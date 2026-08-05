@@ -3656,7 +3656,7 @@ fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
         .heapcache_setfield_cached(callee_frame, last_instr_idx, last_instr);
 }
 
-fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
+pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
 ) -> Result<(), DispatchError> {
