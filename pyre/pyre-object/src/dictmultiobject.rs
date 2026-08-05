@@ -4168,6 +4168,25 @@ pub unsafe fn w_dict_index_of_int_strategy(obj: PyObjectRef, key: PyObjectRef) -
     w_dict_int_storage(obj).get_index_of(&crate::listobject::plain_int_w(key))
 }
 
+/// Return the live value selected by an int-strategy lookup.
+///
+/// Residualise the native table probe for the same reason as
+/// [`w_dict_lookup_int_strategy`] (`rdict.py:576`). The index lookup and value
+/// read share one dict lock so the insertion-order index cannot be invalidated
+/// between the two operations.
+///
+/// # Safety
+/// Same as [`w_dict_lookup_int_strategy`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_lookup_or_null_int_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    lock_dict_refs!(_dict_guard, obj, key);
+    let index = w_dict_index_of_int_strategy(obj, key)?;
+    w_dict_nth_value(obj, index)
+}
+
 /// Return the insertion-order index selected by a Unicode-strategy lookup.
 ///
 /// `dictmultiobject.py:1315-1318` routes exact-str keys through the raw
@@ -4195,38 +4214,22 @@ pub unsafe fn w_dict_index_of_unicode_strategy(
     dict_entries_index_of_str_hashed(entries, hash, key)
 }
 
-/// Exact-str content guard used by compiled exact-dict reads.
+/// Return the live value selected by a Unicode-strategy lookup.
 ///
-/// `dictmultiobject.py:1315-1318` hashes and compares the string contents,
-/// not the object identity.  The stored key is the trace constant; the live
-/// key is rechecked for exact type, hash, and bytes every iteration.
+/// `dictmultiobject.py:1315-1318` routes exact-str keys through the raw
+/// string probe. The index lookup and value read share one dict lock so the
+/// insertion-order index cannot be invalidated between the two operations.
 ///
 /// # Safety
-/// `key` and `stored_key` must be valid object references.
+/// Same as [`w_dict_index_of_unicode_strategy`].
 #[majit_macros::dont_look_inside]
-pub unsafe fn w_exact_unicode_matches_stored_key(
+pub unsafe fn w_dict_lookup_or_null_unicode_strategy(
+    obj: PyObjectRef,
     key: PyObjectRef,
-    stored_key: PyObjectRef,
-) -> bool {
-    lock_dict_refs!(_guard, key, stored_key);
-    if !crate::is_exact_type(key, &crate::STR_TYPE)
-        || !crate::is_exact_type(stored_key, &crate::STR_TYPE)
-    {
-        return false;
-    }
-    let Some(key) = crate::w_str_get_value_opt(key) else {
-        return false;
-    };
-    let Some(stored_key) = crate::w_str_get_value_opt(stored_key) else {
-        return false;
-    };
-    let Some(key_hash) = crate::dict_eq_hook::try_hash_str(key.as_bytes()) else {
-        return false;
-    };
-    let Some(stored_hash) = crate::dict_eq_hook::try_hash_str(stored_key.as_bytes()) else {
-        return false;
-    };
-    key_hash == stored_hash && key.as_bytes() == stored_key.as_bytes()
+) -> Option<PyObjectRef> {
+    lock_dict_refs!(_dict_guard, obj, key);
+    let index = w_dict_index_of_unicode_strategy(obj, key)?;
+    w_dict_nth_value(obj, index)
 }
 
 /// Internal helper: `IntDictStrategy::delitem` body —

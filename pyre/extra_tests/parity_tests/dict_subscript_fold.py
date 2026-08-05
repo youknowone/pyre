@@ -110,3 +110,28 @@ CountingKey.eq_count = 0
 assert read_tag(counted, stored) == 7 * N
 assert CountingKey.hash_count == N
 assert CountingKey.eq_count == 0
+
+
+def read_varying_int_keys(d):
+    total = 0
+    for i in range(N):
+        total += d[i]
+    return total
+
+
+def write_new_keys_and_read_first(d):
+    total = 0
+    for i in range(N):
+        d[i] = i * 3
+        total += d[0]
+    return total
+
+
+varying = {}
+for i in range(N):
+    varying[i] = i + 5
+assert read_varying_int_keys(varying) == (N * (N - 1)) // 2 + 5 * N
+
+mutating = {0: 11}
+assert write_new_keys_and_read_first(mutating) == 0
+assert mutating[N - 1] == (N - 1) * 3
