@@ -11424,6 +11424,36 @@ fn callee_vable_ref_gates_on_frame_register_identity() {
 }
 
 #[test]
+fn callee_locals_region_publishes_only_a_reproducible_frame() {
+    use majit_ir::{GcRef, Value};
+
+    // A slot this walk never wrote still holds what `write_boxes` would have
+    // written back, so an all-absent shadow publishes.
+    let mut shadow = super::CalleeLocalsShadow::default();
+    assert!(super::callee_locals_region_is_publishable(&shadow, 4, 1));
+
+    shadow.set_concrete(1, 2, Value::Ref(GcRef(0x1000)));
+    assert!(super::callee_locals_region_is_publishable(&shadow, 4, 1));
+
+    // A slot recorded through another frame register does not describe this
+    // frame.
+    assert!(!super::callee_locals_region_is_publishable(&shadow, 4, 2));
+
+    // A store whose concrete half is unknown leaves `concrete` cleared while
+    // `opref` still witnesses the write: the frame's value is stale.
+    shadow.set_opref(3, OpRef::ref_op(7));
+    shadow.set_concrete(1, 3, Value::Void);
+    assert!(!super::callee_locals_region_is_publishable(&shadow, 4, 1));
+    // Only within the locals region — an operand-stack slot is not flushed.
+    assert!(super::callee_locals_region_is_publishable(&shadow, 3, 1));
+
+    // The `NO_CONCRETE` sentinel is not a storable reference either.
+    let mut sentinel = super::CalleeLocalsShadow::default();
+    sentinel.set_concrete(1, 0, Value::Ref(GcRef::NO_CONCRETE));
+    assert!(!super::callee_locals_region_is_publishable(&sentinel, 1, 1));
+}
+
+#[test]
 fn dense_fallthrough_seeds_only_its_missing_result_color() {
     let keep = OpRef::ref_op(3);
     let null_ref = OpRef::const_ptr(majit_ir::GcRef(0));

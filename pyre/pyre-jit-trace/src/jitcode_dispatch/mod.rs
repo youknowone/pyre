@@ -807,6 +807,38 @@ fn concrete_portal_frame<Sym: WalkSym>(
     (!frame.is_null()).then_some(frame as *mut pyre_interpreter::PyFrame)
 }
 
+/// Whether `shadow` can reproduce every locals slot of a frame reached through
+/// `frame_reg`.
+///
+/// `virtualizable.py:101-138 write_boxes` writes every locals-array element
+/// because `virtualizable_boxes` is total. This shadow is sparse instead, so an
+/// absent slot carries two meanings and only one of them may be skipped:
+///
+/// * absent from BOTH maps — this walk never wrote the slot, so the frame still
+///   holds the value `write_boxes` would have written back.
+/// * present in `opref` but not in `concrete` — the walk DID write the slot with
+///   no concrete half ([`CalleeLocalsShadow::set_concrete`] drops a
+///   `Value::Void`), so the frame's value is stale and unreconstructable.
+///
+/// `Value::Void` and `GcRef::NO_CONCRETE` are the "no concrete half" sentinels,
+/// not a NULL local: writing one back would store `PY_NULL` or an untraceable
+/// word over the slot the walk holds in a register. Only entries recorded
+/// through `frame_reg` describe this frame.
+fn callee_locals_region_is_publishable(
+    shadow: &CalleeLocalsShadow,
+    nlocals: usize,
+    frame_reg: u16,
+) -> bool {
+    (0..nlocals as i64).all(|slot| match shadow.concrete.get(&slot) {
+        Some(concrete) => {
+            concrete.frame_reg == frame_reg
+                && !matches!(concrete.value, Value::Void)
+                && !matches!(concrete.value, Value::Ref(r) if r == majit_ir::GcRef::NO_CONCRETE)
+        }
+        None => !shadow.opref.contains_key(&slot),
+    })
+}
+
 /// [`crate::state::flush_locals_region_to_frame`]'s twin for an inlined level.
 ///
 /// The top-level frame's slots come from the seeded `virtualizable_boxes`; a
@@ -828,17 +860,10 @@ fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
     let Some(nlocals) = crate::state::concrete_nlocals(frame as usize) else {
         return false;
     };
-    // Validation pass first: a missing entry was never written through this
-    // shadow and leaves the frame's existing slot alone.  `Value::Void` is the
-    // shadow's "no concrete half" sentinel, not a NULL local: writing it back
-    // would box to `PY_NULL` and destroy the slot held in a walk register.
-    for abs in 0..nlocals {
-        let Some(concrete) = shadow.concrete.get(&(abs as i64)) else {
-            continue;
-        };
-        if concrete.frame_reg != frame_reg || matches!(concrete.value, Value::Void) {
-            return false;
-        }
+    // Validation pass first: it allocates nothing, so a decline leaves the
+    // frame untouched (same all-or-nothing discipline as the top-level twin).
+    if !callee_locals_region_is_publishable(shadow, nlocals, frame_reg) {
+        return false;
     }
     let frame_ptr = frame as *const u8;
     let arr_ptr = unsafe {
