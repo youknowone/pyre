@@ -11758,26 +11758,39 @@ impl<M: Clone> MetaInterp<M> {
         }
         let cell_token_key = self.bridge_cell_token_key(green_key, jump_target_key);
 
-        // `pyjitpl.py:2897-2899` parity:
+        // `pyjitpl.py:2921-2923`:
         //   self.resumekey_original_loop_token =
         //       resumedescr.rd_loop_token.loop_token_wref()
         //   if self.resumekey_original_loop_token is None:
-        //       raise compile.giveup()  # should be rare
-        // `compile.giveup()` (`compile.py:27-29`) raises
-        // `SwitchToBlackhole(ABORT_BRIDGE)`, which RPython catches at
-        // `pyjitpl.py:2906-2907` and falls through to blackhole resume.
-        // Pyre's `compile_bridge` mirrors that abort by returning `false`;
-        // the caller (`compile_trace`) maps `false` to
-        // `CompileOutcome::Cancelled`, the same control-flow blackhole
-        // resume observes.  The weakref-dead path is "should be rare" per
-        // upstream, but structurally required — never panic.
+        //       raise compile.giveup() # should be rare
+        //
+        // That check runs at the TOP of `handle_guard_failure`, before
+        // `create_history` (`pyjitpl.py:2925`) and ABOVE the `try:` at
+        // `:2926` — so the `except SwitchToBlackhole` at `:2930-2931` does
+        // NOT catch the `SwitchToBlackhole(ABORT_BRIDGE)` that
+        // `compile.giveup()` (`compile.py:27-29`) raises, and the `finally:`
+        // at `:2932-2935` does not run.  It propagates out with nothing yet
+        // traced, so there is no trace to give up on.
+        //
+        // This site is at a later phase, inside the compile, where upstream
+        // asserts rather than gives up: `compile.py:800
+        // assert metainterp.resumekey_original_loop_token is not None`.
+        // Returning `false` becomes `CompileOutcome::Cancelled` and thence
+        // `Declined`, which keeps the trace alive — the shape `compile.py:1085
+        // return None` already has at a bridge close, since
+        // `raise_if_successful` does not raise on `None`.
+        //
+        // "Should be rare" upstream; here it is unobserved, because every
+        // `set_rd_loop_token_clt` site is preceded by `keep_loop_alive`, which
+        // pins the token in `alive_loops`.  Structurally required — never
+        // panic.
         let source_jct: Arc<JitCellToken> = match majit_backend::descr_owning_jct(fail_descr) {
             Some(jct) => jct,
             None => {
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_bridge: rd_loop_token weakref dead → \
-                         compile.giveup() (pyjitpl.py:2898), key={} fail_index={}",
+                         compile.giveup() (pyjitpl.py:2923), key={} fail_index={}",
                         green_key, fail_index,
                     );
                 }
