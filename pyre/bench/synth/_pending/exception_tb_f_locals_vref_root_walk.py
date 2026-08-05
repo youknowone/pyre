@@ -1,7 +1,19 @@
 # pyre-check: skip-backends=wasm
-# wasm reads the catching frame mid-`except` as if the implicit `del e` had
-# already run, so `f_locals` loses `e` on part of the loop and a second tuple
-# reaches `seen`:
+#
+# PARKED: its guard_failures is not the same on every host. macos-latest and
+# ubuntu-24.04 both report 5980 on cranelift; windows-latest reported 5979 in
+# the run that promoted this file. That is the band #1043 removed the
+# closure_per_call overlay over — two counters there disagreed with themselves
+# across jobs, one toward its shared value and one away from it — so a
+# `.cranelift.win32.jitstats` overlay cannot hold this either, and a missing
+# baseline is a hard fail rather than an opt-out. The walker guard therefore has
+# no suite gate; this file is the reproduction, and it is correct on all three
+# native backends and PYRE_NO_JIT=1 at every size of a 512K-32M PYPY_GC_NURSERY
+# sweep.
+#
+# wasm is exempted above. It reads the catching frame mid-`except` as if the
+# implicit `del e` had already run, so `f_locals` loses `e` on part of the loop
+# and a second tuple reaches `seen`:
 #   2 [(('drive', ('e', 'k', 'seen')), 'mid'), (('drive', ('k', 'seen')), 'mid')]
 # Compiled-code only — clean at N=4000, wrong from N=8000 — and measured
 # identical with the whole source tree reset to the merge base, so it predates
