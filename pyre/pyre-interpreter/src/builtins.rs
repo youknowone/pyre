@@ -4246,9 +4246,14 @@ pub(crate) fn kwarg_reject_unknown(
             continue;
         }
         if !allowed.iter().any(|name| key.as_str() == Ok(*name)) {
-            return Err(crate::PyError::type_error(format!(
-                "{fn_name}() got an unexpected keyword argument '{key}'"
-            )));
+            let mut msg = format!("{fn_name}() got an unexpected keyword argument '{key}'");
+            if let Ok(wrong) = key.as_str() {
+                let candidates: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+                if let Some(suggestion) = crate::error::best_suggestion(&candidates, wrong) {
+                    msg.push_str(&format!(". Did you mean '{suggestion}'?"));
+                }
+            }
+            return Err(crate::PyError::type_error(msg));
         }
     }
     Ok(())

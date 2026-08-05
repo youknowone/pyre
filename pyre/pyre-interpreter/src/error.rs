@@ -2425,7 +2425,7 @@ fn suggestion_distance(a: &str, b: &str, max_cost: usize) -> usize {
     result
 }
 
-fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option<String> {
+pub(crate) fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option<String> {
     if candidates.len() > MAX_SUGGESTION_CANDIDATES
         || wrong_name.chars().count() > MAX_SUGGESTION_STRING_SIZE
     {
