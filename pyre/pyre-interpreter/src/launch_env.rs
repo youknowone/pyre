@@ -33,13 +33,17 @@ pub struct LaunchFlags {
     pub bytes_warning: i64,
     pub dont_write_bytecode: bool,
     pub unbuffered: bool,
-    pub warnoptions: Vec<String>,
+    /// Both option lists stay in the host's own spelling until sys module
+    /// initialization decodes them, because neither is required to be text the
+    /// host can spell in UTF-8: `-W $'ignore\xff'` reaches `sys.warnoptions` as
+    /// `'ignore\udcff'`, and PYTHONWARNINGS carries the same bytes.
+    pub warnoptions: Vec<std::ffi::OsString>,
     /// `app_main.py` passes the raw PYTHONIOENCODING value to initstdio after
     /// applying -E/-I. Keep it raw until stdio parses the optional errors part.
     pub stdio_encoding: Option<String>,
     /// Every raw `-X` value stays in a list until sys module initialization
     /// turns it into `sys._xoptions`.
-    pub xoptions: Vec<String>,
+    pub xoptions: Vec<std::ffi::OsString>,
 }
 
 impl Default for LaunchFlags {
@@ -124,6 +128,21 @@ fn read_raw(name: &str) -> Option<Vec<u8>> {
 /// an undecodable value stays distinguishable from an absent one.
 fn read(name: &str) -> Option<String> {
     read_raw(name).and_then(|value| String::from_utf8(value).ok())
+}
+
+/// Environment bytes in the host's own spelling. The seam hands back what the
+/// platform stores: bytes on unix, where any byte is legal, and the UTF-8 form
+/// of the wide value on Windows, where the host has already validated it.
+fn os_string_from_bytes(value: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(value.to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        std::ffi::OsString::from(String::from_utf8_lossy(value).into_owned())
+    }
 }
 
 /// Presence of a variable, without decoding it. `_Py_GetEnv` tests the raw
@@ -246,23 +265,26 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
     };
     // pypy/interpreter/app_main.py:892-906 — lowest-precedence entries first;
     // the warnings module installs later entries ahead of earlier ones.
-    let mut warnoptions = Vec::new();
+    let mut warnoptions: Vec<std::ffi::OsString> = Vec::new();
     if flags.dev_mode {
-        warnoptions.push("default".to_string());
+        warnoptions.push("default".into());
     }
     if !flags.ignore_environment {
-        if let Some(value) = read("PYTHONWARNINGS") {
+        // Read as bytes: a filter is free text, so `read`'s `env::var`
+        // contract would drop the whole variable for one undecodable byte
+        // rather than carry the entry `-W` would have carried.
+        if let Some(value) = read_raw("PYTHONWARNINGS") {
             if !value.is_empty() {
-                warnoptions.extend(value.split(',').map(str::to_string));
+                warnoptions.extend(value.split(|&b| b == b',').map(os_string_from_bytes));
             }
         }
     }
     warnoptions.append(&mut flags.warnoptions);
     if flags.bytes_warning > 0 {
         warnoptions.push(if flags.bytes_warning > 1 {
-            "error::BytesWarning".to_string()
+            "error::BytesWarning".into()
         } else {
-            "default::BytesWarning".to_string()
+            "default::BytesWarning".into()
         });
     }
     flags.warnoptions = warnoptions;

@@ -1575,6 +1575,24 @@ pub fn fsdecode_os_str(name: &std::ffi::OsStr) -> pyre_object::PyObjectRef {
     }
 }
 
+/// [`fsdecode_os_str`]'s buffer, for a caller that needs the spelling as text
+/// rather than as an object — a `dict` key it has to hash, say. Pairs with
+/// [`fsdecode_os_str`] the way [`fsdecode_filename_wtf8`] pairs with
+/// [`fsdecode_filename_bytes`], and for the same reason: a Rust `String`
+/// cannot hold the lone surrogate an undecodable byte becomes.
+pub fn fsdecode_os_str_wtf8(name: &std::ffi::OsStr) -> rustpython_wtf8::Wtf8Buf {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let units: Vec<u16> = name.encode_wide().collect();
+        rustpython_wtf8::Wtf8Buf::from_wide(&units)
+    }
+    #[cfg(not(windows))]
+    {
+        fsdecode_filename_wtf8(name.as_encoded_bytes())
+    }
+}
+
 /// `interp_posix.py:140-152 Path`: the syscall spelling and the resolved path
 /// object travel together. For `os.PathLike`, `w_path` is the result of the
 /// single `__fspath__` call, not the wrapper that supplied it.

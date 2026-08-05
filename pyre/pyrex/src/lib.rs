@@ -139,12 +139,16 @@ fn parse_args(
                 flags.safe_path = true;
             }
             Short('X') => {
-                let option = parser.value()?.string()?;
-                match option.as_str() {
-                    "dev" => flags.dev_mode = true,
-                    "utf8" | "utf8=1" => flags.utf8_mode = Some(1),
-                    "utf8=0" => flags.utf8_mode = Some(0),
-                    _ if option.starts_with("utf8=") => {
+                // The value reaches `sys._xoptions` in the host's own
+                // spelling, so it is kept as an `OsString`; only the options
+                // pyre acts on are matched, and every one of those is ASCII,
+                // so a value with no UTF-8 form simply cannot be one of them.
+                let option: std::ffi::OsString = parser.value()?;
+                match option.to_str() {
+                    Some("dev") => flags.dev_mode = true,
+                    Some("utf8") | Some("utf8=1") => flags.utf8_mode = Some(1),
+                    Some("utf8=0") => flags.utf8_mode = Some(0),
+                    Some(value) if value.starts_with("utf8=") => {
                         fatal_utf8_config_error("invalid -X utf8 option value")
                     }
                     _ => {}
@@ -156,7 +160,7 @@ fn parse_args(
             // the option/value in launcher parsing lets stdlib subprocesses
             // reach their command or module.
             Short('W') => {
-                flags.warnoptions.push(parser.value()?.string()?);
+                flags.warnoptions.push(parser.value()?);
             }
             // `-O` / `-OO` raise the optimization level; each occurrence counts
             // (app_main.py `optimize`). PYTHONOPTIMIZE folds in during finalize.

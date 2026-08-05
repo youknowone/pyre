@@ -1754,8 +1754,10 @@ static SYS_UNBUFFERED: AtomicBool = AtomicBool::new(false);
 // pypy/interpreter/app_main.py keeps the raw `-X` strings in
 // `options['_xoptions']` (a list) until sys initialization builds the public
 // dict.  Preserve that owner/storage shape rather than introducing a map here.
-static SYS_XOPTIONS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-static SYS_WARNOPTIONS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static SYS_XOPTIONS: LazyLock<Mutex<Vec<std::ffi::OsString>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static SYS_WARNOPTIONS: LazyLock<Mutex<Vec<std::ffi::OsString>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 static SYS_ORIG_ARGV: LazyLock<Mutex<Vec<std::ffi::OsString>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static SYS_STDIO_ENCODING: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
@@ -1795,7 +1797,7 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
 }
 
 /// Raw `-X` values recorded by the launcher, in command-line order.
-pub fn xoptions() -> Vec<String> {
+pub fn xoptions() -> Vec<std::ffi::OsString> {
     SYS_XOPTIONS.lock().unwrap().clone()
 }
 
@@ -1807,7 +1809,7 @@ pub fn unbuffered_flag() -> bool {
     SYS_UNBUFFERED.load(Ordering::Relaxed)
 }
 
-pub fn warnoptions() -> Vec<String> {
+pub fn warnoptions() -> Vec<std::ffi::OsString> {
     SYS_WARNOPTIONS.lock().unwrap().clone()
 }
 

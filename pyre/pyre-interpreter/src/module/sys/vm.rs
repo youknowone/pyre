@@ -1031,12 +1031,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     //                        for x in options['_xoptions'])
     let xoptions = w_dict_new();
     for option in crate::importing::xoptions() {
-        let (name, value) = match option.split_once('=') {
-            Some((name, value)) => (name, w_str_new(value)),
-            None => (option.as_str(), w_bool_from(true)),
+        // `split('=', 1)` over a value that need not have a UTF-8 form. `=` is
+        // ASCII, and `OsStr` documents its encoded form as splittable at an
+        // ASCII byte, so the halves are whole `OsStr`s either side of it.
+        let bytes = option.as_encoded_bytes();
+        let (name, value) = match bytes.iter().position(|&b| b == b'=') {
+            Some(eq) => {
+                let (name, value) = bytes.split_at(eq);
+                let value = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&value[1..]) };
+                (name, crate::gateway::fsdecode_os_str(value))
+            }
+            None => (bytes, w_bool_from(true)),
         };
+        let name = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(name) };
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(xoptions, name, value);
+            pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(
+                xoptions,
+                &crate::gateway::fsdecode_os_str_wtf8(name),
+                value,
+            );
         }
     }
     module_ns_store(ns, "_xoptions", xoptions);
@@ -1732,7 +1745,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         w_list_new(
             crate::importing::warnoptions()
                 .iter()
-                .map(|option| w_str_new(option))
+                .map(|option| crate::gateway::fsdecode_os_str(option))
                 .collect(),
         ),
     );
