@@ -2772,6 +2772,19 @@ impl<S: JitState> JitDriver<S> {
                     // (`RetraceNeeded` / `Declined`) that second set lands after
                     // `compile_trace` sampled `potential_retrace_position`, moving
                     // every later trace position off by the number of rewrites.
+                    // `reached_loop_header` (pyjitpl.py:2974-2989) runs on a live
+                    // MIFrame and builds `live_arg_boxes` from `greenboxes +
+                    // redboxes`; upstream has no "no symbolic state" arm, so the
+                    // `None` fallback below stands in for an invariant rather than
+                    // for a real state. It holds by construction: `merge_point`
+                    // returns early when `self.sym.is_none()`, its walk loop head
+                    // re-establishes `Some` on every iteration, and `trace_fn`
+                    // receives `&mut S::Sym` — never `&mut self` — so nothing
+                    // between the loop head and here can write the `Option`.
+                    debug_assert!(
+                        self.sym.is_some(),
+                        "reached_loop_header: sym must be live on the CloseLoop arm",
+                    );
                     let live_arg_boxes: Vec<OpRef> = match self.sym.as_ref() {
                         Some(sym) => {
                             // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
@@ -3038,6 +3051,19 @@ impl<S: JitState> JitDriver<S> {
                             .trace_ctx()
                             .and_then(|ctx| ctx.close_green_key_hash())
                             .or_else(|| self.current_trace_green_key());
+                        // The cell token a close resolves is `jump_op.getdescr()`
+                        // upstream (unroll.py:196 `cell_token =
+                        // jump_op.getdescr()`, :321-322 `jitcelltoken =
+                        // jump_op.getdescr()`), an object identity that cannot
+                        // miss, so the `unwrap_or(bridge_key)` below stands in for
+                        // an invariant. It holds: `current_trace_green_key()` is
+                        // `trace_ctx().map(|c| c.green_key())` and `merge_point`
+                        // only dispatches while `is_tracing()`, so the `or_else`
+                        // leg always answers.
+                        debug_assert!(
+                            resolved_key.is_some(),
+                            "reached_loop_header: bridge close must resolve a target green key",
+                        );
                         if crate::closedbg_enabled() {
                             eprintln!(
                                 "@@@CLOSE BRIDGE-TARGET close_greens={close_greens:?} resolved_key={} origin_key={}",
