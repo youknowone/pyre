@@ -9421,16 +9421,31 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
         // PyPy `pyopcode.py BEFORE_WITH` / `BEFORE_ASYNC_WITH` converts a
         // missing special method into the protocol-level TypeError here,
         // rather than leaking the AttributeError from an ordinary attribute
-        // lookup.  Keep the sync/async distinction shared with the JIT
-        // residual as well.
-        let protocol = match name {
-            "__aenter__" | "__aexit__" => {
-                "asynchronous context manager protocol (no __aenter__/__aexit__ method)"
-            }
-            _ => "context manager protocol (no __enter__/__exit__ method)",
+        // lookup.  The message names the specific missing method and suggests
+        // the other protocol when both of its methods are present.
+        let asynchronous = matches!(name, "__aenter__" | "__aexit__");
+        let protocol = if asynchronous {
+            "asynchronous context manager protocol"
+        } else {
+            "context manager protocol"
+        };
+        let suggestion = if !w_type.is_null()
+            && name == "__exit__"
+            && unsafe { lookup_in_type(w_type, "__aenter__") }.is_some()
+            && unsafe { lookup_in_type(w_type, "__aexit__") }.is_some()
+        {
+            " but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?"
+        } else if !w_type.is_null()
+            && name == "__aexit__"
+            && unsafe { lookup_in_type(w_type, "__enter__") }.is_some()
+            && unsafe { lookup_in_type(w_type, "__exit__") }.is_some()
+        {
+            " but it supports the context manager protocol. Did you mean to use 'with'?"
+        } else {
+            ""
         };
         crate::PyError::type_error(format!(
-            "'{}' object does not support the {protocol}",
+            "'{}' object does not support the {protocol} (missed {name} method){suggestion}",
             object_functionstr_type_name(obj),
         ))
     })?;
