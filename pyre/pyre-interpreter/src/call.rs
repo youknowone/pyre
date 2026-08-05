@@ -3649,25 +3649,18 @@ fn call_metaclass_with_kwargs(
     kwargs: PyObjectRef,
 ) -> PyObjectRef {
     if unsafe { !pyre_object::is_type(w_metaclass) } {
-        // compiling.py:213-219 — `space.call_args(w_meta, Arguments(name,
+        // compiling.py:215-221 — `space.call_args(w_meta, Arguments(name,
         // bases, ns, **kwds))`; a non-type metaclass receives the
-        // class-definition keywords too.
+        // class-definition keywords too, and `call_args`
+        // (descroperation.py:189) takes no frame.
         let kwds: Vec<(Wtf8Buf, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs) } {
             unsafe { pyre_object::w_dict_str_entries_wtf8(kwargs) }
         } else {
             Vec::new()
         };
-        let frame = {
-            let stored = take_last_exec_ctx();
-            if stored.is_null() {
-                std::ptr::null_mut()
-            } else {
-                unsafe { (*stored).gettopframe_raw() }
-            }
-        };
-        if !kwds.is_empty() && !frame.is_null() {
-            return match call_with_kwargs(
-                unsafe { &mut *frame },
+        if !kwds.is_empty() {
+            return match call_with_kwargs_in_ctx(
+                take_last_exec_ctx(),
                 w_metaclass,
                 &[name, bases, w_namespace_dict],
                 &kwds,
@@ -4075,26 +4068,18 @@ fn build_class_inner(
         // namespace.
         match crate::baseobjspace::getattr_str(w_metaclass, "__prepare__") {
             Ok(prepare) => {
-                // compiling.py:190-196 — call __prepare__ with the
+                // compiling.py:194-199 — call __prepare__ with the
                 // class-definition keywords ('metaclass' already popped by
-                // the caller).
+                // the caller), through the frameless `space.call_args`.
                 let prepare_kwds: Vec<(Wtf8Buf, PyObjectRef)> = match current_kwds() {
                     Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
                         pyre_object::w_dict_str_entries_wtf8(kw)
                     },
                     _ => Vec::new(),
                 };
-                let prepare_frame = {
-                    let stored = take_last_exec_ctx();
-                    if stored.is_null() {
-                        std::ptr::null_mut()
-                    } else {
-                        unsafe { (*stored).gettopframe_raw() }
-                    }
-                };
-                let ns_obj = if !prepare_kwds.is_empty() && !prepare_frame.is_null() {
-                    call_with_kwargs(
-                        unsafe { &mut *prepare_frame },
+                let ns_obj = if !prepare_kwds.is_empty() {
+                    call_with_kwargs_in_ctx(
+                        take_last_exec_ctx(),
                         prepare,
                         &[pyre_object::w_str_new(name), bases],
                         &prepare_kwds,
@@ -4865,37 +4850,15 @@ pub(crate) fn call_init_subclass_on_bases(
     let w_objtype = crate::builtins::super_check(w_type, w_type)?;
     let w_super = pyre_object::descriptor::w_super_new(w_type, w_objtype, w_type);
     let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
-    // `__args__.replace_arguments([])` — keywords only, no positionals.
+    // typeobject.py:1025-1026 — `args = __args__.replace_arguments([])` then
+    // `space.call_args(w_func, args)`: keywords only, no positionals, and no
+    // frame, because `call_args` (descroperation.py:189) never takes one.
     let kwds: Vec<(Wtf8Buf, PyObjectRef)> = init_subclass_kwargs
         .iter()
         .filter(|(k, _)| unsafe { pyre_object::is_str(*k) })
         .map(|(k, v)| (unsafe { pyre_object::w_str_get_wtf8(*k) }.to_owned(), *v))
         .collect();
-    let frame = {
-        let stored = take_last_exec_ctx();
-        if stored.is_null() {
-            std::ptr::null_mut()
-        } else {
-            unsafe { (*stored).gettopframe_raw() }
-        }
-    };
-    if !frame.is_null() {
-        call_with_kwargs(unsafe { &mut *frame }, w_func, &[], &kwds)?;
-    } else if kwds.is_empty() {
-        // No live frame to thread through call_with_kwargs (direct
-        // embedding entry); the bound method carries the receiver.
-        clear_call_error();
-        let res = crate::call_function(w_func, &[]);
-        if res.is_null() {
-            if let Some(err) = take_call_error() {
-                return Err(err);
-            }
-        }
-    } else {
-        return Err(crate::PyError::type_error(
-            "__init_subclass__() takes no keyword arguments",
-        ));
-    }
+    call_with_kwargs_in_ctx(take_last_exec_ctx(), w_func, &[], &kwds)?;
     Ok(())
 }
 
