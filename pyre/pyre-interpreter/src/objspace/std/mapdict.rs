@@ -1766,16 +1766,15 @@ pub unsafe fn load_attr_unboxed_fast_path(
 /// caller separately proves that the incoming value has the slot's unbox
 /// type before performing the in-place write (mapdict.py:615-619).
 ///
-/// Resolving marks the attribute `ever_mutated`, as `STORE_ATTR_caching` does
-/// before `_direct_write` (mapdict.py:1635-1637): the write the caller folds
-/// out of the trace must not leave the attribute looking unmutated.
+/// The resolved attribute node is returned so the caller can mark it
+/// `ever_mutated` once it has committed to folding the write out of the trace.
 ///
 /// # Safety
 /// `w_obj` must be a live object.
 pub unsafe fn store_attr_unboxed_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, MapRef, usize, usize, UnboxType)> {
+) -> Option<(PyObjectRef, u64, MapRef, usize, usize, UnboxType, MapRef)> {
     if name == "__class__" {
         return None;
     }
@@ -1814,9 +1813,15 @@ pub unsafe fn store_attr_unboxed_fast_path(
     let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
     let p = unsafe { (*attr).as_plain() };
     let u = p.unboxed.as_ref()?;
-    // mapdict.py:1635-1636 `if not attr.ever_mutated: attr.ever_mutated = True`.
-    p.set_ever_mutated(true);
-    Some((w_type, version_tag, map, p.storageindex, u.listindex, u.typ))
+    Some((
+        w_type,
+        version_tag,
+        map,
+        p.storageindex,
+        u.listindex,
+        u.typ,
+        attr,
+    ))
 }
 
 /// Resolve an existing boxed plain slot through the STORE_ATTR caching gates.
@@ -1824,15 +1829,15 @@ pub unsafe fn store_attr_unboxed_fast_path(
 /// needs only the guarded map and storage index for the direct write
 /// (mapdict.py:446-447).
 ///
-/// Marks `ever_mutated` on the resolved attribute for the same reason as
-/// [`store_attr_unboxed_fast_path`].
+/// The resolved attribute node is returned so the caller can mark it
+/// `ever_mutated` once it has committed to folding the write out of the trace.
 ///
 /// # Safety
 /// `w_obj` must be a live object.
 pub unsafe fn store_attr_boxed_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, MapRef, usize)> {
+) -> Option<(PyObjectRef, u64, MapRef, usize, MapRef)> {
     if name == "__class__" {
         return None;
     }
@@ -1873,9 +1878,17 @@ pub unsafe fn store_attr_boxed_fast_path(
     if p.unboxed.is_some() {
         return None;
     }
-    // mapdict.py:1635-1636 `if not attr.ever_mutated: attr.ever_mutated = True`.
-    p.set_ever_mutated(true);
-    Some((w_type, version_tag, map, p.storageindex))
+    Some((w_type, version_tag, map, p.storageindex, attr))
+}
+
+/// mapdict.py:1635-1636 `if not attr.ever_mutated: attr.ever_mutated = True`
+/// — performed by the caller once it has committed to folding the store
+/// out of the trace, so a declined resolution mutates nothing.
+///
+/// # Safety
+/// `attr` must point at a live `PlainAttribute` map node.
+pub unsafe fn mark_attr_ever_mutated(attr: MapRef) {
+    unsafe { (*attr).as_plain() }.set_ever_mutated(true);
 }
 
 /// The map transition an attribute-adding STORE_ATTR takes, resolved without
@@ -1887,6 +1900,8 @@ pub struct StoreAttrAdd {
     pub version_tag: u64,
     /// The instance's current map, which the caller guards.
     pub map: MapRef,
+    /// The cached transition holder whose `typ` and `attr` the resolution read.
+    pub holder: *const CachedAttributeHolder,
     /// The `PlainAttribute` the instance's map becomes — a direct child of
     /// `map`, so the transition is `map -> new_map` with no reordering.
     pub new_map: MapRef,
@@ -1897,6 +1912,11 @@ pub struct StoreAttrAdd {
     /// one-element longlong list. Only `Int` today; a float pick stays on
     /// the residual.
     pub unbox_type: Option<UnboxType>,
+    /// The value returned by `pick_unbox_type`. This is distinct from
+    /// `unbox_type`, which is `None` when a cached boxed transition serves an
+    /// unboxable value. `picked_unbox.is_some()` means the pick read the
+    /// terminator's `allow_unboxing` flag as true.
+    pub picked_unbox: Option<UnboxType>,
 }
 
 /// Resolve the `map -> PlainAttribute` transition that a STORE_ATTR adding a
@@ -2044,9 +2064,11 @@ pub unsafe fn store_attr_add_fast_path(
         w_type,
         version_tag,
         map,
+        holder,
         new_map,
         storageindex: p.storageindex,
         unbox_type,
+        picked_unbox: unbox,
     })
 }
 
@@ -2903,9 +2925,11 @@ unsafe fn value_has_unbox_type(typ: UnboxType, w_value: PyObjectRef) -> bool {
 }
 
 /// mapdict.py:437-444 `PlainAttribute._direct_read` / `_prim_direct_read` /
-/// `_pure_direct_read` (identical bodies; the `@jit.elidable` `_pure_direct_read`
-/// variant is applied when the read is JIT-wired). `unerase_item` is identity.
-/// For an `UnboxedPlainAttribute` this is mapdict.py:592-612.
+/// `_pure_direct_read` have identical bodies; the `@jit.elidable`
+/// `_pure_direct_read` variant is applied when the read is JIT-wired.
+/// `unerase_item` is identity. For an `UnboxedPlainAttribute`,
+/// mapdict.py:592-612 gives `_direct_read` the allow-unboxing conversion tail;
+/// pyre places that tail in `maybe_migrate_to_boxed`.
 ///
 /// # Safety
 /// `attr` must point to a live `PlainAttribute` map node.
@@ -3007,8 +3031,10 @@ pub unsafe fn node_read<O: MapdictObject>(
 ) -> Option<PyObjectRef> {
     match unsafe { find_map_attr(self_node, name, attrkind) } {
         // The `jit.isconstant(attr) and jit.isconstant(obj) and not
-        // attr.ever_mutated` guard selects `_pure_direct_read`; both variants
-        // have the same body (mapdict.py:60-65).
+        // attr.ever_mutated` guard selects `_pure_direct_read`
+        // (mapdict.py:60-65). The PlainAttribute variants have the same body;
+        // UnboxedPlainAttribute._direct_read's conversion tail lives in
+        // `maybe_migrate_to_boxed`.
         Some(attr) => Some(unsafe { plain_direct_read(attr, obj) }),
         None => unsafe { terminator_read((*self_node).terminator(), obj, name, attrkind) },
     }

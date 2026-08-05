@@ -2630,6 +2630,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(None);
     };
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, version_tag, map)?;
+    let terminator = unsafe { (*map).terminator() };
+    let term = unsafe { (*terminator).as_terminator() as *const _ };
+    walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
 
     // `_prim_direct_read` (mapdict.py): read the raw longlong from the
     // shared list through a non-forcing, non-elidable residual.  Both indices
@@ -3170,7 +3173,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             None => return Ok(None),
         }
     };
-    if let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = unsafe {
+    if let Some((w_type, version_tag, map, storageindex, listindex, unbox_type, attr)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::store_attr_unboxed_fast_path(concrete_obj, &name)
     } {
         match unbox_type {
@@ -3202,6 +3205,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             version_tag,
             map,
         )?;
+        unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
         let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
         let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
         let (helper_fn, raw, value_type) = match unbox_type {
@@ -3444,6 +3448,22 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             add.version_tag,
             add.map,
         )?;
+        walker_pin_holder_typ(ctx, op_pc, add.holder)?;
+        // This marker is not redundant with the instance-map GuardValue. The
+        // fold bakes `add.new_map`, the transition target, as a green
+        // `const_int`, while the guard pins `add.map`, the instance map before
+        // the transition. `holder_pick_attr` can replace `holder.attr` with a
+        // fresh `PlainAttribute` without changing any instance's current map;
+        // this marker protects the baked target.
+        walker_pin_holder_attr(ctx, op_pc, add.holder)?;
+        // General rule: plant the `allow_unboxing` marker only where the fold
+        // read the flag as true. Marking a false read re-arms a permanently
+        // dead field and lets later writes invalidate without bound.
+        if add.picked_unbox.is_some() {
+            let terminator = unsafe { (*add.map).terminator() };
+            let term = unsafe { (*terminator).as_terminator() as *const _ };
+            walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
+        }
         let new_map_const = ctx.trace_ctx.const_int(add.new_map as i64);
         match value_pin {
             StoreAttrAddValuePin::Boxed => {
@@ -3485,12 +3505,13 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         return Ok(Some(WalkerStoreAttrSpecialization::Direct));
     }
 
-    let Some((w_type, version_tag, map, storageindex)) = (unsafe {
+    let Some((w_type, version_tag, map, storageindex, attr)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::store_attr_boxed_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
     };
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, version_tag, map)?;
+    unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
     let helper = ctx
         .trace_ctx

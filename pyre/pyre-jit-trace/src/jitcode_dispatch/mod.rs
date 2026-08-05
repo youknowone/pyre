@@ -7896,6 +7896,61 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
     Ok(true)
 }
 
+/// Pin mapdict's quasi-immutable fields with `const_ref`, never `const_int`:
+/// `install_quasiimmut_field`, `current_quasiimmut_field_value`, and optimizer
+/// dependency collection require `Value::Ref`. The raw non-GC pointer cannot
+/// reach the gcref table because `OptHeap` consumes `QUASIIMMUT_FIELD` before
+/// the GC rewriter runs, exactly as `walker_pin_namespace_version` relies on.
+///
+/// The owner is the enum variant payload, never `MapNode`: the enum has no
+/// `repr`, while the descr offsets are relative to `Terminator` and
+/// `PlainAttribute`. `CachedAttributeHolder` is already standalone.
+///
+/// `walker_flush_guard_not_invalidated` drains a pending flag, so consecutive
+/// markers at one fold site emit exactly one `GUARD_NOT_INVALIDATED`.
+fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    term: *const pyre_interpreter::objspace::std::mapdict::Terminator,
+) -> Result<(), DispatchError> {
+    if term.is_null() {
+        return Ok(());
+    }
+    let owner = ctx.trace_ctx.const_ref(term as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::terminator_allow_unboxing_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
+fn walker_pin_holder_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    holder: *const pyre_interpreter::objspace::std::mapdict::CachedAttributeHolder,
+) -> Result<(), DispatchError> {
+    if holder.is_null() {
+        return Ok(());
+    }
+    let owner = ctx.trace_ctx.const_ref(holder as i64);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, crate::descr::holder_attr_descr());
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
+fn walker_pin_holder_typ<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    holder: *const pyre_interpreter::objspace::std::mapdict::CachedAttributeHolder,
+) -> Result<(), DispatchError> {
+    if holder.is_null() {
+        return Ok(());
+    }
+    let owner = ctx.trace_ctx.const_ref(holder as i64);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, crate::descr::holder_typ_descr());
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
 fn walker_record_getfield_gc_r_uncached<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     obj: OpRef,
