@@ -1,4 +1,3 @@
-# pyre-check: max-pypy-ratio=23
 # Regression guard for the reentrant import lock's Python-visible semantics.
 # The lock carries three pieces of state -- the allocated lock, the owning
 # execution context, and the recursion depth -- and several of the observables

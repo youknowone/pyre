@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=57
+# pyre-check: min-pypy-ratio=13
 # Regression for wasm CA frames: this self-recursive body reaches the raw
 # float-power residual call (CallF, hence the host jit_call trampoline) and
 # allocates a string at every recursive level. Once the recursion bridge is
@@ -19,7 +20,7 @@ def descend(n):
 def run():
     total = 0
     i = 0
-    while i < 240:
+    while i < 3500:
         total += descend(10)
         i += 1
     return total
