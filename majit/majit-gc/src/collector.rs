@@ -1550,7 +1550,10 @@ impl MiniMarkGC {
         });
         let total = crate::bh_probe_record_violations(fresh);
         if total >= CLASS_BUDGET || (total > 0 && self.minor_collections >= REPORT_AT_MINOR) {
-            panic!("{}", crate::bh_probe_violation_report(self.minor_collections));
+            panic!(
+                "{}",
+                crate::bh_probe_violation_report(self.minor_collections)
+            );
         }
     }
 
@@ -1571,8 +1574,10 @@ impl MiniMarkGC {
         if crate::bh_probe_enabled() {
             let lo = self.nursery.start_ptr() as usize;
             crate::BH_PROBE_NURSERY_LO.store(lo, std::sync::atomic::Ordering::Relaxed);
-            crate::BH_PROBE_NURSERY_HI
-                .store(lo + self.nursery.size(), std::sync::atomic::Ordering::Relaxed);
+            crate::BH_PROBE_NURSERY_HI.store(
+                lo + self.nursery.size(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         // `do_malloc_fixedsize_clear` and the resume.py direct reader both
         // require a zero-filled payload.  In particular, resume

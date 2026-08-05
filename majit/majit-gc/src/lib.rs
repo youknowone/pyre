@@ -2674,7 +2674,9 @@ pub struct BhProbePhase(&'static str);
 
 impl BhProbePhase {
     pub fn enter(name: &'static str) -> Self {
-        let prev = BH_PROBE_PHASE.try_with(|c| c.replace(name)).unwrap_or("interp");
+        let prev = BH_PROBE_PHASE
+            .try_with(|c| c.replace(name))
+            .unwrap_or("interp");
         BhProbePhase(prev)
     }
 }
