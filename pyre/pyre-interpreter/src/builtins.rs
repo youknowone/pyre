@@ -11682,15 +11682,26 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
                 return Ok(hash);
             }
-            let n = w_tuple_len(obj);
+            // `try_hash_value` runs each element's `__hash__`, which may
+            // collect; `obj` is a raw local re-read in the loop and after it, so
+            // pin it on the shadow stack.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let mut hashes = Vec::with_capacity(n);
             for i in 0..(n as i64) {
-                if let Some(item) = w_tuple_getitem(obj, i) {
+                if let Some(item) =
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i)
+                {
                     hashes.push(try_hash_value(item)?);
                 }
             }
             let hash = _hash_tuple_xx(&hashes);
-            pyre_object::w_tuple_set_cached_hash(obj, hash);
+            pyre_object::w_tuple_set_cached_hash(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                hash,
+            );
             return Ok(hash);
         }
         if pyre_object::is_frozenset(obj) {
@@ -11703,17 +11714,32 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // surfaces its TypeError instead of being swallowed.
             let origin = pyre_object::w_generic_alias_get_origin(obj);
             let args = pyre_object::w_generic_alias_get_args(obj);
-            return Ok(try_hash_value(origin)? ^ try_hash_value(args)?);
+            // `try_hash_value(origin)` may collect; `args` is a raw local read
+            // afterward, so pin it across the first hash.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let args_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(args);
+            let origin_hash = try_hash_value(origin)?;
+            let args_hash = try_hash_value(pyre_object::gc_roots::shadow_stack_get(args_slot))?;
+            return Ok(origin_hash ^ args_hash);
         }
         if pyre_object::is_union(obj) {
             // UnionType.__hash__ (`_pypy_generic_alias.py:275`) —
             // `hash(frozenset(self.__args__))`, order-independent so it
             // agrees with `__eq__`'s set equality.
             let args = pyre_object::w_union_get_args(obj);
-            let n = pyre_object::w_tuple_len(args);
+            // `try_hash_value` runs each member's `__hash__`, which may collect;
+            // `args` is a raw local re-read in the loop, so pin it.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let args_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(args);
+            let n = pyre_object::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot));
             let mut hashes = Vec::with_capacity(n);
             for i in 0..n {
-                if let Some(item) = pyre_object::w_tuple_getitem(args, i as i64) {
+                if let Some(item) = pyre_object::w_tuple_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(args_slot),
+                    i as i64,
+                ) {
                     // Preserve frozenset construction's fallible element-hash
                     // phase.  Building a low-level frozenset first would use
                     // its stored infallible digest path and hide an
@@ -11771,9 +11797,16 @@ fn slice_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             pyre_object::sliceobject::w_slice_get_step(obj),
         ]
     };
+    // `try_hash_value` runs each component's `__hash__`, which may collect; the
+    // captured parts array holds raw locals, so pin them on the shadow stack.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for &part in parts.iter() {
+        pyre_object::gc_roots::pin_root(part);
+    }
     let mut acc = PRIME5;
-    for part in parts {
-        let lane = try_hash_value(part)? as u64;
+    for j in 0..parts.len() {
+        let lane = try_hash_value(pyre_object::gc_roots::shadow_stack_get(base + j))? as u64;
         acc = acc.wrapping_add(lane.wrapping_mul(PRIME2));
         acc = acc.rotate_left(31);
         acc = acc.wrapping_mul(PRIME1);

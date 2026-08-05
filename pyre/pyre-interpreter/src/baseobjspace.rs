@@ -748,10 +748,20 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         }
         // abstractinst.py:108-114 — tuple recursion.
         if is_tuple(classinfo) {
-            let n = w_tuple_len(classinfo);
+            // The recursive `isinstance` re-enters Python (`__instancecheck__`)
+            // and may collect; `obj` and the classinfo tuple are raw locals, so
+            // pin them on the shadow stack across the walk.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let info_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(classinfo);
+            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(info_slot));
             for i in 0..n {
-                if let Some(c) = w_tuple_getitem(classinfo, i as i64) {
-                    if isinstance(obj, c)? {
+                if let Some(c) =
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(info_slot), i as i64)
+                {
+                    if isinstance(pyre_object::gc_roots::shadow_stack_get(obj_slot), c)? {
                         return Ok(true);
                     }
                 }
@@ -761,10 +771,17 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         // PEP 604 `X | Y` union recursion — lib_pypy/_pypy_generic_alias.py.
         if pyre_object::is_union(classinfo) {
             let union_args = pyre_object::w_union_get_args(classinfo);
-            let n = w_tuple_len(union_args);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let args_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(union_args);
+            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot));
             for i in 0..n {
-                if let Some(c) = w_tuple_getitem(union_args, i as i64) {
-                    if isinstance(obj, c)? {
+                if let Some(c) =
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(args_slot), i as i64)
+                {
+                    if isinstance(pyre_object::gc_roots::shadow_stack_get(obj_slot), c)? {
                         return Ok(true);
                     }
                 }
@@ -811,10 +828,20 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
     unsafe {
         // abstractinst.py:181-187 — tuple recursion.
         if is_tuple(classinfo) {
-            let n = w_tuple_len(classinfo);
+            // The recursive `issubclass` re-enters Python (`__subclasscheck__`)
+            // and may collect; `derived` and the classinfo tuple are raw locals,
+            // so pin them on the shadow stack across the walk.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let derived_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(derived);
+            let info_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(classinfo);
+            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(info_slot));
             for i in 0..n {
-                if let Some(c) = w_tuple_getitem(classinfo, i as i64) {
-                    if issubclass(derived, c)? {
+                if let Some(c) =
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(info_slot), i as i64)
+                {
+                    if issubclass(pyre_object::gc_roots::shadow_stack_get(derived_slot), c)? {
                         return Ok(true);
                     }
                 }
@@ -823,10 +850,17 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
         }
         if pyre_object::is_union(classinfo) {
             let union_args = pyre_object::w_union_get_args(classinfo);
-            let n = w_tuple_len(union_args);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let derived_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(derived);
+            let args_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(union_args);
+            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot));
             for i in 0..n {
-                if let Some(c) = w_tuple_getitem(union_args, i as i64) {
-                    if issubclass(derived, c)? {
+                if let Some(c) =
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(args_slot), i as i64)
+                {
+                    if issubclass(pyre_object::gc_roots::shadow_stack_get(derived_slot), c)? {
                         return Ok(true);
                     }
                 }
@@ -18044,11 +18078,22 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             }
             match kind {
                 pyre_object::dictmultiobject::DictViewKind::Keys => {
+                    // `w_dict_lookup_checked` runs the key's `__eq__` and may
+                    // collect; `needle` is a raw local read again on the error
+                    // path, so pin it across the probe.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let needle_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(needle);
                     return match unsafe {
-                        pyre_object::dictmultiobject::w_dict_lookup_checked(dict, needle)
+                        pyre_object::dictmultiobject::w_dict_lookup_checked(
+                            dict,
+                            pyre_object::gc_roots::shadow_stack_get(needle_slot),
+                        )
                     } {
                         Ok(v) => Ok(v.is_some()),
-                        Err(_) => Err(take_pending_dict_key_error(needle)),
+                        Err(_) => Err(take_pending_dict_key_error(
+                            pyre_object::gc_roots::shadow_stack_get(needle_slot),
+                        )),
                     };
                 }
                 pyre_object::dictmultiobject::DictViewKind::Items => {
@@ -18063,18 +18108,46 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                         Some(v) => v,
                         None => return Ok(false),
                     };
+                    // `w_dict_lookup_checked` runs the key's `__eq__` and may
+                    // collect; `k` (error path) and `want` (success path) are
+                    // raw locals read after the probe, so pin them across it.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let k_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(k);
+                    let want_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(want);
                     return match unsafe {
-                        pyre_object::dictmultiobject::w_dict_lookup_checked(dict, k)
+                        pyre_object::dictmultiobject::w_dict_lookup_checked(
+                            dict,
+                            pyre_object::gc_roots::shadow_stack_get(k_slot),
+                        )
                     } {
-                        Ok(Some(have)) => eq_w(have, want),
+                        Ok(Some(have)) => {
+                            eq_w(have, pyre_object::gc_roots::shadow_stack_get(want_slot))
+                        }
                         Ok(None) => Ok(false),
-                        Err(_) => Err(take_pending_dict_key_error(k)),
+                        Err(_) => Err(take_pending_dict_key_error(
+                            pyre_object::gc_roots::shadow_stack_get(k_slot),
+                        )),
                     };
                 }
                 pyre_object::dictmultiobject::DictViewKind::Values => {
-                    // values view: PyPy uses iter-based scan.
-                    for (_, v) in pyre_object::w_dict_items(dict) {
-                        if eq_w(v, needle)? {
+                    // values view: PyPy uses iter-based scan.  `eq_w` re-enters
+                    // Python and may collect; the snapshot's values and the
+                    // needle are raw locals, so pin them on the shadow stack.
+                    let items = pyre_object::w_dict_items(dict);
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let needle_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(needle);
+                    let base = pyre_object::gc_roots::shadow_stack_len();
+                    for (_, v) in &items {
+                        pyre_object::gc_roots::pin_root(*v);
+                    }
+                    for j in 0..items.len() {
+                        if eq_w(
+                            pyre_object::gc_roots::shadow_stack_get(base + j),
+                            pyre_object::gc_roots::shadow_stack_get(needle_slot),
+                        )? {
                             return Ok(true);
                         }
                     }
@@ -18107,10 +18180,19 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             ));
         }
         if is_tuple(haystack) {
-            let len = w_tuple_len(haystack);
+            // `eq_w` re-enters Python and may collect; the tuple and needle are
+            // raw locals, so pin them on the shadow stack across the scan.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let hay_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(haystack);
+            let needle_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(needle);
+            let len = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(hay_slot));
             for i in 0..len {
-                if let Some(item) = w_tuple_getitem(haystack, i as i64) {
-                    if eq_w(item, needle)? {
+                if let Some(item) =
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(hay_slot), i as i64)
+                {
+                    if eq_w(item, pyre_object::gc_roots::shadow_stack_get(needle_slot))? {
                         return Ok(true);
                     }
                 }
@@ -18183,9 +18265,19 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
         }
         // dict: key containment (dictmultiobject.py __contains__)
         if is_dict(haystack) {
-            return match pyre_object::dictmultiobject::w_dict_lookup_checked(haystack, needle) {
+            // `w_dict_lookup_checked` runs the key's `__eq__` and may collect;
+            // `needle` is a raw local read again on the error path, so pin it.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let needle_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(needle);
+            return match pyre_object::dictmultiobject::w_dict_lookup_checked(
+                haystack,
+                pyre_object::gc_roots::shadow_stack_get(needle_slot),
+            ) {
                 Ok(v) => Ok(v.is_some()),
-                Err(_) => Err(take_pending_dict_key_error(needle)),
+                Err(_) => Err(take_pending_dict_key_error(
+                    pyre_object::gc_roots::shadow_stack_get(needle_slot),
+                )),
             };
         }
         // set / frozenset (setobject.py W_BaseSetObject.descr_contains)
@@ -18238,10 +18330,17 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
         }
         Err(err) => return Err(err),
     };
+    // `next`/`eq_w` re-enter Python and may collect; the iterator and needle
+    // are raw locals, so pin them on the shadow stack across the scan.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(iterator);
+    let needle_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(needle);
     loop {
-        match next(iterator) {
+        match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
             Ok(item) => {
-                if eq_w(item, needle)? {
+                if eq_w(item, pyre_object::gc_roots::shadow_stack_get(needle_slot))? {
                     return Ok(true);
                 }
             }

@@ -1267,3 +1267,274 @@ assert load_big() is first
         "rbigint code constant gc stress program failed",
     );
 }
+
+/// `contains`'s tuple membership scan (`baseobjspace::contains`) holds the
+/// haystack tuple and the needle in Rust locals while `eq_w` runs the element's
+/// `__eq__`, which collects. A minor collection forwards the young tuple, so a
+/// raw local reused for the next `w_tuple_getitem` would read a swept slot.
+/// Regression for the missing shadow-stack pin on the `is_tuple(haystack)` arm.
+#[test]
+fn tuple_contains_scan_survives_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class Bomb:
+    def __init__(self, v):
+        self.v = v
+    def __eq__(self, other):
+        gc.collect()
+        return self.v == other.v
+
+hits = 0
+i = 0
+while i < 60:
+    box = (Bomb(1), Bomb(2), Bomb(3), Bomb(7))
+    if Bomb(7) in box:
+        hits += 1
+    junk = [0] * 64
+    i += 1
+assert hits == 60, hits
+"#,
+        "<tuple_contains_gc_rooting>",
+        "tuple-contains scan callback-root checks",
+        "tuple contains callback GC rooting program failed",
+    );
+}
+
+/// `contains`'s iterable fallback (`descroperation.py:514 sequence_contains`
+/// analogue) holds the iterator and needle in Rust locals while `next` and
+/// `eq_w` run Python and collect. The sibling `sequence_contains` pins both;
+/// this duplicate on the generic-iterable path must too.
+#[test]
+fn iterable_contains_fallback_survives_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class Bomb:
+    def __init__(self, v):
+        self.v = v
+    def __eq__(self, other):
+        gc.collect()
+        return self.v == other.v
+
+class Seq:
+    def __init__(self, vals):
+        self.vals = vals
+    def __iter__(self):
+        return SeqIter(self.vals)
+
+class SeqIter:
+    def __init__(self, vals):
+        self.vals = vals
+        self.i = 0
+    def __iter__(self):
+        return self
+    def __next__(self):
+        if self.i >= len(self.vals):
+            raise StopIteration
+        v = self.vals[self.i]
+        self.i += 1
+        return v
+
+hits = 0
+i = 0
+while i < 60:
+    seq = Seq([Bomb(1), Bomb(2), Bomb(3), Bomb(7)])
+    if Bomb(7) in seq:
+        hits += 1
+    junk = [0] * 64
+    i += 1
+assert hits == 60, hits
+"#,
+        "<iterable_contains_gc_rooting>",
+        "iterable-contains fallback callback-root checks",
+        "iterable contains fallback callback GC rooting program failed",
+    );
+}
+
+/// `w_list_find_or_count`'s generic strategy loop holds the list and the needle
+/// in Rust locals while `eq_w` runs the element's `__eq__` and collects. The
+/// loop re-reads `w_list_len`/`w_list_getitem` from the raw list each iteration,
+/// so a forwarded young list would be read from a swept slot.
+#[test]
+fn list_contains_scan_survives_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class Bomb:
+    def __init__(self, v):
+        self.v = v
+    def __eq__(self, other):
+        gc.collect()
+        return self.v == other.v
+
+hits = 0
+i = 0
+while i < 60:
+    box = [Bomb(1), Bomb(2), Bomb(3), Bomb(7)]
+    if Bomb(7) in box:
+        hits += 1
+    junk = [0] * 64
+    i += 1
+assert hits == 60, hits
+"#,
+        "<list_contains_gc_rooting>",
+        "list-contains scan callback-root checks",
+        "list contains callback GC rooting program failed",
+    );
+}
+
+/// `isinstance`'s tuple-classinfo recursion holds `obj` and the classinfo tuple
+/// in Rust locals while the recursive `isinstance` runs a metaclass
+/// `__instancecheck__` that collects. A forwarded young tuple would make the
+/// next `w_tuple_getitem(classinfo, i)` read a swept slot.
+#[test]
+fn isinstance_tuple_classinfo_survives_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class Meta(type):
+    def __instancecheck__(cls, obj):
+        gc.collect()
+        return False
+
+class A(metaclass=Meta):
+    pass
+
+class B(metaclass=Meta):
+    pass
+
+class C(metaclass=Meta):
+    pass
+
+class Real:
+    pass
+
+r = Real()
+hits = 0
+i = 0
+while i < 60:
+    classinfo = (A, B, C, Real)
+    if isinstance(r, classinfo):
+        hits += 1
+    junk = [0] * 64
+    i += 1
+assert hits == 60, hits
+"#,
+        "<isinstance_tuple_gc_rooting>",
+        "isinstance tuple-classinfo callback-root checks",
+        "isinstance tuple classinfo callback GC rooting program failed",
+    );
+}
+
+/// The `values()`-view membership scan holds the dict-items snapshot's values
+/// and the needle in Rust locals while `eq_w` runs the value's `__eq__` and
+/// collects. Regression for the un-pinned `w_dict_items` snapshot on the
+/// `DictViewKind::Values` arm.
+#[test]
+fn dict_values_view_contains_survives_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class Bomb:
+    def __init__(self, v):
+        self.v = v
+    def __eq__(self, other):
+        gc.collect()
+        return self.v == other.v
+
+hits = 0
+i = 0
+while i < 60:
+    d = {0: Bomb(1), 1: Bomb(2), 2: Bomb(3), 3: Bomb(7)}
+    if Bomb(7) in d.values():
+        hits += 1
+    junk = [0] * 64
+    i += 1
+assert hits == 60, hits
+"#,
+        "<dict_values_view_gc_rooting>",
+        "dict values-view contains callback-root checks",
+        "dict values-view contains callback GC rooting program failed",
+    );
+}
+
+/// `try_hash_value`'s tuple element walk holds the tuple in a Rust local while
+/// each element's `__hash__` runs Python and collects; it re-reads
+/// `w_tuple_getitem` from the raw tuple in the loop and stores the cached hash
+/// on it afterward. A forwarded young tuple would be read/written at a swept
+/// slot. The per-element `v` gives a deterministic tuple hash across rounds.
+#[test]
+fn tuple_hash_element_walk_survives_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class H:
+    def __init__(self, v):
+        self.v = v
+    def __hash__(self):
+        gc.collect()
+        return self.v
+    def __eq__(self, other):
+        return self is other
+
+expected = None
+i = 0
+while i < 60:
+    t = (H(1), H(2), H(3), H(4))
+    h = hash(t)
+    if expected is None:
+        expected = h
+    else:
+        assert h == expected, (h, expected)
+    junk = [0] * 64
+    i += 1
+"#,
+        "<tuple_hash_gc_rooting>",
+        "tuple-hash element walk callback-root checks",
+        "tuple hash element walk callback GC rooting program failed",
+    );
+}
+
+/// `slice_hash_value` captures `[start, stop, step]` into a Rust array, then
+/// hashes each while the component `__hash__` runs Python and collects. A
+/// forwarded young component would leave a later array entry pointing at a swept
+/// slot. The per-component `v` gives a deterministic slice hash across rounds.
+#[test]
+fn slice_hash_components_survive_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class H:
+    def __init__(self, v):
+        self.v = v
+    def __hash__(self):
+        gc.collect()
+        return self.v
+    def __eq__(self, other):
+        return self is other
+
+expected = None
+i = 0
+while i < 60:
+    s = slice(H(1), H(2), H(3))
+    h = hash(s)
+    if expected is None:
+        expected = h
+    else:
+        assert h == expected, (h, expected)
+    junk = [0] * 64
+    i += 1
+"#,
+        "<slice_hash_gc_rooting>",
+        "slice-hash component callback-root checks",
+        "slice hash component callback GC rooting program failed",
+    );
+}

@@ -50,12 +50,24 @@ pub fn w_list_find_or_count(
     //     raise ValueError / return count
     let mut i = start.max(0);
     let mut result: i64 = 0;
-    while i < stop && i < unsafe { pyre_object::w_list_len(obj) } as i64 {
-        let w_curr = match unsafe { pyre_object::w_list_getitem(obj, i) } {
+    // `eq_w` re-enters Python and may collect; the list and needle are raw
+    // locals re-read each iteration, so pin them on the shadow stack.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_item);
+    while i < stop
+        && i < unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(obj_slot)) }
+            as i64
+    {
+        let w_curr = match unsafe {
+            pyre_object::w_list_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i)
+        } {
             Some(v) => v,
             None => break,
         };
-        if crate::baseobjspace::eq_w(w_curr, w_item)? {
+        if crate::baseobjspace::eq_w(w_curr, pyre_object::gc_roots::shadow_stack_get(item_slot))? {
             if count {
                 result += 1;
             } else {
