@@ -186,11 +186,14 @@ fn insort(
         parsed.x = pin(call_one(key, shadow_stack_get(original_x))?);
     }
     let index = bisect(&mut parsed, right)?;
-    // Allocate the index first: a `getattr` result is young, and this
-    // allocation would collect out from under it.
-    let index = w_int_new(index);
+    // The `insert` lookup runs the attribute protocol and can relocate a young
+    // object, so root the boxed index before it.
+    let index = pin(w_int_new(index));
     let insert = crate::baseobjspace::getattr_str(parsed.a(), "insert")?;
-    crate::call::call_function_impl_result(insert, &[index, shadow_stack_get(original_x)])?;
+    crate::call::call_function_impl_result(
+        insert,
+        &[shadow_stack_get(index), shadow_stack_get(original_x)],
+    )?;
     Ok(w_none())
 }
 
