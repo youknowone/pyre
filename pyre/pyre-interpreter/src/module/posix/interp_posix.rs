@@ -5291,8 +5291,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "configuration names must be strings or integers",
                 ));
             }
-            let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(w)?)?;
-            Ok(value as i32)
+            // `conv_confname` narrows to a C `int` and reports a value that does
+            // not fit rather than truncating it. A truncated name reaches the
+            // syscall as an unrelated one — `2**40` narrows to 0 — and comes
+            // back EINVAL, which reads as "no such configuration option" for a
+            // name the caller never asked about. The object is an int here, so
+            // an `int_w` that fails did so on width.
+            let too_large =
+                || crate::PyError::overflow_error("Python int too large to convert to C int");
+            let value =
+                crate::baseobjspace::int_w(crate::baseobjspace::space_index(w)?).map_err(
+                    |_| too_large(),
+                )?;
+            i32::try_from(value).map_err(|_| too_large())
         }
 
         // os.pathconf(path, name) -> int | None
@@ -5367,7 +5378,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 )
                             })?
                     } else {
-                        crate::baseobjspace::int_w(args[0])? as i32
+                        // Narrowed, not truncated — see `confname_arg`.
+                        i32::try_from(crate::baseobjspace::int_w(args[0])?).map_err(|_| {
+                            crate::PyError::overflow_error(
+                                "Python int too large to convert to C int",
+                            )
+                        })?
                     };
                     let v = host_posix::sysconf(name).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(v as i64))
