@@ -938,7 +938,56 @@ impl PyError {
         w_filename: PyObjectRef,
         w_filename2: PyObjectRef,
     ) -> Self {
-        let strerror = Self::clean_strerror(errno);
+        Self::os_error_from_parts(
+            errno,
+            None,
+            Self::clean_strerror(errno),
+            w_filename,
+            w_filename2,
+        )
+    }
+
+    /// `os_error_syscall2` for a failure reported by a Win32 API: the code is a
+    /// Win32 error, not an errno.  It is kept in `.winerror`, `.strerror` is the
+    /// system's own message for it, and `.errno` — with the subclass picked from
+    /// it — comes from the errmap, so `str(e)` reads `[WinError 183] ...: 'path'`
+    /// (`PyErr_SetExcFromWindowsErrWithFilenameObjects`).
+    #[cfg(windows)]
+    pub fn os_error_win32_syscall2(
+        winerror: i32,
+        w_filename: PyObjectRef,
+        w_filename2: PyObjectRef,
+    ) -> Self {
+        let errno = crate::builtins::winerror_to_errno(winerror as i64) as i32;
+        let strerror = Self::win32_strerror(winerror);
+        Self::os_error_from_parts(errno, Some(winerror), strerror, w_filename, w_filename2)
+    }
+
+    /// The message a Win32 error code names, with the trailing newline and
+    /// full stop `FormatMessageW` appends removed.  Reporting the bare code is
+    /// the answer for a code the system cannot describe.
+    #[cfg(windows)]
+    fn win32_strerror(winerror: i32) -> String {
+        #[cfg(feature = "host_env")]
+        if let Some(message) =
+            rustpython_host_env::windows::format_error_message(Some(winerror as u32))
+        {
+            return message
+                .trim_end_matches(|c: char| c <= ' ' || c == '.')
+                .to_string();
+        }
+        format!("Windows Error 0x{winerror:x}")
+    }
+
+    /// The body both syscall constructors share.  `winerror` is `None` off
+    /// Windows, where no code but the errno exists.
+    fn os_error_from_parts(
+        errno: i32,
+        winerror: Option<i32>,
+        strerror: String,
+        w_filename: PyObjectRef,
+        w_filename2: PyObjectRef,
+    ) -> Self {
         let subclass = crate::builtins::os_error_errno_subclass(errno as i64);
         // The dedicated FileNotFoundError kind carries its own str/repr; the
         // other errno subclasses share OSError's and differ only by class.
@@ -947,7 +996,10 @@ impl PyError {
         } else {
             (PyErrorKind::OSError, ExcKind::OSError)
         };
-        let message = format!("[Errno {errno}] {strerror}");
+        let message = match winerror {
+            Some(code) => format!("[WinError {code}] {strerror}"),
+            None => format!("[Errno {errno}] {strerror}"),
+        };
         // Root the caller's filename and the fresh exception across the
         // exception and args allocations below: they live only in Rust locals,
         // which the precise collector does not scan, so a collection inside
@@ -988,6 +1040,13 @@ impl PyError {
                 exc,
                 pyre_object::w_str_new(&strerror),
             );
+            #[cfg(windows)]
+            if let Some(code) = winerror {
+                pyre_object::interp_exceptions::w_exception_set_winerror(
+                    exc,
+                    pyre_object::w_int_new(code as i64),
+                );
+            }
             // Reload the paths after the args allocations: the pins keep them
             // alive, but a minor collection may have relocated the young
             // strings, leaving the raw locals pointing at the old addresses.

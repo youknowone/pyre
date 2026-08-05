@@ -23,12 +23,11 @@
 //! succeed.  The `CreateProcess`/pipe/`DuplicateHandle` half a real launch
 //! needs is still absent, so an actual `Popen` spawn is a further follow-up.
 
-/// Map the current thread's last OS error to an `OSError`.
+/// Map the current thread's last OS error to an `OSError`
+/// (`PyErr_SetFromWindowsErr`): the code is the one `winerror` reports.
 fn last_os_error() -> crate::PyError {
-    crate::PyError::os_error_syscall(
-        crate::builtins::io_error_posix_errno(&std::io::Error::last_os_error(), 0),
-        pyre_object::PY_NULL,
-    )
+    let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    crate::PyError::os_error_win32_syscall2(code, pyre_object::PY_NULL, pyre_object::PY_NULL)
 }
 
 crate::py_module! {

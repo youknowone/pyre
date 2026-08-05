@@ -5988,13 +5988,18 @@ fn winerror_derived_errno(w_winerror: PyObjectRef) -> Option<i64> {
     if !unsafe { pyre_object::is_int(w_winerror) } {
         return None;
     }
-    let code = unsafe { pyre_object::w_int_get_value(w_winerror) };
-    Some(
-        WINERROR_TO_ERRNO
-            .iter()
-            .find(|&&(win, _)| win == code)
-            .map_or(DEFAULT_WIN32_ERRNO, |&(_, posix)| posix),
-    )
+    Some(winerror_to_errno(unsafe {
+        pyre_object::w_int_get_value(w_winerror)
+    }))
+}
+
+/// The POSIX errno a Win32 error code maps to.
+#[cfg(windows)]
+pub(crate) fn winerror_to_errno(code: i64) -> i64 {
+    WINERROR_TO_ERRNO
+        .iter()
+        .find(|&&(win, _)| win == code)
+        .map_or(DEFAULT_WIN32_ERRNO, |&(_, posix)| posix)
 }
 
 /// The `errno` a 2..=5 argument call settles on: the first argument, unless a

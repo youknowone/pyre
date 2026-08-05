@@ -467,24 +467,32 @@ mod win_nt {
     use std::path::Path;
 
     /// Wrap a host-layer `io::Error` as an OSError carrying the offending path.
+    /// These calls are Win32 APIs, so the code they report is a Win32 error and
+    /// lands in `.winerror` (`os_error_win32_syscall2`).
     fn io_err(error: &std::io::Error, path: &str) -> crate::PyError {
-        let errno = crate::builtins::io_error_posix_errno(error, 0);
         let filename = if path.is_empty() {
             pyre_object::PY_NULL
         } else {
             pyre_object::w_str_new(path)
         };
-        crate::PyError::os_error_syscall(errno, filename)
+        io_err_with_filename(error, filename)
     }
 
     fn io_err_with_filename(
         error: &std::io::Error,
         filename: PyObjectRef,
     ) -> crate::PyError {
-        crate::PyError::os_error_syscall(
-            crate::builtins::io_error_posix_errno(error, 0),
-            filename,
-        )
+        match error.raw_os_error() {
+            Some(winerror) => crate::PyError::os_error_win32_syscall2(
+                winerror,
+                filename,
+                pyre_object::PY_NULL,
+            ),
+            None => crate::PyError::os_error_syscall(
+                crate::builtins::io_error_posix_errno(error, 0),
+                filename,
+            ),
+        }
     }
 
     /// Read argument 0 as a filesystem path; the flag reports whether the
@@ -1263,6 +1271,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         errno_err_with_filename(crate::builtins::io_error_posix_errno(&e, 0), w_path)
     }
 
+    /// The OSError for a failed *filesystem* call, whose error code Windows
+    /// reports through `GetLastError` rather than `errno`: it becomes the
+    /// `.winerror` attribute and picks up the system's message, the way
+    /// `os.stat` and `os.mkdir` report `[WinError 3]`.  The descriptor calls
+    /// (`open`, `read`, `write`, `close`, `lseek`) go through the C runtime and
+    /// keep `io_err`'s errno form, which is what they report as well.
+    ///
+    /// `default_errno` stands in when the error carries no OS code at all.
+    fn fs_err_with_filename2(
+        e: std::io::Error,
+        default_errno: i32,
+        w_path: PyObjectRef,
+        w_path2: PyObjectRef,
+    ) -> crate::PyError {
+        #[cfg(windows)]
+        if let Some(winerror) = e.raw_os_error() {
+            return crate::PyError::os_error_win32_syscall2(winerror, w_path, w_path2);
+        }
+        crate::PyError::os_error_syscall2(
+            crate::builtins::io_error_posix_errno(&e, default_errno),
+            w_path,
+            w_path2,
+        )
+    }
+
+    fn fs_err_with_filename(e: std::io::Error, w_path: PyObjectRef) -> crate::PyError {
+        fs_err_with_filename2(e, 0, w_path, pyre_object::PY_NULL)
+    }
+
     /// A filesystem name reported back to the caller: `bytes` when the path
     /// argument was `bytes` (`posixmodule.c path_converter`), else `str`.
     ///
@@ -1579,7 +1616,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
             let ret = unsafe { libc::unlink(c_path.as_ptr()) };
             if ret < 0 {
-                return Err(io_err_with_filename(
+                return Err(fs_err_with_filename(
                     std::io::Error::last_os_error(),
                     path.w_path(),
                 ));
@@ -1623,7 +1660,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let target = target.as_os_str().as_encoded_bytes();
                     Ok(fs_name_obj(bytes_mode, target))
                 }
-                Err(e) => Err(io_err_with_filename(e, path.w_path())),
+                Err(e) => Err(fs_err_with_filename(e, path.w_path())),
             }
         }),
     );
@@ -1651,7 +1688,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(windows)]
                 let ret = unsafe { libc::mkdir(c_path.as_ptr()) };
                 if ret < 0 {
-                    return Err(io_err_with_filename(
+                    return Err(fs_err_with_filename(
                         std::io::Error::last_os_error(),
                         path.w_path(),
                     ));
@@ -1682,7 +1719,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 let ret = unsafe { libc::rmdir(c_path.as_ptr()) };
                 if ret < 0 {
-                    return Err(io_err_with_filename(
+                    return Err(fs_err_with_filename(
                         std::io::Error::last_os_error(),
                         path.w_path(),
                     ));
@@ -1760,12 +1797,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         } else {
             host_os::rename(src_path.as_ref(), src_b, dst_path.as_ref(), dst_b)
         };
-        result.map_err(|e| {
-            let errno = crate::builtins::io_error_posix_errno(&e, 0);
-            // interp_posix.py:654 hands both resolved `Path.w_path` objects to
-            // `wrap_oserror2`.
-            crate::PyError::os_error_syscall2(errno, src.w_path(), dst.w_path())
-        })?;
+        // interp_posix.py:654 hands both resolved `Path.w_path` objects to
+        // `wrap_oserror2`.
+        result.map_err(|e| fs_err_with_filename2(e, 0, src.w_path(), dst.w_path()))?;
         Ok(pyre_object::w_none())
     }
     crate::module_ns_store(
@@ -1875,7 +1909,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 ));
             }
             host_os::set_file_times(path_from_bytes(&path.as_bytes).as_ref(), access, modified)
-                .map_err(|e| io_err_with_filename(e, path.w_path()))?;
+                .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
             return Ok(pyre_object::w_none());
         }
         #[cfg(all(unix, not(feature = "sandbox")))]
@@ -2009,10 +2043,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             #[cfg(not(feature = "sandbox"))]
             {
                 let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
-                    .map_err(|e| io_err_with_filename(e, w_path()))?;
+                    .map_err(|e| fs_err_with_filename(e, w_path()))?;
                 let mut items = Vec::new();
                 for entry in entries {
-                    let entry = entry.map_err(|e| io_err_with_filename(e, w_path()))?;
+                    let entry = entry.map_err(|e| fs_err_with_filename(e, w_path()))?;
                     let name = entry.file_name();
                     items.push(fs_name_obj(bytes_mode, name.as_encoded_bytes()));
                 }
@@ -2697,9 +2731,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let st_flags = 0u32;
                     Ok(make_stat_result(&m, st_flags))
                 }
-                Err(e) => Err(errno_err_with_filename(
-                    crate::builtins::io_error_posix_errno(&e, 2),
+                Err(e) => Err(fs_err_with_filename2(
+                    e,
+                    2,
                     path.w_path(),
+                    pyre_object::PY_NULL,
                 )),
             }
         }
@@ -2766,7 +2802,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn dir_entry_inode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (w_path, path) = dir_entry_path(args[0])?;
         let meta = host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
-            .map_err(|e| io_err_with_filename(e, w_path))?;
+            .map_err(|e| fs_err_with_filename(e, w_path))?;
         #[cfg(unix)]
         let ino = {
             use std::os::unix::fs::MetadataExt;
@@ -2795,7 +2831,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let st_flags = 0u32;
                 Ok(make_stat_result(&m, st_flags))
             }
-            Err(e) => Err(io_err_with_filename(e, w_path)),
+            Err(e) => Err(fs_err_with_filename(e, w_path)),
         }
     }
     fn dir_entry_fspath(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2968,10 +3004,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 .unwrap_or(pyre_object::PY_NULL)
         };
         let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
-            .map_err(|e| io_err_with_filename(e, w_path()))?;
+            .map_err(|e| fs_err_with_filename(e, w_path()))?;
         let list = pyre_object::w_list_new(Vec::new());
         for entry in entries {
-            let entry = entry.map_err(|e| io_err_with_filename(e, w_path()))?;
+            let entry = entry.map_err(|e| fs_err_with_filename(e, w_path()))?;
             let name = entry.file_name();
             let full = entry.path().into_os_string();
             let de = pyre_object::w_instance_new(dir_entry_type());
