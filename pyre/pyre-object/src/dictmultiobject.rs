@@ -1974,11 +1974,15 @@ pub unsafe fn w_dict_strategy_id(obj: PyObjectRef) -> usize {
         return m.mstrategy as usize;
     }
     let d = &*(obj as *const W_DictObject);
-    // `&'static dyn DictStrategy` — the fat pointer carries both a
-    // vtable and a data pointer; the data pointer alone uniquely
-    // identifies the strategy singleton (`OBJECT_DICT_STRATEGY` etc.).
-    let raw: *const dyn crate::dictmultiobject::DictStrategy = d.dstrategy.imp;
-    raw as *const () as usize
+    // The holder's own address, not `imp`'s data pointer.  Every strategy
+    // singleton is a unit struct, so the data half of the `&'static dyn
+    // DictStrategy` inside the holder is the address of a zero-sized static and
+    // Rust does not guarantee those differ between distinct strategies — two
+    // strategies could stamp the same id and a transition between them would be
+    // invisible to the iterators that compare this.  `DictStrategyRef` is not
+    // zero-sized, so one holder per singleton gives one distinct address per
+    // strategy.
+    d.dstrategy as *const DictStrategyRef as usize
 }
 
 /// Key-set mutation state captured by dict iterators.
@@ -4464,6 +4468,64 @@ pub unsafe fn w_dict_unicode_key_hash(w_key: *mut PyObject) -> i64 {
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook())
 }
 
+/// `rordereddict.py:709 ll_dict_getitem` — the value half of the lookup, read
+/// at the entry index [`w_dict_unicode_lookup_index`] settled on, and answering
+/// null for anything the index no longer describes.
+///
+/// The index is re-validated against the key that produced it, because the two
+/// halves are two residuals and the lock is not held across the gap.  Upstream
+/// runs them as one translated sequence under the GIL and can index straight
+/// in; here another thread's `del` compacts the table (`IndexMap::shift_remove`
+/// closes the hole), so an index that was in range and correct at lookup time
+/// can name a *different* live key by the time it is read.  A bounds check does
+/// not see that — the index is still in range — and the answer would be a wrong
+/// value rather than a crash.  Re-validating also makes the optimizer's own CSE
+/// safe: `_optimize_call_dict_lookup` may delete a repeat of the same
+/// `(dict, key)` probe, so the index arriving here can have been produced by an
+/// earlier iteration.
+///
+/// The strategy is re-checked under the lock for the same reason: the trace
+/// guarded it before the call, and only the Unicode and Object strategies share
+/// this `IndexMap<ObjectKey, _>` storage shape.
+///
+/// A null answer fails the caller's `GuardNonnull` and side-exits to the generic
+/// residual, which redoes the whole subscript.
+///
+/// # Safety
+/// `obj` must be a live regular `W_DictObject` (not a module dict), and `hash`
+/// the digest `object_key_for` produces for `w_key`.
+pub unsafe fn w_dict_unicode_value_at_checked(
+    obj: PyObjectRef,
+    index: usize,
+    w_key: PyObjectRef,
+    hash: i64,
+) -> PyObjectRef {
+    lock_dict_refs!(_dict_guard, obj, w_key);
+    if !matches!(
+        w_dict_get_strategy(obj).strategy_kind(),
+        StrategyKind::Unicode | StrategyKind::Object
+    ) {
+        return std::ptr::null_mut();
+    }
+    let dict = &*(obj as *const W_DictObject);
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    let Some((entry_key, &value)) = entries.get_index(index) else {
+        return std::ptr::null_mut();
+    };
+    if entry_key.hash != hash {
+        return std::ptr::null_mut();
+    }
+    crate::dict_eq_hook::take_eq_error();
+    crate::dict_eq_hook::begin_callback_free_probe();
+    let same_key = dict_keys_equal(entry_key.obj, w_key);
+    let probe_needed_user_code = crate::dict_eq_hook::end_callback_free_probe();
+    if same_key && !probe_needed_user_code {
+        value
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
 /// Internal helper: `ModuleDictStrategy::items` body for pyre's
 /// W_ModuleDictObject — branches on `is_object_strategy` and emits
 /// from whichever storage half is live.  Called only from the
@@ -6646,6 +6708,29 @@ mod tests {
             assert_eq!(
                 w_dict_unicode_lookup_index(dict, gamma, w_dict_unicode_key_hash(gamma), 0),
                 -1,
+            );
+
+            // The value read answers for the key that produced the index, not
+            // for whatever now sits at it.
+            w_dict_setitem_str(dict, "gamma", w_int_new(3));
+            let beta_hash = w_dict_unicode_key_hash(beta);
+            let beta_value = w_dict_getitem_str(dict, "beta").unwrap();
+            assert_eq!(w_dict_unicode_lookup_index(dict, beta, beta_hash, 0), 1);
+            assert_eq!(
+                w_dict_unicode_value_at_checked(dict, 1, beta, beta_hash),
+                beta_value,
+            );
+
+            // Deleting an earlier key compacts the table, so index 1 now names
+            // "gamma".  It is still IN RANGE and still holds a live entry, so a
+            // bounds check passes and would answer gamma's value for beta's
+            // index — only the key re-validation catches it.
+            w_dict_delitem_str(dict, "alpha");
+            assert_eq!(w_dict_unicode_lookup_index(dict, beta, beta_hash, 0), 0);
+            assert!(w_dict_unicode_value_at_checked(dict, 1, beta, beta_hash).is_null());
+            assert_eq!(
+                w_dict_unicode_value_at_checked(dict, 0, beta, beta_hash),
+                beta_value,
             );
         }
     }

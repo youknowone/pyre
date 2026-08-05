@@ -5341,8 +5341,13 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
 
         let value = ctx.trace_ctx.call_ref_typed_with_effect(
             crate::helpers::jit_dict_value_at as *const (),
-            &[list_op, index_op],
-            &[majit_ir::Type::Ref, majit_ir::Type::Int],
+            &[list_op, index_op, key_op, hash_op],
+            &[
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+            ],
             majit_ir::EffectInfo::new(
                 majit_ir::ExtraEffect::CannotRaise,
                 majit_ir::OopSpecIndex::None,

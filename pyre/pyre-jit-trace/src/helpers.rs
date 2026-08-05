@@ -144,23 +144,25 @@ pub extern "C" fn jit_dict_nth_value_versioned(
 
 /// Read a dict value at an entry index a traced `dict.lookup` settled on —
 /// `rordereddict.py:709 ll_dict_getitem`'s `d.entries[i].value` after
-/// `ll_dict_lookup` returned the slot.  The read goes through the live strategy
+/// `ll_dict_lookup` returned the slot.  The read goes through the live storage
 /// so a value-only overwrite stays visible, which is the whole reason the
 /// lookup and the value read are two operations rather than one.
 ///
-/// The bounds check is load-bearing, not defensive.  `_optimize_CALL_DICT_LOOKUP`
-/// may delete a repeat of the same `(dict, key)` probe, so the index reaching
-/// here can have been produced by an earlier iteration; an out-of-range index
-/// answers `PY_NULL` and the caller's `GuardNonnull` side-exits to the generic
-/// residual instead of indexing a compacted table.
-pub extern "C" fn jit_dict_value_at(dict: i64, index: i64) -> i64 {
+/// `w_dict_unicode_value_at_checked` re-validates the index against the key that
+/// produced it; see there for why a bounds check alone is not enough.  Anything
+/// the index no longer describes answers `PY_NULL`, and the caller's
+/// `GuardNonnull` side-exits to the generic residual.
+pub extern "C" fn jit_dict_value_at(dict: i64, index: i64, key: i64, hash: i64) -> i64 {
     if index < 0 {
         return PY_NULL as i64;
     }
-    let dict = dict as PyObjectRef;
     unsafe {
-        pyre_object::dictmultiobject::w_dict_nth_item(dict, index as usize)
-            .map_or(PY_NULL as i64, |(_, value)| value as i64)
+        pyre_object::dictmultiobject::w_dict_unicode_value_at_checked(
+            dict as PyObjectRef,
+            index as usize,
+            key as PyObjectRef,
+            hash,
+        ) as i64
     }
 }
 
