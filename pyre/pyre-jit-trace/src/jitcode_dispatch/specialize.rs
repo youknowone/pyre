@@ -1904,59 +1904,13 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
             // which case this is a no-op; guard here too so a fold that only
             // catches the item reads still proves the layout it loads from.
             walker_guard_specialised_pair_class(ctx, op_pc, seq, spec_type)?;
-            if pair_kind == SpecialisedPairKind::Object {
-                let descr = if int_val == 0 {
-                    crate::descr::specialised_tuple_oo_value0_descr()
-                } else {
-                    crate::descr::specialised_tuple_oo_value1_descr()
-                };
-                // `wraps[i]` is the identity for an object slot, so the field
-                // read is the whole item — no re-boxing, and no `may_force`
-                // execution needed to recover a box identity.
-                let item = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, seq, descr);
-                write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, item)?;
-                return Ok(Some(()));
-            }
-            // Authentic boxed element supplies the concrete shadow / identity
-            // while the emitted field read and transparent wrapper replace
-            // the residual call in machine code. Fall through if execution
-            // raises or cannot provide that box.
-            let Some(elem_ptr) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+            let Some(item) = walker_emit_specialised_pair_item(
+                ctx, op_pc, seq, pair_kind, int_val, allboxes, call_descr,
+            )?
+            else {
                 return Ok(None);
             };
-            if pair_kind == SpecialisedPairKind::Float {
-                let descr = if int_val == 0 {
-                    crate::descr::specialised_tuple_ff_value0_descr()
-                } else {
-                    crate::descr::specialised_tuple_ff_value1_descr()
-                };
-                let raw =
-                    majit_metainterp::box_trace::getfield_gc_f_pureornot(ctx.trace_ctx, seq, descr);
-                let elem =
-                    unsafe { pyre_object::w_float_get_value(elem_ptr as pyre_object::PyObjectRef) };
-                ctx.trace_ctx
-                    .set_opref_concrete(raw, majit_ir::Value::Float(elem));
-                let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
-                ctx.trace_ctx.set_opref_concrete(
-                    boxed,
-                    majit_ir::Value::Ref(majit_ir::GcRef(elem_ptr as usize)),
-                );
-                write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-                return Ok(Some(()));
-            }
-            // `ii`: preserve authentic small-int caching / identity.
-            let descr = if int_val == 0 {
-                crate::descr::specialised_tuple_ii_value0_descr()
-            } else {
-                crate::descr::specialised_tuple_ii_value1_descr()
-            };
-            let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, seq, descr);
-            let elem =
-                unsafe { pyre_object::w_int_get_value(elem_ptr as pyre_object::PyObjectRef) };
-            let boxed = walker_box_int(ctx, op_pc, raw, elem)?;
-            ctx.trace_ctx
-                .set_opref_concrete(boxed, box_int_concrete(elem, elem_ptr as i64));
-            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, item)?;
             Ok(Some(()))
         }
         _ => Ok(None),
@@ -1998,6 +1952,84 @@ fn walker_guard_specialised_pair_class<Sym: WalkSym>(
         .heap_cache_mut()
         .class_now_known(seq, spec_type as i64);
     Ok(())
+}
+
+/// Read slot `index` (0 or 1) of an arity-2 tuple specialisation whose class
+/// the caller has already guarded, applying that slot's `wraps[i]`
+/// (`specialisedtupleobject.py:26-27`, and `:134-142 getitem`, which unrolls
+/// `iter_n` to the matching `value%s`).
+///
+/// `Ok(None)` declines: the `ii` / `ff` slots need the authentic box for its
+/// identity, and that execution can fail.
+///
+/// The `ff` arm currently has no producer to serve. Upstream builds `Cls_ff`
+/// from `makespecialisedtuple2` (`specialisedtupleobject.py:178`) and from
+/// `specialized_zip_2_lists` (`:230`); pyre does not port the latter, and
+/// `w_tuple_new` (tupleobject.rs:174-186) sends a plain-float pair to `Cls_oo`
+/// instead so that `(x, x)` keeps the exact `x` object. It is kept because it
+/// is the layout upstream reads, not because a trace reaches it today.
+#[allow(clippy::too_many_arguments)]
+fn walker_emit_specialised_pair_item<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq: OpRef,
+    pair_kind: SpecialisedPairKind,
+    index: i64,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Result<Option<OpRef>, DispatchError> {
+    let first = index == 0;
+    if pair_kind == SpecialisedPairKind::Object {
+        let descr = if first {
+            crate::descr::specialised_tuple_oo_value0_descr()
+        } else {
+            crate::descr::specialised_tuple_oo_value1_descr()
+        };
+        // `wraps[i]` is the identity for an object slot, so the field read is
+        // the whole item — no re-boxing, and no `may_force` execution needed
+        // to recover a box identity.
+        return Ok(Some(crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            seq,
+            descr,
+        )));
+    }
+    // Authentic boxed element supplies the concrete shadow / identity while
+    // the emitted field read and transparent wrapper replace the residual call
+    // in machine code. Fall through if execution raises or cannot provide that
+    // box.
+    let Some(elem_ptr) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    if pair_kind == SpecialisedPairKind::Float {
+        let descr = if first {
+            crate::descr::specialised_tuple_ff_value0_descr()
+        } else {
+            crate::descr::specialised_tuple_ff_value1_descr()
+        };
+        let raw = majit_metainterp::box_trace::getfield_gc_f_pureornot(ctx.trace_ctx, seq, descr);
+        let elem = unsafe { pyre_object::w_float_get_value(elem_ptr as pyre_object::PyObjectRef) };
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Float(elem));
+        let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+        ctx.trace_ctx.set_opref_concrete(
+            boxed,
+            majit_ir::Value::Ref(majit_ir::GcRef(elem_ptr as usize)),
+        );
+        return Ok(Some(boxed));
+    }
+    // `ii`: preserve authentic small-int caching / identity.
+    let descr = if first {
+        crate::descr::specialised_tuple_ii_value0_descr()
+    } else {
+        crate::descr::specialised_tuple_ii_value1_descr()
+    };
+    let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, seq, descr);
+    let elem = unsafe { pyre_object::w_int_get_value(elem_ptr as pyre_object::PyObjectRef) };
+    let boxed = walker_box_int(ctx, op_pc, raw, elem)?;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(elem, elem_ptr as i64));
+    Ok(Some(boxed))
 }
 
 /// One hop of a `while tb is not None: names.append(tb.tb_frame.f_code.co_name);
@@ -5350,6 +5382,19 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         );
     }
 
+    // The arity-2 specialisations reach the same `getitem`, but their items
+    // are the inline `value0`/`value1` slots, so they need their own reader —
+    // which is why the gate above is `ob_type == &TUPLE_TYPE` and not
+    // `is_tuple()`. No `w_class` guard: only a specialisation carries its own
+    // `ob_type`, so a tuple subclass (which keeps `&TUPLE_TYPE`) can never
+    // pass the class guard below.
+    if let Some(pair_kind) = specialised_pair_kind(unsafe { (*list_obj).ob_type }) {
+        return try_walker_specialize_subscr_specialised_pair(
+            ctx, op_pc, list_op, key_op, list_obj, key_obj, pair_kind, allboxes, call_descr, dst,
+            dst_bank,
+        );
+    }
+
     // The `dict.lookup` gate.  Both `w_class` checks are load-bearing: a dict
     // SUBCLASS shares `ob_type == &DICT_TYPE` but retags `w_class` and reaches
     // `__missing__` on a miss, and a str SUBCLASS key may override `__hash__` /
@@ -5804,6 +5849,80 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// SUBSCRIPT arm for the arity-2 tuple specialisations
+/// (`specialisedtupleobject.py:134-142 getitem`), the analogue of
+/// [`try_walker_specialize_subscr_tuple`] for a receiver whose items are the
+/// inline `value0` / `value1` slots instead of a `wrappeditems` block.
+///
+/// Upstream `getitem` normalises a negative index against the constant
+/// `typelen` and then runs the unrolled `index == i` chain to pick the slot,
+/// so the recorded slot is pinned here with a single `guard_value` on the
+/// unboxed index: it re-proves both the sign test and the comparison at once,
+/// and a literal subscript makes it constant, which the optimizer drops.
+///
+/// The caller matched `ob_type` against one of the three specialisation
+/// classes, which is also why no `w_class` guard follows: a tuple subclass
+/// instance keeps the canonical `ob_type == &TUPLE_TYPE`, so it can neither
+/// reach this arm nor pass the class guard below.
+///
+/// A slice key, a non-int key, or an out-of-range index falls through to the
+/// generic residual (`Ok(None)`), which raises `IndexError` the way `getitem`
+/// does.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_specialize_subscr_specialised_pair<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq_op: OpRef,
+    key_op: OpRef,
+    seq_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    pair_kind: SpecialisedPairKind,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    const TYPELEN: i64 = 2;
+    // `bool` shares int's `intval`, so it indexes through its own &BOOL_TYPE
+    // guard in the unbox below.
+    let raw_key = unsafe {
+        if !pyre_object::is_int(key_obj) {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(key_obj)
+    };
+    let index = if raw_key < 0 {
+        raw_key + TYPELEN
+    } else {
+        raw_key
+    };
+    if !(0..TYPELEN).contains(&index) {
+        return Ok(None);
+    }
+
+    let spec_type = unsafe { (*seq_obj).ob_type };
+    walker_guard_specialised_pair_class(ctx, op_pc, seq_op, spec_type)?;
+
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_index, majit_ir::Value::Int(raw_key));
+    let expected = ctx.trace_ctx.const_int(raw_key);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[raw_index, expected])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(raw_index, expected);
+
+    let Some(item) = walker_emit_specialised_pair_item(
+        ctx, op_pc, seq_op, pair_kind, index, allboxes, call_descr,
+    )?
+    else {
+        return Ok(None);
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, item)?;
+    Ok(Some(()))
+}
+
 /// Builtin `type(x)`:
 ///
 /// ```python
@@ -6137,19 +6256,30 @@ pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
     walker_emit_exact_dict_hit(ctx, op.pc, dict_op, r_args[2], dict, hit, dst, 'r')
 }
 
+/// Where the guarded receiver's length comes from — the `length()` body each
+/// layout has upstream.
+#[derive(Clone, Copy)]
+enum BuiltinLenSource {
+    /// `W_ListObject.length()` → `strategy.length` (rlist.py). Carries the
+    /// storage-strategy id the read is guarded on.
+    ListStrategy(i64),
+    /// `W_UnicodeObject.len` → `bh_unicodelen`; no storage strategy.
+    StrField,
+    /// `tupleobject.py` carries no separate length field, so the length is
+    /// `arraylen_gc(wrappeditems)`.
+    TupleArrayLen,
+    /// `specialisedtupleobject.py:54-55 length()` returns the constant
+    /// `typelen`.
+    PairArity,
+}
+
 /// `len(x)` on an exact canonical `W_ListObject` / `W_UnicodeObject` /
-/// `W_TupleObject`:
+/// `W_TupleObject`, or on an arity-2 tuple specialisation:
 /// lower the opaque `bh_call_fn(len_builtin, PY_NULL, x)` residual to the
 /// inline length read the meta-tracer produces upstream
 /// (descroperation.py `_len`): `guard_value(callable)` +
-/// `guard_class` + exact `w_class` guard + length `getfield_gc_i` +
-/// `wrapint`.  For a list this reads `W_ListObject.length()` →
-/// `strategy.length`, so it additionally emits `guard_value(strategy)`
-/// (rlist.py); for a str it reads the codepoint field directly
-/// (`W_UnicodeObject.len` → `bh_unicodelen`, no storage strategy); for a
-/// tuple it reads `wrappeditems` and applies `arraylen_gc`, matching
-/// `tupleobject.py` where the tuple carries no separate length field. The
-/// exact `w_class` guard is required because a SUBCLASS shares
+/// `guard_class` + exact `w_class` guard + the [`BuiltinLenSource`] read +
+/// `wrapint`.  The exact `w_class` guard is required because a SUBCLASS shares
 /// `ob_type == &LIST_TYPE`/`&STR_TYPE`/`&TUPLE_TYPE` but may override `__len__`
 /// (`baseobjspace::len` dispatches `subclass_special_override`); it
 /// side-exits to the generic residual.
@@ -6185,60 +6315,20 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     if !pyre_interpreter::builtins::is_builtin_len_function(concrete_callable) {
         return Ok(None);
     }
-    // Exact canonical list / str / tuple only (see the doc comment on the subclass
-    // `__len__` hazard).  `arg_type_addr` / `exact_w_class` pin the guard
-    // target; the booleans select the length path.
-    let (arg_type_addr, exact_w_class, is_str, is_tuple) = unsafe {
-        if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::LIST_TYPE)
-            && std::ptr::eq(
-                (*list_obj).w_class,
-                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-            )
-        {
-            (
-                &pyre_object::pyobject::LIST_TYPE as *const _ as i64,
-                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-                false,
-                false,
-            )
-        } else if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::STR_TYPE)
-            && std::ptr::eq(
-                (*list_obj).w_class,
-                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
-            )
-        {
-            (
-                &pyre_object::pyobject::STR_TYPE as *const _ as i64,
-                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
-                true,
-                false,
-            )
-        } else if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE)
-            && std::ptr::eq(
-                (*list_obj).w_class,
-                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
-            )
-        {
-            (
-                &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64,
-                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
-                false,
-                true,
-            )
-        } else {
-            return Ok(None);
-        }
-    };
-    // Length source: str reads the codepoint field directly (no storage
-    // strategy); tuple reads the wrappeditems GcArray header; list resolves
-    // its storage strategy (guarded below). `sid` is `None` for str/tuple.
-    let (sid, concrete_len) = unsafe {
-        if is_str {
-            (None, pyre_object::w_str_len(list_obj))
-        } else if is_tuple {
-            (None, pyre_object::w_tuple_len(list_obj))
-        } else {
-            let concrete_len = pyre_object::w_list_len(list_obj);
+    // Exact canonical list / str / tuple, or one of the arity-2 tuple
+    // specialisations.  `arg_type_addr` pins the `guard_class` target;
+    // `exact_w_class` is the subclass-`__len__` guard (see the doc comment),
+    // absent for a specialisation because only `makespecialisedtuple2` builds
+    // that `ob_type` and always with the canonical tuple `w_class`, so the
+    // class guard alone already excludes every subclass instance.
+    let (arg_type_addr, exact_w_class, len_source, concrete_len) = unsafe {
+        let ob_type = (*list_obj).ob_type;
+        let w_class = (*list_obj).w_class;
+        if std::ptr::eq(ob_type, &pyre_object::pyobject::LIST_TYPE) {
+            let exact = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+            if !std::ptr::eq(w_class, exact) {
+                return Ok(None);
+            }
             let sid = if pyre_object::w_list_uses_int_storage(list_obj) {
                 1i64
             } else if pyre_object::w_list_uses_float_storage(list_obj) {
@@ -6249,7 +6339,43 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
                 // Empty-strategy list: no length field to read.
                 return Ok(None);
             };
-            (Some(sid), concrete_len)
+            (
+                &pyre_object::pyobject::LIST_TYPE as *const _ as i64,
+                Some(exact),
+                BuiltinLenSource::ListStrategy(sid),
+                pyre_object::w_list_len(list_obj),
+            )
+        } else if std::ptr::eq(ob_type, &pyre_object::pyobject::STR_TYPE) {
+            let exact = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+            if !std::ptr::eq(w_class, exact) {
+                return Ok(None);
+            }
+            (
+                &pyre_object::pyobject::STR_TYPE as *const _ as i64,
+                Some(exact),
+                BuiltinLenSource::StrField,
+                pyre_object::w_str_len(list_obj),
+            )
+        } else if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
+            let exact = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE);
+            if !std::ptr::eq(w_class, exact) {
+                return Ok(None);
+            }
+            (
+                &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64,
+                Some(exact),
+                BuiltinLenSource::TupleArrayLen,
+                pyre_object::w_tuple_len(list_obj),
+            )
+        } else if specialised_pair_kind(ob_type).is_some() {
+            (
+                ob_type as i64,
+                None,
+                BuiltinLenSource::PairArity,
+                pyre_object::w_tuple_len(list_obj),
+            )
+        } else {
+            return Ok(None);
         }
     };
 
@@ -6287,43 +6413,55 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(list_op, arg_type_addr);
-    walker_guard_exact_w_class(ctx, op.pc, list_op, exact_w_class)?;
+    if let Some(exact_w_class) = exact_w_class {
+        walker_guard_exact_w_class(ctx, op.pc, list_op, exact_w_class)?;
+    }
     // Length read.  list: guard the storage strategy, then read that
     // strategy's length field (rlist.py inline field for object storage;
     // typed items-block length for int/float storage).  str: a plain
     // codepoint-length getfield (no strategy, `bh_unicodelen`).
-    let raw_len = if let Some(sid) = sid {
-        let strategy = crate::state::opimpl_getfield_gc_i(
+    let raw_len = match len_source {
+        BuiltinLenSource::ListStrategy(sid) => {
+            let strategy = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::list_strategy_descr(),
+            );
+            let sid_const = ctx.trace_ctx.const_int(sid);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(strategy, sid_const);
+            let len_descr = match sid {
+                0 => crate::descr::list_length_descr(),
+                1 => crate::descr::list_int_items_len_descr(),
+                _ => crate::descr::list_float_items_len_descr(),
+            };
+            crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr)
+        }
+        BuiltinLenSource::TupleArrayLen => {
+            let wrappeditems = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::tuple_wrappeditems_descr(),
+            );
+            crate::state::opimpl_arraylen_gc(
+                ctx.trace_ctx,
+                wrappeditems,
+                crate::state::pyobject_gcarray_descr(),
+            )
+        }
+        BuiltinLenSource::StrField => crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
             list_op,
-            crate::descr::list_strategy_descr(),
-        );
-        let sid_const = ctx.trace_ctx.const_int(sid);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(strategy, sid_const);
-        let len_descr = match sid {
-            0 => crate::descr::list_length_descr(),
-            1 => crate::descr::list_int_items_len_descr(),
-            _ => crate::descr::list_float_items_len_descr(),
-        };
-        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr)
-    } else if is_tuple {
-        let wrappeditems = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            list_op,
-            crate::descr::tuple_wrappeditems_descr(),
-        );
-        crate::state::opimpl_arraylen_gc(
-            ctx.trace_ctx,
-            wrappeditems,
-            crate::state::pyobject_gcarray_descr(),
-        )
-    } else {
-        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, crate::descr::str_len_descr())
+            crate::descr::str_len_descr(),
+        ),
+        // `specialisedtupleobject.py:54-55 length()` returns the constant
+        // `typelen`; there is no field to read, so the class guard above is
+        // the whole proof and the box below folds to a constant.
+        BuiltinLenSource::PairArity => ctx.trace_ctx.const_int(concrete_len as i64),
     };
     ctx.trace_ctx
         .set_opref_concrete(raw_len, majit_ir::Value::Int(concrete_len as i64));

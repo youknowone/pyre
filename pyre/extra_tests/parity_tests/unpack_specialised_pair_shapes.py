@@ -35,7 +35,11 @@ def ii_ints(rounds):
     return acc
 
 
-def ff_floats(rounds):
+def float_pair(rounds):
+    # `w_tuple_new` sends a plain-float pair to `Cls_oo` rather than `Cls_ff`
+    # so that `(x, x)` keeps the exact `x` object, and `specialized_zip_2_lists`
+    # — the other `Cls_ff` producer upstream — is not ported, so this is an
+    # object pair whose slots happen to hold floats.
     acc = 0.0
     for i in range(rounds):
         a, b = (1.5, 2.5)
@@ -80,7 +84,7 @@ def alternating(rounds):
     return acc
 
 
-for fn in (oo_longs, oo_strings, oo_mixed, ii_ints, ff_floats, arity3,
+for fn in (oo_longs, oo_strings, oo_mixed, ii_ints, float_pair, arity3,
            from_list, wrong_arity_raises, alternating):
     print(fn.__name__, fn(3000))
 print("OK")
