@@ -816,6 +816,33 @@ impl TraceCtx {
         }
     }
 
+    /// `executor.py:215-222 do_setfield_gc(cpu, _, structbox, itembox,
+    /// fielddescr)` analog — the store half of [`Self::field_sanity_load`].
+    /// `_opimpl_setfield_gc_any` reaches it through `execute_and_record`
+    /// (`pyjitpl.py:979`), so upstream really performs the field store while
+    /// recording the `SETFIELD_GC`; a tracer that only records leaves the
+    /// concrete object disagreeing with the value the heapcache now carries.
+    ///
+    /// Returns `false` when `self.cpu` is unwired, the descr does not
+    /// resolve to a `BhDescr::Field`, or the value's bank disagrees with the
+    /// field's type — the same conditions under which `field_sanity_load`
+    /// returns `None`.
+    pub fn field_store(&self, struct_ptr: i64, descr: &DescrRef, value: Value) -> bool {
+        let Some(cpu_ptr) = self.cpu else {
+            return false;
+        };
+        // SAFETY: cpu pointer was installed via `set_cpu` against a
+        // backend that outlives this TraceCtx.
+        let cpu = unsafe { &*cpu_ptr };
+        let Some(bh_descr) = descr_to_bh_field_descr(descr) else {
+            return false;
+        };
+        let Some(field_type) = descr.as_field_descr().map(|f| f.field_type()) else {
+            return false;
+        };
+        crate::executor::do_setfield_gc(cpu, (), struct_ptr, value, &bh_descr, field_type)
+    }
+
     /// `blackhole.py:1370 bhimpl_arraylen_gc(cpu, array, arraydescr)`
     /// analog — read the GC array's length through
     /// `cpu.bh_arraylen_gc(array_ptr, &arraydescr)`.  RPython has no
