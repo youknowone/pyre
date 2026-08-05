@@ -2502,10 +2502,62 @@ macro_rules! callback_free_dict_op {
     }};
 }
 
+/// The `ObjectKey`-keyed storage servicing the reentrant scan, for either a
+/// regular `W_DictObject` in object strategy (`dstorage`) or a module dict
+/// switched to object strategy (`object_storage`).  Both hold the same
+/// `IndexMap<ObjectKey, PyObjectRef>` — celldict devolves to
+/// `ObjectDictStrategy` (`celldict.py:173`), whose lookup is `ll_dict_lookup`
+/// like the regular object strategy.
+///
+/// # Safety
+/// `obj` must point to a valid object-strategy dict backing.  A module dict
+/// must already be in object strategy (`object_storage` non-null); the caller
+/// switches before the scan, and object strategy is terminal, so it stays
+/// non-null for the whole scan.
+#[inline]
+unsafe fn scan_object_entries<'a>(
+    obj: PyObjectRef,
+) -> &'a indexmap::IndexMap<ObjectKey, PyObjectRef> {
+    if is_module_dict(obj) {
+        w_module_dict_object_storage(obj)
+            .expect("object-strategy module dict must have object_storage")
+    } else {
+        let dict = &*(obj as *const W_DictObject);
+        &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>)
+    }
+}
+
+/// The disturbance generation `ll_dict_lookup` compares to detect a callback
+/// that reallocated or reset the table in place (`rordereddict.py:1058`):
+/// `clear_gen` for a regular dict (bumped by an in-place `clear`),
+/// `keys_version` for a module dict (bumped by every key-set mutation, so a
+/// superset — a spurious restart on an unrelated mutation only re-scans).
+/// `ll_dict_lookup` restarts only on the direct checks (`entries`/`indexes`
+/// realloc, or the candidate entry changed) with no generation counter, so a
+/// module-dict callback that mutates an unrelated key without a realloc makes
+/// the restart — and thus the observable `__eq__` callback count — differ from
+/// upstream.  Narrowing that to a clear-only generation needs a per-module-dict
+/// counter distinct from `keys_version`, which reintroduces the module-dict
+/// fat-pointer layout hazard this fallback was written to avoid; the extra
+/// re-scan is safe (never a wrong result), so it stands.
+///
+/// # Safety
+/// `obj` must point to a valid dict backing (`W_DictObject` or module dict).
+#[inline]
+unsafe fn scan_clear_generation(obj: PyObjectRef) -> usize {
+    if is_module_dict(obj) {
+        (*(obj as *const W_ModuleDictObject)).keys_version
+    } else {
+        (*(obj as *const W_DictObject)).clear_gen
+    }
+}
+
 /// Find `key` in the object storage by scanning same-hash entries one at a
 /// time.  The table borrow ends before equality can call user code; if that
 /// callback changes the candidate entry, restart from the beginning like
-/// `ll_dict_lookup`'s paranoia restart (`rordereddict.py:1057`).
+/// `ll_dict_lookup`'s paranoia restart (`rordereddict.py:1057`).  Services
+/// both regular object-strategy dicts and object-strategy module dicts via
+/// [`scan_object_entries`]/[`scan_clear_generation`].
 unsafe fn scan_dict_key_reentrant(
     mut obj: PyObjectRef,
     mut key: ObjectKey,
@@ -2522,22 +2574,15 @@ unsafe fn scan_dict_key_reentrant(
         let obj_slot = crate::gc_roots::shadow_stack_len();
         crate::gc_roots::pin_root(obj);
         obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let (table_capacity, clear_generation) = {
-            let dict = &*(obj as *const W_DictObject);
-            (
-                dict_entries_capacity(
-                    &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>),
-                ),
-                dict.clear_gen,
-            )
-        };
+        let (table_capacity, clear_generation) = (
+            dict_entries_capacity(scan_object_entries(obj)),
+            scan_clear_generation(obj),
+        );
         let mut i = 0;
         loop {
             obj = crate::gc_roots::shadow_stack_get(obj_slot);
             let (stored_hash, stored_obj) = {
-                let dict = &*(obj as *const W_DictObject);
-                let entries =
-                    &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+                let entries = scan_object_entries(obj);
                 let Some(stored_obj) = dict_entries_key_obj_at(entries, i) else {
                     return Ok((None, key, obj));
                 };
@@ -2564,14 +2609,12 @@ unsafe fn scan_dict_key_reentrant(
                 // the candidate leaves the matched index stale
                 // (`rordereddict.py:1058`).
                 let disturbed = {
-                    let dict = &*(obj as *const W_DictObject);
-                    let entries =
-                        &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+                    let entries = scan_object_entries(obj);
                     // `entries != d.entries`: a realloc grew the table, or a
                     // `clear` reset it in place (`clear_gen`) — either
                     // reallocates `d.entries` in `ll_dict_lookup`'s eyes.
                     dict_entries_capacity(entries) != table_capacity
-                        || dict.clear_gen != clear_generation
+                        || scan_clear_generation(obj) != clear_generation
                         // `entries.valid(index) && entries[index].key == checkingkey`.
                         || !dict_entries_key_is_at(entries, i, stored_hash, stored_obj)
                 };
@@ -3577,7 +3620,29 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
         }) {
             return result;
         }
-        return Err(DictKeyError);
+        // A probing `__eq__`/`__hash__` escaped the callback-free ladder; pin
+        // `value` across the reentrant scan (a mid-scan GC could move it before
+        // the identity check), then remove in place on the module storage.
+        let _value_root = crate::gc_roots::push_roots();
+        let value_slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(value);
+        let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
+        let value = crate::gc_roots::shadow_stack_get(value_slot);
+        let Some(index) = found else {
+            return Ok(false);
+        };
+        let entries = w_module_dict_object_storage_mut(obj);
+        if entries
+            .get_index(index)
+            .is_none_or(|(_, stored)| *stored != value)
+        {
+            return Ok(false);
+        }
+        entries.shift_remove_index(index);
+        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+        strategy.mutated();
+        w_dict_bump_keys_version(obj);
+        return Ok(true);
     }
 
     let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
@@ -3709,10 +3774,23 @@ pub unsafe fn w_dict_move_to_end_checked(
         }) {
             return result;
         }
-        // Module dicts key on interned strings, which compare callback-free; a
-        // key needing a user `__eq__` has no reentrant fallback here, matching
-        // w_dict_delitem_if_value_is_checked's module branch.
-        return Err(DictKeyError);
+        // A probing `__eq__`/`__hash__` escaped the callback-free ladder; the
+        // reentrant scan (which services the module `object_storage`) locates
+        // the entry outside the table borrow, then the reorder runs in place —
+        // the object-strategy tail below, but on the module storage.
+        let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
+        let Some(index) = found else {
+            return Ok(false);
+        };
+        let entries = w_module_dict_object_storage_mut(obj);
+        let target = if last { entries.len() - 1 } else { 0 };
+        if index != target {
+            entries.move_index(index, target);
+            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+            strategy.mutated();
+            w_dict_bump_keys_version(obj);
+        }
+        return Ok(true);
     }
 
     let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;

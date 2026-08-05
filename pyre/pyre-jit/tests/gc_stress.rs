@@ -1538,3 +1538,63 @@ while i < 60:
         "slice hash component callback GC rooting program failed",
     );
 }
+
+/// `w_dict_move_to_end_checked`'s module-dict branch falls back to
+/// `scan_dict_key_reentrant` when a probing `__eq__` escapes the callback-free
+/// ladder. The scan re-derefs the module `object_storage` after each callback;
+/// a `__hash__`/`__eq__` that collects would move a young module dict or its
+/// entries, so the scan must pin and reload the container. Every `K` shares one
+/// hash, forcing a collision bucket where the fresh probe key must compare via
+/// `__eq__` (which collects) to locate the stored entry. Before #46 the module
+/// branch returned `DictKeyError`, surfacing as a spurious `TypeError`; the
+/// reentrant scan now finds and reorders the entry. `delitem_if_value_is` shares
+/// the same scan and tail.
+#[test]
+fn module_dict_move_to_end_reentrant_survives_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+import __pypy__
+
+ModuleType = type(gc)
+
+class K:
+    def __init__(self, tag):
+        self.tag = tag
+    def __hash__(self):
+        gc.collect()
+        return 42
+    def __eq__(self, other):
+        gc.collect()
+        return isinstance(other, K) and self.tag == other.tag
+
+i = 0
+while i < 40:
+    m = ModuleType('probe_mod')
+    d = m.__dict__
+    a = K('a')
+    b = K('b')
+    d[a] = 'va'          # non-str key -> module dict switches to object strategy
+    d[b] = 'vb'          # same hash -> shares a's collision bucket
+    # A fresh, equal, colliding key drives the callback-free probe into the
+    # reentrant scan on the module object_storage.
+    moved = __pypy__.move_to_end(d, K('a'), last=True)
+    assert moved is None or moved, moved
+    order = [k.tag for k in d.keys() if isinstance(k, K)]
+    assert order == ['b', 'a'], order
+    __pypy__.move_to_end(d, K('a'), last=False)
+    order = [k.tag for k in d.keys() if isinstance(k, K)]
+    assert order == ['a', 'b'], order
+    try:
+        __pypy__.move_to_end(d, K('absent'), last=True)
+        raise AssertionError('missing key did not raise')
+    except KeyError:
+        pass
+    junk = [K(i) for _ in range(32)]
+    i += 1
+"#,
+        "<module_dict_move_to_end_gc_rooting>",
+        "module-dict move_to_end reentrant-scan callback-root checks",
+        "module dict move_to_end reentrant scan callback GC rooting program failed",
+    );
+}
