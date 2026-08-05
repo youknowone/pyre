@@ -1810,12 +1810,17 @@ fn analyze_pipeline_from_module_paths(
     // attribute for the walker above to harvest.  Attach the spec here,
     // keyed on the minted graph's NAME — the codewriter derives the
     // CallPath from the funcptr's graph name (`target_to_path`), so a
-    // `direct_call` to `_ll_alloc_and_clear` lowers to `new_array_clear`
-    // instead of residualizing.
-    call_control.mark_oopspec(
-        parse::CallPath::from_segments(["_ll_alloc_and_clear"]),
-        "newlist_clear(count)".to_string(),
-    );
+    // `direct_call` to the clear helper lowers to `new_array_clear`
+    // instead of residualizing.  `alloc_and_set_sub_names` mints a
+    // per-layout clear helper (`_ll_alloc_and_clear` resized,
+    // `_ll_fixed_alloc_and_clear` fixed) so the `(name, args, ret)` helper
+    // cache stays disjoint; both names must carry the spec.
+    for clear_name in ["_ll_alloc_and_clear", "_ll_fixed_alloc_and_clear"] {
+        call_control.mark_oopspec(
+            parse::CallPath::from_segments([clear_name]),
+            "newlist_clear(count)".to_string(),
+        );
+    }
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
     prof.mark("  find_all_graphs");

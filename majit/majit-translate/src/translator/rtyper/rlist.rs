@@ -845,7 +845,7 @@ fn alloc_and_set_sub_names(
     match layout {
         ListLayout::Fixed => (
             "ll_fixed_newlist",
-            "_ll_alloc_and_clear",
+            "_ll_fixed_alloc_and_clear",
             "_ll_fixed_alloc_and_set_nonnull",
             "_ll_fixed_alloc_and_set_jit",
             "_ll_fixed_alloc_and_set_nojit",
@@ -9313,6 +9313,23 @@ mod tests {
             !names.iter().any(|n| n == "ll_alloc_and_set"),
             "fixed arm must NOT mint the resized ll_alloc_and_set, got {names:?}"
         );
+    }
+
+    /// The two layouts must name their clear sub-helper DISTINCTLY, otherwise
+    /// the `(name, args, ret)` helper cache and the `mark_oopspec` CallPath
+    /// registration collide: a resized `newlist_clear` registration would
+    /// overwrite (or serve) the fixed one.  Fixed prefixes `_ll_fixed_*`,
+    /// resized stays unprefixed.
+    #[test]
+    fn alloc_and_set_sub_names_clear_helpers_are_per_layout_distinct() {
+        let (_, fixed_clear, _, _, _) = alloc_and_set_sub_names(ListLayout::Fixed);
+        let (_, resized_clear, _, _, _) = alloc_and_set_sub_names(ListLayout::Resized);
+        assert_ne!(
+            fixed_clear, resized_clear,
+            "fixed and resized clear helpers must be distinct names"
+        );
+        assert_eq!(fixed_clear, "_ll_fixed_alloc_and_clear");
+        assert_eq!(resized_clear, "_ll_alloc_and_clear");
     }
 
     /// `ll_alloc_and_set` clamps `count` with `int_force_ge_zero` and branches
