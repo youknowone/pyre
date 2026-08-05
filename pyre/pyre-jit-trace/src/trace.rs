@@ -2298,10 +2298,9 @@ fn try_adopt_single_frame_blackhole(
     // earns by aborting only once `latch_abort_blackhole` has succeeded
     // (`trace_too_long_abort_safe`).  A capability-gap abort fires regardless of
     // the latch, so its adopt must still be able to decline into legacy replay.
-    let publishes_root_stack =
-        commit_leg == WalkEndCommitLeg::TraceTooLong
-            || commit_leg == WalkEndCommitLeg::WalkAbort
-            || commit_leg == WalkEndCommitLeg::VableEscape;
+    let publishes_root_stack = commit_leg == WalkEndCommitLeg::TraceTooLong
+        || commit_leg == WalkEndCommitLeg::WalkAbort
+        || commit_leg == WalkEndCommitLeg::VableEscape;
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
         assert!(
             !trace_too_long,

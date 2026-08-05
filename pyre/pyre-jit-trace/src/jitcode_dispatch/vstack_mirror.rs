@@ -224,6 +224,20 @@ pub(crate) fn classify_vstack_opcode(
         // any branch guard, so it is never a live kept-stack slot at a resume.
         Instruction::LoadSuperAttr { .. } => VstackOpClass::ResultToTos,
 
+        // LOAD_SPECIAL pops the context-manager object at `prev_depth - 1`
+        // and pushes the special method followed by the call self/NULL slot
+        // upward from that position.  Clear that popped slot and the pushed
+        // range so each pushed slot is sourced from the virtualizable shadow.
+        Instruction::LoadSpecial { method }
+            if matches!(
+                method.get(op_arg),
+                pyre_interpreter::bytecode::SpecialMethod::Enter
+                    | pyre_interpreter::bytecode::SpecialMethod::Exit
+            ) =>
+        {
+            VstackOpClass::MultiResultFromShadow
+        }
+
         // SWAP(i): exchange TOS with the box `i` positions below.  A pure
         // permutation (net depth 0); the decoded `i` drives the
         // `vstack_boxes` exchange in `reconcile_vstack_at_boundary`.
