@@ -16620,9 +16620,66 @@ fn cmp_guard_tuple(b: PyObjectRef) -> bool {
 fn cmp_guard_bytes(b: PyObjectRef) -> bool {
     unsafe { pyre_object::bytesobject::is_bytes(b) }
 }
-fn cmp_guard_bytearray(b: PyObjectRef) -> bool {
-    unsafe { pyre_object::bytesobject::is_bytes_like(b) }
+/// `bytearrayobject.py:305 descr_eq` / `:355 _comparison_helper` — a bytearray
+/// compares by content against **any** `BUF_SIMPLE` exporter, not only against
+/// another bytes-like: the non-bytes-like operand goes to
+/// `space.acquire_py_buffer(w_other, space.BUF_SIMPLE)`, and only the TypeError
+/// that raises becomes `NotImplemented`.
+///
+/// `bytes` deliberately keeps the narrow [`cmp_guard_bytes`] test.  Its own
+/// comparisons never acquire a buffer, which is why
+/// `b'ab' == array.array('B', [97, 98])` is `False` while the bytearray
+/// spelling of it is `True`.
+fn bytearray_compare(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: crate::objspace::descroperation::CompareOp,
+) -> Result<PyObjectRef, crate::PyError> {
+    // The bytes-like arms, and any receiver this slot was not meant for, keep
+    // the by-layout comparison.
+    if unsafe {
+        !pyre_object::bytesobject::is_bytes_like(a) || pyre_object::bytesobject::is_bytes_like(b)
+    } {
+        return crate::objspace::descroperation::compare_slot(a, b, op);
+    }
+    let buffer = match crate::baseobjspace::simple_buffer_bytes(b) {
+        Ok(Some(buffer)) => buffer,
+        Ok(None) => return Ok(pyre_object::w_not_implemented()),
+        Err(error) if error.kind == crate::PyErrorKind::TypeError => {
+            return Ok(pyre_object::w_not_implemented());
+        }
+        Err(error) => return Err(error),
+    };
+    // `getdata()` is read after the acquisition: a `__buffer__` slot is
+    // app-level code and may have resized the receiver.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(a) }.to_vec();
+    // `_memcmp` over the common prefix, then the lengths decide — which is
+    // what a lexicographic slice comparison already is.
+    let ordering = data.as_slice().cmp(buffer.as_bytes());
+    buffer.release();
+    Ok(pyre_object::w_bool_from(
+        crate::objspace::descroperation::ordering_satisfies(ordering, op),
+    ))
 }
+
+macro_rules! bytearray_cmp_dunder {
+    ($name:ident, $op:ident) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            crate::type_methods::arity_slot(args, 1)?;
+            bytearray_compare(
+                args[0],
+                args[1],
+                crate::objspace::descroperation::CompareOp::$op,
+            )
+        }
+    };
+}
+bytearray_cmp_dunder!(bytearray_dunder_eq, Eq);
+bytearray_cmp_dunder!(bytearray_dunder_ne, Ne);
+bytearray_cmp_dunder!(bytearray_dunder_lt, Lt);
+bytearray_cmp_dunder!(bytearray_dunder_le, Le);
+bytearray_cmp_dunder!(bytearray_dunder_gt, Gt);
+bytearray_cmp_dunder!(bytearray_dunder_ge, Ge);
 
 macro_rules! cmp_dunder {
     ($name:ident, $op:ident, $guard:path) => {
@@ -16750,15 +16807,6 @@ cmp_dunder_set!(
     bytes_dunder_gt,
     bytes_dunder_ge,
     cmp_guard_bytes
-);
-cmp_dunder_set!(
-    bytearray_dunder_eq,
-    bytearray_dunder_ne,
-    bytearray_dunder_lt,
-    bytearray_dunder_le,
-    bytearray_dunder_gt,
-    bytearray_dunder_ge,
-    cmp_guard_bytearray
 );
 
 type DunderFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;

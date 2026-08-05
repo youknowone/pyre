@@ -2264,6 +2264,21 @@ unsafe fn long_int_compare(long: PyObjectRef, iother: i64, op: CompareOp) -> boo
     }
 }
 
+/// Read a total-order result under `op` — the shape every `_memcmp`-based
+/// comparison ends in, where the common prefix and then the lengths have
+/// already been folded into one `Ordering`.
+#[inline]
+pub(crate) fn ordering_satisfies(ordering: std::cmp::Ordering, op: CompareOp) -> bool {
+    match op {
+        CompareOp::Lt => ordering.is_lt(),
+        CompareOp::Le => ordering.is_le(),
+        CompareOp::Gt => ordering.is_gt(),
+        CompareOp::Ge => ordering.is_ge(),
+        CompareOp::Eq => ordering.is_eq(),
+        CompareOp::Ne => ordering.is_ne(),
+    }
+}
+
 #[inline]
 fn reverse_compare_op(op: CompareOp) -> CompareOp {
     match op {
@@ -4831,14 +4846,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         {
             let da = pyre_object::bytesobject::bytes_like_data(a);
             let db = pyre_object::bytesobject::bytes_like_data(b);
-            return Ok(w_bool_from(match op {
-                CompareOp::Lt => da < db,
-                CompareOp::Le => da <= db,
-                CompareOp::Gt => da > db,
-                CompareOp::Ge => da >= db,
-                CompareOp::Eq => da == db,
-                CompareOp::Ne => da != db,
-            }));
+            return Ok(w_bool_from(ordering_satisfies(da.cmp(db), op)));
         }
         // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.
         if is_tuple(a) && is_tuple(b) {

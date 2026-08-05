@@ -5155,11 +5155,16 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(w_str_from_wtf8_managed(case::swapcase_wtf8(s)))
 }
 
-/// PyPy: unicodeobject.py descr_center
-/// Resolve the fillchar arg for `center`/`ljust`/`rjust`. Defaults to
-/// `' '` when missing; PyPy raises TypeError when the fill string is
-/// not exactly one character long (unicodeobject.py:1191-1194
-/// _convert_fillchar parity).
+/// Resolve the fillchar arg for `center`/`ljust`/`rjust`. Defaults to `' '`
+/// for an *omitted* argument (`w_fillchar=WrappedDefault(u' ')`); a supplied
+/// `None` is an ordinary value and is refused here like any other non-str.
+///
+/// Upstream converts the operand with two different helpers — `descr_center`
+/// uses `space.utf8_w`, `descr_ljust`/`descr_rjust` use
+/// `convert_arg_to_w_unicode`, which decodes a buffer operand into a fill
+/// char rather than refusing it. That acceptance is a PyPy-only divergence
+/// (CPython refuses a memoryview/array/bytearray fill for all three) and is
+/// deliberately not imported, so all three share one rejection here.
 fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::PyError> {
     if args.len() <= 2 {
         return Ok(CodePoint::from_char(' '));
