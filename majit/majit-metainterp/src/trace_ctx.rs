@@ -844,6 +844,22 @@ impl TraceCtx {
     /// RPython executes the allocation before recording the matching trace op,
     /// so later residual calls and field operations observe a real pointer
     /// while the optimizer remains free to virtualize the recorded allocation.
+    ///
+    /// Rooting contract: the result is returned unrooted, and the caller must
+    /// stamp it onto the op it records for this allocation
+    /// (`set_opref_concrete`) before performing any GC allocation.  That stamp
+    /// is what makes the object a root — `MetaInterp::walk_active_trace_refs`
+    /// forwards every recorder `Op`/`InputArg` `value` cell holding a
+    /// `Value::Ref`, which is the `history.py:803-807` `*FrontendOp(pos,
+    /// value)` slot upstream reaches through the object graph.  Between the
+    /// `bh_new` here and that stamp there is no root at all, so the caller's
+    /// window must contain no GC allocation; recording the op and populating
+    /// the heapcache allocate from the Rust heap only, which is why the
+    /// existing call sites are sound.
+    ///
+    /// A side list of executed allocations is NOT the way to widen that
+    /// window: it duplicates a root the op graph already owns, and it hands
+    /// the collector shapes the op graph never exposes it to.
     pub fn execute_new_allocation(&self, descr: &DescrRef, with_vtable: bool) -> Option<Value> {
         let cpu = unsafe { &*self.cpu? };
         let bh_descr = descr_to_bh_size_descr(descr)?;

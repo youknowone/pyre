@@ -1147,7 +1147,14 @@ fn int_ovf_jump_declines_when_an_operand_is_not_concrete() {
 /// Drive one of the `d>r` struct-allocation handlers (`new`,
 /// `new_with_vtable`): both record the descr alone and write the
 /// allocation into the ref bank.
-fn drive_alloc_with_descr(opname: &str, expected_opcode: OpCode) {
+///
+/// Returns the concrete stamped onto the recorded allocation op, which is
+/// `None` without a cpu (no `bh_new` to execute).
+fn drive_alloc_with_descr(
+    opname: &str,
+    expected_opcode: OpCode,
+    cpu: Option<&dyn majit_backend::Backend>,
+) -> Option<Value> {
     let nwv_byte = *insns_opname_to_byte()
         .get(opname)
         .unwrap_or_else(|| panic!("`{opname}` must be in the runtime instruction table"));
@@ -1159,6 +1166,7 @@ fn drive_alloc_with_descr(opname: &str, expected_opcode: OpCode) {
     let _ = test_outer_resume_jitcode_index();
     let descr_pool = vec![crate::descr::w_int_size_descr()];
     let mut tc = TraceCtx::for_test_types(&[]);
+    tc.set_cpu(cpu);
     let mut regs_r = vec![OpRef::NONE];
     let mut concrete_r = vec![ConcreteValue::Null];
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -1217,16 +1225,118 @@ fn drive_alloc_with_descr(opname: &str, expected_opcode: OpCode) {
         "the `>r` decorator writes the allocation into the ref bank"
     );
     assert_eq!(next_pc, 4, "`d>r` consumes a 2B descr plus a 1B dst");
+    tc.lookup_opref_concrete(dst)
 }
 
 #[test]
 fn new_with_vtable_records_the_alloc_and_writes_the_ref_dst() {
-    drive_alloc_with_descr("new_with_vtable/d>r", OpCode::NewWithVtable);
+    drive_alloc_with_descr("new_with_vtable/d>r", OpCode::NewWithVtable, None);
 }
 
 #[test]
 fn new_records_the_alloc_and_writes_the_ref_dst() {
-    drive_alloc_with_descr("new/d>r", OpCode::New);
+    drive_alloc_with_descr("new/d>r", OpCode::New, None);
+}
+
+/// Backend stub for the allocation-rooting tests: `bh_new*` hands back one
+/// caller-owned block so the handler observes a real, dereferenceable
+/// pointer (`new_with_vtable` writes `w_class` into it).
+struct AllocTestCpu {
+    block: i64,
+}
+impl majit_backend::Backend for AllocTestCpu {
+    fn bh_new(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+        self.block
+    }
+    fn bh_new_with_vtable(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+        self.block
+    }
+    fn compile_loop(
+        &mut self,
+        _inputargs: &[majit_ir::InputArg],
+        _ops: &[majit_ir::OpRc],
+        _token: &majit_backend::JitCellToken,
+    ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+        unimplemented!("AllocTestCpu::compile_loop")
+    }
+    fn compile_bridge(
+        &mut self,
+        _fail_descr: &dyn majit_ir::FailDescr,
+        _inputargs: &[majit_ir::InputArg],
+        _ops: &[majit_ir::OpRc],
+        _original_token: &majit_backend::JitCellToken,
+        _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
+        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
+    ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+        unimplemented!("AllocTestCpu::compile_bridge")
+    }
+    fn execute_token(
+        &self,
+        _token: &majit_backend::JitCellToken,
+        _args: &[majit_ir::Value],
+    ) -> majit_backend::DeadFrame {
+        unimplemented!("AllocTestCpu::execute_token")
+    }
+    fn get_latest_descr<'a>(
+        &'a self,
+        _frame: &'a majit_backend::DeadFrame,
+    ) -> &'a dyn majit_ir::FailDescr {
+        unimplemented!("AllocTestCpu::get_latest_descr")
+    }
+    fn get_latest_descr_arc(
+        &self,
+        _frame: &majit_backend::DeadFrame,
+    ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+        unimplemented!("AllocTestCpu::get_latest_descr_arc")
+    }
+    fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+        unimplemented!("AllocTestCpu::get_int_value")
+    }
+    fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+        unimplemented!("AllocTestCpu::get_float_value")
+    }
+    fn get_ref_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> majit_ir::GcRef {
+        unimplemented!("AllocTestCpu::get_ref_value")
+    }
+    fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+        unimplemented!("AllocTestCpu::invalidate_loop")
+    }
+}
+
+/// The object `execute_new[_with_vtable]` allocates is rooted by being
+/// stamped onto the op recorded for it: `MetaInterp::walk_active_trace_refs`
+/// forwards every recorder `Op` `value` cell holding a `Value::Ref`
+/// (`history.py:803-807` `*FrontendOp(pos, value)`), and that stamp is the
+/// only thing putting a walk-time allocation in the root set — the walker's
+/// `concrete_registers_r` shadow is a borrowed slice, not a root.
+///
+/// Losing the stamp would leave the allocation reachable only from that
+/// shadow, so pin it here rather than relying on a side list of executed
+/// allocations, which would duplicate a root the op graph already owns.
+fn alloc_result_is_stamped_onto_its_recorded_op(opname: &str, expected_opcode: OpCode) {
+    // Real backing storage: `new_with_vtable` writes `w_class` into the
+    // returned block, so a synthetic address would be a wild store.
+    let block: Box<[usize; 32]> = Box::new([0; 32]);
+    let cpu = AllocTestCpu {
+        block: block.as_ref().as_ptr() as i64,
+    };
+    let stamped = drive_alloc_with_descr(opname, expected_opcode, Some(&cpu));
+    assert_eq!(
+        stamped,
+        Some(Value::Ref(majit_ir::GcRef(cpu.block as usize))),
+        "`{opname}` must stamp the allocation onto its recorded op — that cell \
+         is the GC root the walk relies on",
+    );
+}
+
+#[test]
+fn new_stamps_its_allocation_onto_the_recorded_op() {
+    alloc_result_is_stamped_onto_its_recorded_op("new/d>r", OpCode::New);
+}
+
+#[test]
+fn new_with_vtable_stamps_its_allocation_onto_the_recorded_op() {
+    alloc_result_is_stamped_onto_its_recorded_op("new_with_vtable/d>r", OpCode::NewWithVtable);
 }
 
 /// Step one record-only opcode (the heapcache hints, the raw-memory pair)
