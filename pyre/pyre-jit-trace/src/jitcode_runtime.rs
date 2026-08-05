@@ -718,11 +718,36 @@ pub fn descr_set_jit_stats() -> String {
 /// one skip set, so `all_fielddescrs(S)[i].get_index() == i` holds by
 /// construction and there is nothing to count.
 ///
-/// `rederived` is the one to watch: it counts fields whose caller-supplied index
-/// disagreed with the parent that will actually be indexed at
-/// `optimizeopt/info.rs force_box`. Every one of those was, before this was
-/// derived rather than transported, either an out-of-range panic or a store
-/// emitted against a DIFFERENT field.
+/// `attached_misplaced` and `spec_misplaced` are the two to watch. Both count a
+/// producer-supplied `index_in_parent` that disagrees with where the field
+/// actually sits, read before anything downstream can normalise it, and between
+/// them they cover the two shapes a producer can emit: `spec_misplaced` a
+/// parent's own positional list, `attached_misplaced` a standalone field descr
+/// pointing into one. The second is not implied by the first — a producer builds
+/// a list by enumerating what it just sorted, so the list is self-consistent by
+/// construction while a descr minted against an earlier state of it is not.
+///
+/// `rederived` looks like it asks that question and does not. `derive_index_in_parent`
+/// is the judge and the repairman: it replaces the caller's number with the
+/// parent's in the same expression, so a nonzero reading is a log of repairs
+/// already applied, never a defect still present. Worse, it counts only the
+/// mints it reached — `parent_absent` is the ones where it never asked, and that
+/// is the *majority* of them, because
+/// `make_simple_descr_group_keyed_with_headerless` mints every field before
+/// `register_keyed_size` publishes the parent those fields will be indexed
+/// against. `field_pos_rederived=0` therefore states nothing about the
+/// producers; it has to be read as a fraction of `parent_absent`, and a
+/// producer defect can sit at zero forever. `spec_misplaced` is the same defect
+/// measured where no reader has had the chance to repair it.
+///
+/// The defect being measured: `all_fielddescrs()[index_in_parent]` is a
+/// load-bearing lookup (`optimizeopt/info.rs force_box`), so an index naming a
+/// different slot than the field occupies either runs off the end or emits the
+/// store against a DIFFERENT field.
+///
+/// `positional_misplaced` is the output-side companion — the same predicate on
+/// the published list, after `get_field_descr` has reconciled it. The gap
+/// between the two is exactly how much the reader is absorbing.
 ///
 /// `size_shell_*` is the producer-side companion. `parent_empty` counts mint
 /// attempts that found a fieldless parent, so one shell hit by many fields reads
@@ -733,6 +758,9 @@ pub fn descr_set_jit_stats() -> String {
 pub fn field_position_jit_stats() -> String {
     let [parent_absent, parent_empty, rederived, unresolved] =
         majit_ir::descr::GcCache::field_position_census();
+    let [spec_checked, spec_misplaced] = majit_ir::descr::GcCache::spec_position_census();
+    let [attached_checked, attached_misplaced] =
+        majit_ir::descr::GcCache::attached_position_census();
     let (
         [published, fieldless, shadowing, aliased, aliased_multi],
         [slots, misplaced],
@@ -757,6 +785,9 @@ pub fn field_position_jit_stats() -> String {
     format!(
         "field_pos_parent_absent={parent_absent} field_pos_parent_empty={parent_empty} \
          field_pos_rederived={rederived} field_pos_unresolved={unresolved} \
+         field_pos_spec_checked={spec_checked} field_pos_spec_misplaced={spec_misplaced} \
+         field_pos_attached_checked={attached_checked} \
+         field_pos_attached_misplaced={attached_misplaced} \
          size_shell_published={published} size_shell_fieldless={fieldless} \
          size_shell_shadowing={shadowing} size_shell_aliased={aliased} \
          size_shell_aliased_multi={aliased_multi} \

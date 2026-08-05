@@ -5167,6 +5167,17 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                             spec.offset == *offset && spec.field_key() == field_key
                         })
                     {
+                        // `pos` is the slot this reader will index; the descr's
+                        // own `index_in_parent` (`descr.py:228`) is what every
+                        // later consumer indexes by
+                        // (`optimizeopt/info.rs force_box`).  They are two
+                        // producers' answers to one question and nothing else
+                        // compares them: the cache-hit return above and
+                        // `get_field_descr`'s own `derive_index_in_parent` both
+                        // resolve by NAME, so a stale rank is silently replaced
+                        // rather than reported.  Count it where it is still
+                        // visible.
+                        majit_ir::descr::census_attached_index(pos, *index_in_parent);
                         if let Some(descr) = group.field_descrs.get(pos) {
                             return descr.clone() as DescrRef;
                         }

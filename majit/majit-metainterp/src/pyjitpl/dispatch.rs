@@ -142,6 +142,24 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
         } => {
             if let Some(p) = parent {
                 if !p.all_fielddescrs.is_empty() {
+                    // The descr's own two halves, before any of the branches
+                    // below hand it to a reader that would reconcile them:
+                    // `index_in_parent` (`descr.py:228`) must name the slot of
+                    // the attached parent's list that this field's offset
+                    // occupies.  `get_field_descr`'s `derive_index_in_parent`
+                    // cannot answer this — it runs only on the mint path, only
+                    // once `_cache_size` already holds the parent, and it
+                    // overwrites the number it disagrees with.
+                    //
+                    // A miss is the inline-aggregate floor (`ob_header`,
+                    // `int_items`, an enum's `__pos_0`) carrying the documented
+                    // `(0, "")` fallback the branches below already describe,
+                    // not this defect, so it is not counted either way.
+                    if let Some(expected) =
+                        p.all_fielddescrs.iter().position(|f| f.offset == *offset)
+                    {
+                        majit_ir::descr::census_attached_index(expected, *index_in_parent);
+                    }
                     let mut specs: Vec<_> =
                         p.all_fielddescrs.iter().map(field_spec_from_bh).collect();
                     if p.type_id == 0 {

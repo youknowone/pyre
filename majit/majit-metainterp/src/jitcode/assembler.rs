@@ -4952,6 +4952,11 @@ impl JitCodeBuilder {
         self.patch_switch_descrs();
         self.patch_const_refs();
         self.patch_field_descr_parents();
+        debug_assert!(
+            self.field_descr_position_disagreement().is_none(),
+            "{}",
+            self.field_descr_position_disagreement().unwrap()
+        );
         self.patch_const_u8_refs();
         // RPython `jitcode.py:47 self._resulttypes = resulttypes`.
         // Upstream `assembler.py:217-219` records the result-kind
@@ -5562,6 +5567,75 @@ impl JitCodeBuilder {
             *index_in_parent = idx;
             name.clone_from(&p.all_fielddescrs[idx].name);
         }
+    }
+
+    /// The postcondition of [`patch_field_descr_parents`], checked rather than
+    /// assumed: every emitted `Field` descr agrees with the parent attached to
+    /// it about which slot the field occupies.
+    ///
+    /// This exists because the corpus cannot be the detector. The defect the
+    /// pass fixes is *input-order dependent* — it needs a field minted before a
+    /// lower-offset sibling registers — so a program that happens to register in
+    /// offset order exercises the producer without exercising the bug. Measured:
+    /// with the two re-resolution lines removed, `field_pos_rederived`,
+    /// `field_pos_spec_misplaced`, `field_pos_attached_misplaced` and
+    /// `positional_misplaced` all still read 0 over the whole corpus. A census
+    /// counts what ran; only a construction-site check covers what the producer
+    /// can emit.
+    ///
+    /// Three shapes, all of them real states this pass can leave behind:
+    ///
+    /// * the offset resolves — index and name must be that slot's. This is the
+    ///   two lines above, so it guards future edits rather than today's tree.
+    /// * the offset does not resolve — the descr must still carry
+    ///   `add_struct_field_descr`'s `(0, String::new())` fallback untouched.
+    ///   Those are the inline aggregates (`ob_header`, `int_items`, an enum's
+    ///   `__pos_0`) the flattened layout represents only through their leaves.
+    /// * the parent's `type_id` is absent from `struct_size_specs` — the
+    ///   `continue` above, which leaves the mint-time snapshot in place. Nothing
+    ///   patched it, so nothing has established the invariant for it either.
+    ///
+    /// Returns the first disagreement as a message, so the caller's
+    /// `debug_assert!` says which descr and both numbers. Release builds skip
+    /// the walk entirely.
+    ///
+    /// [`patch_field_descr_parents`]: Self::patch_field_descr_parents
+    fn field_descr_position_disagreement(&self) -> Option<String> {
+        for entry in &self.descrs {
+            let RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+                offset,
+                index_in_parent,
+                parent: Some(p),
+                name,
+                ..
+            }) = entry
+            else {
+                continue;
+            };
+            match p.all_fielddescrs.iter().position(|fd| fd.offset == *offset) {
+                Some(idx) => {
+                    let slot = &p.all_fielddescrs[idx];
+                    if *index_in_parent != idx || *name != slot.name {
+                        return Some(format!(
+                            "field descr at offset {offset} of type_id {:#x} claims slot \
+                             {index_in_parent} named {name:?}, but that offset is slot {idx} \
+                             named {:?}",
+                            p.type_id, slot.name,
+                        ));
+                    }
+                }
+                None if *index_in_parent != 0 || !name.is_empty() => {
+                    return Some(format!(
+                        "field descr at offset {offset} is absent from type_id {:#x}'s layout \
+                         yet carries slot {index_in_parent} named {name:?} instead of the \
+                         unresolved fallback",
+                        p.type_id,
+                    ));
+                }
+                None => {}
+            }
+        }
+        None
     }
 
     /// RPython `assembler.py:131-138` resolves a const-source operand

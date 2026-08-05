@@ -703,6 +703,18 @@ def _parse_jit_stats(snapshot):
 # fourth one fail CI instead of surfacing as an intermittent asyncio failure.
 # Like `loops_aborted` it is not absolute: the baseline pins the instances that
 # exist today and a rise means a new one.
+#
+# `field_pos_spec_misplaced` and `field_pos_attached_misplaced` are the same kind
+# of assertion one layer down: a field descr's `index_in_parent` (`descr.py:228`)
+# must name the slot its own parent puts the field in, which upstream gets for
+# free because `heaptracker.py:60-72` and `:96-112` are one walker. Both are
+# counted where the producer's number is still readable — before
+# `get_field_descr` re-derives it — because the counter that looks like it
+# already gates this, `field_pos_rederived`, cannot: `derive_index_in_parent`
+# overwrites the number it disagrees with, and skips the check entirely whenever
+# the parent is not yet published, which is most of them. So a printed
+# `field_pos_rederived=0` never meant the producers agreed, and gating it would
+# have gated nothing.
 JITSTATS_BADNESS_FIELDS = (
     "loops_aborted",
     "internal_compile_panics",
@@ -710,6 +722,8 @@ JITSTATS_BADNESS_FIELDS = (
     "descr_set_ambiguous",
     "descr_set_stale_absent",
     "fbw_rolled_back_with_effects",
+    "field_pos_spec_misplaced",
+    "field_pos_attached_misplaced",
 )
 
 # The three count-valued counters, and what a move in either direction means:
