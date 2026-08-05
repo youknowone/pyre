@@ -12856,6 +12856,11 @@ impl<M: Clone> MetaInterp<M> {
     /// matching RPython's `_prepare_exception_resumption` (phase 1,
     /// trace start) and `prepare_resume_from_failure` (phase 2,
     /// after resume ops).
+    ///
+    /// Not on the live path: the bridge walker emits this sequence itself at
+    /// the bridge-entry frame state, where the GUARD_EXCEPTION it ends with
+    /// carries a snapshot.  The guard emitted here carries none, so it could
+    /// only ever serve a trace that gets discarded.
     pub fn emit_exception_bridge_prologue(&mut self, exc_class: i64, exc_value: i64) {
         let Some(ref mut ctx) = self.tracing else {
             return;

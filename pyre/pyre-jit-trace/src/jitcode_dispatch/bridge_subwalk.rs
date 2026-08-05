@@ -313,8 +313,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // walk MUST resume at an `except` handler — falling through to the
     // no-exception continuation would record the return of the NULL raised-call
     // result (`Finish(NULL)` → "call failed").
-    let exc_edge_precondition = exc_edge_bridge_enabled()
-        && trace_ctx.is_bridge_trace
+    let exc_edge_precondition = trace_ctx.is_bridge_trace
         && trace_ctx.bridge_source_is_exception_guard()
         && !sym.last_exc_box().is_none()
         && !sym.last_exc_value().is_null();
@@ -334,7 +333,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // Routed by `call_jit` with no `catch_exception` in this frame at all,
         // which the routing precondition above is supposed to exclude.  Abort
         // BEFORE any recording so the guard failure resumes via the blackhole,
-        // exactly as when the flag is off.
+        // exactly as an unrouted one does.
         return Err(DispatchError::ExcEdgeNoInFrameCatch { pc: position });
     }
     let exc_edge_concrete = sym.last_exc_value();
@@ -344,7 +343,13 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // One machine word, so read it at pointer width: an i64 read on a
         // 32-bit target pulls the adjacent header word into the high half, and
         // the guard then compares against a class value the pending-exception
-        // cell (`jit_exc_raise`, pointer-width) can never hold.
+        // cell (`jit_exc_raise`, pointer-width) can never hold.  That read is
+        // why exception-edge routing was once wasm-off: the guard it emitted
+        // could not pass, so every raising iteration deopted one chain link
+        // deeper and `guard_failures` tracked the iteration count instead of
+        // converging.  A backend that skips SAVE_EXCEPTION / SAVE_EXC_CLASS /
+        // RESTORE_EXCEPTION rather than lowering them fails the same way, one
+        // step later: the handler then reads a null caught exception.
         unsafe { *(exc_edge_concrete as *const usize) as i64 }
     } else {
         0

@@ -3264,50 +3264,18 @@ pub fn trace_and_compile_from_bridge(
         }
         return BridgeResolution::ResumeBlackhole;
     }
-    // RPython pyjitpl.py:3101 _prepare_exception_resumption +
-    // pyjitpl.py:3132 prepare_resume_from_failure parity:
-    // For exception guard bridges (GUARD_EXCEPTION / GUARD_NO_EXCEPTION),
-    // emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start, then
-    // RESTORE_EXCEPTION before the guard. The exception class/value
-    // are read from the TLS exception state set by Cranelift codegen.
+    // `_prepare_exception_resumption` (pyjitpl.py:3101) +
+    // `prepare_resume_from_failure` (pyjitpl.py:3132) parity: for exception
+    // guard bridges (GUARD_EXCEPTION / GUARD_NO_EXCEPTION), SAVE_EXC_CLASS +
+    // SAVE_EXCEPTION at trace start, then RESTORE_EXCEPTION before the guard.
+    // The walker owns that whole sequence — it emits it at the bridge-entry
+    // frame state, which is where the guard can capture resume data — so this
+    // site only consumes the flag.
     let last_bridge_is_exception_guard = {
         let (driver, _) = crate::eval::driver_pair();
         driver.last_bridge_is_exception_guard
     };
     if last_bridge_is_exception_guard {
-        // The walker emits the whole exception
-        // resumption sequence (SAVE_EXC_CLASS/SAVE_EXCEPTION/RESTORE_EXCEPTION +
-        // a snapshotted GUARD_EXCEPTION) at the bridge-entry frame state, where
-        // the guard can capture resume data.  The legacy call-site prologue
-        // below emits a snapshot-less GUARD_EXCEPTION and is only reached on the
-        // declined path (which discards the trace), so skip it when routing is
-        // enabled and let the walker own the sequence.
-        if !pyre_jit_trace::jitcode_dispatch::exc_edge_bridge_enabled() {
-            #[cfg(feature = "cranelift")]
-            let exc_class = majit_backend_cranelift::jit_exc_class_raw();
-            #[cfg(not(feature = "cranelift"))]
-            let exc_class: i64 = 0;
-            #[cfg(feature = "cranelift")]
-            let exc_value = majit_backend_cranelift::jit_exc_value_raw();
-            #[cfg(not(feature = "cranelift"))]
-            let exc_value: i64 = 0;
-            if exc_class != 0 {
-                // RPython pyjitpl.py:3125-3126 + 3138:
-                // SAVE_EXC_CLASS, SAVE_EXCEPTION, RESTORE_EXCEPTION
-                {
-                    let (driver, _) = crate::eval::driver_pair();
-                    driver
-                        .meta_interp_mut()
-                        .emit_exception_bridge_prologue(exc_class, exc_value);
-                }
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][bridge-exc] exception guard bridge: class={:#x} value={:#x}",
-                        exc_class, exc_value
-                    );
-                }
-            }
-        }
         let (driver, _) = crate::eval::driver_pair();
         driver.last_bridge_is_exception_guard = false;
     }
@@ -3451,9 +3419,7 @@ pub fn trace_and_compile_from_bridge(
         && resume_coords
             .first()
             .is_some_and(|&(outer_w_code, _)| outer_w_code == frame.pycode as usize);
-    let route_exc_edge = caught_in_frame
-        && (!is_multiframe_resume || unwind_to_live_frame)
-        && pyre_jit_trace::jitcode_dispatch::exc_edge_bridge_enabled();
+    let route_exc_edge = caught_in_frame && (!is_multiframe_resume || unwind_to_live_frame);
     // The levels this route is about to throw away: `resume_coords` minus the
     // live frame, which keeps its own recorder at the handler entry.  Published
     // unconditionally on the routing path — an empty slice for the single-frame
