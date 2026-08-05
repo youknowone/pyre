@@ -724,6 +724,7 @@ JITSTATS_BADNESS_FIELDS = (
     "fbw_rolled_back_with_effects",
     "field_pos_spec_misplaced",
     "field_pos_attached_misplaced",
+    "fbw_store_journal_rollback_failed",
 )
 
 # The three count-valued counters, and what a move in either direction means:

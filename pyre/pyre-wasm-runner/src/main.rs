@@ -620,7 +620,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         // which the guest cannot read. Slot layout in
         // `pyre_jit_trace::trace::fbw_diag`.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
-            const RING_BASE: u32 = 11;
+            const RING_BASE: u32 = 12;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
@@ -628,12 +628,14 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             let walks = slot(0);
             eprintln!(
                 "[jit-stats] fbw_diag walks={walks} ROLLED_BACK_WITH_EFFECTS={} \
-                 midbody_latch={}/{} escape_plain_fallback={}/{}",
+                 midbody_latch={}/{} escape_plain_fallback={}/{} \
+                 fbw_store_journal_rollback_failed={}",
                 slot(1),
                 slot(3),
                 slot(2),
                 slot(5),
                 slot(4),
+                slot(11),
             );
             for entry in 0..RING_ENTRIES.min(walks as u32) {
                 let base = RING_BASE + entry * RING_STRIDE;
@@ -654,7 +656,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 let field = |shift: u32| (flags >> shift) & 0xffff;
                 eprintln!(
                     "[fbw-census] end={end} committed={} leg={} bridge={} exec_mf={} \
-                     effects={} journal={}",
+                     effects={} journaled={}",
                     flags & (1 << 1) != 0,
                     (flags >> 56) & 0xff,
                     flags & (1 << 2) != 0,
@@ -858,14 +860,18 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         // the same key the native backends print, because `_jit_stats_change`
         // compares by name and a name only one backend emits gates nothing on
         // the others.
-        let fbw_rolled_back_with_effects = match instance
+        // Slot 11 is `STORE_JOURNAL_ROLLBACK_FAILED`, the store restores the
+        // rollback could not perform — the one journaled effect the walk-end
+        // subtraction must not silently absorb. Both slots come from one
+        // export lookup so an absent export names itself once.
+        let (fbw_rolled_back_with_effects, fbw_store_journal_rollback_failed) = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")
-            .and_then(|f| f.call(&mut store, 1))
+            .and_then(|f| Ok((f.call(&mut store, 1)?, f.call(&mut store, 11)?)))
         {
-            Ok(v) => v,
+            Ok(pair) => pair,
             Err(_) => {
                 missing.push("pyre_fbw_diag");
-                0
+                (0, 0)
             }
         };
         if !missing.is_empty() {
@@ -890,7 +896,8 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
              field_pos_spec_checked={field_pos_spec_checked} \
              field_pos_spec_misplaced={field_pos_spec_misplaced} \
              field_pos_attached_checked={field_pos_attached_checked} \
-             field_pos_attached_misplaced={field_pos_attached_misplaced}"
+             field_pos_attached_misplaced={field_pos_attached_misplaced} \
+             fbw_store_journal_rollback_failed={fbw_store_journal_rollback_failed}"
         );
     }
     let packed = match run_result {

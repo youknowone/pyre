@@ -934,6 +934,9 @@ pub(crate) fn fbw_store_journal_rollback() {
                 // shrank the list after the store — a shape the replay
                 // already cannot undo (the residual re-runs).  Surface it
                 // under the debug gate instead of corrupting silently.
+                crate::trace::fbw_diag::bump(
+                    crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
+                );
                 if fbw_debug_abort_enabled() {
                     eprintln!("[fbw-store-journal] rollback failed (index out of bounds)");
                 }
@@ -1066,6 +1069,19 @@ pub(crate) fn fbw_store_journal_rollback() {
 /// Current journal length (commit-point diagnostics).
 pub(crate) fn fbw_store_journal_len() -> usize {
     FBW_STORE_JOURNAL.with(|j| j.borrow().len())
+}
+
+/// The three journals whose pushes bump [`fbw_bump_executed_effect`], as
+/// `(stores, appends, cell_stores)`.  Read at the walk-end epilogue before the
+/// commit/rollback, their sum is the number of executed effects
+/// [`fbw_store_journal_rollback`] is about to undo.  The traceback journal is
+/// absent because its push bumps nothing.
+pub(crate) fn fbw_journaled_effect_lens() -> (usize, usize, usize) {
+    (
+        fbw_store_journal_len(),
+        FBW_APPEND_JOURNAL.with(|j| j.borrow().len()),
+        FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()),
+    )
 }
 
 /// Mark the walk as carrying a recorded-but-unexecuted side effect only

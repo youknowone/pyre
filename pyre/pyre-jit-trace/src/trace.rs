@@ -4708,7 +4708,8 @@ fn run_perfn_walk<Sym: WalkSym>(
         );
     }
     let committed = WALK_END_FLUSH_COMMITTED.with(|c| c.get()) || terminate_no_replay;
-    let journal = crate::jitcode_dispatch::fbw_store_journal_len();
+    let (jstore, jappend, jcell) = crate::jitcode_dispatch::fbw_journaled_effect_lens();
+    let journaled = jstore + jappend + jcell;
     if committed {
         crate::jitcode_dispatch::fbw_store_journal_commit();
         crate::jitcode_dispatch::fbw_exit_last_instr_commit();
@@ -4737,12 +4738,20 @@ fn run_perfn_walk<Sym: WalkSym>(
         }
         let (unj_val, unj_sym) = crate::jitcode_dispatch::fbw_unjournaled_kinds();
         let (exec_v, exec_mf, exec_pl) = crate::jitcode_dispatch::fbw_executed_residual_counts();
-        // `effects` is the gh#467 executed-effect odometer: residual calls that
-        // were not provably side-effect free AND either wrote the live heap or
-        // entered a Python frame.  A `committed=false` walk rolls its own store
-        // journal back but cannot undo these, so `committed=false effects>0`
-        // marks a walk whose caller is about to replay an irreversible region.
+        // `effects` is the gh#467 executed-effect odometer, and it counts two
+        // unlike things: residual calls that were not provably side-effect free
+        // AND either wrote the live heap or entered a Python frame, plus every
+        // push onto the three journals.  The journal pushes are undone by the
+        // `fbw_store_journal_rollback` above without the odometer moving, so
+        // only the remainder is what a `committed=false` walk leaves behind for
+        // its caller's replay to apply a second time.
+        //
+        // The subtraction cannot under-report: the odometer is zeroed only by
+        // `fbw_store_journal_reset`, which clears all three journals in the
+        // same breath, so `journaled <= effects` holds for every walk.
         let effects = crate::jitcode_dispatch::fbw_executed_effect_count();
+        debug_assert!(journaled <= effects);
+        let unrecoverable = effects.saturating_sub(journaled);
         // The same record, into a static the wasm host reads back through the
         // `pyre_fbw_diag` export.  The guest cannot see `PYRE_FBW_CENSUS`, so
         // without this the wasm target has no walk-level observability at all.
@@ -4752,7 +4761,8 @@ fn run_perfn_walk<Sym: WalkSym>(
             committed,
             ctx.is_bridge_trace,
             effects,
-            journal,
+            journaled,
+            unrecoverable,
             exec_mf,
             leg,
         );
@@ -4760,7 +4770,8 @@ fn run_perfn_walk<Sym: WalkSym>(
             eprintln!(
                 "[fbw-census] end={end} committed={committed} leg={leg} bridge={} \
                  unj_val={unj_val} unj_sym={unj_sym} exec_v={exec_v} exec_mf={exec_mf} \
-                 exec_pl={exec_pl} effects={effects} journal={journal}",
+                 exec_pl={exec_pl} effects={effects} jstore={jstore} jappend={jappend} \
+                 jcell={jcell} unrecoverable={unrecoverable}",
                 ctx.is_bridge_trace,
             );
         }
@@ -6122,12 +6133,13 @@ pub mod fbw_diag {
     pub const ESCAPE_PORTAL_AND_PUBLISHED_CALLEE: usize = 8;
     pub const ESCAPE_FORCE_BY_PORTAL: usize = 9;
     pub const ESCAPE_FORCE_BY_CALLEE_ONLY: usize = 10;
+    pub const STORE_JOURNAL_ROLLBACK_FAILED: usize = 11;
 
     /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
     /// slot, little-endian) followed by one slot of packed counters.  A `u64`
     /// export cannot carry a string, and the outcome set is far too large to
     /// spend a tally slot per variant.
-    pub const RING_BASE: usize = 11;
+    pub const RING_BASE: usize = 12;
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;
     pub const NAME_SLOTS: usize = 4;
@@ -6172,12 +6184,13 @@ pub mod fbw_diag {
         committed: bool,
         bridge: bool,
         effects: usize,
-        journal: usize,
+        journaled: usize,
+        unrecoverable: usize,
         exec_mf: u32,
         leg: u8,
     ) {
         let index = FBW_DIAG[WALKS].fetch_add(1, Ordering::Relaxed) as usize;
-        if !committed && effects > 0 {
+        if !committed && unrecoverable > 0 {
             FBW_DIAG[ROLLED_BACK_WITH_EFFECTS].fetch_add(1, Ordering::Relaxed);
         }
         if index >= RING_ENTRIES {
@@ -6198,7 +6211,7 @@ pub mod fbw_diag {
             | if committed { FLAG_COMMITTED } else { 0 }
             | ((effects as u64).min(FIELD_MASK) << SHIFT_EFFECTS)
             | if bridge { FLAG_BRIDGE } else { 0 }
-            | ((journal as u64).min(FIELD_MASK) << SHIFT_JOURNAL)
+            | ((journaled as u64).min(FIELD_MASK) << SHIFT_JOURNAL)
             | ((exec_mf as u64).min(FIELD_MASK) << SHIFT_EXEC_MF)
             | ((leg as u64) << SHIFT_LEG);
         FBW_DIAG[entry + NAME_SLOTS].store(flags, Ordering::Relaxed);
