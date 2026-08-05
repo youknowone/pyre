@@ -3125,10 +3125,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     let strict_inlinable =
         callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
     // `typeobject.py descr_call` discards `__init__`'s result and returns the
-    // instance.  Pyre flattens that frame for constructor inlining, so a guard
-    // pause inside a branchy `__init__` would have no frame to reconstruct that
-    // discard.  Keep such constructors residual so replay re-enters the whole
-    // instantiation call at the caller boundary.
+    // instance.  Hold constructors to the strict straight-line path here;
+    // together with the `constructor_result.is_none()` term on `strict_seed`,
+    // this keeps `__init__` out of every resume chain.  No callee frame is
+    // seeded, so a guard in `__init__` resumes at the caller's CALL coordinate
+    // and re-runs the instantiation, making the result discard unnecessary to
+    // represent.
     if constructor_result.is_some() && !strict_inlinable {
         return Ok(None);
     }
@@ -4915,19 +4917,6 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     // neither is overridden; leave that TypeError to the interpreter.
     if init_override.is_none() && r_args.len() != 2 {
         return type_call_decline("surplus args without __init__");
-    }
-    // PyPy `typeobject.py:descr_call` keeps `w_newobject` in its own live
-    // frame while it invokes `__init__`, checks that the latter returned
-    // None, and finally returns `w_newobject`.  The direct-allocation shortcut
-    // below has no corresponding `descr_call` MIFrame.  If a guard fails in
-    // the inlined `__init__`, blackhole therefore connects `__init__`'s None
-    // return directly to the Python caller's CALL result and loses the newly
-    // allocated instance.  Keep an overridden initializer on the ordinary
-    // residual constructor path until that owner frame is represented; the
-    // no-override leaf remains safe to fold because no intermediate return
-    // crosses the caller boundary.
-    if init_override.is_some() {
-        return type_call_decline("overridden __init__ requires descr_call frame");
     }
     let inlinable_init = match init_override {
         Some(init) => match unsafe { resolve_inlinable_callee(init) } {
