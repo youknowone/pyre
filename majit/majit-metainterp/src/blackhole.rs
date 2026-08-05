@@ -7804,8 +7804,7 @@ fn handler_residual_call_r_v(
 // `blackhole.py:107`).  All `*_pyre_u16` width adapters have been
 // retired; canonical `handler_*` decoders own every dispatch slot.
 
-/// Per-thread Backend instance for blackhole's `bh_getfield_gc_*` /
-/// `bh_setfield_gc_*` / `bh_getarrayitem_gc_*` / `bh_arraylen_gc` reads.
+/// Per-thread Backend instance backing every `bh.cpu` call.
 ///
 /// TODO: RPython `blackhole.py:55-56,286` reads
 /// `self.cpu = builder.cpu`, where `builder.cpu` is the metainterp-shared
@@ -7815,11 +7814,24 @@ fn handler_residual_call_r_v(
 ///
 /// pyre's `MetaInterp::backend` is per-instance (not `'static`) and
 /// owns trace-compilation state (descr registries, etc.) that would be
-/// inappropriate to share with the blackhole `bh.cpu` field which only
-/// needs the stateless GC memory-access methods.  We leak ONE
-/// `BackendImpl` instance per thread — its `bh_getfield_gc_*` and
-/// related methods do direct unsafe pointer arithmetic
-/// (`runner.rs:2244-2271` for dynasm).
+/// inappropriate to share with the blackhole `bh.cpu` field.  We leak ONE
+/// `BackendImpl` instance per thread instead, so `bh.cpu` is a *different*
+/// object from the one the metainterp that recorded the trace holds.
+///
+/// ## The invariant that makes the split observationally inert
+///
+/// Every `Backend` method this field reaches must be a pure function of
+/// its arguments — `&self` may not be read.  The full reachable surface is
+/// `bh_getfield_gc_{i,r,f}`, `bh_setfield_gc_{i,r,f}`,
+/// `bh_getarrayitem_gc_{i,r,f}`, `bh_arraylen_gc`, `bh_new`,
+/// `bh_new_with_vtable`, `bh_new_array{,_clear}`, `bh_call_{i,r,f,v}`, and
+/// `clear_stored_exception`.  On dynasm each is descr-supplied offsets fed
+/// to `read_int_at_mem` / `write_int_at_mem` (`runner.rs:1386,1402`) or a
+/// free function (`jit_exc_clear`, `call_stub::bh_call_*_dispatch`); none
+/// touches `&self`.  A method added to that list that *does* read backend
+/// state would make the blackhole observe a fresh, empty `BackendImpl`
+/// where the metainterp observes the populated one, and nothing here would
+/// catch it.
 ///
 /// Convergence path: align with RPython's `builder.cpu` invariant by
 /// passing the metainterp-owned `BackendImpl` to `BlackholeInterpBuilder`
@@ -7827,8 +7839,7 @@ fn handler_residual_call_r_v(
 /// `BH_BUILDER3` outlives any single MetaInterp invocation).  Open
 /// architectural item; not in scope here because the change cascades
 /// through the Backend trait's `Send + Sync` bound and every callsite
-/// that holds `&'static dyn Backend` today.  The leak is functionally
-/// correct because vable handlers only invoke stateless reads.
+/// that holds `&'static dyn Backend` today.
 #[cfg(any(feature = "dynasm", feature = "cranelift"))]
 pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
     // Per-thread leak: `BackendImpl` is not `Sync`, so we keep one
