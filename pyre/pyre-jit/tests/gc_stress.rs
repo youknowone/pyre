@@ -1046,6 +1046,48 @@ while i < 40:
     );
 }
 
+/// `list.sort` decodes `reverse=` by calling the object's `__bool__`, which runs
+/// Python and can collect.  The receiver and the `key=` callable are read out of
+/// the builtin's native argument copy, which the collector does not update, so
+/// both have to be pinned across that call rather than after it.
+#[test]
+fn list_sort_receiver_and_key_survive_the_reverse_bool_callback() {
+    run_on_worker(
+        r#"
+import gc
+
+class Flag:
+    def __init__(self, v):
+        self.v = v
+    def __bool__(self):
+        gc.collect()
+        return self.v
+
+def keyf(o):
+    gc.collect()
+    return -o
+
+i = 0
+while i < 40:
+    items = [5, 3, 9, 1, 7]
+    items.sort(reverse=Flag(True))
+    assert items == [9, 7, 5, 3, 1], items
+
+    other = [5, 3, 9, 1, 7]
+    other.sort(key=keyf, reverse=Flag(False))
+    assert other == [9, 7, 5, 3, 1], other
+
+    plain = [5, 3, 9, 1, 7]
+    plain.sort(key=None, reverse=Flag(False))
+    assert plain == [1, 3, 5, 7, 9], plain
+    i += 1
+"#,
+        "<list_sort_reverse_bool_gc_rooting>",
+        "list.sort reverse-callback root checks",
+        "list.sort reverse callback GC rooting program failed",
+    );
+}
+
 /// The reflected binary-operator helper holds both operands and the reflected
 /// implementation in Rust locals while `L.__add__` / `L.__sub__` run Python
 /// and collect before `R.__radd__` / `R.__rsub__` use those values.

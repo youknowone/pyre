@@ -704,7 +704,6 @@ pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// PyPy: listobject.py descr_sort — list.sort()
 pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "sort", true)?;
-    let list = args[0];
     // Keep the argument decoding shared with `sorted()` before changing the
     // receiver's visible storage.
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -719,16 +718,26 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         2,
     )?;
     crate::builtins::kwarg_reject_unknown(kwargs, &["key", "reverse"], "sort")?;
-    let key_fn = crate::builtins::kwarg_get(kwargs, "key")
-        .filter(|key| unsafe { !pyre_object::is_none(*key) });
+    // `reverse=` runs a user `__bool__`, which reaches a safepoint and can move
+    // the receiver and the key callable.  `args` is a native copy the collector
+    // does not update (`call.rs` `call_builtin_code_positional`), so both have
+    // to be pinned before the call and reloaded after, as `tuple_method_index`
+    // does around `eq_w`.  `w_none` stands in when no key was given, keeping the
+    // two roots adjacent so one base covers both.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    pyre_object::gc_roots::pin_root(
+        crate::builtins::kwarg_get(kwargs, "key").unwrap_or_else(w_none),
+    );
+
     let reverse = crate::builtins::kwarg_get(kwargs, "reverse")
         .map(|value| crate::baseobjspace::is_true(value))
         .transpose()?
         .unwrap_or(false);
 
-    let _roots = pyre_object::gc_roots::push_roots();
-    let list_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(list);
+    let key_arg = pyre_object::gc_roots::shadow_stack_get(list_slot + 1);
+    let key_fn = unsafe { !pyre_object::is_none(key_arg) }.then_some(key_arg);
     crate::builtins::sort_list_in_place(list_slot, key_fn, reverse)?;
     Ok(w_none())
 }
