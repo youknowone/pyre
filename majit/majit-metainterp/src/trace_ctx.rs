@@ -263,6 +263,12 @@ pub struct TraceCtx {
     /// sync on every standard vable write (`vable_setfield`,
     /// `vable_setarrayitem_indexed`, `store_local_value` mirror).
     virtualizable_values: Option<Vec<Value>>,
+    /// Per-slot provenance for the virtualizable shadow: the last executed store
+    /// into this flat slot wrote a live NULL Ref (the NULL companion an operand
+    /// stack push leaves behind), as opposed to a slot no store has touched. Same
+    /// layout as `virtualizable_values`; `None` whenever the concrete shadow is
+    /// disabled.
+    virtualizable_live_null_slots: Option<Vec<bool>>,
     /// VirtualizableInfo for the standard virtualizable (if any).
     virtualizable_info: Option<std::sync::Arc<VirtualizableInfo>>,
     /// Lengths of each virtualizable array field, needed for flat index computation.
@@ -276,6 +282,7 @@ pub struct TraceCtx {
         Option<Vec<Value>>,
         Option<std::sync::Arc<VirtualizableInfo>>,
         Option<Vec<usize>>,
+        Option<Vec<bool>>,
     )>,
     /// Live virtualizable heap pointer (pyjitpl.py:3446 write_boxes target).
     /// Mirrored from `MetaInterp::vable_ptr` at trace/bridge-entry.  Used by
@@ -1457,6 +1464,7 @@ impl TraceCtx {
             driver_descriptor: None,
             virtualizable_boxes: None,
             virtualizable_values: None,
+            virtualizable_live_null_slots: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             portal_vable_saves: Vec::new(),
@@ -1543,6 +1551,7 @@ impl TraceCtx {
             driver_descriptor: None,
             virtualizable_boxes: None,
             virtualizable_values: None,
+            virtualizable_live_null_slots: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             portal_vable_saves: Vec::new(),
@@ -2166,6 +2175,7 @@ impl TraceCtx {
             // return None and readers fall back to the zero placeholder,
             // same as the pre-concrete-shadow state.
             self.virtualizable_values = None;
+            self.virtualizable_live_null_slots = None;
         } else {
             assert_eq!(
                 input_oprefs.len(),
@@ -2174,6 +2184,7 @@ impl TraceCtx {
             );
             let mut values = input_values.to_vec();
             values.push(vable_ref_value);
+            self.virtualizable_live_null_slots = Some(vec![false; values.len()]);
             self.virtualizable_values = Some(values);
         }
         self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
@@ -2196,15 +2207,18 @@ impl TraceCtx {
             self.virtualizable_values.clone(),
             self.virtualizable_info.clone(),
             self.virtualizable_array_lengths.clone(),
+            self.virtualizable_live_null_slots.clone(),
         ));
     }
 
     /// [FR] Restore the caller's standard-virtualizable state when a
     /// recursive-portal INLINE frame returns.  No-op if the stack is empty.
     pub fn restore_saved_virtualizable(&mut self) {
-        if let Some((boxes, values, info, lengths)) = self.portal_vable_saves.pop() {
+        if let Some((boxes, values, info, lengths, live_null_slots)) = self.portal_vable_saves.pop()
+        {
             self.virtualizable_boxes = boxes;
             self.virtualizable_values = values;
+            self.virtualizable_live_null_slots = live_null_slots;
             self.virtualizable_info = info;
             self.virtualizable_array_lengths = lengths;
         }
@@ -2720,6 +2734,16 @@ impl TraceCtx {
         );
         boxes[index] = opref;
         values[index] = value;
+        if let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut() {
+            live_null_slots[index] = false;
+        }
+    }
+
+    /// Whether the last executed store into flat slot `index` wrote a live NULL Ref.
+    pub fn virtualizable_slot_stored_live_null(&self, index: usize) -> bool {
+        self.virtualizable_live_null_slots
+            .as_ref()
+            .is_some_and(|slots| slots.get(index).copied().unwrap_or(false))
     }
 
     /// Return the standard virtualizable identity (`virtualizable_boxes[-1]`).
@@ -2962,9 +2986,11 @@ impl TraceCtx {
                 values.len(),
                 "set_virtualizable_boxes_with_info: boxes/values length mismatch",
             );
+            self.virtualizable_live_null_slots = Some(vec![false; values.len()]);
             self.virtualizable_values = Some(values);
         } else {
             self.virtualizable_values = None;
+            self.virtualizable_live_null_slots = None;
         }
         self.virtualizable_boxes = Some(boxes);
         self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
@@ -4490,6 +4516,7 @@ impl TraceCtx {
         adescr: DescrRef,
         value: OpRef,
         concrete: Value,
+        live_null_push: bool,
     ) -> bool {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, vable_concrete) {
@@ -4510,6 +4537,11 @@ impl TraceCtx {
             return false;
         };
         self.set_virtualizable_entry_at(flat_idx, value, concrete);
+        if live_null_push && matches!(concrete, Value::Ref(r) if r.is_null()) {
+            if let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut() {
+                live_null_slots[flat_idx] = true;
+            }
+        }
         self.synchronize_virtualizable();
         true
     }

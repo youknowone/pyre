@@ -4186,6 +4186,7 @@ where
                     adescr,
                     value,
                     Value::Int(concrete),
+                    false,
                 ) {
                     // Promoted index falls outside the standard virtualizable
                     // array (e.g. a transient out-of-bounds state-field index);
@@ -4216,6 +4217,7 @@ where
                     adescr,
                     value,
                     Value::Ref(majit_ir::GcRef(concrete as usize)),
+                    false,
                 ) {
                     return TraceAction::Abort;
                 }
@@ -4243,6 +4245,7 @@ where
                     adescr,
                     value,
                     Value::Float(f64::from_bits(concrete as u64)),
+                    false,
                 ) {
                     return TraceAction::Abort;
                 }

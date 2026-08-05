@@ -4808,7 +4808,7 @@ fn flush_walk_end_state_to_frame_inner(
             let recorded_null = matches!(
                 ctx.concrete_of_opref(opref),
                 Some(Value::Ref(r)) if r.0 == 0
-            );
+            ) || ctx.virtualizable_slot_stored_live_null(base + abs);
             if !allow_known_null_stack || !recorded_null {
                 return decline("NULL operand-stack shadow slot (mid-expression)");
             }

@@ -3729,6 +3729,7 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
             adescr.clone(),
             value,
             concrete,
+            false,
         );
         walker_capture_inline_nonstandard_vable_guard(ctx, pc, guards_before)?;
     }

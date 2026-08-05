@@ -74,48 +74,14 @@ pub(super) fn vable_effective_value_concrete<Sym: WalkSym>(
     }
 }
 
-/// Preserve the concrete half of a null Ref box when an executed vable store
-/// writes it into the frame shadow, returning the box the shadow must store.
-///
-/// pyjitpl.py:1193,1245 `virtualizable_boxes[index] = valuebox` stores one Box
-/// carrying both its identity and concrete value.  Pyre keeps those halves apart;
-/// a value materialized through a Ref register can therefore reach this store
-/// as a non-constant `RefOp` whose register shadow proves `ConstPtr(NULL)` but
-/// whose frontend-op concrete has not yet been stamped.  Record that proof on
-/// the stored box so later loop-header flush validation can distinguish the
-/// intentional NULL from an unwritten operand-stack slot.
-///
-/// A `ConstPtr(NULL)` needs a fresh `SameAsR` box at the store itself.  Loop
-/// header normalization otherwise creates that box later, after the fact, and
-/// loses the fact that this particular null came from an executed store.  The
-/// store-local SameAs is the narrow provenance marker; untouched null shadow
-/// slots never acquire one.  Unknown concrete values (`Void`) and non-null
-/// values are deliberately untouched.
-pub(super) fn record_stored_null_concrete(
-    ctx: &mut TraceCtx,
-    value: OpRef,
-    concrete: Value,
-    is_stack_push: bool,
-) -> OpRef {
-    if !is_stack_push || !matches!(concrete, Value::Ref(r) if r.is_null()) {
-        return value;
-    }
-    let stored = if value.as_const_ptr().is_some_and(|r| r.is_null()) {
-        ctx.record_op(majit_ir::OpCode::SameAsR, &[value])
-    } else {
-        value
-    };
-    if !stored.is_constant() {
-        ctx.set_opref_concrete(stored, concrete);
-    }
-    stored
-}
-
 /// A push writes at the current `valuestackdepth`; a pop/clear decrements its
 /// target index first and updates `valuestackdepth` afterward.  This ordering is
 /// emitted by `emit_pushvalue_ref_const!` / `emit_popvalue_ref!` and lets the
 /// generic vable-store handler distinguish a live NULL push from clearing a
-/// dead slot without weakening flush validation.
+/// dead slot without weakening flush validation. pyjitpl.py:1193,1245
+/// `virtualizable_boxes[index] = valuebox` stores one Box carrying both identity
+/// and concrete value, so it needs no separate marker; pyre keeps the halves
+/// apart and marks the shadow slot beside the trace instead.
 fn vable_store_is_stack_push<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, index: i64) -> bool {
     let depth_index = ctx
         .trace_ctx
@@ -758,7 +724,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
             .unwrap_or(Value::Void);
     let is_stack_push = value_bank == 'r' && vable_store_is_stack_push(ctx, index_value);
-    value = record_stored_null_concrete(ctx.trace_ctx, value, concrete, is_stack_push);
     let guards_before = ctx.trace_ctx.num_guards();
     ctx.trace_ctx.vable_setarrayitem_indexed(
         op.pc,
@@ -769,6 +734,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         adescr,
         value,
         concrete,
+        is_stack_push,
     );
     if index_value >= 0
         && let Some(frame) = current_inline_vable_target(ctx, vable)

@@ -533,58 +533,93 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
 }
 
 #[test]
-fn vable_store_stamps_executed_null_without_treating_unknown_as_null() {
+fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let stored = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
-    assert_eq!(tc.concrete_of_opref(stored), None);
-
-    let stored_result = super::vable_ops::record_stored_null_concrete(
-        &mut tc,
-        stored,
-        Value::Ref(majit_ir::GcRef(0)),
-        true,
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let null = Value::Ref(majit_ir::GcRef::NULL);
+    let vable = tc.const_ref(1);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    let initial_values = vec![null; slot_count];
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
     );
-    assert_eq!(stored_result, stored);
-    assert_eq!(
-        tc.concrete_of_opref(stored),
-        Some(Value::Ref(majit_ir::GcRef(0))),
-        "an actually stored NULL must remain distinguishable from an unwritten slot",
-    );
+    let fdescr = info.array_pointer_field_descr(0);
+    let adescr = info.array_descrs[0].clone();
+    let flat_base = info.num_static_extra_boxes;
+    assert!((0..=slot_count).all(|i| !tc.virtualizable_slot_stored_live_null(i)));
 
-    let unknown = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
-    let unknown_result =
-        super::vable_ops::record_stored_null_concrete(&mut tc, unknown, Value::Void, true);
-    assert_eq!(unknown_result, unknown);
-    assert_eq!(
-        tc.concrete_of_opref(unknown),
-        None,
-        "an unknown store value must not acquire a NULL proof",
-    );
-
+    let index0 = tc.const_int(0);
     let const_null = tc.const_null();
-    let stored_const = super::vable_ops::record_stored_null_concrete(
-        &mut tc,
+    let ops_before = tc.num_ops();
+    assert!(tc.vable_setarrayitem_indexed(
+        0,
+        vable,
+        index0,
+        0,
+        fdescr.clone(),
+        adescr.clone(),
         const_null,
-        Value::Ref(majit_ir::GcRef(0)),
+        null,
         true,
+    ));
+    assert!(tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(
+        (0..=slot_count)
+            .filter(|&i| i != flat_base)
+            .all(|i| !tc.virtualizable_slot_stored_live_null(i))
     );
-    assert!(!stored_const.is_constant());
     assert_eq!(
-        tc.concrete_of_opref(stored_const),
-        Some(Value::Ref(majit_ir::GcRef(0))),
-        "a constant NULL store must materialize a box carrying store provenance",
+        tc.virtualizable_entry_at(flat_base).map(|entry| entry.0),
+        Some(const_null)
+    );
+    assert!(const_null.is_constant());
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "the side-table marker records no op"
     );
 
-    let cleared_const = super::vable_ops::record_stored_null_concrete(
-        &mut tc,
+    assert!(tc.vable_setarrayitem_indexed(
+        0,
+        vable,
+        index0,
+        0,
+        fdescr.clone(),
+        adescr.clone(),
         const_null,
-        Value::Ref(majit_ir::GcRef(0)),
+        null,
         false,
+    ));
+    assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
+
+    let index1 = tc.const_int(1);
+    let non_null = tc.const_ref(2);
+    assert!(tc.vable_setarrayitem_indexed(
+        0,
+        vable,
+        index1,
+        1,
+        fdescr.clone(),
+        adescr.clone(),
+        non_null,
+        Value::Ref(majit_ir::GcRef(2)),
+        true,
+    ));
+    assert!(!tc.virtualizable_slot_stored_live_null(flat_base + 1));
+
+    assert!(
+        tc.vable_setarrayitem_indexed(0, vable, index0, 0, fdescr, adescr, const_null, null, true,)
     );
-    assert_eq!(
-        cleared_const, const_null,
-        "clearing a popped slot must not acquire live-NULL store provenance",
-    );
+    assert!(tc.virtualizable_slot_stored_live_null(flat_base));
+    tc.set_virtualizable_entry_at(flat_base, const_null, null);
+    assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
 }
 
 /// `getfield_vable_*` must abort to `VableBoxNotSeeded` when the
