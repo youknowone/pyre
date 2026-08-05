@@ -8283,7 +8283,7 @@ pub fn truncatedint_w(obj: PyObjectRef) -> Result<i64, PyError> {
     }
 }
 
-/// pypy/interpreter/baseobjspace.py:1976-1982 `c_int_w(w_obj)`.
+/// pypy/interpreter/baseobjspace.py:2062-2068 `c_int_w(w_obj)`.
 ///
 /// ```python
 /// def c_int_w(self, w_obj):
@@ -8293,10 +8293,11 @@ pub fn truncatedint_w(obj: PyObjectRef) -> Result<i64, PyError> {
 ///     return value
 /// ```
 ///
-/// Used by `@unwrap_spec(name="c_int")` (gateway.py). The only caller
-/// today is `sys.setrecursionlimit` (pypy/module/sys/vm.py:63), whose
-/// argument is typed as `c_int`; values outside the 32-bit signed
-/// range surface as `OverflowError` rather than a silent clamp.
+/// The port of `@unwrap_spec(name="c_int")` (gateway.py): values outside the
+/// 32-bit signed range surface as `OverflowError` rather than a silent clamp.
+/// Which sites want it is decided per argument by the upstream `unwrap_spec` —
+/// a `c_int` argument narrows here, while a plain `int` one stays machine-word
+/// wide (RPython's `int`) and is range-checked at its own bound instead.
 pub fn c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
     let value = gateway_int_w(obj)?;
     if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) {

@@ -183,8 +183,11 @@ fn init_compress_type(ns: PyObjectRef) {
                     return Err(crate::PyError::type_error("flush() missing self"));
                 }
                 let id = get_id(args[0]);
+                // interp_zlib.py:196 `@unwrap_spec(mode="c_int")` — the
+                // converter reports a value outside the C `int` range rather
+                // than truncating it into a different flush mode.
                 let mode = match args.get(1).copied() {
-                    Some(o) if !unsafe { is_none(o) } => crate::baseobjspace::int_w(o)? as i32,
+                    Some(o) if !unsafe { is_none(o) } => crate::baseobjspace::c_int_w(o)?,
                     _ => backend::Z_FINISH,
                 };
                 let mut reg = COMPRESSORS.lock().unwrap();

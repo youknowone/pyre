@@ -178,13 +178,18 @@ pub unsafe fn walk_signal_handler_roots_area(
 /// (`gateway.py:646-665` → `int_w(allow_conversion=True)`), which runs
 /// `__index__`/`__int__` and accepts `int` subclasses, so route through
 /// the matching helper rather than an exact-tag check.
-fn signum_arg(w_signum: PyObjectRef) -> Result<i32, crate::PyError> {
-    Ok(crate::baseobjspace::gateway_int_w(w_signum)? as i32)
+/// The unwrapped value stays machine-word wide, as the RPython `int` it
+/// carries upstream does.  Narrowing here instead would truncate the argument
+/// before `check_signum_in_range` ever sees it, and a number that aliases a
+/// valid signal in its low 32 bits — `(1 << 32) | SIGINT` — would pass the
+/// check and act on the signal it aliases.
+fn signum_arg(w_signum: PyObjectRef) -> Result<i64, crate::PyError> {
+    crate::baseobjspace::gateway_int_w(w_signum)
 }
 
 /// interp_signal.py:285-288 `check_signum_in_range`.
-fn check_signum_in_range(signum: i32) -> Result<(), crate::PyError> {
-    if (1..signalstate::NSIG).contains(&signum) {
+fn check_signum_in_range(signum: i64) -> Result<(), crate::PyError> {
+    if (1..signalstate::NSIG as i64).contains(&signum) {
         Ok(())
     } else {
         Err(crate::PyError::value_error("signal number out of range"))
@@ -197,6 +202,8 @@ fn signal_signal(w_signum: PyObjectRef, w_handler: PyObjectRef) -> Result<PyObje
     // interp_signal.py:307-310 — `signals_enabled()` is always true in
     // single-threaded pyre, so the main-thread guard is omitted.
     check_signum_in_range(signum)?;
+    // The range check bounds it to `1..NSIG`, so the narrowing is exact.
+    let signum = signum as i32;
 
     // interp_signal.py:313-321 — SIG_DFL / SIG_IGN are the ints 0 / 1;
     // anything else must be callable.  PyPy compares with
@@ -234,6 +241,7 @@ fn signal_signal(w_signum: PyObjectRef, w_handler: PyObjectRef) -> Result<PyObje
 fn signal_getsignal(w_signum: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let signum = signum_arg(w_signum)?;
     check_signum_in_range(signum)?;
+    let signum = signum as i32;
     let h = get_handler(signum);
     Ok(if h.is_null() {
         pyre_object::w_int_new(0)
@@ -906,13 +914,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 )
                             })?;
                         for it in signal_set_items(args[0])? {
-                            let signum = (unsafe { pyre_object::w_int_get_value(it) }) as i32;
+                            // Range-check before narrowing, or a number that
+                            // aliases a valid signal in its low 32 bits passes.
+                            let signum = unsafe { pyre_object::w_int_get_value(it) };
                             // interp_signal.py:285-288 check_signum_in_range
-                            if !(1..signalstate::NSIG).contains(&signum) {
-                                return Err(crate::PyError::value_error(
-                                    "signal number out of range",
-                                ));
-                            }
+                            check_signum_in_range(signum)?;
+                            let signum = signum as i32;
                             rustpython_host_env::signal::sigaddset(&mut set, signum).map_err(
                                 |e| {
                                     crate::PyError::os_error_with_errno(
