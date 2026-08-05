@@ -6355,6 +6355,356 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Unrolling bound for [`try_walker_specialize_builtin_locals`].
+///
+/// The modelled expansion is a straight-line unroll of `fast2locals`' slot
+/// loop, one guard plus at most one store per fastlocal.  Upstream bounds the
+/// same unroll by `@jit.unroll_safe` on a loop whose trip count is the code
+/// object's `numlocals`; the explicit ceiling here keeps a pathologically
+/// wide frame from turning one `locals()` into hundreds of trace ops.  Over
+/// the bound the fold declines and the generic residual runs (SAFE).
+const MAX_MODELLED_FASTLOCALS: usize = 32;
+
+/// Which builtin [`try_walker_specialize_builtin_locals`] is standing in for.
+///
+/// All three resolve their frame through the same `topframe_for_locals` and
+/// read the same fastlocals, so one modelled expansion serves them; they
+/// differ only in what they make of the resulting mapping.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrameLocalsBuiltin {
+    /// `locals()` / `vars()` — the mapping itself is the result.
+    Mapping,
+    /// `dir()` — the mapping's sorted key set is the result.
+    SortedNames,
+}
+
+/// Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
+/// frame: model
+/// `pyframe.py:539-583 fast2locals` in the trace instead of residualizing
+/// `interp_inspect.py:7-11 locals` → `pyframe.py:525-529 getdictscope`.
+///
+/// `fast2locals` is `@jit.unroll_safe`, and `policy.py:60-67` cancels
+/// `contains_loop` for unroll_safe graphs, so upstream LOOKS INSIDE it: each
+/// `self.locals_cells_stack_w[i]` lowers to `getarrayitem_vable_r`
+/// (`jtransform.py:1877 do_fixed_list_getitem`), answered from
+/// `metainterp.virtualizable_boxes`, and `jtransform.py:2164-2172
+/// rewrite_op_jit_force_virtualizable` returns `[]` for a read the tracer is
+/// inside.  There is no residual and no virtualizable force anywhere on the
+/// upstream locals-read path.
+///
+/// Pyre residualizes the same read as one opaque `bh_call_fn(locals, PY_NULL)`
+/// `CallMayForce`, which arms `virtualizable.py:281-291
+/// force_virtualizable_if_necessary` for the whole call; the read barrier
+/// `force_frame_before_locals_read` then clears `TOKEN_TRACING_RESCALL` and
+/// `tracing_after_residual_call` reads that clear as an escape
+/// (`VableEscapedDuringResidualCall`), losing the loop.  The deviation is the
+/// residual BOUNDARY, not the barrier — `rvirtualizable.py:49-53` injects the
+/// same hook on reads upstream and `pyjitpl.py:3373-3390` aborts
+/// unconditionally on a detected force — so this removes the boundary and
+/// leaves the barrier live for every shape it declines.
+///
+/// Emitted shape, mirroring `pyframe.py:551-568` slot by slot:
+/// `guard_value(callable)`, one `getarrayitem_vable_r(frame, ConstInt(i))` per
+/// fastlocal (the same lowering `emit_load_fast_ref!` already emits for
+/// LOAD_FAST), a `guard_isnull` / `guard_nonnull` pinning the slot's bound-ness,
+/// and a plain non-forcing `Call` chain `newdict` → `setitem_str` per bound
+/// slot.  None of those ops can reach `force_frame`, so nothing arms the vable
+/// protocol.
+///
+/// `dir()` appends one further non-forcing `Call` to
+/// `jit_dir_names_from_locals`, the split-out tail of `builtin_dir`'s
+/// no-argument path, which turns that mapping into its sorted key set.  It
+/// takes the mapping and not the frame, so it too cannot reach `force_frame`.
+///
+/// Returns `None` (fall through to the generic residual, SAFE — exactly
+/// today's behaviour) for every other shape: a rebound `locals` / `vars` /
+/// `dir` name,
+/// a bound receiver, any argument, an inline sub-walk, a frame that is not the
+/// standard virtualizable the boxes describe, a hidden top frame, a
+/// non-OPTIMIZED (module / class / exec) frame, cellvars / freevars /
+/// `CO_FAST_HIDDEN` slots, a slot the shadow cannot answer with a Ref, and a
+/// frame wider than [`MAX_MODELLED_FASTLOCALS`].
+pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain zero-argument `bh_call_fn(callable, PY_NULL)` shape only.
+    if r_args.len() != 2 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
+    // as arg0 — not a plain `locals()` call.
+    if concrete_callable.is_null() || !null_or_self.is_null() {
+        return Ok(None);
+    }
+    // `vars()` with no argument delegates straight to `builtin_locals`
+    // (`app_inspect.py:21-24`), so both names share the fold; `vars(obj)` and
+    // `dir(obj)` carry an extra operand and are already excluded by the arity
+    // gate.
+    let fold = if pyre_interpreter::builtins::is_builtin_locals_function(concrete_callable)
+        || pyre_interpreter::builtins::is_builtin_vars_function(concrete_callable)
+    {
+        FrameLocalsBuiltin::Mapping
+    } else if pyre_interpreter::builtins::is_builtin_dir_function(concrete_callable) {
+        FrameLocalsBuiltin::SortedNames
+    } else {
+        return Ok(None);
+    };
+    // The modelled reads answer from `virtualizable_boxes`, which describe the
+    // PORTAL frame only.  An inline sub-walk publishes a different concrete
+    // frame whose locals live in the callee shadow, not in those boxes.
+    if ctx.fbw_mode.inline_subwalk || current_inline_concrete_frame() != 0 {
+        return Ok(None);
+    }
+    let (Some(vable_op), Some(vable_ptr)) = (
+        ctx.trace_ctx.standard_virtualizable_box(),
+        ctx.trace_ctx.standard_virtualizable_ptr(),
+    ) else {
+        return Ok(None);
+    };
+    // The frame `locals()` reports on is `ec.gettopframe_nohidden()`
+    // (`interp_inspect.py:7-11`).  Resolve it the same way and require it to BE
+    // the standard virtualizable: a hidden portal frame, or any deeper frame
+    // handed out through the backref chain, resolves elsewhere and declines.
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() {
+        return Ok(None);
+    }
+    let frame = unsafe { (*ec).gettopframe_nohidden() };
+    if frame.is_null() || frame as usize != vable_ptr {
+        return Ok(None);
+    }
+    let frame_ref = unsafe { &*frame };
+    let code_ptr = unsafe { pyre_interpreter::pyframe::pyframe_get_pycode(frame_ref) };
+    let code_obj = unsafe { &*code_ptr };
+    if !pyre_interpreter::PyFrame::code_locals_are_plain_fastlocals(code_obj) {
+        return Ok(None);
+    }
+    let numlocals = code_obj.varnames.len();
+    if numlocals > MAX_MODELLED_FASTLOCALS {
+        return Ok(None);
+    }
+    // `locals_cells_stack_w` is PyFrame's only virtualizable array
+    // (`virtualizable_gen.rs arrays`), so array index 0 names it.
+    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
+        return Ok(None);
+    };
+    let Some(lengths) = ctx
+        .trace_ctx
+        .virtualizable_array_lengths()
+        .map(<[usize]>::to_vec)
+    else {
+        return Ok(None);
+    };
+    if info.num_arrays() != 1 || lengths.first().copied().unwrap_or(0) < numlocals {
+        return Ok(None);
+    }
+    let (Some(fdescr), Some(adescr)) = (
+        info.array_field_descrs().first().cloned(),
+        info.array_descrs.first().cloned(),
+    ) else {
+        return Ok(None);
+    };
+    // Resolve every slot's shadow entry BEFORE emitting anything, so a slot the
+    // shadow cannot answer declines from a clean trace position.  The read is
+    // the standard-virtualizable arm of `_opimpl_getarrayitem_vable`
+    // (`virtualizable_boxes[index]`), which records no op — the emit pass below
+    // re-runs it through the real entry point.
+    let mut slots: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(numlocals);
+    for i in 0..numlocals {
+        let flat = info.get_index_in_array(0, i, &lengths);
+        let Some((slot_op, entry_value)) = ctx.trace_ctx.virtualizable_entry_at(flat) else {
+            return Ok(None);
+        };
+        // The value comes from the SHADOW, never from `frame.locals_w()`.  An
+        // unsynchronized virtualizable's heap array holds whatever the frame
+        // last wrote out — measured one FOR_ITER iteration behind on the loop
+        // variable — which is exactly the staleness the read barrier's
+        // `force_now` repairs before the residual reads it.  The shadow already
+        // holds the repaired value, so sourcing from it reproduces the forced
+        // residual's answer without the force, and it is what upstream's
+        // traced-in `fast2locals` reads (`getarrayitem_vable_r` answered from
+        // `virtualizable_boxes`).
+        //
+        // Prefer the OpRef's own concrete over the `virtualizable_values` copy:
+        // the op table is the GC-forwarded channel, so a Ref that moved across
+        // an earlier residual is current there.
+        let value = match ctx
+            .trace_ctx
+            .concrete_of_opref(slot_op)
+            .filter(|v| matches!(v, majit_ir::Value::Ref(_)))
+            .unwrap_or(entry_value)
+        {
+            majit_ir::Value::Ref(gcref) => gcref.as_usize() as pyre_object::PyObjectRef,
+            _ => return Ok(None),
+        };
+        slots.push(value);
+    }
+
+    // Authentic mapping, built on the plain eval loop exactly as the skipped
+    // residual would — through the SAME helpers the emitted calls invoke, so
+    // the recording-time value and the compiled loop's value cannot diverge.
+    let (concrete_dict, concrete_result) = {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let value_roots: Vec<usize> = slots
+            .iter()
+            .map(|&value| {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(value);
+                slot
+            })
+            .collect();
+        let dict_root = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(
+            pyre_interpreter::pyframe::jit_locals_dict_new() as pyre_object::PyObjectRef
+        );
+        for (i, &value_root) in value_roots.iter().enumerate() {
+            let value = pyre_object::gc_roots::shadow_stack_get(value_root);
+            if value.is_null() {
+                continue;
+            }
+            pyre_interpreter::pyframe::jit_locals_dict_setitem_local(
+                pyre_object::gc_roots::shadow_stack_get(dict_root) as i64,
+                code_ptr as i64,
+                i as i64,
+                value as i64,
+            );
+        }
+        // `dir()`'s tail runs here too, so the recorded result is produced by
+        // the very helper the emitted call names.  It allocates, so the
+        // mapping is re-read from its pinned slot afterwards.
+        let result = match fold {
+            FrameLocalsBuiltin::Mapping => pyre_object::gc_roots::shadow_stack_get(dict_root),
+            FrameLocalsBuiltin::SortedNames => {
+                pyre_interpreter::builtins::jit_dir_names_from_locals(
+                    pyre_object::gc_roots::shadow_stack_get(dict_root) as i64,
+                ) as pyre_object::PyObjectRef
+            }
+        };
+        (pyre_object::gc_roots::shadow_stack_get(dict_root), result)
+    };
+    // The tail reports a failure as PY_NULL instead of publishing it; nothing
+    // has been emitted yet, so decline and let the residual raise.
+    if concrete_result.is_null() {
+        return Ok(None);
+    }
+
+    // --- emit the specialized IR (walker-native) ---
+    // Pin the callable identity (LOAD_GLOBAL `locals` is usually already a
+    // constant via the namespace cell fold).
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let concrete_dict_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_dict as usize));
+    // The code object is the jitdriver green this trace is keyed on
+    // (`interp_jit.py:23 greens = ['next_instr', 'is_being_profiled',
+    // 'pycode']`), so its address is a constant for the compiled loop and
+    // carries no guard of its own.
+    let code_const = ctx.trace_ctx.const_int(code_ptr as i64);
+    let mut dict_op = ctx.trace_ctx.call_ref_typed_with_effect(
+        pyre_interpreter::pyframe::jit_locals_dict_new as *const (),
+        &[],
+        &[],
+        majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(dict_op, concrete_dict_value);
+    for (i, &value) in slots.iter().enumerate() {
+        // `self.locals_cells_stack_w[i]` — `jtransform.py:1877
+        // do_fixed_list_getitem`, the identical lowering `emit_load_fast_ref!`
+        // emits for LOAD_FAST.  On the standard virtualizable this resolves to
+        // `virtualizable_boxes[index]` and records no op.
+        let index_const = ctx.trace_ctx.const_int(i as i64);
+        let (slot_op, _) = ctx.trace_ctx.vable_getarrayitem_ref_indexed(
+            op.pc,
+            vable_op,
+            index_const,
+            i as i64,
+            fdescr.clone(),
+            adescr.clone(),
+        );
+        // `pyframe.py:566-571` branches on the slot being bound; pin the
+        // direction so a slot that changes bound-ness side-exits instead of
+        // publishing a mapping with the wrong key set.  A slot the trace
+        // already holds as a constant needs no guard.
+        let bound = !value.is_null();
+        if !slot_op.is_constant() {
+            let opcode = if bound {
+                OpCode::GuardNonnull
+            } else {
+                OpCode::GuardIsnull
+            };
+            walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[slot_op])?;
+        }
+        if !bound {
+            continue;
+        }
+        dict_op = ctx.trace_ctx.call_ref_typed_with_effect(
+            pyre_interpreter::pyframe::jit_locals_dict_setitem_local as *const (),
+            &[dict_op, code_const, index_const, slot_op],
+            &[
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+            ],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        );
+        // Every link of the chain names the SAME mapping, so the post-build
+        // address is the live one for all of them.
+        ctx.trace_ctx
+            .set_opref_concrete(dict_op, concrete_dict_value);
+    }
+    let result_op = match fold {
+        FrameLocalsBuiltin::Mapping => dict_op,
+        // `builtin_dir`'s no-argument tail, split out so the trace and the
+        // eval loop enumerate and sort one key set through one implementation.
+        FrameLocalsBuiltin::SortedNames => {
+            let names_op = ctx.trace_ctx.call_ref_typed_with_effect(
+                pyre_interpreter::builtins::jit_dir_names_from_locals as *const (),
+                &[dict_op],
+                &[majit_ir::Type::Ref],
+                majit_ir::EffectInfo::new(
+                    majit_ir::ExtraEffect::CannotRaise,
+                    majit_ir::OopSpecIndex::None,
+                ),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                names_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete_result as usize)),
+            );
+            // PY_NULL is the tail's unpublished-error report; side-exit on it
+            // so the residual `dir()` re-runs and raises from the eval loop.
+            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[names_op])?;
+            names_op
+        }
+    };
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result_op)?;
+    Ok(Some(()))
+}
+
 /// `math.sqrt(x)` on an exact int/float argument: inline the domain-guarded
 /// pure `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` → `sqrt_nonneg`,
 /// EF_ELIDABLE_CANNOT_RAISE) instead of the opaque

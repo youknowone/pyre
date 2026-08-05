@@ -52,11 +52,11 @@ pub fn force_frame(frame: *mut PyFrame) {
 /// whole synthetic corpus green throughout.
 ///
 /// [`PyExecutionContext::gettopframe_nohidden`] does not substitute.  It forces
-/// the VREF of the frame it starts from and then walks `f_backref` unforced, so
-/// it materializes the top frame only — enough for `locals()`, which reports on
-/// that frame, and nothing for a frame handed out some other way (a traceback's
-/// `tb_frame`), which reaches `fast2locals` unforced; its null slots render as
-/// an EMPTY mapping rather than a stale one.
+/// the VREF of the frame it starts from and then walks `f_backref` unforced, and
+/// the vref force alone does not materialize `locals_cells_stack_w`: measured,
+/// `locals()` on a compiled frame reached that way reports the values the frame
+/// last wrote out, under correct keys.  So the top frame needs this call as much
+/// as one handed out some other way (a traceback's `tb_frame`) does.
 ///
 /// # Safety
 /// `frame` must be a live `PyFrame` (or null).

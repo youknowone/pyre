@@ -3736,6 +3736,23 @@ impl PyFrame {
         Ok(())
     }
 
+    /// Whether a modelled `fast2locals` can reproduce this code object's
+    /// locals mapping from the fastlocals alone.
+    ///
+    /// Only the plain-locals half of `fast2locals` is modelled: the cell /
+    /// freevar half (pyframe.py:576-598) reads through `w_cell_get` per slot
+    /// and the `CO_FAST_HIDDEN` slots are skipped, so a code object carrying
+    /// either is refused and keeps the residual path.  A non-OPTIMIZED
+    /// (module / class / exec) frame is refused too: it hands back its LIVE
+    /// namespace rather than the independent copy
+    /// [`PyFrame::frame_locals_snapshot`] builds for a function frame.
+    pub fn code_locals_are_plain_fastlocals(code: &CodeObject) -> bool {
+        code.flags.contains(CodeFlags::OPTIMIZED)
+            && code.cellvars.is_empty()
+            && code.freevars.is_empty()
+            && !(0..code.varnames.len()).any(|i| hidden_local(code, i))
+    }
+
     /// pyframe.py:208-218 `make_arguments` — build Arguments from the value
     /// stack. `methodcall` and `w_function` are stored on the resulting
     /// Arguments for diagnostic use (better error messages on argument
@@ -4394,6 +4411,60 @@ fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyErr
         Err(e) if e.kind == crate::PyErrorKind::KeyError => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// `pyframe.py:557 self.space.newdict(instance=True)` — the mapping half of
+/// `fast2locals`, for a trace that models the fastlocals reads instead of
+/// residualizing `interp_inspect.py:7-11 locals`.
+///
+/// Takes no `PyFrame`: the modelled expansion feeds the slot values in as
+/// ordinary Ref operands, so nothing reachable from here can call
+/// [`crate::executioncontext::force_frame`].  That is the whole point of the
+/// split — a helper that touched the frame would re-arm the escape this
+/// modelling exists to remove.  The frame's own `w_locals` cache is
+/// deliberately NOT populated: an OPTIMIZED frame hands out an independent
+/// copy per read (`frame_locals_snapshot`), so the cache is never the object
+/// application code sees, and a later `f_locals` rebuilds it from the
+/// fastlocals anyway.
+pub extern "C" fn jit_locals_dict_new() -> i64 {
+    unsafe { pyre_object::w_dict_new() as i64 }
+}
+
+/// `pyframe.py:566-568 fast2locals` for ONE visible fastlocal slot: bind
+/// `code.varnames[index]` to `value` in `dict`.
+///
+/// Unbound slots are not routed here at all — the modelled expansion emits a
+/// `guard_isnull` for them and skips the store, which is `fast2locals`'
+/// `delitem` arm applied to a mapping that never held the key.
+///
+/// Returns `dict` so the unrolled slot chain threads the (possibly forwarded)
+/// mapping from one store to the next instead of holding a raw address across
+/// an allocating call.
+///
+/// # Safety
+/// `dict` must be a live dict, `code` a live `CodeObject` with
+/// `index < varnames.len()`, and `value` a live non-null `W_Root`.
+pub extern "C" fn jit_locals_dict_setitem_local(
+    dict: i64,
+    code: i64,
+    index: i64,
+    value: i64,
+) -> i64 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(dict as PyObjectRef);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(value as PyObjectRef);
+    let code = unsafe { &*(code as usize as *const CodeObject) };
+    let name: &str = &code.varnames[index as usize];
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        );
+    }
+    pyre_object::gc_roots::shadow_stack_get(dict_slot) as i64
 }
 
 #[cfg(test)]

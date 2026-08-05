@@ -4034,6 +4034,52 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
     }
 }
 
+/// True iff `callable` is the builtin `locals` function object.
+///
+/// The JIT walker uses this to recognize the `locals()` residual it can
+/// lower to modelled fastlocals reads; a name rebound to anything else
+/// carries a different builtin code and answers `false`.
+pub fn is_builtin_locals_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, builtin_locals)
+}
+
+/// True iff `callable` is the builtin `vars` function object.
+///
+/// `vars()` with no argument is `locals()` (`app_inspect.py:21-24` →
+/// `interp_inspect.py:7-11`), so the walker recognizes both under one fold.
+pub fn is_builtin_vars_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, builtin_vars)
+}
+
+/// True iff `callable` is the builtin `dir` function object.
+///
+/// Zero-argument `dir()` resolves its frame through the same
+/// `topframe_for_locals` as `locals()` and reports that frame's sorted key
+/// set, so the walker folds it through the same modelled fastlocals
+/// expansion; `dir(obj)` carries an argument and never reaches the fold.
+pub fn is_builtin_dir_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, builtin_dir)
+}
+
+/// Shared identity test behind the `is_builtin_*_function` predicates: the
+/// callable is a function whose code is the builtin-code wrapper around
+/// `expected`.
+fn is_builtin_code_function(
+    callable: PyObjectRef,
+    expected: crate::gateway::BuiltinCodeFn,
+) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(crate::gateway::builtin_code_get(code), expected)
+    }
+}
+
 /// True iff `callable` is the canonical builtin `repr` function object.
 /// The JIT walker uses the builtin-code identity to distinguish it from an
 /// arbitrary replacement stored under the same global name.
@@ -11190,22 +11236,23 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// The frame whose locals `locals()` / `vars()` / `dir()` report on
 /// (`interp_inspect.py:7-11 locals` — `ec.gettopframe_nohidden()`).
 ///
-/// Going through `gettopframe_nohidden` is what makes the frame's fastlocals
-/// readable, but the mechanism is the VREF force on its first line, not a
-/// per-frame `force_frame`: the walk itself only follows `f_backref` and tests
-/// `hide()`.  That materializes the top frame and nothing below it, which is
-/// exactly what this consumer needs — `locals()` reports on the top frame.
-/// `getdictscope` reads `locals_cells_stack_w` directly, so an unforced
-/// virtualizable hands back an array of nulls, which `fast2locals` renders as
-/// an EMPTY mapping rather than a stale one.  Reading `CURRENT_FRAME` instead
-/// skips the vref force, and under the JIT the caller then sees no locals at
-/// all.
+/// `gettopframe_nohidden` forces the VREF on its first line and then only
+/// follows `f_backref` and tests `hide()`; it runs no per-frame `force_frame`.
+/// That vref force is NOT sufficient here, measured: in a compiled `FOR_ITER`
+/// loop `locals()` reported `a = 2082, i = 1041` where the frame held
+/// `10000 / 5000`.  `getdictscope` reads `locals_cells_stack_w` directly, and an
+/// unforced virtualizable holds the values the frame last wrote out — so the
+/// mapping comes back with correct KEYS (those come from the code object) and
+/// STALE values, which no key-only check can see.  Hence the explicit force
+/// below.  Reading `CURRENT_FRAME` instead would skip the vref force too.
 fn topframe_for_locals() -> *mut crate::PyFrame {
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if ec.is_null() {
         return std::ptr::null_mut();
     }
-    unsafe { (*ec).gettopframe_nohidden() }
+    let frame = unsafe { (*ec).gettopframe_nohidden() };
+    crate::executioncontext::force_frame_before_locals_read(frame);
+    frame
 }
 
 fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -11369,6 +11416,54 @@ pub(crate) fn type_dir_default(w_type: PyObjectRef) -> Result<PyObjectRef, crate
     ))
 }
 
+/// The tail of no-argument `dir()`: a locals mapping's sorted key set.
+///
+/// Split out of [`builtin_dir`] so the JIT fold that models `fast2locals`
+/// in the trace finishes through this exact code — the modelled mapping and
+/// the interpreted one are then sorted, and their keys enumerated, by one
+/// implementation that cannot drift.
+fn dir_names_from_locals_mapping(
+    w_locals_dict: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    // `_dir_locals` reads the key set through `PyMapping_Keys(locals)`,
+    // so a locals mapping that overrides `keys()` (`eval(src, {}, A())`
+    // with `A(dict)`) is honoured; only an exact dict takes the
+    // `PyDict_Keys` fast path that iterates the storage directly.
+    let w_keys = if unsafe {
+        pyre_object::pyobject::is_exact_type(w_locals_dict, &pyre_object::pyobject::DICT_TYPE)
+    } {
+        w_locals_dict
+    } else {
+        let keys_meth = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
+        crate::call_and_check(keys_meth, &[])?
+    };
+    let keys_iter = crate::baseobjspace::iter(w_keys)?;
+    let keys = collect_iterable(keys_iter)?;
+    builtin_sorted(&[w_list_new(keys)])
+}
+
+/// Trace helper finishing the modelled no-argument `dir()`: sort the key set
+/// of the mapping the modelled `fast2locals` expansion just built.
+///
+/// Takes the mapping, never a `PyFrame` — that is what keeps `force_frame`
+/// unreachable from the emitted call, so nothing on the folded path arms
+/// `force_virtualizable_if_necessary`.  Declared non-forcing and
+/// `CannotRaise`: the input is always the exact dict the fold allocated, so
+/// the key enumeration takes the storage fast path and the sort compares
+/// `str` keys only.  An error is nevertheless reported as `PY_NULL` rather
+/// than published, and the caller side-exits on it, so the residual `dir()`
+/// re-runs and raises from the interpreter.
+pub extern "C" fn jit_dir_names_from_locals(mapping: i64) -> i64 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mapping_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(mapping as PyObjectRef);
+    let mapping = pyre_object::gc_roots::shadow_stack_get(mapping_slot);
+    match dir_names_from_locals_mapping(mapping) {
+        Ok(names) => names as i64,
+        Err(_) => pyre_object::PY_NULL as i64,
+    }
+}
+
 /// `dir([obj])` — PyPy: pypy/module/__builtin__/app_inspect.py dir
 ///
 /// Without argument: names in the current local scope (not supported).
@@ -11397,21 +11492,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         if w_locals_dict.is_null() {
             return Ok(w_list_new(vec![]));
         }
-        // `_dir_locals` reads the key set through `PyMapping_Keys(locals)`,
-        // so a locals mapping that overrides `keys()` (`eval(src, {}, A())`
-        // with `A(dict)`) is honoured; only an exact dict takes the
-        // `PyDict_Keys` fast path that iterates the storage directly.
-        let w_keys = if unsafe {
-            pyre_object::pyobject::is_exact_type(w_locals_dict, &pyre_object::pyobject::DICT_TYPE)
-        } {
-            w_locals_dict
-        } else {
-            let keys_meth = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
-            crate::call_and_check(keys_meth, &[])?
-        };
-        let keys_iter = crate::baseobjspace::iter(w_keys)?;
-        let keys = collect_iterable(keys_iter)?;
-        return builtin_sorted(&[w_list_new(keys)]);
+        return dir_names_from_locals_mapping(w_locals_dict);
     }
     if args.len() > 1 {
         return Err(crate::PyError::type_error(format!(
