@@ -1804,6 +1804,18 @@ fn analyze_pipeline_from_module_paths(
             call_control.mark_oopspec(path, spec.to_string());
         }
     }
+    // rlist.py:522 — `@jit.oopspec("newlist_clear(count)")` on
+    // `_ll_alloc_and_clear`.  The helper graph is minted by the rtyper
+    // (`rtype_alloc_and_set`), so there is no source-level `#[oopspec]`
+    // attribute for the walker above to harvest.  Attach the spec here,
+    // keyed on the minted graph's NAME — the codewriter derives the
+    // CallPath from the funcptr's graph name (`target_to_path`), so a
+    // `direct_call` to `_ll_alloc_and_clear` lowers to `new_array_clear`
+    // instead of residualizing.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["_ll_alloc_and_clear"]),
+        "newlist_clear(count)".to_string(),
+    );
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
     prof.mark("  find_all_graphs");

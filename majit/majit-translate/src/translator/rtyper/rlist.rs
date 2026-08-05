@@ -23,6 +23,7 @@ use crate::flowspace::model::{
     SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
+use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     Array, LowLevelType, Ptr, PtrTarget, Struct,
@@ -31,8 +32,8 @@ use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, SliceKind,
-    constant_with_lltype, exception_args, helper_pygraph_from_graph, variable_with_lltype,
-    void_field_const,
+    constant_with_lltype, exception_args, functionptr_const, helper_pygraph_from_graph,
+    variable_with_lltype, void_field_const,
 };
 
 /// RPython `class FixedSizeListRepr(AbstractFixedSizeListRepr,
@@ -523,36 +524,344 @@ fn rtype_newlist_layout(
     Ok(Some(v_result))
 }
 
-pub fn rtype_alloc_and_set() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("rtype_alloc_and_set"))
+/// RPython `rtype_alloc_and_set(hop)` (`rlist.py:346-351`):
+///
+/// ```python
+/// def rtype_alloc_and_set(hop):
+///     r_list = hop.r_result
+///     v_count, v_item = hop.inputargs(Signed, r_list.item_repr)
+///     cLIST = hop.inputconst(Void, r_list.LIST)
+///     return hop.gendirectcall(ll_alloc_and_set, cLIST, v_count, v_item)
+/// ```
+///
+/// Mirrors [`rtype_newlist`]: dispatch on the concrete `hop.r_result` repr
+/// (`ListRepr` → resized, `FixedSizeListRepr` → fixed) and forward to the
+/// repr-generic [`rtype_alloc_and_set_layout`]. The upstream `cLIST` Void arg
+/// selects `LIST.ll_newlist`; pyre folds it into the helper IDENTITY (a
+/// distinct helper name per layout selects the newlist body), so it is not
+/// passed at runtime.
+pub fn rtype_alloc_and_set(hop: &HighLevelOp) -> RTypeResult {
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_alloc_and_set: r_result missing"))?;
+    let any_r: &dyn std::any::Any = r_result.as_ref();
+    if let Some(r_list) = any_r.downcast_ref::<ListRepr>() {
+        return rtype_alloc_and_set_layout(
+            hop,
+            r_list.lltype.clone(),
+            r_list.item_repr.lowleveltype().clone(),
+            r_list.item_repr.as_ref(),
+            ListLayout::Resized,
+        );
+    }
+    if let Some(r_list) = any_r.downcast_ref::<FixedSizeListRepr>() {
+        return rtype_alloc_and_set_layout(
+            hop,
+            r_list.lltype.clone(),
+            r_list.item_repr.lowleveltype().clone(),
+            r_list.item_repr.as_ref(),
+            ListLayout::Fixed,
+        );
+    }
+    Err(TyperError::message(
+        "rtype_alloc_and_set: hop.r_result is not a ListRepr or FixedSizeListRepr",
+    ))
 }
 
-pub fn _ll_zero_or_null() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("_ll_zero_or_null"))
+/// Repr-generic body of [`rtype_alloc_and_set`]. `hop.inputargs(Signed,
+/// r_list.item_repr)` yields `(v_count, v_item)`; then `ll_alloc_and_set` is
+/// minted (with its full `{jit, nojit} → {clear, nonnull, arrayclear,
+/// arrayfill}` sub-helper closure) and `direct_call`ed with `[v_count,
+/// v_item]`.
+///
+/// Distinct helper names per layout (`ll_alloc_and_set` /
+/// `ll_fixed_alloc_and_set`) keep the `(name, args, result)` helper cache from
+/// serving a resized graph for a fixed request — the same discipline
+/// [`rtype_newlist_layout`] documents.
+fn rtype_alloc_and_set_layout(
+    hop: &HighLevelOp,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    item_repr: &dyn Repr,
+    layout: ListLayout,
+) -> RTypeResult {
+    // upstream `v_count, v_item = hop.inputargs(Signed, r_list.item_repr)`.
+    let inputs = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+        ConvertedTo::Repr(item_repr),
+    ])?;
+    let mut inputs = inputs.into_iter();
+    let v_count = inputs
+        .next()
+        .ok_or_else(|| TyperError::message("rtype_alloc_and_set: missing count arg"))?;
+    let v_item = inputs
+        .next()
+        .ok_or_else(|| TyperError::message("rtype_alloc_and_set: missing item arg"))?;
+
+    let helper_name = alloc_and_set_helper_name(layout);
+    let helper = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            helper_name.to_string(),
+            vec![LowLevelType::Signed, item_lltype.clone()],
+            ptr_lltype.clone(),
+            move |rtyper, _args, _result| {
+                build_alloc_and_set_family(rtyper, layout, ptr.clone(), item.clone())
+            },
+        )?
+    };
+    hop.gendirectcall(&helper, vec![v_count, v_item])
+}
+
+/// Per-layout name for the dispatch helper (`ll_alloc_and_set`). The `(name,
+/// args, result)` helper cache would otherwise serve a resized graph for a
+/// fixed request, so the fixed layout gets its own identity.
+fn alloc_and_set_helper_name(layout: ListLayout) -> &'static str {
+    match layout {
+        ListLayout::Fixed => "ll_fixed_alloc_and_set",
+        ListLayout::Resized => "ll_alloc_and_set",
+    }
+}
+
+/// Mint the six sub-helpers of the `ll_alloc_and_set` family in dependency
+/// order and build the top-level dispatch graph
+/// ([`build_ll_alloc_and_set_helper_graph`]).
+///
+/// The chain (`rlist.py:487-537`) is
+/// `ll_alloc_and_set → {_ll_alloc_and_set_jit, _ll_alloc_and_set_nojit}`,
+/// with the jit arm reaching `{_ll_alloc_and_clear, _ll_alloc_and_set_nonnull}`
+/// and both leaf arms reaching `LIST.ll_newlist` plus the T1 rgc helpers
+/// `rgc.ll_arrayclear` / `rgc.ll_arrayfill`. Each sub-helper is minted through
+/// [`RPythonTyper::lowlevel_helper_function_with_builder`], converted to a
+/// callee `Constant` by [`functionptr_const`], and threaded into the parent
+/// builder — the exact orchestration shape of `rtype_builder_new`.
+fn build_alloc_and_set_family(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
+    let (newlist_name, clear_name, nonnull_name, jit_name, nojit_name) =
+        alloc_and_set_sub_names(layout);
+
+    // LIST.ll_newlist(count) — shared by every leaf arm.
+    let newlist = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            newlist_name.to_string(),
+            vec![LowLevelType::Signed],
+            ptr_lltype.clone(),
+            move |_r, _a, _res| {
+                build_ll_newlist_helper_graph(newlist_name, layout, ptr.clone(), item.clone())
+            },
+        )?
+    };
+
+    // rgc.ll_arrayclear(items) / rgc.ll_arrayfill(items, item) — the T1
+    // helpers.  Both take the ELEMENT lltype and build `Ptr(GcArray(ITEM))`
+    // internally, so their `p` param IS the items-array ptr.
+    let arrayclear = {
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_arrayclear".to_string(),
+            vec![items_ptr.clone()],
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                crate::translator::rtyper::lltypesystem::rbuilder::build_ll_arrayclear_helper_graph(
+                    "ll_arrayclear",
+                    item.clone(),
+                )
+            },
+        )?
+    };
+    let arrayfill = {
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_arrayfill".to_string(),
+            vec![items_ptr.clone(), item_lltype.clone()],
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                crate::translator::rtyper::lltypesystem::rbuilder::build_ll_arrayfill_helper_graph(
+                    "ll_arrayfill",
+                    item.clone(),
+                )
+            },
+        )?
+    };
+
+    // ll_setitem_fast(l, i, item) — the resized/fixed store used by the
+    // nonnull loop.  It takes the LIST ptr directly (does the items getfield
+    // internally for the resized layout).
+    let setitem = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        let setitem_name = layout.setitem_fast_name();
+        rtyper.lowlevel_helper_function_with_builder(
+            setitem_name.to_string(),
+            vec![
+                ptr_lltype.clone(),
+                LowLevelType::Signed,
+                item_lltype.clone(),
+            ],
+            LowLevelType::Void,
+            move |_r, _a, _res| match layout {
+                ListLayout::Fixed => build_ll_fixed_setitem_fast_helper_graph(
+                    setitem_name,
+                    ptr.clone(),
+                    item.clone(),
+                ),
+                ListLayout::Resized => {
+                    build_ll_setitem_fast_helper_graph(setitem_name, ptr.clone(), item.clone())
+                }
+            },
+        )?
+    };
+
+    // @jit.oopspec("newlist_clear(count)") _ll_alloc_and_clear(LIST, count)
+    // (rlist.py:522-528).  The oopspec is attached in lib.rs by CallPath —
+    // the codewriter derives the path from this graph's NAME.
+    let clear = {
+        let ptr = ptr_lltype.clone();
+        let newlist_fn = functionptr_const(rtyper, &newlist)?;
+        let arrayclear_fn = functionptr_const(rtyper, &arrayclear)?;
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            clear_name.to_string(),
+            vec![LowLevelType::Signed],
+            ptr_lltype.clone(),
+            move |_r, _a, _res| {
+                build_ll_alloc_and_clear_helper_graph(
+                    clear_name,
+                    layout,
+                    ptr.clone(),
+                    item.clone(),
+                    newlist_fn.clone(),
+                    arrayclear_fn.clone(),
+                )
+            },
+        )?
+    };
+
+    // _ll_alloc_and_set_nonnull(LIST, count, item) (rlist.py:530-537).
+    let nonnull = {
+        let ptr = ptr_lltype.clone();
+        let newlist_fn = functionptr_const(rtyper, &newlist)?;
+        let setitem_fn = functionptr_const(rtyper, &setitem)?;
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            nonnull_name.to_string(),
+            vec![LowLevelType::Signed, item_lltype.clone()],
+            ptr_lltype.clone(),
+            move |_r, _a, _res| {
+                build_ll_alloc_and_set_nonnull_helper_graph(
+                    nonnull_name,
+                    ptr.clone(),
+                    item.clone(),
+                    newlist_fn.clone(),
+                    setitem_fn.clone(),
+                )
+            },
+        )?
+    };
+
+    // _ll_alloc_and_set_jit(LIST, count, item) (rlist.py:510-520).
+    let jit = {
+        let ptr = ptr_lltype.clone();
+        let clear_fn = functionptr_const(rtyper, &clear)?;
+        let nonnull_fn = functionptr_const(rtyper, &nonnull)?;
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            jit_name.to_string(),
+            vec![LowLevelType::Signed, item_lltype.clone()],
+            ptr_lltype.clone(),
+            move |_r, _a, _res| {
+                build_ll_alloc_and_set_jit_helper_graph(
+                    jit_name,
+                    ptr.clone(),
+                    item.clone(),
+                    clear_fn.clone(),
+                    nonnull_fn.clone(),
+                )
+            },
+        )?
+    };
+
+    // _ll_alloc_and_set_nojit(LIST, count, item) (rlist.py:494-508).
+    let nojit = {
+        let ptr = ptr_lltype.clone();
+        let newlist_fn = functionptr_const(rtyper, &newlist)?;
+        let arrayclear_fn = functionptr_const(rtyper, &arrayclear)?;
+        let arrayfill_fn = functionptr_const(rtyper, &arrayfill)?;
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            nojit_name.to_string(),
+            vec![LowLevelType::Signed, item_lltype.clone()],
+            ptr_lltype.clone(),
+            move |_r, _a, _res| {
+                build_ll_alloc_and_set_nojit_helper_graph(
+                    nojit_name,
+                    layout,
+                    ptr.clone(),
+                    item.clone(),
+                    newlist_fn.clone(),
+                    arrayclear_fn.clone(),
+                    arrayfill_fn.clone(),
+                )
+            },
+        )?
+    };
+
+    let jit_fn = functionptr_const(rtyper, &jit)?;
+    let nojit_fn = functionptr_const(rtyper, &nojit)?;
+    build_ll_alloc_and_set_helper_graph(
+        alloc_and_set_helper_name(layout),
+        ptr_lltype,
+        item_lltype,
+        jit_fn,
+        nojit_fn,
+    )
+}
+
+/// Per-layout names for the five sub-helpers minted alongside the dispatch
+/// helper. The `newlist` name matches [`rtype_newlist_layout`]'s so the shared
+/// `ll_newlist` graph is reused; the alloc-family sub-helpers get the upstream
+/// spellings (Fixed prefixes its own so the helper cache stays disjoint).
+///
+/// Returns `(newlist, clear, nonnull, jit, nojit)`.
+fn alloc_and_set_sub_names(
+    layout: ListLayout,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    match layout {
+        ListLayout::Fixed => (
+            "ll_fixed_newlist",
+            "_ll_alloc_and_clear",
+            "_ll_fixed_alloc_and_set_nonnull",
+            "_ll_fixed_alloc_and_set_jit",
+            "_ll_fixed_alloc_and_set_nojit",
+        ),
+        ListLayout::Resized => (
+            "ll_newlist",
+            "_ll_alloc_and_clear",
+            "_ll_alloc_and_set_nonnull",
+            "_ll_alloc_and_set_jit",
+            "_ll_alloc_and_set_nojit",
+        ),
+    }
 }
 
 pub fn _null_of_type() -> Result<(), TyperError> {
     Err(rlist_runtime_deferred("_null_of_type"))
-}
-
-pub fn ll_alloc_and_set() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("ll_alloc_and_set"))
-}
-
-pub fn _ll_alloc_and_set_nojit() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("_ll_alloc_and_set_nojit"))
-}
-
-pub fn _ll_alloc_and_set_jit() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("_ll_alloc_and_set_jit"))
-}
-
-pub fn _ll_alloc_and_clear() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("_ll_alloc_and_clear"))
-}
-
-pub fn _ll_alloc_and_set_nonnull() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("_ll_alloc_and_set_nonnull"))
 }
 
 pub fn ll_null_item() -> Result<(), TyperError> {
@@ -3188,6 +3497,727 @@ pub(crate) fn build_ll_newlist_helper_graph(
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["length".to_string()],
+        func,
+    ))
+}
+
+/// Emit the `_ll_zero_or_null(item)` op chain (`rlist.py:472-479`) onto
+/// `block`, returning a Bool var that is `True` when `item` IS zero/null:
+///
+/// ```python
+/// def _ll_zero_or_null(item):
+///     T = typeOf(item)
+///     if T is Char or T is UniChar:
+///         check = ord(item)
+///     elif isinstance(T, Number):
+///         check = widen(item)
+///     else:
+///         check = item
+///     return not check
+/// ```
+///
+/// The `check`/`not check` shape is realised per element type: a Char/UniChar
+/// is cast to int then `int_is_true` (matching `not ord(item)`); an integer
+/// is tested with `<prefix>is_true` directly (`not widen(item)`); a Float with
+/// `float_is_true`; a Ptr with `ptr_nonzero`.  Every arm produces the
+/// "nonzero" boolean, which is then negated with `bool_not` to yield the
+/// "zero/null" result the caller branches on.
+fn emit_zero_or_null(block: &BlockRef, item_lltype: &LowLevelType, item: Hlvalue) -> Variable {
+    let (opname, operand) = match item_lltype {
+        LowLevelType::Char => {
+            let as_int = variable_with_lltype("check", LowLevelType::Signed);
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "cast_char_to_int",
+                vec![item],
+                Hlvalue::Variable(as_int.clone()),
+            ));
+            ("int_is_true", Hlvalue::Variable(as_int))
+        }
+        LowLevelType::UniChar => {
+            let as_int = variable_with_lltype("check", LowLevelType::Signed);
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "cast_unichar_to_int",
+                vec![item],
+                Hlvalue::Variable(as_int.clone()),
+            ));
+            ("int_is_true", Hlvalue::Variable(as_int))
+        }
+        LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
+            ("float_is_true", item)
+        }
+        LowLevelType::Ptr(_) | LowLevelType::Address => ("ptr_nonzero", item),
+        // Signed/Unsigned/LongLong/etc.: `not widen(item)` — the widened
+        // integer is-true test.  `int_is_true` covers the machine-word ints
+        // the list-repeat subjects reach here with.
+        _ => ("int_is_true", item),
+    };
+    let nonzero = variable_with_lltype("nonzero", LowLevelType::Bool);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        opname,
+        vec![operand],
+        Hlvalue::Variable(nonzero.clone()),
+    ));
+    let is_zero = variable_with_lltype("is_zero_or_null", LowLevelType::Bool);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "bool_not",
+        vec![Hlvalue::Variable(nonzero)],
+        Hlvalue::Variable(is_zero.clone()),
+    ));
+    is_zero
+}
+
+/// Read `l.ll_items()` for `layout` onto `block`, returning the items-array
+/// ptr operand `rgc.ll_arrayclear` / `ll_arrayfill` receive.  A
+/// `FixedSizeListRepr` value IS the array ptr (no read); the resized header
+/// reaches its array through `getfield(l, "items")`.
+fn emit_list_items_read(
+    block: &BlockRef,
+    layout: ListLayout,
+    item_lltype: &LowLevelType,
+    l: &Variable,
+) -> Hlvalue {
+    match layout {
+        ListLayout::Fixed => Hlvalue::Variable(l.clone()),
+        ListLayout::Resized => {
+            let items = variable_with_lltype("items", items_array_ptr_lltype(item_lltype));
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(l.clone()), void_field_const("items")],
+                Hlvalue::Variable(items.clone()),
+            ));
+            Hlvalue::Variable(items)
+        }
+    }
+}
+
+/// Synthesise `ll_alloc_and_set(LIST, count, item)` (`rlist.py:487-492`):
+///
+/// ```python
+/// def ll_alloc_and_set(LIST, count, item):
+///     count = int_force_ge_zero(count)
+///     if jit.we_are_jitted():
+///         return _ll_alloc_and_set_jit(LIST, count, item)
+///     else:
+///         return _ll_alloc_and_set_nojit(LIST, count, item)
+/// ```
+///
+/// The startblock clamps `count` with `int_force_ge_zero`, then branches on
+/// the identity-bearing `we_are_jitted()` `SpecTag` exitswitch (the append
+/// helper's shape): true → `direct_call` the jit arm, false → the nojit arm.
+/// `LIST` is folded into the callee identities, so only `(count, item)` cross
+/// the call.
+#[allow(clippy::too_many_arguments)]
+fn build_ll_alloc_and_set_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    jit_fn: Constant,
+    nojit_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let count_arg = variable_with_lltype("count", LowLevelType::Signed);
+    let item_arg = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(count_arg.clone()),
+        Hlvalue::Variable(item_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // count = int_force_ge_zero(count).
+    let count_clamped = variable_with_lltype("count", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_force_ge_zero",
+        vec![Hlvalue::Variable(count_arg)],
+        Hlvalue::Variable(count_clamped.clone()),
+    ));
+
+    // jit arm: return _ll_alloc_and_set_jit(count, item).
+    let jit_count = variable_with_lltype("count", LowLevelType::Signed);
+    let jit_item = variable_with_lltype("item", item_lltype.clone());
+    let block_jit = Block::shared(vec![
+        Hlvalue::Variable(jit_count.clone()),
+        Hlvalue::Variable(jit_item.clone()),
+    ]);
+    let jit_res = variable_with_lltype("result", ptr_lltype.clone());
+    block_jit.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(jit_fn),
+            Hlvalue::Variable(jit_count),
+            Hlvalue::Variable(jit_item),
+        ],
+        Hlvalue::Variable(jit_res.clone()),
+    ));
+    block_jit.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(jit_res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // nojit arm: return _ll_alloc_and_set_nojit(count, item).
+    let nj_count = variable_with_lltype("count", LowLevelType::Signed);
+    let nj_item = variable_with_lltype("item", item_lltype);
+    let block_nojit = Block::shared(vec![
+        Hlvalue::Variable(nj_count.clone()),
+        Hlvalue::Variable(nj_item.clone()),
+    ]);
+    let nj_res = variable_with_lltype("result", ptr_lltype);
+    block_nojit
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(nojit_fn),
+                Hlvalue::Variable(nj_count),
+                Hlvalue::Variable(nj_item),
+            ],
+            Hlvalue::Variable(nj_res.clone()),
+        ));
+    block_nojit.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(nj_res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(count_clamped.clone()),
+                Hlvalue::Variable(item_arg.clone()),
+            ],
+            Some(block_jit),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(count_clamped),
+                Hlvalue::Variable(item_arg),
+            ],
+            Some(block_nojit),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["count".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `_ll_alloc_and_set_jit(LIST, count, item)` (`rlist.py:510-520`):
+///
+/// ```python
+/// def _ll_alloc_and_set_jit(LIST, count, item):
+///     if _ll_zero_or_null(item):
+///         return _ll_alloc_and_clear(LIST, count)
+///     else:
+///         return _ll_alloc_and_set_nonnull(LIST, count, item)
+/// ```
+///
+/// Startblock runs the [`emit_zero_or_null`] op chain and branches on it:
+/// true (zero/null) → `direct_call` the clear arm `(count)`; false → the
+/// nonnull arm `(count, item)`.
+fn build_ll_alloc_and_set_jit_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    clear_fn: Constant,
+    nonnull_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let count_arg = variable_with_lltype("count", LowLevelType::Signed);
+    let item_arg = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(count_arg.clone()),
+        Hlvalue::Variable(item_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // clear arm: return _ll_alloc_and_clear(count).
+    let cl_count = variable_with_lltype("count", LowLevelType::Signed);
+    let block_clear = Block::shared(vec![Hlvalue::Variable(cl_count.clone())]);
+    let cl_res = variable_with_lltype("result", ptr_lltype.clone());
+    block_clear
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![Hlvalue::Constant(clear_fn), Hlvalue::Variable(cl_count)],
+            Hlvalue::Variable(cl_res.clone()),
+        ));
+    block_clear.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(cl_res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // nonnull arm: return _ll_alloc_and_set_nonnull(count, item).
+    let nn_count = variable_with_lltype("count", LowLevelType::Signed);
+    let nn_item = variable_with_lltype("item", item_lltype.clone());
+    let block_nonnull = Block::shared(vec![
+        Hlvalue::Variable(nn_count.clone()),
+        Hlvalue::Variable(nn_item.clone()),
+    ]);
+    let nn_res = variable_with_lltype("result", ptr_lltype);
+    block_nonnull
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(nonnull_fn),
+                Hlvalue::Variable(nn_count),
+                Hlvalue::Variable(nn_item),
+            ],
+            Hlvalue::Variable(nn_res.clone()),
+        ));
+    block_nonnull.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(nn_res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let is_zero = emit_zero_or_null(
+        &startblock,
+        &item_lltype,
+        Hlvalue::Variable(item_arg.clone()),
+    );
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_zero));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(count_arg.clone())],
+            Some(block_clear),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(count_arg), Hlvalue::Variable(item_arg)],
+            Some(block_nonnull),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["count".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `_ll_alloc_and_set_nojit(LIST, count, item)`
+/// (`rlist.py:494-508`):
+///
+/// ```python
+/// def _ll_alloc_and_set_nojit(LIST, count, item):
+///     l = LIST.ll_newlist(count)
+///     if _ll_zero_or_null(item):
+///         if not malloc_zero_filled:
+///             if not isinstance(typeOf(item), Ptr):
+///                 rgc.ll_arrayclear(l.ll_items())
+///         return l
+///     rgc.ll_arrayfill(l.ll_items(), item)
+///     return l
+/// ```
+///
+/// `l = ll_newlist(count)` runs in the startblock, which then branches on the
+/// [`emit_zero_or_null`] chain.  The `not malloc_zero_filled` guard collapses
+/// to always-do (a translated program has `malloc_zero_filled=False`, the
+/// `mallocstr` precedent), and the `not isinstance(typeOf(item), Ptr)` guard
+/// is a BUILD-TIME element-type check: a Ptr item's array was already zeroed
+/// by `ll_newlist`'s `zero_gc_pointers_inside`, so the zero arm just returns
+/// `l`; a non-Ptr item emits `rgc.ll_arrayclear(items)`.  The nonzero arm
+/// always emits `rgc.ll_arrayfill(items, item)`.
+#[allow(clippy::too_many_arguments)]
+fn build_ll_alloc_and_set_nojit_helper_graph(
+    name: &str,
+    layout: ListLayout,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    newlist_fn: Constant,
+    arrayclear_fn: Constant,
+    arrayfill_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let count_arg = variable_with_lltype("count", LowLevelType::Signed);
+    let item_arg = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(count_arg.clone()),
+        Hlvalue::Variable(item_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // l = LIST.ll_newlist(count).
+    let l = variable_with_lltype("l", ptr_lltype.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(newlist_fn), Hlvalue::Variable(count_arg)],
+        Hlvalue::Variable(l.clone()),
+    ));
+
+    // zero/null arm: (build-time) arrayclear unless the element is a Ptr; then
+    // return l.  Threads `l` through the link and reads `items` in the arm.
+    let cl_l = variable_with_lltype("l", ptr_lltype.clone());
+    let cl_item = variable_with_lltype("item", item_lltype.clone());
+    let block_zero = Block::shared(vec![
+        Hlvalue::Variable(cl_l.clone()),
+        Hlvalue::Variable(cl_item.clone()),
+    ]);
+    // upstream `not isinstance(typeOf(item), Ptr)` — only a `Ptr` element had
+    // its slots pre-zeroed by `ll_newlist`'s `zero_gc_pointers_inside`, so only
+    // a `Ptr` item skips `ll_arrayclear`. `Address` is not a `Ptr`, so it (and
+    // every primitive) still clears.
+    let item_is_ptr = matches!(item_lltype, LowLevelType::Ptr(_));
+    if !item_is_ptr {
+        let items = emit_list_items_read(&block_zero, layout, &item_lltype, &cl_l);
+        let cl_void = variable_with_lltype("v", LowLevelType::Void);
+        block_zero.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![Hlvalue::Constant(arrayclear_fn), items],
+            Hlvalue::Variable(cl_void),
+        ));
+    }
+    block_zero.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(cl_l)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // nonzero arm: rgc.ll_arrayfill(l.ll_items(), item); return l.
+    let nz_l = variable_with_lltype("l", ptr_lltype.clone());
+    let nz_item = variable_with_lltype("item", item_lltype.clone());
+    let block_fill = Block::shared(vec![
+        Hlvalue::Variable(nz_l.clone()),
+        Hlvalue::Variable(nz_item.clone()),
+    ]);
+    let fill_items = emit_list_items_read(&block_fill, layout, &item_lltype, &nz_l);
+    let fill_void = variable_with_lltype("v", LowLevelType::Void);
+    block_fill.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(arrayfill_fn),
+            fill_items,
+            Hlvalue::Variable(nz_item),
+        ],
+        Hlvalue::Variable(fill_void),
+    ));
+    block_fill.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(nz_l)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let is_zero = emit_zero_or_null(
+        &startblock,
+        &item_lltype,
+        Hlvalue::Variable(item_arg.clone()),
+    );
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_zero));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l.clone()),
+                Hlvalue::Variable(item_arg.clone()),
+            ],
+            Some(block_zero),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(l), Hlvalue::Variable(item_arg)],
+            Some(block_fill),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["count".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `_ll_alloc_and_clear(LIST, count)` (`rlist.py:522-528`,
+/// `@jit.oopspec("newlist_clear(count)")`):
+///
+/// ```python
+/// def _ll_alloc_and_clear(LIST, count):
+///     l = LIST.ll_newlist(count)
+///     if malloc_zero_filled:
+///         return l
+///     rgc.ll_arrayclear(l.ll_items())
+///     return l
+/// ```
+///
+/// `malloc_zero_filled` collapses to `False` (translated program), so the
+/// early return is dead and the body unconditionally emits `ll_newlist(count)`
+/// → `rgc.ll_arrayclear(items)` → return `l`.  The `newlist_clear(count)`
+/// oopspec is attached in lib.rs by CallPath (the codewriter derives the path
+/// from this graph's NAME `_ll_alloc_and_clear`), so a JIT-path call lowers to
+/// `new_array_clear` instead of residualizing.
+fn build_ll_alloc_and_clear_helper_graph(
+    name: &str,
+    layout: ListLayout,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    newlist_fn: Constant,
+    arrayclear_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let count_arg = variable_with_lltype("count", LowLevelType::Signed);
+    let startblock = Block::shared(vec![Hlvalue::Variable(count_arg.clone())]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // l = LIST.ll_newlist(count).
+    let l = variable_with_lltype("l", ptr_lltype.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(newlist_fn), Hlvalue::Variable(count_arg)],
+        Hlvalue::Variable(l.clone()),
+    ));
+    // rgc.ll_arrayclear(l.ll_items()).
+    let items = emit_list_items_read(&startblock, layout, &item_lltype, &l);
+    let clear_void = variable_with_lltype("v", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(arrayclear_fn), items],
+        Hlvalue::Variable(clear_void),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(l)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["count".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `_ll_alloc_and_set_nonnull(LIST, count, item)`
+/// (`rlist.py:530-537`):
+///
+/// ```python
+/// def _ll_alloc_and_set_nonnull(LIST, count, item):
+///     l = LIST.ll_newlist(count)
+///     i = 0
+///     while i < count:
+///         l.ll_setitem_fast(i, item)
+///         i += 1
+///     return l
+/// ```
+///
+/// The `@jit.look_inside_iff(isconstant(count) and count < 137)` marker is a
+/// TRACING policy and is omitted (optional fidelity follow-up).  Three-block
+/// loop: startblock `l = ll_newlist(count)` then enters the header with
+/// `i = 0`; header `int_lt(i, count)` branches true → body, false → return l;
+/// body `ll_setitem_fast(l, i, item)` then `i += 1` back to header.
+fn build_ll_alloc_and_set_nonnull_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    newlist_fn: Constant,
+    setitem_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let count_arg = variable_with_lltype("count", LowLevelType::Signed);
+    let item_arg = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(count_arg.clone()),
+        Hlvalue::Variable(item_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // Loop blocks carry (l, count, item, i) as fresh inputargs.
+    let l_c = variable_with_lltype("l", ptr_lltype.clone());
+    let count_c = variable_with_lltype("count", LowLevelType::Signed);
+    let item_c = variable_with_lltype("item", item_lltype.clone());
+    let i_c = variable_with_lltype("i", LowLevelType::Signed);
+    let block_cond = Block::shared(vec![
+        Hlvalue::Variable(l_c.clone()),
+        Hlvalue::Variable(count_c.clone()),
+        Hlvalue::Variable(item_c.clone()),
+        Hlvalue::Variable(i_c.clone()),
+    ]);
+
+    let l_b = variable_with_lltype("l", ptr_lltype.clone());
+    let count_b = variable_with_lltype("count", LowLevelType::Signed);
+    let item_b = variable_with_lltype("item", item_lltype.clone());
+    let i_b = variable_with_lltype("i", LowLevelType::Signed);
+    let block_body = Block::shared(vec![
+        Hlvalue::Variable(l_b.clone()),
+        Hlvalue::Variable(count_b.clone()),
+        Hlvalue::Variable(item_b.clone()),
+        Hlvalue::Variable(i_b.clone()),
+    ]);
+
+    // startblock: l = ll_newlist(count); enter header with i = 0.
+    let l = variable_with_lltype("l", ptr_lltype.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(newlist_fn),
+            Hlvalue::Variable(count_arg.clone()),
+        ],
+        Hlvalue::Variable(l.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l),
+                Hlvalue::Variable(count_arg),
+                Hlvalue::Variable(item_arg),
+                signed_const(0),
+            ],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // header: int_lt(i, count). True -> body; False -> return l.
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    block_cond.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![
+            Hlvalue::Variable(i_c.clone()),
+            Hlvalue::Variable(count_c.clone()),
+        ],
+        Hlvalue::Variable(cond.clone()),
+    ));
+    block_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_c.clone()),
+                Hlvalue::Variable(count_c),
+                Hlvalue::Variable(item_c),
+                Hlvalue::Variable(i_c),
+            ],
+            Some(block_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(l_c)],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // body: ll_setitem_fast(l, i, item); i += 1.
+    let set_void = variable_with_lltype("v", LowLevelType::Void);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(setitem_fn),
+            Hlvalue::Variable(l_b.clone()),
+            Hlvalue::Variable(i_b.clone()),
+            Hlvalue::Variable(item_b.clone()),
+        ],
+        Hlvalue::Variable(set_void),
+    ));
+    let i_next = variable_with_lltype("i", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![Hlvalue::Variable(i_b), signed_const(1)],
+        Hlvalue::Variable(i_next.clone()),
+    ));
+    block_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_b),
+                Hlvalue::Variable(count_b),
+                Hlvalue::Variable(item_b),
+                Hlvalue::Variable(i_next),
+            ],
+            Some(block_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["count".to_string(), "item".to_string()],
         func,
     ))
 }
@@ -8009,6 +9039,457 @@ mod tests {
         assert!(
             dbg.contains("ll_listnext"),
             "expected 'll_listnext' in {dbg}"
+        );
+    }
+
+    /// BFS the CFG from `start`, returning `(block_count, all_opnames)`.
+    /// Mirrors the `walk_ops` helper the rbuilder tests use.
+    fn walk_ops(start: &BlockRef) -> (usize, Vec<String>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start.clone()];
+        let mut all_ops: Vec<String> = Vec::new();
+        let mut count = 0usize;
+        while let Some(b) = stack.pop() {
+            if !seen.insert(Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            count += 1;
+            let bb = b.borrow();
+            for op in &bb.operations {
+                all_ops.push(op.opname.clone());
+            }
+            for link in &bb.exits {
+                if let Some(t) = link.borrow().target.clone() {
+                    stack.push(t);
+                }
+            }
+        }
+        (count, all_ops)
+    }
+
+    fn dummy_funcptr_const() -> Constant {
+        Constant::with_concretetype(ConstValue::None, LowLevelType::Void)
+    }
+
+    /// Signed `Ptr(GcStruct("list", …))` lltype for the resized layout tests.
+    fn resized_list_lltype() -> LowLevelType {
+        let rtyper = fresh_rtyper();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        ListRepr::new(&rtyper, r_int)
+            .expect("ListRepr::new")
+            .lowleveltype()
+            .clone()
+    }
+
+    /// `rtype_alloc_and_set` on a resized `ListRepr` mints `ll_alloc_and_set`
+    /// and emits a single top-level `direct_call` to it. The `(count, item)`
+    /// pair is threaded; the `LIST` is folded into the helper identity.
+    #[test]
+    fn rtype_alloc_and_set_resized_mints_ll_alloc_and_set() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> =
+            Arc::new(ListRepr::new(&rtyper, r_int.clone()).expect("ListRepr::new"));
+
+        let v_count = Variable::new();
+        v_count.set_concretetype(Some(LowLevelType::Signed));
+        let v_item = Variable::new();
+        v_item.set_concretetype(Some(LowLevelType::Signed));
+        let v_count_h = Hlvalue::Variable(v_count);
+        let v_item_h = Hlvalue::Variable(v_item);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "alloc_and_set".to_string(),
+            vec![v_count_h.clone(), v_item_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_count_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(v_item_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        let out = rtype_alloc_and_set(&hop)
+            .expect("rtype_alloc_and_set must lower")
+            .expect("alloc_and_set returns the fresh list Variable");
+        assert!(matches!(out, Hlvalue::Variable(_)));
+
+        let ops = hop.llops.borrow();
+        let calls: Vec<_> = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one top-level direct_call to ll_alloc_and_set"
+        );
+
+        // The minted family graphs must be registered under their upstream
+        // names (the resized spellings).
+        let names: Vec<String> = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        for expected in [
+            "ll_alloc_and_set",
+            "_ll_alloc_and_set_jit",
+            "_ll_alloc_and_set_nojit",
+            "_ll_alloc_and_clear",
+            "_ll_alloc_and_set_nonnull",
+            "ll_arrayclear",
+            "ll_arrayfill",
+            "ll_newlist",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "family must mint `{expected}`, got {names:?}"
+            );
+        }
+    }
+
+    /// The fixed layout mints the `ll_fixed_*` dispatch/jit/nojit spellings so
+    /// the `(name, args, result)` helper cache never serves a resized graph
+    /// for a fixed request.
+    #[test]
+    fn rtype_alloc_and_set_fixed_mints_ll_fixed_alloc_and_set() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> = Arc::new(
+            FixedSizeListRepr::new(&rtyper, r_int.clone()).expect("FixedSizeListRepr::new"),
+        );
+
+        let v_count = Variable::new();
+        v_count.set_concretetype(Some(LowLevelType::Signed));
+        let v_item = Variable::new();
+        v_item.set_concretetype(Some(LowLevelType::Signed));
+        let v_count_h = Hlvalue::Variable(v_count);
+        let v_item_h = Hlvalue::Variable(v_item);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "alloc_and_set".to_string(),
+            vec![v_count_h.clone(), v_item_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_count_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(v_item_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        rtype_alloc_and_set(&hop)
+            .expect("rtype_alloc_and_set must lower")
+            .expect("alloc_and_set returns the fresh list Variable");
+
+        let names: Vec<String> = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_fixed_alloc_and_set"),
+            "fixed arm mints ll_fixed_alloc_and_set, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ll_fixed_newlist"),
+            "fixed arm mints ll_fixed_newlist, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "ll_alloc_and_set"),
+            "fixed arm must NOT mint the resized ll_alloc_and_set, got {names:?}"
+        );
+    }
+
+    /// `ll_alloc_and_set` clamps `count` with `int_force_ge_zero` and branches
+    /// on the `we_are_jitted()` SpecTag: true → jit arm direct_call, false →
+    /// nojit arm direct_call.
+    #[test]
+    fn build_ll_alloc_and_set_clamps_then_branches_on_we_are_jitted() {
+        let helper = build_ll_alloc_and_set_helper_graph(
+            "ll_alloc_and_set",
+            resized_list_lltype(),
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_alloc_and_set_helper_graph");
+        assert_eq!(helper.func.name, "ll_alloc_and_set");
+        let inner = helper.graph.borrow();
+
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["int_force_ge_zero"]);
+        assert_eq!(startblock.inputargs.len(), 2); // count, item
+        assert_eq!(startblock.exits.len(), 2); // jit / nojit arms
+        // exitswitch is the identity-bearing we_are_jitted SpecTag.
+        let Some(Hlvalue::Constant(c)) = &startblock.exitswitch else {
+            panic!("exitswitch must be the we_are_jitted SpecTag constant");
+        };
+        assert!(matches!(c.value, ConstValue::SpecTag(_)));
+        drop(startblock);
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, jit, nojit, returnblock.
+        assert_eq!(count, 4);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("int_force_ge_zero"), 1);
+        assert_eq!(n("direct_call"), 2); // jit + nojit arms
+    }
+
+    /// `_ll_alloc_and_set_jit` branches on `_ll_zero_or_null(item)`: true →
+    /// clear arm `(count)`, false → nonnull arm `(count, item)`. The
+    /// integer-item zero test is `int_is_true` negated by `bool_not`.
+    #[test]
+    fn build_ll_alloc_and_set_jit_branches_on_zero_or_null() {
+        let helper = build_ll_alloc_and_set_jit_helper_graph(
+            "_ll_alloc_and_set_jit",
+            resized_list_lltype(),
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_alloc_and_set_jit_helper_graph");
+        let inner = helper.graph.borrow();
+
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        // integer item: int_is_true then bool_not.
+        assert_eq!(start_ops, vec!["int_is_true", "bool_not"]);
+        assert_eq!(startblock.exits.len(), 2);
+        assert!(matches!(startblock.exitswitch, Some(Hlvalue::Variable(_))));
+        drop(startblock);
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, clear arm, nonnull arm, returnblock.
+        assert_eq!(count, 4);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("direct_call"), 2); // clear + nonnull
+        assert_eq!(n("bool_not"), 1);
+    }
+
+    /// `_ll_alloc_and_set_jit` with a Ptr item uses `ptr_nonzero` (negated by
+    /// `bool_not`) for the zero/null test.
+    #[test]
+    fn build_ll_alloc_and_set_jit_ptr_item_uses_ptr_nonzero() {
+        let ptr_list = resized_list_lltype();
+        // item lltype = generic gc pointer.
+        let item = items_array_ptr_lltype(&LowLevelType::Signed);
+        let helper = build_ll_alloc_and_set_jit_helper_graph(
+            "_ll_alloc_and_set_jit",
+            ptr_list,
+            item,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_alloc_and_set_jit_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["ptr_nonzero", "bool_not"]);
+    }
+
+    /// `_ll_alloc_and_set_nojit` (resized, non-Ptr item): `ll_newlist(count)`,
+    /// branch on zero/null; the zero arm reads `items` (getfield) then
+    /// `ll_arrayclear`, the nonzero arm reads `items` then `ll_arrayfill`.
+    #[test]
+    fn build_ll_alloc_and_set_nojit_resized_nonptr_clears_and_fills() {
+        let helper = build_ll_alloc_and_set_nojit_helper_graph(
+            "_ll_alloc_and_set_nojit",
+            ListLayout::Resized,
+            resized_list_lltype(),
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_alloc_and_set_nojit_helper_graph");
+        let inner = helper.graph.borrow();
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, zero arm, nonzero arm, returnblock.
+        assert_eq!(count, 4);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        // ll_newlist + arrayclear (zero arm) + arrayfill (nonzero arm).
+        assert_eq!(n("direct_call"), 3);
+        // Resized reads `items` on BOTH arms.
+        assert_eq!(n("getfield"), 2);
+        assert_eq!(n("bool_not"), 1);
+    }
+
+    /// A Ptr-element resized nojit clear arm skips `ll_arrayclear` entirely
+    /// (the array was zeroed by `ll_newlist`), so only the nonzero arm reads
+    /// `items` and calls `ll_arrayfill` — 2 direct_calls, 1 getfield.
+    #[test]
+    fn build_ll_alloc_and_set_nojit_ptr_item_skips_arrayclear() {
+        let item = items_array_ptr_lltype(&LowLevelType::Signed);
+        let helper = build_ll_alloc_and_set_nojit_helper_graph(
+            "_ll_alloc_and_set_nojit",
+            ListLayout::Resized,
+            resized_list_lltype(),
+            item,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_alloc_and_set_nojit_helper_graph");
+        let inner = helper.graph.borrow();
+        let (_count, all_ops) = walk_ops(&inner.startblock);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        // ll_newlist + arrayfill only (no arrayclear on the zero arm).
+        assert_eq!(n("direct_call"), 2);
+        // Only the nonzero (fill) arm reads `items`.
+        assert_eq!(n("getfield"), 1);
+    }
+
+    /// Fixed-layout nojit: the receiver IS the array ptr, so NO `items`
+    /// getfield is emitted on either arm.
+    #[test]
+    fn build_ll_alloc_and_set_nojit_fixed_passes_receiver_directly() {
+        let rtyper = fresh_rtyper();
+        let fixed_lltype = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
+            .expect("FixedSizeListRepr::new")
+            .lowleveltype()
+            .clone();
+        let helper = build_ll_alloc_and_set_nojit_helper_graph(
+            "_ll_fixed_alloc_and_set_nojit",
+            ListLayout::Fixed,
+            fixed_lltype,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_alloc_and_set_nojit_helper_graph");
+        let inner = helper.graph.borrow();
+        let (_count, all_ops) = walk_ops(&inner.startblock);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("getfield"), 0); // fixed value is already the array ptr
+        assert_eq!(n("direct_call"), 3); // newlist + arrayclear + arrayfill
+    }
+
+    /// `_ll_alloc_and_clear` (resized): `ll_newlist(count)` → `getfield(items)`
+    /// → `ll_arrayclear(items)` → return l — a single straight-line block
+    /// (`malloc_zero_filled` collapses the early return away).
+    #[test]
+    fn build_ll_alloc_and_clear_newlist_then_arrayclear() {
+        let helper = build_ll_alloc_and_clear_helper_graph(
+            "_ll_alloc_and_clear",
+            ListLayout::Resized,
+            resized_list_lltype(),
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_alloc_and_clear_helper_graph");
+        assert_eq!(helper.func.name, "_ll_alloc_and_clear");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["direct_call", "getfield", "direct_call"]);
+        assert_eq!(startblock.inputargs.len(), 1); // count only (LIST folded)
+        assert_eq!(startblock.exits.len(), 1); // straight-line return
+    }
+
+    /// `_ll_alloc_and_set_nonnull`: `ll_newlist(count)` then the runtime
+    /// `while i < count: setitem_fast(l, i, item); i += 1` loop.
+    #[test]
+    fn build_ll_alloc_and_set_nonnull_newlist_then_setitem_loop() {
+        let helper = build_ll_alloc_and_set_nonnull_helper_graph(
+            "_ll_alloc_and_set_nonnull",
+            resized_list_lltype(),
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_alloc_and_set_nonnull_helper_graph");
+        let inner = helper.graph.borrow();
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, loop header, loop body, returnblock.
+        assert_eq!(count, 4);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("direct_call"), 2); // ll_newlist + ll_setitem_fast (loop body)
+        assert_eq!(n("int_lt"), 1); // loop header
+        assert_eq!(n("int_add"), 1); // i += 1
+    }
+
+    /// Char-element zero test uses `cast_char_to_int` then `int_is_true`;
+    /// UniChar uses `cast_unichar_to_int`; Float uses `float_is_true`.
+    #[test]
+    fn emit_zero_or_null_op_chain_per_element_type() {
+        let probe = |lltype: LowLevelType| -> Vec<String> {
+            let item = variable_with_lltype("item", lltype.clone());
+            let block = Block::shared(vec![Hlvalue::Variable(item.clone())]);
+            emit_zero_or_null(&block, &lltype, Hlvalue::Variable(item));
+            block
+                .borrow()
+                .operations
+                .iter()
+                .map(|o| o.opname.clone())
+                .collect()
+        };
+        assert_eq!(
+            probe(LowLevelType::Char),
+            vec!["cast_char_to_int", "int_is_true", "bool_not"]
+        );
+        assert_eq!(
+            probe(LowLevelType::UniChar),
+            vec!["cast_unichar_to_int", "int_is_true", "bool_not"]
+        );
+        assert_eq!(
+            probe(LowLevelType::Float),
+            vec!["float_is_true", "bool_not"]
+        );
+        assert_eq!(probe(LowLevelType::Signed), vec!["int_is_true", "bool_not"]);
+        assert_eq!(
+            probe(items_array_ptr_lltype(&LowLevelType::Signed)),
+            vec!["ptr_nonzero", "bool_not"]
         );
     }
 }

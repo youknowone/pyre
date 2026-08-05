@@ -10893,6 +10893,62 @@ mod tests {
         assert_eq!(new_array_clear, count);
     }
 
+    /// T3 end-to-end: the rtyper mints the `_ll_alloc_and_set` family (whose
+    /// clear sub-helper is named `_ll_alloc_and_clear` for BOTH the resized
+    /// and fixed layouts), and `lib.rs` attaches the `newlist_clear(count)`
+    /// oopspec under the single-segment path `["_ll_alloc_and_clear"]`.  A
+    /// `direct_call` to a `_ll_alloc_and_clear` funcptr therefore resolves to
+    /// that path and lowers to `new_array_clear` — this locks that the path
+    /// `lib.rs` registers is exactly the one the minted graph's name produces.
+    #[test]
+    fn t3_ll_alloc_and_clear_oopspec_registration_lowers_to_new_array_clear() {
+        // Exactly the registration `lib.rs` performs beside the jit.* specs.
+        let mut cc = crate::call::CallControl::new();
+        cc.mark_oopspec(
+            crate::parse::CallPath::from_segments(["_ll_alloc_and_clear"]),
+            "newlist_clear(count)".to_string(),
+        );
+
+        let mut graph = FunctionGraph::new("caller");
+        let count = graph.alloc_value_var();
+        let result = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&count, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+        let startblock = graph.startblock;
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["_ll_alloc_and_clear"]),
+                args: vec![count.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(result.clone());
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let lowered = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::NewArrayClear { length, .. } => Some(length.clone()),
+                _ => None,
+            })
+            .expect("minted _ll_alloc_and_clear must lower to new_array_clear");
+        assert_eq!(lowered, count);
+    }
+
     /// `list.int_getitem(l, i)` lowers to `getfield_gc_r(l,
     /// int_items.block)` feeding `getarrayitem_gc_i(block, i)`.
     #[test]
