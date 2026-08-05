@@ -1701,8 +1701,8 @@ pub fn fspath_buf(obj: pyre_object::PyObjectRef) -> Result<std::path::PathBuf, c
         // an encoding error. Encoding to bytes and decoding them back lossily
         // would substitute U+FFFD, which addresses a different name and makes
         // distinct entries alias onto one another.
-        Ok(std::path::PathBuf::from(
-            crate::baseobjspace::str_utf8_w(obj)?,
-        ))
+        Ok(std::path::PathBuf::from(crate::baseobjspace::str_utf8_w(
+            obj,
+        )?))
     }
 }
