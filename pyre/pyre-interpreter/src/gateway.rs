@@ -1575,10 +1575,14 @@ pub fn fsdecode_os_str(name: &std::ffi::OsStr) -> pyre_object::PyObjectRef {
     }
 }
 
-/// `interp_posix.py:194-219 Path`: the syscall spelling and the resolved path
+/// `interp_posix.py:140-152 Path`: the syscall spelling and the resolved path
 /// object travel together. For `os.PathLike`, `w_path` is the result of the
 /// single `__fspath__` call, not the wrapper that supplied it.
 pub struct FsEncodedPath {
+    /// `Path.as_fd`, `-1` where the argument named a path rather than an open
+    /// descriptor. Only the entry points that pass `allow_fd` can set it, so a
+    /// caller that took a path-only boundary never has to test it.
+    pub as_fd: i32,
     pub as_bytes: Vec<u8>,
     w_path_slot: usize,
     _roots: pyre_object::gc_roots::RootScope,
@@ -1595,11 +1599,51 @@ impl FsEncodedPath {
 }
 
 pub fn fsencode_path_w(obj: pyre_object::PyObjectRef) -> Result<FsEncodedPath, crate::PyError> {
+    path_or_fd_w(obj, None, false)
+}
+
+/// [`fsencode_path_w`] for a boundary that also takes an open file descriptor —
+/// `interp_posix.py:611 path=path_or_fd(allow_fd=True)`. `funcname` names the
+/// caller in the type error, whose allowed-type list widens with `allow_fd`:
+/// `stat` answers "string, bytes, os.PathLike or integer" where `lstat`, which
+/// takes no descriptor, answers "string, bytes or os.PathLike".
+pub fn fsencode_path_or_fd_w(
+    obj: pyre_object::PyObjectRef,
+    funcname: &str,
+    allow_fd: bool,
+) -> Result<FsEncodedPath, crate::PyError> {
+    path_or_fd_w(obj, Some(funcname), allow_fd)
+}
+
+fn path_or_fd_w(
+    obj: pyre_object::PyObjectRef,
+    funcname: Option<&str>,
+    allow_fd: bool,
+) -> Result<FsEncodedPath, crate::PyError> {
+    // interp_posix.py:170-180 builds this list from the same two flags, and the
+    // caller-named form is the only one CPython ever shows for these entry
+    // points; the unnamed form is what every path-only boundary already emits.
+    let reject = |obj: pyre_object::PyObjectRef| -> crate::PyError {
+        let tp = crate::type_methods::arg_type_name(obj);
+        match funcname {
+            Some(name) => {
+                let allowed = if allow_fd {
+                    "string, bytes, os.PathLike or integer"
+                } else {
+                    "string, bytes or os.PathLike"
+                };
+                crate::PyError::type_error(format!("{name}: path should be {allowed}, not {tp}"))
+            }
+            None => crate::PyError::type_error(format!(
+                "expected str, bytes or os.PathLike object, not {tp}"
+            )),
+        }
+    };
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);
 
-    let (data, w_path_slot) = unsafe {
+    let (data, w_path_slot, as_fd) = unsafe {
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if pyre_object::bytesobject::is_bytes_like(obj) {
             // baseobjspace.py:1975-1977: pyre's readable-buffer set here is
@@ -1614,19 +1658,33 @@ pub fn fsencode_path_w(obj: pyre_object::PyObjectRef) -> Result<FsEncodedPath, c
             (
                 pyre_object::bytesobject::bytes_like_data(obj).to_vec(),
                 obj_slot,
+                -1,
             )
         } else if pyre_object::is_str(obj) {
-            (fsencode(obj)?, obj_slot)
+            (fsencode(obj)?, obj_slot, -1)
+        } else if allow_fd
+            && (pyre_object::pyobject::is_int_or_long(obj)
+                || crate::baseobjspace::lookup(obj, "__index__").is_some())
+        {
+            // interp_posix.py:201-210 — the descriptor case is probed with
+            // `__index__` and sits BEFORE the PathLike case, so an object
+            // carrying both is taken as a descriptor and its `__fspath__` is
+            // never called.
+            let fd = crate::baseobjspace::c_int_w(obj)?;
+            // interp_posix.py:269-271 `unwrap_fd` — `-1` is the sentinel for
+            // "not a descriptor", so a caller naming it has to be turned away
+            // here rather than silently read as a path.
+            if fd == -1 {
+                return Err(crate::PyError::os_error("invalid file descriptor: -1"));
+            }
+            (Vec::new(), obj_slot, fd)
         } else {
             // `type(path).__fspath__(path)` — the descriptor read off the type is
             // unbound, so `path` is supplied as the sole argument.
             let Some(fspath_fn) = crate::typedef::r#type(obj)
                 .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
             else {
-                return Err(crate::PyError::type_error(format!(
-                    "expected str, bytes or os.PathLike object, not {}",
-                    crate::type_methods::arg_type_name(obj)
-                )));
+                return Err(reject(obj));
             };
             let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(fspath_fn);
@@ -1643,9 +1701,10 @@ pub fn fsencode_path_w(obj: pyre_object::PyObjectRef) -> Result<FsEncodedPath, c
                 (
                     pyre_object::bytesobject::w_bytes_data(result).to_vec(),
                     result_slot,
+                    -1,
                 )
             } else if pyre_object::is_str(result) {
-                (fsencode(result)?, result_slot)
+                (fsencode(result)?, result_slot, -1)
             } else {
                 // interp_posix.py:3053-3058 names both the object that was asked
                 // and the type its `__fspath__` answered with.
@@ -1658,11 +1717,13 @@ pub fn fsencode_path_w(obj: pyre_object::PyObjectRef) -> Result<FsEncodedPath, c
             }
         }
     };
-    // baseobjspace.py:2016-2017 `bytesbuf0_w` rejects embedded nulls.
-    if data.contains(&0) {
+    // baseobjspace.py:2016-2017 `bytesbuf0_w` rejects embedded nulls. A
+    // descriptor carries no bytes to check.
+    if as_fd == -1 && data.contains(&0) {
         return Err(crate::PyError::value_error("embedded null byte"));
     }
     Ok(FsEncodedPath {
+        as_fd,
         as_bytes: data,
         w_path_slot,
         _roots: roots,

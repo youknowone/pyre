@@ -816,8 +816,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // (supports_dir_fd / supports_fd / supports_follow_symlinks), which
     // callers like shutil.rmtree consult to choose between fd-relative and
     // path-based implementations. Only the macros whose functionality is
-    // actually implemented may be listed: the `*at` family is omitted because
-    // dir_fd is not honored, and HAVE_FDOPENDIR is omitted because
+    // actually implemented may be listed: of the `*at` family only
+    // HAVE_FSTATAT is listed, because stat/lstat are the only calls that
+    // resolve a dir_fd-relative name, and HAVE_FDOPENDIR is omitted because
     // scandir/listdir do not accept a file descriptor. HAVE_LSTAT remains so
     // os.stat is reported in supports_follow_symlinks (follow_symlinks=False
     // works).
@@ -838,6 +839,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // return to the libregrtest worker.
         #[cfg(not(feature = "sandbox"))]
         "HAVE_FPATHCONF",
+        // os.py:120-121 reads this as `stat` and `lstat` honouring dir_fd;
+        // `stat_at` implements it with `fstatat`, which the sandbox seam and
+        // the non-unix hosts do not carry.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        "HAVE_FSTATAT",
         #[cfg(not(feature = "sandbox"))]
         "HAVE_FSTATVFS",
         #[cfg(all(unix, not(feature = "sandbox")))]
@@ -2279,6 +2285,89 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             )
         };
 
+        stat_result_from_fields(
+            &StatFields {
+                mode: st_mode,
+                ino: st_ino,
+                dev: st_dev,
+                nlink: st_nlink,
+                uid: st_uid,
+                gid: st_gid,
+                size: st_size,
+                atime: st_atime,
+                mtime: st_mtime,
+                ctime: st_ctime,
+                atime_ns: st_atime_ns,
+                mtime_ns: st_mtime_ns,
+                ctime_ns: st_ctime_ns,
+                #[cfg(unix)]
+                blksize: st_blksize,
+                #[cfg(unix)]
+                blocks: st_blocks,
+                #[cfg(unix)]
+                rdev: st_rdev,
+            },
+            st_flags,
+        )
+    }
+
+    /// The `stat_result` fields, read out of whichever source produced them:
+    /// `std::fs::Metadata` for the path and descriptor forms, `libc::stat`
+    /// for the `fstatat` form a `dir_fd`-relative name takes.
+    struct StatFields {
+        mode: i64,
+        ino: i64,
+        dev: i64,
+        nlink: i64,
+        uid: i64,
+        gid: i64,
+        size: i64,
+        atime: i64,
+        mtime: i64,
+        ctime: i64,
+        atime_ns: i64,
+        mtime_ns: i64,
+        ctime_ns: i64,
+        #[cfg(unix)]
+        blksize: i64,
+        #[cfg(unix)]
+        blocks: i64,
+        #[cfg(unix)]
+        rdev: i64,
+    }
+
+    fn stat_result_from_fields(f: &StatFields, st_flags: u32) -> pyre_object::PyObjectRef {
+        let (
+            st_mode,
+            st_ino,
+            st_dev,
+            st_nlink,
+            st_uid,
+            st_gid,
+            st_size,
+            st_atime,
+            st_mtime,
+            st_ctime,
+            st_atime_ns,
+            st_mtime_ns,
+            st_ctime_ns,
+        ) = (
+            f.mode,
+            f.ino,
+            f.dev,
+            f.nlink,
+            f.uid,
+            f.gid,
+            f.size,
+            f.atime,
+            f.mtime,
+            f.ctime,
+            f.atime_ns,
+            f.mtime_ns,
+            f.ctime_ns,
+        );
+        #[cfg(unix)]
+        let (st_blksize, st_blocks, st_rdev) = (f.blksize, f.blocks, f.rdev);
         // The 10 sequence slots are the integer fields (integer-seconds
         // times at 7..10, named `_integer_*`); the float times, `st_*_ns`,
         // and the platform block/device extras are named-only fields.
@@ -2395,8 +2484,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `os.stat(path, *, dir_fd=None, follow_symlinks=True)` /
     /// `os.lstat(path, *, dir_fd=None)` — `follow_symlinks` is keyword-only,
     /// so `stat` cannot take the fixed-arity carrier that rejects keywords.
-    /// `dir_fd` stays unimplemented (the `*at` family is absent from
-    /// `_have_functions`), so only `None` is accepted.
+    /// The three argument forms are the three arms of `do_stat`
+    /// (`interp_posix.py:633-649`): an open descriptor as `path` goes to
+    /// `fstat`, a `dir_fd`-relative name to `fstatat`, and a bare name to
+    /// `stat`/`lstat`.
     fn stat_entry(
         args: &[pyre_object::PyObjectRef],
         default_follow: bool,
@@ -2423,38 +2514,123 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 )));
             }
         };
-        if let Some(dir_fd) = crate::builtins::kwarg_get(kwargs, "dir_fd")
-            && !unsafe { pyre_object::is_none(dir_fd) }
+        // `stat`/`lstat` type `dir_fd` as `DirFD(rposix.HAVE_FSTATAT)`
+        // (`interp_posix.py:612,660`), whose `unwrap` is `_unwrap_dirfd`
+        // (:274-278).
+        let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd")
+            .filter(|&v| !unsafe { pyre_object::is_none(v) })
         {
-            return Err(crate::PyError::not_implemented(format!(
-                "{name}: dir_fd unavailable on this platform"
-            )));
-        }
+            Some(v) => Some(unwrap_fd(v, "integer or None")?),
+            None => None,
+        };
         let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
             Some(v) => crate::baseobjspace::is_true(v)?,
             None => default_follow,
         };
-        stat_impl(&[path], follow_symlinks)
+        // interp_posix.py:611,659 — `stat` takes `path_or_fd(allow_fd=True)`
+        // and `lstat` takes `allow_fd=False`, which is also what makes their
+        // type errors name different allowed types.
+        let path = crate::gateway::fsencode_path_or_fd_w(path, name, default_follow)?;
+        // interp_posix.py:634-644 `do_stat` tests the descriptor first: with one
+        // in hand neither other argument has anything to apply to, and both
+        // rejections precede the platform's dir_fd availability.
+        if path.as_fd != -1 {
+            if dir_fd.is_some() {
+                return Err(crate::PyError::value_error(format!(
+                    "{name}: can't specify dir_fd without matching path"
+                )));
+            }
+            if !follow_symlinks {
+                return Err(crate::PyError::value_error(format!(
+                    "{name}: cannot use fd and follow_symlinks together"
+                )));
+            }
+            return fstat_fd(path.as_fd);
+        }
+        match dir_fd {
+            Some(dir_fd) => stat_at(name, &path, dir_fd, follow_symlinks),
+            None => stat_path(&path, follow_symlinks),
+        }
     }
 
-    fn stat_impl(
-        args: &[pyre_object::PyObjectRef],
+    /// `rposix_stat.build_stat_result` reads the same fields off the raw
+    /// `struct stat` the `*at` calls fill in.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    fn stat_fields_from_libc(st: &libc::stat) -> StatFields {
+        StatFields {
+            mode: st.st_mode as i64,
+            ino: st.st_ino as i64,
+            dev: st.st_dev as i64,
+            nlink: st.st_nlink as i64,
+            uid: st.st_uid as i64,
+            gid: st.st_gid as i64,
+            size: st.st_size as i64,
+            atime: st.st_atime as i64,
+            mtime: st.st_mtime as i64,
+            ctime: st.st_ctime as i64,
+            atime_ns: st.st_atime as i64 * 1_000_000_000 + st.st_atime_nsec as i64,
+            mtime_ns: st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
+            ctime_ns: st.st_ctime as i64 * 1_000_000_000 + st.st_ctime_nsec as i64,
+            blksize: st.st_blksize as i64,
+            blocks: st.st_blocks as i64,
+            rdev: st.st_rdev as i64,
+        }
+    }
+
+    /// `do_stat` (`interp_posix.py:649`) resolves a name against an open
+    /// directory descriptor with `fstatat`, where `AT_SYMLINK_NOFOLLOW`
+    /// carries `follow_symlinks=False`. An absolute name ignores `dir_fd`,
+    /// which is why the caller does not have to test for one.
+    fn stat_at(
+        name: &str,
+        path: &crate::gateway::FsEncodedPath,
+        dir_fd: i32,
         follow_symlinks: bool,
     ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-        if args.is_empty() {
-            return Err(crate::PyError::type_error("stat() missing argument"));
-        }
-        // Only a wrong *type* is re-reported under `stat`'s own wording; the
-        // embedded-null ValueError and the surrogate UnicodeEncodeError say
-        // what actually went wrong and have to reach the caller as themselves.
-        // `os.stat('\ud800')` is a `UnicodeEncodeError`, not a `TypeError`.
-        let path = crate::gateway::fsencode_path_w(args[0]).map_err(|err| {
-            if matches!(err.kind, crate::error::PyErrorKind::TypeError) {
-                crate::PyError::type_error("stat: path should be string, bytes, os.PathLike")
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let flags = if follow_symlinks {
+                0
             } else {
-                err
+                libc::AT_SYMLINK_NOFOLLOW
+            };
+            let ret = unsafe { libc::fstatat(dir_fd, c_path.as_ptr(), st.as_mut_ptr(), flags) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(errno_err_with_filename(
+                    crate::builtins::io_error_posix_errno(&err, libc::EBADF),
+                    path.w_path(),
+                ));
             }
-        })?;
+            let st = unsafe { st.assume_init() };
+            #[cfg(target_os = "macos")]
+            let st_flags = st.st_flags;
+            #[cfg(not(target_os = "macos"))]
+            let st_flags = 0u32;
+            return Ok(stat_result_from_fields(
+                &stat_fields_from_libc(&st),
+                st_flags,
+            ));
+        }
+        // `DirFD(available=False)` (`interp_posix.py:285-292`): the platform
+        // has no `fstatat`, so a `dir_fd` that reached this far has nothing
+        // to resolve against.
+        #[allow(unreachable_code)]
+        {
+            let _ = (path, dir_fd, follow_symlinks);
+            Err(crate::PyError::not_implemented(format!(
+                "{name}: dir_fd unavailable on this platform"
+            )))
+        }
+    }
+
+    fn stat_path(
+        path: &crate::gateway::FsEncodedPath,
+        follow_symlinks: bool,
+    ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
         #[cfg(feature = "sandbox")]
         {
             let buf = if follow_symlinks {
@@ -2855,6 +3031,51 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "lstat",
         crate::make_builtin_function("lstat", |args| stat_entry(args, false)),
     );
+    /// `rposix_stat.py fstat`: the descriptor form both `os.fstat` and
+    /// `os.stat` with a descriptor answer through, so the two cannot drift.
+    fn fstat_fd(fd: i32) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+        // `rposix_stat.py:fstat` passes the descriptor to libc, where
+        // `-1` reports EBADF.  Rust's `OwnedFd::from_raw_fd(-1)`
+        // asserts before `File::metadata` can produce that error.
+        if fd == -1 {
+            return Err(crate::PyError::os_error_with_errno(
+                libc::EBADF,
+                std::io::Error::from_raw_os_error(libc::EBADF).to_string(),
+            ));
+        }
+        #[cfg(feature = "sandbox")]
+        {
+            let buf = crate::host_seam::ops::fstat(fd)
+                .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+            Ok(make_stat_result_from_statbuf(&buf))
+        }
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            use std::os::unix::io::FromRawFd;
+            let f = unsafe { std::fs::File::from_raw_fd(fd) };
+            let meta = f.metadata();
+            let _ = std::mem::ManuallyDrop::new(f); // don't close
+            match meta {
+                Ok(m) => {
+                    #[cfg(target_os = "macos")]
+                    let st_flags = macos_fd_st_flags(fd);
+                    #[cfg(not(target_os = "macos"))]
+                    let st_flags = 0u32;
+                    Ok(make_stat_result(&m, st_flags))
+                }
+                Err(e) => Err(crate::PyError::os_error_with_errno(
+                    crate::builtins::io_error_posix_errno(&e, 9),
+                    format!("{}", e),
+                )),
+            }
+        }
+        #[cfg(not(any(unix, feature = "sandbox")))]
+        Err(crate::PyError::os_error_with_errno(
+            9,
+            "fstat unsupported".to_string(),
+        ))
+    }
+
     crate::module_ns_store(
         ns,
         "fstat",
@@ -2864,47 +3085,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("fstat() missing argument"));
                 }
-                let fd = crate::baseobjspace::c_int_w(args[0])?;
-                // `rposix_stat.py:fstat` passes the descriptor to libc, where
-                // `-1` reports EBADF.  Rust's `OwnedFd::from_raw_fd(-1)`
-                // asserts before `File::metadata` can produce that error.
-                if fd == -1 {
-                    return Err(crate::PyError::os_error_with_errno(
-                        libc::EBADF,
-                        std::io::Error::from_raw_os_error(libc::EBADF).to_string(),
-                    ));
-                }
-                #[cfg(feature = "sandbox")]
-                {
-                    let buf = crate::host_seam::ops::fstat(fd)
-                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                    Ok(make_stat_result_from_statbuf(&buf))
-                }
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                {
-                    use std::os::unix::io::FromRawFd;
-                    let f = unsafe { std::fs::File::from_raw_fd(fd) };
-                    let meta = f.metadata();
-                    let _ = std::mem::ManuallyDrop::new(f); // don't close
-                    match meta {
-                        Ok(m) => {
-                            #[cfg(target_os = "macos")]
-                            let st_flags = macos_fd_st_flags(fd);
-                            #[cfg(not(target_os = "macos"))]
-                            let st_flags = 0u32;
-                            Ok(make_stat_result(&m, st_flags))
-                        }
-                        Err(e) => Err(crate::PyError::os_error_with_errno(
-                            crate::builtins::io_error_posix_errno(&e, 9),
-                            format!("{}", e),
-                        )),
-                    }
-                }
-                #[cfg(not(any(unix, feature = "sandbox")))]
-                Err(crate::PyError::os_error_with_errno(
-                    9,
-                    "fstat unsupported".to_string(),
-                ))
+                fstat_fd(crate::baseobjspace::c_int_w(args[0])?)
             },
             1,
         ),
