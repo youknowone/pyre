@@ -2224,11 +2224,21 @@ mod tests {
             "enumeration is bounded by the per-kind slots plus MemoryError"
         );
 
-        // Enumerating must not initialize a slot: a second pass reports the
-        // same set, and every reported pointer is a real exception object.
+        // Enumerating must not initialize a slot: a second pass still reports
+        // every singleton the first one did, stays within the bound, and hands
+        // back real exception objects.  The slots are process-global and the
+        // test binary runs its cases concurrently, so a sibling case creating
+        // another kind in between makes the second set a superset — comparing
+        // the two for equality would fail on that alone.
         let mut again = Vec::new();
         for_each_immortal_exception_singleton(|exc| again.push(exc as usize));
-        assert_eq!(seen, again, "enumeration must not create singletons");
+        for raw in &seen {
+            assert!(again.contains(raw), "enumeration must not drop a singleton");
+        }
+        assert!(
+            again.len() <= EXC_KIND_COUNT + 1,
+            "enumeration is bounded by the per-kind slots plus MemoryError"
+        );
         for &raw in &again {
             assert!(unsafe { is_exception(raw as PyObjectRef) });
         }
