@@ -725,6 +725,17 @@ pub(crate) fn reseed_vstack_from_shadow<Sym: WalkSym>(
     // portal never wrote through) fails the whole re-seed so the caller
     // leaves the slot NONE; `stack_sync` then omits it (resume
     // re-materializes).
+    //
+    // A NULL const-ptr is rejected because it cannot be told apart from a slot
+    // the portal never wrote — EXCEPT where the slot carries the live-NULL
+    // marker, which says the last executed store into it wrote a NULL on
+    // purpose.  That is PUSH_NULL's `self_or_null` sentinel: it stays live
+    // across the whole callable/args/kwargs build ahead of a CALL, and the
+    // reorder region reseeds the mirror from the shadow in the middle of that
+    // build.  Rejecting it left slot NONE, `capture_vstack_mirror_image`
+    // refuses an image with any unresolved slot, and an escape inside the call
+    // then had no blackhole image at all and fell back to the legacy entry
+    // replay — which re-runs the residuals the walk already executed.
     if ctx.vstack_boxes.len() < new_depth {
         ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
     }
@@ -733,8 +744,13 @@ pub(crate) fn reseed_vstack_from_shadow<Sym: WalkSym>(
         if ctx.vstack_boxes[s] != OpRef::NONE {
             continue;
         }
-        match ctx.trace_ctx.virtualizable_box_at(nvs + nlocals + s) {
-            Some(b) if b != OpRef::NONE && !opref_is_null_const_ptr(b) => {
+        let flat = nvs + nlocals + s;
+        match ctx.trace_ctx.virtualizable_box_at(flat) {
+            Some(b)
+                if b != OpRef::NONE
+                    && (!opref_is_null_const_ptr(b)
+                        || ctx.trace_ctx.virtualizable_slot_stored_live_null(flat)) =>
+            {
                 ctx.vstack_boxes[s] = b;
             }
             // Fill what we can; an unsourceable hole (NONE / NULL const-ptr —

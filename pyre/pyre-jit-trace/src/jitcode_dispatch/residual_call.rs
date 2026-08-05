@@ -277,9 +277,12 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
             }
             other => {
                 latchdbg!(
-                    "origin={origin} mirror-slot {}/{} unresolved opref={opref:?} concrete={other:?}",
+                    "origin={origin} mirror-slot {}/{} unresolved opref={opref:?} \
+                     concrete={other:?} pypc={} boxes={:?}",
                     slots.len(),
                     ctx.vstack_boxes.len(),
+                    ctx.vstack_cur_pypc,
+                    ctx.vstack_boxes,
                 );
                 return None;
             }
@@ -4746,6 +4749,17 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // Without it the abort lands in the `Generic` catch-all and the
         // `abort: force quasi-immut` counter stays at 0.
         crate::state::note_force_quasi_immut_abort();
+        // Stamp the abort coordinate at the raise point, the way the two
+        // kept-stack branch-guard raises do, so the flush gate cannot observe
+        // an UNRELATED prior abort.  `abort_in_subwalk` is sticky for the whole
+        // trace attempt (`claim_abort_coordinate` only ever sets it), so an
+        // earlier inline sub-walk abort the walk RECOVERED from — the attempt
+        // discarded, the call residualized, the walk continued — leaves it true
+        // for every later abort.  `flush_qmut_abort_state`'s gate then declines
+        // a root-frame qmut abort as though its pc named a callee jitcode, and
+        // the legacy replay re-runs the region on top of the residuals the walk
+        // already executed.
+        ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
@@ -5870,19 +5884,21 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // `GUARD_NOT_INVALIDATED`, so a rebind or a delete fails the loop instead of
     // reaching a NameError, and a successful fold provably cannot raise.
     //
-    // The gate is load-bearing because the fold INSTALLS the module dict's
-    // `version?` watcher, and that watcher is what makes a later bumping write
-    // in the same program abandon the walk with `ForceQuasiImmutable`.  That
-    // abort resumes mid-expression off a latched operand mirror, and when one
-    // latched slot is unbound the flush declines to the legacy replay, which
-    // then REFUSES to re-deliver an in-flight FOR_ITER item once a body effect
-    // has committed — the iteration is dropped and its accumulator increment is
-    // silently lost.  Lifting the gate to `DELETE_NAME`/`DELETE_GLOBAL` only
-    // (the implicit `del e` an `except X as e:` emits) reaches exactly that:
-    // `bench/synth/pickle_terminal_raise_resume` then prints 214 under the JIT
-    // against 216 interpreted, off one dropped iteration.  Both halves of that
-    // chain — the unbound mirror slot and the silent drop the decline falls
-    // back to — have to be closed before the handler shape stops standing in.
+    // The gate stands on compile behaviour, not on correctness.  The fold
+    // INSTALLS the module dict's `version?` watcher, and that watcher is what
+    // makes a later bumping write in the same program abandon the walk with
+    // `ForceQuasiImmutable` — so lifting the gate multiplies those aborts in
+    // handler-bearing module bodies.  The three wrong-code shapes that used to
+    // ride on that (a dropped FOR_ITER iteration in
+    // `pickle_terminal_raise_resume`, and the two double-applies in
+    // `iter57/real_exception` and `exception_reentry_guard_finally_residual`)
+    // are closed: the first no longer reproduces, and the other two were the
+    // stale `abort_in_subwalk` this file now stamps at its own qmut raise plus
+    // the live-NULL mirror slot `reseed_vstack_from_shadow` now accepts.  With
+    // the gate lifted the whole `bench/synth` corpus is output-correct; what
+    // still fails is `exception_reraise_tb_depth_jitstress` at 13.0x against
+    // its 4x pypy gate, and four benches' jit-stats move (most visibly
+    // `exception_reraise_tb_depth_hot`, `loops_aborted 0 -> 63`).
     //
     // The scan is whole-body, so one `try` anywhere in a module also charges
     // every name access in it a live dict lookup (~83ns each, linear in the
