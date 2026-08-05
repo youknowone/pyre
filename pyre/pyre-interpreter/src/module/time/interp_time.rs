@@ -1355,26 +1355,28 @@ pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `app_time.py:26-34 strptime` — parse `string` per `format`, delegating to
-/// the shared `_strptime` module.  A non-descriptor when stored on a class.
+/// the shared `_strptime` module.  A non-descriptor when stored on a class,
+/// and positional-only: the `app_time.py` definition binds its parameters by
+/// keyword, but the demoted module builtin takes none (`METH_VARARGS`).
 pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `strptime(string[, format])` is positional-only (`PyArg_ParseTuple "s|s"`).
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if kwargs.is_some() {
+    if crate::builtins::has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
             "strptime() takes no keyword arguments",
         ));
     }
-    let Some(&string) = positional.first() else {
+    if positional.is_empty() {
         return Err(crate::PyError::type_error(
-            "strptime() takes at least 1 argument (0 given)",
+            "strptime() missing 1 required positional argument: 'string'",
         ));
-    };
+    }
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
-            "strptime() takes at most 2 arguments ({} given)",
+            "strptime() takes from 1 to 2 positional arguments but {} were given",
             positional.len()
         )));
     }
+    let string = positional[0];
     let format = positional
         .get(1)
         .copied()
@@ -1407,13 +1409,26 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `app_time.py:36-44 get_clock_info` — a `types.SimpleNamespace` filled by
-/// `_get_time_info`.  A non-descriptor when stored on a class.
+/// `_get_time_info`.  A non-descriptor when stored on a class, and
+/// positional-only: the `app_time.py` definition binds `name` by keyword, but
+/// the demoted module builtin takes none (`METH_VARARGS`).
 pub fn get_clock_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // Registered `/ 1`: the framework enforced exactly one positional arg and
-    // rejected keywords before this body runs.
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "get_clock_info() takes no keyword arguments",
+        ));
+    }
+    if positional.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "get_clock_info() takes exactly 1 argument ({} given)",
+            positional.len()
+        )));
+    }
+    let name = positional[0];
     let _roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
+    pyre_object::gc_roots::pin_root(name);
     let info = crate::module::sys::vm::new_simple_namespace_instance();
     let info_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(info);

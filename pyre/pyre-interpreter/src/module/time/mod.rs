@@ -38,8 +38,11 @@ crate::py_module! {
         "mktime"       / 1 = t::mktime,
         "asctime"      / * = t::asctime,
         "ctime"        / * = t::ctime,
+        // `strptime`/`get_clock_info` are `app_time.py` app-level functions,
+        // demoted here to non-binding module builtins: stored on a class they
+        // do not bind, and they take positional arguments only.
         "strptime"     / * = t::strptime,
-        "get_clock_info" / 1 = t::get_clock_info,
+        "get_clock_info" / * = t::get_clock_info,
     },
     extra_init: |ns| {
         // POSIX clock identifiers + clock_gettime / clock_getres
