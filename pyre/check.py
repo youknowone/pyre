@@ -1741,6 +1741,22 @@ class Check:
         def failed_bound(measured, baseline_value):
             exec_measured = self._exec_time(backend, measured)
             exec_baseline = self._exec_time(baseline_key, baseline_value)
+            # A perf ratio is dominated by timer resolution only when BOTH
+            # sides are: a baseline pinned to EXEC_TIME_FLOOR_S by startup
+            # subtraction over-estimates its real (sub-floor) work, so the
+            # reported ratio measured/floor is a LOWER bound on the true ratio.
+            # Exempting on a clamped baseline alone would therefore hide a
+            # provable slowdown -- if measured/floor already clears the gate,
+            # the true ratio clears it by even more. Require the backend to be
+            # at the floor too, so the exemption fires only when neither side
+            # has measurable work; a backend above the floor is a real
+            # measurement the gate still applies to (this is the actual-clamping
+            # test the 100ms absolute threshold failed to be).
+            if (
+                self._baseline_exec_time_clamped(baseline_key, baseline_value)
+                and exec_measured <= EXEC_TIME_FLOOR_S
+            ):
+                return None
             if exec_measured > exec_baseline * limit + compare_buffer:
                 return "ceiling"
             if (
