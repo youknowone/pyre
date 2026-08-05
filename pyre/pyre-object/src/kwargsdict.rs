@@ -15,7 +15,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::dictmultiobject::{DictStrategy, OBJECT_DICT_STRATEGY};
+use crate::dictmultiobject::DictStrategy;
 use crate::pyobject::PyObjectRef;
 
 /// `kwargsdict.py:25-178 KwargsDictStrategy`.
@@ -52,6 +52,13 @@ pub struct KwargsDictStrategy;
 /// `pypy/objspace/std/kwargsdict.py:25 KwargsDictStrategy`
 /// singleton — matches PyPy's `space.fromcache(KwargsDictStrategy)`.
 pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
+
+/// The [`crate::dictmultiobject::DictStrategyRef`] holder a dict's `dstrategy`
+/// slot points at.
+pub static KWARGS_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
+    crate::dictmultiobject::DictStrategyRef {
+        imp: &KWARGS_DICT_STRATEGY,
+    };
 
 /// `KwargsDictStrategy` backing — erased `([], [])` parallel arrays
 /// (`kwargsdict.py:27-29`). GC-managed storage box (mirrors the other
@@ -101,7 +108,7 @@ pub unsafe fn w_dict_switch_kwargs_to_object_strategy(w_dict: PyObjectRef) {
         new_map,
         crate::dictmultiobject::object_dict_storage_gc_type_id(),
     ) as *mut u8;
-    dict.dstrategy = &OBJECT_DICT_STRATEGY;
+    dict.dstrategy = &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF;
 }
 
 /// `kwargsdict.py:62` size threshold past which the strategy
@@ -150,7 +157,7 @@ impl KwargsDictStrategy {
         let keys_w = std::mem::take(&mut old.0);
         let values_w = std::mem::take(&mut old.1);
         dict.dstorage = crate::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY;
+        dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
         for (k, v) in keys_w.into_iter().zip(values_w.into_iter()) {
             crate::dictmultiobject::w_dict_store(w_dict, k, v);
         }
@@ -307,6 +314,6 @@ impl DictStrategy for KwargsDictStrategy {
             storage.clone(),
             kwargs_dict_storage_gc_type_id(),
         );
-        crate::dictmultiobject::w_dict_new_with(&KWARGS_DICT_STRATEGY, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_new_with(&KWARGS_DICT_STRATEGY_REF, new_storage as *mut u8)
     }
 }
