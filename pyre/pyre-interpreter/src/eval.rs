@@ -794,6 +794,33 @@ unsafe fn forward_virtual_ref_forced(
     }
 }
 
+/// Visit one `locals_cells_stack_w` slot as a GC root.
+///
+/// A slot holding a `JitVirtualRef` must skip the PyObject-shaped raw walks:
+/// its leading word is the vtable magic rather than an `ob_type`.
+unsafe fn walk_frame_value_slot(
+    slot_ptr: *mut majit_ir::GcRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    // SAFETY: `slot_ptr` points to live `GcRef` storage whose allocation
+    // outlives this walk. The visitor reads, conditionally forwards, and
+    // stores back a `GcRef` (same layout as `*mut PyObject`).
+    visitor(unsafe { &mut *slot_ptr });
+    // A caught exception bound to a local (`except X as e`) is
+    // `malloc_typed`-immortal, so the visitor above is a no-op
+    // for it and its GC-managed children (`args_w`, `w_errno`,
+    // …) are never traced. Forward them in place. Read the slot
+    // AFTER the visitor so a relocated value is the live one.
+    unsafe {
+        let value = (*slot_ptr).0 as PyObjectRef;
+        if forward_virtual_ref_forced(value as *mut u8, visitor) {
+            return;
+        }
+        walk_raw_exception_roots(value, visitor);
+        walk_raw_immortal_roots(value, visitor);
+    }
+}
+
 /// How much of `locals_cells_stack_w` is reachable state.
 ///
 /// `valuestackdepth` is an absolute index that starts at `stack_base()`
@@ -1100,25 +1127,7 @@ pub unsafe fn walk_pyframe_roots_area(
             if !arr_ptr.is_null() && depth > 0 {
                 for i in 0..depth {
                     let slot_ptr = unsafe { arr_ptr.add(i) } as *mut majit_ir::GcRef;
-                    // SAFETY: slot lies inside the FixedObjectArray's
-                    // heap allocation, which outlives the frame. The
-                    // visitor reads, conditionally forwards, and
-                    // stores back a `GcRef` (same layout as
-                    // `*mut PyObject`).
-                    visitor(unsafe { &mut *slot_ptr });
-                    // A caught exception bound to a local (`except X as e`) is
-                    // `malloc_typed`-immortal, so the visitor above is a no-op
-                    // for it and its GC-managed children (`args_w`, `w_errno`,
-                    // …) are never traced. Forward them in place. Read the slot
-                    // AFTER the visitor so a relocated value is the live one.
-                    unsafe {
-                        let value = (*slot_ptr).0 as PyObjectRef;
-                        if forward_virtual_ref_forced(value as *mut u8, visitor) {
-                            continue;
-                        }
-                        walk_raw_exception_roots(value, visitor);
-                        walk_raw_immortal_roots(value, visitor);
-                    }
+                    unsafe { walk_frame_value_slot(slot_ptr, visitor) };
                 }
             }
             frame = next_frame;
@@ -4957,6 +4966,34 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let result = frame.execute_frame(None, None);
         (result, frame)
+    }
+
+    // A frame value slot may hold a `JitVirtualRef`, whose leading magic word
+    // would be read as a type pointer by the PyObject-shaped raw walks. Keep
+    // the virtual-ref branch returning after it visits the `forced` field.
+    #[test]
+    fn test_frame_value_slot_holding_a_virtual_ref_skips_the_pyobject_walks() {
+        use majit_metainterp::virtualref::{JIT_VIRTUAL_REF_VTABLE, JitVirtualRef, ObjectHeader};
+
+        let mut vref = JitVirtualRef {
+            super_: ObjectHeader {
+                typeptr: JIT_VIRTUAL_REF_VTABLE,
+            },
+            virtual_token: std::ptr::null_mut(),
+            forced: 0x1000usize as *mut u8,
+        };
+        let mut slot = majit_ir::GcRef(&mut vref as *mut JitVirtualRef as usize);
+        let slot_address = &mut slot as *mut majit_ir::GcRef as usize;
+        let forced_address = std::ptr::addr_of_mut!(vref.forced) as usize;
+        let mut visited = Vec::new();
+
+        unsafe {
+            walk_frame_value_slot(&mut slot, &mut |root| {
+                visited.push(root as *mut majit_ir::GcRef as usize);
+            });
+        }
+
+        assert_eq!(visited, vec![slot_address, forced_address]);
     }
 
     #[test]
