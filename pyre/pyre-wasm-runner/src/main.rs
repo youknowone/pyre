@@ -163,31 +163,39 @@ fn main() {
     let mut inspect = false;
     let mut engine: Option<WasmEngine> = None;
 
-    let mut argv = std::env::args().skip(1);
+    // `args_os`, not `args`: the latter unwraps the UTF-8 conversion, so a
+    // script path spelling a byte with no UTF-8 form aborts the runner before
+    // it can name the file. Every flag below is ASCII by construction, so a
+    // value that does not convert is never one and takes the positional arm.
+    let mut argv = std::env::args_os().skip(1);
     while let Some(arg) = argv.next() {
-        match arg.as_str() {
-            "--inspect" => inspect = true,
-            "--module" => {
+        let flag = arg.to_str().map(str::to_owned);
+        match flag.as_deref() {
+            Some("--inspect") => inspect = true,
+            Some("--module") => {
                 module_path = Some(PathBuf::from(
                     argv.next()
                         .unwrap_or_else(|| fatal("--module needs a path")),
                 ))
             }
-            "--engine" => {
+            Some("--engine") => {
                 let v = argv
                     .next()
                     .unwrap_or_else(|| fatal("--engine needs a value"));
-                engine = Some(WasmEngine::parse(&v).unwrap_or_else(|e| fatal(&e)));
+                let v = v
+                    .to_str()
+                    .unwrap_or_else(|| fatal("--engine needs a value"));
+                engine = Some(WasmEngine::parse(v).unwrap_or_else(|e| fatal(&e)));
             }
-            "-h" | "--help" => {
+            Some("-h") | Some("--help") => {
                 eprintln!(
                     "usage: pyre-wasm-runner [--module <pyre_wasm.wasm>] \
                      [--engine wasmtime|wasmi] [--inspect] <script.py>"
                 );
                 std::process::exit(2);
             }
-            other if other.starts_with('-') => fatal(&format!("unknown flag {other}")),
-            other => script = Some(PathBuf::from(other)),
+            Some(other) if other.starts_with('-') => fatal(&format!("unknown flag {other}")),
+            _ => script = Some(PathBuf::from(arg)),
         }
     }
 

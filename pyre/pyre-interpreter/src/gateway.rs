@@ -1551,6 +1551,30 @@ pub fn fsdecode_filename_wtf8(data: &[u8]) -> rustpython_wtf8::Wtf8Buf {
     crate::typedef::charp2uni_wtf8(data)
 }
 
+/// The application-level spelling of a string the host handed us, for a caller
+/// holding an `OsString` rather than the bytes behind it — a command-line
+/// argument, where `targetpypystandalone.py:76-80` builds `sys.argv` out of
+/// `space.newfilename` for exactly this reason.
+///
+/// The two arms are the host's two spellings, not a portability shim. Where the
+/// argument is bytes it takes the filesystem decode, so a byte with no UTF-8
+/// form comes back as the surrogate escape that re-encodes to itself. Where it
+/// is UTF-16 the host already has the code units, and `from_wide` carries them
+/// across losslessly; routing those through the byte decode instead would turn
+/// an unpaired surrogate into three escapes and stop it round-tripping.
+pub fn fsdecode_os_str(name: &std::ffi::OsStr) -> pyre_object::PyObjectRef {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let units: Vec<u16> = name.encode_wide().collect();
+        pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(&units))
+    }
+    #[cfg(not(windows))]
+    {
+        fsdecode_filename_bytes(name.as_encoded_bytes())
+    }
+}
+
 /// `interp_posix.py:194-219 Path`: the syscall spelling and the resolved path
 /// object travel together. For `os.PathLike`, `w_path` is the result of the
 /// single `__fspath__` call, not the wrapper that supplied it.

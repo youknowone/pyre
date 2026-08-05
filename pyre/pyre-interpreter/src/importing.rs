@@ -1710,12 +1710,20 @@ pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyOb
 /// Set the Python-visible sys.modules dict reference. Called during sys
 /// module initialization so subsequent set_sys_module calls keep it in sync.
 /// Also copies all previously cached modules into the dict.
-/// Set sys.argv from a list of strings.
+/// Set sys.argv from the arguments the host gave the process.
 /// Must be called after the first `import sys` has run (e.g. after
 /// `run_source` compiles the module-level code).
-pub fn set_sys_argv(args: &[String]) {
-    let items: Vec<pyre_object::PyObjectRef> =
-        args.iter().map(|s| pyre_object::w_str_new(s)).collect();
+///
+/// `targetpypystandalone.py:76-80` builds the list with `space.newfilename`,
+/// which is `fsdecode(newbytes(s))`, so an argument the filesystem encoding
+/// cannot spell arrives as the surrogate escape rather than being rejected or
+/// replaced. The arguments stay in the host's own spelling until here for that
+/// reason: a Rust `String` cannot hold the escape.
+pub fn set_sys_argv(args: &[std::ffi::OsString]) {
+    let items: Vec<pyre_object::PyObjectRef> = args
+        .iter()
+        .map(|s| crate::gateway::fsdecode_os_str(s))
+        .collect();
     let argv = pyre_object::w_list_new(items);
     SYS_ARGV_PENDING.with(|p| p.set(argv));
 }
@@ -1748,7 +1756,8 @@ static SYS_UNBUFFERED: AtomicBool = AtomicBool::new(false);
 // dict.  Preserve that owner/storage shape rather than introducing a map here.
 static SYS_XOPTIONS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static SYS_WARNOPTIONS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-static SYS_ORIG_ARGV: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static SYS_ORIG_ARGV: LazyLock<Mutex<Vec<std::ffi::OsString>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 static SYS_STDIO_ENCODING: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
@@ -1806,11 +1815,15 @@ pub fn stdio_encoding() -> Option<String> {
     SYS_STDIO_ENCODING.lock().unwrap().clone()
 }
 
-pub fn set_sys_orig_argv(argv: Vec<String>) {
+/// `app_main.py:1239 sys.orig_argv[:] = [executable] + argv`: the launcher's
+/// own arguments, before parsing rewrote them into the run mode and `sys.argv`.
+/// Held in the host's spelling for the same reason `set_sys_argv` takes it —
+/// an argument with no UTF-8 form has to survive to the decode.
+pub fn set_sys_orig_argv(argv: Vec<std::ffi::OsString>) {
     *SYS_ORIG_ARGV.lock().unwrap() = argv;
 }
 
-pub fn sys_orig_argv() -> Vec<String> {
+pub fn sys_orig_argv() -> Vec<std::ffi::OsString> {
     SYS_ORIG_ARGV.lock().unwrap().clone()
 }
 

@@ -1022,7 +1022,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         w_list_new(
             crate::importing::sys_orig_argv()
                 .iter()
-                .map(|arg| w_str_new(arg))
+                .map(|arg| crate::gateway::fsdecode_os_str(arg))
                 .collect(),
         ),
     );
