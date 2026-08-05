@@ -1397,6 +1397,29 @@ fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
         && unsafe { (*raw).kwonlyarg_count } == 0
 }
 
+/// The scope slot `_match_signature` writes the vararg tuple into
+/// (`argument.py:222-234`): `co_argcount + co_kwonlyargcount`.  This helper
+/// admits only the shape whose slot is exactly `co_argcount`, leaving
+/// `**kwargs` and keyword-only locals residual.
+fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let flags = unsafe { (*raw).flags };
+    if flags.contains(pyre_interpreter::CodeFlags::VARARGS)
+        && !flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
+        && unsafe { (*raw).kwonlyarg_count } == 0
+    {
+        Some(unsafe { (*raw).arg_count as usize })
+    } else {
+        None
+    }
+}
+
 unsafe fn fbw_reorder_call_kw_args(
     r_args: &[OpRef],
     arg_concretes: &[ConcreteValue],
@@ -2603,12 +2626,13 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     constructor_result: Option<(OpRef, ConcreteValue)>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // `_compute_flatcall` (`pycode.py:256-268`) leaves `fast_natural_arity`
-    // HOPELESS for a `*args` / `**kwargs` / keyword-only callee, so
-    // `funccall_valuestack` is never entered for one.  Same boundary here: the
-    // seeding fills `locals[0..nparams]` and `co_argcount` counts none of the
-    // three, so a callee owning a local the arity check cannot see must stay
-    // residual.
-    if !fbw_callee_scope_is_positional_only(w_code) {
+    // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
+    // `funcrun` path still traces through `_match_signature`, which writes a
+    // surplus tuple for `*args` (`argument.py:222-234`); seed that one extra
+    // local here while keeping `**kwargs` and keyword-only locals residual.
+    let positional_only = fbw_callee_scope_is_positional_only(w_code);
+    let vararg_slot = fbw_callee_vararg_slot(w_code);
+    if !positional_only && vararg_slot.is_none() {
         return Ok(None);
     }
     // `Function.funccall_valuestack` fills every parameter the call left
@@ -2642,6 +2666,53 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
         Some(defaults)
     };
+    // The surplus positional arguments `_match_signature` packs into the
+    // vararg.  Collected here and emitted alongside the defaults below, so
+    // every remaining eligibility check still declines without having recorded
+    // the tuple build; the placeholder box mirrors how a default is carried.
+    let vararg_surplus = if vararg_slot.is_some() {
+        // `_match_signature` (`argument.py:194-201`) prepends a receiver to
+        // `args_w` — and so to the vararg tuple — when the callee has no
+        // positional parameter to hold it.  A bound method reaches here with
+        // `callee_args[0]` still the placeholder the resolved half replaces
+        // with `GetfieldGcR(Method.w_self)`, which is emitted after the split
+        // below; folding the placeholder into the tuple would put the Method
+        // object where the receiver belongs.  Decline that one shape.
+        if bound_method.is_some() && nparams == 0 {
+            return Ok(None);
+        }
+        if callee_arg_concretes.len() != callee_args.len() || callee_args.len() <= nparams {
+            // The empty tuple is a runtime singleton (`() is tuple([])`), so a
+            // freshly allocated walker tuple would not be the object the
+            // interpreter installs for a zero-surplus call.
+            return Ok(None);
+        }
+        let surplus_ops: Vec<OpRef> = callee_args[nparams..].to_vec();
+        let mut surplus_concretes = Vec::with_capacity(surplus_ops.len());
+        for concrete in &callee_arg_concretes[nparams..] {
+            let ConcreteValue::Ref(obj) = *concrete else {
+                return Ok(None);
+            };
+            if obj.is_null() {
+                return Ok(None);
+            }
+            surplus_concretes.push(obj);
+        }
+        // A new allocation with no heap mutation, safe during the walk, and the
+        // same constructor `emit_object_tuple_inline` reproduces.
+        let concrete = pyre_object::w_tuple_new_array_backed(surplus_concretes);
+        if concrete.is_null() {
+            return Ok(None);
+        }
+        callee_args.truncate(nparams);
+        callee_arg_concretes.truncate(nparams);
+        callee_args.push(OpRef::NONE);
+        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
+        Some((surplus_ops, concrete))
+    } else {
+        None
+    };
+    let seeded_locals = nparams + usize::from(vararg_slot.is_some());
     // Does any incoming binding land a value the callee's register banks can
     // hold unboxed?  Only the `is`-against-None scan below consults this; see
     // its hazard-2 arm for why an int-specialized tested local is unsafe to
@@ -2666,7 +2737,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // PyFrame::finish_for_call_with_globals_obj does. A callee with cellvars
     // needs fresh cell allocation and stays residual until that constructor
     // half is ported too.
-    if callee_args.len() != nparams {
+    if callee_args.len() != seeded_locals {
         return Ok(None);
     }
     let raw_callee_code = unsafe {
@@ -3516,6 +3587,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
     }
 
+    // `scope_w[co_argcount + co_kwonlyargcount] = space.newtuple(starargs_w)`
+    // (`argument.py:233-234`), replacing the placeholder pushed above.
+    if let Some((surplus_ops, concrete)) = vararg_surplus {
+        let tuple_op = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &surplus_ops);
+        ctx.trace_ctx.set_opref_concrete(
+            tuple_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+        );
+        callee_args[nparams] = tuple_op;
+    }
+
     let (
         mut callee_regs_r,
         mut callee_regs_i,
@@ -3530,7 +3612,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // body reads param i from is its per-PC pcdep color at the callee entry
     // (`pcdep_color_slots[0]`), not `r{i}`; an empty fixture map is identity.
     let entry_colors = crate::state::sub_jitcode_entry_param_colors(w_code);
-    for i in 0..nparams {
+    for i in 0..seeded_locals {
         // RPython passes the same RefFrontendOp into the callee MIFrame, so
         // the Box keeps its recording-time pointer across the frame boundary.
         // Pyre also carries a register-local concrete shadow; mirror that
@@ -3804,7 +3886,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
 
             let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
             let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
-            let param_boxes: Vec<OpRef> = (0..nparams).map(|i| callee_args[i]).collect();
+            let param_boxes: Vec<OpRef> = (0..seeded_locals).map(|i| callee_args[i]).collect();
             let freevar_cells: Vec<OpRef> = concrete_freevar_cells
                 .iter()
                 .map(|&cell| ctx.trace_ctx.const_ref(cell as i64))
@@ -4254,7 +4336,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // keep folding: publishing only the callee frame is unsound.
                 shadow.frame_materialized = callee_frame_materialized_has_resume;
             }
-            for i in 0..nparams {
+            for i in 0..seeded_locals {
                 let slot = i as i64;
                 let value = callee_args[i];
                 let concrete = sub_wc

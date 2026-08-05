@@ -6,4 +6,4 @@ fbw_rolled_back_with_effects=0
 guard_failures=1
 internal_compile_panics=0
 loops_aborted=0
-loops_compiled=2
+loops_compiled=1

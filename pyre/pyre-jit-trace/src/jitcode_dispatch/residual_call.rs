@@ -4868,29 +4868,28 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // #195 / #73: virtualize an arity-2 plain-int BUILD_TUPLE
-    // (`newtuple_from_array`) as a `spec_ii` `new_with_vtable` +
-    // `value0` / `value1`, so the backing array build and the partner
-    // UNPACK_SEQUENCE reads DCE to a pure-int loop.  Falls through to the
-    // opaque residual for any other shape (SAFE — never declined).
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::NewtupleFromArray
-        && try_walker_specialize_newtuple(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // The arities `makespecialisedtuple2` does not claim take the canonical
-    // array-backed `W_TupleObject` shape instead, so a non-escaping BUILD_TUPLE
-    // of any width folds away rather than allocating through the opaque
-    // residual.  Reached only after the `spec_ii` fold above declines; falls
-    // through to the residual for any shape it cannot reproduce (SAFE — never
-    // declined).
+    // #171: virtualize a BUILD_TUPLE (`newtuple_from_array`) of any width as
+    // the canonical array-backed `W_TupleObject` shape, so a non-escaping tuple
+    // folds away rather than allocating through the opaque residual, and every
+    // consumer fold that reads `wrappeditems` applies to it.  Falls through to
+    // the residual for any shape it cannot reproduce (SAFE — never declined).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::NewtupleFromArray
         && try_walker_specialize_newtuple_object(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // #195 / #73: the arity-2 plain-int `spec_ii` shape (`new_with_vtable` +
+    // `value0` / `value1`) as the fallback for a pair the canonical fold above
+    // could not reproduce — it needs a const backing-array length, which the
+    // element probing here does not.  Falls through to the opaque residual for
+    // any other shape (SAFE — never declined).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::NewtupleFromArray
+        && try_walker_specialize_newtuple(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }

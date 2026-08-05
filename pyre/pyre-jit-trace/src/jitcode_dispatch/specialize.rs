@@ -3898,11 +3898,10 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// FBW virtualization of the array-backed BUILD_TUPLE — the arities
-/// `makespecialisedtuple2` does not claim.  Sibling of
-/// [`try_walker_specialize_newtuple`] (arity-2 plain-int `spec_ii`) and
-/// [`try_walker_specialize_newlist`], reached only after the `spec_ii` fold
-/// declines, so that path stays byte-identical.
+/// FBW virtualization of the array-backed BUILD_TUPLE, at every arity.
+/// Sibling of [`try_walker_specialize_newlist`] and
+/// [`try_walker_specialize_newtuple`], which now only picks up the arity-2
+/// plain-int shapes this one declines.
 ///
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear` +
 /// per-index `setarrayitem_gc` + a `newtuple_from_array` residual.  Re-emit the
@@ -3913,12 +3912,19 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 /// and one that does escape materializes from the same fields the residual
 /// would have written.
 ///
-/// Arity 2 is `makespecialisedtuple2` territory (`Cls_ii` / `Cls_ff` /
-/// `Cls_oo`, `specialisedtupleobject.py`): the runtime never builds an
-/// array-backed tuple there, so emitting one would diverge from what the
-/// blackhole rebuilds on deopt.  Declined here — the `spec_ii` fold owns the
-/// int-int case and the residual owns the rest.  The empty tuple is declined
-/// too (no element to recover a length from).
+/// Arity 2 is `makespecialisedtuple2` territory at runtime (`Cls_ii` /
+/// `Cls_ff` / `Cls_oo`, `specialisedtupleobject.py`), and this arm builds the
+/// canonical shape there instead.  Representation is not observable — the
+/// polymorphic readers dispatch on `ob_type` and `w_class` is `tuple` either
+/// way — and the trace stays self-consistent because the concrete shadow, the
+/// emitted virtual, and therefore the object a deopt rebuilds are all the one
+/// shape.  What it buys is every consumer: `wrappeditems` is the form
+/// [`try_walker_specialize_subscr_tuple`], [`try_walker_specialize_builtin_len`],
+/// [`try_walker_specialize_get_iter`] and the array-backed arm of
+/// [`try_walker_specialize_unpack`] already read, whereas a specialised pair
+/// has an unpack fold and nothing else, so every other read of one forces it
+/// out of virtual state.  The empty tuple is declined (no element to recover a
+/// length from).
 ///
 /// Returns `Ok(Some(()))` when folded; `Ok(None)` falls through to the opaque
 /// residual, which stays correct for any shape — a non-const array length or
@@ -3949,9 +3955,6 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
             _ => return Ok(None),
         }
     };
-    if len == 2 {
-        return Ok(None);
-    }
 
     // Element boxes the BUILD_TUPLE `setarrayitem_gc` ops stored; a cache miss
     // (clobbered array / non-const index) bails to the opaque residual.
@@ -3974,8 +3977,9 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
         concretes.push(obj);
     }
 
-    // Concrete shadow: a fresh array-backed tuple from the element shadows
-    // (`w_tuple_new` parity for every arity but 2). A new allocation with no
+    // Concrete shadow: a fresh array-backed tuple from the element shadows,
+    // built by the same constructor the emit reproduces so the walk's own value
+    // and the traced object agree at every arity.  A new allocation with no
     // heap mutation, safe during the walk like `wrapint`.  Built before the
     // emit so a failure leaves no orphan ops in the trace.
     let result_concrete = pyre_object::w_tuple_new_array_backed(concretes);
@@ -4003,6 +4007,12 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
 /// build keeps no consumer and DCEs.  The partner
 /// [`try_walker_specialize_unpack`] then folds the `value0` / `value1`
 /// reads off the virtual tuple, collapsing build→unpack to a pure-int loop.
+///
+/// Runs only after [`try_walker_specialize_newtuple_object`] declines, which it
+/// does for a pair whose backing-array length never reached the heap-cache as a
+/// constant; the element probing below recovers the arity without it.  UNPACK
+/// is the one consumer that folds off this shape, so the canonical arm is the
+/// preferred one wherever it applies.
 ///
 /// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
 /// `Ok(None)` to fall through to the opaque residual, which stays correct
