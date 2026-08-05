@@ -33,14 +33,30 @@ pub fn force_frame(frame: *mut PyFrame) {
 
 /// Force a frame whose fastlocals application code is about to read.
 ///
-/// RPython needs no such call: storing the frame pointer anywhere the JIT
-/// cannot see forces the virtualizable by escape analysis, so
-/// `pyframe.py:539 fast2locals` always finds a materialized
-/// `locals_cells_stack_w`.  Pyre forces through explicit hooks instead, and
-/// [`PyExecutionContext::gettopframe_nohidden`] only covers the frames IT
-/// walks — a frame handed out some other way (a traceback's `tb_frame`)
-/// reaches `fast2locals` unforced, whose null slots render as an EMPTY
-/// mapping rather than a stale one.
+/// RPython needs no such call because the force is injected for it, not
+/// because none happens: `rvirtualizable.py:49-53 hook_access_field` genops
+/// `jit_force_virtualizable` on every redirected FIELD access,
+/// `virtualizable.py:288-292` rewrites those into a
+/// `force_virtualizable_if_necessary` call across `translator.graphs`, and
+/// `jtransform.py:2164-2172 rewrite_op_jit_force_virtualizable` drops it again
+/// only in the graphs the codewriter looks inside.  So `pyframe.py:539
+/// fast2locals` always finds a materialized `locals_cells_stack_w` with no
+/// hand-placed hook anywhere.
+///
+/// Pyre's rtyper declines to build a virtualizable `InstanceRepr` at all
+/// (`rclass.rs buildinstancerepr`, blocked on `FieldListAccessor` /
+/// `_parse_field_list` parity), so that injection does not exist here and
+/// explicit calls like this one stand in for it — load-bearing, not redundant.
+/// Deleting them was measured: `f_lineno` starts reporting the `def` line,
+/// `f_locals` grows an entry, and the two read together segfault, with the
+/// whole synthetic corpus green throughout.
+///
+/// [`PyExecutionContext::gettopframe_nohidden`] does not substitute.  It forces
+/// the VREF of the frame it starts from and then walks `f_backref` unforced, so
+/// it materializes the top frame only — enough for `locals()`, which reports on
+/// that frame, and nothing for a frame handed out some other way (a traceback's
+/// `tb_frame`), which reaches `fast2locals` unforced; its null slots render as
+/// an EMPTY mapping rather than a stale one.
 ///
 /// # Safety
 /// `frame` must be a live `PyFrame` (or null).

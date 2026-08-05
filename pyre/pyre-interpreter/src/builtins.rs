@@ -11154,12 +11154,15 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// (`interp_inspect.py:7-11 locals` — `ec.gettopframe_nohidden()`).
 ///
 /// Going through `gettopframe_nohidden` is what makes the frame's fastlocals
-/// readable: it runs `force_frame` on every frame it walks
-/// (`executioncontext.rs:409-421`), and `fast2locals` reads
-/// `locals_cells_stack_w` directly, so an unforced virtualizable hands back an
-/// array of nulls — which `fast2locals` renders as an EMPTY mapping rather
-/// than a stale one.  Reading `CURRENT_FRAME` instead skips that force, and
-/// under the JIT the caller then sees no locals at all.
+/// readable, but the mechanism is the VREF force on its first line, not a
+/// per-frame `force_frame`: the walk itself only follows `f_backref` and tests
+/// `hide()`.  That materializes the top frame and nothing below it, which is
+/// exactly what this consumer needs — `locals()` reports on the top frame.
+/// `getdictscope` reads `locals_cells_stack_w` directly, so an unforced
+/// virtualizable hands back an array of nulls, which `fast2locals` renders as
+/// an EMPTY mapping rather than a stale one.  Reading `CURRENT_FRAME` instead
+/// skips the vref force, and under the JIT the caller then sees no locals at
+/// all.
 fn topframe_for_locals() -> *mut crate::PyFrame {
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if ec.is_null() {

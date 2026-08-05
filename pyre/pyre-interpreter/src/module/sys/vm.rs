@@ -566,10 +566,14 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// (`ExecutionContext::gettopframe_raw`), so `gettopframe_nohidden` is not
 /// "force-free" — it is free of the *virtualizable* force that
 /// `gettopframe` adds. Upstream takes neither of those, because
-/// `look_inside_iff(isconstant(depth))` traces a constant `depth` THROUGH: the
-/// walk never becomes a residual call, and the frame it hands to app level
-/// materialises by escape analysis instead
-/// (`executioncontext::force_frame_before_locals_read` states that contract).
+/// `look_inside_iff(isconstant(depth))` traces a constant `depth` THROUGH, so
+/// the walk never becomes a residual call — and the frame it hands to app level
+/// materialises through the force `rvirtualizable.py:49-53 hook_access_field`
+/// injects at every redirected FIELD access, which
+/// `jtransform.py:2164-2172 rewrite_op_jit_force_virtualizable` deletes only in
+/// the graphs the codewriter looks inside.  Pyre has no such injection —
+/// `rclass.rs buildinstancerepr` declines a virtualizable `InstanceRepr`
+/// outright — so these two calls ARE that mechanism, relocated to one consumer.
 /// Pyre calls this residually, so both forces are load-bearing here:
 /// `gettopframe()` because a JIT-inlined callee has no frame of its own until a
 /// force materialises one — an unforced walk would start at the caller and then

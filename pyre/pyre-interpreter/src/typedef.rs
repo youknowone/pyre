@@ -7211,9 +7211,11 @@ fn init_frame_type(ns: PyObjectRef) {
             // Both arms end at `fast2locals` (the proxy routes its reads
             // back through the frame), which reads `locals_cells_stack_w`
             // directly — so the virtualizable has to be materialized first or
-            // the mapping comes back EMPTY.  `sys._getframe` gets that for
-            // free from `gettopframe_nohidden`; a frame reached through a
-            // traceback's `tb_frame` does not.
+            // the mapping comes back EMPTY.  `sys._getframe` materializes it
+            // with its own explicit `force_frame` (`module/sys/vm.rs
+            // getframe`), not as a side effect of the walk: `gettopframe_nohidden`
+            // forces only the VREF of the frame it starts from.  A frame
+            // reached through a traceback's `tb_frame` gets neither.
             crate::executioncontext::force_frame_before_locals_read(f);
             let frame = unsafe { &mut *f };
             if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
