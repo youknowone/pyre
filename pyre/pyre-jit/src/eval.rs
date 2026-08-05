@@ -6324,7 +6324,7 @@ fn cached_unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> Unsuppor
             _ => unreachable!("invalid cached UnsupportedJitShape discriminant"),
         };
     }
-    let shape = unsupported_jit_shape(code);
+    let (shape, _census_key) = unsupported_jit_shape(code);
     callcontrol.graph_jit_shapes.insert(key, shape as u8);
     shape
 }
@@ -6378,6 +6378,12 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::JumpForward { .. }
             | I::JumpBackward { .. }
             | I::JumpBackwardNoInterrupt { .. }
+            // `return` out of the loop.  It pops TOS and ends the frame: no
+            // heap mutation, no sub-walk, so it cannot reach the
+            // append/STORE_SUBSCR path this gate exists for.  The list already
+            // admits `RaiseVarargs` / `Reraise`, which leave the frame by a
+            // strictly more involved route.
+            | I::ReturnValue
             // nested FOR_ITER: the inner loop's iterator setup and iteration
             | I::GetIter
             | I::ForIter { .. }
@@ -6902,10 +6908,17 @@ fn const_pool_slot_upper_bound(c: &pyre_interpreter::ConstantData) -> usize {
 /// `PyCode.code_ptr` (`Box::into_raw`, never freed), so its address is a stable
 /// key that is never reused — the same property the frame-shape decline census
 /// already relies on.
-fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
+///
+/// The second element is the census key for the decline, naming the specific
+/// arm that produced it. `CurrentFrameOnly` is reached from five unrelated
+/// predicates, so the shape alone does not say which defect kept the frame
+/// interpreted; the key does. It is `""` for [`UnsupportedJitShape::None`].
+fn unsupported_jit_shape(
+    code: &pyre_interpreter::CodeObject,
+) -> (UnsupportedJitShape, &'static str) {
     thread_local! {
         static SHAPE_CACHE: std::cell::RefCell<
-            std::collections::HashMap<usize, UnsupportedJitShape>,
+            std::collections::HashMap<usize, (UnsupportedJitShape, &'static str)>,
         > = std::cell::RefCell::new(std::collections::HashMap::new());
     }
     let key = code as *const _ as usize;
@@ -6919,7 +6932,9 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     shape
 }
 
-fn unsupported_jit_shape_uncached(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
+fn unsupported_jit_shape_uncached(
+    code: &pyre_interpreter::CodeObject,
+) -> (UnsupportedJitShape, &'static str) {
     // RPython/PyPy has no counterpart to this function at all: `jit_merge_point`
     // and `can_enter_jit` are unconditional (`pypy/module/pypyjit/interp_jit.py`),
     // and `JitPolicy.look_inside_graph` (`rpython/jit/codewriter/policy.py:48`)
@@ -6970,11 +6985,17 @@ fn unsupported_jit_shape_uncached(code: &pyre_interpreter::CodeObject) -> Unsupp
         .sum::<usize>()
         + code.names.len();
     if register_slots_upper_bound + constant_slots_upper_bound > 256 {
-        return UnsupportedJitShape::ConstEncodingOverflow;
+        return (
+            UnsupportedJitShape::ConstEncodingOverflow,
+            "FrameShape::ConstEncodingOverflow",
+        );
     }
 
     if nested_break_bridge_resume_hazard(code) {
-        return UnsupportedJitShape::NestedBreakBridgeResume;
+        return (
+            UnsupportedJitShape::NestedBreakBridgeResume,
+            "FrameShape::NestedBreakBridgeResume",
+        );
     }
 
     let mut arg_state = pyre_interpreter::OpArgState::default();
@@ -6984,13 +7005,19 @@ fn unsupported_jit_shape_uncached(code: &pyre_interpreter::CodeObject) -> Unsupp
         match instruction {
             pyre_interpreter::Instruction::ForIter { .. } => has_for_iter = true,
             pyre_interpreter::Instruction::CheckEgMatch => {
-                return UnsupportedJitShape::CurrentFrameOnly;
+                return (
+                    UnsupportedJitShape::CurrentFrameOnly,
+                    "FrameShape::CurrentFrameOnly/CheckEgMatch",
+                );
             }
             pyre_interpreter::Instruction::CallIntrinsic2 { func }
                 if func.get(op_arg)
                     == pyre_interpreter::bytecode::IntrinsicFunction2::PrepReraiseStar =>
             {
-                return UnsupportedJitShape::CurrentFrameOnly;
+                return (
+                    UnsupportedJitShape::CurrentFrameOnly,
+                    "FrameShape::CurrentFrameOnly/PrepReraiseStar",
+                );
             }
             _ => {}
         }
@@ -7003,14 +7030,28 @@ fn unsupported_jit_shape_uncached(code: &pyre_interpreter::CodeObject) -> Unsupp
         // caught exception and then raises re-aborts the walk for the whole run,
         // and an abort with an item in flight drops that iteration (see
         // `for_iter_frame_has_raising_named_handler`).
-        if !for_iter_bodies_all_jit_safe(code)
-            || for_iter_frame_is_finally_duplicated(code)
-            || for_iter_frame_has_raising_named_handler(code)
-        {
-            return UnsupportedJitShape::CurrentFrameOnly;
+        // Tested one at a time rather than as one `||` so the census names the
+        // predicate that fired; the three are unrelated defects.
+        if !for_iter_bodies_all_jit_safe(code) {
+            return (
+                UnsupportedJitShape::CurrentFrameOnly,
+                "FrameShape::CurrentFrameOnly/ForIterBodyNotJitSafe",
+            );
+        }
+        if for_iter_frame_is_finally_duplicated(code) {
+            return (
+                UnsupportedJitShape::CurrentFrameOnly,
+                "FrameShape::CurrentFrameOnly/ForIterFinallyDuplicated",
+            );
+        }
+        if for_iter_frame_has_raising_named_handler(code) {
+            return (
+                UnsupportedJitShape::CurrentFrameOnly,
+                "FrameShape::CurrentFrameOnly/ForIterRaisingNamedHandler",
+            );
         }
     }
-    UnsupportedJitShape::None
+    (UnsupportedJitShape::None, "")
 }
 
 fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
@@ -7054,36 +7095,23 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
         crate::call_jit::cranelift_recovery_layout_for_descr,
     );
     let jit_shape = cached_unsupported_jit_shape(code);
+    // Every declining shape runs the frame in the plain interpreter, so the
+    // tracer never sees it. Record the decline in the census — keyed by the
+    // predicate that fired, not just the shape — rather than leaving a silent
+    // no-token gap. `CurrentFrameOnly` covers five unrelated defects and
+    // `ConstEncodingOverflow` is not a defect at all (the frame genuinely
+    // cannot be encoded), so one key per shape cannot rank them. The key comes
+    // from the memoized `unsupported_jit_shape`, read only on the decline path
+    // so the `graph_jit_shapes` fast path stays a single map hit.
+    // Declining is per-frame: nested callees stay JIT-eligible.
     match jit_shape {
         UnsupportedJitShape::None => {}
-        UnsupportedJitShape::CurrentFrameOnly => {
-            // Run frames with unsupported current-frame bytecode shapes in the
-            // plain interpreter. The tracer never sees them, so record the
-            // frame-shape decline in the census rather than leaving a silent
-            // no-token gap.
+        UnsupportedJitShape::CurrentFrameOnly
+        | UnsupportedJitShape::NestedBreakBridgeResume
+        | UnsupportedJitShape::ConstEncodingOverflow => {
             pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
                 code as *const _ as usize,
-                "FrameShape::CurrentFrameOnly",
-            );
-            return frame_root.frame().execute_frame(None, None);
-        }
-        UnsupportedJitShape::NestedBreakBridgeResume => {
-            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
-                code as *const _ as usize,
-                "FrameShape::NestedBreakBridgeResume",
-            );
-            return frame_root.frame().execute_frame(None, None);
-        }
-        UnsupportedJitShape::ConstEncodingOverflow => {
-            // The frame's constant pool plus register file overruns the
-            // single-byte register-or-constant index encoding, so no jitcode
-            // can be assembled for it (`unsupported_jit_shape`).  Run this frame
-            // in the plain interpreter; nested callees stay JIT-eligible (the
-            // overflow is per-frame).  Record the decline in the census so the
-            // interpreted frame is visible, not a silent no-token gap.
-            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
-                code as *const _ as usize,
-                "FrameShape::ConstEncodingOverflow",
+                unsupported_jit_shape(code).1,
             );
             return frame_root.frame().execute_frame(None, None);
         }
