@@ -1213,20 +1213,28 @@ class Check:
         # platform. This is for the counter a host genuinely disagrees on, and
         # it keeps the comparison exact everywhere instead of widening the gate
         # for everyone: a band that tolerated the disagreement would tolerate it
-        # on all 371 fixtures and all three backends, and the band this gate
+        # on every fixture and all three backends, and the band this gate
         # replaced is exactly what let eight baselines go stale unnoticed.
         #
-        # Measured, not assumed. windows-latest cranelift reports
-        # `closure_per_call` guard_failures 416 and
-        # `recursive_call_frame_relocation` 637 where macos-latest and
-        # ubuntu-24.04 both report 415 and 638, on two independent runs, with
-        # every other counter identical. `PYPY_GC_NURSERY` is pinned above, so
-        # the nursery is not the differing variable, and the same windows host
-        # passes its dynasm leg 371/371. What is left is that the allocation
+        # Measured, not assumed, and read back from the windows job rather than
+        # predicted. `closure_per_call` is the one fixture that carries an
+        # overlay: windows-latest cranelift reports guard_failures 416 where
+        # macos-latest and ubuntu-24.04 both report 415, every other counter
+        # identical, on every windows run since exact equality replaced the
+        # tolerance band — including the runs taken after PYTHONSAFEPATH moved
+        # the ambient import loop. `PYPY_GC_NURSERY` is pinned above, so the
+        # nursery is not the differing variable, and the same windows host
+        # passes its dynasm leg in full. What is left is that the allocation
         # footprint differs, hence when a collection lands, hence how often the
         # back-edge eval-breaker poll bails out; the specific cause is not
-        # identified. Adding an overlay is therefore recording a fact about the
-        # host, and the shared file still gates the other two.
+        # identified. An overlay is therefore recording a fact about the host,
+        # and the shared file still gates the other two.
+        #
+        # An overlay shadows the shared baseline permanently, so one written
+        # against a value that later converges becomes a failure main does not
+        # have: `recursive_call_frame_relocation` was given one for 637, and
+        # windows has reported the shared 638 on every run since. Read the value
+        # back from the latest windows job before adding another.
         source = Path(script)
         per_platform = source.with_name(f"{source.stem}.{backend}.{sys.platform}.jitstats")
         if per_platform.exists():
