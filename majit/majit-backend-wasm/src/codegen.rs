@@ -8,12 +8,9 @@
 ///   offset 8:       slot[0] (i64)
 ///   offset 16:      slot[1] (i64)
 ///   ...
-///   CALL_AREA_OFS:  func_ptr (i64)   — used by jit_call trampoline
-///   CALL_AREA_OFS+8: num_args (i64)
-///   CALL_AREA_OFS+16: arg[0] (i64)
-///   CALL_AREA_OFS+24: arg[1] (i64)
-///   ...
-///   CALL_RESULT_OFS: result (i64)    — written by host after call
+///
+/// The residual-call trampoline scratch is stored separately at the static
+/// base returned by `jit_call_area_addr`.
 use std::collections::HashMap;
 
 use majit_backend::BackendError;
@@ -39,14 +36,18 @@ const CALL_FUNC_OFS: u64 = 2008;
 const CALL_NARGS_OFS: u64 = 2016;
 const CALL_ARGS_OFS: u64 = 2024;
 
+const STATIC_CALL_RESULT_OFS: u64 = 0;
+const STATIC_CALL_FUNC_OFS: u64 = SLOT_SIZE;
+const STATIC_CALL_NARGS_OFS: u64 = 2 * SLOT_SIZE;
+const STATIC_CALL_ARGS_OFS: u64 = 3 * SLOT_SIZE;
+
 /// Minimum frame allocation size in bytes to accommodate the call area.
 pub const MIN_FRAME_BYTES: usize = 2024 + 16 * 8; // 16 max call args
 
-/// Per-token layout of a wasm execution frame.  Every frozen geometry carries
-/// the host-trampoline call area, so a later chained bridge can use it without
-/// changing its source token's frame offsets.  CA callee frames alone allocate
-/// the prefix ending after the Ref homes; the tail is protected by the
-/// trampoline-decline floor in `compile_bridge`.
+/// Per-token layout of a wasm execution frame. Every frozen geometry retains
+/// the historical host-trampoline call area even though emitted code uses the
+/// module-static scratch area. CA callee frames allocate only the prefix ending
+/// after the Ref homes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGeometry {
     /// Number of value slots before the dispatch key (including frame[0]).
@@ -69,7 +70,7 @@ pub struct FrameGeometry {
     /// use the low slots.  The whole home region remains covered by jf_gcmap.
     pub label_ref_slots: usize,
     /// Bytes through the end of Ref homes. CA callee frames allocate exactly
-    /// this many item bytes; the tail call area is intentionally omitted.
+    /// this many item bytes; the unused tail call area is intentionally omitted.
     pub ca_frame_bytes: u32,
     /// Full bytes in the frame layout, including the tail call area. Host entry
     /// frames and every chained bridge use this geometry and allocation size.
@@ -77,7 +78,7 @@ pub struct FrameGeometry {
 }
 
 impl FrameGeometry {
-    const CALL_AREA_SLOTS: usize = 3 + 16; // result, function, nargs, args
+    pub const CALL_AREA_SLOTS: usize = 3 + 16; // result, function, nargs, args
 
     /// Historical fixed geometry, used by direct codegen tests and by callers
     /// that deliberately need the arena-compatible layout.
@@ -178,14 +179,17 @@ fn memarg(offset: u64, align: u32) -> MemArg {
     }
 }
 
-/// Invoke the residual-call trampoline. The historical import receives only a
-/// frame pointer and therefore reads the fixed call area; compact frames use a
-/// second import carrying their call-area base. The old trampoline remains
-/// unchanged for fixed-layout frames.
-fn emit_jit_call(sink: &mut InstructionSink<'_>, jit_call_idx: u32, frame: FrameGeometry) {
-    if frame.call_result_ofs != CALL_RESULT_OFS {
-        sink.i32_const(frame.call_result_ofs as i32);
-    }
+fn emit_call_area_addr(sink: &mut InstructionSink<'_>) {
+    sink.i32_const(crate::jit_call_area_addr() as i32);
+}
+
+/// Invoke the residual-call trampoline, which reads its scratch at
+/// `base + offset`. The scratch no longer lives in the frame, so the pair is
+/// always the static call area at offset zero, and the base-only import — whose
+/// host side adds a baked `CALL_RESULT_OFS` — can no longer be used.
+fn emit_jit_call(sink: &mut InstructionSink<'_>, jit_call_idx: u32) {
+    emit_call_area_addr(sink);
+    sink.i32_const(0);
     sink.call(jit_call_idx);
 }
 
@@ -743,7 +747,6 @@ fn emit_write_barrier(
     residual_type_base: Option<u32>,
     wb_fn_ptr: i64,
     base_ref: OpRef,
-    frame: FrameGeometry,
 ) {
     if let Some(base) = residual_type_base {
         // Header word is a u64 at `obj - GcHeader::SIZE` with the flags in
@@ -776,21 +779,20 @@ fn emit_write_barrier(
         return;
     };
     // func_ptr = wasm_jit_write_barrier
-    sink.local_get(0);
+    emit_call_area_addr(sink);
     sink.i64_const(wb_fn_ptr);
-    sink.i64_store(mem64(frame.call_func_ofs));
+    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
     // num_args = 1 (the trampoline reflects arity from the wasm signature;
     // written for protocol symmetry with the alloc/call paths)
-    sink.local_get(0);
+    emit_call_area_addr(sink);
     sink.i64_const(1);
-    sink.i64_store(mem64(frame.call_nargs_ofs));
+    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
     // arg0 = base object pointer
-    sink.local_get(0);
+    emit_call_area_addr(sink);
     emit_resolve(sink, constants, value_types, base_ref);
-    sink.i64_store(mem64(frame.call_args_ofs));
+    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
     // call trampoline; void result ignored
-    sink.local_get(0);
-    emit_jit_call(sink, jit_call, frame);
+    emit_jit_call(sink, jit_call);
 }
 
 /// Per-value def / last-use op positions over the trace, used to filter the
@@ -1249,17 +1251,14 @@ fn has_call_ops(ops: &[Op]) -> bool {
 }
 
 /// Whether this trace emits a host `jit_call` / `jit_call_compact` trampoline
-/// invocation.  CA frames are movable nursery objects, while the host
-/// trampoline writes its result back through the pre-call frame pointer, so
-/// `compile_bridge` uses this exact lowering census to keep such traces off a
-/// live CA frame.
+/// invocation and therefore needs the corresponding function import.
 ///
 /// Keep this in lockstep with the individual emission arms below: the uniform
 /// i64 and typed float residual families, `New*`, and write barriers are direct
 /// under `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string allocation
 /// retain the trampoline. When the direct family is disabled, all of the
 /// existing call-area users return to the trampoline baseline.
-pub fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bool {
+fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bool {
     let ref_values = RefValues::collect(inputargs, ops);
     if !WASM_DIRECT_RESIDUAL_CALL {
         return has_call_ops(ops) || has_ref_store_op(ops, &ref_values);
@@ -1469,11 +1468,8 @@ pub struct CaTarget {
     pub dispatch_entry: u32,
     /// Bytes to reserve per CA callee frame (the GC `JitFrame`'s data region,
     /// i.e. its Signed item area). This is the source geometry's prefix through
-    /// the Ref homes, excluding its tail call area. The trampoline-decline
-    /// floor in `WasmBackend::compile_bridge` (`source_ca_active &&
-    /// bridge_has_trampoline_calls`) guarantees that no trampoline-lowered op
-    /// runs on this movable frame, so the omitted tail is unreachable. The alloc
-    /// trampoline derives the JitFrame item count from this exact byte count.
+    /// the Ref homes, excluding its unused tail call area. The alloc trampoline
+    /// derives the JitFrame item count from this exact byte count.
     pub callee_frame_bytes: u32,
     /// Leaked per-bridge `jf_gcmap` (`lib.rs::build_callee_gcmap`) marking the
     /// callee frame's CA input + home Ref slots; baked into each frame's
@@ -1713,14 +1709,10 @@ pub fn build_wasm_module(
     // Type 0: trace function (param i32) -> (result i32)
     types.ty().function(vec![ValType::I32], vec![ValType::I32]);
     if needs_call {
-        // Type 1: fixed `jit_call(frame)` or compact
-        // `jit_call_compact(frame, call_area_ofs)` trampoline.
-        let params = if frame.call_result_ofs == CALL_RESULT_OFS {
-            vec![ValType::I32]
-        } else {
-            vec![ValType::I32, ValType::I32]
-        };
-        types.ty().function(params, vec![]);
+        // Type 1: `jit_call_compact(base, call_area_ofs)` trampoline.
+        types
+            .ty()
+            .function(vec![ValType::I32, ValType::I32], vec![]);
     }
     // Residual-call types follow: `(i64×n) -> i64` for arity `n`, indexed by
     // `residual_type_base + n`. `residual_type_base` = the count of types above.
@@ -1774,15 +1766,7 @@ pub fn build_wasm_module(
     );
     if needs_call {
         // Import jit_call trampoline as function index 0
-        imports.import(
-            "env",
-            if frame.call_result_ofs == CALL_RESULT_OFS {
-                "jit_call"
-            } else {
-                "jit_call_compact"
-            },
-            EntityType::Function(1),
-        );
+        imports.import("env", "jit_call_compact", EntityType::Function(1));
     }
     if needs_table {
         // Import the host's shared indirect function table as table index 0.
@@ -2858,7 +2842,6 @@ fn build_function(
                         residual_type_base,
                         wb_fn_ptr,
                         base,
-                        frame,
                     );
                 }
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr
@@ -2953,7 +2936,6 @@ fn build_function(
                         residual_type_base,
                         wb_fn_ptr,
                         base,
-                        frame,
                     );
                 }
                 emit_array_addr(&mut sink, constants, value_types, op);
@@ -3623,22 +3605,21 @@ fn build_function(
                 } else {
                     let jit_call =
                         jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(ca.ca_alloc_fn_ptr);
-                    sink.i64_store(mem64(frame.call_func_ofs));
-                    sink.local_get(0);
+                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(2);
-                    sink.i64_store(mem64(frame.call_nargs_ofs));
-                    sink.local_get(0);
+                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(tgt.callee_frame_bytes as i64);
-                    sink.i64_store(mem64(frame.call_args_ofs));
-                    sink.local_get(0);
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(tgt.callee_gcmap_ptr);
-                    sink.i64_store(mem64(frame.call_args_ofs + SLOT_SIZE));
-                    sink.local_get(0);
-                    emit_jit_call(&mut sink, jit_call, frame);
-                    sink.local_get(0);
-                    sink.i64_load(mem64(frame.call_result_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + SLOT_SIZE));
+                    emit_jit_call(&mut sink, jit_call);
+                    emit_call_area_addr(&mut sink);
+                    sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
                 }
                 sink.i32_wrap_i64();
                 sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
@@ -3648,8 +3629,6 @@ fn build_function(
                 // own frame was the shadow-stack top. Now that the callee is
                 // pushed, reload local 0 from the entry beneath it before
                 // resolving inputs through local-0-relative homes. The
-                // trampoline path intentionally keeps the earlier assumption:
-                // its scratch writes themselves dereference stale local 0.
                 if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
                     emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
                     sink.local_set(0);
@@ -3701,16 +3680,15 @@ fn build_function(
                 } else {
                     let jit_call =
                         jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(ca.ca_reload_fn_ptr);
-                    sink.i64_store(mem64(frame.call_func_ofs));
-                    sink.local_get(0);
+                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(0);
-                    sink.i64_store(mem64(frame.call_nargs_ofs));
-                    sink.local_get(0);
-                    emit_jit_call(&mut sink, jit_call, frame);
-                    sink.local_get(0);
-                    sink.i64_load(mem64(frame.call_result_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                    emit_jit_call(&mut sink, jit_call);
+                    emit_call_area_addr(&mut sink);
+                    sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
                 }
                 sink.i32_wrap_i64();
                 sink.local_set(ca_cfp_local);
@@ -3790,18 +3768,17 @@ fn build_function(
                 } else {
                     let jit_call =
                         jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(ca.ca_pop_fn_ptr);
-                    sink.i64_store(mem64(frame.call_func_ofs));
-                    sink.local_get(0);
+                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(1);
-                    sink.i64_store(mem64(frame.call_nargs_ofs));
-                    sink.local_get(0);
+                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                    emit_call_area_addr(&mut sink);
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
-                    sink.i64_store(mem64(frame.call_args_ofs));
-                    sink.local_get(0);
-                    emit_jit_call(&mut sink, jit_call, frame);
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
+                    emit_jit_call(&mut sink, jit_call);
                 }
                 // The callee recursion minor-collected; this bridge's other live
                 // Ref locals are now stale. Reload them from the forwarded homes.
@@ -3955,25 +3932,24 @@ fn build_function(
                     let call_args = &op.getarglist()[1..];
 
                     // Store func_ptr to call area
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
-                    sink.i64_store(mem64(frame.call_func_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
 
                     // Store num_args
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(call_args.len() as i64);
-                    sink.i64_store(mem64(frame.call_nargs_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
 
                     // Store each arg
                     for (i, arg) in call_args.iter().enumerate() {
-                        sink.local_get(0);
+                        emit_call_area_addr(&mut sink);
                         emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                        sink.i64_store(mem64(frame.call_args_ofs + i as u64 * SLOT_SIZE));
+                        sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
                     }
 
                     // Call trampoline
-                    sink.local_get(0);
-                    emit_jit_call(&mut sink, jit_call, frame);
+                    emit_jit_call(&mut sink, jit_call);
 
                     // Read result (for non-void calls)
                     let is_void = matches!(
@@ -3986,8 +3962,8 @@ fn build_function(
                             | OpCode::CallLoopinvariantN
                     );
                     if !OpRef::raw_is_constant(vi) && !is_void {
-                        sink.local_get(0);
-                        sink.i64_load(mem64(frame.call_result_ofs));
+                        emit_call_area_addr(&mut sink);
+                        sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
                         if value_types[vi as usize] == ValType::F64 {
                             sink.f64_reinterpret_i64();
                         }
@@ -4158,29 +4134,28 @@ fn build_function(
                 } else {
                     let jit_call = jit_call_idx.expect("New op present but jit_call not imported");
                     // func_ptr = wasm_jit_alloc
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(alloc_fn_ptr);
-                    sink.i64_store(mem64(frame.call_func_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
                     // num_args = 2
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(2);
-                    sink.i64_store(mem64(frame.call_nargs_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
                     // arg0 = type_id
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(type_id);
-                    sink.i64_store(mem64(frame.call_args_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
                     // arg1 = size
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(size);
-                    sink.i64_store(mem64(frame.call_args_ofs + SLOT_SIZE));
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + SLOT_SIZE));
                     // call trampoline
-                    sink.local_get(0);
-                    emit_jit_call(&mut sink, jit_call, frame);
+                    emit_jit_call(&mut sink, jit_call);
 
                     if !OpRef::raw_is_constant(vi) {
                         // result pointer
-                        sink.local_get(0);
-                        sink.i64_load(mem64(frame.call_result_ofs));
+                        emit_call_area_addr(&mut sink);
+                        sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
                         sink.local_set(1 + vi);
                     }
                 }
@@ -4555,40 +4530,39 @@ fn build_function(
                     let jit_call =
                         jit_call_idx.expect("NewArray op present but jit_call not imported");
                     // func_ptr = wasm_jit_alloc_array
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(alloc_array_fn_ptr);
-                    sink.i64_store(mem64(frame.call_func_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
                     // num_args = 5
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(5);
-                    sink.i64_store(mem64(frame.call_nargs_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
                     // arg0 = type_id
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(type_id);
-                    sink.i64_store(mem64(frame.call_args_ofs));
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
                     // arg1 = base_size
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(base_size);
-                    sink.i64_store(mem64(frame.call_args_ofs + SLOT_SIZE));
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + SLOT_SIZE));
                     // arg2 = item_size
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(item_size);
-                    sink.i64_store(mem64(frame.call_args_ofs + 2 * SLOT_SIZE));
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + 2 * SLOT_SIZE));
                     // arg3 = length (op.arg(0))
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i64_store(mem64(frame.call_args_ofs + 3 * SLOT_SIZE));
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + 3 * SLOT_SIZE));
                     // arg4 = len_offset
-                    sink.local_get(0);
+                    emit_call_area_addr(&mut sink);
                     sink.i64_const(len_offset);
-                    sink.i64_store(mem64(frame.call_args_ofs + 4 * SLOT_SIZE));
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + 4 * SLOT_SIZE));
                     // call trampoline
-                    sink.local_get(0);
-                    emit_jit_call(&mut sink, jit_call, frame);
+                    emit_jit_call(&mut sink, jit_call);
 
                     if !OpRef::raw_is_constant(vi) {
-                        sink.local_get(0);
-                        sink.i64_load(mem64(frame.call_result_ofs));
+                        emit_call_area_addr(&mut sink);
+                        sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
                         sink.local_set(1 + vi);
                     }
                 }

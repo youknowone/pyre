@@ -562,21 +562,23 @@ fn test_call_generates_import() {
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
-    // Verify the module has jit_call import
+    // The residual-call trampoline reads its scratch at `base + offset`, and
+    // the scratch is the module-static call area, so every emitting module
+    // takes the two-argument import.
     let parser = wasmparser::Parser::new(0);
     let mut has_jit_call = false;
     for payload in parser.parse_all(&bytes) {
         if let Ok(wasmparser::Payload::ImportSection(imports)) = payload {
             for import in imports {
                 if let Ok(import) = import {
-                    if import.name == "jit_call" {
+                    if import.name == "jit_call_compact" {
                         has_jit_call = true;
                     }
                 }
             }
         }
     }
-    assert!(has_jit_call, "module should import jit_call");
+    assert!(has_jit_call, "module should import jit_call_compact");
 }
 
 #[test]

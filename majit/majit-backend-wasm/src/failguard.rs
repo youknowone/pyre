@@ -178,7 +178,6 @@ pub struct CallAssemblerTarget {
     pub callee_gcmap_ptr: i64,
     pub loop_finish_fi: u32,
     pub compiled_ptr: u64,
-    pub has_trampoline_calls: bool,
 }
 
 /// Compiled loop targets keyed by their `JitCellToken` number. Unlike label
@@ -315,7 +314,6 @@ pub fn register_pending_call_assembler_target(number: u64, input_types: Vec<Type
             callee_gcmap_ptr: 0,
             loop_finish_fi: WASM_CA_FINISH_FI_UNKNOWN,
             compiled_ptr: 0,
-            has_trampoline_calls: false,
         },
     );
 }
@@ -428,9 +426,7 @@ pub fn publish_label_target(descr_id: usize, target: LabelTarget) {
 /// guard that lives inside an already-chained bridge: the failing guard's
 /// meta descr carries `(trace_id, per-trace fail_index)`, and this record
 /// supplies the owning bridge's cell array and livelock advance flags — the
-/// same data `CompiledWasmLoop` holds for the loop's own guards.  It also
-/// publishes whether another bridge may safely compose a CALL_ASSEMBLER arm
-/// while executing on this bridge's shared frozen frame.
+/// same data `CompiledWasmLoop` holds for the loop's own guards.
 pub struct ChainedTraceMeta {
     /// Base address of the bridge's per-guard bridge-slot cell array
     /// (`CompiledWasmLoop::bridge_cells_base` analog); `0` = no dispatch.
@@ -440,10 +436,6 @@ pub struct ChainedTraceMeta {
     /// Per-guard, per-fail-arg induction-advance flags
     /// (`CompiledWasmLoop::guard_fail_arg_advanced` analog).
     pub guard_fail_arg_advanced: Vec<Vec<bool>>,
-    /// This bridge contains no host-trampoline lowering, so a nested bridge's
-    /// movable CALL_ASSEMBLER callee cannot strand a stale source-frame
-    /// pointer when control returns here.
-    pub ca_reentry_safe: bool,
 }
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
@@ -483,11 +475,6 @@ pub struct CompiledWasmLoop {
     /// Geometry frozen when this token was first compiled. Every bridge
     /// chained onto it is emitted against this exact layout.
     pub frame: crate::codegen::FrameGeometry,
-    /// True when this loop or any successfully chained bridge uses the host
-    /// residual-call trampoline. A CA callee frame is movable, but that
-    /// trampoline retains the pre-call frame pointer, so `compile_bridge` must
-    /// not enable the CA arm for this source token.
-    pub has_trampoline_calls: Cell<bool>,
     /// Base address (shared linear memory) of this loop's per-guard bridge-slot
     /// cell array — one i32 per `fail_index`, `0` = no bridge. The trace's
     /// epilogue reads `cells[fail_index]` and `compile_bridge` writes a bridge's
@@ -599,15 +586,6 @@ impl CompiledWasmLoop {
             Ok(handle)
         }
     }
-
-    /// Incorporate the normal (non-CA unless this bridge is the candidate)
-    /// codegen census for a bridge after it has been chained onto this token.
-    /// Every earlier bridge remains reachable from a later CA recursion's
-    /// guard exits, so its host trampoline use also rules out CA.
-    pub fn record_chained_bridge_trampoline_calls(&self, bridge_has_trampoline_calls: bool) {
-        self.has_trampoline_calls
-            .set(self.has_trampoline_calls.get() || bridge_has_trampoline_calls);
-    }
 }
 
 impl Drop for CompiledWasmLoop {
@@ -635,53 +613,5 @@ impl Drop for CompiledWasmLoop {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn token_with_trampoline_census(has_trampoline_calls: bool) -> CompiledWasmLoop {
-        CompiledWasmLoop {
-            token_number: 0,
-            trace_id: 0,
-            input_types: Vec::new(),
-            func_handle: Cell::new(0),
-            pending_wasm_bytes: RefCell::new(None),
-            fail_descrs: RefCell::new(Vec::new()),
-            num_inputs: 0,
-            max_output_slots: 0,
-            num_ref_homes: 0,
-            frame: crate::codegen::FrameGeometry::fixed(),
-            has_trampoline_calls: Cell::new(has_trampoline_calls),
-            bridge_cells_base: 0,
-            num_guard_cells: 0,
-            has_preamble: false,
-            label_descrs: Vec::new(),
-            guard_fail_arg_advanced: Vec::new(),
-            bridge_descr_ranges: RefCell::new(Vec::new()),
-            chained_trace_meta: RefCell::new(std::collections::HashMap::new()),
-            _bridge_cells_owner: None,
-            _bridge_owned_cells: RefCell::new(Vec::new()),
-            ca_active: Cell::new(false),
-            ca_terminal_declined: Cell::new(false),
-            ca_callers: RefCell::new(Vec::new()),
-        }
-    }
-
-    #[test]
-    fn chained_bridge_trampoline_census_is_orred_into_token() {
-        let token = token_with_trampoline_census(false);
-        token.record_chained_bridge_trampoline_calls(false);
-        assert!(!token.has_trampoline_calls.get());
-
-        token.record_chained_bridge_trampoline_calls(true);
-        assert!(token.has_trampoline_calls.get());
-
-        // A later clean bridge cannot erase an earlier chained bridge's
-        // trampoline census before a CA bridge is considered.
-        token.record_chained_bridge_trampoline_calls(false);
-        assert!(token.has_trampoline_calls.get());
     }
 }

@@ -227,6 +227,14 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 
+/// Residual-call scratch shared by emitted wasm and the host trampoline.
+/// Trampoline use is strictly LIFO: the host materialises every argument
+/// before invoking the callee, and the guest loads the result immediately on
+/// return, so a nested guest trampoline call cannot observe an outer call's
+/// live data.
+static JIT_CALL_AREA: [AtomicI64; codegen::FrameGeometry::CALL_AREA_SLOTS] =
+    [const { AtomicI64::new(0) }; codegen::FrameGeometry::CALL_AREA_SLOTS];
+
 /// llmodel.py:194-199 _store_exception parity: set JIT exception state.
 /// `value` is a valid OBJECTPTR (or 0); the exception class is read from
 /// `value.typeptr` (offset 0).
@@ -273,6 +281,11 @@ pub fn jit_exc_value_addr() -> usize {
 /// Address of `JIT_EXC_TYPE`, embedded as an immediate in JIT-emitted wasm.
 pub fn jit_exc_type_addr() -> usize {
     &JIT_EXC_TYPE as *const _ as usize
+}
+
+/// Address of `JIT_CALL_AREA`, embedded as an immediate in JIT-emitted wasm.
+pub fn jit_call_area_addr() -> usize {
+    &JIT_CALL_AREA as *const _ as usize
 }
 
 thread_local! {
@@ -1495,7 +1508,6 @@ struct PendingSelfCa<'a> {
     token_number: u64,
     input_types: &'a [majit_ir::Type],
     frame: codegen::FrameGeometry,
-    has_trampoline_calls: bool,
 }
 
 /// Resolve every distinct compiled target used by CALL_ASSEMBLER ops in this
@@ -1541,13 +1553,8 @@ fn general_int_call_assembler_target(
                 && ca_dispatch_exists(target_token)
         }) {
             // Keep the ordinary input validation, then use the current loop's
-            // frozen geometry.  Its direct-lowering census is the pending
-            // equivalent of the normal live-loop census below: a movable self
-            // frame must not run a host trampoline.
-            if registered.input_types.as_slice() != arg_types
-                || self_.frame.ca_frame_bytes == 0
-                || self_.has_trampoline_calls
-            {
+            // frozen geometry.
+            if registered.input_types.as_slice() != arg_types || self_.frame.ca_frame_bytes == 0 {
                 return None;
             }
             let callee_gcmap_ptr =
@@ -1563,7 +1570,6 @@ fn general_int_call_assembler_target(
                 callee_gcmap_ptr,
                 loop_finish_fi: failguard::WASM_CA_FINISH_FI_UNKNOWN,
                 compiled_ptr: 0,
-                has_trampoline_calls: false,
             }
         } else {
             // A straight-line function trace may have deferred host module
@@ -1589,20 +1595,16 @@ fn general_int_call_assembler_target(
                 || registered.callee_frame_bytes == 0
                 || registered.callee_gcmap_ptr == 0
                 || registered.compiled_ptr == 0
-                || registered.has_trampoline_calls
             {
                 return None;
             }
             // A successfully compiled loop is retained by its token while it
-            // is registered. Its chained bridges can subsequently add
-            // trampoline calls or become terminally declined, so read the
-            // live census before baking every CA entry.
+            // is registered. It can subsequently become terminally declined,
+            // so read the live state before baking every CA entry.
             let live = unsafe {
                 (registered.compiled_ptr as *const CompiledWasmLoop)
                     .as_ref()
-                    .is_some_and(|loop_| {
-                        !loop_.has_trampoline_calls.get() && !loop_.ca_terminal_declined.get()
-                    })
+                    .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
             };
             if !live {
                 return None;
@@ -1971,26 +1973,19 @@ impl majit_backend::Backend for WasmBackend {
             ),
         };
         let input_types: Vec<majit_ir::Type> = inputargs.iter().map(|ia| ia.tp).collect();
-        // Count with CA direct-lowering enabled.  This is the safety census
-        // for a pending self target: no CompiledWasmLoop exists yet to inspect.
-        let pending_self_has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, true);
         // A general CALL_ASSEMBLER can enter already-compiled loops through
         // the shared table. Codegen keeps each callee's geometry keyed by its
-        // operation's target token.  The pending self token is admitted with
-        // the current frame; distinct sibling targets retain their live census.
+        // operation's target token. The pending self token is admitted with
+        // the current frame.
         let ca_targets = general_int_call_assembler_target(
             ops,
             Some(PendingSelfCa {
                 token_number: token.number,
                 input_types: &input_types,
                 frame,
-                has_trampoline_calls: pending_self_has_trampoline_calls,
             }),
         );
         let allow_ca = ca_deopt_helper_slot() != 0 && ca_targets.is_some();
-        // This must use the same direct-vs-trampoline predicates as codegen:
-        // a CA callee runs this source-loop body on a movable nursery frame.
-        let has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, allow_ca);
 
         // Decline traces the wasm backend cannot compile correctly, so the
         // metainterp falls back to the interpreter (correct, if unaccelerated)
@@ -2268,7 +2263,6 @@ impl majit_backend::Backend for WasmBackend {
             max_output_slots,
             num_ref_homes,
             frame,
-            has_trampoline_calls: std::cell::Cell::new(has_trampoline_calls),
             bridge_cells_base,
             num_guard_cells: guard_exits.len(),
             has_preamble,
@@ -2334,7 +2328,6 @@ impl majit_backend::Backend for WasmBackend {
                 callee_gcmap_ptr,
                 loop_finish_fi,
                 compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
-                has_trampoline_calls: compiled.has_trampoline_calls.get(),
             },
         );
         if let Some(targets) = ca_targets.as_ref() {
@@ -2399,11 +2392,6 @@ impl majit_backend::Backend for WasmBackend {
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
         let ca_targets = bridge_int_call_assembler_target(ops);
         let ca_candidate = ca_deopt_helper_slot() != 0 && ca_targets.is_some();
-        // The CA candidate is a dedicated direct arm; all other ops are
-        // scanned against their normal emission paths.
-        let bridge_has_trampoline_calls =
-            codegen::has_trampoline_calls(inputargs, ops, ca_candidate);
-
         // The source guard this bridge attaches to. `fail_index` is its index in
         // the source loop's `fail_descrs` / cell array; `trace_id` identifies the
         // owning trace.
@@ -2412,15 +2400,7 @@ impl majit_backend::Backend for WasmBackend {
 
         // Scalars read from the source loop up front, so the immutable borrow of
         // `original_token` is released before the `&mut self` codegen calls.
-        let (
-            source_guard,
-            source_ca_reentry_safe,
-            source_func_handle,
-            source_has_preamble,
-            source_frame,
-            source_ca_active,
-            source_has_trampoline_calls,
-        ) = {
+        let (source_guard, source_func_handle, source_has_preamble, source_frame) = {
             let source_loop = original_token
                 .compiled
                 .get()
@@ -2438,47 +2418,38 @@ impl majit_backend::Backend for WasmBackend {
             // per-fail-arg advance flags. `None` = foreign trace (declined
             // below, diag 3).
             let is_direct = source_trace_id == source_loop.trace_id;
-            let (guard, ca_reentry_safe) = if is_direct {
-                (
-                    Some((
-                        source_loop.bridge_cells_base,
-                        source_loop.num_guard_cells,
-                        source_loop
-                            .guard_fail_arg_advanced
-                            .get(source_fail_index as usize)
-                            .cloned()
-                            .unwrap_or_default(),
-                    )),
-                    true,
-                )
+            let guard = if is_direct {
+                Some((
+                    source_loop.bridge_cells_base,
+                    source_loop.num_guard_cells,
+                    source_loop
+                        .guard_fail_arg_advanced
+                        .get(source_fail_index as usize)
+                        .cloned()
+                        .unwrap_or_default(),
+                ))
             } else {
                 match source_loop
                     .chained_trace_meta
                     .borrow()
                     .get(&source_trace_id)
                 {
-                    Some(m) => (
-                        Some((
-                            m.cells_base,
-                            m.num_cells,
-                            m.guard_fail_arg_advanced
-                                .get(source_fail_index as usize)
-                                .cloned()
-                                .unwrap_or_default(),
-                        )),
-                        m.ca_reentry_safe,
-                    ),
-                    None => (None, false),
+                    Some(m) => Some((
+                        m.cells_base,
+                        m.num_cells,
+                        m.guard_fail_arg_advanced
+                            .get(source_fail_index as usize)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )),
+                    None => None,
                 }
             };
             (
                 guard,
-                ca_reentry_safe,
                 source_loop.materialize_func_handle()?,
                 source_loop.has_preamble,
                 source_loop.frame,
-                source_loop.ca_active.get(),
-                source_loop.has_trampoline_calls.get(),
             )
         };
 
@@ -2500,34 +2471,10 @@ impl majit_backend::Backend for WasmBackend {
                 "wasm backend: bridge source guard index has no dispatch cell".into(),
             ));
         }
-        // A nested bridge may compose CALL_ASSEMBLER only when its owning
-        // bridge published that it has no host-trampoline lowering.  Merely
-        // finding the nested guard's cell is insufficient: after a movable
-        // callee returns, a trampoline-bearing source would retain a stale
-        // frame pointer. Direct loop guards satisfy the same condition through
-        // the token-wide trampoline census below.
-        let mut allow_ca = ca_candidate && source_ca_reentry_safe;
-        let ca_trampoline_decline = if allow_ca && source_has_trampoline_calls {
-            Some(
-                "wasm backend: self-recursive CA source token or chained bridge \
-                 uses the host call trampoline",
-            )
-        } else if allow_ca && bridge_has_trampoline_calls {
-            Some("wasm backend: self-recursive CA bridge uses the host call trampoline")
-        } else {
-            None
-        };
-        if ca_trampoline_decline.is_some() {
-            // Let the ordinary non-CA CALL_ASSEMBLER decline path retain the
-            // interpreter fallback, but make this soundness floor observable.
-            diag_bump(15);
-            allow_ca = false;
-        }
+        let allow_ca = ca_candidate;
         if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
             diag_bump(1); // declined: CALL_ASSEMBLER
-            return Err(BackendError::Unsupported(
-                ca_trampoline_decline.unwrap_or(reason.as_str()).to_string(),
-            ));
+            return Err(BackendError::Unsupported(reason));
         }
         if allow_ca {
             diag_bump(14); // accepted CALL_ASSEMBLER bridge
@@ -2543,19 +2490,7 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_ref_homes = codegen::count_ref_homes(inputargs, ops);
         if bridge_value_slots > source_frame.value_slots
             || bridge_ref_homes > source_frame.ordinary_home_slots()
-            || (source_ca_active && bridge_has_trampoline_calls)
         {
-            if source_ca_active && bridge_has_trampoline_calls {
-                // Guard exits in a CA-active token execute on movable callee
-                // frames. Do not chain a later bridge whose own body would
-                // re-enter the stale-pointer host trampoline.
-                diag_bump(15);
-                return Err(BackendError::Unsupported(
-                    "wasm backend: CA-active source cannot chain a bridge that \
-                     uses the host call trampoline"
-                        .into(),
-                ));
-            }
             diag_bump(4);
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: bridge frame needs values={bridge_value_slots}, homes={bridge_ref_homes}; \
@@ -2835,7 +2770,6 @@ impl majit_backend::Backend for WasmBackend {
                     count,
                 ));
             }
-            source_loop.record_chained_bridge_trampoline_calls(bridge_has_trampoline_calls);
             // Publish this bridge's own guard-dispatch metadata so a hot guard
             // INSIDE it can chain a nested sub-bridge (same resolution the
             // loop's own guards get, keyed by this bridge's trace_id).
@@ -2845,7 +2779,6 @@ impl majit_backend::Backend for WasmBackend {
                     cells_base: bridge_cells_base,
                     num_cells: guard_exits.len(),
                     guard_fail_arg_advanced: guard_fail_args_advanced(ops, &guard_exits),
-                    ca_reentry_safe: !bridge_has_trampoline_calls,
                 },
             );
             // The bridge module lives as long as this source loop, so hand its
@@ -3371,13 +3304,10 @@ impl majit_backend::Backend for WasmBackend {
         let movable_callee = new_target.callee_frame_bytes != 0
             && new_target.callee_gcmap_ptr != 0
             && new_target.compiled_ptr != 0
-            && !new_target.has_trampoline_calls
             && unsafe {
                 (new_target.compiled_ptr as *const CompiledWasmLoop)
                     .as_ref()
-                    .is_some_and(|loop_| {
-                        !loop_.has_trampoline_calls.get() && !loop_.ca_terminal_declined.get()
-                    })
+                    .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
             };
         if !movable_callee {
             return Err(BackendError::Unsupported(format!(
