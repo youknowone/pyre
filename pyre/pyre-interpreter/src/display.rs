@@ -998,6 +998,12 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
                 pyre_object::tagged_int::untag_int(obj)
             )));
         }
+        // The native `__str__` implementations reached below re-enter
+        // `py_str_wtf8` without pushing a Python frame — a one-element
+        // `BaseException.args` holding the exception itself recurses here
+        // forever. Guard the stack so `str(e)` raises RecursionError instead of
+        // overflowing.
+        crate::stack_check::stack_check()?;
         if obj.is_null() {
             return Ok(Wtf8Buf::from_string("NULL".to_string()));
         }
@@ -1091,6 +1097,13 @@ pub(crate) unsafe fn base_exception_str(obj: PyObjectRef) -> Result<String, crat
 }
 
 pub(crate) unsafe fn base_exception_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+    // `space.str(self.args_w[0])` re-enters `py_str_wtf8` on the element, which
+    // for `e.args = (e,)` lands back here. The re-entry pushes no Python frame
+    // and sits in tail position, so neither the frame counter nor the stack
+    // pointer moves and `stack_check` alone cannot see the cycle. Spend a
+    // recursion unit for this dispatch level, as the equally frameless
+    // `A.__call__ = A()` chain does.
+    let _depth = crate::call::enter_native_dispatch();
     unsafe {
         let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
         if args.is_null() {
