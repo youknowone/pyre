@@ -1727,10 +1727,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // descended body made every object-strategy append decline the fold. The
     // wrapper is `dont_look_inside`; register it for the same reason as the
     // barrier itself.
-    let prepare_list_ref_store: fn(
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-    ) -> pyre_object::PyObjectRef = pyre_object::listobject::prepare_list_ref_store;
+    //
+    // Register the macro-emitted `extern "C" fn(i64, i64) -> i64` call
+    // trampoline, not the raw fn — the shape
+    // `#[jit_module]::__majit_helper_trace_fnaddrs()` publishes for a
+    // policy-bearing free fn (`majit-macros` `impl_addr_expr` routes it through
+    // `__majit_call_policy_*`'s trace-target slot; the raw fn is only its
+    // null-target fallback).  The wasm backend lowers an `Int`/`Ref`-result
+    // residual to a direct `call_indirect` whose static type is `(i64 x n) ->
+    // i64` derived from the descr alone, so a raw
+    // `(*mut PyObject, *mut PyObject) -> *mut PyObject` — `(i32, i32) -> i32` on
+    // wasm32 — traps `indirect call type mismatch`.  The registered paths are
+    // unchanged, so `is_list_write_barrier` and the path-keyed build->runtime
+    // re-pairing are unaffected.
+    let prepare_list_ref_store: extern "C" fn(i64, i64) -> i64 =
+        pyre_object::listobject::__majit_call_target_prepare_list_ref_store;
     push_alias_pair(
         &mut entries,
         "pyre_object::listobject::prepare_list_ref_store",

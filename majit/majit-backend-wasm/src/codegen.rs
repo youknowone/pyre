@@ -669,8 +669,10 @@ pub fn label_ref_capture_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     LabelResumeData::collect(inputargs, ops).ref_slots
 }
 
-/// First free value position — one past the highest id any input arg or op
-/// result occupies. `majit_gc::rewrite::remove_ref_constants` numbers the
+/// First free value position — one past the highest id any value reference in
+/// the trace occupies (input args, op results, and every op argument, including
+/// a folded value the constants pool alone binds).
+/// `majit_gc::rewrite::remove_ref_constants` numbers the
 /// `LoadFromGcTable` results it emits from here upward, so the operand
 /// numbering the optimizer produced stays untouched. Same id set
 /// `collect_guards_and_vars` sizes `num_vars` from, so the loads land inside
@@ -1303,12 +1305,25 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
         {
             max_var = op.pos.get().raw() + 1;
         }
-        if op.opcode == OpCode::Label {
-            for a in op.getarglist().iter() {
-                let a = a.to_opref();
-                if a != OpRef::NONE && !a.is_constant() && a.raw() + 1 > max_var {
-                    max_var = a.raw() + 1;
-                }
+        // Every value an op reads occupies a local, whether or not the trace
+        // also contains an op that produces it: constant folding and the short
+        // preamble leave a folded value bound only by the constants pool, and
+        // `unbound_pool_const_seeds` materializes it in the prologue. Counting
+        // only op results would under-size `num_vars` for such a value and,
+        // through `next_value_pos`, let `remove_ref_constants` reuse its id for
+        // a `LoadFromGcTable` — whose store then lands after the read, so the
+        // read returns the zero wasm initializes the local to.
+        let mut widen = |a: OpRef, max_var: &mut u32| {
+            if a != OpRef::NONE && !a.is_constant() && a.raw() + 1 > *max_var {
+                *max_var = a.raw() + 1;
+            }
+        };
+        for a in op.getarglist().iter() {
+            widen(a.to_opref(), &mut max_var);
+        }
+        if let Some(fa) = op.getfailargs() {
+            for a in fa.iter() {
+                widen(a.to_opref(), &mut max_var);
             }
         }
 
