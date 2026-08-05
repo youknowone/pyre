@@ -9008,6 +9008,10 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
+    if let Ok(name) = name.as_str() {
+        return lookup_in_type_where(w_type, name);
+    }
+    // MethodCache is keyed on `&str`, so a non-UTF-8 name cannot use it.
     let cached = w_type_get_mro(w_type);
     let mro_owned;
     let mro: &[PyObjectRef] = if !cached.is_null() {
