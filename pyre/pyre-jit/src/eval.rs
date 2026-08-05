@@ -7255,6 +7255,41 @@ fn exit_frame_handler_needs_unwritten_stack(frame: &PyFrame) -> bool {
     lasti && frame.valuestackdepth < frame.nlocals() + frame.ncells() + depth as usize
 }
 
+/// Keep a compiled-run exit from giving its own frame a second traceback node.
+///
+/// `pyopcode.py:148-149 handle_operation_error` attaches one node per frame per
+/// delivery, at the raising instruction, and only then runs the `:152`
+/// exception-table lookup — a frame whose handler declines propagates with no
+/// second attach.  A compiled run records this frame itself (the in-trace
+/// handler-entry arm), and by the time the exception reaches the interpreter for
+/// that table search `frame.last_instr` has advanced past the raise to the
+/// handler dispatch.  A second attach would therefore name the `except` clause
+/// that declined, or the `finally` body, rather than the raise, and the frame
+/// would appear twice.
+///
+/// `record_application_traceback` prepends, so the frame already owns a node
+/// exactly when the chain HEAD names it.  A compiled exit that carries no node
+/// of its own still owes itself one, which is why this is not the unconditional
+/// clear the `FinishConcrete::Raise` arm can afford.
+///
+/// Only the compiled-exit deliveries screen.  An ordinary interpreted raise IS
+/// the `pyopcode.py:148` attach, and `raise caught_object` re-raising by name
+/// legitimately gives one frame two adjacent nodes through the raises
+/// themselves.
+fn screen_frame_already_recorded(frame: *const PyFrame, err: &mut pyre_interpreter::PyError) {
+    if err.exc_object.is_null() || frame.is_null() {
+        return;
+    }
+    let head = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(err.exc_object) };
+    let owns_head = !head.is_null()
+        && unsafe { pyre_interpreter::pytraceback::is_pytraceback(head) }
+        && unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) }
+            == frame as *mut PyFrame;
+    if owns_head {
+        err.attach_tb = false;
+    }
+}
+
 /// warmspot.py:998-1005 `ExitFrameWithExceptionRef` delivery for a compiled-run
 /// exit that surfaced outside the eval loop (the `handle_jit_outcome` /
 /// compile-once path).  Offer the pending exception to `frame`'s exception
@@ -7277,6 +7312,7 @@ fn deliver_exit_frame_exception(
     if exit_frame_handler_needs_unwritten_stack(frame) {
         return Err(err);
     }
+    screen_frame_already_recorded(frame as *const PyFrame, &mut err);
     if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut handler_instr) {
         frame.set_last_instr_from_next_instr(handler_instr);
         handle_jitexception(frame)
@@ -7656,6 +7692,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     // per-opcode `Err` arm below); resume at the handler pc when
                     // caught, otherwise propagate it out as a plain `Done(Err)`.
                     if let LoopResult::ExitFrameWithException(mut err) = loop_result {
+                        screen_frame_already_recorded(f as *const PyFrame, &mut err);
                         if pyre_interpreter::eval::handle_exception(
                             unsafe { &mut *f },
                             &mut err,
