@@ -779,7 +779,11 @@ fn call_user_function_with_eval(
     eval_fn(&mut func_frame)
 }
 
-/// Residual-call sibling of [`call_user_function_plain`] that keeps the
+/// [`call_user_function`] with the execution context in place of the caller
+/// frame — the `function.py:79 Function.call_args(self, args)` shape, which
+/// upstream reaches with no frame at all.
+///
+/// Also the residual-call sibling of [`call_user_function_plain`], keeping the
 /// JIT-aware eval function.
 ///
 /// `blackhole.py:1225 bhimpl_residual_call_r_i` is `cpu.bh_call_i(func, ...)`
@@ -811,7 +815,7 @@ fn call_user_function_with_eval(
 /// The caller-side `FrameLocalsRoot` is skipped for the same reason it is in
 /// [`call_user_function_plain_with_ctx`] — no caller `PyFrame` is available.
 /// The callee root is still installed so its locals stay reachable.
-pub fn call_user_function_residual_with_ctx(
+pub fn call_user_function_with_ctx(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     args: &[PyObjectRef],
@@ -830,7 +834,7 @@ pub fn call_user_function_residual_with_ctx(
 /// (call_kw) already produced the final scope via resolve_kwargs which
 /// mirrors PyPy's Arguments.parse_into_scope.
 pub fn call_user_function_resolved(
-    frame: &PyFrame,
+    execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
@@ -849,7 +853,7 @@ pub fn call_user_function_resolved(
                 w_code,
                 args,
                 w_globals,
-                frame.execution_context,
+                execution_context,
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             )?);
@@ -863,12 +867,11 @@ pub fn call_user_function_resolved(
             w_code,
             args,
             w_globals,
-            frame.execution_context,
+            execution_context,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         )?);
     func_frame.fix_array_ptrs();
-    let _caller_locals_root = FrameLocalsRoot::new(frame);
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     eval_fn(&mut func_frame)
 }
@@ -987,8 +990,56 @@ enum CallMode {
     Plain,
 }
 
+/// `baseobjspace.py:1243 call_valuestack(w_func, nargs, frame, …)` — the one
+/// dispatcher upstream gives a frame to.  It settles the C-profile question and
+/// hands off to the frameless `space.call_args`, which is
+/// [`call_callable_in_ctx`].
+///
+/// Pyre adds one thing to that shape: `FrameLocalsRoot` on the caller.  RPython
+/// roots the caller's locals through the shadowstack of the translated
+/// `call_valuestack`; this Rust ABI boundary is outside that transform, so the
+/// root is installed here and held across the whole dispatch.
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
-    call_callable_with_mode(frame, callable, args, CallMode::Jit)
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    call_callable_with_mode(frame.execution_context, callable, args, CallMode::Jit)
+}
+
+/// `descroperation.py:189 call_args(space, w_obj, args)` — the generic callable
+/// dispatcher, which upstream reaches with **no frame**: `Function.call_args`
+/// (`function.py:79`) goes straight to `code.funcrun(self, args)` and the callee
+/// frame takes its execution context from the space.
+pub fn call_callable_in_ctx(
+    execution_context: *const crate::PyExecutionContext,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> PyResult {
+    call_callable_with_mode(execution_context, callable, args, CallMode::Jit)
+}
+
+/// The caller frame the C-level profile arm needs, or null when no profiler is
+/// installed.
+///
+/// `baseobjspace.py:1245` gates the arm on `frame.get_is_being_profiled()`, and
+/// that flag has exactly one writer: `executioncontext.py:147-149 call_trace`
+/// sets it only while `profilefunc is not None`, and `:121-123
+/// _c_call_return_trace` clears it and returns the moment `profilefunc is
+/// None`.  So an execution context with no profiler installed cannot take the
+/// arm, and testing that first leaves the frame unresolved on the ordinary
+/// path — `gettopframe_raw` is `force_vref`, and a vref forced while the trace
+/// records is marked as escaping (`virtualref.py:161-167`).
+fn c_profile_frame(execution_context: *const crate::PyExecutionContext) -> *mut PyFrame {
+    if execution_context.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ec = unsafe { &*execution_context };
+    if ec.profilefunc.is_none() {
+        return std::ptr::null_mut();
+    }
+    let frame = ec.gettopframe_raw();
+    if frame.is_null() || !unsafe { (*frame).get_is_being_profiled() } {
+        return std::ptr::null_mut();
+    }
+    frame
 }
 
 /// Function/_BuiltinFunction leaf of ObjSpace call dispatch.
@@ -1000,12 +1051,11 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
 /// the method arm below preserve that shape instead of retaining a second
 /// large generic-dispatch Rust frame for every Python method call.
 fn call_function_carrier_with_mode(
-    frame: &mut PyFrame,
+    execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
-    let frame_ptr = frame as *mut PyFrame;
     match classify_callable(callable)? {
         CallableKind::Builtin => {
             // baseobjspace.py:1243 — `if frame.get_is_being_profiled() and
@@ -1014,14 +1064,10 @@ fn call_function_carrier_with_mode(
             // here: `classify_callable` already selected the builtin arm
             // (`runtime_ops.rs`: `if is_builtin_code(code) { Builtin }`),
             // so reaching this closure means the callable is a builtin.
-            // The remaining condition is the per-frame profile flag, set
-            // by `ec.call_trace` (executioncontext.py:150) on frame entry
-            // and cleared by `_c_call_return_trace` when profilefunc was
-            // turned off (executioncontext.py:122-123).
-            let profile_active = unsafe { (*frame_ptr).get_is_being_profiled() };
-            if profile_active {
+            let profile_frame = c_profile_frame(execution_context);
+            if !profile_frame.is_null() {
                 let w_res = crate::baseobjspace::call_args_and_c_profile(
-                    unsafe { &mut *frame_ptr },
+                    unsafe { &mut *profile_frame },
                     callable,
                     args,
                 );
@@ -1035,10 +1081,31 @@ fn call_function_carrier_with_mode(
             call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
         }
         CallableKind::User => match mode {
-            CallMode::Jit => call_user_function(frame, callable, args),
-            CallMode::Plain => call_user_function_plain(frame, callable, args),
+            CallMode::Jit => call_user_function_with_ctx(execution_context, callable, args),
+            CallMode::Plain => call_user_function_plain_with_ctx(execution_context, callable, args),
         },
     }
+}
+
+/// [`call_function_ex_in_ctx`] reached from a frame — the `pyopcode.py:1429
+/// CALL_FUNCTION_EX` shape, whose else-branch is the frameless
+/// `space.call_args(w_function, args)`.  Installs the caller `FrameLocalsRoot`
+/// the way [`call_callable`] does.
+pub fn call_function_ex(
+    frame: &mut PyFrame,
+    callable: PyObjectRef,
+    self_or_null: PyObjectRef,
+    starargs: PyObjectRef,
+    kwargs_or_null: PyObjectRef,
+) -> PyResult {
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    call_function_ex_in_ctx(
+        frame.execution_context,
+        callable,
+        self_or_null,
+        starargs,
+        kwargs_or_null,
+    )
 }
 
 /// CALL_FUNCTION_EX helper — unpack `starargs`, merge the `**` mapping, and
@@ -1049,8 +1116,8 @@ fn call_function_carrier_with_mode(
 /// the iter protocol; a non-null `**` mapping accepts the dict fast path or
 /// `keys()`/`__getitem__`.  `self_or_null` is the pre-callable stack slot —
 /// a non-null value prepends as arg0.
-pub fn call_function_ex(
-    frame: &mut PyFrame,
+pub fn call_function_ex_in_ctx(
+    execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     self_or_null: PyObjectRef,
     starargs: PyObjectRef,
@@ -1101,11 +1168,32 @@ pub fn call_function_ex(
                 .zip(keywords_w.iter())
                 .map(|(&k, &v)| (unsafe { pyre_object::w_str_get_wtf8(k) }.to_owned(), v))
                 .collect();
-            return call_with_kwargs(frame, callable, &args, &entries);
+            return call_with_kwargs_in_ctx(execution_context, callable, &args, &entries);
         }
     }
 
-    call_callable(frame, callable, &args)
+    call_callable_in_ctx(execution_context, callable, &args)
+}
+
+/// [`call_kw_in_ctx`] reached from a frame — the `pyopcode.py:1402
+/// CALL_FUNCTION_KW` shape, whose else-branch is the frameless
+/// `space.call_args(w_function, args)`.  Installs the caller `FrameLocalsRoot`
+/// the way [`call_callable`] does.
+pub fn call_kw(
+    frame: &mut PyFrame,
+    callable: PyObjectRef,
+    self_or_null: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwarg_names: PyObjectRef,
+) -> PyResult {
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    call_kw_in_ctx(
+        frame.execution_context,
+        callable,
+        self_or_null,
+        positional,
+        kwarg_names,
+    )
 }
 
 /// CALL_KW helper — resolve keyword arguments against the callable and
@@ -1115,8 +1203,8 @@ pub fn call_function_ex(
 /// included); `kwarg_names` is the constant kwnames tuple (its length is
 /// the number of trailing keyword args).  `self_or_null` is the
 /// pre-callable stack slot — a non-null value prepends as arg0.
-pub fn call_kw(
-    frame: &mut PyFrame,
+pub fn call_kw_in_ctx(
+    execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     self_or_null: PyObjectRef,
     positional: &[PyObjectRef],
@@ -1163,7 +1251,12 @@ pub fn call_kw(
                 kw_entries.push((key, args[n_pos + ki]));
             }
         }
-        return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+        return call_with_kwargs_in_ctx(
+            execution_context,
+            callable_unwrapped,
+            &pos_args,
+            &kw_entries,
+        );
     }
 
     // A base classmethod has no tp_call, but a user subtype may define
@@ -1185,7 +1278,12 @@ pub fn call_kw(
                 kw_entries.push((key, args[n_pos + ki]));
             }
         }
-        return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+        return call_with_kwargs_in_ctx(
+            execution_context,
+            callable_unwrapped,
+            &pos_args,
+            &kw_entries,
+        );
     }
 
     // For type objects with kwargs: use call_with_kwargs which handles
@@ -1207,7 +1305,12 @@ pub fn call_kw(
                     kw_entries.push((key, args[n_pos + ki]));
                 }
             }
-            return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+            return call_with_kwargs_in_ctx(
+                execution_context,
+                callable_unwrapped,
+                &pos_args,
+                &kw_entries,
+            );
         }
     }
 
@@ -1231,7 +1334,12 @@ pub fn call_kw(
                 kw_entries.push((key, args[n_pos + ki]));
             }
         }
-        return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+        return call_with_kwargs_in_ctx(
+            execution_context,
+            callable_unwrapped,
+            &pos_args,
+            &kw_entries,
+        );
     }
 
     // Resolve keyword args into positional order.
@@ -1269,9 +1377,14 @@ pub fn call_kw(
             // through call_with_kwargs so pyre's profile path constructs
             // Arguments::with_kw instead of treating the kwargs dict tail
             // as a positional firstarg.
-            return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+            return call_with_kwargs_in_ctx(
+                execution_context,
+                callable_unwrapped,
+                &pos_args,
+                &kw_entries,
+            );
         }
-        return call_callable(frame, callable_unwrapped, &args);
+        return call_callable_in_ctx(execution_context, callable_unwrapped, &args);
     }
 
     // `descroperation.py descr_call` binds an instance's `__call__` and
@@ -1299,7 +1412,12 @@ pub fn call_kw(
                     kw_entries.push((key, args[n_pos + ki]));
                 }
             }
-            return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+            return call_with_kwargs_in_ctx(
+                execution_context,
+                callable_unwrapped,
+                &pos_args,
+                &kw_entries,
+            );
         }
     }
 
@@ -1336,9 +1454,9 @@ pub fn call_kw(
     let _ = prepended;
 
     if unsafe { crate::is_function(target_func) } {
-        call_user_function_resolved(frame, target_func, &resolved)
+        call_user_function_resolved(execution_context, target_func, &resolved)
     } else {
-        call_callable(frame, target_func, &resolved)
+        call_callable_in_ctx(execution_context, target_func, &resolved)
     }
 }
 
@@ -1474,7 +1592,7 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, 
 /// descriptor/type dispatcher below.
 #[inline(always)]
 fn call_callable_with_mode(
-    frame: &mut PyFrame,
+    execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     args: &[PyObjectRef],
     mode: CallMode,
@@ -1483,7 +1601,7 @@ fn call_callable_with_mode(
     // speedhack and calls `funccall_valuestack` directly.  Do not retain the
     // generic descriptor/type dispatcher across every Python frame.
     if unsafe { crate::is_function_carrier(callable) } {
-        return call_function_carrier_with_mode(frame, callable, args, mode);
+        return call_function_carrier_with_mode(execution_context, callable, args, mode);
     }
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
@@ -1504,38 +1622,38 @@ fn call_callable_with_mode(
             // function.py `_Method.call_args` -> baseobjspace.py
             // `call_obj_args`: exact Function/BuiltinFunction carriers skip a
             // second generic callable dispatch.
-            return call_function_carrier_with_mode(frame, func, &call_args, mode);
+            return call_function_carrier_with_mode(execution_context, func, &call_args, mode);
         }
-        return call_callable_with_mode(frame, func, &call_args, mode);
+        return call_callable_with_mode(execution_context, func, &call_args, mode);
     }
-    call_non_function_callable_with_mode(frame, callable, args, mode)
+    call_non_function_callable_with_mode(execution_context, callable, args, mode)
 }
 
 #[inline(never)]
 fn call_non_function_callable_with_mode(
-    frame: &mut PyFrame,
+    execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
     if unsafe { pyre_object::is_type(callable) } {
         if let Some(bound) = metaclass_call_override(callable) {
-            return call_callable_with_mode(frame, bound, args, mode);
+            return call_callable_with_mode(execution_context, bound, args, mode);
         }
-        return type_descr_call_with_mode(frame, callable, args, mode);
+        return type_descr_call_with_mode(execution_context, callable, args, mode);
     }
 
     // staticmethod → unwrap
     // PyPy: function.py StaticMethod.descr_call
     if unsafe { pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
-        return call_callable_with_mode(frame, func, args, mode);
+        return call_callable_with_mode(execution_context, func, args, mode);
     }
     if let Some(bound) = staticmethod_call_override(callable)? {
-        return call_callable_with_mode(frame, bound, args, mode);
+        return call_callable_with_mode(execution_context, bound, args, mode);
     }
     if let Some(bound) = classmethod_call_override(callable)? {
-        return call_callable_with_mode(frame, bound, args, mode);
+        return call_callable_with_mode(execution_context, bound, args, mode);
     }
     // The base ClassMethod defines no descr_call (function.py), so a raw
     // classmethod object falls through to the not-callable error.
@@ -1561,7 +1679,7 @@ fn call_non_function_callable_with_mode(
             let mut call_args = Vec::with_capacity(1 + current_args.len());
             call_args.push(current_callable);
             call_args.extend_from_slice(&current_args);
-            return call_callable_with_mode(frame, call_fn, &call_args, mode);
+            return call_callable_with_mode(execution_context, call_fn, &call_args, mode);
         }
         // `user_call_slot`'s stack_check bounds a self-referential
         // `A.__call__ = A()` chain only while this self-dispatch recurses
@@ -1569,7 +1687,7 @@ fn call_non_function_callable_with_mode(
         // dropping only after the call returns, keeps it off the tail so LLVM
         // cannot rewrite the self-call into a loop that never grows the stack.
         let _depth_guard = enter_native_dispatch();
-        return call_callable_with_mode(frame, call_fn, &current_args, mode);
+        return call_callable_with_mode(execution_context, call_fn, &current_args, mode);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -1577,12 +1695,12 @@ fn call_non_function_callable_with_mode(
     // `result.__orig_class__ = self`.
     if unsafe { pyre_object::is_generic_alias(callable) } {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(callable) };
-        let result = call_callable_with_mode(frame, origin, args, mode)?;
+        let result = call_callable_with_mode(execution_context, origin, args, mode)?;
         set_orig_class(result, callable)?;
         return Ok(result);
     }
 
-    call_function_carrier_with_mode(frame, callable, args, mode)
+    call_function_carrier_with_mode(execution_context, callable, args, mode)
 }
 
 pub fn call_user_function(
@@ -1673,7 +1791,8 @@ pub fn call_callable_inline_residual(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    call_callable_with_mode(frame, callable, args, CallMode::Plain)
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    call_callable_with_mode(frame.execution_context, callable, args, CallMode::Plain)
 }
 
 // ── __build_class__ implementation ───────────────────────────────────
@@ -2252,13 +2371,25 @@ pub(crate) fn bind_kwargs_to_signature(
     Ok(result)
 }
 
+/// [`call_with_kwargs_in_ctx`] reached from a frame.  Installs the caller
+/// `FrameLocalsRoot` the way [`call_callable`] does.
+pub fn call_with_kwargs(
+    frame: &mut crate::pyframe::PyFrame,
+    callable: PyObjectRef,
+    pos_args: &[PyObjectRef],
+    kwargs: &[(Wtf8Buf, PyObjectRef)],
+) -> PyResult {
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    call_with_kwargs_in_ctx(frame.execution_context, callable, pos_args, kwargs)
+}
+
 /// Call a user function with positional args + keyword args from a dict.
 ///
 /// PyPy: argument.py Arguments._match_signature with keyword handling.
 /// Used by CALL_FUNCTION_KW / CALL_KW and CALL_FUNCTION_EX when kwargs
 /// are non-empty.
-pub fn call_with_kwargs(
-    frame: &mut crate::pyframe::PyFrame,
+pub fn call_with_kwargs_in_ctx(
+    execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     pos_args: &[PyObjectRef],
     kwargs: &[(Wtf8Buf, PyObjectRef)],
@@ -2287,15 +2418,15 @@ pub fn call_with_kwargs(
     // collections unchanged to its w_function.
     if unsafe { pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
-        return call_with_kwargs(frame, func, pos_args, kwargs);
+        return call_with_kwargs_in_ctx(execution_context, func, pos_args, kwargs);
     }
     if let Some(bound) = staticmethod_call_override(callable)? {
-        return call_with_kwargs(frame, bound, pos_args, kwargs);
+        return call_with_kwargs_in_ctx(execution_context, bound, pos_args, kwargs);
     }
 
     if unsafe { pyre_object::is_classmethod(callable) } {
         if let Some(bound) = classmethod_call_override(callable)? {
-            return call_with_kwargs(frame, bound, pos_args, kwargs);
+            return call_with_kwargs_in_ctx(execution_context, bound, pos_args, kwargs);
         }
         let type_name = crate::typedef::r#type(callable)
             .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
@@ -2314,14 +2445,14 @@ pub fn call_with_kwargs(
             full_args.push(receiver);
         }
         full_args.extend_from_slice(pos_args);
-        return call_with_kwargs(frame, func, &full_args, kwargs);
+        return call_with_kwargs_in_ctx(execution_context, func, &full_args, kwargs);
     }
 
     // A class call routes through `type(cls).__call__` when the metaclass
     // overrides it (enum functional API passes `module=`/`type=` kwargs).
     if unsafe { pyre_object::is_type(callable) } {
         if let Some(bound) = metaclass_call_override(callable) {
-            return call_with_kwargs(frame, bound, pos_args, kwargs);
+            return call_with_kwargs_in_ctx(execution_context, bound, pos_args, kwargs);
         }
     }
 
@@ -2365,8 +2496,8 @@ pub fn call_with_kwargs(
                 // `c_call_trace` / `c_return_trace`, so route the bound flat
                 // slice through the profile-aware path like the marker branch
                 // below rather than invoking the builtin directly.
-                let frame_ptr = frame as *mut PyFrame;
-                if unsafe { (*frame_ptr).get_is_being_profiled() } {
+                let frame_ptr = c_profile_frame(execution_context);
+                if !frame_ptr.is_null() {
                     let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
                         .iter()
                         .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
@@ -2467,9 +2598,8 @@ pub fn call_with_kwargs(
                 // breaking the FunctionWithFixedCode rebinding's
                 // firstarg() (`argument.py:164-168` returns `None`
                 // when positional count is zero, not the kwargs dict).
-                let frame_ptr = frame as *mut PyFrame;
-                let profile_active = unsafe { (*frame_ptr).get_is_being_profiled() };
-                if profile_active {
+                let frame_ptr = c_profile_frame(execution_context);
+                if !frame_ptr.is_null() {
                     let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
                         .iter()
                         .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
@@ -2505,7 +2635,7 @@ pub fn call_with_kwargs(
                     return Ok(w_res);
                 }
             }
-            return call_callable(frame, callable, &full_args);
+            return call_callable_in_ctx(execution_context, callable, &full_args);
         }
 
         // For user functions: resolve kwargs to parameter slots
@@ -2759,7 +2889,7 @@ pub fn call_with_kwargs(
                     w_code,
                     &final_args,
                     w_globals,
-                    frame.execution_context,
+                    execution_context,
                     closure,
                     crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
                 )?,
@@ -2859,9 +2989,9 @@ pub fn call_with_kwargs(
             new_args.push(current_metaclass());
             new_args.extend_from_slice(pos_args);
             if unsafe { crate::is_function(new_fn) } && !kwargs.is_empty() {
-                call_with_kwargs(frame, new_fn, &new_args, kwargs)?
+                call_with_kwargs_in_ctx(execution_context, new_fn, &new_args, kwargs)?
             } else {
-                call_callable(frame, new_fn, &new_args)?
+                call_callable_in_ctx(execution_context, new_fn, &new_args)?
             }
         } else {
             pyre_object::w_instance_new(current_type())
@@ -2895,7 +3025,7 @@ pub fn call_with_kwargs(
                 // descriptor dispatch.
                 init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
                 init_args.extend_from_slice(pos_args);
-                call_with_kwargs(frame, init_descr, &init_args, kwargs)?
+                call_with_kwargs_in_ctx(execution_context, init_descr, &init_args, kwargs)?
             } else {
                 let init_fn = unsafe {
                     crate::baseobjspace::get(
@@ -2905,7 +3035,7 @@ pub fn call_with_kwargs(
                     )?
                 }
                 .unwrap_or(init_descr);
-                call_with_kwargs(frame, init_fn, pos_args, kwargs)?
+                call_with_kwargs_in_ctx(execution_context, init_fn, pos_args, kwargs)?
             };
             check_init_returned_none(init_result)?;
         }
@@ -2921,7 +3051,7 @@ pub fn call_with_kwargs(
             full_args.push(w_self);
         }
         full_args.extend_from_slice(pos_args);
-        return call_with_kwargs(frame, func, &full_args, kwargs);
+        return call_with_kwargs_in_ctx(execution_context, func, &full_args, kwargs);
     }
 
     if let Some((call_fn, prepend_receiver)) = user_call_slot(current_callable())? {
@@ -2938,13 +3068,23 @@ pub fn call_with_kwargs(
             let mut call_args = Vec::with_capacity(1 + current_pos_args.len());
             call_args.push(current_callable());
             call_args.extend_from_slice(&current_pos_args);
-            return call_with_kwargs(frame, call_fn, &call_args, &current_kwargs);
+            return call_with_kwargs_in_ctx(
+                execution_context,
+                call_fn,
+                &call_args,
+                &current_kwargs,
+            );
         }
         // Depth guard: count this dispatch level and, dropping after the call,
         // keep it off the tail so a self-referential `A.__call__ = A()`
         // recurses natively for stack_check (see call_callable_with_mode).
         let _depth_guard = enter_native_dispatch();
-        return call_with_kwargs(frame, call_fn, &current_pos_args, &current_kwargs);
+        return call_with_kwargs_in_ctx(
+            execution_context,
+            call_fn,
+            &current_pos_args,
+            &current_kwargs,
+        );
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -2952,13 +3092,13 @@ pub fn call_with_kwargs(
     // `result.__orig_class__ = self`.
     if unsafe { pyre_object::is_generic_alias(callable) } {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(callable) };
-        let result = call_with_kwargs(frame, origin, pos_args, kwargs)?;
+        let result = call_with_kwargs_in_ctx(execution_context, origin, pos_args, kwargs)?;
         set_orig_class(result, callable)?;
         return Ok(result);
     }
 
     // Fallback: call_callable with positional args only
-    call_callable(frame, callable, pos_args)
+    call_callable_in_ctx(execution_context, callable, pos_args)
 }
 
 pub fn register_build_class() {
@@ -4763,7 +4903,7 @@ pub(crate) fn call_init_subclass_on_bases(
 // PyPy equivalent: typeobject.py descr_call → __new__ + __init__
 
 fn type_descr_call_with_mode(
-    frame: &mut PyFrame,
+    execution_context: *const crate::PyExecutionContext,
     w_type: PyObjectRef,
     args: &[PyObjectRef],
     mode: CallMode,
@@ -4793,7 +4933,7 @@ fn type_descr_call_with_mode(
     let mut new_args = Vec::with_capacity(1 + args.len());
     new_args.push(w_type);
     new_args.extend_from_slice(args);
-    let instance = call_callable_with_mode(frame, new_fn, &new_args, mode)?;
+    let instance = call_callable_with_mode(execution_context, new_fn, &new_args, mode)?;
     let _instance_roots = pyre_object::gc_roots::push_roots();
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(instance);
@@ -4811,13 +4951,13 @@ fn type_descr_call_with_mode(
                 let mut init_args = Vec::with_capacity(1 + args.len());
                 init_args.push(current_instance());
                 init_args.extend_from_slice(args);
-                call_callable_with_mode(frame, init_descr, &init_args, mode)?
+                call_callable_with_mode(execution_context, init_descr, &init_args, mode)?
             } else {
                 let init_fn = unsafe {
                     crate::baseobjspace::get(init_descr, current_instance(), w_insttype)?
                 }
                 .unwrap_or(init_descr);
-                call_callable_with_mode(frame, init_fn, args, mode)?
+                call_callable_with_mode(execution_context, init_fn, args, mode)?
             };
             check_init_returned_none(init_result)?;
         }

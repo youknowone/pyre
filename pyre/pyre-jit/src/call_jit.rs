@@ -4770,9 +4770,11 @@ bh_call_fn_arity!(bh_call_fn_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 bh_call_fn_arity!(bh_call_fn_14; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13);
 
 /// CALL_KW residual shared body (`call_kw(callable, self_or_null,
-/// positional, kwnames)` HLOp → per-arity `residual_call_r_r`).  Resolves
-/// the parent frame from the execution context like [`bh_call_fn_impl`],
-/// then runs keyword resolution + the dispatched call under
+/// positional, kwnames)` HLOp → per-arity `residual_call_r_r`).  Carries no
+/// frame, like [`bh_call_fn_impl`]: `pyopcode.py:1402 CALL_FUNCTION_KW`
+/// settles the C-profile question against its own frame and then calls the
+/// frameless `space.call_args(w_function, args)`, which is what a residual
+/// reaches.  Keyword resolution + the dispatched call run under
 /// `force_plain_eval` (blackhole.py:1225 `bhimpl_residual_call_*` is an
 /// opaque CPU call — no JIT re-entry; `call_kw`'s
 /// `call_user_function_resolved` fast path routes through the JIT-aware
@@ -4787,25 +4789,17 @@ fn bh_call_kw_impl(
     positional: &[PyObjectRef],
 ) -> i64 {
     let ec = pyre_interpreter::call::getexecutioncontext();
-    let parent_frame_ptr: *const PyFrame = if ec.is_null() {
-        std::ptr::null()
-    } else {
-        unsafe { (*ec).gettopframe_raw() as *const PyFrame }
-    };
     assert!(
-        !parent_frame_ptr.is_null(),
-        "bh_call_kw_impl requires a live parent PyFrame from \
-         getexecutioncontext().gettopframe_raw(); the eval loop must pin the \
-         execution context before any residual call"
+        !ec.is_null(),
+        "bh_call_kw_impl requires a pinned execution context from \
+         getexecutioncontext(); the eval loop must pin the execution context \
+         before any residual call"
     );
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
-    unsafe {
-        pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
-    }
-    let parent_frame = unsafe { &mut *(parent_frame_ptr as *mut PyFrame) };
+    pyre_interpreter::call::set_last_exec_ctx(ec);
     let result = {
         let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_kw(parent_frame, callable, null_or_self, positional, kwnames)
+        pyre_interpreter::call::call_kw_in_ctx(ec, callable, null_or_self, positional, kwnames)
     };
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
@@ -5020,8 +5014,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         // `GUARD_NO_EXCEPTION` as a spurious pending exception (the failure
         // `drain_backend_jit_exc` names for the walker's snapshot side).
         let parked = park_residual_call_exception();
-        let result =
-            pyre_interpreter::call::call_user_function_residual_with_ctx(ec, callable, &call_args);
+        let result = pyre_interpreter::call::call_user_function_with_ctx(ec, callable, &call_args);
         unpark_residual_call_exception(parked);
         pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
         return match result {
@@ -5058,9 +5051,11 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
 /// CALL_FUNCTION_EX residual (`call_function_ex(callable, self_or_null,
 /// starargs, kwargs_or_null)` HLOp → `residual_call_r_r`).  Unpacks the
 /// `*` iterable and merges the `**` mapping through the shared
-/// `call::call_function_ex`, then dispatches.  Resolves the parent frame
-/// from the execution context like [`bh_call_fn_impl`], and runs the
-/// nested Python call under `force_plain_eval` (blackhole.py:1225
+/// `call::call_function_ex`, then dispatches.  Carries no frame, like
+/// [`bh_call_fn_impl`]: `pyopcode.py:1429 CALL_FUNCTION_EX` settles the
+/// C-profile question against its own frame and then calls the frameless
+/// `space.call_args(w_function, args)`, which is what a residual reaches.
+/// The nested Python call runs under `force_plain_eval` (blackhole.py:1225
 /// `bhimpl_residual_call_*` is an opaque CPU call — no JIT re-entry).
 /// MayForce: unpacking an arbitrary iterable / mapping and the dispatched
 /// call may run Python.
@@ -5071,26 +5066,18 @@ pub extern "C" fn bh_call_function_ex_fn(
     kwargs_or_null: i64,
 ) -> i64 {
     let ec = pyre_interpreter::call::getexecutioncontext();
-    let parent_frame_ptr: *const PyFrame = if ec.is_null() {
-        std::ptr::null()
-    } else {
-        unsafe { (*ec).gettopframe_raw() as *const PyFrame }
-    };
     assert!(
-        !parent_frame_ptr.is_null(),
-        "bh_call_function_ex_fn requires a live parent PyFrame from \
-         getexecutioncontext().gettopframe_raw(); the eval loop must pin the \
-         execution context before any residual call"
+        !ec.is_null(),
+        "bh_call_function_ex_fn requires a pinned execution context from \
+         getexecutioncontext(); the eval loop must pin the execution context \
+         before any residual call"
     );
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
-    unsafe {
-        pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
-    }
-    let parent_frame = unsafe { &mut *(parent_frame_ptr as *mut PyFrame) };
+    pyre_interpreter::call::set_last_exec_ctx(ec);
     let result = {
         let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_function_ex(
-            parent_frame,
+        pyre_interpreter::call::call_function_ex_in_ctx(
+            ec,
             callable as PyObjectRef,
             self_or_null as PyObjectRef,
             starargs as PyObjectRef,
