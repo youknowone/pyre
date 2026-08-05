@@ -77,6 +77,13 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::LoadName { .. }
         | Instruction::LoadDeref { .. }
         | Instruction::LoadLocals
+        // LOAD_BUILD_CLASS shares one codewriter arm and one liveness arm with
+        // LOAD_LOCALS (`(d + 1, d + 1)`), and the `abort_permanent` arm there is
+        // gated on `is_locals && !is_true_portal`, so it always lowers to the
+        // `load_build_class` residual plus `emit_pushvalue_ref!`.  Left
+        // unmodeled it killed the mirror at the first `class` statement in a
+        // loop-owning frame.
+        | Instruction::LoadBuildClass
         | Instruction::UnaryNegative
         | Instruction::UnaryNot
         | Instruction::UnaryInvert
@@ -95,6 +102,14 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::ToBool
         | Instruction::GetIter
         | Instruction::GetLen
+        // MATCH_SEQUENCE / MATCH_MAPPING / MATCH_KEYS peek their operands and
+        // push one result (liveness `(d + 1, d + 1)`), the same shape as GET_LEN
+        // and IMPORT_FROM in this group.  `match_keys` is bound MayForce — it
+        // runs the subject's `get` — so a replay of a region containing one can
+        // re-enter a Python frame.
+        | Instruction::MatchSequence
+        | Instruction::MatchMapping
+        | Instruction::MatchKeys
         | Instruction::LoadAttr { .. }
         | Instruction::ImportFrom { .. }
         | Instruction::BinaryOp { .. }
@@ -119,6 +134,14 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::ConvertValue { .. }
         | Instruction::BinarySlice
         | Instruction::ImportName { .. }
+        // MATCH_CLASS pops the keyword-names tuple, the class and the subject
+        // and pushes one result (liveness `(d - 2, d - 2)`), so the new TOS sits
+        // where the popped `subject` box was and `ResultToTos` overwrites it.
+        // `MultiResultFromShadow` would be wrong here: its pop point is
+        // `vstack_depth - 1`, which for a net-negative opcode is an EMPTY clear
+        // range, and both hole-fill helpers skip non-NONE slots — the stale
+        // `subject` box would survive as the result.
+        | Instruction::MatchClass { .. }
         // MAKE_FUNCTION pops the code object and pushes the built function
         // (net 0, `stack_effects` `(d, d)`).  The `make_function_value`
         // residual's Ref result reaches the new TOS through the operand-stack
