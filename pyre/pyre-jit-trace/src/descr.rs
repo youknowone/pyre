@@ -984,6 +984,63 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     )
 });
 
+static SEQ_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::iterobject::W_SeqIterObject>(),
+        W_SEQ_ITER_GC_TYPE_ID,
+        &pyre_object::iterobject::SEQ_ITER_TYPE as *const _ as usize,
+        &[
+            (
+                "seq",
+                pyre_object::iterobject::SEQ_ITER_SEQ_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "index",
+                pyre_object::iterobject::SEQ_ITER_INDEX_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "length",
+                pyre_object::iterobject::SEQ_ITER_LENGTH_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "empty_kind",
+                pyre_object::iterobject::SEQ_ITER_EMPTY_KIND_OFFSET,
+                1,
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_SeqIterObject",
+        "iterobject::W_SeqIterObject",
+    )
+});
+
+/// `stop` carries no accessor of its own — the GET_ITER virtualization derives
+/// the cursor from `start` / `step` / `length` — but it is a pointer-shaped
+/// slot, so it belongs in the census for the same reason `FUNCTION_DESCR_GROUP`
+/// lists every slot: `clear_gc_fields` walks exactly this group's
+/// `gc_fielddescrs` to emit a fresh object's delayed NULL stores, and a slot
+/// left out would keep recycled nursery bytes that the collector then follows
+/// as a child reference.  Its presence also keeps the list in byte-offset
+/// order, which is what makes the positional numbering agree with the
+/// analyzer's.
 static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<W_Range>(),
@@ -999,6 +1056,7 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
             ),
+            ("stop", RANGE_STOP_OFFSET, 8, Type::Ref, false, true, false),
             ("step", RANGE_STEP_OFFSET, 8, Type::Ref, false, true, false),
             (
                 "length",
@@ -2096,7 +2154,7 @@ use pyre_object::floatobject::{
 };
 use pyre_object::functional::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
-    RANGE_LENGTH_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, W_Range,
+    RANGE_LENGTH_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
 };
 use pyre_object::interp_exceptions::{
     EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET,
@@ -2224,19 +2282,42 @@ pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
 }
 
+/// Field descriptor for `W_SeqIterObject.seq`.
+pub fn seq_iter_seq_descr() -> DescrRef {
+    field_descr_from_group(&SEQ_ITER_DESCR_GROUP, 0)
+}
+
+/// Field descriptor for `W_SeqIterObject.index`.
+pub fn seq_iter_index_descr() -> DescrRef {
+    field_descr_from_group(&SEQ_ITER_DESCR_GROUP, 1)
+}
+
+/// Resolve one [`RANGE_DESCR_GROUP`] field by byte offset, so the accessors
+/// below stay correct however the census is ordered.  They were positional
+/// until `stop` joined the census and shifted every later slot.
+fn range_field_descr(offset: usize) -> DescrRef {
+    let parent = RANGE_DESCR_GROUP.size_descr.clone() as DescrRef;
+    majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
+}
+
 /// Field descriptor for `W_Range.start` (wrapped PyObjectRef).
 pub fn range_start_descr() -> DescrRef {
-    field_descr_from_group(&RANGE_DESCR_GROUP, 0)
+    range_field_descr(RANGE_START_OFFSET)
+}
+
+/// Field descriptor for `W_Range.stop` (wrapped PyObjectRef).
+pub fn range_stop_descr() -> DescrRef {
+    range_field_descr(RANGE_STOP_OFFSET)
 }
 
 /// Field descriptor for `W_Range.step` (wrapped PyObjectRef).
 pub fn range_step_descr() -> DescrRef {
-    field_descr_from_group(&RANGE_DESCR_GROUP, 1)
+    range_field_descr(RANGE_STEP_OFFSET)
 }
 
 /// Field descriptor for `W_Range.length` (wrapped PyObjectRef).
 pub fn range_length_descr() -> DescrRef {
-    field_descr_from_group(&RANGE_DESCR_GROUP, 2)
+    range_field_descr(RANGE_LENGTH_OFFSET)
 }
 
 /// `Method.w_function` — the underlying function (`Function` or
@@ -2787,6 +2868,78 @@ pub fn str_len_descr() -> DescrRef {
 
 // ── Object header & allocation descriptors ──────────────────────────
 
+/// `PyCode.code_ptr` — the host `CodeObject` every code-field getter resolves
+/// through (`code_get_field` -> `require_code`).  Read only to prove it is
+/// non-null, which is the check the getter would have run.
+///
+/// The three code descrs below are standalone rather than a positional group:
+/// a `PyCode` is never allocated from a trace, so the group's size / GC-edge
+/// half would have no consumer, and publishing a partial layout under the
+/// live `W_CODE_GC_TYPE_ID` would put a second answer in the registry for a
+/// type the collector already describes.
+static PYCODE_CODE_PTR_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
+    Arc::new(PyreFieldDescr {
+        offset: pyre_interpreter::pycode::CODE_PTR_OFFSET,
+        field_size: std::mem::size_of::<*const ()>(),
+        field_type: Type::Int,
+        signed: false,
+        immutable: false,
+        quasi_immutable: false,
+        name: "code_ptr",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
+});
+
+pub fn pycode_code_ptr_descr() -> DescrRef {
+    PYCODE_CODE_PTR_FIELD_DESCR.clone() as DescrRef
+}
+
+/// `PyCode.w_name` — the realized `co_name` string.  `w_code_name_obj` builds
+/// it on first demand and retains it, so the slot IS the getter's value once
+/// it is non-null; a null slot declines to the residual, which realizes it.
+static PYCODE_W_NAME_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
+    Arc::new(PyreFieldDescr {
+        offset: pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
+        field_size: std::mem::size_of::<pyre_object::PyObjectRef>(),
+        field_type: Type::Ref,
+        signed: false,
+        immutable: false,
+        quasi_immutable: false,
+        name: "w_name",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
+});
+
+pub fn pycode_w_name_descr() -> DescrRef {
+    PYCODE_W_NAME_FIELD_DESCR.clone() as DescrRef
+}
+
+/// `PyCode.co_firstlineno_raw` — a signed 32-bit slot, because 3.14's
+/// `CodeType` constructor accepts zero and negative first lines that
+/// `CodeObject.first_line_number` cannot hold.
+static PYCODE_CO_FIRSTLINENO_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
+    Arc::new(PyreFieldDescr {
+        offset: pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
+        field_size: std::mem::size_of::<i32>(),
+        field_type: Type::Int,
+        signed: true,
+        immutable: false,
+        quasi_immutable: false,
+        name: "co_firstlineno_raw",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
+});
+
+pub fn pycode_co_firstlineno_descr() -> DescrRef {
+    PYCODE_CO_FIRSTLINENO_FIELD_DESCR.clone() as DescrRef
+}
+
 /// Size descriptor for W_IntObject allocation via NewWithVtable.
 /// vtable = &INT_TYPE (ob_type for virtual materialization).
 pub fn w_int_size_descr() -> DescrRef {
@@ -2803,6 +2956,12 @@ pub fn w_bool_size_descr() -> DescrRef {
 /// vtable = &RANGE_ITER_TYPE; type_id = 0.
 pub fn w_range_iter_size_descr() -> DescrRef {
     RANGE_ITER_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for W_Range allocation via NewWithVtable.
+/// vtable = &RANGE_TYPE.
+pub fn w_range_size_descr() -> DescrRef {
+    RANGE_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for W_FloatObject allocation via NewWithVtable.
@@ -5479,6 +5638,7 @@ pub(crate) fn publish_runtime_descr_groups() {
         &*W_BOOL_DESCR_GROUP,
         &*W_UNICODE_DESCR_GROUP,
         &*RANGE_ITER_DESCR_GROUP,
+        &*SEQ_ITER_DESCR_GROUP,
         &*RANGE_DESCR_GROUP,
         &*W_METHOD_DESCR_GROUP,
         &*W_OBJECT_MUTABLE_CELL_DESCR_GROUP,

@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=9
+# pyre-check: max-pypy-ratio=4
+# pyre-check: min-pypy-ratio=0.22
 # JIT-stress twin of exception_reraise_tb_depth_hot: `pypyjit.set_param`
 # lowers the trace/function thresholds to 1 so trace recording fires on the
 # earliest iterations rather than only after the ~1600-iteration warmup. That

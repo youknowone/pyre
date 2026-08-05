@@ -313,6 +313,8 @@ pub(crate) struct InlineBodyFacts {
     pub(crate) exc_override_sample_safe: bool,
     /// Body performs a nested Python call.
     pub(crate) exc_override_has_nested_call: bool,
+    /// Body carries a loop header of its own (a `jit_merge_point`).
+    pub(crate) owns_loop_header: bool,
 }
 
 /// Compiled JitCode plus pyre-only metadata.

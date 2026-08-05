@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=252
+# pyre-check: max-pypy-ratio=167
+# pyre-check: min-pypy-ratio=18
 # Regression guard for the per-call-created nested closure JIT hang.
 #
 # `add` is defined fresh on every `make` call, and `make` is driven from a

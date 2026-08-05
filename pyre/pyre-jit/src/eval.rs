@@ -3998,6 +3998,35 @@ fn install_pyre_object_hooks() {
     pyre_object::register_gc_write_barrier_managed_hook(
         pyre_object_gc_write_barrier_managed_trampoline,
     );
+    {
+        use pyre_jit_trace::frame_layout as fl;
+        const T: u32 = pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
+        majit_gc::bh_probe_set_field_names(&[
+            (T, 0, "ob_type"),
+            (T, fl::PYFRAME_EXECUTION_CONTEXT_OFFSET, "execution_context"),
+            (T, fl::PYFRAME_PYCODE_OFFSET, "pycode"),
+            (
+                T,
+                fl::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+                "locals_cells_stack_w",
+            ),
+            (T, fl::PYFRAME_VALUESTACKDEPTH_OFFSET, "valuestackdepth"),
+            (T, fl::PYFRAME_LAST_INSTR_OFFSET, "last_instr"),
+            (T, fl::PYFRAME_FLAGS_OFFSET, "flags"),
+            (T, fl::PYFRAME_DEBUGDATA_OFFSET, "debugdata"),
+            (T, fl::PYFRAME_LASTBLOCK_OFFSET, "lastblock"),
+            (T, fl::PYFRAME_VABLE_TOKEN_OFFSET, "vable_token"),
+            (
+                T,
+                fl::PYFRAME_F_GENERATOR_NOWREF_OFFSET,
+                "f_generator_nowref",
+            ),
+            (T, fl::PYFRAME_W_YIELDING_FROM_OFFSET, "w_yielding_from"),
+            (T, fl::PYFRAME_F_BACKREF_OFFSET, "f_backref"),
+            (T, fl::PYFRAME_W_BUILTIN_OFFSET, "w_builtin"),
+            (T, fl::PYFRAME_W_GLOBALS_OFFSET, "w_globals"),
+        ]);
+    }
     pyre_object::gc_hook::register_gc_identity_hash_hook(pyre_object_gc_identity_hash_trampoline);
     // Let a born-old allocation that crosses the next-major threshold request
     // a collection, the check `external_malloc` (incminimark.py:987-994) makes
@@ -7234,6 +7263,41 @@ fn exit_frame_handler_needs_unwritten_stack(frame: &PyFrame) -> bool {
     lasti && frame.valuestackdepth < frame.nlocals() + frame.ncells() + depth as usize
 }
 
+/// Keep a compiled-run exit from giving its own frame a second traceback node.
+///
+/// `pyopcode.py:148-149 handle_operation_error` attaches one node per frame per
+/// delivery, at the raising instruction, and only then runs the `:152`
+/// exception-table lookup — a frame whose handler declines propagates with no
+/// second attach.  A compiled run records this frame itself (the in-trace
+/// handler-entry arm), and by the time the exception reaches the interpreter for
+/// that table search `frame.last_instr` has advanced past the raise to the
+/// handler dispatch.  A second attach would therefore name the `except` clause
+/// that declined, or the `finally` body, rather than the raise, and the frame
+/// would appear twice.
+///
+/// `record_application_traceback` prepends, so the frame already owns a node
+/// exactly when the chain HEAD names it.  A compiled exit that carries no node
+/// of its own still owes itself one, which is why this is not the unconditional
+/// clear the `FinishConcrete::Raise` arm can afford.
+///
+/// Only the compiled-exit deliveries screen.  An ordinary interpreted raise IS
+/// the `pyopcode.py:148` attach, and `raise caught_object` re-raising by name
+/// legitimately gives one frame two adjacent nodes through the raises
+/// themselves.
+fn screen_frame_already_recorded(frame: *const PyFrame, err: &mut pyre_interpreter::PyError) {
+    if err.exc_object.is_null() || frame.is_null() {
+        return;
+    }
+    let head = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(err.exc_object) };
+    let owns_head = !head.is_null()
+        && unsafe { pyre_interpreter::pytraceback::is_pytraceback(head) }
+        && unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) }
+            == frame as *mut PyFrame;
+    if owns_head {
+        err.attach_tb = false;
+    }
+}
+
 /// warmspot.py:998-1005 `ExitFrameWithExceptionRef` delivery for a compiled-run
 /// exit that surfaced outside the eval loop (the `handle_jit_outcome` /
 /// compile-once path).  Offer the pending exception to `frame`'s exception
@@ -7256,6 +7320,7 @@ fn deliver_exit_frame_exception(
     if exit_frame_handler_needs_unwritten_stack(frame) {
         return Err(err);
     }
+    screen_frame_already_recorded(frame as *const PyFrame, &mut err);
     if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut handler_instr) {
         frame.set_last_instr_from_next_instr(handler_instr);
         handle_jitexception(frame)
@@ -7635,6 +7700,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     // per-opcode `Err` arm below); resume at the handler pc when
                     // caught, otherwise propagate it out as a plain `Done(Err)`.
                     if let LoopResult::ExitFrameWithException(mut err) = loop_result {
+                        screen_frame_already_recorded(f as *const PyFrame, &mut err);
                         if pyre_interpreter::eval::handle_exception(
                             unsafe { &mut *f },
                             &mut err,
@@ -11586,6 +11652,7 @@ fn bh_setfield_gc_byte_write(struct_ptr: i64, value: i64, descr_info: &majit_ir:
     if struct_ptr == 0 {
         return;
     }
+    majit_gc::bh_probe_note_store(struct_ptr as usize, field_offset, 8);
     unsafe {
         let ptr = (struct_ptr as *mut u8).add(field_offset);
         match descr_info.field_size {
@@ -11806,6 +11873,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         // collection reclaims the payload while the materialized struct still
         // points at it, and the following major mark reads a dangling header.
         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+        majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 7);
         unsafe {
             ((struct_ptr as *mut u8).add(descr_info.offset) as *mut usize).write(value as usize);
         }

@@ -2059,6 +2059,15 @@ enum TracebackWalkField {
     /// the fold would have to carry the doubling rather than hand back the
     /// slot.
     TbLineno,
+    /// `code.co_name` — `code_get_field` answers it with `w_code_name_obj`,
+    /// which realizes the string once and retains it on the code object, so
+    /// every later read is the retained slot.
+    CoName,
+    /// `code.co_firstlineno` — the `co_firstlineno_raw` slot, reboxed.  The
+    /// other code fields are deliberately absent: they read the host
+    /// `CodeObject` behind `code_ptr` rather than a slot on the `PyCode`, so
+    /// folding one means a raw load through a second indirection.
+    CoFirstlineno,
 }
 
 /// Which walk hop, if any, this `(receiver, attribute)` pair is.
@@ -2078,7 +2087,35 @@ fn traceback_walk_field(
     if std::ptr::eq(ob_type, &pyre_interpreter::pyframe::FRAME_TYPE) && name == "f_code" {
         return Some(TracebackWalkField::FCode);
     }
+    if std::ptr::eq(ob_type, &pyre_interpreter::pycode::CODE_TYPE) {
+        return match name {
+            "co_name" => Some(TracebackWalkField::CoName),
+            "co_firstlineno" => Some(TracebackWalkField::CoFirstlineno),
+            _ => None,
+        };
+    }
     None
+}
+
+/// Prove the receiving code object still owns its host `CodeObject`, the
+/// `require_code` check every code-field getter runs before reading a slot.
+fn walker_guard_code_ptr_present<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    let code_ptr = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        obj,
+        crate::descr::pycode_code_ptr_descr(),
+    );
+    let live = unsafe { pyre_interpreter::w_code_get_ptr(concrete_obj) } as i64;
+    ctx.trace_ctx
+        .set_opref_concrete(code_ptr, majit_ir::Value::Int(live));
+    let zero = ctx.trace_ctx.const_int(0);
+    let absent = ctx.trace_ctx.record_op(OpCode::IntEq, &[code_ptr, zero]);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[absent])
 }
 
 /// Emit one traceback-walk hop as a guarded inline field read instead of the
@@ -2101,6 +2138,9 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
 
     let receiver_type = match field {
         TracebackWalkField::FCode => &pyre_interpreter::pyframe::FRAME_TYPE,
+        TracebackWalkField::CoName | TracebackWalkField::CoFirstlineno => {
+            &pyre_interpreter::pycode::CODE_TYPE
+        }
         _ => &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
     };
     let descr = match field {
@@ -2108,6 +2148,8 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         TracebackWalkField::TbFrame => crate::descr::pytraceback_frame_descr(),
         TracebackWalkField::FCode => crate::descr::pyframe_code_descr(),
         TracebackWalkField::TbLineno => crate::descr::pytraceback_lineno_descr(),
+        TracebackWalkField::CoName => crate::descr::pycode_w_name_descr(),
+        TracebackWalkField::CoFirstlineno => crate::descr::pycode_co_firstlineno_descr(),
     };
     let w_type = pyre_interpreter::typedef::gettypeobject(receiver_type);
     let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
@@ -2120,6 +2162,41 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     // recording a doomed trace.
     if unsafe { (*concrete_obj).w_class } != w_type {
         return Ok(None);
+    }
+
+    // Every code-field getter resolves the host `CodeObject` first
+    // (`code_get_field` -> `require_code`) and raises when it is absent, so a
+    // code fold owes that check.  It is a slot on the receiver, so the trace
+    // proves it the same way — a read plus a non-null guard — rather than
+    // trusting the record-time object.
+    let code_receiver = matches!(
+        field,
+        TracebackWalkField::CoName | TracebackWalkField::CoFirstlineno
+    );
+    if code_receiver
+        && unsafe { pyre_interpreter::w_code_get_ptr(concrete_obj) }
+            .cast::<u8>()
+            .is_null()
+    {
+        return Ok(None);
+    }
+
+    if field == TracebackWalkField::CoFirstlineno {
+        let live =
+            i64::from(unsafe { pyre_interpreter::pycode::w_code_firstlineno_raw(concrete_obj) });
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        walker_guard_code_ptr_present(ctx, op_pc, obj, concrete_obj)?;
+        let raw_value = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, descr);
+        ctx.trace_ctx
+            .set_opref_concrete(raw_value, majit_ir::Value::Int(live));
+        // Reboxed for the same reason `TbLineno` is: the getter hands back a
+        // Python int, and the boxed op is a heap `NewWithVtable`.
+        let boxed = walker_box_int(ctx, op_pc, raw_value, live)?;
+        let live_ptr = pyre_object::w_int_new(live) as i64;
+        ctx.trace_ctx
+            .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+        return Ok(Some(()));
     }
 
     if field == TracebackWalkField::TbLineno {
@@ -2164,6 +2241,12 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
             (unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(concrete_obj) })
                 as pyre_object::PyObjectRef
         }
+        // `w_name` is realized on first demand, so an unread code object
+        // carries a null here; that declines below and the residual realizes
+        // it for the next attempt.
+        TracebackWalkField::CoName => unsafe {
+            (*(concrete_obj as *const pyre_interpreter::pycode::PyCode)).w_name
+        },
         _ => (unsafe { (*(concrete_obj as *const PyFrame)).pycode }) as pyre_object::PyObjectRef,
     };
     // Only `tb_next` has a null with a defined meaning.  A null frame is a
@@ -2173,6 +2256,9 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         return Ok(None);
     }
     walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    if code_receiver {
+        walker_guard_code_ptr_present(ctx, op_pc, obj, concrete_obj)?;
+    }
     let raw_value = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
     let value = if stored.is_null() {
         // End of the chain.  There is no is-null guard opcode, so pin the
@@ -5895,6 +5981,198 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `range(stop)` / `range(start, stop)` / `range(start, stop, step)` with
+/// exact canonical machine-word ints: lower the opaque constructor residual
+/// to a virtual `W_Range` and four virtual wrapped-int fields.  This lets the
+/// existing GET_ITER specialization consume the range without forcing either
+/// allocation.  All other callables and argument shapes fall through to the
+/// generic residual.
+pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if !(3..=5).contains(&r_args.len()) {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    let range_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE);
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || !std::ptr::eq(concrete_callable, range_type)
+    {
+        return Ok(None);
+    }
+
+    let exact_int_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let mut concrete_args = Vec::with_capacity(r_args.len() - 2);
+    let mut concrete_values = Vec::with_capacity(r_args.len() - 2);
+    for concrete in &arg_concretes[2..] {
+        let ConcreteValue::Ref(arg_obj) = *concrete else {
+            return Ok(None);
+        };
+        if arg_obj.is_null()
+            || unsafe {
+                !std::ptr::eq((*arg_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+                    || !std::ptr::eq((*arg_obj).w_class, exact_int_class)
+            }
+        {
+            return Ok(None);
+        }
+        concrete_args.push(arg_obj);
+        concrete_values.push(unsafe { pyre_object::w_int_get_value(arg_obj) });
+    }
+    if concrete_values.len() == 3 && concrete_values[2] == 0 {
+        return Ok(None);
+    }
+    // Produce the authentic result before emitting IR, keeping every decline
+    // point side-effect-free with respect to the trace under construction.
+    let authentic_range = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &concrete_args)
+    };
+    let Ok(authentic_range) = authentic_range else {
+        return Ok(None);
+    };
+    let (authentic_start, authentic_stop, authentic_step) =
+        unsafe { pyre_object::functional::w_range_fields(authentic_range) };
+    let authentic_length = unsafe { pyre_object::functional::w_range_length(authentic_range) };
+    let authentic_fields = [
+        authentic_start,
+        authentic_stop,
+        authentic_step,
+        authentic_length,
+    ];
+    if authentic_fields.iter().any(|&field| unsafe {
+        !std::ptr::eq((*field).ob_type, &pyre_object::pyobject::INT_TYPE)
+            || !std::ptr::eq((*field).w_class, exact_int_class)
+    }) {
+        return Ok(None);
+    }
+    let concrete_fields =
+        authentic_fields.map(|field| unsafe { pyre_object::w_int_get_value(field) });
+    let [
+        concrete_start,
+        concrete_stop,
+        concrete_step,
+        concrete_length,
+    ] = concrete_fields;
+
+    // The bound test below reads the unboxed `intval`, and that read is only
+    // safe behind the class guards emitted here, so the decline cannot be
+    // hoisted ahead of the emission — it rewinds instead.
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let int_type_const = ctx.trace_ctx.const_int(int_type_addr);
+    let mut raw_args = Vec::with_capacity(concrete_values.len());
+    for (&arg_op, &concrete_value) in r_args[2..].iter().zip(&concrete_values) {
+        if !arg_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(arg_op) {
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[arg_op, int_type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        }
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(arg_op, int_type_addr);
+        walker_guard_exact_w_class(ctx, op.pc, arg_op, exact_int_class)?;
+        let raw = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            arg_op,
+            crate::descr::int_intval_descr(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Int(concrete_value));
+        raw_args.push(raw);
+    }
+
+    let zero = ctx.trace_ctx.const_int(0);
+    let one = ctx.trace_ctx.const_int(1);
+    let (start, stop, step) = match raw_args.as_slice() {
+        [stop] => (zero, *stop, one),
+        [start, stop] => (*start, *stop, one),
+        [start, stop, step] => (*start, *stop, *step),
+        _ => unreachable!("range arity gate admitted an invalid argument count"),
+    };
+    // Trace-constant bounds only.  This is what makes `length` sound as a
+    // record-time constant: a bound that varies per iteration would pair a
+    // stale length with fresh start/stop/step.  The alternative — emitting
+    // `compute_range_length` — costs a division chain plus its overflow
+    // guards, and it regressed two shapes the gate pins: a bound that
+    // alternates empty and non-empty needs the emptiness folded in
+    // branchlessly (a guard side-exits every other call), and the resulting op
+    // run aborts the wasm trace when the `range` sits inside a self-recursive
+    // callee that is inlined per level.  A variable bound keeps the residual
+    // until that is worked out.
+    if !start.is_constant() || !stop.is_constant() || !step.is_constant() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    let length = ctx.trace_ctx.const_int(concrete_length);
+
+    let new = ctx.trace_ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_range_size_descr(),
+    );
+    ctx.trace_ctx.heap_cache_mut().new_object(new);
+
+    let field_descrs = [
+        crate::descr::range_start_descr(),
+        crate::descr::range_stop_descr(),
+        crate::descr::range_step_descr(),
+        crate::descr::range_length_descr(),
+    ];
+    let raw_fields = [start, stop, step, length];
+    for (((descr, raw), concrete_value), authentic_field) in field_descrs
+        .into_iter()
+        .zip(raw_fields)
+        .zip(concrete_fields)
+        .zip(authentic_fields)
+    {
+        let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
+        ctx.trace_ctx.set_opref_concrete(
+            boxed,
+            majit_ir::Value::Ref(majit_ir::GcRef(authentic_field as usize)),
+        );
+        let descr_index = descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[new, boxed], descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(new, descr_index, boxed);
+    }
+
+    let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(new, range_type_addr);
+    ctx.trace_ctx.set_opref_concrete(
+        new,
+        majit_ir::Value::Ref(majit_ir::GcRef(authentic_range as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', new)?;
+    Ok(Some(()))
+}
+
 /// `math.sqrt(x)` on an exact int/float argument: inline the domain-guarded
 /// pure `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` → `sqrt_nonneg`,
 /// EF_ELIDABLE_CANNOT_RAISE) instead of the opaque
@@ -7732,21 +8010,9 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // Decide the final runtime `args_w` list strategy and extract typed
-    // payloads.  OSError can rebind the list after parsing a filename, so its
-    // final slice is selected below after the concrete constructor exposes the
-    // value-dependent branch result.  The shared typed-list emitter reproduces
-    // `w_list_new`'s Integer layout, allowing the common `SystemExit(i)` shape
-    // to virtualize alongside message-bearing Object lists.  The Empty strategy
-    // (zero-argument `raise ValueError()` / `raise StopIteration()`, the most
-    // common raise shape) reproduces `w_list_new(vec![])`'s empty list, and the
-    // Float strategy reproduces its Float layout.
-    enum ArgsEmit {
-        Object,
-        Int(Vec<i64>),
-        Float(Vec<f64>),
-        Empty,
-    }
+    // OSError can rebind `args_w` after parsing a filename, so its final
+    // slice is selected below, once the concrete constructor has exposed the
+    // value-dependent branch result.
 
     let is_canonical = pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable);
     let mut subclass_lookups = None;
@@ -7901,41 +8167,6 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         && !unsafe { pyre_object::is_none(concrete_args[2]) };
     let final_args_len = if has_filename { 2 } else { args.len() };
     let final_args = &args[..final_args_len];
-    let final_concrete_args = &concrete_args[..final_args_len];
-    let args_emit = match pyre_object::listobject::list_strategy_for(final_concrete_args) {
-        pyre_object::listobject::ListStrategy::Object => ArgsEmit::Object,
-        pyre_object::listobject::ListStrategy::Integer => {
-            let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
-            let mut values = Vec::with_capacity(final_concrete_args.len());
-            for &arg in final_concrete_args {
-                if pyre_object::tagged_int::CAN_BE_TAGGED
-                    && pyre_object::tagged_int::is_tagged_int(arg)
-                {
-                    return Ok(None);
-                }
-                let exact_int = unsafe {
-                    pyre_object::is_plain_int1(arg) && std::ptr::eq((*arg).ob_type, int_ty)
-                };
-                if !exact_int {
-                    return Ok(None);
-                }
-                values.push(unsafe { pyre_object::w_int_get_value(arg) });
-            }
-            ArgsEmit::Int(values)
-        }
-        pyre_object::listobject::ListStrategy::Float => {
-            // `all_floats` is strict `type(w) is W_FloatObject`, which reads
-            // `w_class`, so every element is an exact `W_FloatObject` here.
-            // The emit side pins that `w_class` as well: `walker_unbox_float`
-            // guards only the payload `ob_type`, which a subclass shares.
-            let mut values = Vec::with_capacity(final_concrete_args.len());
-            for &arg in final_concrete_args {
-                values.push(unsafe { pyre_object::w_float_get_value(arg) });
-            }
-            ArgsEmit::Float(values)
-        }
-        pyre_object::listobject::ListStrategy::Empty => ArgsEmit::Empty,
-    };
 
     // GuardClass pins each None-sensitive `_init_error` branch.  A tagged
     // immediate cannot be consumed by GuardClass; retain the residual path for
@@ -8012,67 +8243,10 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     }
 
     // Build `args_w` inline so its wrapper and backing block virtualize
-    // alongside the exception.
-    let args_list = match args_emit {
-        ArgsEmit::Object => crate::helpers::emit_object_list_inline(ctx.trace_ctx, final_args),
-        ArgsEmit::Empty => crate::helpers::emit_empty_list_inline(ctx.trace_ctx),
-        ArgsEmit::Float(values) => {
-            let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-            let float_typeobj = pyre_object::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE);
-            let mut raws = Vec::with_capacity(final_args.len());
-            for (&arg, value) in final_args.iter().zip(values) {
-                // A float subclass instance carries the same payload
-                // `ob_type` and only retags `w_class`, so `walker_unbox_float`
-                // alone would let a later subclass argument stay on this trace
-                // and be unboxed into Float-strategy storage — `e.args[0]`
-                // would come back a plain float.  `FloatListStrategy.
-                // is_correct_type` rejects it, so pin the exact `w_class` and
-                // let such an argument side-exit to the residual.  A constant
-                // operand is the same object on every iteration, so its
-                // trace-time `w_class` already holds.
-                if !arg.is_constant() {
-                    walker_guard_exact_w_class(ctx, op.pc, arg, float_typeobj)?;
-                }
-                let raw = walker_unbox_float(ctx, op.pc, arg, float_type_addr)?;
-                ctx.trace_ctx
-                    .set_opref_concrete(raw, majit_ir::Value::Float(value));
-                raws.push(raw);
-            }
-            crate::helpers::emit_typed_list_inline(
-                ctx.trace_ctx,
-                &raws,
-                crate::state::float_gcarray_descr(),
-                crate::descr::list_float_items_len_descr(),
-                crate::descr::list_float_items_block_descr(),
-                pyre_object::listobject::ListStrategy::Float,
-            )
-        }
-        ArgsEmit::Int(values) => {
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            let int_typeobj = pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-            let mut raws = Vec::with_capacity(final_args.len());
-            for (&arg, value) in final_args.iter().zip(values) {
-                // Same subclass hole as the Float arm: `is_plain_int1` rejects
-                // an int subclass on `w_class`, but `walker_unbox_int` guards
-                // the shared payload `ob_type`.
-                if !arg.is_constant() {
-                    walker_guard_exact_w_class(ctx, op.pc, arg, int_typeobj)?;
-                }
-                let raw = walker_unbox_int(ctx, op.pc, arg, int_type_addr)?;
-                ctx.trace_ctx
-                    .set_opref_concrete(raw, majit_ir::Value::Int(value));
-                raws.push(raw);
-            }
-            crate::helpers::emit_typed_list_inline(
-                ctx.trace_ctx,
-                &raws,
-                crate::state::int_gcarray_descr(),
-                crate::descr::list_int_items_len_descr(),
-                crate::descr::list_int_items_block_descr(),
-                pyre_object::listobject::ListStrategy::Integer,
-            )
-        }
-    };
+    // alongside the exception.  `w_exception_args_new` pins the object
+    // representation at every arity, so this reproduces that one shape
+    // instead of picking a layout from the element types.
+    let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, final_args);
     // A raised exception can keep args_w live through the execution-context
     // slot, forcing the otherwise-virtual list.  Stamp the canonical list
     // class just as w_list_new does so that materialization preserves the
@@ -8402,7 +8576,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
 
     // Empty `args_w` list (zero-argument construction), stamped with the
     // canonical list class exactly as `w_list_new` does.
-    let args_list = crate::helpers::emit_empty_list_inline(ctx.trace_ctx);
+    let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &[]);
     let list_w_class = pyre_object::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
     let list_w_class = ctx.trace_ctx.const_ref(list_w_class as i64);
     let list_w_class_descr = crate::descr::list_w_class_descr();

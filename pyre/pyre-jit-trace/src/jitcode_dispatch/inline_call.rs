@@ -413,6 +413,20 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
     false
 }
 
+/// True iff `body_code` carries a `jit_merge_point`, i.e. the callee owns a
+/// loop header of its own.
+///
+/// Reaching one during an inline sub-walk surfaces
+/// `SubLoopCalleeCallAssembler`, the one arm of
+/// [`try_walker_inline_resolved_user_call`] that consumes the residual's
+/// `funcptr` / `r_args` / `call_descr` — and it consumes them as a CALL's
+/// `[callable, null_or_self, args…]` operand list.  A route that enters with a
+/// callee it resolved itself (rather than off a CALL) carries a differently
+/// shaped operand list, so it declines such a body up front.
+pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
+    crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "jit_merge_point")
+}
+
 /// Whether a method-form callee body is free of `LoadAttr` residuals.
 ///
 /// A `self.attr` read in the body is what makes it answer `false`, and that is
@@ -1532,6 +1546,7 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
                 exc_override_has_nested_call: exception_string_override_has_nested_call(
                     body.code, descr_refs,
                 ),
+                owns_loop_header: callee_body_owns_loop_header(body.code),
             }),
     )
 }
@@ -1815,6 +1830,11 @@ fn walker_ec_enter(
     // barrier and the concrete store has to carry it too.  This frame is an
     // old-gen `FrameBox` and the caller's vref can be young.
     pyre_object::gc_hook::try_gc_write_barrier(concrete_frame as *mut u8);
+    majit_gc::bh_probe_note_store(
+        concrete_frame as usize,
+        crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
+        4,
+    );
     unsafe {
         (*concrete_frame).f_backref = concrete_caller_topframeref;
         (*concrete_ec).topframeref = concrete_vref as *mut pyre_interpreter::PyFrame;
@@ -2808,7 +2828,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         return Ok(None);
     }
     // An unbound method-form callee whose body reads `self.attr`.  Every entry
-    // inlines one; the two declines below are what that reach costs.
+    // inlines one; the FOR_ITER deferred-admit decline below is what that reach
+    // still costs.
     let widened_method_form =
         method_form && bound_method.is_none() && !body_facts.method_form_supported;
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
@@ -2888,30 +2909,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    if method_form && bound_method.is_none() {
-        // The narrow surface declines any `self.attr` read in the body.
-        //
-        // The wide one admits it, and pays for the reach with a body that also
-        // raises: the sub-walk records into the handler region, and a guard
-        // whose resume coordinate lands on the `Reraise` needs ref registers
-        // the recorded path never wrote (`collect_callee_active_boxes`).  That
-        // decline arrives mid-recording on a non-effect-free opcode, so it has
-        // no mid-body carrier and the whole enclosing loop is discarded.
-        // Decline here instead, where the call stays residual and the loop
-        // still compiles.
-        //
-        // Both conjuncts are load-bearing.  Without `widened_method_form` this
-        // also withdraws a raise-bearing body that reads no attribute, which
-        // every entry inlined before the widening -- 3.6x on
-        // `for i in range(400000): t += b.bump(i)` over
-        // `def bump(self, n): if n < 0: raise ValueError(n); return n + 1`.
-        if widened_method_form && body_facts.contains_raise {
-            if fbw_inline_diag_enabled() {
-                eprintln!("[inline-method-form] decline pc={}", op.pc);
-            }
-            return Ok(None);
-        }
-    }
+    // A widened method-form body that also raises was declined here until the
+    // resume-liveness filter started keeping the raise operand.  The decline
+    // existed because a guard whose resume coordinate landed on the `Reraise`
+    // needed ref registers the recorded path never wrote
+    // (`collect_callee_active_boxes`), and that decline arrived mid-recording
+    // on a non-effect-free opcode with no mid-body carrier, discarding the
+    // whole enclosing loop.  With the operand retained the sub-walk records the
+    // handler region with the registers the coordinate names, so the body
+    // inlines like any other.
+    //
+    // The raise need not even execute to have been caught by it: a dead
+    // `if self.i < 0: raise` in an `o.m()` callee measured 1705 ns/call against
+    // 15.3 once admitted, and `self.i >= self.n` 1207 -> 15.9.  Swapping that
+    // `raise` for a `return` already measured 17.7, which is what named the
+    // token rather than the branch or the attribute compare.
     if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
         let mut pc = 0usize;
         let mut shown = 0;
@@ -3021,19 +3033,24 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     };
     let inline_depth = ctx.session.borrow().framestack.len();
     let contains_raise = body_facts.contains_raise;
-    if contains_raise
-        && !strict_inlinable
-        && jitcode_has_exception_handler(body.code)
-        && fbw_callee_body_replay_safety(
-            body.code,
-            &exact_numeric_args,
-            body.num_regs_i,
-            body.constants_i,
-            body.num_regs_r,
-            body.constants_r,
-            callee_descr_refs,
-        ) != CalleeReplaySafety::Clean
-    {
+    // Evaluated only behind the three cheaper terms, so the short-circuit order
+    // is the same one the single condition had.  Keeping the class lets the
+    // decline census say which admission would widen it.
+    let branchy_handler_safety =
+        if contains_raise && !strict_inlinable && jitcode_has_exception_handler(body.code) {
+            Some(fbw_callee_body_replay_safety(
+                body.code,
+                &exact_numeric_args,
+                body.num_regs_i,
+                body.constants_i,
+                body.num_regs_r,
+                body.constants_r,
+                callee_descr_refs,
+            ))
+        } else {
+            None
+        };
+    if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean) {
         // A branchy callee with its own exception handler can take a structural
         // abort after an earlier effectful Python opcode. The current
         // callee-rebuild payload resumes at the Python opcode owning the abort
@@ -3043,6 +3060,13 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // ordinary residual path until the generated frame snapshot can
         // represent the precise post-effect coordinate. A terminal raising
         // callee without a handler retains its after-residual live anchor.
+        crate::jitcode_dispatch::census_record(
+            if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {
+                "InlineCallee::BranchyHandlerDeferredCall"
+            } else {
+                "InlineCallee::BranchyHandlerDirty"
+            },
+        );
         return Ok(None);
     }
     // A callee that raises inline needs the cross-frame bridge the carrier
@@ -3066,7 +3090,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     } else {
         fbw_max_multiframe_depth()
     };
-    let try_multiframe = multiframe_eligible
+    // FOR_ITER must re-execute its iterator protocol as one unit when a body
+    // guard fails.  Its Clean-only admission above makes caller-boundary
+    // replay safe, and keeping the callee frame unseeded makes the terminating
+    // branch resume at FOR_ITER so the residual maps IndexError to exhaustion.
+    let force_caller_boundary_resume =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
+    let try_multiframe = !force_caller_boundary_resume
+        && multiframe_eligible
         && inline_depth < effective_multiframe_depth
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
@@ -3083,7 +3114,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // descr_call` owns the discard of `__init__`'s result, and the flattened
     // frame shape cannot reconstruct that discard from a two-frame in-callee
     // guard pause.
-    let strict_seed = strict_inlinable
+    let strict_seed = !force_caller_boundary_resume
+        && strict_inlinable
         && inline_depth < fbw_max_multiframe_depth()
         && callee_code.cellvars.is_empty()
         && constructor_result.is_none();
@@ -3106,7 +3138,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if foriter_dirty_bound && !try_multiframe {
         return Ok(None);
     }
-    if !strict_inlinable && !try_multiframe {
+    if !strict_inlinable && !try_multiframe && !force_caller_boundary_resume {
         // A non-self-recursive loop/branch callee that neither the strict nor
         // the multiframe fast path can serve declines to interpretation
         // (`FBW_DECLINED_KEYS`).  Self-recursive calls were already routed to
@@ -4365,10 +4397,20 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // not the pre-sub-walk `arg_concretes`, so it is current after the
             // sub-walk's allocations.  Any doubt keeps the legacy replay — the
             // honest residual (the inner-frame rebuild is #126/#215).
+            //
+            // The kept-stack branch-guard aborts belong to the same class: they
+            // refuse to COMPILE a guard whose not-taken arm the blackhole could
+            // not reconstruct, which says nothing about the sub-walk having
+            // committed anything.  Without a carrier their only remaining leg
+            // rewinds to the OUTER frame's entry (`trace.rs`, "legacy drop
+            // kept"), re-running every effect the walk already executed —
+            // `threading.Thread.start` calling `_start_joinable_thread` twice.
             if matches!(
                 e,
                 DispatchError::AbortPermanentMarkerReached { .. }
                     | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+                    | DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. }
+                    | DispatchError::BranchGuardKeptStackUnsupported { .. }
             ) {
                 latch_abort_call_resume(
                     code,
@@ -5112,6 +5154,334 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         false,
         None,
     )
+}
+
+/// Inline `obj[key]` into the receiver type's Python `__getitem__`.
+///
+/// `descroperation.py:356-381 DescrOperation.getitem` resolves `__getitem__`
+/// on the receiver's type and calls it; PyPy traces through that call and
+/// inlines the body.  pyre lowers BINARY_SUBSCR to one `binary_op` residual,
+/// and `try_walker_specialize_subscr` only recognizes the canonical tuple and
+/// exact-`list[int]` storage shapes — so a user `__getitem__` never reaches the
+/// inline plumbing at all and runs as a fresh interpreter frame behind a
+/// `CALL_MAY_FORCE` on every iteration.  This route closes that gap: pin the
+/// receiver class + version tag so the MRO lookup const-folds, then enter the
+/// resolved-callee inline with the receiver as `self`.
+///
+/// The gate is `getitem_fast_path`, which admits exactly the receivers whose
+/// subscript the type's own MRO owns — a user instance, or a builtin sequence
+/// layout that overrides `__getitem__`.  A callee owning a loop header is
+/// declined for the reason [`callee_body_owns_loop_header`] documents.  Unlike
+/// the property folds this admits a branching, raising body: `__getitem__`
+/// raising `IndexError` at the end of a sequence is the shape worth inlining,
+/// not an edge case.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    // `binary_op_fn(obj, key, tag)` — the two Ref operands are the whole
+    // subscript; the operator tag rides the Int list.
+    let [obj, key] = r_args else {
+        return Ok(None);
+    };
+    let (obj, key) = (*obj, *key);
+    let (Some(concrete_obj), Some(concrete_key)) = (
+        walker_concrete_ref_object(ctx, obj),
+        walker_concrete_ref_object(ctx, key),
+    ) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, w_getitem)) =
+        (unsafe { pyre_interpreter::baseobjspace::getitem_fast_path(concrete_obj) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_getitem) })
+    else {
+        return Ok(None);
+    };
+    // `__getitem__(self, key)` — any other arity is a shape
+    // `get_and_call_function` would reject before the body runs.
+    if nparams != 2 {
+        return Ok(None);
+    }
+    // Decided once per callee on its jitcode payload; `None` means no body or
+    // descr pool, which this route declines on either way.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header {
+        return Ok(None);
+    }
+
+    // `[__getitem__, <self-placeholder>, obj, key]`: the method-form call
+    // header the inline plumbing expects, then the two positional args.
+    let arg_concretes = vec![
+        ConcreteValue::Ref(w_getitem),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_key),
+    ];
+    let getitem_const = ctx.trace_ctx.const_ref(w_getitem as i64);
+    try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        w_getitem,
+        getitem_const,
+        w_getitem,
+        arg_concretes,
+        vec![obj, key],
+        vec![
+            ConcreteValue::Ref(concrete_obj),
+            ConcreteValue::Ref(concrete_key),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((obj, concrete_obj, w_type, version_tag)),
+        None,
+        false,
+        None,
+    )
+}
+
+/// Inline the generic sequence cursor's `__getitem__(seq, index)` step.
+///
+/// The cursor update is deliberately emitted and applied only after the
+/// callee returns an item.  A guard in the callee therefore resumes at this
+/// FOR_ITER with the same index, while a recording-time exhaustion raise can
+/// discard the inline and let the existing residual produce the NULL result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_seqiter_getitem_next<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor {
+        return Ok(None);
+    }
+    if dst_bank != 'r' {
+        return Ok(None);
+    }
+    if ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    if r_args.len() != 1 {
+        return Ok(None);
+    }
+
+    let iter_op = r_args[0];
+    let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
+        return Ok(None);
+    };
+    let (seq, index) = unsafe {
+        if (*iter_obj).ob_type != &pyre_object::iterobject::SEQ_ITER_TYPE {
+            return Ok(None);
+        }
+        let iter = iter_obj as *mut pyre_object::iterobject::W_SeqIterObject;
+        ((*iter).seq, (*iter).index)
+    };
+    if seq.is_null() {
+        return Ok(None);
+    }
+    if unsafe {
+        pyre_object::is_list(seq)
+            || pyre_object::is_tuple(seq)
+            || pyre_object::is_str(seq)
+            || pyre_object::bytesobject::is_bytes_like(seq)
+            || pyre_object::interp_array::is_array(seq)
+            || pyre_object::is_generic_alias(seq)
+    } {
+        return Ok(None);
+    }
+
+    let Some((w_type, version_tag, w_getitem)) =
+        (unsafe { pyre_interpreter::baseobjspace::getitem_fast_path(seq) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_getitem) })
+    else {
+        return Ok(None);
+    };
+    if nparams != 2 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header {
+        return Ok(None);
+    }
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+        return Ok(None);
+    };
+    let Some((callee_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    else {
+        return Ok(None);
+    };
+    let exact_numeric_args = [
+        ExactNumericArg::default(),
+        ExactNumericArg {
+            numeric: true,
+            plain_int: true,
+        },
+    ];
+    let replay_safety = fbw_callee_body_replay_safety(
+        body.code,
+        &exact_numeric_args,
+        body.num_regs_i,
+        body.constants_i,
+        body.num_regs_r,
+        body.constants_r,
+        callee_descr_refs,
+    );
+    // `DeferredCall` is admitted alongside `Clean`, and the terminating `raise`
+    // is what makes that necessary: `RaiseVarargs` classifies as a deferred
+    // residual, so a cursor body that ends on one would otherwise never be
+    // served.  The deferred promise holds here — a residual the lever cannot
+    // inline aborts before executing and denies the callee — and the one shape
+    // the shared FOR_ITER gate withholds it from, a `BINARY_OP` dunder entry
+    // carrying an `arg_class_guard`, cannot reach this route: the entry is a
+    // FOR_ITER whose only operand is the iterator.
+    if !matches!(
+        replay_safety,
+        CalleeReplaySafety::Clean | CalleeReplaySafety::DeferredCall
+    ) {
+        return Ok(None);
+    }
+    if fbw_foriter_deferred_call_denied(w_code as usize) {
+        return Ok(None);
+    }
+
+    let body_coord = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op.pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+    fbw_foriter_inflight_mark_attempt(body_coord);
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+
+    let seq_iter_type_addr = &pyre_object::iterobject::SEQ_ITER_TYPE as *const _ as i64;
+    if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
+        let type_const = ctx.trace_ctx.const_int(seq_iter_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(iter_op, seq_iter_type_addr);
+
+    let seq_descr = crate::descr::seq_iter_seq_descr();
+    let seq_op = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, iter_op, seq_descr);
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[seq_op])?;
+    ctx.trace_ctx
+        .set_opref_concrete(seq_op, Value::Ref(majit_ir::GcRef(seq as usize)));
+
+    let index_descr = crate::descr::seq_iter_index_descr();
+    let index_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, iter_op, index_descr.clone());
+    ctx.trace_ctx
+        .set_opref_concrete(index_op, Value::Int(index));
+    let boxed_index = crate::state::wrapint(ctx.trace_ctx, index_op);
+    let concrete_boxed_index = pyre_object::w_int_new(index);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed_index,
+        Value::Ref(majit_ir::GcRef(concrete_boxed_index as usize)),
+    );
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iter_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(iter_obj);
+    let boxed_index_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(concrete_boxed_index);
+    let concrete_boxed_index = pyre_object::gc_roots::shadow_stack_get(boxed_index_root);
+    let getitem_const = ctx.trace_ctx.const_ref(w_getitem as i64);
+
+    let inline = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        w_getitem,
+        getitem_const,
+        w_getitem,
+        vec![
+            ConcreteValue::Ref(w_getitem),
+            ConcreteValue::Null,
+            ConcreteValue::Ref(seq),
+            ConcreteValue::Ref(concrete_boxed_index),
+        ],
+        vec![seq_op, boxed_index],
+        vec![
+            ConcreteValue::Ref(seq),
+            ConcreteValue::Ref(concrete_boxed_index),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((seq_op, seq, w_type, version_tag)),
+        None,
+        false,
+        None,
+    );
+    if !matches!(inline, Ok(Some((DispatchOutcome::Continue, _)))) {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+
+    let one = ctx.trace_ctx.const_int(1);
+    let next_index = ctx.trace_ctx.record_op(OpCode::IntAdd, &[index_op, one]);
+    ctx.trace_ctx
+        .set_opref_concrete(next_index, Value::Int(index.wrapping_add(1)));
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[iter_op, next_index],
+        index_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(iter_op, index_descr.index(), next_index);
+    let iter_ptr = pyre_object::gc_roots::shadow_stack_get(iter_root)
+        as *mut pyre_object::iterobject::W_SeqIterObject;
+    unsafe {
+        (*iter_ptr).index += 1;
+    }
+
+    let item_op = ctx.registers_r[dst];
+    let Some(concrete_item) = walker_concrete_ref_object(ctx, item_op) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
+    fbw_foriter_inflight_capture(concrete_item, body_coord);
+    ctx.vstack_last_ref = item_op;
+
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Forward dunder selected by `try_dispatch_binary_special` for a non-inplace

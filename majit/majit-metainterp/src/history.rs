@@ -2071,6 +2071,17 @@ impl TraceCtx {
         self.recorder.cut(pos);
     }
 
+    /// Restore both recorded operations and snapshots to a saved position.
+    ///
+    /// A speculative inline can attach guards before its concrete walk
+    /// declines.  Those snapshots refer to the discarded operation namespace,
+    /// so keeping them in the side table would expose stale boxes when a later
+    /// optimizer remaps every published snapshot.
+    pub fn cut_trace_with_snapshots(&mut self, pos: TracePosition) {
+        self.recorder.cut(pos);
+        self.snapshots.truncate(pos.snapshot_data_len);
+    }
+
     /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)` —
     /// trace-context portion.
     ///

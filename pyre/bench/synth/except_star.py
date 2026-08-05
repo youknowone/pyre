@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=28
+# pyre-check: max-pypy-ratio=3.8
+# pyre-check: min-pypy-ratio=0.48
 def m(label, value):
     print(label, "->", repr(value))
 

@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=80
+# pyre-check: max-pypy-ratio=46
+# pyre-check: min-pypy-ratio=2.38
 # A guard failing inside an inlined `__init__` must hand the caller the
 # instance, not `__init__`'s return value.  `typeobject.py descr_call` discards
 # `__init__`'s result and returns the instance; the flattened constructor

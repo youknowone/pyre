@@ -2386,6 +2386,7 @@ pub trait Backend: Send {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
+        majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
         // SAFETY: see `bh_setfield_gc_i`. `usize` is the pointer-width store.
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = newvalue.0 };
         // The store target may be an old-gen object holding a young ref; the

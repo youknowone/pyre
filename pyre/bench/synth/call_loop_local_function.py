@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=8
+# pyre-check: min-pypy-ratio=1.28
 # A loop that defines a function in its own body and calls it.
 #
 # `pyopcode.py:1457 MAKE_FUNCTION` runs `function.py:47-57 Function.__init__`

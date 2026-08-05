@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=34
+# pyre-check: max-pypy-ratio=14
+# pyre-check: min-pypy-ratio=1.78
 # A failed `from X import Y` raises ImportError carrying `.name` (the module)
 # and `.path` (its source file), per error.py new_import_error. The absolute
 # path is install-dependent, so only its basename is checked.  `keyword` is a

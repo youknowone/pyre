@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=321
+# pyre-check: max-pypy-ratio=143
+# pyre-check: min-pypy-ratio=6.75
 # A float subclass that overrides the arithmetic and comparison dunders, driven
 # hot enough to compile. The walker's float specialization lowers BINARY_OP to
 # `FloatAdd` / `FloatSub` / `FloatMul` / `FloatTrueDiv` and COMPARE_OP to

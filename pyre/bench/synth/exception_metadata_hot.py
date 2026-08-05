@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=30
+# pyre-check: max-pypy-ratio=12
+# pyre-check: min-pypy-ratio=1.72
 # Exception metadata observed from inside JIT-hot handlers: traceback
 # attachment and shape, __context__ / __cause__ chaining, sys.exc_info, handler
 # name clearing, and re-raise.

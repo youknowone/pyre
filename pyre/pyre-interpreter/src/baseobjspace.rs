@@ -1875,6 +1875,50 @@ unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     )))
 }
 
+/// BINARY_SUBSCR fast path: return the receiver's type, its version tag, and
+/// the `__getitem__` [`getitem`] would dispatch, so the full-body walker can
+/// inline the subscript in place of the opaque residual.
+///
+/// Admits the two receiver shapes whose subscript the type's own MRO owns:
+/// a builtin sequence layout overriding `__getitem__` (the
+/// [`subclass_special_override`] arm) and a user instance (the
+/// [`getitem_instance`] arm).  Every other receiver — including a `dict`
+/// layout, which reaches its strategy arm without an override consultation —
+/// returns `None` and keeps the residual.
+///
+/// Both arms resolve from `ob_type` and `w_class` alone, so pinning those two
+/// plus the returned version tag is what makes the answer constant for the
+/// trace; the caller owes those guards.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn getitem_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    unsafe {
+        let (w_type, method) = if is_list(w_obj)
+            || is_tuple(w_obj)
+            || is_str(w_obj)
+            || pyre_object::bytesobject::is_bytes_like(w_obj)
+            || pyre_object::is_w_range(w_obj)
+        {
+            let (method, w_type) = subclass_special_override(w_obj, "__getitem__")?;
+            (w_type, method)
+        } else if is_instance(w_obj) {
+            let w_type = w_instance_get_type(w_obj);
+            if w_type.is_null() {
+                return None;
+            }
+            (w_type, lookup_in_type_where(w_type, "__getitem__")?)
+        } else {
+            return None;
+        };
+        let version_tag = w_type_version_tag(w_type);
+        if version_tag == 0 {
+            return None;
+        }
+        Some((w_type, version_tag, method))
+    }
+}
+
 #[inline(never)]
 /// `functional.py W_Range.descr_getitem` — integer index returns
 /// the member `start + i*step` (negative folded, bounds-checked); a slice
@@ -11568,10 +11612,10 @@ pub unsafe fn exception_attr_slot_fold(
 /// (matching `descr_getargs: return space.newtuple(self.args_w)`).
 unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if value.is_null() {
-        return Ok(w_list_new(vec![]));
+        return Ok(pyre_object::interp_exceptions::w_exception_args_new(vec![]));
     }
     let items = fixedview(value, -1)?;
-    Ok(w_list_new(items))
+    Ok(pyre_object::interp_exceptions::w_exception_args_new(items))
 }
 
 /// baseobjspace.py:52-57 W_Root.setdictvalue (default).
@@ -16635,7 +16679,7 @@ fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
         // `interp_exceptions.py:121-124 W_BaseException.descr_init`
         // stores `args_w` as a list; pyre matches the shape so that
         // `e.args` materialises a fresh tuple each read.
-        let args_list = w_list_new(vec![value]);
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![value]);
         unsafe {
             w_exception_set_args(exc, args_list);
         }

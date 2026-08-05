@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=11
+# pyre-check: max-pypy-ratio=5
+# pyre-check: min-pypy-ratio=0.65
 # list(iterable) and list.extend(iterable) consult __length_hint__ before
 # iterating (listobject.py _extend_from_iterable -> space.length_hint), which
 # validates it: a negative hint raises ValueError, one exceeding a C ssize_t

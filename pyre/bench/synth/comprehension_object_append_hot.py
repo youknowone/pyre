@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=44
+# pyre-check: max-pypy-ratio=41
+# pyre-check: min-pypy-ratio=5.28
 # An inlined list comprehension whose LIST_APPEND element lands in a list
 # Object-strategy (tuple / None / str / dict / f-string) folds through the #171
 # orthodox append. Its Object arm stores a GC ref and runs list_write_barrier,

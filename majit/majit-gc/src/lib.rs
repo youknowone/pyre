@@ -2440,6 +2440,343 @@ pub fn gc_write_barrier_managed(obj: GcRef) {
     }
 }
 
+// ── TEMPORARY DIAGNOSTIC: blackhole-materialized object registry ──
+//
+// Enabled by `MAJIT_GC_BH_PROBE`. Records every block a backend's `bh_new*`
+// hands out so `do_collect_nursery` can check, at the end of a minor, that
+// none of them still names a nursery address. Remove with the investigation.
+
+thread_local! {
+    /// (address, payload size, origin) — origin 1 = born old, 2 = promoted.
+    static BH_PROBE_OBJECTS: std::cell::RefCell<Vec<(usize, usize, u8)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One distinct `(type, offset, origin)` class of post-minor nursery reference.
+pub struct BhProbeViolation {
+    pub minor: usize,
+    pub origin: u8,
+    pub holder: usize,
+    pub tid: u32,
+    pub payload_size: usize,
+    pub offset: usize,
+    pub value: usize,
+    pub forwarded: bool,
+    pub type_size: usize,
+    pub item_size: usize,
+    pub length_offset: usize,
+    pub gc_ptr_offsets: Vec<usize>,
+    pub custom_trace: bool,
+    pub is_object: bool,
+    pub track_young_ptrs: bool,
+    pub remembered: bool,
+    pub barriered_ever: bool,
+    pub traced_this_minor: bool,
+    pub store_sites: u32,
+}
+
+thread_local! {
+    static BH_PROBE_VIOLATIONS: std::cell::RefCell<Vec<BhProbeViolation>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether this `(type, offset, origin)` class was already recorded.
+pub fn bh_probe_violation_seen(tid: u32, offset: usize, origin: u8) -> bool {
+    BH_PROBE_VIOLATIONS
+        .try_with(|v| {
+            v.borrow()
+                .iter()
+                .any(|e| e.tid == tid && e.offset == offset && e.origin == origin)
+        })
+        .unwrap_or(false)
+}
+
+/// Append newly seen classes; returns the total class count.
+pub fn bh_probe_record_violations(fresh: Vec<BhProbeViolation>) -> usize {
+    BH_PROBE_VIOLATIONS
+        .try_with(|v| {
+            let mut v = v.borrow_mut();
+            v.extend(fresh);
+            v.len()
+        })
+        .unwrap_or(0)
+}
+
+pub fn bh_probe_violation_report(minor: usize) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("BH PROBE: post-minor nursery references, through minor #{minor}\n");
+    let _ = BH_PROBE_VIOLATIONS.try_with(|v| {
+        for e in v.borrow().iter() {
+            let _ = write!(
+                out,
+                "  minor#{} {} holder={:#x} tid={} payload={} offset={}({}) value={:#x} \
+                 forwarded={} | type: size={} item_size={} length_offset={} gc_ptr_offsets={:?} \
+                 custom_trace={} is_object={} | holder: track_young={} remembered={} \
+                 barriered_ever={} traced_this_minor={} store_sites={:#b} | layout={:?}\n",
+                e.minor,
+                if e.origin == BH_PROBE_ORIGIN_PROMOTED {
+                    "promoted"
+                } else {
+                    "born-old"
+                },
+                e.holder,
+                e.tid,
+                e.payload_size,
+                e.offset,
+                bh_probe_field_name(e.tid, e.offset),
+                e.value,
+                e.forwarded,
+                e.type_size,
+                e.item_size,
+                e.length_offset,
+                e.gc_ptr_offsets,
+                e.custom_trace,
+                e.is_object,
+                e.track_young_ptrs,
+                e.remembered,
+                e.barriered_ever,
+                e.traced_this_minor,
+                e.store_sites,
+                bh_probe_layout(e.tid),
+            );
+        }
+    });
+    out
+}
+
+/// Type ids the post-minor scan must not read as a plain word array.
+static BH_PROBE_IGNORED_TIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Exempt a type from the post-minor nursery-reference scan.
+///
+/// A `JitFrame`'s slots are typed by its own `jf_gcmap`, not by the type table,
+/// so a slot outside that map legitimately holds a stale scratch word that can
+/// fall inside the nursery range.
+pub fn bh_probe_ignore_tid(type_id: u32) {
+    if let Ok(mut v) = BH_PROBE_IGNORED_TIDS.lock() {
+        if !v.contains(&type_id) {
+            v.push(type_id);
+        }
+    }
+}
+
+pub fn bh_probe_tid_ignored(type_id: u32) -> bool {
+    BH_PROBE_IGNORED_TIDS
+        .lock()
+        .map(|v| v.contains(&type_id))
+        .unwrap_or(false)
+}
+
+/// Origin tag for a block born straight into the old generation.
+pub const BH_PROBE_ORIGIN_BORN_OLD: u8 = 1;
+/// Origin tag for a nursery survivor the minor promoted.
+pub const BH_PROBE_ORIGIN_PROMOTED: u8 = 2;
+
+/// Whether the blackhole-object probe is enabled.
+pub fn bh_probe_enabled() -> bool {
+    // wasm32-unknown-unknown has no process environment, so the guest cannot
+    // read MAJIT_GC_BH_PROBE; the compile-time feature is its gate instead.
+    if cfg!(target_arch = "wasm32") {
+        return cfg!(feature = "bh_probe");
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAJIT_GC_BH_PROBE").is_some())
+}
+
+/// Record an old-generation block and its payload size.
+pub fn note_bh_object(addr: usize, payload_size: usize, origin: u8) {
+    if addr == 0 || !bh_probe_enabled() {
+        return;
+    }
+    let _ = BH_PROBE_OBJECTS.try_with(|v| v.borrow_mut().push((addr, payload_size, origin)));
+}
+
+/// Visit every recorded old-generation block.
+pub fn with_bh_objects<R>(f: impl FnOnce(&[(usize, usize, u8)]) -> R) -> Option<R> {
+    BH_PROBE_OBJECTS.try_with(|v| f(&v.borrow())).ok()
+}
+
+thread_local! {
+    /// Objects `remember_young_pointer` has ever put on the remembered set.
+    static BH_PROBE_BARRIERED: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Objects `trace_and_update_object` visited during the current minor.
+    static BH_PROBE_TRACED: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+pub fn bh_probe_note_barriered(addr: usize) {
+    if !bh_probe_enabled() {
+        return;
+    }
+    let _ = BH_PROBE_BARRIERED.try_with(|s| s.borrow_mut().insert(addr));
+}
+
+pub fn bh_probe_note_traced(addr: usize) {
+    if !bh_probe_enabled() {
+        return;
+    }
+    let _ = BH_PROBE_TRACED.try_with(|s| s.borrow_mut().insert(addr));
+}
+
+pub fn bh_probe_clear_traced() {
+    if !bh_probe_enabled() {
+        return;
+    }
+    let _ = BH_PROBE_TRACED.try_with(|s| s.borrow_mut().clear());
+}
+
+pub fn bh_probe_was_barriered(addr: usize) -> bool {
+    BH_PROBE_BARRIERED
+        .try_with(|s| s.borrow().contains(&addr))
+        .unwrap_or(false)
+}
+
+pub fn bh_probe_was_traced(addr: usize) -> bool {
+    BH_PROBE_TRACED
+        .try_with(|s| s.borrow().contains(&addr))
+        .unwrap_or(false)
+}
+
+thread_local! {
+    /// (object, offset) -> bitmask of instrumented store sites that wrote it.
+    static BH_PROBE_STORES: std::cell::RefCell<
+        std::collections::HashMap<(usize, usize), u32>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub fn bh_probe_note_store(obj: usize, offset: usize, site: u32) {
+    if obj == 0 || !bh_probe_enabled() {
+        return;
+    }
+    let _ = BH_PROBE_STORES.try_with(|m| {
+        *m.borrow_mut().entry((obj, offset)).or_insert(0) |= 1u32 << site;
+    });
+}
+
+pub fn bh_probe_store_sites(obj: usize, offset: usize) -> u32 {
+    BH_PROBE_STORES
+        .try_with(|m| m.borrow().get(&(obj, offset)).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Published nursery bounds so the probe can scan without reaching the GC.
+pub static BH_PROBE_NURSERY_LO: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static BH_PROBE_NURSERY_HI: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    static BH_PROBE_PHASE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("interp") };
+}
+
+pub struct BhProbePhase(&'static str);
+
+impl BhProbePhase {
+    pub fn enter(name: &'static str) -> Self {
+        let prev = BH_PROBE_PHASE
+            .try_with(|c| c.replace(name))
+            .unwrap_or("interp");
+        BhProbePhase(prev)
+    }
+}
+
+impl Drop for BhProbePhase {
+    fn drop(&mut self) {
+        let _ = BH_PROBE_PHASE.try_with(|c| c.set(self.0));
+    }
+}
+
+pub fn bh_probe_phase() -> &'static str {
+    BH_PROBE_PHASE.try_with(|c| c.get()).unwrap_or("interp")
+}
+
+/// Walk every recorded blackhole object looking for a word that names the
+/// nursery, and panic naming the phase that produced it.
+pub fn bh_probe_scan(reason: &str) {
+    if !bh_probe_enabled() {
+        return;
+    }
+    let lo = BH_PROBE_NURSERY_LO.load(std::sync::atomic::Ordering::Relaxed);
+    let hi = BH_PROBE_NURSERY_HI.load(std::sync::atomic::Ordering::Relaxed);
+    if lo == 0 {
+        return;
+    }
+    let hit = with_bh_objects(|objects| {
+        for &(addr, payload_size, origin) in objects {
+            // Promoted blocks are the minor's own output; this scan is about
+            // what a blackhole store just left behind in a born-old block.
+            if origin != BH_PROBE_ORIGIN_BORN_OLD || (addr >= lo && addr < hi) {
+                continue;
+            }
+            // TRACK_YOUNG_PTRS clear means the object is already on the
+            // remembered set, so a young field in it is legal and will be
+            // traced.  Only a flagged object naming the nursery is a lost edge.
+            let hdr = (addr - crate::header::GcHeader::SIZE) as *const crate::header::GcHeader;
+            if unsafe { !(*hdr).has_flag(crate::flags::TRACK_YOUNG_PTRS) } {
+                continue;
+            }
+            for offset in (0..payload_size).step_by(std::mem::size_of::<usize>()) {
+                let word = unsafe { *((addr + offset) as *const usize) };
+                if word >= lo && word < hi {
+                    return Some((addr, offset, word));
+                }
+            }
+        }
+        None
+    });
+    if let Some(Some((addr, offset, word))) = hit {
+        panic!(
+            "BH SCAN: blackhole object named the nursery — reason={} phase={} \
+             holder={:#x} offset={}({}) value={:#x} sites={:#b}",
+            reason,
+            bh_probe_phase(),
+            addr,
+            offset,
+            bh_probe_field_name(37, offset),
+            word,
+            bh_probe_store_sites(addr, offset),
+        );
+    }
+}
+
+/// Offset -> field-name table for the probe's diagnostics, published by the
+/// crate that owns the layout so the probe does not have to guess.
+static BH_PROBE_FIELD_NAMES: std::sync::Mutex<Vec<(u32, usize, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn bh_probe_set_field_names(entries: &[(u32, usize, &'static str)]) {
+    if let Ok(mut v) = BH_PROBE_FIELD_NAMES.lock() {
+        v.extend_from_slice(entries);
+    }
+}
+
+pub fn bh_probe_layout(type_id: u32) -> Vec<(usize, &'static str)> {
+    let mut rows: Vec<(usize, &'static str)> = BH_PROBE_FIELD_NAMES
+        .lock()
+        .map(|v| {
+            v.iter()
+                .filter(|&&(t, _, _)| t == type_id)
+                .map(|&(_, o, n)| (o, n))
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_unstable();
+    rows
+}
+
+pub fn bh_probe_field_name(type_id: u32, offset: usize) -> &'static str {
+    BH_PROBE_FIELD_NAMES
+        .lock()
+        .ok()
+        .and_then(|v| {
+            v.iter()
+                .find(|&&(t, o, _)| t == type_id && o == offset)
+                .map(|&(_, _, n)| n)
+        })
+        .unwrap_or("?")
+}
+
 #[cfg(test)]
 mod headerless_no_collect_tests {
     use super::*;

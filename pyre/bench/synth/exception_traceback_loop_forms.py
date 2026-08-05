@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=94
+# pyre-check: max-pypy-ratio=36
+# pyre-check: min-pypy-ratio=4.6
 # Traceback nodes recorded by a compiled loop, driven by BOTH loop forms.
 #
 # The sibling exception-traceback fixtures all drive their workload with
@@ -16,7 +17,7 @@
 # into a helper adds a call to the loop body and changes what the body traces,
 # which is enough to hide the divergence.
 
-N = 20000
+N = 300000
 
 
 def out(key, value):

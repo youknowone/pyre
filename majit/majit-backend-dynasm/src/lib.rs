@@ -676,11 +676,13 @@ fn handle_fail_resume_guard(
         raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
     }
 
-    // pyjitpl.py:2897-2899 parity: recover the owning Arc<JitCellToken>
+    // pyjitpl.py:2921-2923 parity: recover the owning Arc<JitCellToken>
     // identity from the descr.  When the weakref is dead (memmgr-evicted
     // JCT — "should be rare" per upstream), `compile.giveup()` raises
-    // `SwitchToBlackhole(ABORT_BRIDGE)` (compile.py:27-29), caught at
-    // pyjitpl.py:2906-2907, falling through to blackhole resume.  Pyre
+    // `SwitchToBlackhole(ABORT_BRIDGE)` (compile.py:27-29).  That raise sits
+    // ABOVE the `try:` at pyjitpl.py:2926, so the `except SwitchToBlackhole`
+    // at :2930-2931 does NOT catch it and the `finally:` at :2932-2935 does
+    // not run: it leaves `handle_guard_failure` with nothing traced.  Pyre
     // mirrors this by gating bridge tracing on `Some(jct)` and passing
     // `green_key=0` to the blackhole callback so it derives the key from
     // the deadframe's pyframe pointer (call_jit.rs:1694-1704); never

@@ -4815,11 +4815,22 @@ fn find_jump_target_label_index(ops: &[Op], jump: &Op) -> Option<usize> {
 }
 
 fn find_loop_label_index(ops: &[Op]) -> Option<usize> {
-    ops.iter()
-        .rev()
-        .find(|op| op.opcode == OpCode::Jump)
-        .and_then(|jump| find_jump_target_label_index(ops, jump))
-        .or_else(|| ops.iter().rposition(|op| op.opcode == OpCode::Label))
+    match ops.iter().rev().find(|op| op.opcode == OpCode::Jump) {
+        // x86/assembler.py:2463 `if target_token in
+        // self.target_tokens_currently_compiling` — the TOKEN decides. A JUMP
+        // that names a token this compilation does not define is upstream's
+        // `else` arm at :2467 (`JMP(imm(target))`, an absolute jump into
+        // another trace), even when this trace defines labels of its own.
+        // That is exactly a `jump_to_preamble` retrace: compile.py:381 keeps
+        // the retrace's own label_op in the middle while unroll.py:238-242
+        // retargets the JUMP at the ORIGINAL loop's start descr. Answering
+        // with the trailing label here would turn that JUMP into a back-edge
+        // to a label it does not name.
+        Some(jump) if jump.has_descr() => find_jump_target_label_index(ops, jump),
+        // No descr to decide with (legacy IR whose JUMP carries none), or no
+        // JUMP at all: keep the historical last-LABEL answer.
+        _ => ops.iter().rposition(|op| op.opcode == OpCode::Label),
+    }
 }
 
 fn find_label_args(ops: &[Op], jump: &Op) -> Vec<OpRef> {

@@ -20,6 +20,13 @@ description = "Garbage collector for majit JIT runtime"
 # untouched — only an opted-in GC stresses its own allocations.
 gc_stress = []
 
+# Blackhole-object probe. Records every old-generation block and panics with a
+# violation report when it finds invalid nursery references. The
+# wasm32-unknown-unknown guest has no process environment, so it cannot read
+# the `MAJIT_GC_BH_PROBE` env var and needs this compile-time gate instead. Off
+# by default so ordinary wasm builds do not abort.
+bh_probe = []
+
 [dependencies]
 indexmap = { workspace = true }
 majit-ir = { workspace = true }

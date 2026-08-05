@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=47
+# pyre-check: max-pypy-ratio=31
+# pyre-check: min-pypy-ratio=3.42
 # An exception raised in an inlined callee and caught two or three frames up
 # must still attach a traceback node for every frame it passed through: one at
 # the raise instruction and one per callee->caller propagation.

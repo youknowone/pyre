@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=20
+# pyre-check: max-pypy-ratio=40
+# pyre-check: min-pypy-ratio=4.2
 # Memoized vs plain recursion with post-warm-up branch divergence. The
 # memo-dict store (memo[n] = r) once died with a TypeError after warm-up
 # (an empty-string type name from a clobbered class read on the dict-store
@@ -32,14 +33,14 @@ def rec_plain(n):
 
 def main():
     acc = 0
-    for i in range(1, 9001):
+    for i in range(1, 135001):
         n = (i * 37) % 211 + 2
-        if i > 7000:
+        if i > 105000:
             n = n * 31 + 1
             acc = (acc + rec_plain(n) * 2 + rec_memo(n)) % MOD
         else:
             acc = (acc + rec_memo(n) + rec_plain(n)) % MOD
-        if i % 1500 == 0:
+        if i % 22500 == 0:
             print("checksum1", i, acc)
     print("final1", acc, len(memo))
 

@@ -1467,6 +1467,17 @@ impl VirtualState {
         // a Virtual/VArray/VStruct, the comparison is handled by the
         // VirtualStateInfo._generate_guards path (the main match below),
         // which does struct-level field comparison — not type-tag matching.
+        //
+        // This gate is ALSO what rejects a Virtual / VArray / VStruct /
+        // VArrayStruct incoming against a NotVirtual `expected`, the
+        // LEVEL_CONSTANT one included: `info_type_matches`
+        // (virtualstate.rs:103-145) has no arm accepting a Virtual* incoming
+        // for any expected type — Int, Float and Ref all fall to their
+        // `_ => false` catch-alls. That is the port of virtualstate.py:392-394
+        // for the Int/Float constant leaves and of virtualstate.py:525-529 for
+        // the Ptr leaf. The `(Constant(_), _)` arm below is therefore never
+        // entered with a virtual incoming; do NOT add a separate
+        // `other.is_virtual()` arm there — it would be dead code.
         if !expected_info.is_virtual() {
             if let Some(expected_type) = expected_info.info_type() {
                 if !info_type_matches(expected_type, incoming_info) {
@@ -1497,7 +1508,24 @@ impl VirtualState {
             (VirtualStateInfo::Unknown(_), _) => Ok(()),
 
             // ── Constant target ── (virtualstate.py:396-405)
+            //
+            //     if other.level == LEVEL_CONSTANT:
+            //         if self.constbox.same_constant(other.constbox):
+            //             return
+            //         raise VirtualStatesCantMatch("different constants")
+            //
+            // virtualstate.py:396-399 settles a LEVEL_CONSTANT incoming
+            // STATICALLY, ahead of the runtime-box test at :400-405: two
+            // different constants can never match, whatever value the runtime
+            // box happens to carry at the jump point. Falling through to the
+            // runtime test instead would emit a GUARD_VALUE against a target
+            // constant the incoming state already contradicts.
+            // `Value`'s PartialEq is the `same_constant` port
+            // (majit-ir/src/value.rs:84-95 — bitwise for floats,
+            // history.py:292).
             (VirtualStateInfo::Constant(a), VirtualStateInfo::Constant(b)) if a == b => Ok(()),
+            // virtualstate.py:399 `raise VirtualStatesCantMatch("different constants")`.
+            (VirtualStateInfo::Constant(_), VirtualStateInfo::Constant(_)) => Err(()),
             (VirtualStateInfo::Constant(val), _) => {
                 // virtualstate.py:400-405: emit GUARD_VALUE only when the
                 // concrete runtime box already equals the target constant.
@@ -3109,6 +3137,54 @@ mod tests {
         assert!(
             expected
                 .generate_guards(&incoming, &boxes, &[mismatching_runtime], &mut ctx, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_differing_constants_reject_before_the_runtime_box_test() {
+        // virtualstate.py:396-399: a LEVEL_CONSTANT incoming is settled
+        // statically — `raise VirtualStatesCantMatch("different constants")` —
+        // and never reaches the runtime-box GUARD_VALUE path at :400-405.
+        // Without the explicit arm a runtime box that happens to equal the
+        // TARGET constant makes pyre emit a GUARD_VALUE where upstream reports
+        // CantMatch.
+        let expected = VirtualState::new(vec![VirtualStateInfo::Constant(Value::Int(7))]);
+        let incoming = VirtualState::new(vec![VirtualStateInfo::Constant(Value::Int(8))]);
+        let boxes = vec![OpRef::int_op(10)];
+
+        let mut ctx = OptContext::new(128);
+        let runtime = ctx.make_constant_int(7);
+        assert!(
+            expected
+                .generate_guards(&incoming, &boxes, &[runtime], &mut ctx, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_constant_target_rejects_virtual_incoming() {
+        // virtualstate.py:392-394 (Int/Float leaves) / :525-529 (Ptr leaf): a
+        // virtual incoming can never satisfy a NotVirtual expected. In pyre the
+        // rejection is performed by the `info_type_matches` gate
+        // (virtualstate.rs:1470-1476) before the Constant match arm is reached;
+        // this test pins that gate so the arm stays unreachable for virtuals.
+        let mut ctx = OptContext::new(128);
+        let descr = test_descr(1);
+        let expected =
+            VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(GcRef(0x1234)))]);
+        let incoming = VirtualState::new(vec![VirtualStateInfo::VArray {
+            descr,
+            items: vec![VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
+                Value::Int(1),
+            ))],
+            lenbound: None,
+        }]);
+        let boxes = vec![OpRef::ref_op(10)];
+        let runtime = ctx.make_constant_ref(GcRef(0x1234));
+        assert!(
+            expected
+                .generate_guards(&incoming, &boxes, &[runtime], &mut ctx, false)
                 .is_err()
         );
     }

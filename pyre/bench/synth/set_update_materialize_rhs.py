@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=53
+# pyre-check: max-pypy-ratio=29
+# pyre-check: min-pypy-ratio=2.98
 # symmetric_difference_update turns a non-set operand into a set before it
 # toggles anything, so the operand is hashed and deduped up front: a duplicate
 # toggles once, and a later unhashable element leaves self untouched. update

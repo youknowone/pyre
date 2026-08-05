@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=48
+# pyre-check: max-pypy-ratio=27
+# pyre-check: min-pypy-ratio=3.02
 import re
 
 # Regex work runs through the `re` layer and native `_sre`, which the trace

@@ -1628,7 +1628,8 @@ impl DynasmBackend {
     /// backend whose only surviving load op wants a *constant* offset
     /// (`aarch64/regalloc.py:535` `op.getarg(1).getint()`).
     ///
-    /// Exactly four fields come from the collector. With none installed
+    /// Four fields come from the collector and two more take their boehm values
+    /// when there is none (gc.py:151-162). With none installed
     /// they take upstream's base-class values: `can_use_nursery_malloc`
     /// returns False (gc.py:81-82, inherited by `GcLLDescr_boehm`), spelled
     /// here as `max_nursery_size: 0`, and `write_barrier_descr = None`
@@ -1642,16 +1643,25 @@ impl DynasmBackend {
     /// already been consulted), and emitting barriers for a program that
     /// has no collector would call through an absent helper.
     fn gc_rewriter(&self) -> majit_gc::rewrite::GcRewriterImpl {
+        let collector = with_dynasm_active_gc(|gc| {
+            (
+                gc.nursery_free_addr(),
+                gc.nursery_top_addr(),
+                gc.max_nursery_object_size(),
+                gc.get_write_barrier_descr(),
+            )
+        });
+        // gc.py:653-664 `get_ll_description(gcdescr)`: `gcdescr is None`
+        // selects `GcLLDescr_boehm`, so upstream has no "no collector" state
+        // at all — the configuration with none installed IS boehm, and
+        // gc.py:151-162 is its field block. Two of the four collector-sourced
+        // values already take the base-class answer here
+        // (`can_use_nursery_malloc -> False`, gc.py:81-82, spelled
+        // `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156);
+        // this flag carries the other two, below.
+        let is_boehm = collector.is_none();
         let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
-            with_dynasm_active_gc(|gc| {
-                (
-                    gc.nursery_free_addr(),
-                    gc.nursery_top_addr(),
-                    gc.max_nursery_object_size(),
-                    gc.get_write_barrier_descr(),
-                )
-            })
-            .unwrap_or((0, 0, 0, None));
+            collector.unwrap_or((0, 0, 0, None));
         majit_gc::rewrite::GcRewriterImpl {
             nursery_free_addr,
             nursery_top_addr,
@@ -1683,11 +1693,15 @@ impl DynasmBackend {
             // even though the aarch64 backend has a native
             // `genop_load_effective_address` lowering.
             supports_load_effective_address: supports_load_effective_address(),
-            // incminimark.py:211 `malloc_zero_filled = False`:
-            // clear_gc_fields / clear_varsize_gc_fields emit only the
-            // per-object GC-pointer initialization required by
-            // rewrite.py:498-535.
-            malloc_zero_filled: false,
+            // incminimark.py:211 `malloc_zero_filled = False` when a
+            // collector answers: clear_gc_fields / clear_varsize_gc_fields
+            // emit the per-object GC-pointer initialization
+            // rewrite.py:498-535 requires. With none installed the value is
+            // gc.py:153 `GcLLDescr_boehm.malloc_zero_filled = True` and both
+            // are inert (rewrite.py:499-500, :521-522), which is what this
+            // configuration's allocation actually does: every malloc reaches
+            // a raw fallback built on `libc::calloc`.
+            malloc_zero_filled: is_boehm,
             // gc.py:39 `self.memcpy_fn = memcpy_fn` cast through
             // `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py:1046-1047).
             memcpy_fn: majit_ir::memcpy_fn_addr(),
@@ -1714,8 +1728,13 @@ impl DynasmBackend {
             // self.GCClass.HDR, 'tid')` — framework GC.  pyre's GC
             // is always framework-style; gen_initialize_tid translates
             // the descr's offset by `-HDR_SIZE` because pyre's HDR
-            // sits before the object pointer.
-            fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
+            // sits before the object pointer. gc.py:157
+            // `GcLLDescr_boehm.fielddescr_tid = None` makes
+            // gen_initialize_tid (rewrite.py:914-918) emit nothing, which is
+            // right with no collector: the raw malloc fallbacks stamp the
+            // header themselves, so a second tid GC_STORE has no producer to
+            // agree with.
+            fielddescr_tid: (!is_boehm).then(majit_ir::make_tid_field_descr),
             malloc_array_fn: dynasm_malloc_array as *const () as i64,
             malloc_array_nonstandard_fn: dynasm_malloc_array_nonstandard as *const () as i64,
             malloc_array_oldgen_fn: dynasm_malloc_array_oldgen as *const () as i64,

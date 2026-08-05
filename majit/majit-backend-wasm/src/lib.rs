@@ -704,6 +704,19 @@ fn wasm_bh_alloc(type_id: u32, payload_size: usize) -> i64 {
         0
     };
     if gc_ptr != 0 {
+        // A blackhole-materialized object is born into the old generation, so the
+        // collector reaches it only through the remembered set. It is not on the
+        // frame chain `walk_pyframe_roots` walks, and the resume fills it through
+        // stores that are barrier-free precisely because that chain is a root set
+        // (`ExecutionContext::enter`), so nothing would put it there. A nursery
+        // object needed none of this — being young was enough to have its fields
+        // traced. Remember it at birth to restore that, before any field is
+        // written; `TRACK_YOUNG_PTRS` is set by `finish_alloc_in_oldgen`, so this
+        // is the ordinary barrier, not a new mechanism.
+        //
+        // The raw fallback below is deliberately outside it: that block is plain
+        // malloc, not a collector-owned object, so it has no header to remember.
+        majit_gc::gc_write_barrier(GcRef(gc_ptr));
         return gc_ptr as i64;
     }
     wasm_bh_alloc_raw(payload_size)
@@ -1067,6 +1080,7 @@ static WASM_JITFRAME_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// id (counterpart to `set_jitframe_gc_type_id` on the native backends).
 pub fn set_wasm_jitframe_tid(id: u32) {
     WASM_JITFRAME_TID.store(id, std::sync::atomic::Ordering::Relaxed);
+    majit_gc::bh_probe_ignore_tid(id);
 }
 
 // Only read on the wasm32 execute_token path and by CA callee-frame allocation.
@@ -2226,7 +2240,18 @@ impl majit_backend::Backend for WasmBackend {
                 );
             }
         } else {
-            let publishable = label_descrs.first().is_some_and(|&id| id != 0)
+            // A LABEL with real work before it is not reachable through the plain
+            // entry: key 0 runs the function from its first op, so a bridge chaining
+            // there would re-run that work. Before the descr-strict dispatch every
+            // such trace was `is_resumable_peeled` and never reached this branch; a
+            // `jump_to_preamble` retrace (own LABEL, foreign closing JUMP) is not, so
+            // state the assumption the comment below already relies on.
+            let first_label_at_entry = ops
+                .iter()
+                .position(|op| op.opcode == majit_ir::OpCode::Label)
+                == Some(0);
+            let publishable = first_label_at_entry
+                && label_descrs.first().is_some_and(|&id| id != 0)
                 && label_num_args.first() == Some(&inputargs.len());
             if !publishable {
                 diag_bump(21);
@@ -3150,7 +3175,10 @@ impl majit_backend::Backend for WasmBackend {
                 let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
                 unsafe { wasm_gc_add_root(slot) };
             }
-            glue::execute(func_handle, frame_ptr);
+            {
+                let _bh_phase = majit_gc::BhProbePhase::enter("compiled");
+                glue::execute(func_handle, frame_ptr);
+            }
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);

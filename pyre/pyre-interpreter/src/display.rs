@@ -49,7 +49,8 @@ pub(crate) unsafe fn try_call_dunder_obj_above_object(
         let Some(w_type) = crate::typedef::r#type(obj) else {
             return Ok(None);
         };
-        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_type.as_ptr(), name)
+        let Some((src, method)) =
+            crate::baseobjspace::lookup_where_with_method_cache(w_type.as_ptr(), name)
         else {
             return Ok(None);
         };
@@ -392,7 +393,8 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         {
             return Ok(None);
         }
-        let Some((src, found)) = crate::baseobjspace::lookup_where_pair(w_class, name) else {
+        let Some((src, found)) = crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
+        else {
             return Ok(None);
         };
         // `object`'s inherited default is not a leaf override — fall through
@@ -434,7 +436,8 @@ pub(crate) unsafe fn type_metaclass_dunder_obj(
         if !pyre_object::is_type(metaclass.as_ptr()) {
             return Ok(None);
         }
-        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(metaclass.as_ptr(), name)
+        let Some((src, method)) =
+            crate::baseobjspace::lookup_where_with_method_cache(metaclass.as_ptr(), name)
         else {
             return Ok(None);
         };
@@ -473,7 +476,9 @@ pub(crate) unsafe fn exc_user_dunder_obj(
         if w_class.is_null() || !pyre_object::is_type(w_class) {
             return Ok(None);
         }
-        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_class, name) else {
+        let Some((src, method)) =
+            crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
+        else {
             return Ok(None);
         };
         // `object`'s and `BaseException`'s registrations are the two the
@@ -521,7 +526,9 @@ unsafe fn module_user_dunder_obj(
         if std::ptr::eq(w_class, module_class) {
             return Ok(None);
         }
-        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_class, name) else {
+        let Some((src, method)) =
+            crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
+        else {
             return Ok(None);
         };
         if method.is_null()
@@ -1032,6 +1039,16 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         // above, so this fallthrough never reaches a bare-`str` subclass.
         if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__str__")? {
             return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
+        }
+        // A class object is an instance of its metaclass, so `space.str`
+        // resolves `__str__` on that metaclass before falling back to the
+        // `<class ...>` representation.  `type` defines no `__str__`, so a
+        // metaclass without an override resolves to `object`'s and declines
+        // here, leaving `py_repr_wtf8` below to produce the native text.  The
+        // override may return a lone surrogate, so read it as WTF-8 rather
+        // than folding to `&str`.
+        if let Some(result) = type_metaclass_dunder_obj(obj, "__str__")? {
+            return Ok(pyre_object::w_str_get_wtf8(result).to_wtf8_buf());
         }
         // A `types.ModuleType` subclass `__str__` override wins; without one,
         // `str` falls back to `__repr__` through `py_repr`.

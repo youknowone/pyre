@@ -286,6 +286,16 @@ pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyCode, w_globals)
 pub const CODE_W_QUALNAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_qualname);
 /// Field offset of `w_name` within `PyCode`.
 pub const CODE_W_NAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_name);
+/// Field offset of `co_firstlineno_raw` within `PyCode`.
+pub const CODE_CO_FIRSTLINENO_RAW_OFFSET: usize = std::mem::offset_of!(PyCode, co_firstlineno_raw);
+
+/// The `co_firstlineno` slot, exactly as [`code_get_field`] reads it.
+///
+/// # Safety
+/// `w_code` must be a live `PyCode`.
+pub unsafe fn w_code_firstlineno_raw(w_code: PyObjectRef) -> i32 {
+    unsafe { (*(w_code as *const PyCode)).co_firstlineno_raw }
+}
 
 /// `pycode.py:127 self.co_qualname = qualname` — the shared wrapped qualified
 /// name, realized on first demand and retained on the code object.

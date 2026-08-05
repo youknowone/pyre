@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=2.4
+# pyre-check: min-pypy-ratio=0.28
 # Bound list methods flowing as values (`m = xs.append; m(i)`) dispatch the
 # JIT's Method method-form arms, which get NO concrete execution
 # during tracing — their heap effect must stay deferred, unlike the

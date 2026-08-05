@@ -1094,6 +1094,15 @@ impl ResidualFrameChainGuard {
             frame,
         );
         if entered {
+            // Same barrier obligation as the inline-call push: `f_backref` is
+            // a traced `Type::Ref` field, `frame` can be old-generation, and
+            // `saved_topframeref` can name a young frame.
+            pyre_object::gc_hook::try_gc_write_barrier(frame as *mut u8);
+            majit_gc::bh_probe_note_store(
+                frame as usize,
+                crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
+                2,
+            );
             unsafe {
                 (*frame).f_backref = saved_topframeref;
                 (*ec).topframeref = frame;
@@ -4583,6 +4592,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+        if let Some(outcome) = try_walker_specialize_seqiter_getitem_next(
+            ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+        )? {
+            return Ok(outcome);
+        }
     }
 
     // Emit MAKE_FUNCTION's `Function.__init__` as New + SetField so a `def` in a
@@ -4749,6 +4763,17 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && try_walker_specialize_builtin_len(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // An exact `range(...)` constructor call becomes a virtual W_Range whose
+    // four wrapped-int fields can fold directly into GET_ITER virtualization.
+    // Non-canonical callables and arguments fall through to the residual.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
@@ -5808,6 +5833,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
                     );
                     if is_subscr {
+                        // A user-instance receiver resolves `__getitem__` on
+                        // its own type; inline that body instead of leaving
+                        // the subscript an opaque residual.  The storage folds
+                        // below are for builtin containers, which this
+                        // declines.
+                        if let Some(inlined) = try_walker_inline_subscr_getitem(
+                            ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+                        )? {
+                            return Ok(inlined);
+                        }
                         // BINARY_SUBSCR list[int] getitem (int/float storage);
                         // falls through to the generic may-force leg otherwise.
                         try_walker_specialize_subscr(

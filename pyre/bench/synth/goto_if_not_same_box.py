@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=5.6
+# pyre-check: min-pypy-ratio=0.78
 # Fused `goto_if_not_<cmp>` with the SAME box on both sides (`b1 is b2`).
 #
 # `record_or_fold_fused_guard` mirrors `opimpl_goto_if_not_<cmp>`

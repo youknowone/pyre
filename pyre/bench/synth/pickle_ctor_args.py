@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=336
+# pyre-check: max-pypy-ratio=36
+# pyre-check: min-pypy-ratio=4.15
 # _pickle.Pickler/Unpickler accept their constructor arguments positionally and
 # by keyword: tp_new allocates and ignores them, __init__ validates and stores
 # them. `pickle.Pickler` binds to the C accelerator where it exists and to the

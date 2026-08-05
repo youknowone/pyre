@@ -1,12 +1,17 @@
-# pyre-check: max-pypy-ratio=718
+# pyre-check: max-pypy-ratio=24
+# pyre-check: min-pypy-ratio=1.9
 # Inline chain of increasing depth whose argument flips int -> float partway
 # through the loop, so the type guard deopts with 2, 3 and 7 frames inlined.
 # Each depth keeps its own driver loop and its own chain so the trace shape is
-# the same as when the depths lived in separate files.  N is half of what a
-# single depth used to run so that three drivers in one file cost no more than
-# the slowest of the three did on its own.
-N = 150000
-FLIP_AT = 100000
+# the same as when the depths lived in separate files.  FLIP_AT stays two
+# thirds of the way through, so each driver keeps the same pre- and post-flip
+# share of its iterations.
+#
+# N is sized so pypy spends time the execution floor can be subtracted from:
+# at 150000 it ran the whole file in 0.01s, which left the ratio dividing by
+# that floor rather than by pypy's own time.
+N = 3000000
+FLIP_AT = 2000000
 
 
 def h(x):

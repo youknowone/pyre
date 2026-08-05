@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=90
+# pyre-check: max-pypy-ratio=31
+# pyre-check: min-pypy-ratio=2.72
 # A `for` body that calls two DISTINCT recursive functions and then runs one
 # more statement, with the branch it takes flipping after warm-up. Once a callee
 # owns a compiled loop the walk aborts the enclosing trace

@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=1025
+# pyre-check: max-pypy-ratio=374
+# pyre-check: min-pypy-ratio=33
 # Two regressions in one hot loop:
 #
 # 1. Binding: a non-default `__getattribute__` must suppress LOAD_METHOD

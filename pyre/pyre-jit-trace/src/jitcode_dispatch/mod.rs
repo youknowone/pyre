@@ -8117,34 +8117,47 @@ fn classify_compare_box_use<Sym: WalkSym>(
     dst_reg: u8,
     publish: VablePublish,
 ) -> CompareBoxUse {
-    // `compare_pc` indexes the JitCode being walked, while everything below
-    // reads the snapshot root's.  An inlined sub-walk has a distinct callee
-    // JitCode and deliberately shares the root snapshot, so the two disagree
-    // and the scan would decode the callee's offset against the caller's
-    // bytes.  `walker_foriter_green_key` declines the same mismatch.
-    if ctx.fbw_mode.inline_subwalk {
-        return CompareBoxUse::Other;
-    }
-    let full_body_sym = ctx.fbw_mode.snapshot_sym;
-    if full_body_sym.is_null() {
-        return CompareBoxUse::Other;
-    }
-    // SAFETY: same contract as walker_capture_snapshot_for_last_guard_impl —
-    // pointer live for the full-body walk, immutable layout fields only.
-    let (code, jitcode_index, payload): (&[u8], i32, &crate::PyJitCode) = unsafe {
-        let sym = &*full_body_sym;
-        if sym.jitcode().is_null() {
+    // `compare_pc` indexes the JitCode being walked.  For a root walk that is
+    // the snapshot root's; an inlined sub-walk drives the callee's OWN per-fn
+    // body, so decoding the callee's offset against the root's bytes reads
+    // unrelated ops.  Take the bytes from the frame the walk is actually in —
+    // upstream reads the bytecode per frame as well (`MIFrame.setup`,
+    // `pyjitpl.py:74-80`, assigns `self.bytecode` at every `perform_call`).
+    //
+    // Condition 4's liveness tables are keyed on the ROOT jitcode index and do
+    // not describe a callee, so a callee scan reports the shape without it.
+    // That is what [`walker_newbool_guarded`] asks for; the box elision in
+    // [`compare_box_provably_dead`] requires condition 4 and so keeps declining
+    // inside a sub-walk exactly as before.
+    let (code, liveness): (&[u8], Option<(i32, &crate::PyJitCode)>) = if ctx.fbw_mode.inline_subwalk
+    {
+        let w_code = ctx.session.borrow().framestack.last().map(|f| f.w_code);
+        match w_code.and_then(|c| crate::state::sub_jitcode_body_for_code(c as *const ())) {
+            Some(body) => (body.code, None),
+            // An inline level with no resolvable body: no bytes to scan.
+            None => return CompareBoxUse::Other,
+        }
+    } else {
+        let full_body_sym = ctx.fbw_mode.snapshot_sym;
+        if full_body_sym.is_null() {
             return CompareBoxUse::Other;
         }
-        let jc = &*sym.jitcode();
-        if jc.payload.code_ptr.is_null() {
-            return CompareBoxUse::Other;
+        // SAFETY: same contract as walker_capture_snapshot_for_last_guard_impl —
+        // pointer live for the full-body walk, immutable layout fields only.
+        unsafe {
+            let sym = &*full_body_sym;
+            if sym.jitcode().is_null() {
+                return CompareBoxUse::Other;
+            }
+            let jc = &*sym.jitcode();
+            if jc.payload.code_ptr.is_null() {
+                return CompareBoxUse::Other;
+            }
+            (
+                jc.payload.jitcode.code.as_slice(),
+                Some((jc.index as i32, &jc.payload)),
+            )
         }
-        (
-            jc.payload.jitcode.code.as_slice(),
-            jc.index as i32,
-            &jc.payload,
-        )
     };
     let Some(start) = crate::jitcode_runtime::decode_op_at(code, compare_pc) else {
         return CompareBoxUse::Other;
@@ -8225,6 +8238,11 @@ fn classify_compare_box_use<Sym: WalkSym>(
     };
     let Some(gin_op) = crate::jitcode_runtime::decode_op_at(code, gin_pc) else {
         return CompareBoxUse::Other;
+    };
+    // A callee scan carries no liveness table of its own (see above), so it
+    // reports the shape alone and leaves condition 4 unproven.
+    let Some((jitcode_index, payload)) = liveness else {
+        return CompareBoxUse::FeedsBranchOnly { arms_dead: false };
     };
     // Condition 4: `dst_reg`'s color must be dead at BOTH branch arms (the
     // POP_JUMP pops the tested bool regardless of direction, so the
@@ -11039,9 +11057,22 @@ fn handle<Sym: WalkSym>(
                                         entry_meta,
                                     )
                                 }
-                                None => driver
-                                    .meta_interp_mut()
-                                    .compile_trace(key, &live_args, None),
+                                // compile.py:1002-1021 — an interp-origin close is a
+                                // `ResumeFromInterpDescr` entry bridge, and with no
+                                // entry data there is no original green key to attach
+                                // it to. `compile_trace(key, args, None)` cannot serve
+                                // that state: its `None`-origin arm demands the
+                                // entry-bridge payload and answers `Cancelled` for
+                                // every input, after deep-cloning the whole
+                                // trace-so-far and lowering its snapshot pool. Decline
+                                // here instead, so the give-up reads as one.
+                                // `compile_trace_entry_data` reads
+                                // `trace_ctx().root_green_key()` and `trace_meta()`,
+                                // and every `JitDriver` trace start installs both
+                                // halves, so this is unreachable from a jd0 walk; only
+                                // `MetaInterp::force_start_tracing` opens a tracer with
+                                // no session envelope.
+                                None => majit_metainterp::CompileOutcome::Cancelled,
                             },
                         };
                         if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {

@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=84
+# pyre-check: max-pypy-ratio=27
+# pyre-check: min-pypy-ratio=3.28
 # str.encode() rejects non-text (binary) codecs with LookupError instead of
 # silently producing bytes: the binary codecs' CodecInfo._is_text_encoding
 # (False, stored on a tuple subclass instance) is honored. Output verified

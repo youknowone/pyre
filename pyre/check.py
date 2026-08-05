@@ -123,6 +123,12 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # as the run it is subtracted from.
 STARTUP_SAMPLES = 5
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
+# A floor failure is only trustworthy when the baseline clears the execution
+# floor enough for small relative error: execution time is the difference
+# between two independently measured values.
+FLOOR_GATE_MIN_BASELINE_S = 3 * EXEC_TIME_FLOOR_S
+# The default pypy performance floor is its ceiling divided by this value.
+PERF_GATE_FLOOR_DIVISOR = 5
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
 # quantized (see WIN_TIMER_QUANTUM_S above).
@@ -854,6 +860,30 @@ def synth_perf_gate(path):
                 raise ValueError(f"invalid synthetic performance gate in {path}: {line.strip()}") from e
             if ratio <= 0:
                 raise ValueError(f"synthetic performance gate must be positive in {path}")
+            return ratio
+    return None
+
+
+def synth_min_perf_gate(path):
+    """Read an optional per-fixture minimum pypy ratio from its header.
+
+    The minimum overrides the floor derived from `max-pypy-ratio`, for example:
+        # pyre-check: min-pypy-ratio=2
+    """
+    prefix = "# pyre-check: min-pypy-ratio="
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix):
+                continue
+            try:
+                ratio = float(line[len(prefix):].strip())
+            except ValueError as e:
+                raise ValueError(f"invalid synthetic minimum performance gate in {path}: {line.strip()}") from e
+            if ratio <= 0:
+                raise ValueError(f"synthetic minimum performance gate must be positive in {path}")
             return ratio
     return None
 
@@ -1617,14 +1647,24 @@ class Check:
             pyre_times.append(elapsed)
         return statistics.median(pyre_times), statistics.median(baseline_times)
 
+    def _baseline_exec_time_clamped(self, baseline, baseline_time):
+        """Whether startup subtraction pinned a baseline to its floor."""
+        exec_b = self._exec_time(baseline, baseline_time)
+        return (
+            not self.args.no_startup_subtract
+            and exec_b not in (None, "-")
+            and float(exec_b) <= EXEC_TIME_FLOOR_S
+        )
+
     def _performance_gate_passed(
         self, backend, script, timeout, elapsed, limit, baseline_time,
-        baseline_cmd, expected_output, baseline_key,
+        baseline_cmd, expected_output, baseline_key, minimum=None,
     ):
         """Check one performance ratio, retrying a failure by median.
 
         The pass/fail decision compares execution-only (startup-subtracted)
-        times; the returned elapsed/baseline stay raw for reporting.
+        times; the returned elapsed/baseline stay raw for reporting. The
+        returned bound is ``ceiling`` or ``floor`` when the gate fails.
         """
         # Each execution-only value is a difference between two independently
         # measured quantities (bench - empty-program startup).  On Windows each
@@ -1636,38 +1676,48 @@ class Check:
         if sys.platform == "win32":
             compare_buffer += 2 * WIN_TIMER_QUANTUM_S * (1 + limit)
 
-        if (
-            self._exec_time(backend, elapsed)
-            <= self._exec_time(baseline_key, baseline_time) * limit
-            + compare_buffer
-        ):
-            return True, elapsed, baseline_time, ""
+        def failed_bound(measured, baseline_value):
+            exec_measured = self._exec_time(backend, measured)
+            exec_baseline = self._exec_time(baseline_key, baseline_value)
+            if exec_measured > exec_baseline * limit + compare_buffer:
+                return "ceiling"
+            if (
+                minimum is not None
+                and exec_baseline >= FLOOR_GATE_MIN_BASELINE_S
+                and exec_measured * (limit / minimum) + compare_buffer
+                < exec_baseline * limit
+            ):
+                return "floor"
+            return None
+
+        bound = failed_bound(elapsed, baseline_time)
+        if bound is None:
+            return True, None, elapsed, baseline_time, ""
 
         retry = self._retry_performance_gate(
             backend, script, timeout, baseline_cmd, expected_output,
         )
         if retry is not None:
             median_elapsed, median_baseline = retry
-            if (
-                self._exec_time(backend, median_elapsed)
-                <= self._exec_time(baseline_key, median_baseline) * limit
-                + compare_buffer
-            ):
-                return True, median_elapsed, median_baseline, f"median {PERF_RETRY_RUNS}"
-            return False, median_elapsed, median_baseline, f"median {PERF_RETRY_RUNS}"
+            bound = failed_bound(median_elapsed, median_baseline)
+            return (
+                bound is None, bound, median_elapsed, median_baseline,
+                f"median {PERF_RETRY_RUNS}",
+            )
 
-        return False, elapsed, baseline_time, ""
+        return False, bound, elapsed, baseline_time, ""
 
-    def _gate_fail_detail(self, backend, baseline, measured, baseline_time, limit):
+    def _gate_fail_detail(
+        self, backend, baseline, measured, baseline_time, limit, bound,
+        minimum=None,
+    ):
         """One-line FAIL detail using the exact numbers the gate compared.
 
         The gate decides on startup-subtracted exec times
-        (``_exec_time(backend, measured) <= _exec_time(baseline, baseline_time)
-        * limit``), so those exec times — not the raw run times — are printed,
-        alongside their true measured ratio and the gate threshold. On a FAIL
-        the ratio necessarily exceeds the threshold, so every number on the
-        line is arithmetically self-consistent: exec_measured / exec_baseline
-        equals the shown ratio, which is above the shown gate.
+        rather than raw run times, so those exec times are printed alongside
+        their true measured ratio and the failed gate threshold. Every number
+        on the line is arithmetically self-consistent: exec_measured /
+        exec_baseline equals the shown ratio, which is outside the shown gate.
         """
         exec_m = self._exec_time(backend, measured)
         exec_b = self._exec_time(baseline, baseline_time)
@@ -1675,20 +1725,18 @@ class Check:
             ratio = "-"
         else:
             ratio = f"{float(exec_m) / float(exec_b):.1f}x"
-        # A baseline sitting exactly on EXEC_TIME_FLOOR_S was clamped: the
-        # subtraction put it at or below the floor, so its execution time could
-        # not be separated from its own startup and the ratio computed against
-        # it is an artifact of the clamp rather than a measurement.  Say so on
-        # the line, because the printed denominator otherwise reads like one.
-        clamped = (
-            not self.args.no_startup_subtract
-            and exec_b not in (None, "-")
-            and float(exec_b) <= EXEC_TIME_FLOOR_S
-        )
-        detail = (
-            f"exec {exec_m:.2f}s > {baseline} {exec_b:.2f}s  "
-            f"ratio {ratio} > gate {float(limit):g}x"
-        )
+        clamped = self._baseline_exec_time_clamped(baseline, baseline_time)
+        if bound == "floor":
+            detail = (
+                f"exec {exec_m:.2f}s vs {baseline} {exec_b:.2f}s  "
+                f"ratio {ratio} < gate {float(minimum):g}x; "
+                f"max-pypy-ratio ceiling {float(limit):g}x needs re-recording"
+            )
+        else:
+            detail = (
+                f"exec {exec_m:.2f}s > {baseline} {exec_b:.2f}s  "
+                f"ratio {ratio} > gate {float(limit):g}x"
+            )
         if clamped:
             detail += f"  [{baseline} exec clamped to floor; ratio not a measurement]"
         return detail
@@ -1696,7 +1744,7 @@ class Check:
     def _run_backend_bench(
         self, backend, name, script, timeout,
         vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
-        wasm_float_tol=False, max_rss_mb=None,
+        wasm_float_tol=False, max_rss_mb=None, min_pypy_ratio=None,
     ):
         pyre_bin = self._pyre(backend)
         effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
@@ -1749,19 +1797,21 @@ class Check:
             den = self._exec_time("pypy", pypy_val)
             if den in (None, "-") or float(den) <= 0 or num in (None, "-"):
                 return "-"
-            return f"{float(num) / float(den):.1f}x"
+            marker = "~" if self._baseline_exec_time_clamped("pypy", pypy_val) else ""
+            return f"{marker}{float(num) / float(den):.1f}x"
 
         ratio = _ratio(elapsed, t_pypy) if elapsed > 0 else "-"
 
         retry_note = ""
         if vs_cpython and t_cpython not in (None, "-"):
-            passed, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
+            passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_cpython, float(t_cpython),
                 [PYTHON3, script], pypy_output, "cpython",
             )
             if not passed:
                 detail = self._gate_fail_detail(
-                    backend, "cpython", checked_elapsed, checked_baseline, vs_cpython,
+                    backend, "cpython", checked_elapsed, checked_baseline,
+                    vs_cpython, bound,
                 )
                 self._record(backend, False, name, detail)
                 suffix = f" ({retry_note})" if retry_note else ""
@@ -1776,17 +1826,23 @@ class Check:
                 ratio = _ratio(elapsed, t_pypy)
 
         if vs_pypy and t_pypy not in (None, "-"):
-            passed, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
+            minimum = (
+                min_pypy_ratio if min_pypy_ratio is not None
+                else vs_pypy / PERF_GATE_FLOOR_DIVISOR
+            )
+            passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_pypy, float(t_pypy),
-                [PYPY3, script], pypy_output, "pypy",
+                [PYPY3, script], pypy_output, "pypy", minimum,
             )
             if not passed:
                 detail = self._gate_fail_detail(
-                    backend, "pypy", checked_elapsed, checked_baseline, vs_pypy,
+                    backend, "pypy", checked_elapsed, checked_baseline,
+                    vs_pypy, bound, minimum,
                 )
                 self._record(backend, False, name, detail)
                 suffix = f" ({retry_note})" if retry_note else ""
-                print(f"{red('SLOWER')}  pyre {detail}{suffix}")
+                label = "FASTER" if bound == "floor" else "SLOWER"
+                print(f"{red(label)}  pyre {detail}{suffix}")
                 self._append_comparison(
                     backend, name, t_cpython, t_pypy,
                     fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
@@ -1980,6 +2036,7 @@ class Check:
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
         try:
             max_pypy_ratio = synth_perf_gate(path)
+            min_pypy_ratio = synth_min_perf_gate(path)
             max_rss_mb = synth_rss_gate(path)
             skip_backends = synth_skip_backends(path)
         except ValueError as e:
@@ -2061,6 +2118,7 @@ class Check:
                 backend, name, path, timeout,
                 None, vs_pypy, t_cpython, t_pypy, pypy_output,
                 max_rss_mb=None if backend == "wasm" else max_rss_mb,
+                min_pypy_ratio=min_pypy_ratio,
             )
 
     def run_synthetic_suite(self):
@@ -2116,6 +2174,8 @@ class Check:
         header = f"  {'benchmark':<35s} {'cpython':>8s} {'pypy':>8s}"
         header += "".join(f" {b:>18s}" for b in cols)
         print(header)
+        if any("~" in c[b] for c in self.comparisons for b in cols):
+            print("  ~ pypy exec clamped to floor; ratio is not a measurement")
         print("  " + "─" * (54 + 19 * len(cols)))
         for c in self.comparisons:
             row = f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"

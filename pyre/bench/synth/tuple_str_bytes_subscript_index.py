@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=15
+# pyre-check: min-pypy-ratio=1.45
 # tuple, str, and bytes subscripts coerce a non-int, non-slice key through
 # `__index__` (`getindex_w`): a small custom index reads the resolved position,
 # an out-of-range index raises the type's "index out of range", and an index

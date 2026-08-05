@@ -1832,21 +1832,53 @@ impl UnrollOptimizer {
             // unroll.py:170-171: jump_to_preamble — body JUMP → preamble Label
             //
             // force_box_for_end_of_preamble (unroll.py:126-127) has already run
-            // over the body JUMP's args above, so they carry the types the
-            // preamble's Label declares and the retarget below is a plain
-            // send_extra_operation.
+            // over the body JUMP's args above, so each arg is a forced box rather
+            // than a virtual. That is a per-ARG property and says nothing about the
+            // arg LIST matching the preamble Label's — on a retrace it does not, and
+            // the arity check below is what catches it.
             let preamble_target = self
                 .target_tokens
                 .first()
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
             let preamble_arity = exported_renamed_inputargs.len();
+            let body_jump_arity = body_terminal_op.as_ref().map(|j| j.num_args()).unwrap_or(0);
             if crate::majit_log_enabled() {
-                let body_jump_arity = body_terminal_op.as_ref().map(|j| j.num_args()).unwrap_or(0);
                 eprintln!(
                     "[jit] jump_to_preamble: body_jump_args={} preamble_arity={} start_label_args={:?}",
                     body_jump_arity, preamble_arity, exported_renamed_inputargs,
                 );
+            }
+            // `compile.py:334 assert jump.numargs() == label.numargs()`.
+            // Upstream can assert because its `target_tokens[0]` is the start
+            // label whose args ARE `loop.inputargs` — the same loop-carried
+            // positions the body JUMP carries — so `unroll.py:238-242`'s
+            // arg-preserving retarget is sound by construction.
+            //
+            // A pyre RETRACE has no start label of its own (see
+            // `emit_start_label`), so `target_tokens[0]` is the ORIGINAL loop's
+            // start label: the portal's entry contract, one boxed Ref per frame
+            // local. The optimized loop-carried set is wider and mixed, so the
+            // retarget can land N values on an M-slot label and the target then
+            // reads a raw integer as a Ref — measured as EXC_BAD_ACCESS on the
+            // loop counter inside GuardClass.
+            //
+            // Give up, which is `unroll.py:242`'s own escape (it lets
+            // `send_extra_operation` raise `InvalidLoop`) and lands on
+            // `compile.py:368-371`'s cancel. Scoped to the retrace: a
+            // `compile_loop` unroll keeps its start label in the SAME artifact,
+            // so its preamble target is local and this mismatch cannot arise.
+            if !self.emit_start_label && body_jump_arity != preamble_arity {
+                crate::mc_diag_bump(57);
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] jump_to_preamble giveup: body JUMP args {body_jump_arity} \
+                         != preamble LABEL args {preamble_arity}"
+                    );
+                }
+                return Err(crate::optimize::InvalidLoop(
+                    "jump_to_preamble: body JUMP arity != preamble LABEL arity",
+                ));
             }
             if let Some(mut end_jump) = body_terminal_op {
                 end_jump.setdescr(preamble_target.as_jump_target_descr());

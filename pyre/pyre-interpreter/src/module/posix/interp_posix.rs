@@ -2596,10 +2596,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         out.push_str(">");
         Ok(pyre_object::w_str_from_wtf8(out))
     }
+    /// `interp_scandir.py:463-465 descr_reduce_ex` — an entry names a live
+    /// position in a directory listing, so it refuses to be pickled.  `%T` is
+    /// `error.py:592-593 space.type(value).name`, the qualified typedef name
+    /// (`interp_scandir.py:469 'posix.DirEntry'`), which is what
+    /// `w_type_get_name` returns; the flag-driven `reduce_newobj` refusal in
+    /// `reduce_protocol_app.py:13-14` spells it with the bare `__name__`.
+    fn dir_entry_reduce_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let type_name = match crate::typedef::r#type(args[0]) {
+            Some(tp) => unsafe { pyre_object::typeobject::w_type_get_name(tp.as_ptr()) },
+            None => "posix.DirEntry",
+        };
+        Err(crate::PyError::type_error(format!(
+            "cannot pickle '{type_name}' object"
+        )))
+    }
     fn dir_entry_type() -> PyObjectRef {
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *CELL.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("DirEntry", |ns| {
+            // `interp_scandir.py:469` names the typedef `'posix.DirEntry'`.
+            // typedef.rs:2285-2291 turns the leading component of a qualified
+            // builtin name into a `__module__` entry, so `type(e).__module__`
+            // reports `posix` and every type-name-bearing error message is
+            // spelled the way the typedef spells it.
+            let tp = crate::typedef::make_builtin_type("posix.DirEntry", |ns| {
                 for (name, f) in [
                     ("is_dir", dir_entry_is_dir as crate::gateway::BuiltinCodeFn),
                     ("is_file", dir_entry_is_file),
@@ -2609,6 +2629,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ("stat", dir_entry_stat),
                     ("__fspath__", dir_entry_fspath),
                     ("__repr__", dir_entry_repr),
+                    ("__reduce_ex__", dir_entry_reduce_ex),
                 ] {
                     unsafe {
                         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -2632,6 +2653,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 };
             });
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            // `interp_scandir.py:468-487` declares no `__new__` on the typedef
+            // and `:487` sets `acceptable_as_base_class = False`; `typedef.py:55
+            // acceptable_as_base_class = '__new__' in rawdict` is the rule, and
+            // `typedef.py:754 assert not PyFrame.typedef.acceptable_as_base_class
+            // # no __new__` is the same shape typedef.rs:534-539 already ports.
+            // `scandir_fn` below allocates entries with
+            // `pyre_object::w_instance_new`, which never enters `type.__call__`,
+            // so the producer is untouched by the instantiation gate.
+            unsafe {
+                pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
+                pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
+            }
             tp as usize
         }) as PyObjectRef
     }
@@ -2662,7 +2695,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn scandir_iter_type() -> PyObjectRef {
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *CELL.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("ScandirIterator", |ns| {
+            // `interp_scandir.py:173` names the typedef `'posix.ScandirIterator'`.
+            let tp = crate::typedef::make_builtin_type("posix.ScandirIterator", |ns| {
                 for (name, f) in [
                     (
                         "__iter__",
@@ -2683,6 +2717,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
             });
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            // `interp_scandir.py:172-180` declares no `__new__` on the typedef
+            // and `:180` sets `acceptable_as_base_class = False`.  The iterator
+            // is produced only by `scandir_fn` below, through
+            // `pyre_object::w_instance_new`.
+            unsafe {
+                pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
+                pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
+            }
             tp as usize
         }) as PyObjectRef
     }

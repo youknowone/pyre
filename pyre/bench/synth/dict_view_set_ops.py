@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=39
+# pyre-check: max-pypy-ratio=25
+# pyre-check: min-pypy-ratio=3.8
 # A set operation on a dict view builds a set from the left operand and runs
 # the matching in-place set method against the right one, so the result is a
 # plain set. The reflected forms build the set from the other operand, keeping
@@ -29,7 +30,7 @@ K2 = {"b": 2, "c": 3}
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(120000))
     # forward ops, view vs view
     m("keys_sub", lambda: s(K.keys() - K2.keys()))
     m("keys_and", lambda: s(K.keys() & K2.keys()))

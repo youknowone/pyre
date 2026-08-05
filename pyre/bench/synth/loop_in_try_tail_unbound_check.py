@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=250
+# pyre-check: max-pypy-ratio=23
+# pyre-check: min-pypy-ratio=2.45
 # A hot loop whose header is covered by an exception handler, with a post-loop
 # tail that reads the loop variable through LOAD_FAST_CHECK.
 #

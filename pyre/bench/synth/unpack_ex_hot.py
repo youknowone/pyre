@@ -1,11 +1,12 @@
-# pyre-check: max-pypy-ratio=29
+# pyre-check: max-pypy-ratio=17
+# pyre-check: min-pypy-ratio=2.6
 # UNPACK_EX in a hot loop: `a, *b = data` with a star target compiles to the
 # unpack_ex residual (the UNPACK_SEQUENCE sibling with a starred list slot)
 # instead of an abort_permanent marker, so the hot body JIT-compiles rather
 # than declining to the trait leg. The residual returns a tuple of the
 # `before + 1 + after` slots that `unpack_item_fn` reads back out.
 # Output is verified against CPython/PyPy.
-N = 200000
+N = 2000000
 
 
 def main():

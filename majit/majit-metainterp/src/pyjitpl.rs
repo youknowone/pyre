@@ -6959,6 +6959,14 @@ impl<M: Clone> MetaInterp<M> {
             .filter_map(|&op| op.ty().map(|ty| crate::trace_ctx::GreenBox::new(op, ty)))
             .collect();
         if green_boxes.len() != jump_args.len() {
+            // `pyjitpl.py:3059-3060 self.current_merge_points.append(
+            // (live_arg_boxes, start))` appends unconditionally. This decline
+            // is a pyre stand-in and it ALSO suppresses the
+            // `keep_tracing_after_close` write below, so the trace is
+            // abandoned without appearing in `loops_aborted`. Slot 55 counts
+            // every firing so a corpus (run with a non-zero `retrace_limit`)
+            // reading 0 can promote it to a `debug_assert!`.
+            crate::mc_diag_bump(55);
             return;
         }
         let key = ctx.green_key;
@@ -7697,41 +7705,17 @@ impl<M: Clone> MetaInterp<M> {
         // `jump_to_existing_trace`, and the foreign-target fallback at
         // `unroll.rs:1797-1810` all reach it.
         //
-        // It is declined here for a BACKEND reason, and only one backend:
-        // `majit-backend-wasm` decides local-vs-external JUMP on `has_loop`
-        // (`codegen.rs:1983`), not on whether the descr resolves. A retrace has
-        // its own LABEL, so `find_loop_label_index`'s
-        // `.or_else(rposition(Label))` fallback (`codegen.rs:4785-4791`) makes
-        // `has_loop` true, the external arm at `codegen.rs:2195` is skipped,
-        // and `find_label_args` (`codegen.rs:4806-4810`) falls back to the
-        // trailing label — silently turning the preamble JUMP into a back-edge
-        // to this trace's own label. Cranelift has no such gap
-        // (`compiler.rs:13247-13302` resolves by descr and emits an external
-        // exit). Until the wasm dispatch is descr-driven, take
-        // `compile.py:368-371`'s cancel shape: declining costs the guard its
-        // retrace, compiling it would miscompile on wasm.
-        let closes_on_own_label = {
-            let jump_descr = combined_ops
-                .iter()
-                .rev()
-                .find(|op| op.opcode == OpCode::Jump)
-                .and_then(|op| op.getdescr())
-                .map(|descr| descr.index());
-            let label_descr = combined_ops
-                .iter()
-                .rev()
-                .find(|op| op.opcode == OpCode::Label)
-                .and_then(|op| op.getdescr())
-                .map(|descr| descr.index());
-            jump_descr.is_some() && jump_descr == label_descr
-        };
-        if !closes_on_own_label {
-            crate::debug::log_one(
-                "jit-abort",
-                "compile_retrace: closing JUMP does not target this trace's label",
-            );
-            return false;
-        }
+        // Both outcomes are compiled, as upstream does: `compile.py:341-394
+        // compile_retrace` declines only on `InvalidLoop` (:368-371), and both
+        // `jump_to_preamble` sites return a full `UnrollInfo`.
+        //
+        // This used to decline the retargeted outcome for a single backend's sake.
+        // All three now decide local-vs-external on the TOKEN, which is
+        // `x86/assembler.py:2461-2467 closing_jump`'s own test
+        // (`target_token in self.target_tokens_currently_compiling`): dynasm at
+        // `aarch64/assembler.rs:3129` / `x86/assembler.rs:4126`, cranelift at
+        // `compiler.rs:13244-13310`, and wasm at `codegen.rs find_loop_label_index`
+        // since the descr-strict dispatch landed.
 
         let num_combined_ops = combined_ops.len();
         let has_guard = combined_ops.iter().any(|op| op.opcode.is_guard());
@@ -8066,6 +8050,43 @@ impl<M: Clone> MetaInterp<M> {
             );
             return false;
         };
+        // `compile.py:797-811 ResumeGuardDescr.compile_and_attach` installs a
+        // finished retrace under ONE identity: the source guard's own loop
+        // token (`metainterp.resumekey_original_loop_token`), which it uses for
+        // `new_loop.original_jitcell_token`, for `send_bridge_to_backend` and
+        // for `record_loop_or_bridge` alike. This function binds the artifact
+        // to `source_jct` the same way (`set_original_jitcell_token_number`,
+        // `record_loop_or_bridge`) but files everything else under the
+        // caller-supplied `green_key`: `set_next_header_pc`, the
+        // `previous_tokens` read, `caller_recovery_layout`,
+        // `build_guard_metadata`'s key, and the `compiled.traces` insert. Those
+        // five only name the right loop while the two identities agree.
+        //
+        // They do agree by construction — the bridge entry derives its key from
+        // this very token (`descr_owning_jct(descr)?.green_key()`) before the
+        // trace context exists, and seeds both `TraceCtx::green_key` and
+        // `BridgeTraceInfo::green_key` from it — but nothing in this function
+        // said so. State it, exactly as `compile_bridge` already does for its
+        // own origin key.
+        //
+        // The retrace-budget half is deliberately NOT covered here: the
+        // `loop_jitcell_token` charges (`record_target_token`,
+        // `set_retraced_count`) follow the loop being ENTERED
+        // (`unroll.py:213-215`, `unroll.py:290-297`), which is a different
+        // question from which loop the artifact hangs off.
+        debug_assert_eq!(
+            green_key,
+            source_jct.green_key(),
+            "compile.py:801 — the retrace artifact is bound to source_jct, so \
+             the key its resume/exit layouts are filed under must name the same \
+             loop"
+        );
+        debug_assert_eq!(
+            bridge.green_key, green_key,
+            "pyjitpl.py:2890 — BridgeTraceInfo.green_key (the origin key stashed \
+             at start_retrace_from_guard) must match the trace-context key \
+             compile_retrace passes down"
+        );
         let fail_index = fail_descr.fail_index_per_trace();
         let source_trace_id = fail_descr.trace_id();
         let bridge_trace_id = self.alloc_trace_id();
@@ -11740,26 +11761,39 @@ impl<M: Clone> MetaInterp<M> {
         }
         let cell_token_key = self.bridge_cell_token_key(green_key, jump_target_key);
 
-        // `pyjitpl.py:2897-2899` parity:
+        // `pyjitpl.py:2921-2923`:
         //   self.resumekey_original_loop_token =
         //       resumedescr.rd_loop_token.loop_token_wref()
         //   if self.resumekey_original_loop_token is None:
-        //       raise compile.giveup()  # should be rare
-        // `compile.giveup()` (`compile.py:27-29`) raises
-        // `SwitchToBlackhole(ABORT_BRIDGE)`, which RPython catches at
-        // `pyjitpl.py:2906-2907` and falls through to blackhole resume.
-        // Pyre's `compile_bridge` mirrors that abort by returning `false`;
-        // the caller (`compile_trace`) maps `false` to
-        // `CompileOutcome::Cancelled`, the same control-flow blackhole
-        // resume observes.  The weakref-dead path is "should be rare" per
-        // upstream, but structurally required — never panic.
+        //       raise compile.giveup() # should be rare
+        //
+        // That check runs at the TOP of `handle_guard_failure`, before
+        // `create_history` (`pyjitpl.py:2925`) and ABOVE the `try:` at
+        // `:2926` — so the `except SwitchToBlackhole` at `:2930-2931` does
+        // NOT catch the `SwitchToBlackhole(ABORT_BRIDGE)` that
+        // `compile.giveup()` (`compile.py:27-29`) raises, and the `finally:`
+        // at `:2932-2935` does not run.  It propagates out with nothing yet
+        // traced, so there is no trace to give up on.
+        //
+        // This site is at a later phase, inside the compile, where upstream
+        // asserts rather than gives up: `compile.py:800
+        // assert metainterp.resumekey_original_loop_token is not None`.
+        // Returning `false` becomes `CompileOutcome::Cancelled` and thence
+        // `Declined`, which keeps the trace alive — the shape `compile.py:1085
+        // return None` already has at a bridge close, since
+        // `raise_if_successful` does not raise on `None`.
+        //
+        // "Should be rare" upstream; here it is unobserved, because every
+        // `set_rd_loop_token_clt` site is preceded by `keep_loop_alive`, which
+        // pins the token in `alive_loops`.  Structurally required — never
+        // panic.
         let source_jct: Arc<JitCellToken> = match majit_backend::descr_owning_jct(fail_descr) {
             Some(jct) => jct,
             None => {
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_bridge: rd_loop_token weakref dead → \
-                         compile.giveup() (pyjitpl.py:2898), key={} fail_index={}",
+                         compile.giveup() (pyjitpl.py:2923), key={} fail_index={}",
                         green_key, fail_index,
                     );
                 }

@@ -19,6 +19,15 @@ pub struct W_SeqIterObject {
     pub empty_kind: u8,
 }
 
+/// Field offset of `seq` within [`W_SeqIterObject`].
+pub const SEQ_ITER_SEQ_OFFSET: usize = std::mem::offset_of!(W_SeqIterObject, seq);
+/// Field offset of `index` within [`W_SeqIterObject`].
+pub const SEQ_ITER_INDEX_OFFSET: usize = std::mem::offset_of!(W_SeqIterObject, index);
+/// Field offset of `length` within [`W_SeqIterObject`].
+pub const SEQ_ITER_LENGTH_OFFSET: usize = std::mem::offset_of!(W_SeqIterObject, length);
+/// Field offset of `empty_kind` within [`W_SeqIterObject`].
+pub const SEQ_ITER_EMPTY_KIND_OFFSET: usize = std::mem::offset_of!(W_SeqIterObject, empty_kind);
+
 /// `iterobject.py W_FastListIterObject`.  PyPy shares the abstract
 /// `sequenceiterator` typedef, while CPython 3.14 exposes the specialized
 /// concrete type as `list_iterator`; keep the PyPy payload/algorithm and the

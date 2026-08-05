@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=14
+# pyre-check: min-pypy-ratio=2.72
 # A list subscript, assignment, and deletion coerce a non-int key through
 # `__index__` (`getindex_w`); an index too large for a machine word raises
 # IndexError naming the key's real type ("cannot fit '<type>' ..."), and an

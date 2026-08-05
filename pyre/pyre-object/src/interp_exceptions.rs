@@ -610,7 +610,7 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
         let _roots = crate::gc_roots::push_roots();
         crate::gc_roots::pin_root(exc);
         let arg = crate::unicodeobject::w_str_new(message);
-        unsafe { w_exception_set_args(exc, crate::listobject::w_list_new(vec![arg])) };
+        unsafe { w_exception_set_args(exc, w_exception_args_new(vec![arg])) };
     }
     exc
 }
@@ -624,7 +624,7 @@ pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
         let _roots = crate::gc_roots::push_roots();
         crate::gc_roots::pin_root(exc);
         let arg = crate::unicodeobject::w_str_from_wtf8(message.to_wtf8_buf());
-        unsafe { w_exception_set_args(exc, crate::listobject::w_list_new(vec![arg])) };
+        unsafe { w_exception_set_args(exc, w_exception_args_new(vec![arg])) };
     }
     exc
 }
@@ -864,6 +864,23 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
         };
         crate::tupleobject::w_tuple_new(items)
     }
+}
+
+/// Build the `args_w` storage list for an exception.
+///
+/// `interp_exceptions.py:114` declares `args_w = []` — an RPython
+/// `list of W_Root`, i.e. a plain array of object pointers.  List
+/// *strategies* are a `W_ListObject` feature of the app-level list type
+/// (`objspace/std/listobject.py`) and have no counterpart in an RPython
+/// list, so `args_w` must never take the unboxed `Integer` / `Float`
+/// representation `w_list_new` would pick for `ValueError(7)`, nor the
+/// `Empty` one it picks for `ValueError()`.
+///
+/// Beyond parity this is what keeps the slot readable: the `args` load
+/// fold walks the object items block directly, and declines on any other
+/// strategy, leaving `e.args` as a residual `getattr` call.
+pub fn w_exception_args_new(items: Vec<PyObjectRef>) -> PyObjectRef {
+    crate::listobject::w_list_new_object(items)
 }
 
 /// Raw `args_w` storage for JIT field mirrors.  Unlike
