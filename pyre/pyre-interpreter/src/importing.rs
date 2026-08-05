@@ -1815,9 +1815,9 @@ pub fn quiet_flag() -> bool {
     SYS_QUIET.load(Ordering::Relaxed)
 }
 
-/// `-i`, which `make_flags` reports as both `inspect` and `interactive`.
-/// `PYTHONINSPECT` would set only the former, but the launcher does not
-/// read it, so `-i` is the whole of this flag's input.
+/// `-i`, which `make_flags` reports as both `inspect` and `interactive`, folded
+/// with `PYTHONINSPECT`. The variable sets only `inspect`, so a run that owes
+/// the flag to the environment still reports `interactive` as false.
 pub fn inspect_flag() -> bool {
     SYS_INSPECT.load(Ordering::Relaxed)
 }

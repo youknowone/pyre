@@ -523,8 +523,10 @@ thread_local! {
     /// environment carries and `run_python_impl` folds them the way the native
     /// launcher does. Only the native-host binding seeds this — the browser has
     /// no environment to seed it from.
+    /// Values are raw bytes: `_Py_GetEnv` tests presence on the undecoded
+    /// bytes, so a `PYTHONSAFEPATH` the host cannot decode is still set.
     #[cfg(feature = "wasm-host")]
-    static LAUNCH_ENV: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    static LAUNCH_ENV: RefCell<Vec<(String, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(any(feature = "web", feature = "wasm-host"))]
@@ -853,17 +855,24 @@ mod host_abi {
     /// and `sys.flags` reports the defaults no matter what the host was run
     /// with. `pyre_launch_env_names` lists the names worth sending; anything
     /// else is carried but never read. A record without `=`, or with an empty
-    /// name, is dropped.
+    /// or non-UTF-8 name, is dropped.
+    ///
+    /// The blob is read as bytes, not text: a VALUE that is not valid UTF-8 is
+    /// carried through undecoded, because `_Py_GetEnv` tests presence on the
+    /// raw bytes and `PYTHONSAFEPATH` is set by any nonempty value whether or
+    /// not it decodes. Names are ASCII by construction.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_set_launch_env(ptr: *const u8, len: usize) {
-        let Some(blob) = guest_str(ptr, len) else {
+        let Some(blob) = guest_bytes(ptr, len) else {
             return;
         };
         let entries = blob
-            .split('\0')
-            .filter_map(|record| record.split_once('='))
-            .filter(|(name, _)| !name.is_empty())
-            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .split(|&b| b == 0)
+            .filter_map(|record| {
+                let eq = record.iter().position(|&b| b == b'=')?;
+                let name = std::str::from_utf8(&record[..eq]).ok()?;
+                (!name.is_empty()).then(|| (name.to_string(), record[eq + 1..].to_vec()))
+            })
             .collect();
         super::LAUNCH_ENV.with(|e| *e.borrow_mut() = entries);
     }
@@ -893,7 +902,7 @@ mod host_abi {
             let mut entries = e.borrow_mut();
             entries.retain(|(name, _)| name != "PYTHONSAFEPATH");
             if enabled != 0 {
-                entries.push(("PYTHONSAFEPATH".to_string(), "1".to_string()));
+                entries.push(("PYTHONSAFEPATH".to_string(), b"1".to_vec()));
             }
         });
     }
@@ -903,14 +912,22 @@ mod host_abi {
     /// (`None`) before a slice is formed rather than being undefined
     /// behaviour; an empty buffer reads as the empty string.
     fn guest_str(ptr: *const u8, len: usize) -> Option<String> {
+        guest_bytes(ptr, len).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Copy `[ptr, ptr+len)` out of linear memory undecoded, for a caller whose
+    /// payload is not text. Same bounds contract as [`guest_str`]: the embedder
+    /// supplies the pair raw, so a range escaping linear memory is rejected
+    /// (`None`) before a slice is formed rather than being undefined behaviour;
+    /// an empty buffer reads as an empty slice.
+    fn guest_bytes(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
         if ptr.is_null() || len == 0 {
-            return Some(String::new());
+            return Some(Vec::new());
         }
         let mem_bytes = core::arch::wasm32::memory_size(0).saturating_mul(65536);
         match (ptr as usize).checked_add(len) {
             Some(end) if end <= mem_bytes => {
-                let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-                Some(String::from_utf8_lossy(bytes).into_owned())
+                Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
             }
             _ => None,
         }

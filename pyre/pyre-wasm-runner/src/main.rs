@@ -400,18 +400,21 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         memory.read(&store, nptr as usize, &mut buf)?;
         dealloc.call(&mut store, (nptr, nlen))?;
 
-        // Only values that are valid UTF-8 are forwarded: the fold reads all
-        // but one of these names through `env::var`, which drops a value that
-        // is not, so dropping it here is what the native launcher already
-        // sees. The exception is the `PYTHONSAFEPATH` presence flag, tested on
-        // raw bytes — a non-UTF-8 value for it reaches the guest as unset,
-        // which leaves `sys.path[0]` seeded rather than suppressed.
+        // Values are forwarded undecoded. The fold reads all but one of these
+        // names through `env::var` and so drops a value that is not UTF-8 on
+        // its own, matching the native launcher; the exception is the
+        // `PYTHONSAFEPATH` presence flag, which `_Py_GetEnv` tests on raw
+        // bytes. Decoding here would make such a value read as unset and leave
+        // `sys.path[0]` seeded rather than suppressed, so the decision belongs
+        // to the fold, not the transport. `into_encoded_bytes` round-trips a
+        // valid-UTF-8 `OsString` to exactly its UTF-8 bytes, so the guest's
+        // `from_utf8` reproduces `env::var`'s accept/reject split unchanged.
         let mut blob: Vec<u8> = Vec::new();
         for name in String::from_utf8_lossy(&buf)
             .split('\0')
             .filter(|name| !name.is_empty())
         {
-            let Some(value) = std::env::var_os(name).and_then(|v| v.into_string().ok()) else {
+            let Some(value) = std::env::var_os(name) else {
                 continue;
             };
             if !blob.is_empty() {
@@ -419,7 +422,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             }
             blob.extend_from_slice(name.as_bytes());
             blob.push(b'=');
-            blob.extend_from_slice(value.as_bytes());
+            blob.extend_from_slice(&value.into_encoded_bytes());
         }
 
         let blen = blob.len() as u32;

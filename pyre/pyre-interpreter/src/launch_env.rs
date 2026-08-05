@@ -66,20 +66,25 @@ impl Default for LaunchFlags {
 }
 
 /// Environment the launcher options resolve against, when the process
-/// environment is not it. Installed once at startup; absent means read
-/// `std::env` directly.
-static LAUNCH_ENV: LazyLock<Mutex<Option<HashMap<String, String>>>> =
+/// environment is not it. Installed once at startup; absent means read the
+/// process environment through the host seam.
+///
+/// Values are raw bytes, not `String`: `_Py_GetEnv` tests presence on the
+/// undecoded bytes, so a value that is not valid Unicode is still *set*. A
+/// table of `String` could not represent that, and the name whose fold depends
+/// on it — `PYTHONSAFEPATH` — would silently read as unset.
+static LAUNCH_ENV: LazyLock<Mutex<Option<HashMap<String, Vec<u8>>>>> =
     LazyLock::new(|| Mutex::new(None));
 
 /// Supply the launcher-relevant environment explicitly, for an embedding whose
 /// own process environment is not the one the program should observe.
 ///
-/// wasm32 has no environment at all — every `std::env::var` inside the module
-/// returns unset regardless of the host process — so a guest resolving `-P`,
-/// `-O` or PYTHONWARNINGS from `std::env` reads them all as absent. Passing the
-/// entries in restores the fold. Once installed the table is authoritative: a
-/// name missing from it is unset, never a fallback to `std::env`.
-pub fn set_launch_env(entries: impl IntoIterator<Item = (String, String)>) {
+/// wasm32 has no environment at all — every lookup inside the module returns
+/// unset regardless of the host process — so a guest resolving `-P`, `-O` or
+/// PYTHONWARNINGS from it reads them all as absent. Passing the entries in
+/// restores the fold. Once installed the table is authoritative: a name missing
+/// from it is unset, never a fallback to the process environment.
+pub fn set_launch_env(entries: impl IntoIterator<Item = (String, Vec<u8>)>) {
     *LAUNCH_ENV.lock().unwrap() = Some(entries.into_iter().collect());
 }
 
@@ -88,6 +93,10 @@ pub fn set_launch_env(entries: impl IntoIterator<Item = (String, String)>) {
 /// because an unset chain resolves to the C locale, which coerces UTF-8 mode.
 pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "PYTHONSAFEPATH",
+    "PYTHONNOUSERSITE",
+    "PYTHONUNBUFFERED",
+    "PYTHONDEVMODE",
+    "PYTHONINSPECT",
     "PYTHONOPTIMIZE",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONUTF8",
@@ -98,22 +107,31 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "LANG",
 ];
 
-fn read(name: &str) -> Option<String> {
+/// The raw bytes of a variable, from the installed table when there is one and
+/// otherwise from the process environment through the host seam. A seam error
+/// reads as unset, the same as a name the environment does not carry.
+fn read_raw(name: &str) -> Option<Vec<u8>> {
     if let Some(table) = LAUNCH_ENV.lock().unwrap().as_ref() {
         return table.get(name).cloned();
     }
-    std::env::var(name).ok()
+    crate::host_seam::getenv(name.as_bytes()).ok().flatten()
+}
+
+/// The decoded value, or `None` when unset *or* not valid Unicode — the
+/// `env::var` contract. Only the free-text names resolve under it
+/// (PYTHONWARNINGS, PYTHONIOENCODING and the locale chain); every name whose
+/// fold turns on presence or on an exact spelling reads bytes instead, so that
+/// an undecodable value stays distinguishable from an absent one.
+fn read(name: &str) -> Option<String> {
+    read_raw(name).and_then(|value| String::from_utf8(value).ok())
 }
 
 /// Presence of a variable, without decoding it. `_Py_GetEnv` tests the raw
-/// bytes, so a value that is not valid Unicode still counts as set — which the
-/// process-environment path preserves and an installed table cannot, its values
-/// having already been decoded to cross the embedding boundary.
+/// bytes, so a value that is not valid Unicode still counts as set. Both paths
+/// preserve that: the seam hands back bytes, and the installed table stores
+/// bytes for this reason.
 fn is_set_nonempty(name: &str) -> bool {
-    if let Some(table) = LAUNCH_ENV.lock().unwrap().as_ref() {
-        return table.get(name).is_some_and(|value| !value.is_empty());
-    }
-    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+    read_raw(name).is_some_and(|value| !value.is_empty())
 }
 
 fn locale_implies_utf8_mode() -> bool {
@@ -139,11 +157,13 @@ fn resolve_utf8_mode(flags: &LaunchFlags) -> Result<i64, PreConfigError> {
         return Ok(value);
     }
     if !flags.ignore_environment {
-        if let Some(value) = read("PYTHONUTF8") {
+        // Compared as bytes: a value that does not decode is *invalid*, which is
+        // fatal, not absent, which would silently fall through to the locale.
+        if let Some(value) = read_raw("PYTHONUTF8") {
             if !value.is_empty() {
-                return match value.as_str() {
-                    "0" => Ok(0),
-                    "1" => Ok(1),
+                return match value.as_slice() {
+                    b"0" => Ok(0),
+                    b"1" => Ok(1),
                     _ => Err(PreConfigError(
                         "invalid PYTHONUTF8 environment variable value",
                     )),
@@ -158,12 +178,18 @@ fn resolve_utf8_mode(flags: &LaunchFlags) -> Result<i64, PreConfigError> {
 /// absent; a clean non-negative integer is used as-is; anything else (trailing
 /// junk, negative, overflow) counts as 1.
 fn env_int_flag(name: &str) -> Option<u32> {
-    let raw = read(name)?;
+    let raw = read_raw(name)?;
     if raw.is_empty() {
         return None;
     }
-    let value = match raw.parse::<i64>() {
-        Ok(v) if (0..=i64::from(u32::MAX)).contains(&v) => v as u32,
+    // Read the bytes, not a decoded string: `_Py_str_to_int` rejects undecodable
+    // input exactly the way it rejects trailing junk, so both land on 1 rather
+    // than on "unset".
+    let parsed = std::str::from_utf8(&raw)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok());
+    let value = match parsed {
+        Some(v) if (0..=i64::from(u32::MAX)).contains(&v) => v as u32,
         _ => 1,
     };
     Some(value)
@@ -183,26 +209,19 @@ fn resolve_optimize(flags: &LaunchFlags) -> i64 {
     level
 }
 
-/// `-B` folded with PYTHONDONTWRITEBYTECODE: either disables bytecode caches.
-fn resolve_dont_write_bytecode(flags: &LaunchFlags) -> bool {
-    if flags.dont_write_bytecode {
-        return true;
-    }
-    if !flags.ignore_environment {
-        if let Some(v) = env_int_flag("PYTHONDONTWRITEBYTECODE") {
-            return v != 0;
-        }
-    }
-    false
+/// A boolean option folded with an *integer* environment flag: the variable
+/// enables it for any value `_Py_get_env_flag` resolves nonzero, so an explicit
+/// `NAME=0` leaves it off. The fold only ever sets, so the command-line spelling
+/// survives both `-E` and a zero-valued variable.
+fn fold_int_flag(flags: &LaunchFlags, set: bool, name: &str) -> bool {
+    set || (!flags.ignore_environment && env_int_flag(name).is_some_and(|v| v != 0))
 }
 
-/// `-P` folded with PYTHONSAFEPATH (`config_read_env_vars`). The variable is a
-/// bare presence flag read through `_Py_GetEnv`, not an integer one: any
-/// non-empty value enables safe path — `"0"` included — while an empty value
-/// counts as unset. It only ever sets the flag, so an explicit `-P` survives
-/// `-E`.
-fn resolve_safe_path(flags: &LaunchFlags) -> bool {
-    flags.safe_path || (!flags.ignore_environment && is_set_nonempty("PYTHONSAFEPATH"))
+/// A boolean option folded with a *presence* environment flag, read through
+/// `_Py_GetEnv` rather than `_Py_get_env_flag`: any non-empty value enables it —
+/// `"0"` included — while an empty value counts as unset.
+fn fold_presence_flag(flags: &LaunchFlags, set: bool, name: &str) -> bool {
+    set || (!flags.ignore_environment && is_set_nonempty(name))
 }
 
 /// Fold the environment over the options a command line named. An embedding
@@ -210,8 +229,16 @@ fn resolve_safe_path(flags: &LaunchFlags) -> bool {
 pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
     flags.utf8_mode = Some(resolve_utf8_mode(&flags)?);
     flags.optimize = resolve_optimize(&flags);
-    flags.dont_write_bytecode = resolve_dont_write_bytecode(&flags);
-    flags.safe_path = resolve_safe_path(&flags);
+    // Which of the two shapes a name takes is per-variable, not a category:
+    // PYTHONSAFEPATH and PYTHONINSPECT enable on a bare `=0`, PYTHONNOUSERSITE
+    // and PYTHONUNBUFFERED do not.
+    flags.dont_write_bytecode =
+        fold_int_flag(&flags, flags.dont_write_bytecode, "PYTHONDONTWRITEBYTECODE");
+    flags.no_user_site = fold_int_flag(&flags, flags.no_user_site, "PYTHONNOUSERSITE");
+    flags.unbuffered = fold_int_flag(&flags, flags.unbuffered, "PYTHONUNBUFFERED");
+    flags.safe_path = fold_presence_flag(&flags, flags.safe_path, "PYTHONSAFEPATH");
+    flags.dev_mode = fold_presence_flag(&flags, flags.dev_mode, "PYTHONDEVMODE");
+    flags.inspect = fold_presence_flag(&flags, flags.inspect, "PYTHONINSPECT");
     flags.stdio_encoding = if flags.ignore_environment {
         None
     } else {
