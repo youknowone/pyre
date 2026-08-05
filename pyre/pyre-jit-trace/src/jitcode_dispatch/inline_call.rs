@@ -3518,6 +3518,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // below met).  For a strict callee this gates routing its guards through the
     // multi-frame snapshot vs. falling back to collapse.
     let mut callee_frame_seeded = false;
+    // Names the `break 'seed` arm that left `callee_frame_seeded` false, for
+    // the `[fbw-census]` collapse tally at the `parent_frame` decision below.
+    // Empty means the seed block was never entered or ran to completion.
+    let mut seed_break_reason: &'static str = "";
     // The concrete callee frame the seed block materializes, retained so the
     // sub-walk can put it on the interpreter frame chain: the walk executes
     // the callee's residuals for real, and a residual that reads the chain
@@ -3645,6 +3649,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     if try_multiframe {
                         return Ok(None);
                     }
+                    seed_break_reason = "Collapse::IsNoneBranch";
                     break 'seed;
                 }
             }
@@ -3658,6 +3663,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 if try_multiframe {
                     return Ok(None);
                 }
+                seed_break_reason = "Collapse::NoCalleeJitcode";
                 break 'seed;
             };
             let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jitcode_index as i32);
@@ -3669,6 +3675,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 if try_multiframe {
                     return Ok(None);
                 }
+                seed_break_reason = "Collapse::NoPortalRedRegs";
                 break 'seed;
             }
 
@@ -3684,6 +3691,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 if try_multiframe {
                     return Ok(None);
                 }
+                seed_break_reason = "Collapse::NoSnapshotSym";
                 break 'seed;
             }
             let sym = unsafe { &*sym_ptr };
@@ -3848,6 +3856,28 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // straight-line callee (its pre-multiframe behavior).
         None
     };
+    // Name the population a collapsing CALL falls into, so the
+    // `PYRE_FBW_DEBUG_ABORT` corpus can rank the remaining collapse sources
+    // the same way it ranks walk declines.  A collapse is not an abort and
+    // discards no trace, so this counts a resume-SHAPE choice, not a failure;
+    // it is read only to decide which population to retire next.
+    if fbw_debug_abort_enabled() && parent_frame.is_none() {
+        census_record(if !seed_break_reason.is_empty() {
+            seed_break_reason
+        } else if callee_frame_seeded {
+            // Seeded, but `compute_inline_caller_frame` could not build the
+            // caller side (`InlineCallerFrameDecline::Unavailable`).
+            "Collapse::ParentUnavailable"
+        } else if inline_depth >= fbw_max_multiframe_depth() {
+            "Collapse::DepthCap"
+        } else if !callee_code.cellvars.is_empty() {
+            "Collapse::CellVars"
+        } else if constructor_result.is_some() {
+            "Collapse::Constructor"
+        } else {
+            "Collapse::Other"
+        });
+    }
 
     // CODEX1 parity: snapshot the heap-effect state before the callee
     // sub-walk.  If the prologue (callee pc 0 → its loop header) mutates the
