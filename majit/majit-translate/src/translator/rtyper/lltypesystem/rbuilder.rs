@@ -19,7 +19,7 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
+    Array, ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -5163,6 +5163,369 @@ pub fn build_ll_build_helper_graph(
     ))
 }
 
+/// `Ptr(GcArray(ITEM))` for an item lltype — the array pointer shape both
+/// `ll_arrayclear` and `ll_arrayfill` operate on (`p` is the array itself:
+/// `len(p)`, `p[i]`, `typeOf(p).TO`).
+fn array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(Array::gc(item_lltype.clone())),
+    }))
+}
+
+/// Synthesise `rgc.ll_arrayclear(p)` (`rpython/rlib/rgc.py:510`):
+///
+/// ```python
+/// def ll_arrayclear(p):
+///     length = len(p)
+///     ARRAY = typeOf(p).TO
+///     if must_split_gc_address_space():
+///         i = 0
+///         if isinstance(ARRAY.OF, Ptr):
+///             while i < length:
+///                 p[i] = nullptr(ARRAY.OF.TO)
+///                 i += 1
+///         else:
+///             ZERO = rffi.cast(ARRAY.OF, 0)
+///             while i < length:
+///                 p[i] = ZERO
+///                 i += 1
+///     else:
+///         offset = itemoffsetof(ARRAY, 0)
+///         dest_addr = cast_ptr_to_adr(p) + offset
+///         raw_memclear(dest_addr, sizeof(ARRAY.OF) * length)
+///     keepalive_until_here(p)
+/// ```
+///
+/// Three-block loop over the bare `Ptr(GcArray(ITEM))` operand: writes the
+/// null/zero element into every slot. Writing NULL never creates an
+/// old->young reference, so no write barrier is emitted. `@specialize.ll()`
+/// picks the two `isinstance(ARRAY.OF, Ptr)` arms per concrete item type;
+/// the Rust-side match on `item_lltype` folds that specialisation to one
+/// `ZERO` element constant (`nullptr` for a `Ptr` item, `0` otherwise). The
+/// `raw_memclear` fast path (the `must_split_gc_address_space()` `else`
+/// branch) is deferred as a translation-time concern, mirroring
+/// [`build_ll_arraycopy_helper_graph`](../../rlist.rs) which lowers the
+/// sibling `rgc.ll_arraycopy` to the same bare element loop and defers its
+/// `raw_memcopy` fast path (`rgc.py:403-411`); the `itemoffsetof` / `sizeof`
+/// / `cast_ptr_to_adr` / `raw_memclear` address machinery has no
+/// construction-side surface here.
+pub fn build_ll_arrayclear_helper_graph(
+    name: &str,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let items_ptr = array_ptr_lltype(&item_lltype);
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_case = |b: bool| {
+        Some(constant_with_lltype(
+            ConstValue::Bool(b),
+            LowLevelType::Bool,
+        ))
+    };
+    let none_void = || constant_with_lltype(ConstValue::None, LowLevelType::Void);
+
+    // `ZERO`: the null pointer for a `Ptr` item, else the zero primitive.
+    let zero_value = match &item_lltype {
+        LowLevelType::Ptr(_) => constant_with_lltype(ConstValue::None, item_lltype.clone()),
+        LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
+            constant_with_lltype(ConstValue::float(0.0), item_lltype.clone())
+        }
+        _ => constant_with_lltype(ConstValue::Int(0), item_lltype.clone()),
+    };
+
+    let p = variable_with_lltype("p", items_ptr.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // Loop blocks carry (p, length, i) as fresh inputargs.
+    let p_c = variable_with_lltype("p", items_ptr.clone());
+    let len_c = variable_with_lltype("length", LowLevelType::Signed);
+    let i_c = variable_with_lltype("i", LowLevelType::Signed);
+    let block_cond = Block::shared(vec![
+        Hlvalue::Variable(p_c.clone()),
+        Hlvalue::Variable(len_c.clone()),
+        Hlvalue::Variable(i_c.clone()),
+    ]);
+
+    let p_b = variable_with_lltype("p", items_ptr.clone());
+    let len_b = variable_with_lltype("length", LowLevelType::Signed);
+    let i_b = variable_with_lltype("i", LowLevelType::Signed);
+    let block_body = Block::shared(vec![
+        Hlvalue::Variable(p_b.clone()),
+        Hlvalue::Variable(len_b.clone()),
+        Hlvalue::Variable(i_b.clone()),
+    ]);
+
+    // ---- startblock: length = len(p); i = 0.
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(p.clone())],
+        Hlvalue::Variable(length.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(p), Hlvalue::Variable(length), signed(0)],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_cond: int_lt(i, length). True -> body; False -> return None.
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    block_cond.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![
+            Hlvalue::Variable(i_c.clone()),
+            Hlvalue::Variable(len_c.clone()),
+        ],
+        Hlvalue::Variable(cond.clone()),
+    ));
+    block_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(p_c),
+                Hlvalue::Variable(len_c),
+                Hlvalue::Variable(i_c),
+            ],
+            Some(block_body.clone()),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_void()],
+            Some(graph.returnblock.clone()),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_body: p[i] = ZERO; i += 1.
+    let store_void = variable_with_lltype("v", LowLevelType::Void);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(p_b.clone()),
+            Hlvalue::Variable(i_b.clone()),
+            zero_value,
+        ],
+        Hlvalue::Variable(store_void),
+    ));
+    let i_next = variable_with_lltype("i", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![Hlvalue::Variable(i_b), signed(1)],
+        Hlvalue::Variable(i_next.clone()),
+    ));
+    block_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(p_b),
+                Hlvalue::Variable(len_b),
+                Hlvalue::Variable(i_next),
+            ],
+            Some(block_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["p".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `rgc.ll_arrayfill(p, item)` (`rpython/rlib/rgc.py:540`,
+/// `@jit.dont_look_inside @specialize.ll()`):
+///
+/// ```python
+/// def ll_arrayfill(p, item):
+///     i = 0
+///     length = len(p)
+///     if we_are_translated():
+///         llop.gc_writebarrier(Void, p)
+///         while i < length:
+///             llop.bare_setarrayitem(Void, p, i, item)
+///             i += 1
+///     else:
+///         while i < length:
+///             p[i] = item
+///             i += 1
+///     keepalive_until_here(p)
+/// ```
+///
+/// A lifted low-level helper is part of the translated program, so
+/// `we_are_translated()` folds to the translated arm (as
+/// [`build_ll_mallocstr_helper_graph`](../rstr.rs) resolves the same
+/// predicate): one `gc_writebarrier(p)` before the loop covers every slot
+/// (if `p` is old it is added to `old_objects_pointing_to_young`; if young
+/// the barrier is a no-op), then the loop stores `item` into each slot via
+/// `bare_setarrayitem`. Three-block loop over the bare `Ptr(GcArray(ITEM))`
+/// operand.
+pub fn build_ll_arrayfill_helper_graph(
+    name: &str,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let items_ptr = array_ptr_lltype(&item_lltype);
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_case = |b: bool| {
+        Some(constant_with_lltype(
+            ConstValue::Bool(b),
+            LowLevelType::Bool,
+        ))
+    };
+    let none_void = || constant_with_lltype(ConstValue::None, LowLevelType::Void);
+
+    let p = variable_with_lltype("p", items_ptr.clone());
+    let item = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(p.clone()),
+        Hlvalue::Variable(item.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // Loop blocks carry (p, item, length, i) as fresh inputargs.
+    let p_c = variable_with_lltype("p", items_ptr.clone());
+    let item_c = variable_with_lltype("item", item_lltype.clone());
+    let len_c = variable_with_lltype("length", LowLevelType::Signed);
+    let i_c = variable_with_lltype("i", LowLevelType::Signed);
+    let block_cond = Block::shared(vec![
+        Hlvalue::Variable(p_c.clone()),
+        Hlvalue::Variable(item_c.clone()),
+        Hlvalue::Variable(len_c.clone()),
+        Hlvalue::Variable(i_c.clone()),
+    ]);
+
+    let p_b = variable_with_lltype("p", items_ptr.clone());
+    let item_b = variable_with_lltype("item", item_lltype.clone());
+    let len_b = variable_with_lltype("length", LowLevelType::Signed);
+    let i_b = variable_with_lltype("i", LowLevelType::Signed);
+    let block_body = Block::shared(vec![
+        Hlvalue::Variable(p_b.clone()),
+        Hlvalue::Variable(item_b.clone()),
+        Hlvalue::Variable(len_b.clone()),
+        Hlvalue::Variable(i_b.clone()),
+    ]);
+
+    // ---- startblock: length = len(p); gc_writebarrier(p); i = 0.
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(p.clone())],
+        Hlvalue::Variable(length.clone()),
+    ));
+    let wb_void = variable_with_lltype("v", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "gc_writebarrier",
+        vec![Hlvalue::Variable(p.clone())],
+        Hlvalue::Variable(wb_void),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(p),
+                Hlvalue::Variable(item),
+                Hlvalue::Variable(length),
+                signed(0),
+            ],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_cond: int_lt(i, length). True -> body; False -> return None.
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    block_cond.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![
+            Hlvalue::Variable(i_c.clone()),
+            Hlvalue::Variable(len_c.clone()),
+        ],
+        Hlvalue::Variable(cond.clone()),
+    ));
+    block_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(p_c),
+                Hlvalue::Variable(item_c),
+                Hlvalue::Variable(len_c),
+                Hlvalue::Variable(i_c),
+            ],
+            Some(block_body.clone()),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_void()],
+            Some(graph.returnblock.clone()),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_body: bare_setarrayitem(p, i, item); i += 1.
+    let store_void = variable_with_lltype("v", LowLevelType::Void);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "bare_setarrayitem",
+        vec![
+            Hlvalue::Variable(p_b.clone()),
+            Hlvalue::Variable(i_b.clone()),
+            Hlvalue::Variable(item_b.clone()),
+        ],
+        Hlvalue::Variable(store_void),
+    ));
+    let i_next = variable_with_lltype("i", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![Hlvalue::Variable(i_b), signed(1)],
+        Hlvalue::Variable(i_next.clone()),
+    ));
+    block_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(p_b),
+                Hlvalue::Variable(item_b),
+                Hlvalue::Variable(len_b),
+                Hlvalue::Variable(i_next),
+            ],
+            Some(block_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["p".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
 /// RPython `class BaseStringBuilderRepr(AbstractStringBuilderRepr)`.
 #[derive(Debug, Default)]
 pub struct BaseStringBuilderRepr;
@@ -6510,6 +6873,82 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(super::STRPTR.clone())
         );
+    }
+
+    #[test]
+    fn build_ll_arrayclear_zeroes_each_slot_in_a_bare_element_loop() {
+        use super::Hlvalue;
+        let helper = super::build_ll_arrayclear_helper_graph("ll_arrayclear", LowLevelType::Signed)
+            .expect("build_ll_arrayclear_helper_graph");
+        assert_eq!(helper.func.name, "ll_arrayclear");
+        let inner = helper.graph.borrow();
+
+        // start: length = len(p); i = 0 (a single unconditional exit).
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["getarraysize"]);
+        assert_eq!(startblock.inputargs.len(), 1); // p
+        assert_eq!(startblock.exits.len(), 1);
+        drop(startblock);
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, cond, body, returnblock.
+        assert_eq!(count, 4);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("getarraysize"), 1);
+        assert_eq!(n("int_lt"), 1); // loop header
+        assert_eq!(n("setarrayitem"), 1); // p[i] = ZERO
+        assert_eq!(n("int_add"), 1); // i += 1
+        assert_eq!(n("gc_writebarrier"), 0); // NULL store needs no barrier
+        assert_eq!(n("raw_memclear"), 0); // fast path deferred
+
+        // Void return.
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn build_ll_arrayfill_barriers_once_then_fills_each_slot() {
+        use super::Hlvalue;
+        let helper = super::build_ll_arrayfill_helper_graph("ll_arrayfill", LowLevelType::Signed)
+            .expect("build_ll_arrayfill_helper_graph");
+        assert_eq!(helper.func.name, "ll_arrayfill");
+        let inner = helper.graph.borrow();
+
+        // start: length = len(p); one gc_writebarrier(p) before the loop.
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["getarraysize", "gc_writebarrier"]);
+        assert_eq!(startblock.inputargs.len(), 2); // p, item
+        assert_eq!(startblock.exits.len(), 1);
+        drop(startblock);
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, cond, body, returnblock.
+        assert_eq!(count, 4);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("getarraysize"), 1);
+        assert_eq!(n("gc_writebarrier"), 1); // one barrier covers all slots
+        assert_eq!(n("int_lt"), 1); // loop header
+        assert_eq!(n("bare_setarrayitem"), 1); // p[i] = item, barrier-free
+        assert_eq!(n("setarrayitem"), 0); // uses the bare store
+        assert_eq!(n("int_add"), 1); // i += 1
+
+        // Void return.
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
     }
 
     #[test]
