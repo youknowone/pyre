@@ -153,7 +153,26 @@ fn is_set_nonempty(name: &str) -> bool {
     read_raw(name).is_some_and(|value| !value.is_empty())
 }
 
+/// Whether the effective `LC_CTYPE` is the legacy C/POSIX locale, which is what
+/// coerces utf8_mode to 1; every named locale (en_US, C.UTF-8, …) leaves it 0.
 fn locale_implies_utf8_mode() -> bool {
+    // `_Py_SetLocaleFromEnv(LC_CTYPE)` and read the answer back, so the value
+    // tested is the locale the C library actually installed rather than the
+    // variables that asked for it. The two differ whenever the environment
+    // names a locale the system cannot set: `setlocale` keeps C there, and
+    // utf8_mode has to follow the installed locale, not the unusable name.
+    //
+    // Only when the process environment is the authority — an embedding that
+    // supplied its own table is describing an environment this process does not
+    // have, and `setlocale("")` would answer from the wrong one, so that path
+    // keeps the string cascade below. wasm32 has no locale database at all and
+    // reaches the cascade the same way.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    if LAUNCH_ENV.lock().unwrap().is_none() {
+        rustpython_host_env::locale::setlocale(libc::LC_CTYPE, Some(c""));
+        let effective = rustpython_host_env::locale::setlocale(libc::LC_CTYPE, None);
+        return matches!(effective.as_deref(), None | Some(b"C") | Some(b"POSIX"));
+    }
     // An empty variable is treated as unset (`setlocale` POSIX semantics) and
     // falls through to the next, so `LC_ALL= LC_CTYPE=en_US.UTF-8` resolves to
     // en_US.UTF-8, not C.
