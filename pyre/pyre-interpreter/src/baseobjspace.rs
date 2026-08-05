@@ -8300,7 +8300,10 @@ pub fn realunicode_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
     if unsafe { !isinstance_str_w(obj) } {
         return Err(PyError::type_error("expected unicode"));
     }
-    Ok(unsafe { pyre_object::w_str_get_value(obj) })
+    // A lone surrogate is reported the way the strict utf-8 encoder reports
+    // one, not by aborting for want of a view the buffer cannot give — see
+    // [`str_utf8_w`].
+    str_utf8_w(obj)
 }
 
 /// baseobjspace.py text0_w — rejects an embedded null character.

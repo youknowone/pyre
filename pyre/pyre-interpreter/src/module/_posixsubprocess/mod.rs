@@ -78,7 +78,11 @@ mod imp {
     fn obj_to_cstring(o: PyObjectRef, what: &str) -> Result<CString, PyError> {
         let bytes = unsafe {
             if is_str(o) {
-                w_str_get_value(o).as_bytes().to_vec()
+                // The exec boundary carries OS bytes: a program name or argv
+                // entry that came back from the filesystem holds surrogate
+                // escapes, which fold back to the original bytes here rather
+                // than having no `&str` spelling at all.
+                crate::gateway::fsencode(o)?
             } else if is_bytes(o) {
                 w_bytes_data(o).to_vec()
             } else {

@@ -1417,8 +1417,11 @@ pub fn add_sys_path(dir: &Path) {
     let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
     for i in 0..n {
         if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) } {
+            // A `sys.path` entry read back from the filesystem can hold a
+            // surrogate escape and so have no `&str` spelling; it simply is
+            // not equal to this ASCII startup entry.
             if unsafe { pyre_object::is_str(item) }
-                && unsafe { pyre_object::w_str_get_value(item) } == entry.as_ref()
+                && unsafe { pyre_object::w_str_get_value_opt(item) } == Some(entry.as_ref())
             {
                 return;
             }
@@ -2070,8 +2073,10 @@ fn python_sys_path_dirs() -> Option<Vec<PathBuf>> {
                     // Non-str entries are skipped: pyre's only path hook is the
                     // native filesystem probe, and CPython also skips an entry no
                     // hook accepts.
-                    if unsafe { pyre_object::is_str(item) } {
-                        dirs.push(PathBuf::from(unsafe { pyre_object::w_str_get_value(item) }));
+                    if unsafe { pyre_object::is_str(item) }
+                        && let Some(dir) = crate::gateway::fspath_buf(item)
+                    {
+                        dirs.push(dir);
                     }
                 }
             }
@@ -2159,10 +2164,11 @@ fn parent_package_path(parent: PyObjectRef) -> Option<Vec<PathBuf>> {
     let n = unsafe { pyre_object::listobject::w_list_len(path_obj) };
     let mut dirs = Vec::with_capacity(n);
     for i in 0..n {
-        if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(path_obj, i as i64) } {
-            if unsafe { pyre_object::is_str(item) } {
-                dirs.push(PathBuf::from(unsafe { pyre_object::w_str_get_value(item) }));
-            }
+        if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(path_obj, i as i64) }
+            && unsafe { pyre_object::is_str(item) }
+            && let Some(dir) = crate::gateway::fspath_buf(item)
+        {
+            dirs.push(dir);
         }
     }
     Some(dirs)
@@ -3148,7 +3154,11 @@ fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
                 && crate::pycode::code_get_field(w_code, "co_filename")
                     .ok()
                     .filter(|f| pyre_object::is_str(*f))
-                    .is_some_and(|f| is_bootstrap_filename(&pyre_object::w_str_get_value(f)));
+                    // A module imported from a path with no UTF-8 spelling
+                    // carries a surrogate escape in `co_filename`; it is not
+                    // one of the bootstrap names either way.
+                    .and_then(|f| pyre_object::w_str_get_value_opt(f))
+                    .is_some_and(is_bootstrap_filename);
             if !is_bootstrap {
                 break;
             }

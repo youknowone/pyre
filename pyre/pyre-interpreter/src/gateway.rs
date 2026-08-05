@@ -1672,3 +1672,30 @@ pub fn fsencode(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError
     }
     Ok(out)
 }
+
+/// The host `PathBuf` a `str` names, taking the filesystem encoding.
+///
+/// A name that came back from `readdir` carries the surrogate escapes
+/// [`fsdecode_filename_bytes`] produced, and those have no `&str` spelling —
+/// building the path with `w_str_get_value` aborts the process. Route through
+/// [`fsencode`] so the escapes fold back to the original bytes and the path
+/// names the same file it was read from. `None` when the str holds a surrogate
+/// outside the escape range, which no filesystem read can produce.
+pub fn fspath_buf(obj: pyre_object::PyObjectRef) -> Option<std::path::PathBuf> {
+    let bytes = fsencode(obj).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            bytes,
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        // No byte spelling on this platform; the host API necessarily receives
+        // the text representation.
+        Some(std::path::PathBuf::from(
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ))
+    }
+}
