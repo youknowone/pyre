@@ -1658,6 +1658,23 @@ impl Assembler {
                 let key = format!("new_array_clear/{argcodes}");
                 state.code[startposition] = self.get_opnum(&key);
             }
+            // `newlist_clear/idddd>r` (`handler_newlist_clear`,
+            // blackhole.rs, wired for length + four descriptors:
+            // struct, length, items, array) has no emit arm yet — the
+            // dedicated encoding lands with the codewriter producer.
+            // Fail loud rather than fall through the descriptor-less
+            // `other =>` default below, which would build the key
+            // `newlist_clear/i>r` and let `get_opnum` mint an
+            // unregistered dynamic opcode with no wired runtime handler
+            // (a silent miscompile).  This placeholder enforces the
+            // ordering: the emit arm must land before any producer.
+            OpKind::NewListClear { .. } => {
+                panic!(
+                    "newlist_clear emit is not implemented: a NewListClear op reached \
+                     the assembler before its `newlist_clear/idddd>r` encoding arm was \
+                     added (length + structdescr/lengthdescr/itemsdescr/arraydescr)"
+                );
+            }
             // Boxing GC allocation (`fuse_boxing_alloc`).  Mirrors the runtime
             // tracer oracle (`box_trace.rs trace_box_float`): a `new_with_vtable`
             // carrying ONLY a size descriptor and a fresh ref-kind result, no
@@ -4218,10 +4235,11 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
         OpKind::New { .. } => "new".into(),
         OpKind::NewWithVtable { .. } => "new_with_vtable".into(),
-        // `NewArrayClear` carries a descriptor operand (`new_array_clear/id>r`)
-        // so it is encoded by its dedicated `encode_op` arm, never the
-        // descriptor-less default path that calls this helper — the arm exists
-        // only to keep the opname map exhaustive.
+        // `NewArrayClear` (`new_array_clear/id>r`) and `NewListClear`
+        // (`newlist_clear/idddd>r`) both carry descriptor operands and are
+        // encoded by their dedicated `encode_op` arms, never the
+        // descriptor-less default path that calls this helper — these arms
+        // exist only to keep the opname map exhaustive.
         OpKind::NewArrayClear { .. } => "new_array_clear".into(),
         OpKind::NewListClear { .. } => "newlist_clear".into(),
         // RPython: getarrayitem_gc_i etc.
@@ -5333,10 +5351,12 @@ mod tests {
         // proves the length field was rewritten, not merely preserved.
         assert_ne!(length, remapped_length);
 
+        // `array_type_id` is the ITEMS ARRAY identity (`cpu.arraydescrof(
+        // ARRAY)`), not the enclosing struct name — use a plausible array id.
         let kind = OpKind::NewListClear {
             length: length.clone(),
             item_ty: ValueType::Ref(None),
-            array_type_id: Some("list".to_string()),
+            array_type_id: Some("list_items".to_string()),
         };
 
         // Run it through the inline var remap: length is rewritten via the
@@ -5359,7 +5379,7 @@ mod tests {
             } => {
                 assert_eq!(*l, remapped_length, "length must be rewritten by remap");
                 assert!(matches!(item_ty, ValueType::Ref(None)));
-                assert_eq!(array_type_id.as_deref(), Some("list"));
+                assert_eq!(array_type_id.as_deref(), Some("list_items"));
             }
             other => panic!("expected NewListClear, got {other:?}"),
         }
