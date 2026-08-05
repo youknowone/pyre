@@ -4034,6 +4034,18 @@ pub unsafe fn w_dict_nth_item(
     w_dict_get_strategy(obj).nth_item(obj, index)
 }
 
+/// Read only the value at iteration position `index`.
+///
+/// `dictmultiobject.py:1095-1098` reads the typed storage value without
+/// wrapping its key.
+///
+/// # Safety
+/// `obj` must be a valid `W_DictObject` PyObjectRef.
+pub unsafe fn w_dict_nth_value(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    lock_dict_refs!(_dict_guard, obj);
+    w_dict_get_strategy(obj).nth_value(obj, index)
+}
+
 /// Return the `index`-th key together with the hash stored in an exact dict's
 /// object-shaped table.
 ///
@@ -4117,6 +4129,19 @@ pub unsafe fn w_dict_lookup_int_strategy(
     let entries = w_dict_int_storage(obj);
     let k = crate::listobject::plain_int_w(key);
     entries.get(&k).copied()
+}
+
+/// Return the insertion-order index selected by an int-strategy lookup.
+///
+/// Residualise the native table probe for the same reason as
+/// [`w_dict_lookup_int_strategy`] (`rdict.py:576`).
+///
+/// # Safety
+/// Same as [`w_dict_lookup_int_strategy`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_index_of_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> Option<usize> {
+    lock_dict_refs!(_dict_guard, obj, key);
+    w_dict_int_storage(obj).get_index_of(&crate::listobject::plain_int_w(key))
 }
 
 /// Internal helper: `IntDictStrategy::delitem` body —
@@ -5169,6 +5194,15 @@ pub trait DictStrategy {
         self.items(w_dict).into_iter().nth(index)
     }
 
+    /// Read the value at iteration position `index` without requiring a
+    /// separately materialised key (`dictmultiobject.py:1095-1098`).
+    ///
+    /// # Safety
+    /// `w_dict` must be a valid PyObjectRef.
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+        self.nth_item(w_dict, index).map(|(_, value)| value)
+    }
+
     /// `dictmultiobject.py:624-634 DictStrategy.pop` — remove and
     /// return the value for `w_key`.  Returns `Ok(value)` on hit,
     /// `Ok(w_default)` on miss when a default is provided, or
@@ -6206,6 +6240,13 @@ impl DictStrategy for BytesDictStrategy {
         crate::dictmultiobject::w_dict_nth_item_bytes_strategy(w_dict, index)
     }
 
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+        lock_dict_refs!(_dict_guard, w_dict);
+        crate::dictmultiobject::w_dict_bytes_storage(w_dict)
+            .get_index(index)
+            .map(|(_, &value)| value)
+    }
+
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         crate::dictmultiobject::w_dict_clear_bytes_strategy(w_dict);
     }
@@ -6582,6 +6623,13 @@ impl DictStrategy for IntDictStrategy {
         index: usize,
     ) -> Option<(PyObjectRef, PyObjectRef)> {
         crate::dictmultiobject::w_dict_nth_item_int_strategy(w_dict, index)
+    }
+
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+        lock_dict_refs!(_dict_guard, w_dict);
+        crate::dictmultiobject::w_dict_int_storage(w_dict)
+            .get_index(index)
+            .map(|(_, &value)| value)
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {

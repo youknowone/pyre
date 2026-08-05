@@ -5781,22 +5781,23 @@ fn is_builtin_dict_get_function(callable: pyre_object::PyObjectRef) -> bool {
             == pyre_interpreter::type_methods::dict_method_get as *const () as usize
 }
 
-/// `dict.get` on an exact dictionary and an identity-present promoted key.
+/// `dict.get` on an exact dictionary and a safely probed promoted key.
 ///
-/// PyPy traces `DictStrategy.getitem` into its r_dict lookup.  Once the
-/// observed key is the exact stored key, the hash/equality probe selects a
-/// stable entry index; PyPy's native iterator/table state keeps that selection
-/// valid until the key set changes.  Pyre represents the same state explicitly
-/// as `W_DictObject.keys_version`, so guard it and issue a live nth-value read.
-/// Value-only replacement is intentionally visible without invalidation.
+/// `dictmultiobject.py:1095-1098` probes an Int strategy with the unboxed key
+/// value.  All other strategies retain the identity-only recording-time probe;
+/// Object and Identity strategy equality can execute user code.  The selected
+/// entry index remains valid until the key set changes; `W_DictObject` exposes
+/// that state as `keys_version`, so guard it and issue a live nth-value read.
+/// Value-only replacement remains visible without invalidation.
 ///
 /// The emitted `keys_version` guard is an unlocked field read, which is a
 /// pre-filter only — `jit_dict_nth_value_versioned` re-checks the version
 /// under the dict's own lock, and a `guard_nonnull` on its result side-exits
 /// when a concurrent key-set mutation detached the index from the key.
 ///
-/// Equal-but-nonidentical keys and misses remain residual because reproducing
-/// their hash/equality effects requires the complete r_dict probe.
+/// Equal-but-nonidentical non-Int keys and misses remain residual.  Object and
+/// Identity strategy probes require the complete r_dict lookup to preserve
+/// their hash/equality effects (`rdict.py:576`).
 pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -5846,19 +5847,42 @@ pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let len = unsafe { pyre_object::w_dict_len(dict) };
-    let mut found = None;
-    for index in 0..len {
-        let Some((stored_key, value)) =
-            (unsafe { pyre_object::dictmultiobject::w_dict_nth_item(dict, index) })
-        else {
-            return Ok(None);
-        };
-        if std::ptr::eq(stored_key, key) {
-            found = Some((index, value));
-            break;
-        }
+    let strategy_kind =
+        unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(dict).strategy_kind() };
+    // A mapdict-backed instance dict keeps its keys in the carrier's attribute
+    // map, and those adds/deletes never reach `w_dict_bump_keys_version` — the
+    // wrapper is only a view.  `keys_version` is therefore constant for a Map
+    // dict, so the guard below would certify an entry index that a `del
+    // o.attr` has already re-numbered.  Decline instead of certifying a
+    // version that cannot move.
+    if strategy_kind == pyre_object::dictmultiobject::StrategyKind::Map {
+        return Ok(None);
     }
+    let value_probed_int = strategy_kind == pyre_object::dictmultiobject::StrategyKind::Int
+        && unsafe { pyre_object::listobject::is_plain_int1(key) && pyre_object::is_int(key) };
+    let found = if value_probed_int {
+        let index =
+            unsafe { pyre_object::dictmultiobject::w_dict_index_of_int_strategy(dict, key) };
+        index.and_then(|index| {
+            unsafe { pyre_object::dictmultiobject::w_dict_nth_value(dict, index) }
+                .map(|value| (index, value))
+        })
+    } else {
+        let len = unsafe { pyre_object::w_dict_len(dict) };
+        let mut found = None;
+        for index in 0..len {
+            let Some((stored_key, value)) =
+                (unsafe { pyre_object::dictmultiobject::w_dict_nth_item(dict, index) })
+            else {
+                return Ok(None);
+            };
+            if std::ptr::eq(stored_key, key) {
+                found = Some((index, value));
+                break;
+            }
+        }
+        found
+    };
     let Some((index, concrete_value)) = found else {
         return Ok(None);
     };
@@ -5910,17 +5934,46 @@ pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
     )?;
     walker_guard_exact_w_class(ctx, op.pc, dict_op, canonical_dict)?;
     let key_op = r_args[2];
-    let key_expected = ctx.trace_ctx.const_ref(key as i64);
-    if !key_op.is_constant() {
+    if value_probed_int {
+        walker_guard_class(
+            ctx,
+            op.pc,
+            key_op,
+            &pyre_object::pyobject::INT_TYPE as *const _ as i64,
+        )?;
+        walker_guard_exact_w_class(
+            ctx,
+            op.pc,
+            key_op,
+            pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
+        )?;
+        let (key_type, key_descr) = crate::state::int_or_bool_unbox_type_descr(key);
+        let raw_key = walker_unbox_int_typed(ctx, op.pc, key_op, key_type, key_descr)?;
+        let expected_key = ctx
+            .trace_ctx
+            .const_int(unsafe { pyre_object::w_int_get_value(key) });
         walker_emit_fold_guard_with_snapshot(
             ctx,
             op.pc,
             OpCode::GuardValue,
-            &[key_op, key_expected],
+            &[raw_key, expected_key],
         )?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .replace_box(key_op, key_expected);
+            .replace_box(raw_key, expected_key);
+    } else {
+        let key_expected = ctx.trace_ctx.const_ref(key as i64);
+        if !key_op.is_constant() {
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardValue,
+                &[key_op, key_expected],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(key_op, key_expected);
+        }
     }
     let live_version = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,

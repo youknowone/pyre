@@ -130,15 +130,15 @@ pub extern "C" fn jit_dict_nth_value_versioned(
         // safepoint, so `dict` arrives as a raw JIT argument that must be
         // shadow-rooted across the lock and re-read afterwards —
         // `DictOperationGuard` is that bracket. The stripe is reentrant, so the
-        // nested acquire inside `w_dict_nth_item` neither blocks nor releases
+        // nested acquire inside `w_dict_nth_value` neither blocks nor releases
         // this guard.
         let dict_guard = pyre_object::dictmultiobject::DictOperationGuard::new(dict, &[]);
         let dict = dict_guard.root(0);
         if pyre_object::dictmultiobject::w_dict_keys_version(dict) != expected_version as usize {
             return PY_NULL as i64;
         }
-        pyre_object::dictmultiobject::w_dict_nth_item(dict, index as usize)
-            .map_or(PY_NULL as i64, |(_, value)| value as i64)
+        pyre_object::dictmultiobject::w_dict_nth_value(dict, index as usize)
+            .map_or(PY_NULL as i64, |value| value as i64)
     }
 }
 
