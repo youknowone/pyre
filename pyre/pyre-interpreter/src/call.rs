@@ -741,7 +741,7 @@ enum PreparedUserCall {
 /// temporaries are live while the recursive evaluator runs.
 #[inline(never)]
 fn prepare_user_call(
-    frame: &PyFrame,
+    execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PreparedUserCall, crate::PyError> {
@@ -753,13 +753,8 @@ fn prepare_user_call(
     };
     let code_ref = unsafe { &*func_code };
     let final_args = fill_user_function_args(callable, code_ref, args)?;
-    let func_frame = make_user_call_frame(
-        w_code,
-        &final_args,
-        w_globals,
-        frame.execution_context,
-        closure,
-    )?;
+    let func_frame =
+        make_user_call_frame(w_code, &final_args, w_globals, execution_context, closure)?;
 
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         return frame_into_generator_for_function(func_frame, callable)
@@ -774,7 +769,7 @@ fn call_user_function_with_eval(
     args: &[PyObjectRef],
     eval_fn: EvalFn,
 ) -> PyResult {
-    let mut func_frame = match prepare_user_call(frame, callable, args)? {
+    let mut func_frame = match prepare_user_call(frame.execution_context, callable, args)? {
         PreparedUserCall::Frame(func_frame) => func_frame,
         PreparedUserCall::Generator(generator) => return Ok(generator),
     };
@@ -782,6 +777,52 @@ fn call_user_function_with_eval(
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     eval_fn(&mut func_frame)
+}
+
+/// Residual-call sibling of [`call_user_function_plain`] that keeps the
+/// JIT-aware eval function.
+///
+/// `blackhole.py:1225 bhimpl_residual_call_r_i` is `cpu.bh_call_i(func, ...)`
+/// — it invokes the *translated function*, and when that function's graph
+/// reaches a `jit_merge_point` (`execute_frame` does) the JIT is entered
+/// normally. "Opaque to the trace" does not mean "the JIT is off inside":
+/// upstream has no flag that disables it for the extent of a residual call.
+/// `bhimpl_recursive_call_*` (`blackhole.py:1095-1132`) is not the only way
+/// to reach the portal — it is the path the codewriter emits when the callee
+/// is *statically* the portal graph.
+///
+/// Re-entrant tracing is prevented where upstream prevents it, on the green
+/// key: `warmstate.py:473-477` skips a hot back-edge while `JC_TRACING` is
+/// set, which pyre mirrors with the `driver.is_tracing()` guard in
+/// `maybe_compile_and_run`.
+///
+/// The execution context is passed in rather than read off a caller frame:
+/// `bhimpl_residual_call_r_r` (`blackhole.py:1227`) is
+/// `cpu.bh_call_r(func, None, args_r, ...)`, carrying no frame operand, and
+/// the callee frame takes its context from the space
+/// (`space.getexecutioncontext()`).  A residual helper that resolved the
+/// caller frame instead would have to read `topframeref`, and
+/// `gettopframe_raw` is `force_vref`: forcing a vref that carries
+/// `TOKEN_TRACING_RESCALL` across a residual clears the token, which
+/// `tracing_after_residual_call` reads back as "the callee escaped this
+/// frame" (`virtualref.py:161-167`).  The recorded escape then materializes
+/// the caller frame on every execution of the compiled trace.
+///
+/// The caller-side `FrameLocalsRoot` is skipped for the same reason it is in
+/// [`call_user_function_plain_with_ctx`] — no caller `PyFrame` is available.
+/// The callee root is still installed so its locals stay reachable.
+pub fn call_user_function_residual_with_ctx(
+    execution_context: *const crate::PyExecutionContext,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> PyResult {
+    let mut func_frame = match prepare_user_call(execution_context, callable, args)? {
+        PreparedUserCall::Frame(func_frame) => func_frame,
+        PreparedUserCall::Generator(generator) => return Ok(generator),
+    };
+    func_frame.fix_array_ptrs();
+    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
+    get_eval_fn()(&mut func_frame)
 }
 
 /// Call a user function with pre-resolved args (scope already packed by
@@ -1551,30 +1592,6 @@ pub fn call_user_function(
 ) -> PyResult {
     let eval_fn = get_eval_fn();
     call_user_function_with_eval(frame, callable, args, eval_fn)
-}
-
-/// Residual-call sibling of [`call_user_function_plain`] that keeps the
-/// JIT-aware eval function.
-///
-/// `blackhole.py:1225 bhimpl_residual_call_r_i` is `cpu.bh_call_i(func, ...)`
-/// — it invokes the *translated function*, and when that function's graph
-/// reaches a `jit_merge_point` (`execute_frame` does) the JIT is entered
-/// normally. "Opaque to the trace" does not mean "the JIT is off inside":
-/// upstream has no flag that disables it for the extent of a residual call.
-/// `bhimpl_recursive_call_*` (`blackhole.py:1095-1132`) is not the only way
-/// to reach the portal — it is the path the codewriter emits when the callee
-/// is *statically* the portal graph.
-///
-/// Re-entrant tracing is prevented where upstream prevents it, on the green
-/// key: `warmstate.py:473-477` skips a hot back-edge while `JC_TRACING` is
-/// set, which pyre mirrors with the `driver.is_tracing()` guard in
-/// `maybe_compile_and_run`.
-pub fn call_user_function_residual(
-    frame: &PyFrame,
-    callable: PyObjectRef,
-    args: &[PyObjectRef],
-) -> PyResult {
-    call_user_function_with_eval(frame, callable, args, get_eval_fn())
 }
 
 /// Plain interpreter-only user-function call.
