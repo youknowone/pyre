@@ -3225,6 +3225,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             {
                 (cb.drain_backend_jit_exc)();
             }
+            crate::state::note_vable_escape_abort();
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
     }
