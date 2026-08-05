@@ -499,6 +499,22 @@ pub fn emit_stdout(bytes: &[u8]) {
     {
         let _ = ops::write(1, bytes);
     }
+    flush_stdout_when_unbuffered();
+}
+
+/// Settle fd 1 when `-u` / PYTHONUNBUFFERED asked for no buffering.
+///
+/// `std::io::Stdout` is a `LineWriter`, so without this a value carrying no
+/// newline waits in its buffer until process exit — which is the opposite of
+/// what the flag requests, and differs from the block buffering an unflagged
+/// run should get. Under sandbox fd 1 is already written through unbuffered
+/// `ll_os_write` requests, so there is nothing to settle.
+pub fn flush_stdout_when_unbuffered() {
+    #[cfg(not(feature = "sandbox"))]
+    if crate::importing::unbuffered_flag() {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
 }
 
 /// Emit bytes to the interpreter's stderr (fd 2).

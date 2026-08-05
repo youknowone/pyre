@@ -71,6 +71,19 @@ pub mod host_seam {
         }
         use std::io::Write;
         let _ = std::io::stdout().write_all(bytes);
+        flush_stdout_when_unbuffered();
+    }
+
+    /// Settle fd 1 when `-u` / PYTHONUNBUFFERED asked for no buffering.
+    ///
+    /// `std::io::Stdout` is a `LineWriter`, so without this a value carrying no
+    /// newline waits in its buffer until process exit — the opposite of what
+    /// the flag requests.
+    pub fn flush_stdout_when_unbuffered() {
+        if crate::importing::unbuffered_flag() {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
     }
 
     /// Emit bytes to the interpreter's stderr (fd 2).
@@ -1140,6 +1153,7 @@ pub fn print_output(s: &str) {
     let _ = crate::host_seam::ops::write(1, s.as_bytes());
     #[cfg(not(all(unix, feature = "sandbox")))]
     print!("{s}");
+    crate::host_seam::flush_stdout_when_unbuffered();
 }
 
 /// Set a hook that receives everything the interpreter writes to fd 2 —

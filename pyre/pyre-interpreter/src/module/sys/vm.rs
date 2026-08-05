@@ -2624,6 +2624,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                     #[cfg(feature = "sandbox")]
                     crate::host_seam::ops::write(1, &bytes)
                         .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                    crate::host_seam::flush_stdout_when_unbuffered();
                 }
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
