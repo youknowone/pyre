@@ -777,6 +777,7 @@ impl<'c> Lowerer<'c> {
                         #base_reg,
                         ::core::mem::offset_of!(#struct_path, #member),
                         #tid,
+                        stringify!(#member),
                     );
                 },
             );
@@ -811,6 +812,7 @@ impl<'c> Lowerer<'c> {
                         #base_reg,
                         ::core::mem::offset_of!(#struct_path, #member),
                         #tid,
+                        stringify!(#member),
                     );
                 },
             );
@@ -880,6 +882,7 @@ impl<'c> Lowerer<'c> {
                         #base_reg,
                         ::core::mem::offset_of!(#struct_path, #member),
                         #tid,
+                        stringify!(#member),
                     );
                 },
             );
@@ -913,6 +916,7 @@ impl<'c> Lowerer<'c> {
                         #base_reg,
                         ::core::mem::offset_of!(#struct_path, #member),
                         #tid,
+                        stringify!(#member),
                     );
                 },
             );
@@ -1075,6 +1079,7 @@ impl<'c> Lowerer<'c> {
                         #src,
                         ::core::mem::offset_of!(#struct_path, #member),
                         #tid,
+                        stringify!(#member),
                     );
                 },
             );
@@ -1107,6 +1112,7 @@ impl<'c> Lowerer<'c> {
                         #src,
                         ::core::mem::offset_of!(#struct_path, #member),
                         #tid,
+                        stringify!(#member),
                     );
                 },
             );
@@ -1175,6 +1181,7 @@ impl<'c> Lowerer<'c> {
                         #src,
                         ::core::mem::offset_of!(#struct_path, #member),
                         #tid,
+                        stringify!(#member),
                     );
                 },
             );
@@ -1206,6 +1213,7 @@ impl<'c> Lowerer<'c> {
                         #src,
                         ::core::mem::offset_of!(#struct_path, #member),
                         #tid,
+                        stringify!(#member),
                     );
                 },
             );

@@ -757,6 +757,7 @@ impl JitCodeBuilder {
         offset: usize,
         field_type: majit_ir::value::Type,
         type_id: u64,
+        field_name: &str,
     ) -> u16 {
         let parent = self.struct_size_specs.get(&type_id).cloned();
         let Some(parent_spec) = parent.as_ref() else {
@@ -773,18 +774,24 @@ impl JitCodeBuilder {
         // store order.  descr.py:227 name = '%s.%s' % (STRUCT._name,
         // fieldname): take it from the same layout so the repr matches.
         //
-        // This site has no `fieldname` to key on — `getfield_gc_*` /
-        // `setfield_gc_*` reach it with `(offset, type, type_id)` — so the byte
-        // offset stands in, and it is not an identity: a flattened layout puts
-        // an inline aggregate and its first leaf at one address
-        // (`heaptracker.py:68-69`).  Where the offset names two fields, take
-        // the unresolved fallback rather than the first of them.  A guessed
-        // NAME is the damaging half: it becomes the descr's `_cache_field` key
-        // downstream, so naming the aggregate hands the leaf's access the
-        // aggregate's descr.
-        let (index_in_parent, name) = field_slot_in(&parent_spec.all_fielddescrs, "", offset)
-            .map(|idx| (idx, parent_spec.all_fielddescrs[idx].name.clone()))
-            .unwrap_or((0, String::new()));
+        // `field_name` is the `fieldname` argument itself, carried from the
+        // emit site — `jitcode_lower` already hands `register_struct_layout`
+        // the same `stringify!(#member)` in the same expansion, so read and
+        // write agree by construction.  It is what makes this a real
+        // `get_fielddescr_index_in(STRUCT, fieldname)` rather than an
+        // offset lookup wearing its name.
+        //
+        // The offset remains the fallback for a caller that has no name (`""`),
+        // and it is not an identity: a flattened layout puts an inline
+        // aggregate and its first leaf at one address (`heaptracker.py:68-69`).
+        // Where the offset names two fields, take the unresolved fallback
+        // rather than the first of them.  A guessed NAME is the damaging half:
+        // it becomes the descr's `_cache_field` key downstream, so naming the
+        // aggregate hands the leaf's access the aggregate's descr.
+        let (index_in_parent, name) =
+            field_slot_in(&parent_spec.all_fielddescrs, field_name, offset)
+                .map(|idx| (idx, parent_spec.all_fielddescrs[idx].name.clone()))
+                .unwrap_or((0, String::new()));
         self.add_bh_descr(CanonicalBhDescr::Field {
             offset,
             field_size: scalar_size(field_type),
@@ -804,10 +811,18 @@ impl JitCodeBuilder {
     /// store the int in `value_reg` into `struct_reg`'s field at `offset`.
     /// `type_id` + `offset` identify the field against the layout
     /// `new_struct` registered, so the optimizer can virtualize the store.
-    pub fn setfield_gc_i(&mut self, struct_reg: u16, value_reg: u16, offset: usize, type_id: u64) {
+    pub fn setfield_gc_i(
+        &mut self,
+        struct_reg: u16,
+        value_reg: u16,
+        offset: usize,
+        type_id: u64,
+        field_name: &str,
+    ) {
         self.touch_ref_reg(struct_reg);
         self.touch_reg(value_reg);
-        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id);
+        let descr =
+            self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id, field_name);
         self.write_insn("setfield_gc_i/rid");
         self.push_reg_u8(struct_reg, "setfield_gc_i struct");
         self.push_reg_u8(value_reg, "setfield_gc_i value");
@@ -818,10 +833,18 @@ impl JitCodeBuilder {
     /// store the ref in `value_reg` into `struct_reg`'s field at `offset`.
     /// `type_id` + `offset` identify the field against the layout
     /// `new_struct` registered, so the optimizer can virtualize the store.
-    pub fn setfield_gc_r(&mut self, struct_reg: u16, value_reg: u16, offset: usize, type_id: u64) {
+    pub fn setfield_gc_r(
+        &mut self,
+        struct_reg: u16,
+        value_reg: u16,
+        offset: usize,
+        type_id: u64,
+        field_name: &str,
+    ) {
         self.touch_ref_reg(struct_reg);
         self.touch_ref_reg(value_reg);
-        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Ref, type_id);
+        let descr =
+            self.add_struct_field_descr(offset, majit_ir::value::Type::Ref, type_id, field_name);
         self.write_insn("setfield_gc_r/rrd");
         self.push_reg_u8(struct_reg, "setfield_gc_r struct");
         self.push_reg_u8(value_reg, "setfield_gc_r value");
@@ -835,9 +858,17 @@ impl JitCodeBuilder {
     ///
     /// Encoding: `[BC_SETFIELD_GC_I_C][struct_reg u8][value i8]
     ///             [descr_idx lo u8][descr_idx hi u8]`.
-    pub fn setfield_gc_i_c(&mut self, struct_reg: u16, value: i8, offset: usize, type_id: u64) {
+    pub fn setfield_gc_i_c(
+        &mut self,
+        struct_reg: u16,
+        value: i8,
+        offset: usize,
+        type_id: u64,
+        field_name: &str,
+    ) {
         self.touch_ref_reg(struct_reg);
-        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id);
+        let descr =
+            self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id, field_name);
         self.write_insn("setfield_gc_i/rcd");
         self.push_reg_u8(struct_reg, "setfield_gc_i_c struct");
         self.push_u8(value as u8);
@@ -854,10 +885,18 @@ impl JitCodeBuilder {
     /// A `type_id` whose layout was never registered degrades to a parentless
     /// scalar descr (`add_struct_field_descr` returns the scalar form), which
     /// keeps existing callers correct.
-    pub fn getfield_gc_i(&mut self, dest: u16, struct_reg: u16, offset: usize, type_id: u64) {
+    pub fn getfield_gc_i(
+        &mut self,
+        dest: u16,
+        struct_reg: u16,
+        offset: usize,
+        type_id: u64,
+        field_name: &str,
+    ) {
         self.touch_ref_reg(struct_reg);
         self.touch_reg(dest);
-        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id);
+        let descr =
+            self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id, field_name);
         self.write_insn("getfield_gc_i/rd>i");
         self.push_reg_u8(struct_reg, "getfield_gc_i struct");
         self.push_u16(descr);
@@ -868,10 +907,18 @@ impl JitCodeBuilder {
     /// load `struct_reg`'s ref field at `offset` into `dest`.
     ///
     /// See [`Self::getfield_gc_i`] for the `type_id` parent-descr contract.
-    pub fn getfield_gc_r(&mut self, dest: u16, struct_reg: u16, offset: usize, type_id: u64) {
+    pub fn getfield_gc_r(
+        &mut self,
+        dest: u16,
+        struct_reg: u16,
+        offset: usize,
+        type_id: u64,
+        field_name: &str,
+    ) {
         self.touch_ref_reg(struct_reg);
         self.touch_ref_reg(dest);
-        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Ref, type_id);
+        let descr =
+            self.add_struct_field_descr(offset, majit_ir::value::Type::Ref, type_id, field_name);
         self.write_insn("getfield_gc_r/rd>r");
         self.push_reg_u8(struct_reg, "getfield_gc_r struct");
         self.push_u16(descr);
@@ -1796,10 +1843,18 @@ impl JitCodeBuilder {
             is_gc_managed: true,
         });
         // lengthdescr / itemsdescr: parent-carrying field descrs.
-        let length_descr =
-            self.add_struct_field_descr(length_offset, majit_ir::value::Type::Int, struct_type_id);
-        let items_descr =
-            self.add_struct_field_descr(items_offset, majit_ir::value::Type::Ref, struct_type_id);
+        let length_descr = self.add_struct_field_descr(
+            length_offset,
+            majit_ir::value::Type::Int,
+            struct_type_id,
+            "length",
+        );
+        let items_descr = self.add_struct_field_descr(
+            items_offset,
+            majit_ir::value::Type::Ref,
+            struct_type_id,
+            "items",
+        );
         // arraydescr: length-prefixed items block (length word at offset 0).
         let is_item_signed = !matches!(
             item_type,
@@ -6009,10 +6064,10 @@ mod tests {
         let mut builder = JitCodeBuilder::new();
         // Site 1 registers only the HIGH offset, so the mint ranks it 0.
         builder.register_struct_layout(24, TID, false, false, &[(16, false, "hi")]);
-        builder.getfield_gc_i(0, 1, 16, TID);
+        builder.getfield_gc_i(0, 1, 16, TID, "hi");
         // Site 2 registers the LOW offset; the merge re-indexes to {8→0, 16→1}.
         builder.register_struct_layout(24, TID, false, false, &[(8, false, "lo")]);
-        builder.getfield_gc_i(2, 1, 8, TID);
+        builder.getfield_gc_i(2, 1, 8, TID, "lo");
         let jitcode = builder.finish();
 
         let fields: Vec<_> = jitcode
@@ -6058,56 +6113,71 @@ mod tests {
 
     /// Two fields at one offset — a flattened inline aggregate and its first
     /// leaf — must not be arbitrated by offset. Neither the re-resolution nor
-    /// the debug postcondition may name one of them; the mint's number stands.
+    /// the debug postcondition may name one of them.
     ///
     /// Measured on the real corpus: 7 of 1714 submitted field specs share an
     /// offset with a sibling, so this is a reachable state and not a
     /// hypothetical. An offset-keyed pass would rewrite `index_in_parent` to
     /// whichever of the two happens to sort first, and the postcondition would
     /// then panic on any descr correctly naming the other.
+    ///
+    /// The named access resolves through it; the unnamed one declines. Both
+    /// halves matter: `heaptracker.get_fielddescr_index_in(STRUCT, fieldname)`
+    /// keys on the name, and the offset is only what is left when a caller has
+    /// none.
     #[test]
-    fn an_ambiguous_offset_is_left_alone_rather_than_arbitrated() {
+    fn an_ambiguous_offset_is_arbitrated_by_name_and_otherwise_declined() {
         const TID: u64 = 0x414D_4249_4755;
-        let mut builder = JitCodeBuilder::new();
-        // One `register_struct_layout` call, so the merge's offset dedup does
-        // not apply and both fields survive at offset 8.
-        builder.register_struct_layout(
-            24,
-            TID,
-            false,
-            false,
-            &[(8, false, "agg"), (8, true, "leaf")],
-        );
-        builder.getfield_gc_i(0, 1, 8, TID);
-        // `finish` runs the postcondition under `cfg!(debug_assertions)`; a
-        // resolution that guessed here would trip it before this returns.
-        let jitcode = builder.finish();
+        let field_of = |name: &str| {
+            let mut builder = JitCodeBuilder::new();
+            // One `register_struct_layout` call, so the merge's offset dedup
+            // does not apply and both fields survive at offset 8.
+            builder.register_struct_layout(
+                24,
+                TID,
+                false,
+                false,
+                &[(8, false, "agg"), (8, true, "leaf")],
+            );
+            builder.getfield_gc_i(0, 1, 8, TID, name);
+            // `finish` runs the postcondition under `cfg!(debug_assertions)`; a
+            // resolution that guessed would trip it before this returns.
+            let jitcode = builder.finish();
+            let (index_in_parent, name, parent) = jitcode
+                .exec
+                .descrs
+                .iter()
+                .find_map(|entry| match entry {
+                    RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+                        index_in_parent,
+                        parent,
+                        name,
+                        ..
+                    }) => Some((*index_in_parent, name.clone(), parent.clone())),
+                    _ => None,
+                })
+                .expect("one Field descr for the getfield site");
+            let parent = parent.expect("a registered type_id gives the field a parent");
+            assert_eq!(parent.all_fielddescrs.len(), 2, "both fields are listed");
+            assert_eq!(
+                parent.all_fielddescrs[0].offset, parent.all_fielddescrs[1].offset,
+                "the fixture's point is that one offset names two fields",
+            );
+            (index_in_parent, name)
+        };
 
-        let (index_in_parent, name, parent) = jitcode
-            .exec
-            .descrs
-            .iter()
-            .find_map(|entry| match entry {
-                RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
-                    index_in_parent,
-                    parent,
-                    name,
-                    ..
-                }) => Some((*index_in_parent, name.clone(), parent.clone())),
-                _ => None,
-            })
-            .expect("one Field descr for the getfield site");
-        let parent = parent.expect("a registered type_id gives the field a parent");
-        assert_eq!(parent.all_fielddescrs.len(), 2, "both fields are listed");
+        let (idx, name) = field_of("leaf");
         assert_eq!(
-            parent.all_fielddescrs[0].offset, parent.all_fielddescrs[1].offset,
-            "the fixture's point is that one offset names two fields",
+            (idx, name.as_str()),
+            (1, "leaf"),
+            "the emit site's `fieldname` names the field the shared offset cannot",
         );
+        let (idx, name) = field_of("");
         assert_eq!(
-            (index_in_parent, name.as_str()),
+            (idx, name.as_str()),
             (0, ""),
-            "an ambiguous offset resolves to nothing, so the mint's \
-             `unwrap_or((0, String::new()))` fallback stands",
+            "without a name the ambiguous offset resolves to nothing, so the \
+             mint's `unwrap_or((0, String::new()))` fallback stands",
         );
     }
 

@@ -10803,10 +10803,10 @@ mod tests {
             &[(0, false, "value"), (8, true, "next")],
         ); // ref reg 0 = Node*
         builder.load_const_i_value(0, 99); // int reg 0 = 99
-        builder.setfield_gc_i(0, 0, 0, 0xCD); // Node.value = 99
-        builder.setfield_gc_r(0, 0, 8, 0xCD); // Node.next  = Node (self-ref)
-        builder.getfield_gc_i(1, 0, 0, 0xCD); // int reg 1 = Node.value
-        builder.getfield_gc_r(1, 0, 8, 0xCD); // ref reg 1 = Node.next
+        builder.setfield_gc_i(0, 0, 0, 0xCD, "value"); // Node.value = 99
+        builder.setfield_gc_r(0, 0, 8, 0xCD, "next"); // Node.next  = Node (self-ref)
+        builder.getfield_gc_i(1, 0, 0, 0xCD, "value"); // int reg 1 = Node.value
+        builder.getfield_gc_r(1, 0, 8, 0xCD, "next"); // ref reg 1 = Node.next
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -10874,7 +10874,7 @@ mod tests {
             false,
             &[(0, false, "value"), (8, true, "next")],
         );
-        builder.setfield_gc_i_c(0, -7, 0, 0xCE); // Node.value = -7 (inline const)
+        builder.setfield_gc_i_c(0, -7, 0, 0xCE, "value"); // Node.value = -7 (inline const)
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
