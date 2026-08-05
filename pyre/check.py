@@ -408,6 +408,37 @@ def pyre_env():
     # compute anyway, so pinning it costs nothing there and makes a macOS
     # recorder agree with them.
     env.setdefault("PYPY_GC_NURSERY", str(4 * 1024 * 1024))
+    # Pin the major-collection threshold too, because the nursery pin above only
+    # fixes one term of it. `min_heap_size` is `PYPY_GC_MIN`, else `nursery * 8`
+    # (collector.rs:648), floored by `nursery * major_collection_threshold`
+    # (:662), and installed as `next_major_collection_threshold` (:702) — so a
+    # 4MB nursery also sets a 32MB threshold, and where old-gen use crosses it
+    # (:2437 `threshold_reached`) stayed free to move.
+    #
+    # Crossing it is what reaches `guard_failures`. The major step's finalizer
+    # trigger arms the eval-breaker word, and every compiled loop's back edge
+    # polls that word through a real guard —
+    # `RawLoadI(&EVAL_BREAKER_WORD) -> IntAnd(word, JIT_BREAKER_MASK) ->
+    # IntIsTrue -> GuardFalse` (trace_opcode.rs:2003-2015) — whose failure is
+    # counted like any other at pyjitpl.rs:2087. The trace is peeled, so that
+    # poll appears twice, and which copy catches the armed bit sets the price:
+    # the loop-body copy costs one bailout, the peeled-preamble copy costs two,
+    # because resuming from it re-enters at the loop head and fails the
+    # preamble's FOR_ITER guard once more. That is the whole of the
+    # `recursive_call_frame_relocation` 638/637 knife edge — 638 preamble, 637
+    # body, 636 no crossing at all — with `loops_compiled` and
+    # `bridges_compiled` identical across all three, and it is why the windows
+    # runner disagreed with itself between jobs rather than against the tree.
+    #
+    # Pushing the threshold past every fixture's working set removes the event
+    # instead of relocating it. Measured: `recursive_call_frame_relocation`
+    # reads 636 at every nursery from 3968KB to 8MB, and `closure_per_call`
+    # reads 414 where it had alternated 415/416 — the pair a per-platform
+    # overlay could not hold. Host RAM cannot re-open it: `max_delta`
+    # (0.125 * total memory) enters only as an upper bound at collector.rs:3570
+    # and the `min_heap_size` floor is applied after it (:2452), so the floor
+    # wins on every host.
+    env.setdefault("PYPY_GC_MIN", str(256 * 1024 * 1024))
     # Keep the bench directory off `sys.path` (`-P`), so the jit-stats counters
     # describe the fixture rather than the directory it happens to sit in.
     #
