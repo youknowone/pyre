@@ -1,8 +1,13 @@
 """Focused steady-state workloads for PyPy rbigint ↔ pyre RBigInt parity.
 
-Usage: rbigint_perf_matrix.py CASE [ROUNDS]
+Usage: rbigint_perf_matrix.py [CASE [ROUNDS]]
 Each case keeps operand sizes stable and mutates at least one operand so a
 meta-tracer cannot fold the arbitrary-precision operation out of the loop.
+
+With no CASE, every case runs at a reduced round count and prints its name and
+checksum. That mode is a cross-engine oracle rather than a measurement: it is
+what `wasm_check.py` gets, since that harness runs every `pyre/bench/*.py` with
+no argv and requires the outputs to match across host engines.
 """
 
 import math
@@ -177,7 +182,17 @@ CASES = {
 }
 
 
+# Divisor applied to every case's round count in the no-argument oracle mode.
+# Large enough that each case still enters its steady state and forms a trace,
+# small enough that all fourteen fit one run of a wasm host interpreter.
+ORACLE_ROUND_DIVISOR = 20
+
+
 def main():
+    if len(sys.argv) < 2:
+        for case, (function, default_rounds) in CASES.items():
+            print(case, function(max(1, default_rounds // ORACLE_ROUND_DIVISOR)))
+        return
     case = sys.argv[1]
     function, default_rounds = CASES[case]
     rounds = int(sys.argv[2]) if len(sys.argv) > 2 else default_rounds
