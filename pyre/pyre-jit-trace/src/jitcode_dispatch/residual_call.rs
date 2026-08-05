@@ -4267,6 +4267,21 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
     if !is_store && !matches!(helper, K::DeleteAttr) {
         return None;
     }
+    // Force only where the abort can hand the flush leg an operand-stack mirror
+    // it can adopt — the same predicate the latch below uses. Without it the
+    // abort falls to the legacy replay-from-entry, which re-runs every residual
+    // the walk already executed concretely; `pickle_terminal_raise_resume`
+    // reaches that through a `self.x = v` inside an inlined callee and
+    // desynchronises the unpickler's read position
+    // (`end=ForceQuasiImmutable committed=false effects=4`).
+    //
+    // Declining is sound, not a hole: without the abort the trace keeps
+    // recording and the optimizer's revalidation (heap.py:798-804
+    // `is_still_valid_for`) discards any loop whose recorded `?` value moved,
+    // so the only cost is a wasted trace attempt.
+    if !ctx.vstack_valid || ctx.fbw_mode.inline_subwalk || ctx.trace_ctx.is_bridge_trace {
+        return None;
+    }
 
     let &obj_opref = r_args.first()?;
     let &code_opref = r_args.get(if is_store { 2 } else { 1 })?;
@@ -4378,9 +4393,10 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
             }
         }
     }
-    if ctx.vstack_valid && !ctx.fbw_mode.inline_subwalk && !ctx.trace_ctx.is_bridge_trace {
-        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
-    }
+    // Offer the flush leg the operand stack this opcode began with. Its three
+    // preconditions were established at the top of this function, which is the
+    // last point where declining to force is still free.
+    fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
     Some(())
 }
 
