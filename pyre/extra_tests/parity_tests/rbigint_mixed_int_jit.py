@@ -100,4 +100,34 @@ def shift_guards(rounds):
 
 assert shift_guards(20_000) == (True, -1)
 
+
+def fitting_results(rounds):
+    """Long-typed operands whose results land back inside a machine word.
+
+    Nothing in `_make_generic_descr_binop`, `_int_lshift`/`_int_rshift` or
+    `_int_floordiv` demotes such a result to a compact int, so a traced arm has
+    to box it the same way the interpreter's `w_long_new` does. Every operator
+    below is driven from `tiny`, which is a long by construction, while its
+    result stays machine-sized; the final term keeps a non-fitting shift at the
+    same site.
+    """
+    tiny = BIG >> 4090
+    checksum = 0
+    for i in range(rounds):
+        small = 1 + (i & 7)
+        checksum += tiny & 0xFF
+        checksum += tiny | small
+        checksum += tiny ^ small
+        checksum += tiny + small
+        checksum += tiny - small
+        checksum += tiny * small
+        checksum += tiny // small
+        checksum += tiny << (i & 3)
+        checksum += BIG >> (4000 + (i & 7))
+        checksum %= 1000000007
+    return checksum
+
+
+assert fitting_results(20_000) == 489_509_669
+
 print("OK")

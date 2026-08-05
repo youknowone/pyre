@@ -826,10 +826,6 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
         *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
             as *const i64)
     };
-    let fits_concrete = pyre_object::longobject::jit_bigint_fits_int(raw_concrete);
-    if fits_concrete != 0 {
-        return Ok(None);
-    }
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, long, long_type_addr)?;
@@ -871,19 +867,16 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
     }
 
-    let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
-    let fits = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallI,
-        fits_fn,
-        &[raw],
-        &[majit_ir::Type::Ref],
-        majit_ir::Type::Int,
-        majit_metainterp::cannot_raise_effect_info(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
-
+    // The box needs no preceding fits_int guard. `_make_generic_descr_binop`
+    // and `descr_sub` (longobject.py:304-349) wrap with
+    // `W_LongObject(intop(...))`, and the interpreter arms they model
+    // (`long_add`, `long_sub`, `long_mul`, `long_bitand`, `long_bitor`,
+    // `long_bitxor`) wrap with `w_long_new`. Neither side demotes a
+    // machine-sized result to a `W_IntObject`, so a result that fits is the
+    // same object shape as one that does not, and declining on it left every
+    // `x & 0xff`-shaped operation on the generic residual. The
+    // `is_int(boxed_result_obj)` test above is what catches a path that does
+    // demote.
     let result = crate::helpers::emit_box_long_inline(
         ctx.trace_ctx,
         raw,
@@ -998,9 +991,6 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
             *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
                 as *const i64)
         };
-        if pyre_object::longobject::jit_bigint_fits_int(raw_concrete) != 0 {
-            return Ok(None);
-        }
         Some(raw_concrete)
     } else {
         if unsafe { !pyre_object::is_int(boxed_result_obj) } {
@@ -1058,22 +1048,12 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
             if raw.inline_const_to_value().is_none() {
                 walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
             }
-            // `w_long_new` keeps the quotient a `W_LongObject`, so this guard is
-            // not a demotion test: it pins the trace to the payload shape the
-            // inline box was recorded for, exactly as the shift leg does.
-            let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
-            let fits = ctx.trace_ctx.call_typed_with_effect(
-                OpCode::CallI,
-                fits_fn,
-                &[raw],
-                &[majit_ir::Type::Ref],
-                majit_ir::Type::Int,
-                majit_metainterp::cannot_raise_effect_info(),
-            );
-            ctx.trace_ctx
-                .set_opref_concrete(fits, majit_ir::Value::Int(0));
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
-
+            // The box needs no preceding fits_int guard. `_floordiv`/
+            // `_int_floordiv` (longobject.py:409-424) wrap with `newlong` and
+            // `long_floordiv` with `w_long_new`, so the quotient is a
+            // `W_LongObject` whatever its magnitude, and the inline box carries
+            // the payload by pointer — nothing about it varies with the digit
+            // count the guard was testing.
             let boxed = crate::helpers::emit_box_long_inline(
                 ctx.trace_ctx,
                 raw,
@@ -1369,10 +1349,6 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
         *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
             as *const i64)
     };
-    let fits_concrete = pyre_object::longobject::jit_bigint_fits_int(raw_concrete);
-    if fits_concrete != 0 {
-        return Ok(None);
-    }
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
@@ -1424,19 +1400,13 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
     }
 
-    let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
-    let fits = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallI,
-        fits_fn,
-        &[raw],
-        &[majit_ir::Type::Ref],
-        majit_ir::Type::Int,
-        majit_metainterp::cannot_raise_effect_info(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
-
+    // The box needs no preceding fits_int guard: `_int_lshift` wraps with
+    // `W_LongObject(...)` and `_int_rshift` with `newlong` (longobject.py:383,
+    // 402), and `long_lshift`/`long_rshift` both end in `w_long_new`. Neither
+    // demotes a machine-sized result — `newlong` only reaches
+    // `W_SmallLongObject`, which `withsmalllong` leaves off — so declining on
+    // a fitting result put every `x >> 32`-shaped shift back on the generic
+    // residual for no observable difference.
     let result = crate::helpers::emit_box_long_inline(
         ctx.trace_ctx,
         raw,
