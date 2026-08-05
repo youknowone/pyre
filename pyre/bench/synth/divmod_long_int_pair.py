@@ -1,4 +1,10 @@
-# pyre-check: max-pypy-ratio=14
+# pyre-check: max-pypy-ratio=8
+# Sized for headroom, not sensitivity: the worst ratio measured across
+# platforms is 3.7x (macOS cranelift; macOS dynasm 2.9x, linux/aarch64 2.4x
+# dynasm and 3.2x cranelift), and CI runners swing this fixture by ~20% under
+# load. Losing either fold this file covers also moves `guard_failures`, which
+# the jit-stats baselines gate in both directions, so that is the sensitive
+# guard and this one is the net beneath it.
 # `divmod(long, int)` at a traced call site. `_int_divmod` keeps the divisor
 # unwrapped and calls `rbigint.int_divmod`, whose rtyped return is a two-item
 # `GcStruct`: the walker emits one elidable call plus two `getfield_gc_r`, then
