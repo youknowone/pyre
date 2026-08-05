@@ -7034,6 +7034,91 @@ mod tests {
         );
     }
 
+    /// `translate_operation("alloc_and_set")` routes to
+    /// [`rtype_alloc_and_set`] (rtyper.py:534-535), which lowers a
+    /// `[item] * count` display to a single `gendirectcall(ll_alloc_and_set,
+    /// count, item)` (rlist.py:346-350). Unlike `newlist`, the count is a
+    /// runtime `Signed` operand (not a static element enumeration), so the
+    /// dispatch emits exactly one `direct_call` and mints the
+    /// `ll_alloc_and_set` dispatch helper graph.
+    #[test]
+    fn translate_operation_alloc_and_set_dispatches_to_ll_alloc_and_set() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> =
+            Arc::new(ListRepr::new(&rtyper, r_int.clone()).expect("ListRepr::new"));
+
+        // Upstream `v_count, v_item = hop.inputargs(Signed, r_list.item_repr)`
+        // — arg 0 is the runtime count, arg 1 is the fill item.
+        let v_count = Variable::new();
+        v_count.set_concretetype(Some(LowLevelType::Signed));
+        let v_item = Variable::new();
+        v_item.set_concretetype(Some(LowLevelType::Signed));
+        let v_count_h = Hlvalue::Variable(v_count);
+        let v_item_h = Hlvalue::Variable(v_item);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "alloc_and_set".to_string(),
+            vec![v_count_h.clone(), v_item_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_count_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(
+                Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_"))) as Arc<dyn Repr>,
+            ));
+        hop.args_v.borrow_mut().push(v_item_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        let out = rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation alloc_and_set must dispatch to rtype_alloc_and_set")
+            .expect("alloc_and_set returns the fresh list Variable");
+        let Hlvalue::Variable(_) = out else {
+            panic!("alloc_and_set must return a Variable (the ll_alloc_and_set result)");
+        };
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        // A single `gendirectcall(ll_alloc_and_set, count, item)`.
+        assert_eq!(
+            direct_calls,
+            1,
+            "expected one ll_alloc_and_set direct_call, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+
+        // The resized arm must mint the `ll_alloc_and_set` dispatch helper.
+        let translator = ann.translator.clone();
+        let names: Vec<String> = translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_alloc_and_set"),
+            "resized arm must mint an ll_alloc_and_set helper graph, got {names:?}"
+        );
+    }
+
     /// `l[start:stop]` on a resized `ListRepr` with non-constant nonneg int
     /// bounds decomposes to `"startstop"` (rtyper.py:781) and lowers to
     /// `gendirectcall(ll_listslice_startstop, l, start, stop)`, which mints the
