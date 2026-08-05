@@ -822,6 +822,41 @@ pub struct DescrSetCounts {
     pub stale_absent: u64,
 }
 
+/// The two producer-side field-position invariants as numbers, for the same
+/// reason [`descr_set_counts`] exists: the wasm guest has no stderr, so it
+/// exports them individually (`pyre_jit_field_pos_*` in `pyre-wasm`) and the
+/// runner prints the line.
+///
+/// This matters more on wasm than the name suggests. The invariant is stated in
+/// terms of BYTE OFFSETS — `index_in_parent` must name the slot the field's
+/// offset occupies — and wasm32's word is 4 bytes (`symbolic.py:12 WORD =
+/// sizeof(lltype.Signed)`), so every struct is laid out differently there. A
+/// producer that ranks correctly on a 64-bit host is not thereby correct on
+/// wasm, and without these exports a wasm-only rise reads as absent-and-
+/// therefore-zero, i.e. healthy.
+pub fn field_position_counts() -> FieldPositionCounts {
+    let [spec_checked, spec_misplaced] = majit_ir::descr::GcCache::spec_position_census();
+    let [attached_checked, attached_misplaced] =
+        majit_ir::descr::GcCache::attached_position_census();
+    FieldPositionCounts {
+        spec_checked: spec_checked as u64,
+        spec_misplaced: spec_misplaced as u64,
+        attached_checked: attached_checked as u64,
+        attached_misplaced: attached_misplaced as u64,
+    }
+}
+
+/// `*_checked` are the denominators — reported so a run that checked nothing
+/// cannot read the same as one that checked everything, but host-dependent and
+/// therefore not in `JITSTATS_SNAPSHOT_FIELDS`. The two `*_misplaced` are
+/// `JITSTATS_BADNESS_FIELDS` members and healthy only at zero.
+pub struct FieldPositionCounts {
+    pub spec_checked: u64,
+    pub spec_misplaced: u64,
+    pub attached_checked: u64,
+    pub attached_misplaced: u64,
+}
+
 /// Name every member whose container has been registered since its raw set was
 /// frozen, under `PYRE_DESCR_SPELLING_GATE=1`.
 ///

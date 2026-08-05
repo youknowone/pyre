@@ -837,6 +837,12 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         let descr_set_absent = counter("pyre_jit_descr_set_absent", &mut missing);
         let descr_set_ambiguous = counter("pyre_jit_descr_set_ambiguous", &mut missing);
         let descr_set_stale_absent = counter("pyre_jit_descr_set_stale_absent", &mut missing);
+        let field_pos_spec_checked = counter("pyre_jit_field_pos_spec_checked", &mut missing);
+        let field_pos_spec_misplaced = counter("pyre_jit_field_pos_spec_misplaced", &mut missing);
+        let field_pos_attached_checked =
+            counter("pyre_jit_field_pos_attached_checked", &mut missing);
+        let field_pos_attached_misplaced =
+            counter("pyre_jit_field_pos_attached_misplaced", &mut missing);
         // Walks that ended uncommitted after a residual had already run an
         // irreversible effect. Reached through the slot-indexed `pyre_fbw_diag`
         // export rather than a counter of its own; slot 1 is
@@ -872,7 +878,11 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
              descr_set_absent={descr_set_absent} \
              descr_set_ambiguous={descr_set_ambiguous} \
              descr_set_stale_absent={descr_set_stale_absent} \
-             fbw_rolled_back_with_effects={fbw_rolled_back_with_effects}"
+             fbw_rolled_back_with_effects={fbw_rolled_back_with_effects} \
+             field_pos_spec_checked={field_pos_spec_checked} \
+             field_pos_spec_misplaced={field_pos_spec_misplaced} \
+             field_pos_attached_checked={field_pos_attached_checked} \
+             field_pos_attached_misplaced={field_pos_attached_misplaced}"
         );
     }
     let packed = match run_result {

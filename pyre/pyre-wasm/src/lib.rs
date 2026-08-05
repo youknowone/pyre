@@ -482,6 +482,42 @@ pub extern "C" fn pyre_jit_descr_set_resolved() -> u64 {
     pyre_jit::descr_set_counts().resolved
 }
 
+/// The producer-side field-position invariants, the other two
+/// `JITSTATS_BADNESS_FIELDS` members, exported for the same reason as the
+/// `descr_set_*` block above.
+///
+/// Not redundant with the native backends' reading of them: the invariant is
+/// that `index_in_parent` names the slot the field's BYTE OFFSET occupies, and
+/// wasm32 lays every struct out on a 4-byte word (`symbolic.py:12`). A
+/// producer's ranking is a function of the target's offsets, so a 64-bit host
+/// reading zero says nothing about wasm.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_spec_misplaced() -> u64 {
+    pyre_jit::field_position_counts().spec_misplaced
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_attached_misplaced() -> u64 {
+    pyre_jit::field_position_counts().attached_misplaced
+}
+
+/// The denominators for the two above, on the same footing as
+/// `pyre_jit_descr_set_resolved`: reported so a run that checked nothing cannot
+/// read the same as one that checked everything, host-dependent, not gated.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_spec_checked() -> u64 {
+    pyre_jit::field_position_counts().spec_checked
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_attached_checked() -> u64 {
+    pyre_jit::field_position_counts().attached_checked
+}
+
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 static PANIC_HOOK: Once = Once::new();
 
