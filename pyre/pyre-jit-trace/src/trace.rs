@@ -4087,17 +4087,29 @@ fn run_perfn_walk<Sym: WalkSym>(
         {
             crate::jitcode_dispatch::restore_escape_flush_undo();
         }
+        // The third field marks an abort that may only consume the `Entry`
+        // carrier: the `MidBody` carrier is latched exclusively by the first two
+        // variants (`inline_call.rs`), so a kept-stack abort matching a MidBody
+        // payload would be reading another abort's rebuild plan.
         let call_forward_abort = match &walk_result {
             Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
-                Some((*pc, true))
+                Some((*pc, true, false))
             }
             Err(crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
                 pc,
-            }) => Some((*pc, false)),
+            }) => Some((*pc, false, false)),
+            Err(
+                crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
+                    pc,
+                },
+            )
+            | Err(crate::jitcode_dispatch::DispatchError::BranchGuardKeptStackUnsupported { pc }) => {
+                Some((*pc, false, true))
+            }
             _ => None,
         };
         let mut committed_entry_carrier_call_py_pc = None;
-        if let Some((abort_jit_pc, is_marker_abort)) = call_forward_abort {
+        if let Some((abort_jit_pc, is_marker_abort, entry_carrier_only)) = call_forward_abort {
             // gh#467: a supported abort fired inside a TOP-level inline
             // sub-walk whose callee executed no concrete effect
             // (`try_walker_inline_user_call` latched the carrier only under
@@ -4131,12 +4143,13 @@ fn run_perfn_walk<Sym: WalkSym>(
                     );
                 }
                 Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
-                    if (is_marker_abort
-                        && payload.abort_kind
-                            == crate::jitcode_dispatch::MidBodyAbortKind::Marker)
-                        || (!is_marker_abort
+                    if !entry_carrier_only
+                        && ((is_marker_abort
                             && payload.abort_kind
-                                == crate::jitcode_dispatch::MidBodyAbortKind::Structural) =>
+                                == crate::jitcode_dispatch::MidBodyAbortKind::Marker)
+                            || (!is_marker_abort
+                                && payload.abort_kind
+                                    == crate::jitcode_dispatch::MidBodyAbortKind::Structural)) =>
                 {
                     let rebuilt = match resolve_midbody_flush_words(payload) {
                         Some(words) => {
@@ -4485,7 +4498,18 @@ fn run_perfn_walk<Sym: WalkSym>(
         };
         if let Some((pc, is_unsupported)) = kept_stack_abort_pc {
             let abort_jit_pc = pc;
-            if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+            if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) {
+                // A walk commits at most ONE leg.  The gh#467 CALL-forward block
+                // above now also serves these aborts, and its flush already
+                // repositioned the frame; flushing again here would move it a
+                // second time.
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-branch-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (a carrier leg already committed this walk)"
+                    );
+                }
+            } else if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
                 || session.borrow().abort_in_subwalk
             {
                 if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -5596,7 +5620,24 @@ fn full_body_walk_trace<Sym: WalkSym>(
             use crate::jitcode_dispatch::DispatchError as DE;
             crate::jitcode_dispatch::census_record(e.variant_name());
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                eprintln!("[fbw-abort] start_pc={start_pc} Err={e:?}");
+                let raw_code =
+                    unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) }
+                        as *const CodeObject;
+                let (name, path) = if raw_code.is_null() {
+                    ("<unknown>", "<unknown>")
+                } else {
+                    unsafe {
+                        (
+                            (*raw_code).obj_name.as_str(),
+                            (*raw_code).source_path.as_str(),
+                        )
+                    }
+                };
+                eprintln!(
+                    "[fbw-abort] start_pc={start_pc} Err={e:?} \
+                     code={name} src={path} effects={}",
+                    crate::jitcode_dispatch::fbw_executed_effect_count(),
+                );
             }
             match e {
                 // A kept-stack branch guard whose not-taken arm reads an

@@ -4365,10 +4365,20 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // not the pre-sub-walk `arg_concretes`, so it is current after the
             // sub-walk's allocations.  Any doubt keeps the legacy replay — the
             // honest residual (the inner-frame rebuild is #126/#215).
+            //
+            // The kept-stack branch-guard aborts belong to the same class: they
+            // refuse to COMPILE a guard whose not-taken arm the blackhole could
+            // not reconstruct, which says nothing about the sub-walk having
+            // committed anything.  Without a carrier their only remaining leg
+            // rewinds to the OUTER frame's entry (`trace.rs`, "legacy drop
+            // kept"), re-running every effect the walk already executed —
+            // `threading.Thread.start` calling `_start_joinable_thread` twice.
             if matches!(
                 e,
                 DispatchError::AbortPermanentMarkerReached { .. }
                     | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+                    | DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. }
+                    | DispatchError::BranchGuardKeptStackUnsupported { .. }
             ) {
                 latch_abort_call_resume(
                     code,
