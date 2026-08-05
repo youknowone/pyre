@@ -5521,15 +5521,46 @@ impl JitCodeBuilder {
     /// This is the pyre analogue of PyPy always calling `get_size_descr`
     /// at descr-creation time (which returns the single canonical
     /// SizeDescr with all fields populated by `heaptracker.all_fielddescrs`).
+    ///
+    /// `index_in_parent` and `name` are re-resolved against that same final
+    /// spec, because `add_struct_field_descr` derived both from the snapshot
+    /// this pass is replacing.  Swapping only the parent leaves the two halves
+    /// of one descr disagreeing: the field is declared to sit at slot `i` of a
+    /// list whose slot `i` is a different offset.  The re-resolution is the
+    /// original mint's own `position(|fd| fd.offset == offset)` lookup, run
+    /// against the complete list instead of a prefix of it — not a new
+    /// identity basis.  (`descr.rs find_index_in_parent` rejects an offset
+    /// fallback, but that is the runtime lookup, where `parent` comes from a
+    /// cache key several structs can share; here the spec is the very entry
+    /// keyed by the `type_id` the mint site passed.)
+    ///
+    /// A field still absent from the final spec keeps what the mint left it —
+    /// `add_struct_field_descr`'s `unwrap_or((0, String::new()))`.  Those are
+    /// the inline aggregates the flattened layout only covers through their
+    /// leaves (`ob_header`, `int_items`, an enum's `__pos_0`), which
+    /// `heaptracker.py:68-69` mints no descr for at all.
     fn patch_field_descr_parents(&mut self) {
         for entry in &mut self.descrs {
-            if let RuntimeBhDescr::Descr(CanonicalBhDescr::Field { parent, .. }) = entry {
-                if let Some(p) = parent {
-                    if let Some(final_spec) = self.struct_size_specs.get(&p.type_id) {
-                        *p = final_spec.clone();
-                    }
-                }
-            }
+            let RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+                offset,
+                index_in_parent,
+                parent,
+                name,
+                ..
+            }) = entry
+            else {
+                continue;
+            };
+            let Some(p) = parent else { continue };
+            let Some(final_spec) = self.struct_size_specs.get(&p.type_id) else {
+                continue;
+            };
+            *p = final_spec.clone();
+            let Some(idx) = p.all_fielddescrs.iter().position(|fd| fd.offset == *offset) else {
+                continue;
+            };
+            *index_in_parent = idx;
+            name.clone_from(&p.all_fielddescrs[idx].name);
         }
     }
 
@@ -5831,6 +5862,71 @@ mod tests {
                 .and_then(|resulttypes| resulttypes.get(&pc).copied()),
             None
         );
+    }
+
+    /// `add_struct_field_descr` resolves `index_in_parent` / `name` against
+    /// the layout accumulated SO FAR, and `register_struct_layout` re-indexes
+    /// every entry on each merge, so a field minted before a lower-offset
+    /// sibling is registered carries a rank the merge then invalidates.
+    ///
+    /// `patch_field_descr_parents` installs the final merged spec as the
+    /// parent, so a stale rank left beside it declares the field at a slot the
+    /// parent fills with a different offset — `descr.py:228`'s index and
+    /// `descr.py:238`'s parent_descr describing two different fields.
+    ///
+    /// Emission order here is high-offset first, which is what makes the
+    /// prefix rank (0) differ from the final rank (1).
+    #[test]
+    fn field_descr_index_follows_the_final_layout_not_the_mint_time_prefix() {
+        const TID: u64 = 0x5747_5F49_4458;
+        let mut builder = JitCodeBuilder::new();
+        // Site 1 registers only the HIGH offset, so the mint ranks it 0.
+        builder.register_struct_layout(24, TID, false, false, &[(16, false, "hi")]);
+        builder.getfield_gc_i(0, 1, 16, TID);
+        // Site 2 registers the LOW offset; the merge re-indexes to {8→0, 16→1}.
+        builder.register_struct_layout(24, TID, false, false, &[(8, false, "lo")]);
+        builder.getfield_gc_i(2, 1, 8, TID);
+        let jitcode = builder.finish();
+
+        let fields: Vec<_> = jitcode
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|entry| match entry {
+                RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+                    offset,
+                    index_in_parent,
+                    parent,
+                    name,
+                    ..
+                }) => Some((*offset, *index_in_parent, name.clone(), parent.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fields.len(), 2, "one Field descr per getfield site");
+        for (offset, index_in_parent, name, parent) in fields {
+            let parent = parent.expect("a registered type_id gives the field a parent");
+            assert_eq!(
+                parent.all_fielddescrs.len(),
+                2,
+                "the parent is the final merged spec, not the mint-time prefix",
+            );
+            let (expected_index, expected_name) = match offset {
+                8 => (0, "lo"),
+                16 => (1, "hi"),
+                other => panic!("unexpected field offset {other}"),
+            };
+            assert_eq!(
+                index_in_parent, expected_index,
+                "field at offset {offset} must rank by the final layout",
+            );
+            assert_eq!(name, expected_name, "and name from that same layout");
+            assert_eq!(
+                parent.all_fielddescrs[index_in_parent].offset, offset,
+                "`all_fielddescrs[index_in_parent]` must be this very field \
+                 (`heaptracker.py:60-72` / `:96-112` share one walker upstream)",
+            );
+        }
     }
 
     #[test]
