@@ -4403,9 +4403,17 @@ pub unsafe fn w_dict_nth_item_object_strategy(
 /// hash the caller already computed.
 ///
 /// `flag` is the `FLAG_LOOKUP` / `FLAG_STORE` / `FLAG_DELETE` selector
-/// `ll_dict_lookup` takes (`rordereddict.py:1041-1060`).  An `IndexMap` keeps no
-/// free-slot bookkeeping, so every flag answers the same index; the argument
-/// exists because the optimizer reads it off `arg(4)` (`heap.py:497-500`).
+/// `ll_dict_lookup` takes (`rordereddict.py:1041-1060`), and **only
+/// `FLAG_LOOKUP` is implemented here**.  The argument exists because the
+/// optimizer reads it off `arg(4)` (`heap.py:497-500`) and requires it to be a
+/// constant; the recorder only ever emits 0.
+///
+/// The other two are not "the same answer" — they are not expressible.  On a
+/// miss `FLAG_STORE` answers the free slot the caller is to write into, and
+/// `FLAG_DELETE` walks to the tombstone, both of which read the free-slot
+/// bookkeeping an `IndexMap` does not keep.  This helper answers -1 for every
+/// miss, so a store or delete lookup would be wrong rather than merely
+/// conservative.
 ///
 /// Only a Unicode-strategy dict reaches here, so every stored key is an exact
 /// `str` and the probe's comparisons are WTF-8 byte equality.  The
@@ -4436,8 +4444,9 @@ pub unsafe fn w_dict_unicode_lookup_index(
     w_dict: *mut PyObject,
     w_key: *mut PyObject,
     hash: i64,
-    _flag: i64,
+    flag: i64,
 ) -> i64 {
+    debug_assert_eq!(flag, 0, "only FLAG_LOOKUP is implemented");
     lock_dict_refs!(_dict_guard, w_dict, w_key);
     let dict = &*(w_dict as *const W_DictObject);
     let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
