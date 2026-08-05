@@ -842,10 +842,20 @@ fn maybe_print_jit_stats() {
     // `STORE_JOURNAL_ROLLBACK_FAILED` is the hole that subtraction would
     // otherwise open: a journaled store the rollback could not restore is
     // subtracted out of the count above, so it needs one of its own.
+    //
+    // The two adoption tallies are the same population read from the other end:
+    // the walks that DID hand the interpreter a resumable image. Nothing else
+    // counts them, so a change that silently sends a shape back to the legacy
+    // replay moves no gated counter without these.
     eprintln!(
-        "[jit-stats] fbw_rolled_back_with_effects={} fbw_store_journal_rollback_failed={}",
+        "[jit-stats] fbw_rolled_back_with_effects={} \
+         fbw_store_journal_rollback_failed={} \
+         fbw_blackhole_adopted_single_frame={} \
+         fbw_blackhole_adopted_multi_frame={}",
         pyre_jit::fbw_diag_counter(1),
         pyre_jit::fbw_diag_counter(11),
+        pyre_jit::fbw_diag_counter(12),
+        pyre_jit::fbw_diag_counter(13),
     );
     let stats = pyre_jit::eval::driver_pair().0.get_stats();
     eprintln!(

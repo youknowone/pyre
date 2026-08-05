@@ -620,7 +620,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         // which the guest cannot read. Slot layout in
         // `pyre_jit_trace::trace::fbw_diag`.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
-            const RING_BASE: u32 = 12;
+            const RING_BASE: u32 = 14;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
@@ -864,14 +864,25 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         // rollback could not perform — the one journaled effect the walk-end
         // subtraction must not silently absorb. Both slots come from one
         // export lookup so an absent export names itself once.
-        let (fbw_rolled_back_with_effects, fbw_store_journal_rollback_failed) = match instance
+        let (
+            fbw_rolled_back_with_effects,
+            fbw_store_journal_rollback_failed,
+            fbw_blackhole_adopted_single_frame,
+            fbw_blackhole_adopted_multi_frame,
+        ) = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")
-            .and_then(|f| Ok((f.call(&mut store, 1)?, f.call(&mut store, 11)?)))
-        {
-            Ok(pair) => pair,
+            .and_then(|f| {
+                Ok((
+                    f.call(&mut store, 1)?,
+                    f.call(&mut store, 11)?,
+                    f.call(&mut store, 12)?,
+                    f.call(&mut store, 13)?,
+                ))
+            }) {
+            Ok(slots) => slots,
             Err(_) => {
                 missing.push("pyre_fbw_diag");
-                (0, 0)
+                (0, 0, 0, 0)
             }
         };
         if !missing.is_empty() {
@@ -897,7 +908,9 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
              field_pos_spec_misplaced={field_pos_spec_misplaced} \
              field_pos_attached_checked={field_pos_attached_checked} \
              field_pos_attached_misplaced={field_pos_attached_misplaced} \
-             fbw_store_journal_rollback_failed={fbw_store_journal_rollback_failed}"
+             fbw_store_journal_rollback_failed={fbw_store_journal_rollback_failed} \
+             fbw_blackhole_adopted_single_frame={fbw_blackhole_adopted_single_frame} \
+             fbw_blackhole_adopted_multi_frame={fbw_blackhole_adopted_multi_frame}"
         );
     }
     let packed = match run_result {

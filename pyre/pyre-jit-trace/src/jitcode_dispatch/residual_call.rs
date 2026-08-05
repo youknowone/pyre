@@ -3087,8 +3087,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // here instead left the shapes that DID commit — a re-entry guard
             // plus a non-idempotent store ahead of the escaping call — on the
             // replay path.
-            if !ctx.trace_ctx.is_bridge_trace
-                && let Some((resume_pc, result_bank, result_color)) = blackhole_result
+            if let Some((resume_pc, result_bank, result_color)) = blackhole_result
                 && !ctx.fbw_mode.snapshot_sym.is_null()
             {
                 let (lastop_result, last_exc_value, raising_exception) = match exec_result {

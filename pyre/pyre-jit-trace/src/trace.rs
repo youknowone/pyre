@@ -2656,6 +2656,7 @@ fn try_adopt_single_frame_blackhole(
     // The blackhole ran the region to a frame terminal, so the resume is
     // the frame's RESULT, not a pc that re-runs anything.
     let _ = commit_walk_end(commit_leg, WalkEndResume::Terminal);
+    fbw_diag::bump(fbw_diag::BLACKHOLE_ADOPTED_SINGLE_FRAME);
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!(
             "[fbw-blackhole] adopted single-frame terminal at jitcode_index={} \
@@ -3154,6 +3155,7 @@ fn try_adopt_multi_frame_blackhole(
     crate::jitcode_dispatch::fbw_foriter_inflight_clear();
     // Same as the single-frame adoption: a frame terminal, not a resume pc.
     let _ = commit_walk_end(commit_leg, WalkEndResume::Terminal);
+    fbw_diag::bump(fbw_diag::BLACKHOLE_ADOPTED_MULTI_FRAME);
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!("[fbw-blackhole] adopted multi-frame terminal depth={depth}");
     }
@@ -6134,12 +6136,18 @@ pub mod fbw_diag {
     pub const ESCAPE_FORCE_BY_PORTAL: usize = 9;
     pub const ESCAPE_FORCE_BY_CALLEE_ONLY: usize = 10;
     pub const STORE_JOURNAL_ROLLBACK_FAILED: usize = 11;
+    /// Successful single-frame blackhole adoptions. A fall means the walk
+    /// stopped handing the interpreter an image and went back to legacy replay.
+    pub const BLACKHOLE_ADOPTED_SINGLE_FRAME: usize = 12;
+    /// Successful multi-frame blackhole adoptions. A fall means the walk
+    /// stopped handing the interpreter an image and went back to legacy replay.
+    pub const BLACKHOLE_ADOPTED_MULTI_FRAME: usize = 13;
 
     /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
     /// slot, little-endian) followed by one slot of packed counters.  A `u64`
     /// export cannot carry a string, and the outcome set is far too large to
     /// spend a tally slot per variant.
-    pub const RING_BASE: usize = 12;
+    pub const RING_BASE: usize = 14;
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;
     pub const NAME_SLOTS: usize = 4;

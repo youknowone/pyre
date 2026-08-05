@@ -749,6 +749,12 @@ JITSTATS_BADNESS_FIELDS = (
 #   under ordinary tuning", which made a bridge collapse (27 -> 0) invisible for
 #   as long as `guard_failures` stayed inside its band — the whole dead-bridge
 #   class this suite exists to catch.
+# * `fbw_blackhole_adopted_single_frame` and
+#   `fbw_blackhole_adopted_multi_frame` count successful full-body-walk
+#   blackhole adoptions: the walk handed the interpreter a resumable image
+#   instead of making its caller replay the region. A fall means the adoption
+#   path stopped firing and the legacy replay path came back; a rise means more
+#   walks avoided replay and the baseline should say so.
 #
 # A move is not *always* a defect: two loops merging into one trace lowers
 # `loops_compiled` while raising coverage. That is the bargain `loops_aborted`
@@ -778,6 +784,8 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
     "loops_compiled",
     "bridges_compiled",
     "guard_failures",
+    "fbw_blackhole_adopted_single_frame",
+    "fbw_blackhole_adopted_multi_frame",
 )
 
 
@@ -791,9 +799,14 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # `loops_compiled` is inverted against the badness fields: it is the counter
 # that falls when the tracer stops admitting a frame at all, which aborts
 # nothing and *lowers* `guard_failures`, so a fall is the regression and a rise
-# is the gain.
+# is the gain. The blackhole adoption counters are inverted the same way: a
+# fall means the interpreter stopped receiving an image and went back to replay.
 JITSTATS_REGRESSION_ON_RISE = JITSTATS_BADNESS_FIELDS + ("guard_failures",)
-JITSTATS_REGRESSION_ON_FALL = ("loops_compiled",)
+JITSTATS_REGRESSION_ON_FALL = (
+    "loops_compiled",
+    "fbw_blackhole_adopted_single_frame",
+    "fbw_blackhole_adopted_multi_frame",
+)
 
 # How many fresh runs a disagreeing fixture gets before its counters are called
 # stable. Only a fixture that already disagrees pays this, so the common path is
