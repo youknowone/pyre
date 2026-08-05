@@ -5564,6 +5564,18 @@ fn register_quasi_immutable_deps(_green_key: u64) {
         return;
     };
     let module_dict_version = pyre_jit_trace::descr::module_dict_version_descr().index();
+    let type_version_tag = pyre_jit_trace::descr::type_version_tag_descr().index();
+    let terminator_allow_unboxing =
+        pyre_jit_trace::descr::terminator_allow_unboxing_descr().index();
+    let plain_attribute_ever_mutated =
+        pyre_jit_trace::descr::plain_attribute_ever_mutated_descr().index();
+    let holder_attr = pyre_jit_trace::descr::holder_attr_descr().index();
+    let holder_typ = pyre_jit_trace::descr::holder_typ_descr().index();
+    // Hoisted because each accessor clones a `LazyLock` descr; the index also
+    // decides which type `dep_ptr` is cast to, so the chain below ends in a
+    // fail-loud default rather than reinterpreting a headerless map node as a
+    // `W_TypeObject`.  These six are every quasi-immutable descr this binary
+    // mints — see the same reasoning on `state.rs install_quasiimmut_field`.
     for (dep_ptr, field_index) in deps {
         unsafe {
             if field_index == module_dict_version {
@@ -5571,10 +5583,35 @@ fn register_quasi_immutable_deps(_green_key: u64) {
                     dep_ptr as *mut pyre_object::celldict::ModuleDictStrategy,
                     &flag,
                 );
-            } else {
+            } else if field_index == type_version_tag {
                 pyre_object::typeobject::w_type_register_quasi_immut_watcher(
                     dep_ptr as pyre_object::PyObjectRef,
                     &flag,
+                );
+            } else if field_index == terminator_allow_unboxing {
+                pyre_interpreter::objspace::std::mapdict::terminator_register_allow_unboxing_watcher(
+                    dep_ptr as *const _,
+                    &flag,
+                );
+            } else if field_index == plain_attribute_ever_mutated {
+                pyre_interpreter::objspace::std::mapdict::plain_attribute_register_ever_mutated_watcher(
+                    dep_ptr as *const _,
+                    &flag,
+                );
+            } else if field_index == holder_attr {
+                pyre_interpreter::objspace::std::mapdict::holder_register_attr_watcher(
+                    dep_ptr as *const _,
+                    &flag,
+                );
+            } else if field_index == holder_typ {
+                pyre_interpreter::objspace::std::mapdict::holder_register_typ_watcher(
+                    dep_ptr as *const _,
+                    &flag,
+                );
+            } else {
+                debug_assert!(
+                    false,
+                    "unrecognised quasi-immutable field descr index {field_index:#x}"
                 );
             }
         }

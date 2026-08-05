@@ -4524,17 +4524,46 @@ fn install_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
     if struct_ptr == 0 || struct_ptr == usize::MAX as i64 {
         return;
     }
-    // The non-module owner is a `W_TypeObject`; the accessor re-checks
-    // `is_type`, so a descr naming neither owner is a no-op rather than a
-    // mistyped write.
+    let index = descr.index();
+    // The index decides which type `struct_ptr` is cast to, so an unrecognised
+    // one must fail loudly rather than reinterpret a headerless map-node
+    // allocation as a `W_TypeObject`.  Dropping the old implicit `W_TypeObject`
+    // fallback is safe: the six arms below are every quasi-immutable descr this
+    // binary can mint.  The two `opimpl_getfield_gc_*` callers gate on
+    // `descr.is_quasi_immutable()` and see only analyzer-derived descrs, whose
+    // rank comes from a `#[jit_immutable_fields]` entry carrying the
+    // `_immutable_fields_` `?` suffix — no declaration in the tree has one.
+    // `record_quasiimmut_field` is pinned in the unreachable-opname set, so no
+    // jitcode reaches this either.
     unsafe {
-        if descr.index() == crate::descr::module_dict_version_descr().index() {
+        if index == crate::descr::module_dict_version_descr().index() {
             pyre_object::dictmultiobject::module_dict_strategy_install_version_watcher(
                 struct_ptr as *mut pyre_object::celldict::ModuleDictStrategy,
             );
-        } else {
+        } else if index == crate::descr::type_version_tag_descr().index() {
             pyre_object::typeobject::w_type_install_quasi_immut(
                 struct_ptr as pyre_object::PyObjectRef,
+            );
+        } else if index == crate::descr::terminator_allow_unboxing_descr().index() {
+            pyre_interpreter::objspace::std::mapdict::terminator_install_allow_unboxing_watcher(
+                struct_ptr as *const _,
+            );
+        } else if index == crate::descr::plain_attribute_ever_mutated_descr().index() {
+            pyre_interpreter::objspace::std::mapdict::plain_attribute_install_ever_mutated_watcher(
+                struct_ptr as *const _,
+            );
+        } else if index == crate::descr::holder_attr_descr().index() {
+            pyre_interpreter::objspace::std::mapdict::holder_install_attr_watcher(
+                struct_ptr as *const _,
+            );
+        } else if index == crate::descr::holder_typ_descr().index() {
+            pyre_interpreter::objspace::std::mapdict::holder_install_typ_watcher(
+                struct_ptr as *const _,
+            );
+        } else {
+            debug_assert!(
+                false,
+                "unrecognised quasi-immutable field descr index {index:#x}"
             );
         }
     }

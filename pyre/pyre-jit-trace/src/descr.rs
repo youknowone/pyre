@@ -48,6 +48,20 @@ const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
 const CELL_DESCR_TAG: u32 = 0x4000_0000;
 const INT_MUTABLE_CELL_VALUE_INDEX: u32 = CELL_DESCR_TAG;
 
+// FIELD spans [0x1000_0000, 0x10FF_FFFF], ARRAY 0x2xxx_xxxx,
+// SIZE 0x3xxx_xxxx, CELL 0x4000_0000 — 0x5000_0000 is disjoint from all four.
+// These reserved indices cannot use `make_quasi_immutable_field_descr`:
+// `Terminator.allow_unboxing` and `PlainAttribute.ever_mutated` are both
+// `Cell<bool>`, so `stable_field_index(offset, field_size, field_type, signed)`
+// could collide whenever their `repr(Rust)` offsets coincide. Because the
+// index selects the pointer cast in `install_quasiimmut_field`, that collision
+// would be type confusion rather than merely a shared `HeapCache` key.
+const MAPDICT_DESCR_TAG: u32 = 0x5000_0000;
+const TERMINATOR_ALLOW_UNBOXING_INDEX: u32 = MAPDICT_DESCR_TAG;
+const PLAIN_ATTRIBUTE_EVER_MUTATED_INDEX: u32 = MAPDICT_DESCR_TAG | 1;
+const HOLDER_ATTR_INDEX: u32 = MAPDICT_DESCR_TAG | 2;
+const HOLDER_TYP_INDEX: u32 = MAPDICT_DESCR_TAG | 3;
+
 fn type_bits(tp: Type) -> u32 {
     match tp {
         Type::Int => 0,
@@ -2574,6 +2588,121 @@ static MODULE_DICT_VERSION_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
 
 pub fn module_dict_version_descr() -> DescrRef {
     MODULE_DICT_VERSION_FIELD_DESCR.clone()
+}
+
+// These headerless-map-node descrs deliberately retain `parent_descr = None`
+// and `index_in_parent = 0`. This is sound only because arg0 of every one of
+// their `QUASIIMMUT_FIELD` ops is a freshly minted `const_ref`:
+// optimizer.py:464-502 would otherwise ask for `get_parent_descr()` and
+// `get_index()`, but the constant-arg0 `ConstPtrInfo` short-circuit at
+// optimizer.py:468-469 skips that path. Therefore these four descrs may appear
+// ONLY on `QUASIIMMUT_FIELD`, never on `GetfieldGc*` or `SetfieldGc*`:
+// `field_slot_index` falls back to `descr.index()` without a parent, and a
+// 0x5000_000X slot would blow out `_fields`. They also stay singleton Arcs for
+// the identity reason documented on `TYPE_VERSION_TAG_FIELD_DESCR`.
+static TERMINATOR_ALLOW_UNBOXING_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            TERMINATOR_ALLOW_UNBOXING_INDEX,
+            core::mem::offset_of!(
+                pyre_interpreter::objspace::std::mapdict::Terminator,
+                allow_unboxing
+            ),
+            1,
+            Type::Int,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "Terminator.allow_unboxing".to_string(),
+            "allow_unboxing".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn terminator_allow_unboxing_descr() -> DescrRef {
+    TERMINATOR_ALLOW_UNBOXING_FIELD_DESCR.clone()
+}
+
+static PLAIN_ATTRIBUTE_EVER_MUTATED_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            PLAIN_ATTRIBUTE_EVER_MUTATED_INDEX,
+            core::mem::offset_of!(
+                pyre_interpreter::objspace::std::mapdict::PlainAttribute,
+                ever_mutated
+            ),
+            1,
+            Type::Int,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "PlainAttribute.ever_mutated".to_string(),
+            "ever_mutated".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn plain_attribute_ever_mutated_descr() -> DescrRef {
+    PLAIN_ATTRIBUTE_EVER_MUTATED_FIELD_DESCR.clone()
+}
+
+static HOLDER_ATTR_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            HOLDER_ATTR_INDEX,
+            core::mem::offset_of!(
+                pyre_interpreter::objspace::std::mapdict::CachedAttributeHolder,
+                attr
+            ),
+            // A map node is an opaque pointer-sized Int, including on wasm32.
+            core::mem::size_of::<usize>(),
+            Type::Int,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "CachedAttributeHolder.attr".to_string(),
+            "attr".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn holder_attr_descr() -> DescrRef {
+    HOLDER_ATTR_FIELD_DESCR.clone()
+}
+
+// `field_sanity_load` / `bh_getfield_gc_i` only handle power-of-two widths;
+// make an `Option<UnboxType>` layout change a compile error instead of a
+// silent wrong-width read.
+const _: () = assert!(matches!(
+    core::mem::size_of::<
+        std::cell::Cell<Option<pyre_interpreter::objspace::std::mapdict::UnboxType>>,
+    >(),
+    1 | 2 | 4 | 8
+));
+
+static HOLDER_TYP_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            HOLDER_TYP_INDEX,
+            core::mem::offset_of!(
+                pyre_interpreter::objspace::std::mapdict::CachedAttributeHolder,
+                typ
+            ),
+            core::mem::size_of::<
+                std::cell::Cell<Option<pyre_interpreter::objspace::std::mapdict::UnboxType>>,
+            >(),
+            Type::Int,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "CachedAttributeHolder.typ".to_string(),
+            "typ".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn holder_typ_descr() -> DescrRef {
+    HOLDER_TYP_FIELD_DESCR.clone()
 }
 
 /// `W_ObjectObject` SizeDescr group (`objectobject.rs:34-46`) — the instance
