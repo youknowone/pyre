@@ -5,14 +5,14 @@
 
 pub const PYFRAME_VABLE_OWNER_ROOT: &str = "PyFrame";
 
-/// Virtualizable scalar fields, in line-by-line PyPy parity order with
-/// `pypy/module/pypyjit/interp_jit.py:25-31`'s `_virtualizable_`
-/// declaration.  PyPy lists
-/// `[last_instr, pycode, valuestackdepth, debugdata, lastblock,
-/// w_globals]`; pyre keeps the same six static fields and the same
-/// ordering so `VirtualizableInfo::static_fields` matches RPython's
-/// `rpython/jit/metainterp/virtualizable.py:71 static_field_descrs`
-/// length.
+/// Virtualizable scalar fields.
+///
+/// `pypy/module/pypyjit/interp_jit.py:25-30` declares
+/// `['last_instr', 'pycode', 'valuestackdepth', 'locals_cells_stack_w[*]',
+/// 'debugdata', 'w_globals']` — five scalars and one array. Pyre carries a
+/// SIXTH scalar, `lastblock`, which upstream does not list; the ordering
+/// below is otherwise upstream's, so `w_globals` sits one slot later here
+/// than it would there.
 ///
 /// Note on `lastblock` semantics: PyPy's bytecode emits
 /// `SETUP_FINALLY` / `SETUP_EXCEPT` / `POP_BLOCK` (`pyopcode.py:1268`)

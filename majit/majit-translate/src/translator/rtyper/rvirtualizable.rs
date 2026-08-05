@@ -11,8 +11,24 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 ///
 /// Pyre's `InstanceRepr` is a single Rust struct rather than a Python
 /// subclass hierarchy. This carrier records the extra state introduced by
-/// `rvirtualizable.py`; wiring it into `rclass::buildinstancerepr` is blocked
-/// on the `FieldListAccessor` / `_parse_field_list` surface in `rclass.py`.
+/// `rvirtualizable.py`.
+///
+/// It has no production caller, and the reason is not a missing piece of
+/// `rclass.py`. Upstream discovers the redirected field set by reading
+/// `classdesc.get_param('_virtualizable_')` off an RPython class and then
+/// injects a `jit_force_virtualizable` per redirected access
+/// (`hook_access_field`, rvirtualizable.py:49-53) into the FLOWGRAPHS it is
+/// about to rtype. Pyre's interpreter is hand-written Rust, so no class
+/// carries that parameter — nothing writes the key — and the rtyper's
+/// lowered op stream is not what the production jitcode is built from.
+/// An injected op would land in a list the production path discards.
+///
+/// The field set itself is therefore declared out of band, as a data table
+/// (`pyre-jit-trace/src/virtualizable_spec.rs`, consumed through
+/// `GraphTransformConfig::vable_fields` in `pyre-jit-trace/build.rs`), the
+/// same way `_immutable_fields_` is handled. What has no counterpart is the
+/// force injection: the frame forces are placed by hand at the consumers
+/// that need them (`pyre-interpreter` `sys.getframe`, `f_locals`, `f_back`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VirtualizableInstanceRepr {
     pub top_of_virtualizable_hierarchy: bool,
@@ -66,7 +82,12 @@ pub fn replace_force_virtualizable_with_call(
                     && op.args.first().and_then(hlvalue_concretetype).as_ref() == Some(VTYPEPTR)
                 {
                     if op.args.last().is_some_and(|arg| flags_access_directly(arg)) {
-                        newoplist.push(op);
+                        // `continue` before the append: an `access_directly`
+                        // read reaches the virtualizable without going through
+                        // the JIT, so the op is dropped rather than rewritten.
+                        // Nothing downstream understands the `jit_force_virtualizable`
+                        // opname, so leaving it in the block is not a weaker
+                        // rewrite but an unlowerable operation.
                         continue;
                     }
                     op.opname = "direct_call".to_string();
@@ -166,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_force_virtualizable_preserves_access_directly_ops() {
+    fn replace_force_virtualizable_drops_access_directly_ops() {
         let VTYPEPTR = lltype::GCREF.clone();
         let vable = Variable::named("vable");
         vable.set_concretetype(Some(VTYPEPTR.clone()));
@@ -184,10 +205,7 @@ mod tests {
         let count = replace_force_virtualizable_with_call(&[graph.clone()], &VTYPEPTR, &funcptr);
 
         assert_eq!(count, 0);
-        assert_eq!(
-            graph.borrow().startblock.borrow().operations[0].opname,
-            "jit_force_virtualizable"
-        );
+        assert!(graph.borrow().startblock.borrow().operations.is_empty());
     }
 
     #[test]

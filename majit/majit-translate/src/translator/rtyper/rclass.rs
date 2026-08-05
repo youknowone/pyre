@@ -4576,9 +4576,16 @@ pub fn buildinstancerepr(
             "_virtualizable_ class must not have UnboxedValue subclasses"
         );
         assert_eq!(gcflavor, Flavor::Gc, "_virtualizable_ requires gc flavor");
+        // Unreachable as things stand: `_virtualizable_` is never written into
+        // a `ClassDesc` member map, because pyre's virtualizable is the
+        // hand-written Rust `PyFrame` rather than an RPython class, and its
+        // field set is declared out of band in
+        // `pyre-jit-trace/src/virtualizable_spec.rs`. Kept fail-closed so a
+        // future producer of that parameter cannot silently get a plain
+        // `InstanceRepr` with no `vable_token`.
         return Err(TyperError::message(
-            "buildinstancerepr: VirtualizableInstanceRepr integration requires \
-             rclass.py FieldListAccessor/_parse_field_list parity",
+            "buildinstancerepr: no VirtualizableInstanceRepr — pyre declares its \
+             virtualizable field set out of band, not through _virtualizable_",
         ));
     }
     // rclass.py:109-117 — tagged-pointer path.
