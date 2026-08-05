@@ -887,14 +887,13 @@ impl ModuleDictStrategy {
     ///     self.version = VersionTag()
     /// ```
     ///
-    /// Reassigning the `version?` quasi-immutable field is what
-    /// invalidates the JIT.  In RPython the `?` machinery does this
-    /// automatically on the field write; pyre flips the registered loop
-    /// flags explicitly here (the single `version` write site).
+    /// Reassigning the `version?` quasi-immutable field invalidates the JIT.
+    /// `rclass.py:1010-1012 hook_setfield` notifies watchers before the store;
+    /// pyre flips the registered loop flags explicitly at this write site.
     #[inline]
     pub fn mutated(&mut self) {
-        self.version = VersionTag::fresh();
         self.notify_version_watchers();
+        self.version = VersionTag::fresh();
     }
 
     /// `celldict.py:47-55 getdictvalue_no_unwrapping`:
