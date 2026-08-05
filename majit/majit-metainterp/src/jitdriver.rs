@@ -2910,6 +2910,16 @@ impl<S: JitState> JitDriver<S> {
                                 // need not be reached — and declining the guard origin too
                                 // makes `pi/pi.jinseo` at `MAJIT_THRESHOLD=50` compute wrong
                                 // digits from byte 865, same length, no crash.
+                                //
+                                // What the widened arm produces, at the op level: the
+                                // declined close returns here, the walk runs on and closes a
+                                // second time one aheui instruction later, and the bridge it
+                                // compiles carries that instruction's pop (`IntAdd -1`, two
+                                // `GcLoadR`, two `GcStore`) ahead of a `Jump` into a
+                                // four-input label, where the close that was declined jumped
+                                // into a three-input one.  So the cost is not the lost close
+                                // but the resumed walk: declining and then giving the trace
+                                // up outright reproduces the un-compiled output exactly.
                                 None if self.meta.is_cross_loop_cut_key(target_key) => {
                                     crate::pyjitpl::BridgeCompileResult::Declined
                                 }
