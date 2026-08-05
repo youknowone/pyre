@@ -92,9 +92,20 @@ fn scanner_call_inner(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> Py
         '"' => {
             let parse_string = crate::baseobjspace::getattr_str(self_obj, "parse_string")?;
             let strict = crate::baseobjspace::getattr_str(self_obj, "strict")?;
+            let _roots = gc_roots::push_roots();
+            let slot = gc_roots::shadow_stack_len();
+            for value in [parse_string, strict, doc, self_obj] {
+                gc_roots::pin_root(value);
+            }
+            let end = pyre_object::w_int_new(index as i64 + 1);
+            gc_roots::pin_root(end);
             crate::call::call_function_impl_result(
-                parse_string,
-                &[doc, pyre_object::w_int_new(index as i64 + 1), strict],
+                gc_roots::shadow_stack_get(slot),
+                &[
+                    gc_roots::shadow_stack_get(slot + 2),
+                    gc_roots::shadow_stack_get(slot + 4),
+                    gc_roots::shadow_stack_get(slot + 1),
+                ],
             )
         }
         '{' => {
@@ -103,18 +114,59 @@ fn scanner_call_inner(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> Py
             let object_hook = crate::baseobjspace::getattr_str(self_obj, "object_hook")?;
             let pairs_hook = crate::baseobjspace::getattr_str(self_obj, "object_pairs_hook")?;
             let memo = crate::baseobjspace::getattr_str(self_obj, "memo")?;
-            let state =
-                pyre_object::w_tuple_new(vec![doc, pyre_object::w_int_new(index as i64 + 1)]);
-            crate::call::call_function_impl_result(
+            let _roots = gc_roots::push_roots();
+            let slot = gc_roots::shadow_stack_len();
+            for value in [
                 parse_object,
-                &[state, strict, self_obj, object_hook, pairs_hook, memo],
+                strict,
+                self_obj,
+                object_hook,
+                pairs_hook,
+                memo,
+                doc,
+            ] {
+                gc_roots::pin_root(value);
+            }
+            let end = pyre_object::w_int_new(index as i64 + 1);
+            gc_roots::pin_root(end);
+            let state = pyre_object::w_tuple_new(vec![
+                gc_roots::shadow_stack_get(slot + 6),
+                gc_roots::shadow_stack_get(slot + 7),
+            ]);
+            gc_roots::pin_root(state);
+            crate::call::call_function_impl_result(
+                gc_roots::shadow_stack_get(slot),
+                &[
+                    gc_roots::shadow_stack_get(slot + 8),
+                    gc_roots::shadow_stack_get(slot + 1),
+                    gc_roots::shadow_stack_get(slot + 2),
+                    gc_roots::shadow_stack_get(slot + 3),
+                    gc_roots::shadow_stack_get(slot + 4),
+                    gc_roots::shadow_stack_get(slot + 5),
+                ],
             )
         }
         '[' => {
             let parse_array = crate::baseobjspace::getattr_str(self_obj, "parse_array")?;
-            let state =
-                pyre_object::w_tuple_new(vec![doc, pyre_object::w_int_new(index as i64 + 1)]);
-            crate::call::call_function_impl_result(parse_array, &[state, self_obj])
+            let _roots = gc_roots::push_roots();
+            let slot = gc_roots::shadow_stack_len();
+            for value in [parse_array, self_obj, doc] {
+                gc_roots::pin_root(value);
+            }
+            let end = pyre_object::w_int_new(index as i64 + 1);
+            gc_roots::pin_root(end);
+            let state = pyre_object::w_tuple_new(vec![
+                gc_roots::shadow_stack_get(slot + 2),
+                gc_roots::shadow_stack_get(slot + 3),
+            ]);
+            gc_roots::pin_root(state);
+            crate::call::call_function_impl_result(
+                gc_roots::shadow_stack_get(slot),
+                &[
+                    gc_roots::shadow_stack_get(slot + 4),
+                    gc_roots::shadow_stack_get(slot + 1),
+                ],
+            )
         }
         _ => scan_scalar(self_obj, doc, value, index),
     }
@@ -587,9 +639,18 @@ fn encode_dict(
                 "dictionary update sequence element has length other than 2",
             ));
         }
-        let Some(key) = coerce_key(self_obj, pair_items[0])? else {
+        // `collect_iterable` hands back a plain `Vec`, and both `coerce_key`
+        // and the key encoding below run arbitrary Python — a custom encoder
+        // can drop the iterable a dict subclass's `items()` returned and move
+        // this pair.  Root both halves before the first of those calls.
+        let _pair_roots = gc_roots::push_roots();
+        let pair_slot = gc_roots::shadow_stack_len();
+        gc_roots::pin_root(pair_items[0]);
+        gc_roots::pin_root(pair_items[1]);
+        let Some(key) = coerce_key(self_obj, gc_roots::shadow_stack_get(pair_slot))? else {
             continue;
         };
+        gc_roots::pin_root(key);
         if first {
             first = false;
             if let Some(indent) = &indent {
@@ -601,11 +662,21 @@ fn encode_dict(
                 append_indent(&mut out, indent, child_level);
             }
         }
-        encode_string_field(self_obj, &mut out, key)?;
+        encode_string_field(
+            self_obj,
+            &mut out,
+            gc_roots::shadow_stack_get(pair_slot + 2),
+        )?;
         out.push_wtf8(&key_separator);
-        let encoded = encode_child(self_obj, pair_items[1], child_level).map_err(|err| {
+        let encoded = encode_child(
+            self_obj,
+            gc_roots::shadow_stack_get(pair_slot + 1),
+            child_level,
+        )
+        .map_err(|err| {
             let key_repr =
-                unsafe { crate::display::py_repr(key) }.unwrap_or_else(|_| "<?>".to_owned());
+                unsafe { crate::display::py_repr(gc_roots::shadow_stack_get(pair_slot + 2)) }
+                    .unwrap_or_else(|_| "<?>".to_owned());
             add_json_note(
                 err,
                 format!("when serializing {} item {key_repr}", short_type_name(obj)),
@@ -682,26 +753,51 @@ fn make_encoder_impl(
         2
     };
 
-    let result = pyre_object::w_instance_new(encoder_class::type_object());
     let _roots = gc_roots::push_roots();
     let slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(result);
-    for (name, value) in [
-        ("markers", markers),
-        ("default", default),
-        ("encoder", encoder),
-        ("indent", indent),
-        ("key_separator", key_separator),
-        ("item_separator", item_separator),
-        ("sort_keys", sort_keys),
-        ("skipkeys", skipkeys),
-        ("allow_nan", allow_nan),
-        ("_fast_mode", pyre_object::w_int_new(fast_mode)),
-        ("_depth", pyre_object::w_int_new(0)),
+    for value in [
+        markers,
+        default,
+        encoder,
+        indent,
+        key_separator,
+        item_separator,
+        sort_keys,
+        skipkeys,
+        allow_nan,
     ] {
-        crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), name, value)?;
+        gc_roots::pin_root(value);
     }
-    Ok(gc_roots::shadow_stack_get(slot))
+    // The two synthesized ints are pinned next so the slots stay in the same
+    // order as the name list below; the receiver is pinned last and sits one
+    // past it.
+    gc_roots::pin_root(pyre_object::w_int_new(fast_mode));
+    gc_roots::pin_root(pyre_object::w_int_new(0));
+    let receiver = gc_roots::shadow_stack_len();
+    gc_roots::pin_root(pyre_object::w_instance_new(encoder_class::type_object()));
+    for (offset, name) in [
+        "markers",
+        "default",
+        "encoder",
+        "indent",
+        "key_separator",
+        "item_separator",
+        "sort_keys",
+        "skipkeys",
+        "allow_nan",
+        "_fast_mode",
+        "_depth",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        crate::baseobjspace::setattr_str(
+            gc_roots::shadow_stack_get(receiver),
+            name,
+            gc_roots::shadow_stack_get(slot + offset),
+        )?;
+    }
+    Ok(gc_roots::shadow_stack_get(receiver))
 }
 
 fn make_scanner_impl(context: PyObjectRef) -> PyResult {
