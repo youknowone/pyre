@@ -3238,6 +3238,26 @@ pub(crate) fn note_vable_escape_abort() {
     stage_walker_abort_reason(majit_metainterp::counters::ABORT_ESCAPE);
 }
 
+/// Name `Counters.ABORT_ESCAPE` as the reason for the abort the walker returns
+/// when `tracing_after_residual_call` reports the virtualizable was forced
+/// (`pyjitpl.py:3389-3390` raises `SwitchToBlackhole(Counters.ABORT_ESCAPE)`
+/// there).  Without this the reason ladder falls through to
+/// `AbortReason::Generic`, whose `as_int()` is `ABORT_BRIDGE` — so the escape
+/// lands in the bucket `jitprof.rs ABORT_COUNTER_KINDS` labels
+/// `bridge_or_generic`, and the tally reads as bridge activity that never
+/// happened.
+///
+/// `raising_exception` does not travel this channel: pyre computes it from the
+/// residual's own `exec_result` (`residual_call.rs`), where the escape's `Err`
+/// arm already sets it, so upstream's hardcoded `True` needs no counterpart
+/// here.
+pub(crate) fn note_vable_escape_abort() {
+    let (driver, _) = crate::driver::driver_pair();
+    driver
+        .meta_interp_mut()
+        .stage_abort_reason(majit_metainterp::counters::ABORT_ESCAPE);
+}
+
 pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_box_float_inline(ctx, value, w_float_size_descr(), float_floatval_descr())
 }
