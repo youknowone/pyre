@@ -392,21 +392,24 @@ def pyre_env():
     # macOS machines can disagree while every Linux and Windows host already
     # sits on the 4MB fallback.
     #
-    # `guard_failures` is what moves: it counts bailouts, and a collection
+    # `guard_failures` is what moved: it counts bailouts, and a collection
     # landing a little earlier or later moves them. Measured — a macos runner
     # reported 19 differences against baselines recorded here, every one of
     # them `guard_failures` and most of them identical on both backends (so the
     # difference is in the schedule, not in codegen: no `loops_compiled` or
-    # `bridges_compiled` moved at all). Sweeping `PYPY_GC_NURSERY` reproduces
+    # `bridges_compiled` moved at all). Sweeping `PYPY_GC_NURSERY` reproduced
     # that runner's numbers exactly at 6MB — `fib_loop` 189, `dict_set` 609,
     # `listcomp_hot` 239, `nested_list_comprehension_hot` 402,
     # `recursive_call_frame_relocation` 636, `str_fstring` 657,
-    # `closure_per_call` 415, `type_name_setter` 2, all eight — while 4MB
-    # reproduces the committed baselines. A 12MB L2 halves to exactly that.
+    # `closure_per_call` 415, `type_name_setter` 2, all eight. A 12MB L2 halves
+    # to exactly that.
     #
     # 4MB is the documented unknown-cache value and what the non-macOS hosts
     # compute anyway, so pinning it costs nothing there and makes a macOS
-    # recorder agree with them.
+    # recorder agree with them. It no longer decides `guard_failures` — the
+    # threshold pin below removes the collection those readings were counting,
+    # and the baselines are recorded with both pins in place — but it still
+    # fixes the minor schedule and the nursery term the threshold derives from.
     env.setdefault("PYPY_GC_NURSERY", str(4 * 1024 * 1024))
     # Pin the major-collection threshold too, because the nursery pin above only
     # fixes one term of it. `min_heap_size` is `PYPY_GC_MIN`, else `nursery * 8`
@@ -636,19 +639,33 @@ def _parse_jit_stats(snapshot):
 # the expected trace is updated. These counters are a coarser projection of the
 # same idea.
 #
-# The exact comparison is affordable because nothing on the path takes a
-# per-run input. Each counter is a plain increment at the event
-# (`record_guard_failure_event`, pyjitpl.rs); what varies between runs would
-# have to be the event stream, i.e. which guards got compiled and when, and
-# that is decided by `JitCounter`, which indexes its thresholds by the pure
-# `_nexthash` sequence of `fetch_next_hash` (counter.py) rather than by an
-# object address — the one place in the compile-decision path where a
-# per-process value could have entered. Measured across runners as well as
-# run-to-run — one CI run reported `list_length_hint_validate guard_failures
-# 828 -> 4923` and `exception_args_virtual 401 -> 1002` with identical digits
-# on ubuntu-24.04, macos-latest and windows-latest. That measurement is what
-# retired the +25% band `guard_failures` used to carry for cross-runner drift
-# that had never been measured.
+# The exact comparison is affordable, but not because the compile decision is
+# free of per-run inputs — it is not. `JitCounter` does index the loop half by
+# a hash rather than an address, but the guard half is built from one:
+# `current_object_addr_as_int(self) * 777767777 + intval * 1442968193`
+# (compile.py:780-781, ported at pyjitpl.rs:10841-10845). Upstream spells it
+# the same way, so this is orthodoxy rather than drift, and it is not what
+# moved these numbers.
+#
+# What moved them is that `guard_failures` is not a compile decision at all.
+# Each counter is a plain increment at the event (`record_guard_failure_event`,
+# pyjitpl.rs), so the total is the runtime taken-count of every guard site —
+# the same run reports `mc_diag mc_entered` with the identical value, because
+# the counter is the metainterp-entry count. An already-compiled guard running
+# once more moves it while `loops_compiled` and `bridges_compiled` stay put,
+# which is exactly the shape every disagreement took. The GC schedule was
+# reaching it through the back-edge safepoint poll; both halves of that
+# schedule are pinned above, and with them pinned the numbers agree across
+# hosts and across tree vintages — `recursive_call_frame_relocation` reads 636
+# and `closure_per_call` 414 on macOS and on Linux alike, where unpinned the
+# same nursery gave 638 on one and 637 on the other.
+#
+# Measured across runners as well as run-to-run — one CI run reported
+# `list_length_hint_validate guard_failures 828 -> 4923` and
+# `exception_args_virtual 401 -> 1002` with identical digits on ubuntu-24.04,
+# macos-latest and windows-latest. That measurement is what retired the +25%
+# band `guard_failures` used to carry for cross-runner drift that had never
+# been measured.
 #
 # `internal_compile_panics` counts an internal compile bug falling back to the
 # interpreter, so 0 is its only healthy value. `loops_aborted` is not absolute:
