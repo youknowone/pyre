@@ -9537,6 +9537,54 @@ mod tests {
     }
 
     #[test]
+    fn rtyper_synthesised_list_struct_resolves_its_field_descrs() {
+        // The rtyper synthesises `GcStruct("list", ("length", Signed),
+        // ("items", Ptr(GcArray(ITEM))))` (`translator/rtyper/rlist.rs:1112`).
+        // `lib.rs` registers the {length, items} shape into `struct_fields`
+        // before `set_struct_fields`; mirror that injection here.  The
+        // heuristic accumulation over two word-sized fields must land
+        // length@0, items@8, struct size 16.
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "list".to_string(),
+            vec![
+                ("length".to_string(), "i64".to_string()),
+                ("items".to_string(), "&[i64]".to_string()),
+            ],
+        );
+        cc.set_struct_fields(registry);
+
+        let length = cc
+            .fielddescrof(0, "list", None, "length")
+            .expect("list.length descr resolves");
+        assert_eq!(
+            length
+                .as_field_descr()
+                .expect("length is a field descr")
+                .offset(),
+            0,
+            "length is the first field",
+        );
+        let items = cc
+            .fielddescrof(1, "list", None, "items")
+            .expect("list.items descr resolves");
+        assert_eq!(
+            items
+                .as_field_descr()
+                .expect("items is a field descr")
+                .offset(),
+            8,
+            "items follows the 8-byte length word",
+        );
+        assert_eq!(
+            compute_struct_size(&cc, "list"),
+            16,
+            "two word-sized fields → 16-byte struct",
+        );
+    }
+
+    #[test]
     fn raw_pointer_field_is_not_flattened_as_a_known_pointee_struct() {
         use majit_ir::descr::ArrayFlag;
         use majit_ir::value::Type;

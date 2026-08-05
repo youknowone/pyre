@@ -812,7 +812,7 @@ fn analyze_pipeline_from_module_paths(
     // `scripts/extract-llbc.py`), located via `PYRE_MIR_FRONTEND_LLBC`
     // or workspace auto-discovery.
     mark_phase!("known_statics + struct_field_attrs populated");
-    let program = build_semantic_program_via_active_frontend(
+    let mut program = build_semantic_program_via_active_frontend(
         module_paths,
         static_addrs,
         explicit_llbc_paths,
@@ -874,6 +874,32 @@ fn analyze_pipeline_from_module_paths(
             program.exact_layouts.len(),
         )
     });
+    // The rtyper synthesises a resizable-list `GcStruct("list", ("length",
+    // Signed), ("items", Ptr(GcArray(ITEM))), hints={'list': True})`
+    // (`translator/rtyper/rlist.rs:1112-1124`).  Because it is synthesised by
+    // the rtyper — not a Rust source type Charon extracts — it never appears
+    // in `program.struct_fields`, so `fielddescrof`/`compute_struct_size`
+    // return None/0 for owner "list" and any `new(descr)` keyed on it would
+    // trip the `bh_size_spec_from_callcontrol().unwrap_or_else(panic!)` in
+    // `codewriter/assembler.rs:1595`.  Register the {length, items} shape here,
+    // before both the `set_struct_fields` snapshot (:1076 below) and the
+    // `struct_layouts` loop (:1140 below), so both see it.  Offsets accumulate
+    // by field order via `get_type_flag`: `i64`→(Signed,8) and a leading-`&`
+    // spelling→(Pointer,Ref,8), giving length@0, items@8, struct size 16 — the
+    // natural word-sized GcStruct layout the backend's `build_ll_newlist`
+    // malloc uses (length-first, items-second, both word-sized;
+    // `rlist.rs:3444-3479`).  `.entry().or_insert_with` leaves a real "list"
+    // entry untouched if one ever exists.
+    program
+        .struct_fields
+        .fields
+        .entry("list".to_string())
+        .or_insert_with(|| {
+            vec![
+                ("length".to_string(), "i64".to_string()),
+                ("items".to_string(), "&[i64]".to_string()),
+            ]
+        });
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     // `(trait_leaf, trait_qualified, method_name, owner, return_type,
