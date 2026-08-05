@@ -4076,6 +4076,34 @@ impl<'a> Transformer<'a> {
                     }],
                 )
             }
+            // `do_fixed_newlist_clear` (jtransform.py:1858-1863):
+            //   v_length = self._get_initial_newlist_length(op, args)
+            //   return SpaceOperation('new_array_clear', [v_length, arraydescr],
+            //                         op.result)
+            // `_ll_alloc_and_clear` (rlist.py:522-528, `@jit.oopspec(
+            // "newlist_clear(count)")`) reaches here through
+            // `_handle_list_call`; the `count` arg is the initial length.
+            // `_get_initial_newlist_length` (jtransform.py:1835-1842):
+            // `args[0]` when present, else the constant 0 — pyre carries the
+            // materialised `count` Variable, so a `newlist_clear(count)`
+            // callsite always supplies `args[0]`.  The cleared list holds GC
+            // pointers, so the arraydescr's item type is `Ref` — the exact
+            // shape that makes `do_fixed_newlist` select `new_array_clear`
+            // over `new_array` (jtransform.py:1851-1855).
+            "newlist_clear" => {
+                let length = args.first()?.clone();
+                (
+                    "newlist_clear → new_array_clear(count, arraydescr)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::NewArrayClear {
+                            length,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                        },
+                    }],
+                )
+            }
             "list.obj_setitem" => {
                 let l = args.first()?.clone();
                 let index = args.get(1)?.clone();
@@ -5847,6 +5875,15 @@ fn remap_op(
         },
         OpKind::NewList { args } => OpKind::NewList {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
+        },
+        OpKind::NewArrayClear {
+            length,
+            item_ty,
+            array_type_id,
+        } => OpKind::NewArrayClear {
+            length: remap_value(length, aliases),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
         },
         OpKind::GetSlice { args } => OpKind::GetSlice {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
@@ -10752,6 +10789,108 @@ mod tests {
             other => panic!("expected FieldRead, got {other:?}"),
         }
         assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// `newlist_clear(count)` (`_ll_alloc_and_clear`, rlist.py:522-528)
+    /// lowers to a single `new_array_clear(count, arraydescr)`
+    /// (`do_fixed_newlist_clear`, jtransform.py:1858-1863). The `count`
+    /// operand is the initial length; the cleared items array holds GC
+    /// pointers, so the emitted `item_ty` is `Ref`.
+    #[test]
+    fn handle_list_call_newlist_clear_lowers_to_new_array_clear() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_clear");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "newlist_clear",
+                &op,
+                &[count.clone()],
+                &mut graph,
+                "newlist_clear",
+            )
+            .expect("newlist_clear must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(length, &count);
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(array_type_id, &None);
+            }
+            other => panic!("expected NewArrayClear, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// End-to-end rendezvous: a minted throwaway helper graph is given the
+    /// `newlist_clear(count)` oopspec via [`CallControl::mark_oopspec`]
+    /// (the same field [`CallControl::get_oopspec`] reads at
+    /// `handle_builtin_call`), so a call to it classifies `Builtin` and
+    /// dispatches through `_handle_list_call` to `new_array_clear`.  This
+    /// locks the T2↔T3 contract: `mark_oopspec(path, "newlist_clear(count)")`
+    /// is exactly what T3 must attach to the minted `_ll_alloc_and_clear`
+    /// graph for it to lower instead of residualizing.
+    #[test]
+    fn marked_newlist_clear_oopspec_dispatches_call_to_new_array_clear() {
+        let path = crate::parse::CallPath::from_segments(["_ll_alloc_and_clear"]);
+        let target = CallTarget::function_path(["_ll_alloc_and_clear"]);
+
+        let mut cc = crate::call::CallControl::new();
+        // The spec STRING form the codewriter reader parses: bare name
+        // before `(`, so the dispatch keys on `newlist_clear`.
+        cc.mark_oopspec(path, "newlist_clear(count)".to_string());
+
+        let mut graph = FunctionGraph::new("caller");
+        let count = graph.alloc_value_var();
+        let result = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&count, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+        let startblock = graph.startblock;
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target,
+                args: vec![count.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(result.clone());
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let new_array_clear = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::NewArrayClear { length, .. } => Some(length.clone()),
+                _ => None,
+            })
+            .expect("marked newlist_clear must lower to new_array_clear");
+        assert_eq!(new_array_clear, count);
     }
 
     /// `list.int_getitem(l, i)` lowers to `getfield_gc_r(l,

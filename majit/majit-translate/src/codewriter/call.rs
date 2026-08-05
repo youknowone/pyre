@@ -7565,9 +7565,13 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // ── Known non-raising ops (canraise = ()) ─────────────────
         // RPython LL: getfield_gc, setfield_gc → cannot raise
         OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => RaiseClass::No,
-        // `malloc` can only raise MemoryError; with `ignore_memoryerror`
-        // it is treated as non-raising (canraise = (MemoryError,)).
-        OpKind::New { .. } | OpKind::NewWithVtable { .. } => RaiseClass::MemoryErrorOnly,
+        // `malloc` / `malloc_varsize` can only raise MemoryError; with
+        // `ignore_memoryerror` it is treated as non-raising
+        // (canraise = (MemoryError,)).  `new_array_clear` is the cleared
+        // varsize allocation, same class.
+        OpKind::New { .. } | OpKind::NewWithVtable { .. } | OpKind::NewArrayClear { .. } => {
+            RaiseClass::MemoryErrorOnly
+        }
         // RPython LL: getarrayitem_gc, setarrayitem_gc, arraylen_gc → cannot raise
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } | OpKind::ArrayLen { .. } => {
             RaiseClass::No

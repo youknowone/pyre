@@ -2639,6 +2639,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::JitMergePoint { .. } => "JitMergePoint",
         OpKind::LoopHeader { .. } => "LoopHeader",
         OpKind::Abort { .. } => "Abort",
+        OpKind::NewArrayClear { .. } => "NewArrayClear",
         // Catch-all for variants pyre may add without bumping this
         // table — surfaces as `<unknown>` in the fail-loud message
         // rather than a misleading variant tag.  The catch-all message
@@ -2677,6 +2678,9 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
         OpKind::Live => "Live (jtransform.py:469,481,533)",
         OpKind::JitMergePoint { .. } => "JitMergePoint (jtransform.py:1690-1718)",
         OpKind::LoopHeader { .. } => "LoopHeader (jtransform.py:1690-1718)",
+        OpKind::NewArrayClear { .. } => {
+            "NewArrayClear (jtransform.py:1858-1863 do_fixed_newlist_clear)"
+        }
         // `OpKind::Abort` is pyre-only — RPython raises `FlowingError`
         // (`flowspace/flowcontext.py:258,417`) and drops the function
         // before reaching the rtyper.  Now handled by an explicit

@@ -1613,6 +1613,51 @@ impl Assembler {
                 let key = format!("new/{argcodes}");
                 state.code[startposition] = self.get_opnum(&key);
             }
+            // RPython `new_array_clear(v_length, arraydescr)` — the cleared
+            // fixed-size array allocation `do_fixed_newlist_clear` emits
+            // (`jtransform.py:1858-1863`).  `bhimpl_new_array_clear`
+            // (`blackhole.py:1311-1313`, `@arguments("cpu", "i", "d",
+            // returns="r")`) gives the canonical key `new_array_clear/id>r`:
+            // length (Int) + arraydescr + ref result.  The arraydescr is the
+            // same `arraydescrof(item_ty, array_type_id, len_offset=Some(0))`
+            // shape `ArrayRead`/`ArrayWrite` mint for the length-prefixed
+            // items block.
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(length, regallocs);
+                assert_eq!(
+                    kc, 'i',
+                    "new_array_clear length must be int-kind, got {kc:?}",
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.emit_ready_descr(arraydescrof(
+                    item_ty,
+                    array_type_id,
+                    Some(0),
+                    callcontrol,
+                ));
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let result = op
+                    .result
+                    .as_ref()
+                    .expect("new_array_clear must produce a result");
+                let (reg, kind) = self.lookup_reg_with_kind_var(result, regallocs);
+                assert_eq!(
+                    kind, 'r',
+                    "new_array_clear result must use the ref register bank"
+                );
+                state.code.push(reg);
+                argcodes.push('>');
+                argcodes.push('r');
+                let key = format!("new_array_clear/{argcodes}");
+                state.code[startposition] = self.get_opnum(&key);
+            }
             // Boxing GC allocation (`fuse_boxing_alloc`).  Mirrors the runtime
             // tracer oracle (`box_trace.rs trace_box_float`): a `new_with_vtable`
             // carrying ONLY a size descriptor and a fresh ref-kind result, no
@@ -2640,6 +2685,7 @@ impl Assembler {
                 OpKind::GetSlice { .. } => "GetSlice",
                 OpKind::New { .. } => "New",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
+                OpKind::NewArrayClear { .. } => "NewArrayClear",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
                 OpKind::LoadStatic { .. } => "LoadStatic",
             }
@@ -4171,6 +4217,11 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
         OpKind::New { .. } => "new".into(),
         OpKind::NewWithVtable { .. } => "new_with_vtable".into(),
+        // `NewArrayClear` carries a descriptor operand (`new_array_clear/id>r`)
+        // so it is encoded by its dedicated `encode_op` arm, never the
+        // descriptor-less default path that calls this helper — the arm exists
+        // only to keep the opname map exhaustive.
+        OpKind::NewArrayClear { .. } => "new_array_clear".into(),
         // RPython: getarrayitem_gc_i etc.
         OpKind::ArrayRead { item_ty, .. } => {
             format!("getarrayitem_gc_{}", value_type_to_kind(item_ty))

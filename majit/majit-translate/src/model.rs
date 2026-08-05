@@ -666,6 +666,29 @@ pub enum OpKind {
         owner: String,
         vtable: i64,
     },
+    /// RPython `new_array_clear(v_length, arraydescr)` — the cleared
+    /// fixed-size array allocation `do_fixed_newlist_clear` emits
+    /// (`jtransform.py:1858-1863`, `corresponds to rtyper.rlist.
+    /// ll_alloc_and_clear: needs to clear the items`).  Also the
+    /// allocation half `do_fixed_newlist` picks (`jtransform.py:1851-1855`)
+    /// when `ARRAY.OF` is a GC `Ptr` or `Struct` — the exact case that
+    /// distinguishes `new_array_clear` from the uninitialised `new_array`.
+    ///
+    /// `length` is the item count (`_get_initial_newlist_length`,
+    /// `jtransform.py:1835-1842`).  `item_ty` / `array_type_id` resolve the
+    /// `arraydescr` at assembly exactly like `ArrayRead`/`ArrayWrite`; a
+    /// cleared list holds GC pointers (`Ptr(GcArray(OBJECTPTR))`), so
+    /// `item_ty` is `Ref`.  The allocator zero-fills every slot
+    /// (`bhimpl_new_array_clear`, `blackhole.py:1311-1313`), so the result
+    /// register is always a fresh `Ref` ('r') and the emitted key is
+    /// `new_array_clear/id>r`.
+    NewArrayClear {
+        length: crate::flowspace::model::Variable,
+        item_ty: ValueType,
+        /// ARRAY identity for `cpu.arraydescrof(ARRAY)`, same role as
+        /// `ArrayRead::array_type_id`.
+        array_type_id: Option<String>,
+    },
     ArrayRead {
         base: crate::flowspace::model::Variable,
         index: crate::flowspace::model::Variable,

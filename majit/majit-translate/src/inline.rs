@@ -438,6 +438,15 @@ pub(crate) fn remap_op_kind(
             owner: owner.clone(),
             vtable: *vtable,
         },
+        OpKind::NewArrayClear {
+            length,
+            item_ty,
+            array_type_id,
+        } => OpKind::NewArrayClear {
+            length: remap_var(length),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::FieldRead {
             base,
             field,
@@ -890,6 +899,9 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         }
         OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
         OpKind::NewList { args } => args.iter().map(clone_var).collect(),
+        // `new_array_clear(v_length, arraydescr)` — only the length Variable
+        // is an SSA operand; the arraydescr is a descriptor, not a value.
+        OpKind::NewArrayClear { length, .. } => vec![clone_var(length)],
         OpKind::GetSlice { args } => args.iter().map(clone_var).collect(),
         OpKind::LoweredBlackholeOp { args, .. } => args.iter().map(clone_var).collect(),
         OpKind::VableForce { base } => vec![clone_var(base)],
@@ -1119,10 +1131,10 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
 /// pure op's args even though both should die together.
 pub fn is_pure_op(kind: &OpKind) -> bool {
     match kind {
-        // `new` / `new_with_vtable` heap-allocate fresh objects: NOT pure.
-        // CSE must never coalesce two allocations, or Python `is` object
-        // identity would break.
-        OpKind::New { .. } | OpKind::NewWithVtable { .. } => false,
+        // `new` / `new_with_vtable` / `new_array_clear` heap-allocate fresh
+        // objects: NOT pure.  CSE must never coalesce two allocations, or
+        // Python `is` object identity would break.
+        OpKind::New { .. } | OpKind::NewWithVtable { .. } | OpKind::NewArrayClear { .. } => false,
         // `OpKind::ConstInt` / `OpKind::ConstFloat` materialize a
         // `Variable` for a literal in pyre's IR.  There
         // is NO upstream `int_constant` op — RPython's `Constant` is
