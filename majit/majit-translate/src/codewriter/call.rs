@@ -7569,9 +7569,10 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // `ignore_memoryerror` it is treated as non-raising
         // (canraise = (MemoryError,)).  `new_array_clear` is the cleared
         // varsize allocation, same class.
-        OpKind::New { .. } | OpKind::NewWithVtable { .. } | OpKind::NewArrayClear { .. } => {
-            RaiseClass::MemoryErrorOnly
-        }
+        OpKind::New { .. }
+        | OpKind::NewWithVtable { .. }
+        | OpKind::NewArrayClear { .. }
+        | OpKind::NewListClear { .. } => RaiseClass::MemoryErrorOnly,
         // RPython LL: getarrayitem_gc, setarrayitem_gc, arraylen_gc → cannot raise
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } | OpKind::ArrayLen { .. } => {
             RaiseClass::No

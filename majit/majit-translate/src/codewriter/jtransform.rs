@@ -5885,6 +5885,15 @@ fn remap_op(
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
         },
+        OpKind::NewListClear {
+            length,
+            item_ty,
+            array_type_id,
+        } => OpKind::NewListClear {
+            length: remap_value(length, aliases),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::GetSlice { args } => OpKind::GetSlice {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },
@@ -10887,6 +10896,7 @@ mod tests {
             .iter()
             .find_map(|op| match &op.kind {
                 OpKind::NewArrayClear { length, .. } => Some(length.clone()),
+                OpKind::NewListClear { length, .. } => Some(length.clone()),
                 _ => None,
             })
             .expect("marked newlist_clear must lower to new_array_clear");
@@ -10943,6 +10953,7 @@ mod tests {
             .iter()
             .find_map(|op| match &op.kind {
                 OpKind::NewArrayClear { length, .. } => Some(length.clone()),
+                OpKind::NewListClear { length, .. } => Some(length.clone()),
                 _ => None,
             })
             .expect("minted _ll_alloc_and_clear must lower to new_array_clear");

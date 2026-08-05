@@ -447,6 +447,15 @@ pub(crate) fn remap_op_kind(
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
         },
+        OpKind::NewListClear {
+            length,
+            item_ty,
+            array_type_id,
+        } => OpKind::NewListClear {
+            length: remap_var(length),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::FieldRead {
             base,
             field,
@@ -902,6 +911,10 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         // `new_array_clear(v_length, arraydescr)` — only the length Variable
         // is an SSA operand; the arraydescr is a descriptor, not a value.
         OpKind::NewArrayClear { length, .. } => vec![clone_var(length)],
+        // `newlist_clear(v_length, ...)` — same operand shape: only the
+        // length Variable is an SSA operand; the struct/array descrs are
+        // descriptors, not values.
+        OpKind::NewListClear { length, .. } => vec![clone_var(length)],
         OpKind::GetSlice { args } => args.iter().map(clone_var).collect(),
         OpKind::LoweredBlackholeOp { args, .. } => args.iter().map(clone_var).collect(),
         OpKind::VableForce { base } => vec![clone_var(base)],
@@ -1134,7 +1147,10 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // `new` / `new_with_vtable` / `new_array_clear` heap-allocate fresh
         // objects: NOT pure.  CSE must never coalesce two allocations, or
         // Python `is` object identity would break.
-        OpKind::New { .. } | OpKind::NewWithVtable { .. } | OpKind::NewArrayClear { .. } => false,
+        OpKind::New { .. }
+        | OpKind::NewWithVtable { .. }
+        | OpKind::NewArrayClear { .. }
+        | OpKind::NewListClear { .. } => false,
         // `OpKind::ConstInt` / `OpKind::ConstFloat` materialize a
         // `Variable` for a literal in pyre's IR.  There
         // is NO upstream `int_constant` op — RPython's `Constant` is

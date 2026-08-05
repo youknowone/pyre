@@ -729,6 +729,9 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         // `new_array_clear(v_length, arraydescr)` — only the length is an
         // SSA operand; the arraydescr is a descriptor, not a value.
         OpKind::NewArrayClear { length, .. } => vec![length.clone()],
+        // `newlist_clear(v_length, ...)` — same operand shape: only the
+        // length is an SSA operand; the struct/array descrs are not values.
+        OpKind::NewListClear { length, .. } => vec![length.clone()],
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![cond.clone()],
         OpKind::GuardValue { value, .. }
         | OpKind::AssertGreen { value, .. }

@@ -689,6 +689,32 @@ pub enum OpKind {
         /// `ArrayRead::array_type_id`.
         array_type_id: Option<String>,
     },
+    /// The compound resizable-list allocation `opimpl_newlist_clear`
+    /// records (`pyjitpl.py:792-798`) — the resized-layout counterpart to
+    /// `do_resizable_newlist_clear` (`jtransform.py:1938-1943`).  Allocates
+    /// the resizable-list `GcStruct` header (the struct named `"list"`),
+    /// zero-clears a fresh items array of `length` slots, and wires the two
+    /// header fields `length`/`items` so the result is a fully-formed empty
+    /// resizable list.  `bhimpl_newlist_clear` (`blackhole.py:1174-1181`,
+    /// `@arguments("cpu", "i", "d", "d", returns="r")`) runs the same four
+    /// steps at the blackhole boundary: `new(structdescr)` +
+    /// `setfield(length)` + `new_array_clear(items_arraydescr)` +
+    /// `setfield(items)`.
+    ///
+    /// The owner struct is always `"list"` and its fields are always
+    /// `length`/`items`, so neither is carried on the variant — only the
+    /// `new_array_clear` sub-operation's operands survive: `length` (item
+    /// count), `item_ty` (the items array element type, `Ref` for a cleared
+    /// list of GC pointers), and `array_type_id` (the items ARRAY identity
+    /// for `cpu.arraydescrof(ARRAY)`).  Field shape is identical to
+    /// `NewArrayClear` above.
+    NewListClear {
+        length: crate::flowspace::model::Variable,
+        item_ty: ValueType,
+        /// ARRAY identity for `cpu.arraydescrof(ARRAY)`, same role as
+        /// `NewArrayClear::array_type_id`.
+        array_type_id: Option<String>,
+    },
     ArrayRead {
         base: crate::flowspace::model::Variable,
         index: crate::flowspace::model::Variable,

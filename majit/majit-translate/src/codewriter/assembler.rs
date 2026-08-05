@@ -2686,6 +2686,7 @@ impl Assembler {
                 OpKind::New { .. } => "New",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
                 OpKind::NewArrayClear { .. } => "NewArrayClear",
+                OpKind::NewListClear { .. } => "NewListClear",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
                 OpKind::LoadStatic { .. } => "LoadStatic",
             }
@@ -4222,6 +4223,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // descriptor-less default path that calls this helper — the arm exists
         // only to keep the opname map exhaustive.
         OpKind::NewArrayClear { .. } => "new_array_clear".into(),
+        OpKind::NewListClear { .. } => "newlist_clear".into(),
         // RPython: getarrayitem_gc_i etc.
         OpKind::ArrayRead { item_ty, .. } => {
             format!("getarrayitem_gc_{}", value_type_to_kind(item_ty))
@@ -5313,6 +5315,64 @@ mod tests {
         // jtransform.py:1718 `SpaceOperation('loop_header', [c_index], None)`
         let header = crate::model::OpKind::LoopHeader { jitdriver_index: 0 };
         assert_eq!(op_kind_to_opname(&header), "loop_header");
+    }
+
+    /// `OpKind::NewListClear` (`opimpl_newlist_clear`, pyjitpl.py:792-798)
+    /// carries the same `{length, item_ty, array_type_id}` shape as
+    /// `NewArrayClear`.  Its length operand must survive the inline var
+    /// remap while the descriptor fields (`item_ty`/`array_type_id`) copy
+    /// through unchanged, and it must map to the opname `newlist_clear`.
+    #[test]
+    fn newlist_clear_survives_remap_and_names() {
+        use crate::flowspace::model::Variable;
+        use crate::model::{OpKind, ValueType};
+
+        let length = Variable::new();
+        let remapped_length = Variable::new();
+        // The remapped length must be a *distinct* SSA var so the assert
+        // proves the length field was rewritten, not merely preserved.
+        assert_ne!(length, remapped_length);
+
+        let kind = OpKind::NewListClear {
+            length: length.clone(),
+            item_ty: ValueType::Ref(None),
+            array_type_id: Some("list".to_string()),
+        };
+
+        // Run it through the inline var remap: length is rewritten via the
+        // closure, the descriptor fields clone through unchanged.
+        let remapped_length_c = remapped_length.clone();
+        let length_c = length.clone();
+        let remap = move |v: &Variable| {
+            if *v == length_c {
+                remapped_length_c.clone()
+            } else {
+                v.clone()
+            }
+        };
+        let remapped = crate::inline::remap_op_kind(&kind, &remap);
+        match &remapped {
+            OpKind::NewListClear {
+                length: l,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(*l, remapped_length, "length must be rewritten by remap");
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(array_type_id.as_deref(), Some("list"));
+            }
+            other => panic!("expected NewListClear, got {other:?}"),
+        }
+
+        // Only the length is an SSA operand; the descrs are not values.
+        let refs = crate::inline::op_variable_refs(&kind);
+        assert_eq!(refs, vec![length.clone()]);
+
+        // Allocation is never pure — CSE must not coalesce two of them.
+        assert!(!crate::inline::is_pure_op(&kind));
+
+        // opname map: `newlist_clear`.
+        assert_eq!(op_kind_to_opname(&kind), "newlist_clear");
     }
 
     #[test]
