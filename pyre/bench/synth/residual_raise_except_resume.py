@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=10
+# pyre-check: max-pypy-ratio=7.5
+# pyre-check: min-pypy-ratio=0.58
 # A hot loop FOLLOWED by a try/except whose body raises through a
 # *may-force residual call* (`//`, subscript) rather than an explicit
 # `raise`.  The try/except is reached only after the loop's exit guard

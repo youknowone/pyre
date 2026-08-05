@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=25
+# pyre-check: min-pypy-ratio=2.28
 # An inlined closure keeps its freevar cells in MIFrame.registers_r across a
 # may-force call.  The `Fraction` arithmetic in `forward` is that may-force
 # call and invalidates heap-cache facts; the following LOAD_DEREF must recover

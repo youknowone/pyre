@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=95
+# pyre-check: max-pypy-ratio=34
+# pyre-check: min-pypy-ratio=1.6
 # reversed() treats `__reversed__ = None` as not reversible (even with a
 # sequence protocol) and propagates a raised __reversed__ instead of yielding a
 # corrupt null object. Output verified against CPython/PyPy.

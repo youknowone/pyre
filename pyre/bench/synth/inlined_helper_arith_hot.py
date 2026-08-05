@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=12
+# pyre-check: min-pypy-ratio=0.78
 # One-line arithmetic helpers called from a hot `for` loop body. The inline
 # lever gates a FOR_ITER-in-flight callee on `fbw_callee_body_replay_safety`:
 # a body whose only residual is a BINARY_OP the walker will specialize to a

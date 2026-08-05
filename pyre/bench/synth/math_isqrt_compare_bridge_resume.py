@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=35
+# pyre-check: max-pypy-ratio=19
+# pyre-check: min-pypy-ratio=1.72
 # A comparison helper (like test_math.testIsqrt's assertLessEqual/assertLess)
 # runs first on exact ints and then on bignums. The `<=`/`<` inside the helper
 # callee has CompareOp class/value guards that must attach a bridge at the

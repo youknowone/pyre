@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=14
+# pyre-check: min-pypy-ratio=1.42
 # A CALL_ASSEMBLER guard failure whose bridge resume spans two frames: the
 # walk runs the resumed region to the callee's return, executing the recursive
 # calls inside it concretely, and the walk's result completes the callee. If

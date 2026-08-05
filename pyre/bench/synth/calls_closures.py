@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=154
+# pyre-check: max-pypy-ratio=109
+# pyre-check: min-pypy-ratio=7.45
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept verbatim from its former standalone file with module-level names prefixed
 # by the source name. Bug-repro / resume / kept-stack tests are NOT merged (they
