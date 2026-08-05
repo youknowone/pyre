@@ -8071,6 +8071,43 @@ impl<M: Clone> MetaInterp<M> {
             );
             return false;
         };
+        // `compile.py:797-811 ResumeGuardDescr.compile_and_attach` installs a
+        // finished retrace under ONE identity: the source guard's own loop
+        // token (`metainterp.resumekey_original_loop_token`), which it uses for
+        // `new_loop.original_jitcell_token`, for `send_bridge_to_backend` and
+        // for `record_loop_or_bridge` alike. This function binds the artifact
+        // to `source_jct` the same way (`set_original_jitcell_token_number`,
+        // `record_loop_or_bridge`) but files everything else under the
+        // caller-supplied `green_key`: `set_next_header_pc`, the
+        // `previous_tokens` read, `caller_recovery_layout`,
+        // `build_guard_metadata`'s key, and the `compiled.traces` insert. Those
+        // five only name the right loop while the two identities agree.
+        //
+        // They do agree by construction — the bridge entry derives its key from
+        // this very token (`descr_owning_jct(descr)?.green_key()`) before the
+        // trace context exists, and seeds both `TraceCtx::green_key` and
+        // `BridgeTraceInfo::green_key` from it — but nothing in this function
+        // said so. State it, exactly as `compile_bridge` already does for its
+        // own origin key.
+        //
+        // The retrace-budget half is deliberately NOT covered here: the
+        // `loop_jitcell_token` charges (`record_target_token`,
+        // `set_retraced_count`) follow the loop being ENTERED
+        // (`unroll.py:213-215`, `unroll.py:290-297`), which is a different
+        // question from which loop the artifact hangs off.
+        debug_assert_eq!(
+            green_key,
+            source_jct.green_key(),
+            "compile.py:801 — the retrace artifact is bound to source_jct, so \
+             the key its resume/exit layouts are filed under must name the same \
+             loop"
+        );
+        debug_assert_eq!(
+            bridge.green_key, green_key,
+            "pyjitpl.py:2890 — BridgeTraceInfo.green_key (the origin key stashed \
+             at start_retrace_from_guard) must match the trace-context key \
+             compile_retrace passes down"
+        );
         let fail_index = fail_descr.fail_index_per_trace();
         let source_trace_id = fail_descr.trace_id();
         let bridge_trace_id = self.alloc_trace_id();
