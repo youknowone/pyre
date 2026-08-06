@@ -446,9 +446,12 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // instead of running unprotected.
     if ctx.vstack_reorder_ceiling != u32::MAX && new_pypc > ctx.vstack_reorder_ceiling {
         ctx.vstack_reorder_ceiling = u32::MAX;
+        ctx.vstack_reorder_saved = None;
     }
     if !cfg_successor && ctx.vstack_reorder_ceiling == u32::MAX {
         ctx.vstack_reorder_ceiling = (new_pypc as usize).max(prev_pypc) as u32;
+        ctx.vstack_reorder_saved =
+            Some((prev_pypc as u32, ctx.vstack_depth, ctx.vstack_boxes.clone()));
     }
     let in_reorder_region = ctx.vstack_reorder_ceiling != u32::MAX;
     let (fallthrough_depth, branch_depth) =
@@ -484,6 +487,33 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // matches; holes remain conservative and are handled by the shadow fill
     // below.
     let layout_only_boundary = new_depth != fallthrough_depth && new_depth != branch_depth;
+
+    // The excursion came back to the coordinate it left.  A `LOAD_ATTR` +
+    // `CALL` pair puts the walk here: the CALL's lowering re-enters the
+    // LOAD_ATTR source segment, so the floor lookup reports the earlier py_pc,
+    // and the return boundary reports the CALL's again at the same depth.  No
+    // Python opcode retired in between — the stack the walk left is the stack
+    // it resumes with — so replay the saved boxes rather than reseeding.  The
+    // reseed cannot serve this shape: the operands the in-flight opcode
+    // already popped read NULL in the virtualizable shadow, so
+    // `reseed_vstack_from_shadow` rejects them and the callable slides down
+    // into the `self_or_null` slot with the TOS left a hole.
+    let returned_to_arm_point = matches!(
+        &ctx.vstack_reorder_saved,
+        Some((pc, depth, _)) if *pc == new_pypc && *depth == new_depth
+    );
+    if in_reorder_region && returned_to_arm_point {
+        let (_, _, boxes) = ctx
+            .vstack_reorder_saved
+            .take()
+            .expect("checked by returned_to_arm_point");
+        ctx.vstack_boxes = boxes;
+        ctx.vstack_reorder_ceiling = u32::MAX;
+        ctx.vstack_cur_pypc = new_pypc;
+        ctx.vstack_depth = new_depth;
+        ctx.vstack_last_ref = OpRef::NONE;
+        return;
+    }
 
     // PER-OP RECONCILE.  In the SEQUENTIAL case the previous opcode's stack
     // effect explains the depth change: a producer (`ResultToTos`) lands its

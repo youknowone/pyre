@@ -1656,6 +1656,14 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// the virtualizable shadow instead of replaying stack effects.  Cleared once
     /// the walk advances past this ceiling (py-pc order is monotonic again).
     pub vstack_reorder_ceiling: u32,
+    /// The `(py_pc, depth, boxes)` the mirror held when `vstack_reorder_ceiling`
+    /// was armed.  A layout excursion that returns to that exact coordinate has
+    /// retired no Python opcode, so the operand stack it left is still the
+    /// operand stack it comes back to and the saved boxes are restored verbatim
+    /// — the shadow reseed cannot reconstruct them, because mid-expression the
+    /// virtualizable's stack region holds the NULLs the in-flight opcode's
+    /// `popvalue_maybe_none` wrote.  `None` outside a region.
+    pub vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>)>,
     /// The py_pc the walk's floor lookup reports while it is inside an
     /// out-of-line exception LANDING block — the unwind bookkeeping the
     /// codewriter emits per catch site, after the whole body, which then jumps
