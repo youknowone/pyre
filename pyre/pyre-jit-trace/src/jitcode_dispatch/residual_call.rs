@@ -6389,17 +6389,17 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     } else {
                         // int specialization first; float (incl. mixed int/float)
                         // as a fallback so two-int operands keep int arithmetic.
-                        let mut specialized = try_walker_specialize_binary_op_int(
+                        if let Some(outcome) = try_walker_specialize_binary_op_int(
+                            ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                        )? {
+                            return Ok((outcome, op.next_pc));
+                        }
+                        // longobject.py `_make_generic_descr_binop` and
+                        // `descr_sub` use the rbigint.int_* family for
+                        // mixed Long/Int operands.
+                        let mut specialized = try_walker_specialize_binary_op_long_int(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                         )?;
-                        if specialized.is_none() {
-                            // longobject.py `_make_generic_descr_binop` and
-                            // `descr_sub` use the rbigint.int_* family for
-                            // mixed Long/Int operands.
-                            specialized = try_walker_specialize_binary_op_long_int(
-                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?;
-                        }
                         if specialized.is_none() {
                             // `_make_descr_binop` gives shifts with an Int
                             // count their own `_int_lshift` / `_int_rshift`

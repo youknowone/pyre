@@ -664,10 +664,11 @@ pub(crate) fn try_walker_specialize_unary_invert_int<Sym: WalkSym>(
 /// `execute_residual_call` path the generic leg uses, so
 /// `concrete_registers_r[dst]` holds the authentic runtime `W_IntObject`.
 ///
-/// Returns `Ok(Some(()))` when the specialization was emitted (caller
-/// returns `Continue`); `Ok(None)` when the operator is deferred
+/// Returns `Ok(Some(outcome))` when the specialization was emitted; the
+/// outcome is `Continue` for a value arm or `SubRaise` for a zero divisor.
+/// `Ok(None)` means the operator is deferred
 /// (FloorDiv / Mod / Shift / TrueDiv / Power / Subscr), the operands are
-/// not both concrete `W_IntObject`, or the helper raises — the caller
+/// not both concrete `W_IntObject`, or an unsupported helper arm is reached — the caller
 /// then falls through to the generic `CallMayForce` record so the
 /// Python-level `__op__` semantics are preserved.
 pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
@@ -679,7 +680,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
@@ -726,10 +727,103 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
             _ => false,
         };
 
-    // Speculation gate + authentic boxed result (shared with COMPARE_OP).
-    let Some((lhs, rhs, lhs_obj, rhs_obj, la, rb, boxed_result_i64)) =
-        walker_int_specialization_operands(ctx, r_args, allboxes, call_descr)
+    // Inspect the operands before executing the authentic helper.  A raising
+    // zero-divisor arm needs the helper-produced exception as its concrete
+    // shadow, but records no helper call in the trace.
+    let Some((lhs, rhs, lhs_obj, rhs_obj, la, rb)) =
+        walker_int_specialization_input_operands(ctx, r_args)
     else {
+        return Ok(None);
+    };
+
+    if matches!(op_code, OpCode::IntFloorDiv | OpCode::IntMod) && rb == 0 {
+        let Some(Err(exc_i64)) = walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)
+        else {
+            return Ok(None);
+        };
+        // The helper publishes through both the blackhole cell (drained by
+        // `execute_residual_call`) and the backend exception cells.  The
+        // latter belong to compiled execution; drain the trace-time publish
+        // before the walk continues into the Python handler, exactly as the
+        // generic residual executor's Err arm does.
+        if let Some(cb) = crate::callbacks::try_get() {
+            (cb.drain_backend_jit_exc)();
+        }
+        let exc = exc_i64 as usize as pyre_object::PyObjectRef;
+        if exc.is_null()
+            || unsafe { !pyre_object::is_exception(exc) }
+            || unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) }
+                != pyre_object::interp_exceptions::ExcKind::ZeroDivisionError
+        {
+            return Ok(None);
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(exc);
+        let concrete_args =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(exc) };
+        let Some(concrete_message) = (unsafe { pyre_object::w_list_getitem(concrete_args, 0) })
+        else {
+            return Ok(None);
+        };
+
+        // Commit to the raising arm only after every decline.  Exact-class
+        // guards preserve builtin dispatch; GuardTrue(rhs == 0) is the branch
+        // guard a bridge can invert when the divisor changes mid-loop.
+        let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
+        let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
+        let _lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
+        let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
+        let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, 1);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[rhs_zero])?;
+
+        // The interpreter-produced object supplies the authoritative message
+        // and args for this recording iteration.  Reuse its message object as
+        // a rooted trace constant, then construct the exception and args list
+        // with ordinary allocation ops so escape analysis can virtualize both.
+        let message = ctx.trace_ctx.const_ref(concrete_message as i64);
+        let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &[message]);
+        let list_w_class = pyre_object::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+        let list_w_class = ctx.trace_ctx.const_ref(list_w_class as i64);
+        let list_w_class_descr = crate::descr::list_w_class_descr();
+        let list_w_class_index = list_w_class_descr.index();
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[args_list, list_w_class],
+            list_w_class_descr,
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(args_list, list_w_class_index, list_w_class);
+
+        let kind = pyre_object::interp_exceptions::ExcKind::ZeroDivisionError;
+        let class = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
+        let class = ctx.trace_ctx.const_ref(class as i64);
+        let raised =
+            crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class, args_list);
+        let exc_type = pyre_object::interp_exceptions::exc_kind_to_pytype(kind) as *const _ as i64;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(raised, exc_type);
+        ctx.trace_ctx
+            .set_opref_concrete(raised, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
+        fbw_built_exc_insert(raised);
+
+        // This replaces one concretely executed may-force residual.  Publish
+        // the same pending-exception state its executor arm would establish so
+        // current-frame and inlined-caller handlers take the normal SubRaise
+        // path, including traceback construction and bridge resume state.
+        fbw_count_executed_residual(false, true);
+        let exc_concrete = ConcreteValue::Ref(exc);
+        ctx.last_exc_value = Some(raised);
+        ctx.last_exc_value_concrete = exc_concrete;
+        ctx.fbw_mode.class_of_last_exc_is_const = true;
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_i64));
+        return Ok(Some(DispatchOutcome::SubRaise {
+            exc: raised,
+            exc_concrete,
+        }));
+    }
+
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
         return Ok(None);
     };
 
@@ -740,7 +834,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     if needs_check {
         match op_code {
             OpCode::IntFloorDiv | OpCode::IntMod => {
-                if rb == 0 || (la == i64::MIN && rb == -1) {
+                if la == i64::MIN && rb == -1 {
                     return Ok(None);
                 }
             }
@@ -831,7 +925,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
             boxed_result_i64,
         )?;
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-        return Ok(Some(()));
+        return Ok(Some(DispatchOutcome::Continue));
     }
     let (raw_result, concrete_value) = match op_code {
         OpCode::IntFloorDiv | OpCode::IntMod => {
@@ -900,7 +994,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         boxed
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(()))
+    Ok(Some(DispatchOutcome::Continue))
 }
 
 /// rint.py `_ovf_zer` guards for a machine-int division: `int_eq(rhs,0)` →

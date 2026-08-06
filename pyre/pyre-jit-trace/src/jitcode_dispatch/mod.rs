@@ -7105,6 +7105,23 @@ fn walker_execute_may_force_boxed<Sym: WalkSym>(
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
 ) -> Option<i64> {
+    match walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)? {
+        Ok(result) if result != 0 => Some(result),
+        _ => None,
+    }
+}
+
+/// Execute the authentic boxed helper at record time, retaining its raising
+/// result for specializations that trace through an exception arm.  The
+/// ordinary result-only gate above deliberately maps a raise back to `None`;
+/// this lower-level form lets a caller replace the opaque call with guarded
+/// allocation IR while keeping the interpreter-produced exception as its
+/// concrete shadow.
+fn walker_execute_may_force_boxed_outcome<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Option<Result<i64, i64>> {
     if allboxes.is_empty() || !allboxes[0].is_constant() {
         return None;
     }
@@ -7128,16 +7145,9 @@ fn walker_execute_may_force_boxed<Sym: WalkSym>(
         };
         args.push(v);
     }
-    // Execute the helper concretely for the authentic boxed result
-    // (small-int caching / identity).  A raised helper (`Err`) or a NULL
-    // result defers to the generic `CallMayForce` record so the
-    // Python-level `__op__` semantics are preserved.
-    let boxed_result_i64 =
-        match majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args) {
-            Ok(result) if result != 0 => result,
-            _ => return None,
-        };
-    Some(boxed_result_i64)
+    Some(majit_metainterp::executor::execute_residual_call(
+        call_descr, func_ptr, &args,
+    ))
 }
 
 /// Resolve the concrete `PyObjectRef` carried by a Ref-bank operand's
@@ -7237,6 +7247,35 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
     i64,
     i64,
 )> {
+    let (lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val) =
+        walker_int_specialization_input_operands(ctx, r_args)?;
+    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
+    Some((
+        lhs,
+        rhs,
+        lhs_obj,
+        rhs_obj,
+        lhs_val,
+        rhs_val,
+        boxed_result_i64,
+    ))
+}
+
+/// Operand-only half of [`walker_int_specialization_operands`].  Raising
+/// specializations must choose their guarded arm before executing the helper:
+/// the helper's exception is needed as a concrete shadow, but the helper call
+/// itself must not become the trace operation.
+fn walker_int_specialization_input_operands<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+) -> Option<(
+    OpRef,
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    i64,
+    i64,
+)> {
     if r_args.len() != 2 {
         return None;
     }
@@ -7266,16 +7305,7 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
             pyre_object::w_int_get_value(rhs_obj),
         )
     };
-    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
-    Some((
-        lhs,
-        rhs,
-        lhs_obj,
-        rhs_obj,
-        lhs_val,
-        rhs_val,
-        boxed_result_i64,
-    ))
+    Some((lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val))
 }
 
 /// Float counterpart of [`walker_int_specialization_operands`].  Each
