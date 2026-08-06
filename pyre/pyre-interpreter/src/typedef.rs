@@ -10721,16 +10721,12 @@ fn init_type_type(ns: PyObjectRef) {
         )
     };
 
-    // CPython 3.14 typeobject.c `type_members`, in declaration order.  The
-    // values live on each W_TypeObject just as CPython stores them on each
-    // PyTypeObject; flags and best-base retain PyPy's computed semantics.
+    // PyPy typeobject.py `W_TypeObject.typedef` exposes `__flags__` and
+    // `__base__`. Its object model has no C-struct layout members, so those
+    // members are deliberately absent.
     for (name, kind) in [
-        ("__basicsize__", pyre_object::MEMBER_TYPE_BASICSIZE),
-        ("__itemsize__", pyre_object::MEMBER_TYPE_ITEMSIZE),
         ("__flags__", pyre_object::MEMBER_TYPE_FLAGS),
-        ("__weakrefoffset__", pyre_object::MEMBER_TYPE_WEAKREFOFFSET),
         ("__base__", pyre_object::MEMBER_TYPE_BASE),
-        ("__dictoffset__", pyre_object::MEMBER_TYPE_DICTOFFSET),
     ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -12255,18 +12251,6 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             let value = unsafe { pyre_object::typeobject::w_type_get_best_base(obj) };
             Ok(if value.is_null() { w_none() } else { value })
         }
-        pyre_object::MEMBER_TYPE_BASICSIZE => Ok(w_int_new(unsafe {
-            pyre_object::w_type_get_abi_basicsize(obj)
-        })),
-        pyre_object::MEMBER_TYPE_ITEMSIZE => Ok(w_int_new(unsafe {
-            pyre_object::w_type_get_abi_itemsize(obj)
-        })),
-        pyre_object::MEMBER_TYPE_WEAKREFOFFSET => Ok(w_int_new(unsafe {
-            pyre_object::w_type_get_abi_weakrefoffset(obj)
-        })),
-        pyre_object::MEMBER_TYPE_DICTOFFSET => Ok(w_int_new(unsafe {
-            pyre_object::w_type_get_abi_dictoffset(obj)
-        })),
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {

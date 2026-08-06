@@ -368,14 +368,6 @@ pub const MEMBER_SUPER_SELF_CLASS: u32 = MEMBER_DIRECT_FLAG | 54;
 pub const MEMBER_TYPE_FLAGS: u32 = MEMBER_DIRECT_FLAG | 55;
 /// CPython 3.14 `type_members.__base__`, backed by PyPy's best-base lookup.
 pub const MEMBER_TYPE_BASE: u32 = MEMBER_DIRECT_FLAG | 56;
-/// CPython 3.14 `type_members.__basicsize__`.
-pub const MEMBER_TYPE_BASICSIZE: u32 = MEMBER_DIRECT_FLAG | 57;
-/// CPython 3.14 `type_members.__itemsize__`.
-pub const MEMBER_TYPE_ITEMSIZE: u32 = MEMBER_DIRECT_FLAG | 58;
-/// CPython 3.14 `type_members.__weakrefoffset__`.
-pub const MEMBER_TYPE_WEAKREFOFFSET: u32 = MEMBER_DIRECT_FLAG | 59;
-/// CPython 3.14 `type_members.__dictoffset__`.
-pub const MEMBER_TYPE_DICTOFFSET: u32 = MEMBER_DIRECT_FLAG | 60;
 /// CPython 3.14 `OSError_members.winerror`, backed by PyPy's `w_winerror`.
 /// Declared on every platform, registered on `OSError` only where the
 /// platform has Windows error codes (`interp_exceptions.py:723-728`).
