@@ -1,3 +1,6 @@
+# pyre-check: platforms=linux,darwin
+# The asserted spelling is the `posix` module's; on Windows `os` re-exports
+# these from `nt`, so every qualified name below differs in the reference too.
 """`os.DirEntry` / `posix.ScandirIterator` are produced only by `os.scandir`.
 
 `interp_scandir.py:468-487` gives `W_DirEntry.typedef` no `__new__` and sets

@@ -1348,11 +1348,18 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
             let w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
             if pyre_object::pyobject::is_exact_type(w_filename, &STR_TYPE) {
                 let fbuf = pyre_object::w_str_get_wtf8(w_filename).to_wtf8_buf();
-                let start = fbuf
+                // `os.path.basename` is the platform's: `ntpath` splits on
+                // `\` as well as `/` and drops the drive `splitdrive` peeled
+                // off first, `posixpath` splits on `/` alone.
+                let windows = cfg!(windows);
+                let mut start = fbuf
                     .as_bytes()
                     .iter()
-                    .rposition(|&b| b == b'/')
+                    .rposition(|&b| b == b'/' || (windows && b == b'\\'))
                     .map_or(0, |i| i + 1);
+                if windows && start == 0 && fbuf.as_bytes().get(1) == Some(&b':') {
+                    start = 2;
+                }
                 let mut inner = fbuf[start..].to_wtf8_buf();
                 if let Some(l) = lineno_str {
                     inner.push_str(", ");

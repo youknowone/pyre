@@ -1,3 +1,7 @@
+# pyre-check: platforms=linux,darwin
+# `os.fsencode` rejects a surrogate outside U+DC80..U+DCFF only under the
+# `surrogateescape` handler; Windows encodes with `surrogatepass` and accepts
+# it, so the reference never reaches the import at all.
 """A path entry the filesystem encoding cannot spell raises, it is not skipped.
 
 `os.fsencode` refuses a surrogate outside the escape range (U+DC80..U+DCFF), so

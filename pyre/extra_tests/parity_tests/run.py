@@ -14,6 +14,10 @@ Any divergence between CPython and a pyre backend is a parity
 regression: the runtime has drifted from CPython observable
 semantics.
 
+A script whose subject is platform-specific names the platforms it
+applies to in its header (`# pyre-check: platforms=linux,darwin`) and is
+skipped elsewhere.
+
 Usage:
     python3 pyre/extra_tests/parity_tests/run.py
         [--dynasm-only|--cranelift-only] [--gc-poison]
@@ -40,14 +44,42 @@ TARGET_RELEASE = ROOT / "target" / "release"
 
 EXE = ".exe" if sys.platform == "win32" else ""
 
+PLATFORMS_PREFIX = "# pyre-check: platforms="
 
-def _scripts() -> list[Path]:
+
+def _runs_here(path: Path) -> bool:
+    """Whether this platform is one the script's expectations hold on.
+
+    A script may name the `sys.platform` values it applies to in its header,
+    above the docstring, with the reason beside it:
+
+        # pyre-check: platforms=linux,darwin
+
+    Elsewhere it is skipped, because what it pins is platform-specific and the
+    reference CPython fails it too — comparing a backend against a failing
+    reference measures nothing. A script with no marker runs everywhere.
+    """
+    with path.open(encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(PLATFORMS_PREFIX):
+                continue
+            named = line[len(PLATFORMS_PREFIX):].strip().split(",")
+            return sys.platform in [name.strip() for name in named]
+    return True
+
+
+def _scripts() -> tuple[list[Path], list[Path]]:
+    """The scripts to run on this platform, and the ones skipped."""
     out = []
+    skipped = []
     for p in sorted(HERE.glob("*.py")):
         if p.name == "run.py":
             continue
-        out.append(p)
-    return out
+        (out if _runs_here(p) else skipped).append(p)
+    return out, skipped
 
 
 def _run(cmd: list[str], script: Path, env: dict[str, str] | None) -> tuple[bool, str]:
@@ -96,13 +128,15 @@ def main() -> int:
     args = parser.parse_args()
 
     runners = _runners(args.dynasm_only, args.cranelift_only, args.gc_poison)
-    scripts = _scripts()
+    scripts, skipped = _scripts()
     if not scripts:
         print("no parity test scripts found", file=sys.stderr)
         return 1
 
     print(f"runners: {[name for name, _, _ in runners]}")
     print(f"scripts: {len(scripts)}")
+    for script in skipped:
+        print(f"skipped ({sys.platform} not in its platforms): {script.name}")
     print()
 
     fail = 0
