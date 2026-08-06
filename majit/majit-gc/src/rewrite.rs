@@ -220,13 +220,12 @@ pub struct GcRewriterImpl {
     pub supports_load_effective_address: bool,
     /// llsupport/gc.py:30-34 `malloc_zero_filled` parity.
     ///
-    /// `true` when the allocator zero-fills payload bytes on
-    /// allocation.  pyre's `Nursery` uses `alloc_zeroed` (nursery.rs:68)
-    /// and `reset()` memsets to zero on recycle (nursery.rs:105-110),
-    /// so production is always `true`.  Gates `clear_gc_fields` per
-    /// rewrite.py:499-500; a future non-zero-fill allocator path would
-    /// flip this to `false` and let the existing plumbing emit
-    /// explicit NULL-pointer stores at flush time
+    /// `true` when the allocation path itself guarantees zero-filled
+    /// payload bytes. Production backends set this to `false` whenever a
+    /// real collector is installed and to `true` for the Boehm/raw-calloc
+    /// fallback (compiler.rs:8303, runner.rs:1704). Gates
+    /// `clear_gc_fields` per rewrite.py:499-500; the non-zero-fill path
+    /// emits explicit NULL-pointer stores at flush time
     /// (rewrite.py:761-766).
     pub malloc_zero_filled: bool,
     /// llsupport/gc.py:39 `self.memcpy_fn = memcpy_fn` cast to a Signed
@@ -1205,24 +1204,18 @@ impl GcRewriterImpl {
                     self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
                 }
             }
-            // Upstream rewrite.py:479-484 rewrites NEW_WITH_VTABLE into allocation
-            // plus full header initialization. Pyre's object layout carries a
-            // separate `w_class` Python-class pointer alongside the vtable;
-            // interpreter, blackhole, and deopt-materialize paths all write it,
-            // so compiled allocations must too or trace-time GuardValue(w_class)
-            // folds fail deterministically on trace-made objects.
-            if let Some(w_class) = descr.w_class_obj() {
-                if w_class != 0 {
-                    if let Some(w_class_fd) =
-                        descr.gc_fielddescrs().iter().find(|fd| fd.is_w_class())
-                    {
-                        self.gen_initialize_w_class(
-                            obj_ref.clone(),
-                            w_class,
-                            w_class_fd.as_ref(),
-                            st,
-                        );
-                    }
+        }
+        // Upstream rewrite.py:479-484 rewrites NEW_WITH_VTABLE into allocation
+        // plus full header initialization. Pyre's object layout carries a
+        // separate `w_class` Python-class pointer alongside the vtable. Honor
+        // that descriptor invariant for both fixed-size allocation opcodes:
+        // clear_gc_fields handles both, and the optimizer's force path may
+        // materialize either Virtual or VirtualStruct without a duplicate
+        // SETFIELD_GC for this header slot.
+        if let Some(w_class) = descr.w_class_obj() {
+            if w_class != 0 {
+                if let Some(w_class_fd) = descr.gc_fielddescrs().iter().find(|fd| fd.is_w_class()) {
+                    self.gen_initialize_w_class(obj_ref.clone(), w_class, w_class_fd.as_ref(), st);
                 }
             }
         }
@@ -1958,12 +1951,11 @@ impl GcRewriterImpl {
     /// (rewrite.py:761-766) does not re-zero a slot that this explicit
     /// SETFIELD_GC is about to overwrite.
     ///
-    /// Under pyre's default zero-fill nursery configuration
-    /// (`malloc_zero_filled = true`), `clear_gc_fields` skips its
-    /// insertion path, so this is effectively a no-op.  The body is
-    /// wired for parity so that a non-zero-fill allocator automatically
-    /// activates the delayed-zero tracking without further callsite
-    /// changes.
+    /// Under the Boehm/raw-calloc fallback (`malloc_zero_filled = true`),
+    /// `clear_gc_fields` skips its insertion path, so this is effectively a
+    /// no-op. With a real collector, production backends set the flag to
+    /// false (compiler.rs:8303, runner.rs:1704), activating the delayed-zero
+    /// tracking.
     fn consider_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
         let Some(descr) = op.getdescr() else { return };
         let Some(fd) = descr.as_field_descr() else {
@@ -4592,6 +4584,66 @@ mod tests {
             w_class_stores[0].arg(2).to_opref().inline_const_bits(),
             Some(0),
             "w_class initialization must not be a NULL delayed-zero store"
+        );
+    }
+
+    #[test]
+    fn test_new_with_vtable_eagerly_initializes_w_class_without_trace_store() {
+        let mut rw = make_rewriter();
+        rw.fielddescr_vtable = None;
+        let w_class = 0xD00D;
+        let ops = vec![Op::with_descr(
+            OpCode::NewWithVtable,
+            &[],
+            size_descr_with_w_class(48, 3, 0, Some(w_class), vec![w_class_field_descr_at(8)]),
+        )];
+
+        let (result, _constants, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
+
+        assert_eq!(gcrefs, vec![GcRef(w_class as usize)]);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|op| {
+                    op.opcode == OpCode::GcStore
+                        && op.arg(1).to_opref().inline_const_bits() == Some(8)
+                        && op.arg(2).to_opref().inline_const_bits() != Some(0)
+                })
+                .count(),
+            1,
+            "allocation lowering must remain the sole w_class writer: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_new_initializes_w_class_before_clear_gc_fields() {
+        let mut rw = make_rewriter();
+        rw.fielddescr_vtable = None;
+        rw.malloc_zero_filled = false;
+        let w_class = 0xD00D;
+        let ops = vec![
+            Op::with_descr(
+                OpCode::New,
+                &[],
+                size_descr_with_w_class(48, 3, 0, Some(w_class), vec![w_class_field_descr_at(8)]),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+
+        let (result, _constants, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
+
+        assert_eq!(gcrefs, vec![GcRef(w_class as usize)]);
+        let w_class_stores: Vec<_> = result
+            .iter()
+            .filter(|op| {
+                op.opcode == OpCode::GcStore && op.arg(1).to_opref().inline_const_bits() == Some(8)
+            })
+            .collect();
+        assert_eq!(w_class_stores.len(), 1, "{result:?}");
+        assert_ne!(
+            w_class_stores[0].arg(2).to_opref().inline_const_bits(),
+            Some(0),
+            "plain NEW must receive the eager class value, not delayed NULL"
         );
     }
 
