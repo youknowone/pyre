@@ -36,6 +36,10 @@ if not WIN32:
 
 assert "winerror" in dir(OSError)
 assert type(OSError.__dict__["winerror"]).__name__ == "member_descriptor"
+# The descriptor names the class it was defined on, the way the rest of
+# `OSError`'s members do — that is what `repr` and `inspect` read it from.
+assert OSError.__dict__["winerror"].__objclass__ is OSError
+assert OSError.__dict__["errno"].__objclass__ is OSError
 
 # `ERROR_ACCESS_DENIED` maps to `EACCES`, so the class follows the Windows code
 # and not the errno that was passed.

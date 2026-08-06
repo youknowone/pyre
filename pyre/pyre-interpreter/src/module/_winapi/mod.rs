@@ -185,10 +185,9 @@ mod process {
                 keys_base + i,
             ))?
             .to_string();
-            let value = crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(
-                value_slot,
-            ))?
-            .to_string();
+            let value =
+                crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(value_slot))?
+                    .to_string();
             entries.push((key, value));
         }
         host_winapi::build_environment_block(entries).map_err(|e| {
