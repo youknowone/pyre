@@ -492,11 +492,12 @@ fn acquire_pickle_buffer(obj: PyObjectRef) -> Result<(PyObjectRef, bool, PyObjec
             return Ok((obj, false, pyre_object::w_none()));
         }
 
-        const BUF_FULL_RO: i64 = 0x011c;
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(obj);
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(BUF_FULL_RO));
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+            crate::baseobjspace::BUF_FULL_RO as i64,
+        ));
         let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
         if let Some(w_impl) = crate::baseobjspace::lookup(r_obj, "__buffer__") {
             pyre_object::gc_roots::pin_root(w_impl);

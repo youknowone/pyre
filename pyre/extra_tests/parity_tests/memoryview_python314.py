@@ -100,6 +100,23 @@ assert isinstance(exported, memoryview)
 assert exported.tobytes() == mv.tobytes()
 exported.release()
 
+
+# `bytes()` / `bytearray()` request `PyBUF_FULL_RO`, so an exporter that
+# branches on the request sees `PyBUF_FORMAT` (0x004) set.  A `PyBUF_SIMPLE`
+# request would reach the refusal instead.
+class Picky:
+    def __buffer__(self, flags):
+        if not (flags & 0x004):
+            raise BufferError("format not requested")
+        return memoryview(b"wxyz")
+
+    def __release_buffer__(self, view):
+        pass
+
+
+assert bytes(Picky()) == b"wxyz"
+assert bytearray(Picky()) == bytearray(b"wxyz")
+
 alias = memoryview[int]
 assert alias.__origin__ is memoryview and alias.__args__ == (int,)
 

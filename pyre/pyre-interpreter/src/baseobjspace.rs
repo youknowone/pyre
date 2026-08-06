@@ -8602,7 +8602,7 @@ impl SimpleBufferBytes {
 /// `Ok(None)` is the `BufferInterfaceNotFound` path, so callers can spell
 /// their own operation-specific TypeError.
 pub(crate) fn simple_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>, PyError> {
-    buffer_bytes(obj, true)
+    buffer_bytes(obj, BufferRequest::Simple)
 }
 
 /// `ObjSpace.buffer_w(w_obj, space.BUF_FULL_RO)`: the same acquisition without
@@ -8611,16 +8611,39 @@ pub(crate) fn simple_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBuffe
 /// `bytes()` / `bytearray()` source this way, which is why
 /// `bytes(memoryview(b'abcd')[::2])` is a copy and not a `BufferError`.
 pub(crate) fn full_ro_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>, PyError> {
-    buffer_bytes(obj, false)
+    buffer_bytes(obj, BufferRequest::FullRo)
+}
+
+pub(crate) const BUF_FULL_RO: i32 = 0x011c;
+
+#[derive(Clone, Copy)]
+enum BufferRequest {
+    Simple,
+    FullRo,
+}
+
+impl BufferRequest {
+    fn require_contiguous(self) -> bool {
+        matches!(self, Self::Simple)
+    }
+
+    fn flags(self) -> i32 {
+        match self {
+            Self::Simple => 0,
+            Self::FullRo => BUF_FULL_RO,
+        }
+    }
 }
 
 fn buffer_bytes(
     obj: PyObjectRef,
-    require_contiguous: bool,
+    request: BufferRequest,
 ) -> Result<Option<SimpleBufferBytes>, PyError> {
     if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
-        return buffer_bytes(target?, require_contiguous);
+        return buffer_bytes(target?, request);
     }
+    let require_contiguous = request.require_contiguous();
+    let flags = request.flags();
     let roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -8674,7 +8697,7 @@ fn buffer_bytes(
         if lookup(r_obj, "__buffer__").is_none() {
             return Ok(None);
         }
-        let w_view = crate::builtins::w_memoryview_new_with_flags(r_obj, 0)?;
+        let w_view = crate::builtins::w_memoryview_new_with_flags(r_obj, flags)?;
         pyre_object::gc_roots::pin_root(w_view);
         let view_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let r_view = pyre_object::gc_roots::shadow_stack_get(view_slot);
