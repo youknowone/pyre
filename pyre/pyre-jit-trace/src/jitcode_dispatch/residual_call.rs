@@ -4806,8 +4806,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && r_args.len() == 1
         && ei.pyre_helper == majit_ir::PyreHelperKind::UnaryPositive
-        && try_walker_specialize_unary_positive_int(ctx, op.pc, r_args[0], dst, dst_bank)?
-            .is_some()
+        && try_walker_specialize_unary_positive_int(ctx, op.pc, r_args[0], dst, dst_bank)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
