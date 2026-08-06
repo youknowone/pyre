@@ -95,5 +95,11 @@ crate::py_module! {
         fn SetErrorMode(mode: u32) -> u32 {
             host_msvcrt::set_error_mode(mode)
         }
+        // The mode `SetErrorMode` replaces, which is the only way to read it
+        // back: the setter reports the previous value, so a caller that wants
+        // to leave it alone has nothing to restore without this.
+        fn GetErrorMode() -> u32 {
+            host_msvcrt::get_error_mode()
+        }
     }
 }
