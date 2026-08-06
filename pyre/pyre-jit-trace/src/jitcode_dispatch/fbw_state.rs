@@ -1991,6 +1991,24 @@ pub(crate) enum CalleeReplaySafety {
     Clean,
     /// Clean apart from Python-level CALL residuals, whose callee is resolved
     /// only at walk time.
+    ///
+    /// This variant and the deferred arm of the nested-residual abort are ONE
+    /// contract, not two independent gates: the admission is sound only
+    /// because a residual the lever could not inline aborts BEFORE executing
+    /// and rewinds to the enclosing CALL (see the enforcer above, which states
+    /// the same promise from the other side).  Retiring the abort on its own
+    /// leaves the admission standing on a promise nothing enforces.
+    ///
+    /// The axis is the EXECUTED-EFFECT delta, not raising — the rewind leg is
+    /// gated on `fbw_executed_effect_count() == entry_executed_effects`.  A
+    /// narrowing keyed on "can this body raise" would admit a `list.append`
+    /// residual, which raises nothing and is exactly what the arm must catch,
+    /// so `EffectInfo::check_can_raise` is not the predicate for this decision.
+    ///
+    /// There is no upstream counterpart to defer against: `look_inside_graph`
+    /// (`codewriter/policy.py:48`) and `can_inline_callable`
+    /// (`warmstate.py:669`) decide statically before tracing and turn a "no"
+    /// into a residual call.
     DeferredCall,
     /// Carries a live-heap effect a replay would double.
     Dirty,

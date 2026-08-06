@@ -3512,14 +3512,25 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // `positional_defaults_for_inline` derives that from `len(defs_w)`
         // alone — the length is the only thing that has to be re-checked.
         //
-        // Guard the tuple's identity all the same.  `GuardValue` over an
-        // `arraylen_gc` leaves the guard's only argument dead after it, and a
-        // bridge compiled at that fail index segfaults on entry: reassign
-        // `f.__defaults__` to a different length mid-loop and it is correct up
-        // to ~1000 post-flip iterations and dies past ~2000, with and without
-        // `MAJIT_NO_BRIDGE`.  Identity is stricter than needed but sound, and
-        // it only costs the shape that builds the callee in the caller's own
-        // loop AND omits an argument it has a default for.
+        // Guard the tuple's identity all the same.  Replacing this with
+        // `arraylen_gc` + a length `GuardValue` was implemented and reverted:
+        // it answers correctly on every defaults shape, including the
+        // specialised two-int tuple, but `synth/pickle_terminal_raise_resume`
+        // then segfaults deterministically (EXC_BAD_ACCESS on a null in
+        // compiled code, 5/5), while keeping the added class guard and
+        // restoring this identity `GuardValue` is clean 3/3.  The length guard
+        // is what is unsound here; the class guard is not.
+        //
+        // Identity is stricter than needed and costs nothing measured.  All
+        // three compilers fold an all-constant defaults list into one code
+        // constant — `codegen.py:582-590 _visit_defaults` takes the
+        // `_tuple_of_consts` branch, and pyre's own compiler emits the same
+        // single `LOAD_CONST (None, 7)` — so even a `def` re-executed inside
+        // the caller's loop hands out the same tuple every iteration.  Only a
+        // non-constant default expression (`def f(a=mk())`, which emits
+        // `BUILD_TUPLE`) rebuilds it; no fixture in `bench/` has that shape,
+        // and `make_function_inline`, the one loop-local `def` with a default,
+        // records `guard_failures=1` for its whole run.
         let tuple_expected = ctx.trace_ctx.const_ref(defaults.tuple as i64);
         ctx.trace_ctx
             .record_guard(OpCode::GuardValue, &[defaults_op, tuple_expected], 0);
