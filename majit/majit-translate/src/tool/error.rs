@@ -246,6 +246,53 @@ pub fn offset2lineno(code: &HostCode, stopat: i64) -> u32 {
     line
 }
 
+/// Upstream falls back to `['no source!']` when a graph carries no Python
+/// source, which is every MIR-built pyre graph — so the listing that upstream
+/// prints around the failing operation is always empty here.  Print the
+/// block's inputargs and operations instead: without them a record names the
+/// failing op but never the op that PRODUCED its receiver, which is the one
+/// piece of context a classdef-less / blocked-block diagnosis needs.
+fn no_source_lines(
+    g: &std::cell::Ref<'_, crate::flowspace::model::FunctionGraph>,
+    block: Option<&BlockRef>,
+) -> Vec<String> {
+    /// Bound the listing: a blocked op's producer is normally a few ops away,
+    /// and an unbounded dump would multiply the size of every record.
+    const MAX_OPS: usize = 40;
+    let mut out = vec!["no source!".to_string()];
+    if let Some(b) = block {
+        let b = b.borrow();
+        out.push(format!(
+            "  block inputargs: [{}]",
+            b.inputargs
+                .iter()
+                .map(|v| format!("{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        for (i, op) in b.operations.iter().take(MAX_OPS).enumerate() {
+            out.push(format!("  op[{i}] {op}"));
+        }
+        if b.operations.len() > MAX_OPS {
+            out.push(format!(
+                "  … {} more operation(s)",
+                b.operations.len() - MAX_OPS
+            ));
+        }
+    }
+    out.push(format!(
+        "  startblock inputargs: [{}]",
+        g.startblock
+            .borrow()
+            .inputargs
+            .iter()
+            .map(|v| format!("{v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    out
+}
+
 /// RPython `source_lines1(graph, block, operindex, offset=None,
 ///                          long=False, show_lines_of_code=SHOW_DEFAULT_LINES_OF_CODE)`
 /// (error.py:18-61).
@@ -310,23 +357,23 @@ pub fn source_lines1(
     // upstream: `source = graph.source`; attribute absent → ['no source!'].
     let source = match g.source() {
         Ok(s) => s,
-        Err(_) => return vec!["no source!".into()],
+        Err(_) => return no_source_lines(&g, block),
     };
     let filename = match g.filename() {
         Ok(s) => s,
-        Err(_) => return vec!["no source!".into()],
+        Err(_) => return no_source_lines(&g, block),
     };
     let startline = match g.startline() {
         Ok(n) => n,
-        Err(_) => return vec!["no source!".into()],
+        Err(_) => return no_source_lines(&g, block),
     };
     let func = match &g.func {
         Some(f) => f,
-        None => return vec!["no source!".into()],
+        None => return no_source_lines(&g, block),
     };
     let code = match func.code.as_deref() {
         Some(c) => c,
-        None => return vec!["no source!".into()],
+        None => return no_source_lines(&g, block),
     };
     let graph_lines: Vec<&str> = source.split('\n').collect();
 
