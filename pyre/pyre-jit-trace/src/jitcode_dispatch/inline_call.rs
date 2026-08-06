@@ -2955,11 +2955,20 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return Ok(None);
     }
-    // An unbound method-form callee whose body reads `self.attr`.  Every entry
-    // inlines one; the FOR_ITER deferred-admit decline below is what that reach
-    // still costs.
+    // An unbound method-form callee whose body reads `self.attr`.  FOR_ITER
+    // admits this widened surface only when the receiver is known not to be a
+    // type object: type-attribute reads can run through metatype descriptor
+    // dispatch and still reach the deferred abort path below.
     let widened_method_form =
         method_form && bound_method.is_none() && !body_facts.method_form_supported;
+    let widened_method_foriter_admissible = !widened_method_form
+        || callee_arg_concretes.first().is_some_and(|concrete| {
+            matches!(
+                concrete,
+                ConcreteValue::Ref(receiver)
+                    if !receiver.is_null() && !unsafe { pyre_object::is_type(*receiver) }
+            )
+        });
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
     // Replaying a live-heap mutation would double it, so a Dirty body stays on
@@ -2997,14 +3006,15 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // body is still admitted from there — it has nothing that can
                 // abort.
                 //
-                // A body that reads `self.attr` stays out as well.  Admitting
-                // one costs an abort that retires the enclosing loop before the
-                // deny takes effect -- `synth/type_metatype_method_call` went
-                // `loops_aborted` 0 -> 1 and `bridges_compiled` 47 -> 44 on the
-                // admission alone.  Declining here reaches the same residual
-                // call with the loop intact.
+                // A widened method-form body is admitted only after proving the
+                // receiver is not a type object.  The type receiver shape
+                // (`cls.__name__` through `type.__getattribute__`) reaches the
+                // deferred abort path, and that first abort retires the
+                // enclosing loop before the deny helps the next attempt.
+                // Declining it here reaches the same residual call with the
+                // loop intact.
                 foriter_deferred_admit = arg_class_guard.is_none()
-                    && !widened_method_form
+                    && widened_method_foriter_admissible
                     && !fbw_foriter_deferred_call_denied(callee_code_key);
                 foriter_deferred_admit
             }
