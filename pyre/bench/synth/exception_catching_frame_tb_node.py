@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=18
+# pyre-check: max-pypy-ratio=53
+# The ceiling is twice the slowest ratio observed, 26.2x on the macos
+# runner; the runners read this fixture between 3.0x and 26.2x.
 # The frame holding the `try` contributes its own traceback node, including
 # when its `except` is reached from inside its own compiled trace.
 #

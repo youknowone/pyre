@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=40
+# pyre-check: max-pypy-ratio=102
+# The ceiling is twice the slowest ratio observed, 50.9x on the macos
+# runner; the runners read this fixture between 9.0x and 50.9x.
 # gh#495 guard: an inlined subwalk whose callee makes an unjournaled mutation
 # through a nested residual CALL, in the two miss-handling shapes.
 #
