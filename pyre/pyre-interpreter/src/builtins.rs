@@ -8773,18 +8773,15 @@ fn make_exception_group_type(
             }
         }
     } else if name == "ExceptionGroup" {
-        // PyPy's app-level multiple-inheritance type receives the ordinary
-        // heap-instance weakref slot.  pyre constructs the equivalent type
-        // directly, so install the copied descriptor and flag explicitly.
+        // `moduledef.py` names `interp_group.W_ExceptionGroup` under
+        // `interpleveldefs`, so this multiple-inheritance type is a static
+        // builtin exactly like `BaseExceptionGroup` beside it — immutable, and
+        // carrying none of the heap-type flag bits. Its instances still take
+        // the ordinary weakref slot; pyre constructs the type directly, so
+        // install the copied descriptor and flag explicitly.
         let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
         crate::type_dict_store(cls, "__weakref__", descr);
-        unsafe {
-            pyre_object::w_type_set_weakrefable(cls, true);
-            // CPython 3.14 declares ExceptionGroup as a heap type (unlike the
-            // static BaseExceptionGroup); this controls mutability as well as
-            // the public Py_TPFLAGS_HEAPTYPE/IMMUTABLETYPE bits.
-            pyre_object::w_type_set_heaptype(cls, true);
-        };
+        unsafe { pyre_object::w_type_set_weakrefable(cls, true) };
     }
     register_exc_class(name, cls)
 }

@@ -19,12 +19,6 @@ assert B.__base__ is A
 assert isinstance(A.__flags__, int)
 assert A.__flags__ & (1 << 9)
 
-# ExceptionGroup is the mutable heap-type exception-group leaf; BaseExceptionGroup
-# remains an immutable static type.
-ExceptionGroup._pyre_type_flags_probe = 1
-assert ExceptionGroup._pyre_type_flags_probe == 1
-del ExceptionGroup._pyre_type_flags_probe
-
 for non_base in (slice, types.MappingProxyType):
     try:
         type("BadSubclass", (non_base,), {})
