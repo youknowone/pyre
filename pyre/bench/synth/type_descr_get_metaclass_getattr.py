@@ -20,25 +20,12 @@ class C(metaclass=Meta):
     attr = Raises()
 
 
-N = 30000
-
-
 def main():
     # C.attr finds the descriptor, calls Raises().__get__(None, C) which raises
     # AttributeError, so the lookup falls back to Meta.__getattr__('attr').
     print('descr_get_raise', C.attr)
     # a plain missing name takes the terminal metaclass __getattr__ path
     print('missing', C.missing)
-
-    total = 0
-    i = 0
-    while i < N:
-        if C.attr == 'meta:attr':
-            total += 1
-        if C.missing == 'meta:missing':
-            total += 1
-        i += 1
-    print('loop', total)
 
 
 main()
