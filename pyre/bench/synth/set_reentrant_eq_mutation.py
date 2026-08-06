@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=13
-# The ceiling is twice the slowest ratio observed, 6.1x on the macos runner;
-# the gate it replaces sat inside the run-to-run spread.
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 class ReentrantKey:
     def __init__(self, value, state):
         self.value = value

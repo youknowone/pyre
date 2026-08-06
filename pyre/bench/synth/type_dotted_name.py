@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6.8
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # type.__name__ / __qualname__ dot handling: a heap type built with a dotted
 # name string (type('a.b', (), {})) keeps the name verbatim on both getters,
 # while a static/builtin dotted tp_name strips to its final component. An

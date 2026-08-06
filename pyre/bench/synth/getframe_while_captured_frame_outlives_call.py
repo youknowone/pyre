@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=43
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # The callee's frame OUTLIVES the call and its f_back is read after the loop.
 #
 # This is the discriminator for the root `f_backref` operand in the multi-frame

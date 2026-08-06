@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=10
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # Conditional expression whose taken arm loads a heap-int constant (>= 256, a
 # LOAD_CONST rather than the inline LoadSmallInt).  That arm value reaches the
 # branch-merge block as a flow-graph Constant link arg.

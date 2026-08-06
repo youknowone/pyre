@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=95
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # Coverage for the multi-frame blackhole build path: an INLINED callee that
 # forces an outer frame through `sys._getframe(2)`.
 #

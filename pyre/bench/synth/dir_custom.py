@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=12
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # app_inspect.py:57-62 — dir(obj) is driven by a custom __dir__; its result is
 # returned sorted.  An object without one still enumerates its real attributes.
 

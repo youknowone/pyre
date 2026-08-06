@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # complex.real / complex.imag are read-only getset descriptors bound to the
 # complex type: they carry __objclass__ == complex and __name__, reject a
 # non-complex receiver with TypeError, and reject assignment with

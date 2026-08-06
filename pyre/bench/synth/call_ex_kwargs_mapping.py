@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # argument.py:106-150 _combine_starstarargs_wrapped: CALL_FUNCTION_EX accepts
 # any mapping via keys()/__getitem__, rejects a non-str key with TypeError, and
 # rejects a non-mapping after ** with TypeError.

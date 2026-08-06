@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6.6
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # Reassigning type.__bases__ recomputes the MRO of the type and every
 # subclass and invalidates the method/attribute lookup cache, so a method or
 # class attribute that was resolved before the swap resolves through the new

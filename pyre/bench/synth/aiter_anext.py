@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=9
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # aiter()/anext() builtins over an async iterator: aiter returns the async
 # iterator, anext drives it item by item, and the two-argument anext yields the
 # default once the iterator is exhausted. Also covers the three TypeError paths

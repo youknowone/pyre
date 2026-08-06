@@ -1,5 +1,7 @@
-# pyre-check: max-pypy-ratio=12
-# The ceiling is twice the slowest ratio observed (5.8x on the macos runner),
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # rounded up; the gate it replaces was fitted to no measurement.
 # A subclass whose base already carries an instance dict rejects a second
 # `__dict__` slot. BaseException subclasses carry the dict through the native
