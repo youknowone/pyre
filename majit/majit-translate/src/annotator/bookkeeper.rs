@@ -2125,17 +2125,43 @@ impl Bookkeeper {
         // Strip the `<…>` argument span so the lookup resolves under the
         // template key — matching `StructFieldRegistry::lookup_fields`,
         // which the bare-`reg.fields.get` here bypasses.
+        //
+        // A per-shape tuple (`Tuple<FrameDebugData>`) is the exception: it has
+        // no template — `register_tuple_shape_rows` registers its concrete
+        // element spellings under the full shaped key, and stripping would
+        // look up a bare `Tuple` that carries no rows.  Without the exact
+        // lookup every `__pos_N` keeps the untyped FORCE shell
+        // (`valuetype_to_someshell(Ref) -> SomeInstance(classdef=None)`), which
+        // `generalize_attr` can only widen, so a reference-typed tuple element
+        // stays classdef-less however precisely its writers are annotated.
         let mut fields: Vec<(String, String)> = {
             let guard = self.pyre_struct_fields.borrow();
             match guard.as_ref().and_then(|r| {
-                r.fields
-                    .get(majit_ir::descr::strip_generic_args(n).as_ref())
-                    .cloned()
+                if majit_ir::descr::is_shaped_tuple_name(n) {
+                    r.fields.get(n).cloned()
+                } else {
+                    r.fields
+                        .get(majit_ir::descr::strip_generic_args(n).as_ref())
+                        .cloned()
+                }
             }) {
                 Some(f) => f,
                 None => return Ok(()),
             }
         };
+        if majit_ir::descr::is_shaped_tuple_name(n) {
+            // Every `__pos_N` of a shaped tuple is written by the frontend's
+            // own constructor sequence (`simple_call(<host Tuple<…>>)` then one
+            // `setattr` per element), so a projected row has to agree with the
+            // value that sequence produces.  A sum-typed element does not: the
+            // constructor materializes a variant INSTANCE, while
+            // `project_pyre_field_type` models the spelling as the nullable
+            // payload — `Option<Vec<*mut PyObject>>` projects to list-or-none
+            // and then fails `generalize_attr` against
+            // `Instance(Option<Vec<*mut PyObject>>::None)`.  Leave those rows
+            // to the constructor.
+            fields.retain(|(_, ty)| !is_nullable_sum_spelling(ty));
+        }
         // A per-instantiation variant carries concrete payload rows keyed
         // under its full `<…>`-suffixed spelling
         // (`Option<*mut PyObject>::Some` → `__pos_0: *mut PyObject`,
@@ -3683,6 +3709,23 @@ fn collect_referenced_struct_names(
     if reg.fields.contains_key(stripped) {
         out.push(stripped.to_string());
     }
+}
+
+/// Whether a field-type spelling names a sum type that
+/// [`Bookkeeper::project_pyre_field_type`] models as its *payload* plus
+/// `None` — the nullable-pointer shape (`Option<Vec<T>>` → list-or-none).
+/// That model describes a field lowered to one nullable word; it does NOT
+/// describe a slot the frontend fills with a materialized variant instance
+/// (`simple_call(<host Option<Vec<*mut PyObject>>::None>)`), whose
+/// annotation is `Instance(Option<…>::None)` and cannot union with the
+/// payload.
+fn is_nullable_sum_spelling(field_ty: &str) -> bool {
+    let t = field_ty
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim();
+    strip_generic_one(t, "Option<").is_some() || strip_generic_one(t, "Result<").is_some()
 }
 
 /// Strip `Wrapper<` prefix and matching `>` suffix from a type string,
