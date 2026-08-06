@@ -1072,6 +1072,10 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             158,
             typed::<crate::module::__pypy__::interp_buffer::bufferable_impl::W_Bufferable>(),
         ),
+        // `_io.BytesIO` registers after the `rbigint` result pair, which takes
+        // 159 as a bare `with_gc_ptrs` id and carries no vtable of its own.
+        subclass_range_alias(160, typed::<crate::module::_io::W_BytesIO>()),
+        subclass_range_alias(161, typed::<crate::module::_io::W_StringIO>()),
     ]
 }
 

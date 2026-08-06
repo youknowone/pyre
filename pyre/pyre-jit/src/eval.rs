@@ -3458,6 +3458,23 @@ fn build_gc() -> Box<MiniMarkGC> {
         ],
     ));
     pyre_object::longobject::set_bigint_pair_gc_type_id(bigint_pair_tid);
+    // `_io.BytesIO` keeps its content in an inline `bytearray` field, the
+    // storage `interp_bytesio.py:66` mixes in from `RStringIO`.  Appended at
+    // the tail so adding the stream type renumbers no established GC id.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_io::W_BytesIO
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // `_io.StringIO` holds its UnicodeIO codepoint array and newline objects
+    // in managed fields. Appended after BytesIO so established ids stay put.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_io::W_StringIO
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
