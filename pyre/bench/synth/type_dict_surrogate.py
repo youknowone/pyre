@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=74
-# pyre-check: min-pypy-ratio=7.08
+# pyre-check: max-pypy-ratio=350
+# pypy's exec time is pinned to the startup-subtraction floor here, so the
+# ratio is not a measurement and no floor gate is recorded.
 N = 200000
 
 S = '\udcff'                  # lone low surrogate

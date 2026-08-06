@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=30
-# pyre-check: min-pypy-ratio=1.98
+# pyre-check: max-pypy-ratio=84
+# pypy's exec time is pinned to the startup-subtraction floor here, so the
+# ratio is not a measurement and no floor gate is recorded.
 N = 2000000
 
 

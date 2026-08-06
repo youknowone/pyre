@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=46
-# pyre-check: min-pypy-ratio=2.38
+# pyre-check: max-pypy-ratio=80
+# pypy's exec time sits just above the startup-subtraction floor here, so the
+# ratio is host-dominated and no floor gate is recorded.
 # A guard failing inside an inlined `__init__` must hand the caller the
 # instance, not `__init__`'s return value.  `typeobject.py descr_call` discards
 # `__init__`'s result and returns the instance; the flattened constructor
