@@ -525,6 +525,26 @@ def pyre_env():
     # them to the guest explicitly (`pyre_set_gc_env`): a wasm32-unknown-unknown
     # module's `std::env` is permanently empty, so setting them here does
     # nothing on its own there.
+    #
+    # Reaching the guest is not the same as clearing the crossing there. 256MB
+    # removes it on both native backends and does not in the guest, which reads
+    # `recursive_call_frame_relocation` 638 and `closure_per_call` 420 against
+    # their 636 and 414 — the same knife edge described above, one step along
+    # it. The two run different interpreter allocation models, so one program
+    # presents the collector with two different old-gen totals: `PYRE_GC_INTERP`
+    # (`pyre-object/src/gc_interp.rs`) is off natively, where `w_int_new` /
+    # `w_float_new` take an untracked `alloc_with_gc_header` that
+    # `threshold_reached` never sees, and on in the guest, where the same
+    # objects are collector-allocated and counted. So the guest reaches a
+    # threshold the native backends do not, from the same fixture.
+    #
+    # Left where it is deliberately. 384MB and above does land the guest exactly
+    # on the native counts, but it buys agreement with memory: `closure_per_call`
+    # peaks at 459MB there against 358MB here. The three baselines are recorded
+    # per backend and each is deterministic — five repeats of both fixtures
+    # under the guest report one number — so the difference costs nothing but
+    # the sensitivity this note is here to name: a change in interpreter-path
+    # allocation volume moves the wasm numbers while the native ones sit still.
     env.setdefault("PYPY_GC_MIN", str(256 * 1024 * 1024))
     # Keep the bench directory off `sys.path` (`-P`), so the jit-stats counters
     # describe the fixture rather than the directory it happens to sit in.
