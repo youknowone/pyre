@@ -18553,12 +18553,14 @@ fn init_object_type(ns: PyObjectRef) {
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__init__", object_init)
     };
-    // PyPy: objectobject.py — default comparison/hash/repr for all objects
+    // objectobject.py:187-189 hard-codes explicit text signatures for object
+    // descriptors whose generated spelling would otherwise follow RPython
+    // parameter names.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__eq__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__eq__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
@@ -18571,6 +18573,7 @@ fn init_object_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "($self, value, /)",
             ),
         )
     };
@@ -18582,7 +18585,7 @@ fn init_object_type(ns: PyObjectRef) {
             // negates the (virtually dispatched) `__eq__` result, so a
             // subclass that overrides only `__eq__` still gets a consistent
             // `!=`.  `__eq__` itself falls back to identity here.
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__ne__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
@@ -18613,6 +18616,7 @@ fn init_object_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)?))
                 },
                 2,
+                "($self, value, /)",
             ),
         )
     };
@@ -18624,13 +18628,14 @@ fn init_object_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
                     name,
                     |args| {
                         crate::type_methods::arity_slot(args, 1)?;
                         Ok(pyre_object::w_not_implemented())
                     },
                     2,
+                    "($self, value, /)",
                 ),
             )
         };
@@ -18639,7 +18644,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__hash__",
                 |args| {
                     // The fixed arity above is only a fast-dispatch hint; the
@@ -18659,6 +18664,7 @@ fn init_object_type(ns: PyObjectRef) {
                     Ok(default_identity_hash(pyre_object::PY_NULL, args[0]))
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18666,8 +18672,8 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            // PyPy: objectobject.py descr___repr__ — base __repr__ for all objects
-            make_builtin_function_with_arity(
+            // objectobject.py:184 descr___repr__ — base __repr__ for all objects
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__repr__",
                 |args| {
                     if args.is_empty() {
@@ -18693,6 +18699,7 @@ fn init_object_type(ns: PyObjectRef) {
                     )))
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18700,7 +18707,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__str__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__str__",
                 |args| {
                     if args.is_empty() {
@@ -18716,15 +18723,16 @@ fn init_object_type(ns: PyObjectRef) {
                     }))
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
-    // PyPy: objectobject.py descr___format__
+    // objectobject.py:435-436 descr___format__
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__format__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__format__",
                 |args| {
                     if args.is_empty() {
@@ -18750,6 +18758,7 @@ fn init_object_type(ns: PyObjectRef) {
                     }))
                 },
                 2,
+                "($self, format_spec, /)",
             ),
         )
     };
@@ -18758,7 +18767,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__reduce__",
                 |args| {
                     if args.is_empty() {
@@ -18770,6 +18779,7 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::reduce_protocol::descr_reduce(args[0])
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18777,7 +18787,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce_ex__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__reduce_ex__",
                 |args| {
                     if args.is_empty() {
@@ -18790,6 +18800,7 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::reduce_protocol::descr_reduce_ex(args[0], proto)
                 },
                 2,
+                "($self, protocol, /)",
             ),
         )
     };
@@ -18797,7 +18808,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getstate__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__getstate__",
                 |args| {
                     if args.is_empty() {
@@ -18809,6 +18820,7 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::reduce_protocol::object_getstate_default(args[0])
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18816,7 +18828,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__dir__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__dir__",
                 |args| {
                     if args.is_empty() {
@@ -18828,6 +18840,7 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::builtins::object_dir_default(args[0])
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18835,7 +18848,7 @@ fn init_object_type(ns: PyObjectRef) {
     // keywords; class-definition keywords reaching it via the builtin
     // kwargs ABI are an error, not silently dropped.
     unsafe {
-        let init_subclass = pyre_object::function::w_classmethod_new(make_builtin_function(
+        let init_subclass_func = crate::gateway::make_builtin_function_with_text_signature(
             "__init_subclass__",
             |args| {
                 let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -18854,7 +18867,9 @@ fn init_object_type(ns: PyObjectRef) {
                 }
                 Ok(pyre_object::w_none())
             },
-        ));
+            "($type, /)",
+        );
+        let init_subclass = pyre_object::function::w_classmethod_new(init_subclass_func);
         // Read the wrapped callable back out of the classmethod: allocating it
         // can move the function, and the qualname lookup compares addresses.
         crate::function::register_object_class_method(
@@ -18871,10 +18886,12 @@ fn init_object_type(ns: PyObjectRef) {
         // objectobject.py:413 `interp2app(descr___subclasshook__,
         // as_classmethod=True)` — the hook receives the class it is
         // consulted for, so a read off any type binds to that type.
-        let subclasshook = pyre_object::function::w_classmethod_new(make_builtin_function(
+        let subclasshook_func = crate::gateway::make_builtin_function_with_text_signature(
             "__subclasshook__",
             |_| Ok(pyre_object::w_not_implemented()),
-        ));
+            "($type, object, /)",
+        );
+        let subclasshook = pyre_object::function::w_classmethod_new(subclasshook_func);
         crate::function::register_object_class_method(
             "__subclasshook__",
             pyre_object::function::w_classmethod_get_func(subclasshook),
@@ -18885,13 +18902,13 @@ fn init_object_type(ns: PyObjectRef) {
             subclasshook,
         )
     };
-    // PyPy: objectobject.py descr___setattr__
+    // objectobject.py:420-421 descr___setattr__
     // object.__setattr__(self, name, value) → setattr dispatch
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__setattr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__setattr__",
                 |args| {
                     if args.len() < 3 {
@@ -18926,15 +18943,16 @@ fn init_object_type(ns: PyObjectRef) {
                     }
                 },
                 3,
+                "($self, name, value, /)",
             ),
         )
     };
-    // PyPy: objectobject.py descr___delattr__
+    // objectobject.py:422-423 descr___delattr__
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__delattr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__delattr__",
                 |args| {
                     if args.len() < 2 {
@@ -18960,15 +18978,16 @@ fn init_object_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "($self, name, /)",
             ),
         )
     };
-    // PyPy: objectobject.py descr___getattribute__
+    // objectobject.py:416-417 descr___getattribute__
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getattribute__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__getattribute__",
                 |args| {
                     if args.len() < 2 {
@@ -18990,6 +19009,7 @@ fn init_object_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "($self, name, /)",
             ),
         )
     };
