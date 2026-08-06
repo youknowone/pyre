@@ -2459,6 +2459,18 @@ impl OptContext {
         }
     }
 
+    /// optimizer.py:528-534 new_const(fielddescr) — default value for an
+    /// unset field of a freshly allocated virtual struct.  GC allocations are
+    /// zero-filled, so optimizeopt can answer the read without materialising
+    /// the virtual.
+    pub fn new_const(&mut self, field_type: Type) -> OpRef {
+        match field_type {
+            Type::Int | Type::Void => self.make_constant_int(0),
+            Type::Ref => self.make_constant_ref(GcRef::NULL),
+            Type::Float => self.make_constant_float(0.0),
+        }
+    }
+
     /// vstring.py:110-119 / 171-175 / 251-253 / 281-295
     /// Per-subclass getstrlen() dispatch — returns a cached lgtop OpRef if
     /// available, or computes/emits the length and caches in StrPtrInfo.lgtop.
