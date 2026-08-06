@@ -6136,7 +6136,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         if is_module(obj) {
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() {
-                if let Some(v) = pyre_object::w_dict_lookup(w_dict, w_name) {
+                if let Some(v) = finditem(w_dict, w_name)? {
                     if !v.is_null() {
                         return Ok(v);
                     }
@@ -6206,9 +6206,13 @@ pub(crate) unsafe fn object_getattribute_surrogate(
                 }
             }
         }
+        // `space.finditem`, not the raw lookup: the probe compares the name
+        // against whatever each colliding bucket holds, so a stored non-string
+        // key can run a user `__eq__` that raises, and the swallowing spelling
+        // would read that back as an absent attribute.
         let w_dict = getdict_backing(obj)?;
         if !w_dict.is_null() {
-            if let Some(v) = pyre_object::w_dict_lookup(w_dict, w_name) {
+            if let Some(v) = finditem(w_dict, w_name)? {
                 if !v.is_null() {
                     return Ok(v);
                 }
