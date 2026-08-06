@@ -6414,9 +6414,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             // an Int divisor keeps its machine word instead of
                             // being widened to a bigint, and `_int_mod`'s
                             // result is a machine int rather than a long.
-                            specialized = try_walker_specialize_binary_op_long_int_div(
+                            if let Some(outcome) = try_walker_specialize_binary_op_long_int_div(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?;
+                            )? {
+                                return Ok((outcome, op.next_pc));
+                            }
                         }
                         if specialized.is_none() {
                             // `descr_pow` keeps a `W_IntObject` exponent
