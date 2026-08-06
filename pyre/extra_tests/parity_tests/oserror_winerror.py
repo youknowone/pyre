@@ -68,6 +68,20 @@ for winerror in (None, "notint"):
     assert e.winerror == winerror, e.winerror
     assert str(e) == "[WinError %s] msg: 'file'" % (winerror,), str(e)
 
+# A non-integer code leaves the errno alone, so the subclass is the one that
+# errno names — the code decides the class only when it is one.
+e = OSError(1, "msg", "file", "notint")
+assert type(e) is PermissionError, type(e)
+assert e.errno == 1, e.errno
+
+# The derived errno replaces the first argument whether or not a filename came
+# with it; what a filename changes is how many of them `args` keeps.  Without
+# one the whole call is kept, first argument rewritten.
+e = OSError(2, "msg", None, 5)
+assert type(e) is PermissionError, type(e)
+assert e.args == (13, "msg", None, 5), e.args
+assert str(e) == "[WinError 5] msg", str(e)
+
 # Both filenames are reported alongside the Windows code.
 e = OSError(22, "msg", "file", 5, "file2")
 assert e.filename2 == "file2", e.filename2
