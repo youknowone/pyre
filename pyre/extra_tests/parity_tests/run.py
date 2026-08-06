@@ -2,7 +2,7 @@
 """Parity baseline runner.
 
 Runs every script under `pyre/extra_tests/parity_tests/` against:
-  - CPython (the system `python3`),
+  - CPython 3.14 (`PYRE_CHECK_PYTHON3`, else `python3.14` on PATH),
   - the pyre-dynasm binary (release build),
   - the pyre-cranelift binary (release build, if present).
 
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -45,6 +46,15 @@ TARGET_RELEASE = ROOT / "target" / "release"
 EXE = ".exe" if sys.platform == "win32" else ""
 
 PLATFORMS_PREFIX = "# pyre-check: platforms="
+
+# The version whose observable behaviour these scripts pin, which is the one
+# pyre's native modules (`_sre.MAGIC`) and the vendored `lib-python/3` are
+# coupled to. An older CPython disagrees with it on error text, dunder surfaces
+# and structure sizes — dozens of failures that are not parity failures, and
+# that bury the ones that are. Comparing a backend against the wrong reference
+# measures nothing, so a run that cannot find the right one stops rather than
+# reporting what it found.
+CPYTHON_TARGET = (3, 14)
 
 
 def _runs_here(path: Path) -> bool:
@@ -113,12 +123,75 @@ def _run(cmd: list[str], script: Path, env: dict[str, str] | None) -> tuple[bool
     return ok, detail
 
 
+PROBE = "import sys; print(sys.version_info[0], sys.version_info[1]); print(sys.executable)"
+
+
+def _probe(command: str) -> tuple[tuple[int, int], str] | None:
+    """What the interpreter reports as its version and its own path.
+
+    `None` when the command did not run at all, which on Windows is what a
+    `python3.14` that names an extensionless shim rather than an executable
+    does — `shutil.which` finds it and `CreateProcess` cannot start it.
+    """
+    try:
+        proc = subprocess.run(
+            [command, "-c", PROBE],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = (proc.stdout or "").splitlines()
+    if len(lines) < 2:
+        return None
+    try:
+        major, minor = lines[0].split()
+    except ValueError:
+        return None
+    return (int(major), int(minor)), lines[1].strip() or command
+
+
+def _cpython() -> str:
+    """The reference interpreter, which has to be the version the scripts pin.
+
+    `PYRE_CHECK_PYTHON3` names it outright; otherwise the version-qualified
+    name is tried before the bare ones, because a `python3` on PATH is
+    whichever CPython the system happens to ship. What comes back is the path
+    the interpreter reports for itself, so the scripts are spawned by a name
+    that does not depend on the PATH they inherit.
+    """
+    named = os.environ.get("PYRE_CHECK_PYTHON3")
+    candidates = [named] if named else ["python3.14", "python3", "python"]
+    rejected = []
+    for candidate in candidates:
+        if named is None and shutil.which(candidate) is None:
+            continue
+        probed = _probe(candidate)
+        if probed is None:
+            rejected.append(f"  {candidate}: did not run")
+            continue
+        version, executable = probed
+        if version == CPYTHON_TARGET:
+            return executable
+        rejected.append("  %s: %d.%d" % (candidate, *version))
+    wanted = "%d.%d" % CPYTHON_TARGET
+    raise SystemExit(
+        f"no CPython {wanted} to compare against — the parity scripts pin its "
+        f"behaviour, and an older one fails them for reasons that are not "
+        f"parity failures.\n"
+        + ("\n".join(rejected) or "  (no candidate on PATH)")
+        + "\nName one with PYRE_CHECK_PYTHON3."
+    )
+
+
 def _runners(
     only_dynasm: bool, only_cranelift: bool, gc_poison: bool
 ) -> list[tuple[str, list[str], dict[str, str] | None]]:
     runners: list[tuple[str, list[str], dict[str, str] | None]] = []
-    cpython = os.environ.get("PYRE_CHECK_PYTHON3") or "python3"
-    runners.append(("cpython", [cpython], None))
+    runners.append(("cpython", [_cpython()], None))
     pyre_env = {"MAJIT_GC_NURSERY_POISON": "1"} if gc_poison else None
     dynasm = TARGET_RELEASE / f"pyre-dynasm{EXE}"
     cranelift = TARGET_RELEASE / f"pyre-cranelift{EXE}"

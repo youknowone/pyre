@@ -24,14 +24,69 @@ if hasattr(sys.stderr, "reconfigure"):
 
 EXE = ".exe" if sys.platform == "win32" else ""
 # pyre's compat target is CPython 3.14; its native modules (`_sre.MAGIC`) and the
-# vendored `lib-python/3` are coupled to that version. Prefer a version-matched
-# oracle so a stale `python3` on PATH (an older system CPython) does not diverge
-# from pypy on version-sensitive error text and trip a spurious cpython-vs-pypy
-# baseline mismatch.
-PYTHON3 = os.environ.get("PYRE_CHECK_PYTHON3") or next(
-    (cand for cand in ("python3.14", "python3", "python") if shutil.which(cand)),
-    "python3",
-)
+# vendored `lib-python/3` are coupled to that version. Take a version-matched
+# oracle or none at all: a stale `python3` on PATH (an older system CPython)
+# diverges from pypy on version-sensitive error text and trips a spurious
+# cpython-vs-pypy baseline mismatch, and its timings gate the ratios.
+CPYTHON_TARGET = (3, 14)
+
+
+def _probe_interpreter(command):
+    """What the interpreter reports as its version and its own path.
+
+    `None` when the command did not run at all, which on Windows is what a
+    `python3.14` naming an extensionless shim rather than an executable does —
+    `shutil.which` finds it and `CreateProcess` cannot start it.
+    """
+    probe = "import sys; print(sys.version_info[0], sys.version_info[1]); print(sys.executable)"
+    try:
+        proc = subprocess.run(
+            [command, "-c", probe], capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = (proc.stdout or "").splitlines()
+    if len(lines) < 2:
+        return None
+    try:
+        major, minor = lines[0].split()
+    except ValueError:
+        return None
+    return (int(major), int(minor)), lines[1].strip() or command
+
+
+def _resolve_python3():
+    """The oracle interpreter, as the absolute path it reports for itself.
+
+    A bare name would be resolved against the PATH of whichever environment
+    spawns it, and the timed runs hand the child a curated one.
+    """
+    named = os.environ.get("PYRE_CHECK_PYTHON3")
+    candidates = [named] if named else ["python3.14", "python3", "python"]
+    rejected = []
+    for candidate in candidates:
+        if named is None and shutil.which(candidate) is None:
+            continue
+        probed = _probe_interpreter(candidate)
+        if probed is None:
+            rejected.append(f"  {candidate}: did not run")
+            continue
+        version, executable = probed
+        if version == CPYTHON_TARGET:
+            return executable
+        rejected.append("  %s: %d.%d" % (candidate, *version))
+    wanted = "%d.%d" % CPYTHON_TARGET
+    raise SystemExit(
+        f"no CPython {wanted} to measure against — pyre targets it, and an "
+        f"older one disagrees on version-sensitive behaviour and timings.\n"
+        + ("\n".join(rejected) or "  (no candidate on PATH)")
+        + "\nName one with PYRE_CHECK_PYTHON3."
+    )
+
+
+PYTHON3 = _resolve_python3()
 PYPY3 = os.environ.get("PYRE_CHECK_PYPY3") or (
     "pypy3" if shutil.which("pypy3") else "pypy"
 )
