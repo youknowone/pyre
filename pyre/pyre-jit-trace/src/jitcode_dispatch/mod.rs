@@ -2887,6 +2887,28 @@ pub fn walk<Sym: WalkSym>(
         // enclosing Python `walk()` perform this same post-step limit check at
         // its real per-frame coordinate, matching RPython's one-red-frame
         // ownership.
+        //
+        // The exemption defers the abort, it does not drop it, and the deferral
+        // is bounded by one descent:
+        //
+        // * `run_sub_jitcode_walk` is the only site that sets the flag, and the
+        //   Python-callee sub-walk merely inherits it, which extends the exempt
+        //   region downward.  Every walk ROOT is built with it clear
+        //   (`bridge_subwalk.rs`), so an exempt descent always has a non-exempt
+        //   Python frame above it.
+        // * `is_too_long` is a `num_ops > trace_limit` comparison over the
+        //   shared `TraceCtx`, not an edge, so it still holds when the helper
+        //   returns and the enclosing frame runs this check.
+        //
+        // The exposure is therefore the ops one helper body records after
+        // crossing the limit.  Over the 373 synth fixtures two reach it at all:
+        // `trace_too_long_inline_multiframe` ends at 100 ops against a limit of
+        // 70, and `trace_too_long_effect_replay` at 115 against 100.  The size
+        // of that overshoot is a property of the base, not of this exemption —
+        // it moves whenever the walk records a different number of ops per
+        // helper — so re-measure it rather than inheriting the numbers.
+        // `helper_descent_defers_the_limit_check_to_the_enclosing_frame` pins
+        // both halves.
         if !ctx.fbw_mode.transparent_helper_subwalk && ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their

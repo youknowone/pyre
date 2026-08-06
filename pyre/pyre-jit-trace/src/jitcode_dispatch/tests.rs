@@ -9137,6 +9137,121 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // this fixture.
 }
 
+/// The post-step trace-limit check (`pyjitpl.py:2865 _interpret`) is skipped
+/// inside a canonical helper descent, which has no blackhole entry point to
+/// abort at, and runs on the enclosing Python frame instead.
+///
+/// Both halves are load-bearing and only their composition bounds the trace:
+/// exempting the descent without the enclosing frame still checking would let a
+/// helper record past `trace_limit` with nothing to stop it.  The caller here is
+/// one `inline_call_r_v/dR` — the descent — followed by its terminator, walked
+/// with the limit already crossed, so the two settings of the flag differ in
+/// exactly the frame that owns the check.
+#[test]
+fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
+    fn walk_past_the_limit(
+        transparent_helper_subwalk: bool,
+    ) -> Result<(DispatchOutcome, usize), DispatchError> {
+        let void_ret = *insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table");
+        let inline_byte = *insns_opname_to_byte()
+            .get("inline_call_r_v/dR")
+            .expect("`inline_call_r_v/dR` must be in insns table");
+        let callee_code: &'static [u8] = Box::leak(Box::new([void_ret]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 0,
+            num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| (idx == 7).then(|| sub_body.clone())
+        };
+        let caller_code = [
+            inline_byte,
+            0x07,
+            0x00, // descr index 7
+            0x01,
+            0x00,     // R: len=1, arg=r0
+            void_ret, // caller terminates
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        // One recorded op against a zero limit: the walk is over budget before
+        // its first step, so whichever frame owns the check aborts immediately.
+        tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+        tc.set_trace_limit(0);
+        assert!(tc.is_too_long(), "the walk must start over budget");
+        // Bridge-shaped (pyjitpl.py:2908), so the abort's warm-state half —
+        // `note_root_trace_too_long`, which reaches the driver through the
+        // merge point — is a no-op and the frame that owns the check is the
+        // only thing this fixture measures.
+        tc.clear_merge_points();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let mut wc = WalkContext {
+            callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: FbwWalkMode {
+                transparent_helper_subwalk,
+                ..test_fbw_mode()
+            },
+            session: &session,
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
+            pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        walk(&caller_code, 0, &mut wc)
+    }
+
+    // The descent runs inside the caller's first step, so the abort coordinate
+    // states which frame took it: pc 0 is the `inline_call_r_v/dR` itself, and
+    // the callee body — whose own offsets index a different JitCode — is never
+    // a legal abort pc for the enclosing walk.
+    assert_eq!(
+        walk_past_the_limit(false),
+        Err(DispatchError::TraceTooLong { pc: 0, ops: 1 }),
+        "an enclosing Python frame must abort at its own step",
+    );
+
+    assert_eq!(
+        walk_past_the_limit(true).map(|(outcome, _)| outcome),
+        Ok(DispatchOutcome::Terminate),
+        "a helper descent must finish its body and leave the check to its caller",
+    );
+}
+
 #[test]
 fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
     // codewriter shape contract says `R-list.len() <=
