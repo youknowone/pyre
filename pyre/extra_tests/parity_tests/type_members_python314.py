@@ -1,6 +1,5 @@
 """Type base relationships, heap flags, mutability, and baseability parity."""
 
-import sys
 import types
 
 
