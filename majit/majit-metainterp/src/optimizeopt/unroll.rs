@@ -1849,11 +1849,18 @@ impl UnrollOptimizer {
                     body_jump_arity, preamble_arity, exported_renamed_inputargs,
                 );
             }
-            // `compile.py:334 assert jump.numargs() == label.numargs()`.
-            // Upstream can assert because its `target_tokens[0]` is the start
-            // label whose args ARE `loop.inputargs` — the same loop-carried
-            // positions the body JUMP carries — so `unroll.py:238-242`'s
-            // arg-preserving retarget is sound by construction.
+            // Upstream has no arity check on this path at all, and the check
+            // below is pyre's own. `unroll.py:238-242 jump_to_preamble` only
+            // asserts `target_tokens[0].virtual_state is None` and retargets the
+            // JUMP with `copy_and_change`, keeping its args; `compile.py:334`'s
+            // `assert jump_op.numargs() == loop_info.label_op.numargs()` is
+            // guarded one line above by `if jump_op.getdescr() is
+            // loop_info.label_op.getdescr()`, which is exactly what
+            // `jump_to_preamble` has just stopped being true, and
+            // `compile_retrace` checks nothing. Upstream needs no check because
+            // its `target_tokens[0]` is the preamble start label carrying
+            // `start_state.renamed_inputargs` — the same loop-carried positions
+            // the body JUMP carries — so the retarget is sound by construction.
             //
             // A pyre RETRACE has no start label of its own (see
             // `emit_start_label`), so `target_tokens[0]` is the ORIGINAL loop's

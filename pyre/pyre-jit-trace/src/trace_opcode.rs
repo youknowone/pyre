@@ -2058,11 +2058,10 @@ impl MIFrame {
         //
         // A bytecode offset has exactly one operand-stack depth, so the merge
         // point's depth is available statically from the same liveness table
-        // `maybe_compile_and_run` gates interpreter entry on. Take it when it
-        // exceeds what the frame advertises — never carry fewer slots than the
-        // target header requires. Narrowing is deliberately not done: a close
-        // whose frame is deeper than the header's static depth keeps its
-        // slots, since dropping one would lose a value the JUMP must carry.
+        // `maybe_compile_and_run` gates interpreter entry on. Use that exact
+        // depth in either direction. The full virtualizable array capacity is
+        // still carried below; slots above the header's live depth are dead
+        // capacity and are null-padded rather than counted as live stack.
         self.close_merge_point_vsd = target_pc.and_then(|pc| {
             crate::state::merge_point_stack_depth_to_recover(self.concrete_frame_addr, pc)
         });

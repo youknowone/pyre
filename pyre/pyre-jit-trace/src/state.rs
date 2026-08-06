@@ -4399,15 +4399,14 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     Some(nlocals + ncells)
 }
 
-/// Static operand-stack depth at `target_pc`, but only when it exceeds the
-/// depth `frame` still advertises — the depth a closing JUMP must not fall
-/// below when it retargets a merge point at a different bytecode offset.
+/// Static operand-stack depth at `target_pc` when it differs from the depth
+/// `frame` still advertises. A closing JUMP retargeted to a different bytecode
+/// offset must publish the merge point's own live depth.
 ///
 /// `None` means "keep reading the frame": the frame or its code object cannot
 /// answer, the code has no liveness entry for `target_pc`, the depth would
-/// overrun `locals_cells_stack_w`, or the frame already covers the merge
-/// point. Never narrows — see `close_loop_args_at` for why only the widening
-/// direction is a correction.
+/// overrun `locals_cells_stack_w`, or the frame is already at the merge
+/// point's depth.
 pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize) -> Option<usize> {
     let concrete = concrete_stack_depth(frame)?;
     let w_code = unsafe {
@@ -4419,7 +4418,7 @@ pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize)
     if concrete_frame_array_len(frame).is_none_or(|len| depth > len) {
         return None;
     }
-    (depth > concrete).then_some(depth)
+    (depth != concrete).then_some(depth)
 }
 
 /// Return the absolute valuestackdepth.
@@ -13614,7 +13613,7 @@ mod tests {
     /// must recover that offset's own depth, or every operand-stack slot the
     /// header binds is force-nulled into the JUMP.
     #[test]
-    fn merge_point_stack_depth_recovers_a_deeper_header_and_never_narrows() {
+    fn merge_point_stack_depth_recovers_the_header_depth() {
         use pyre_interpreter::pyframe::PyFrame;
 
         ensure_test_callbacks();
@@ -13654,10 +13653,13 @@ mod tests {
             None,
         );
 
-        // Frame already deeper than the header's static depth: never narrow —
-        // dropping a slot would lose a value the JUMP must carry.
+        // Stale frame (resumed at a deeper offset), closing on the shallower
+        // header: slots above the header's static depth are dead capacity.
         frame.valuestackdepth = deep_vsd + 1;
-        assert_eq!(merge_point_stack_depth_to_recover(frame_ptr, deep_pc), None);
+        assert_eq!(
+            merge_point_stack_depth_to_recover(frame_ptr, deep_pc),
+            Some(deep_vsd),
+        );
 
         // An offset the code object has no liveness entry for keeps the frame.
         frame.valuestackdepth = base;

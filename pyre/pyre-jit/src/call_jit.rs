@@ -2231,9 +2231,15 @@ fn reject_non_exception_channel_value(
     );
 }
 
-/// resume.py:1312 blackhole_from_resumedata parity:
-/// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
-/// run _run_forever.
+/// `executioncontext.py:91-107 ExecutionContext.leave`'s frame-chain half, for a
+/// frame a blackhole resumed into and has now finished.
+///
+/// The profile-hook half (`if self.profilefunc: self._trace(frame,
+/// 'leaveframe', w_exitvalue)`) stays with the interpreter's own
+/// [`pyre_interpreter::PyExecutionContext::leave`], for the reason
+/// `walker_ec_leave` states: `is_being_profiled` is a portal-driver green, so a
+/// trace recorded with profiling off is only ever entered with profiling off,
+/// and the blackhole resuming out of it inherits that key.
 fn leave_resumed_blackhole_frame(
     frame: &majit_metainterp::blackhole::BlackholeInterpreter,
     got_exception: bool,
@@ -2276,6 +2282,9 @@ fn leave_resumed_blackhole_frame(
     }
 }
 
+/// resume.py:1312 blackhole_from_resumedata parity:
+/// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
+/// run _run_forever.
 pub fn blackhole_resume_via_rd_numb(
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],

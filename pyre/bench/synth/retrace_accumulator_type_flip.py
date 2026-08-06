@@ -5,13 +5,18 @@
 # one be BUILT: it defaults to 0 (`rpython/rlib/jit.py:595`), so no other fixture
 # in this corpus reaches `compile_retrace` at all.
 #
-# What this currently covers is the retrace path up to and including its give-up:
-# `retrace_needed` -> `cut_retrace_from` -> the unroll pass -> `jump_to_preamble`
-# (`unroll.py:156/171`) -> the `compile.py:334` arity give-up. The retrace is not
-# assembled, because pyre's start label is the portal entry contract while the
-# optimized loop-carried set is wider — see MC_DIAG slot 57. When that contract
-# is unified this fixture is what starts exercising a compiled retrace, and its
-# jit-stats row is what will say so.
+# It covers a retrace that is ASSEMBLED: `retrace_needed` -> `cut_retrace_from`
+# -> the unroll pass -> the fresh target token, which the closing JUMP then
+# matches. `loops_aborted` in the recorded jit-stats is what says so — it read 5
+# while every attempt gave up, and reads 0 now.
+#
+# The closure crosses bytecode offsets (the guard resumes deeper than the loop
+# header it closes onto), so `close_loop_args_at` has to publish the merge
+# point's own static stack depth rather than the depth the resumed frame still
+# advertises. Publishing the stale deeper one pins a loop-VARIANT
+# `valuestackdepth` as a constant, and the retrace then fails to match even its
+# own label; the fallback is `jump_to_preamble` (`unroll.py:156/171`), which
+# pyre refuses on an arity mismatch — MC_DIAG slot 57.
 #
 # CPython (the oracle) has no `pypyjit`; PyPy and pyre do. Guarding the import
 # keeps the output identical across all three while the param only binds where a
