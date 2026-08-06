@@ -126,26 +126,32 @@ EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # A floor failure is only trustworthy when the baseline clears the execution
 # floor enough for small relative error: execution time is the difference
 # between two independently measured values.
-FLOOR_GATE_MIN_BASELINE_S = 3 * EXEC_TIME_FLOOR_S
+#
+# Three times the floor is not enough of a clearance to fail a bench on.  At
+# that size the baseline is 3 scheduler ticks of Windows CPU accounting, each
+# side of the ratio carries +-1 tick, and a "you got fast" verdict is being
+# read off a number with a third of its own magnitude in quantization error.
+# One CI run failed `comprehension_accumulators` on windows for reading 0.3x
+# against a pypy baseline of 0.05s -- 3.2 ticks -- while the same fixture read
+# 1.6x and 2.5x on macos.  Ten times the floor holds that error near a tenth,
+# and it leaves the gate armed on 24 fixtures whose pypy time is real work.
+FLOOR_GATE_MIN_BASELINE_S = 10 * EXEC_TIME_FLOOR_S
 # The pypy performance floor is DERIVED from the ceiling and is never stated
 # per bench.  What we want from every bench is parity with pypy, so a
 # hand-written floor would assert that a fixture must STAY some number of times
 # slower than pypy -- not a thing anyone wants to be true, and one more number
 # to re-fit every time the ceiling moves.  The floor is only an instrument for
 # reporting that a ceiling has gone stale, so it sits at parity: reaching it is
-# the event worth a red run, and no ceiling above parity can put the floor
-# anywhere a bench that is merely fast on a fast host can reach.  Ceilings run
-# as far as 194x above the lowest ratio a runner has reported for their fixture,
-# and none of that spread can reach a floor pinned here.
+# the event worth a red run.
 PERF_GATE_FLOOR_RATIO = 1.0
 # Below a ceiling of this many times parity, a floor AT parity would sit inside
 # the band the ceiling itself allows, so the floor drops proportionally instead.
 # The divisor has to clear the span one fixture reads across the CI runners --
 # the ceiling is an allowance set from the slowest of them, and the fastest can
-# read several times lower.  Among the fixtures whose ceiling is low enough for
-# the divisor to bind, the widest gap between a ceiling and the lowest ratio any
-# runner reported for it is 22x, so a smaller divisor would fail a bench for
-# being fast on the host where it is fastest.
+# read several times lower.  Of the fixtures whose baseline is large enough to
+# arm the floor at all, the widest gap between a ceiling and a ratio a runner
+# reported for it is 6x; those are the fixtures whose pypy time is real work,
+# which is also what earns them a closely fitted ceiling.
 PERF_GATE_FLOOR_DIVISOR = 25
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
