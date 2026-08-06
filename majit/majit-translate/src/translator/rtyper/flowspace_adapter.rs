@@ -1593,6 +1593,21 @@ pub fn translate_op(
                             result,
                         )]);
                     }
+                    if segments.as_slice() == ["__getslice_rangeto"] && arg_hls.len() == 2 {
+                        // slice, end -> getslice(slice, 0, end)
+                        let mut args = arg_hls.into_iter();
+                        let slice = args.next().expect("slice arg");
+                        let end = args.next().expect("RangeTo end arg");
+                        return Ok(vec![FlowspaceOp::new(
+                            "getslice",
+                            vec![
+                                slice,
+                                Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+                                end,
+                            ],
+                            result,
+                        )]);
+                    }
                     // `[v; N]` array literal.  `front::mir` lowers
                     // `Rvalue::Repeat` to the `__array_repeat` synthetic
                     // carrying `(fill, count)` whenever the count decodes.
@@ -4749,6 +4764,40 @@ mod tests {
             translated[0].args[2],
             Hlvalue::Constant(Constant::new(ConstValue::Int(-1)))
         );
+        assert_eq!(translated[0].result, result);
+    }
+
+    #[test]
+    fn translate_op_getslice_rangeto_expands_after_annotation() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_getslice_rangeto_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let slice = Hlvalue::Variable(Variable::new());
+        let end = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), slice.clone());
+        value_map.insert(vars[1].clone(), end.clone());
+        value_map.insert(vars[2].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__getslice_rangeto".into()],
+                },
+                args: vec![vars[0].clone(), vars[1].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("RangeTo marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getslice");
+        assert_eq!(translated[0].args[0], slice);
+        assert_eq!(
+            translated[0].args[1],
+            Hlvalue::Constant(Constant::new(ConstValue::Int(0)))
+        );
+        assert_eq!(translated[0].args[2], end);
         assert_eq!(translated[0].result, result);
     }
 

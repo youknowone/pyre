@@ -2087,7 +2087,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
             || !lo.option_try_sites.is_empty()
-            || !lo.slice_index_minusone_sites.is_empty()
+            || !lo.slice_index_rangeto_sites.is_empty()
         {
             // The exception-link transforms run on a simplified graph,
             // as exceptiontransform.py does (graphs reach it after
@@ -2100,10 +2100,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
         }
         let mut tail_forwarded_returns = 0usize;
-        if !lo.slice_index_minusone_sites.is_empty() {
-            crate::front::slice_index::rewire_slice_index_minusone_sites(
+        if !lo.slice_index_rangeto_sites.is_empty() {
+            crate::front::slice_index::rewire_slice_index_rangeto_sites(
                 &mut lo.graph,
-                &lo.slice_index_minusone_sites,
+                &lo.slice_index_rangeto_sites,
             );
         }
         if !lo.result_exc_call_results.is_empty() {
@@ -2812,9 +2812,10 @@ struct Lowering<'a> {
     /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
     /// the loop (see [`crate::front::range_iter::RangeNewSite`]).
     range_iter_new_sites: Vec<crate::front::range_iter::RangeNewSite>,
-    /// RangeTo aggregates retained as candidates for the exact MinusOne
-    /// slice-index recognizer; general RangeTo remains dormant.
-    slice_index_minusone_sites: Vec<crate::front::slice_index::SliceIndexMinusOneSite>,
+    /// RangeTo aggregates retained as candidates for the slice-index
+    /// recognizer. The end's unsigned coloring is captured from MIR here,
+    /// before the operand can become a block inputarg.
+    slice_index_rangeto_sites: Vec<crate::front::slice_index::SliceIndexRangeToSite>,
     /// `RangeInclusive::contains(&self, &x)` call sites paired with the
     /// `new` sites above by the `front::range_contains` post-pass (see
     /// [`crate::front::range_contains::RangeContainsSite`]).
@@ -3040,7 +3041,7 @@ impl<'a> Lowering<'a> {
             saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
-            slice_index_minusone_sites: Vec::new(),
+            slice_index_rangeto_sites: Vec::new(),
             range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
@@ -4649,6 +4650,10 @@ impl<'a> Lowering<'a> {
                 // Resolve operand Variables up front; they flow into the
                 // synthesised FieldWrite chain rather than the ctor's
                 // arg list.
+                let rangeto_end_is_unsigned = operands
+                    .first()
+                    .and_then(operand_tyref)
+                    .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Unsigned);
                 let mut arg_vars: Vec<Variable> = Vec::with_capacity(operands.len());
                 for op in operands {
                     arg_vars.push(self.resolve_operand(mir_bb, op)?);
@@ -4749,24 +4754,16 @@ impl<'a> Lowering<'a> {
                     && ctor_name == "RangeTo"
                     && arg_vars.len() == 1
                 {
-                    self.slice_index_minusone_sites.push(
-                        crate::front::slice_index::SliceIndexMinusOneSite {
+                    self.slice_index_rangeto_sites.push(
+                        crate::front::slice_index::SliceIndexRangeToSite {
                             range_result: res.clone(),
                             end: arg_vars[0].clone(),
+                            end_is_unsigned: rangeto_end_is_unsigned,
                         },
                     );
                 }
-                // NOTE: RangeFrom and RangeTo capture are DORMANT. Their
-                // rewrites plant `getslice`, which has no blackhole handler.
-                // RangeFrom first exposed this when a graph dropped to the
-                // legacy walker with an uncolored Void stop. Activating
-                // RangeTo later exposed bare `getslice/rii>r` in both
-                // `split_builtin_kwargs` and `do_warn_explicit`: both stops
-                // are `args.len() - 1`, statically unsigned but not constant.
-                // The recognizer's const-nonnegative gate declines them; both
-                // captures remain disabled until the codewriter is guaranteed
-                // to consume the rtyped graph where `rtype_getslice` has
-                // replaced the op.
+                // RangeFrom alone stays dormant: its Void ConstNone stop has
+                // no regalloc coloring on the legacy-walker path.
                 // Surface every operand through a separate FieldWrite so
                 // the field-to-value binding survives into the
                 // codewriter / annotator.  Field names default to
@@ -23276,11 +23273,18 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|b| b.operations.iter())
-            .find_map(|op| match &op.kind {
-                OpKind::GetSlice { args } => args.get(2).cloned(),
+            .find_map(|space_op| match (&space_op.result, &space_op.kind) {
+                (
+                    Some(result),
+                    OpKind::BinOp {
+                        result_ty: ValueType::Unsigned,
+                        op,
+                        ..
+                    },
+                ) if op == "sub" => Some(result.clone()),
                 _ => None,
             })
-            .expect("RangeTo rewrite must emit getslice stop");
+            .expect("RangeTo end must retain an unsigned subtraction");
         let producer = graph
             .blocks
             .iter()
@@ -23945,5 +23949,31 @@ mod tests {
             "Option<&Wtf8> is a fat-ref DST option and must not niche-fold to a \
              pointer-null test (no null_mut discriminant)"
         );
+    }
+
+    /// Array slicing uses the general RangeTo lever; mutable indexing remains
+    /// residual because it writes through a view.
+    #[test]
+    #[ignore]
+    fn call_function_impl_result_has_no_residual_array_index() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "call_function_impl_result")
+            .expect("lower call_function_impl_result");
+        assert!(!graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments },
+                    ..
+                } if segments
+                    == &["core", "array", "<Impl>", "index"]
+                        .map(str::to_string)
+            )
+        }));
     }
 }
