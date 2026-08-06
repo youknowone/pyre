@@ -4457,33 +4457,34 @@ impl<'a> Lowering<'a> {
                 let v = self.resolve_place(mir_bb, place)?;
                 Ok((None, v))
             }
-            // `Repeat(elem, ty, count)` — `[v; N]` literal. Modeled as
-            // a synthetic Call so the IR shape stays uniform; downstream
-            // consumers see a 1-arg array construction call.
+            // `Repeat(elem, ty, count)` — `[v; N]` literal. The decodable
+            // shape follows upstream `transform.py:36-50` and
+            // `rlist.py:346-351`: `newlist(fill)` followed by
+            // `mul(list, count)`, which the transform pass collapses to
+            // `alloc_and_set(count, fill)`.
             //
-            // `__array_repeat` is deliberately unregistered: an array-repeat
-            // graph annotate-fails on it and falls back to the legacy
-            // walker. The transparent `Array` ctor the `Rvalue::Aggregate`
-            // array arm uses is NOT a substitute here — that arm materialises
-            // its elements through an explicit `__pos_N` `FieldWrite` chain,
-            // whereas a `Repeat` carries a count and a single fill and no
-            // per-slot writes, so an `Array` ctor would leave the value with
-            // no element representation and no length. The ctor does not
-            // zero-fill either: a zero-arg `Array` ctor matches no jtransform
-            // arm (only the zero-arg `Tuple` unit collapses to a null ref,
-            // `jtransform.rs`), so it would residualise as an unlowerable
-            // `symbolic_fnaddr` rather than a `new_array_clear`.
-            Rvalue::Repeat(elem, _ty, _count) => {
+            // `__array_repeat` remains deliberately unregistered for the
+            // fallback shape when Charon supplies a const-generic reference
+            // that cannot be decoded. In that case the old 1-arg call is
+            // preserved verbatim and the graph follows its existing legacy
+            // walker path. The transparent `Array` ctor is not equivalent:
+            // `Repeat` carries one fill value and a count, not per-slot
+            // `__pos_N` writes.
+            Rvalue::Repeat(elem, _ty, count) => {
                 let arg = self.resolve_operand(mir_bb, elem)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                let args = match self.emit_constant(mir_bb, &count) {
+                    Ok(count) => vec![arg, count],
+                    Err(_) => vec![arg],
+                };
                 Ok((
                     Some(OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__array_repeat".to_string()],
                         },
-                        args: vec![arg],
+                        args,
                         result_ty: ValueType::Int,
                     }),
                     res,

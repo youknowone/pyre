@@ -1567,6 +1567,42 @@ pub fn translate_op(
                     if let Some(opname) = nonraising_core_bridge_opname(segments, arg_hls.len()) {
                         return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
                     }
+                    // `[v; N]` array literal.  `front::mir` lowers
+                    // `Rvalue::Repeat` to the `__array_repeat` synthetic
+                    // carrying `(fill, count)` whenever the count decodes.
+                    // Expand it into the `[a] * b` shape upstream builds —
+                    // `newlist(a)` then `mul(list, b)` — which
+                    // `transform_allocate` (transform.py:36-50) collapses
+                    // into `alloc_and_set(b, a)`, the operation
+                    // `rtype_alloc_and_set` (rlist.py:346-351) lowers
+                    // through `ll_alloc_and_set` (rlist.py:487) to
+                    // `_ll_alloc_and_clear` / `_ll_alloc_and_set_nonnull`.
+                    //
+                    // The list must be `mul`'s arg 0: `transform_allocate`
+                    // matches on `op.args[0] in length1_lists` and reads the
+                    // count back out of `op.args[1]`, which is the order
+                    // `rtype_alloc_and_set` then consumes as
+                    // `hop.inputargs(Signed, r_list.item_repr)`.  Upstream's
+                    // `pairtype(SomeInteger, SomeList).mul` (binaryop.py:657)
+                    // exists but `transform_allocate` does not match it.
+                    // Both ops go out together so they share a block, which
+                    // is the scope `transform_allocate` scans.
+                    //
+                    // Emitting here rather than in `front::mir` is
+                    // deliberate: this adapter is only reached on the way to
+                    // the rtyper, so neither op can survive on a graph that
+                    // fell back to the legacy walker.
+                    if segments.len() == 1 && segments[0] == "__array_repeat" && arg_hls.len() == 2
+                    {
+                        let mut iter = arg_hls.into_iter();
+                        let fill = iter.next().expect("array repeat fill arg");
+                        let count = iter.next().expect("array repeat count arg");
+                        let list = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new("newlist", vec![fill], list.clone()),
+                            FlowspaceOp::new("mul", vec![list, count], result),
+                        ]);
+                    }
                     // `[__iter_next]` (`front::iter_next`) → the raising
                     // flowspace `next` op (`operation.rs` `OpKind::Next`,
                     // `can_only_throw = [StopIteration, RuntimeError]`).  The
@@ -4620,6 +4656,39 @@ mod tests {
         // `__name__`, mirroring upstream `func.__name__` (the leaf
         // identifier, not the dotted module path).
         assert_eq!(host.qualname(), "b");
+    }
+
+    #[test]
+    fn translate_op_array_repeat_expands_to_newlist_then_mul() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_array_repeat_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        let fill = Hlvalue::Variable(Variable::new());
+        let count = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), fill.clone());
+        value_map.insert(vars[2].clone(), count.clone());
+        value_map.insert(vars[3].clone(), result.clone());
+
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__array_repeat".into()],
+                },
+                args: vec![vars[1].clone(), vars[2].clone()],
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("two-arg __array_repeat must lower");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "newlist");
+        assert_eq!(translated[0].args, vec![fill.clone()]);
+        assert_eq!(translated[1].opname, "mul");
+        assert_eq!(translated[1].args[0], translated[0].result);
+        assert_eq!(translated[1].args[1], count);
+        assert_eq!(translated[1].result, result);
     }
 
     #[test]
