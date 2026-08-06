@@ -10323,7 +10323,7 @@ fn init_type_type(ns: PyObjectRef) {
                     }
                     let name = pyre_object::w_str_get_wtf8(args[1]);
                     match name.as_str() {
-                        Ok(name) => crate::baseobjspace::object_getattribute(w_type, name),
+                        Ok(name) => crate::baseobjspace::type_getattribute(w_type, name),
                         Err(_) => crate::baseobjspace::object_getattribute_surrogate(
                             w_type, args[1], name,
                         ),

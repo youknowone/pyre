@@ -6288,34 +6288,55 @@ pub(crate) unsafe fn object_delattr_surrogate(
     }
 }
 
-/// `raiseattrerror` for a lone-surrogate name.  descroperation.py:58-64
-/// renders the name with `%R` (its repr), so a lone surrogate prints as
-/// `\udcXX` rather than a lossy replacement char.  The repr already
-/// supplies the surrounding quotes (`format_wtf8_repr`), matching the
-/// `%R` substitution in `"'%T' object has no attribute %R"`.
+/// `raiseattrerror` for a lone-surrogate name. descroperation.py:58-64 keeps
+/// the original name object in the formatted AttributeError, so build the
+/// exception argument as WTF-8 instead of reducing it to a Rust string.
 fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
-    let tp_name = unsafe {
-        match crate::typedef::r#type(obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-            None => (*(*obj).ob_type).name.to_string(),
-        }
-    };
-    let name_repr = crate::display::format_wtf8_repr(name);
-    let mut err = PyError::new(
-        PyErrorKind::AttributeError,
-        format!("'{tp_name}' object has no attribute {name_repr}"),
+    let mut message = Wtf8Buf::from_string(format!(
+        "{} has no attribute '",
+        missing_attribute_subject(obj)
+    ));
+    message.push_wtf8(name);
+    message.push_wtf8(Wtf8::new("'"));
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let w_name = pyre_object::w_str_from_wtf8(name.to_wtf8_buf());
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_name);
+    let exc = pyre_object::interp_exceptions::w_exception_new_wtf8(
+        pyre_object::interp_exceptions::ExcKind::AttributeError,
+        &message,
     );
-    err.w_name_context = pyre_object::w_str_from_wtf8(name.to_wtf8_buf());
-    err.w_obj_context = obj;
-    err
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_name(
+            exc,
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+        );
+        pyre_object::interp_exceptions::w_exception_set_attr_obj(
+            exc,
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        );
+        PyError::from_exc_object(exc)
+    }
 }
 
 /// `object.__getattribute__` terminal — the default descriptor protocol
 /// without the user `__getattribute__` override check.
 pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
-        if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
+        if is_instance(obj) || is_type(obj) {
+            // descroperation.py:88-112 `Object.descr__getattribute__` uses
+            // `space.lookup(w_obj, name)`, hence the receiver's class (the
+            // metatype for a type object), and reads only
+            // `w_obj.getdictvalue`, never the receiver type's own MRO.
+            let instance = is_instance(obj);
+            let w_type = if instance {
+                w_instance_get_type(obj)
+            } else {
+                crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr())
+            };
             let w_descr = lookup_in_type_where(w_type, name);
             if let Some(descr) = w_descr {
                 if is_data_descr(descr) {
@@ -6324,13 +6345,15 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
                     }
                 }
             }
-            // Instance dict is the sole authority for instance attributes:
-            // read the mapdict node directly (getdictvalue, mapdict.py:846-847)
-            // rather than materialising the MapDictStrategy `__dict__` view, which
-            // MapDictStrategy.getitem_str (mapdict.py:1168-1175) delegates to
-            // anyway.  No side-table fallback.
-            let value =
-                crate::objspace::std::mapdict::instance_node_getdictvalue(obj, Wtf8::new(name));
+            // The receiver namespace is the sole authority at this stage.
+            // Read a user instance's mapdict node directly (getdictvalue,
+            // mapdict.py:846-847); a type receiver uses only its canonical
+            // dictionary, which is the corresponding `getdictvalue` result.
+            let value = if instance {
+                crate::objspace::std::mapdict::instance_node_getdictvalue(obj, Wtf8::new(name))
+            } else {
+                crate::type_dict_lookup(obj, name)
+            };
             if let Some(value) = value {
                 return Ok(value);
             }
@@ -6347,7 +6370,7 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
                 }
                 return Ok(descr);
             }
-            if name == "__class__" {
+            if instance && name == "__class__" {
                 return Ok(w_type);
             }
             // descroperation.py:88 — object.__getattribute__ raises
@@ -6362,10 +6385,17 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             ));
         }
     }
-    // Non-instance receiver (module, type, builtin object): the pure descriptor
-    // protocol with no `__getattr__` fallback — that belongs to space.getattr,
-    // not the bare object.__getattribute__ slot (descroperation.py:88).
+    // Remaining non-instance receivers (module and builtin objects): preserve
+    // their pure descriptor protocol with no `__getattr__` fallback — that
+    // belongs to space.getattr, not the bare object.__getattribute__ slot
+    // (descroperation.py:88).
     getattr_str_impl(obj, name, false, false)
+}
+
+/// typeobject.py:811-828 `W_TypeObject.descr_getattribute` — the canonical
+/// metatype-data-descriptor, class-MRO, metatype-non-data-descriptor lookup.
+pub(crate) fn type_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
+    object_getattr_miss(obj, name, false)
 }
 
 /// module.py `Module.descr_getattribute` — run the object-default descriptor
@@ -11742,17 +11772,7 @@ pub(crate) fn raiseattrerror(
             "'{tp_name}' object attribute '{name}' is read-only"
         ));
     }
-    let subject = unsafe {
-        if is_type(obj) {
-            format!("type object '{}'", pyre_object::w_type_get_name(obj))
-        } else {
-            let tp_name = match crate::typedef::r#type(obj) {
-                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-                None => (*(*obj).ob_type).name.to_string(),
-            };
-            format!("'{}' object", tp_name)
-        }
-    };
+    let subject = missing_attribute_subject(obj);
     // `object.c _PyObject_GenericSetAttrWithDict` appends the suffix when the
     // receiver has no dict *slot*.  A raising `getdict` says nothing about
     // whether the object could hold a dict, so the suffix is only added on a
@@ -11767,6 +11787,20 @@ pub(crate) fn raiseattrerror(
         obj,
         name,
     )
+}
+
+fn missing_attribute_subject(obj: PyObjectRef) -> String {
+    unsafe {
+        if is_type(obj) {
+            format!("type object '{}'", pyre_object::w_type_get_name(obj))
+        } else {
+            let tp_name = match crate::typedef::r#type(obj) {
+                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+                None => (*(*obj).ob_type).name.to_string(),
+            };
+            format!("'{tp_name}' object")
+        }
+    }
 }
 
 /// Delete an attribute: `del obj.name`.
