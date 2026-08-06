@@ -149,7 +149,9 @@ assert proc.wait() != 0, proc.returncode
 try:
     subprocess.run(child("import time; time.sleep(30)"), timeout=0.5)
 except subprocess.TimeoutExpired as exc:
-    assert exc.timeout == 0.5, exc.timeout
+    # The reported timeout is whatever was left of it when the wait gave up,
+    # which is the whole of it only where nothing was waited for first.
+    assert 0 < exc.timeout <= 0.5, exc.timeout
 else:
     raise AssertionError("a child that outlasts the timeout must raise")
 
