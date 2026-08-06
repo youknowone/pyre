@@ -1146,9 +1146,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "dup3",
             "fdatasync",
             "mkfifo",
-            "major",
-            "minor",
-            "makedev",
             "getloadavg",
             "killpg",
             "getpriority",
@@ -1200,6 +1197,71 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "register_at_fork",
         crate::make_builtin_function("register_at_fork", register_at_fork),
     );
+
+    // os.major(device) / os.minor(device) / os.makedev(major, minor)
+    // (`interp_posix.py:2551-2563`) — how a device number is taken apart and
+    // put back together, which is the host's own encoding and not arithmetic
+    // that can be spelled portably. `tarfile` reads a node's pair out of
+    // `st_rdev` to write a header (`tarfile.py:2275-2276`) and puts one back
+    // together to recreate the node (`:2735`), so a `None` here writes a
+    // header field that is not a number.
+    //
+    // No syscall, but the encoding is still the host's, and the sandbox build
+    // reaches libc through a shim that carries no `dev_t` — so the names are
+    // absent there rather than answering with another host's arithmetic.
+    // `moduledef.py:152-157` registers each only where the host has it.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    {
+        // A device number is a `dev_t`, which is wider than a C int where the
+        // pair is more than two bytes and signed where it is not — so the
+        // argument is narrowed to that type rather than to `c_int`, and a value
+        // that does not fit says so instead of wrapping.
+        fn device_w(args: &[PyObjectRef]) -> Result<libc::dev_t, crate::PyError> {
+            let Some(&value) = args.first() else {
+                return Err(crate::PyError::type_error("device is required"));
+            };
+            libc::dev_t::try_from(crate::baseobjspace::int_w(value)?).map_err(|_| {
+                crate::PyError::overflow_error("Python int too large to convert to C dev_t")
+            })
+        }
+        crate::module_ns_store(
+            ns,
+            "major",
+            crate::make_builtin_function_with_arity(
+                "major",
+                |args| Ok(pyre_object::w_int_new(libc::major(device_w(args)?) as i64)),
+                1,
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "minor",
+            crate::make_builtin_function_with_arity(
+                "minor",
+                |args| Ok(pyre_object::w_int_new(libc::minor(device_w(args)?) as i64)),
+                1,
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "makedev",
+            crate::make_builtin_function_with_arity(
+                "makedev",
+                |args| {
+                    let (major, minor) = match args {
+                        [major, minor, ..] => (*major, *minor),
+                        _ => return Err(crate::PyError::type_error("makedev takes 2 arguments")),
+                    };
+                    let major = crate::baseobjspace::c_int_w(major)?;
+                    let minor = crate::baseobjspace::c_int_w(minor)?;
+                    Ok(pyre_object::w_int_new(
+                        libc::makedev(major as _, minor as _) as i64
+                    ))
+                },
+                2,
+            ),
+        );
+    }
 
     // PyPy `interp_posix.get_blocking/set_blocking` → rposix
     // `get_blocking/set_blocking`: inspect or update O_NONBLOCK with fcntl.

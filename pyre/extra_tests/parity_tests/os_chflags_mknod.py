@@ -102,6 +102,31 @@ if hasattr(os, "mknod"):
     )
     raises(lambda: os.mknod("x", dir_fd="x"), TypeError, "argument should be integer or None, not str")
 
+# ── the device number mknod is handed comes apart and back together ───────
+# tarfile reads the pair out of st_rdev to write a header (tarfile.py:2275-2276)
+# and puts one back together to recreate the node (:2735), so these have to be
+# the host's own encoding rather than a plausible one.
+if hasattr(os, "makedev"):
+    check(hasattr(os, "major") and hasattr(os, "minor"), "makedev without major/minor")
+    for pair in ((5, 1), (0, 0), (1, 0x1ffff), (0xff, 0)):
+        device = os.makedev(*pair)
+        check(isinstance(device, int), f"makedev{pair} is not a number: {device!r}")
+        check(
+            (os.major(device), os.minor(device)) == pair,
+            f"makedev{pair} did not survive major/minor: {device!r}",
+        )
+    # A node the process can make is one whose pair reads back.
+    if hasattr(os, "mknod"):
+        os.mknod("n", 0o600 | stat.S_IFIFO)
+        rdev = os.lstat(os.path.join(d, "n")).st_rdev
+        check(os.makedev(os.major(rdev), os.minor(rdev)) == rdev, "st_rdev did not round-trip")
+        os.unlink("n")
+    raises(lambda: os.major(1.5), TypeError)
+    raises(lambda: os.makedev(1.5, 0), TypeError)
+    raises(lambda: os.makedev(5), TypeError, "makedev expected 2 arguments, got 1")
+else:
+    check(not hasattr(os, "major"), "major without makedev")
+
 # ── chflags sets the flag it is given ─────────────────────────────────────
 if hasattr(os, "chflags"):
     check(hasattr(os, "lchflags"), "chflags without lchflags")
