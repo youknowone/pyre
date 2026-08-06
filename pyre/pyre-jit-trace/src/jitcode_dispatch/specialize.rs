@@ -5783,7 +5783,7 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
@@ -5805,20 +5805,43 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
         _ => return Ok(None),
     };
 
-    let Some((
-        lhs,
-        rhs,
-        lhs_obj,
-        rhs_obj,
-        lhs_is_int,
-        rhs_is_int,
-        lhs_f64,
-        rhs_f64,
-        boxed_result_i64,
-    )) = walker_float_specialization_operands(ctx, r_args, allboxes, call_descr)
+    let Some((lhs, rhs, lhs_obj, rhs_obj, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64)) =
+        walker_float_specialization_input_operands(ctx, r_args)
     else {
         return Ok(None);
     };
+
+    if matches!(op_code, Some(OpCode::FloatTrueDiv)) && rhs_f64 == 0.0 {
+        let Some(Err(exc_i64)) = walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)
+        else {
+            return Ok(None);
+        };
+        if let Some(cb) = crate::callbacks::try_get() {
+            (cb.drain_backend_jit_exc)();
+        }
+        let exc = exc_i64 as usize as pyre_object::PyObjectRef;
+        let kind = pyre_object::interp_exceptions::ExcKind::ZeroDivisionError;
+        if !walker_recorded_builtin_raise_is_supported(exc, kind) {
+            return Ok(None);
+        }
+
+        let _lhs_raw =
+            walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64, false)?;
+        let rhs_raw =
+            walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64, false)?;
+        let rhs_zero = walker_float_eq_const(ctx, rhs_raw, 0.0, 1);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[rhs_zero])?;
+        return Ok(Some(walker_emit_recorded_builtin_raise(ctx, exc, kind)));
+    }
+
+    let Some(Ok(boxed_result_i64)) =
+        walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)
+    else {
+        return Ok(None);
+    };
+    if boxed_result_i64 == 0 {
+        return Ok(None);
+    }
     if op_code.is_none() {
         // The generic helper already executed concretely (it produced
         // `boxed_result_i64`), so a non-float result here would mean
@@ -5828,15 +5851,6 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
         if unsafe { !pyre_object::pyobject::is_float(boxed_obj) } {
             return Ok(None);
         }
-    }
-
-    // floatobject.py `_floatdiv` raises "float division by zero" — a
-    // concrete zero divisor at trace time means the generic helper already
-    // raised, so a non-raising specialized `FloatTrueDiv` (raw IEEE → inf)
-    // would be a miscompile.  Decline so the generic CALL_MAY_FORCE leg
-    // (descr_truediv) records the raising call.
-    if matches!(op_code, Some(OpCode::FloatTrueDiv)) && rhs_f64 == 0.0 {
-        return Ok(None);
     }
 
     // --- emit the specialized IR (walker-native) ---
@@ -5904,7 +5918,7 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(()))
+    Ok(Some(DispatchOutcome::Continue))
 }
 
 /// #62: walker-native speculative specialization for the `BINARY_SUBSCR`

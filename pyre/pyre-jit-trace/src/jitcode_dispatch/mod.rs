@@ -7331,6 +7331,38 @@ fn walker_float_specialization_operands<Sym: WalkSym>(
     f64,
     i64,
 )> {
+    let (lhs, rhs, lhs_obj, rhs_obj, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64) =
+        walker_float_specialization_input_operands(ctx, r_args)?;
+    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
+    Some((
+        lhs,
+        rhs,
+        lhs_obj,
+        rhs_obj,
+        lhs_is_int,
+        rhs_is_int,
+        lhs_f64,
+        rhs_f64,
+        boxed_result_i64,
+    ))
+}
+
+/// Operand-only half of [`walker_float_specialization_operands`], used when a
+/// raising arithmetic arm needs the helper-produced exception rather than a
+/// boxed value.
+fn walker_float_specialization_input_operands<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+) -> Option<(
+    OpRef,
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    bool,
+    bool,
+    f64,
+    f64,
+)> {
     if r_args.len() != 2 {
         return None;
     }
@@ -7370,17 +7402,8 @@ fn walker_float_specialization_operands<Sym: WalkSym>(
     if lhs_is_int && rhs_is_int {
         return None;
     }
-    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
     Some((
-        lhs,
-        rhs,
-        lhs_obj,
-        rhs_obj,
-        lhs_is_int,
-        rhs_is_int,
-        lhs_f64,
-        rhs_f64,
-        boxed_result_i64,
+        lhs, rhs, lhs_obj, rhs_obj, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64,
     ))
 }
 

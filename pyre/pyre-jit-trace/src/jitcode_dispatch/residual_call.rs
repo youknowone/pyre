@@ -6442,9 +6442,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             )?;
                         }
                         if specialized.is_none() {
-                            specialized = try_walker_specialize_binary_op_float(
+                            if let Some(outcome) = try_walker_specialize_binary_op_float(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?;
+                            )? {
+                                return Ok((outcome, op.next_pc));
+                            }
                         }
                         specialized
                     }
