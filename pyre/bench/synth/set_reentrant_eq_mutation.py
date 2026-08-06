@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=13
+# The ceiling is twice the slowest ratio observed, 6.1x on the macos runner;
+# the gate it replaces sat inside the run-to-run spread.
 class ReentrantKey:
     def __init__(self, value, state):
         self.value = value
