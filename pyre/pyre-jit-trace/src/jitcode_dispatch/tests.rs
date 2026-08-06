@@ -441,6 +441,7 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -662,6 +663,7 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -718,6 +720,7 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -792,6 +795,7 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -1043,6 +1047,7 @@ fn drive_int_add_jump_if_ovf(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -1200,6 +1205,7 @@ fn drive_alloc_with_descr(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -1393,6 +1399,7 @@ fn run_hint_step_with_descrs(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -1901,6 +1908,7 @@ fn switch_id_hit_jumps_to_matching_target() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -1958,6 +1966,7 @@ fn switch_id_miss_falls_through() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2014,6 +2023,7 @@ fn switch_id_requires_concrete_int_value() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2079,6 +2089,7 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2136,6 +2147,7 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2192,6 +2204,7 @@ fn goto_if_not_requires_concrete_int_value() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2457,6 +2470,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2625,6 +2639,7 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2741,6 +2756,7 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2852,6 +2868,7 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2952,6 +2969,7 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3048,6 +3066,7 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3126,6 +3145,7 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3183,6 +3203,7 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3236,6 +3257,7 @@ fn step_through_live_opcode_advances_by_offset_size() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3298,6 +3320,7 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3358,6 +3381,7 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3419,6 +3443,7 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3481,6 +3506,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3560,6 +3586,7 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3627,6 +3654,7 @@ fn step_through_void_return_stashes_void_finish_payload() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3695,6 +3723,7 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3751,6 +3780,7 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3810,6 +3840,7 @@ fn step_through_goto_jumps_to_label_target() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3869,6 +3900,7 @@ fn step_through_goto_handles_high_byte_of_label() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3976,6 +4008,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4030,6 +4063,7 @@ fn step_through_catch_exception_advances_past_label_operand() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4098,6 +4132,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4180,6 +4215,7 @@ fn top_level_raise_settles_the_vable_token() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4286,6 +4322,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4386,6 +4423,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4463,6 +4501,7 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4517,6 +4556,7 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4635,6 +4675,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4756,6 +4797,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4825,6 +4867,7 @@ fn step_through_int_copy_advances_past_operand_bytes() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4891,6 +4934,7 @@ fn int_copy_writes_src_value_into_dst_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4948,6 +4992,7 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5004,6 +5049,7 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5080,6 +5126,7 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5144,6 +5191,7 @@ fn ref_copy_writes_src_value_into_dst_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5199,6 +5247,7 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5253,6 +5302,7 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5318,6 +5368,7 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5543,6 +5594,7 @@ fn drive_int_between(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5680,6 +5732,7 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5770,6 +5823,7 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5848,6 +5902,7 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5946,6 +6001,7 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6117,6 +6173,7 @@ fn run_float_step(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6311,6 +6368,7 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6366,6 +6424,7 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6423,6 +6482,7 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6488,6 +6548,7 @@ fn unsupported_opname_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6544,6 +6605,7 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6693,6 +6755,7 @@ fn abort_result_r_is_pure_pc_advance() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6759,6 +6822,7 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6843,6 +6907,7 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6928,6 +6993,7 @@ fn ref_guard_value_on_const_records_nothing() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7023,6 +7089,7 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7192,6 +7259,7 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7278,6 +7346,7 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7336,6 +7405,7 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7409,6 +7479,7 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7506,6 +7577,7 @@ fn may_force_with_active_vable_executes_and_clears_token() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7607,6 +7679,7 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7683,6 +7756,7 @@ fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7746,6 +7820,7 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7803,6 +7878,7 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7872,6 +7948,7 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7943,6 +8020,7 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8034,6 +8112,7 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8114,6 +8193,7 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8193,6 +8273,7 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8252,6 +8333,7 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8349,6 +8431,7 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8445,6 +8528,7 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8549,6 +8633,7 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8685,6 +8770,7 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8757,6 +8843,7 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8815,6 +8902,7 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8897,6 +8985,7 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9010,6 +9099,7 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9045,6 +9135,121 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // + `Arc::ptr_eq(real_call_descr)` checks that lived here in
     // the pre-`Ok` / `Err` / `Some` identity rewrite version of
     // this fixture.
+}
+
+/// The post-step trace-limit check (`pyjitpl.py:2865 _interpret`) is skipped
+/// inside a canonical helper descent, which has no blackhole entry point to
+/// abort at, and runs on the enclosing Python frame instead.
+///
+/// Both halves are load-bearing and only their composition bounds the trace:
+/// exempting the descent without the enclosing frame still checking would let a
+/// helper record past `trace_limit` with nothing to stop it.  The caller here is
+/// one `inline_call_r_v/dR` — the descent — followed by its terminator, walked
+/// with the limit already crossed, so the two settings of the flag differ in
+/// exactly the frame that owns the check.
+#[test]
+fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
+    fn walk_past_the_limit(
+        transparent_helper_subwalk: bool,
+    ) -> Result<(DispatchOutcome, usize), DispatchError> {
+        let void_ret = *insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table");
+        let inline_byte = *insns_opname_to_byte()
+            .get("inline_call_r_v/dR")
+            .expect("`inline_call_r_v/dR` must be in insns table");
+        let callee_code: &'static [u8] = Box::leak(Box::new([void_ret]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 0,
+            num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| (idx == 7).then(|| sub_body.clone())
+        };
+        let caller_code = [
+            inline_byte,
+            0x07,
+            0x00, // descr index 7
+            0x01,
+            0x00,     // R: len=1, arg=r0
+            void_ret, // caller terminates
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        // One recorded op against a zero limit: the walk is over budget before
+        // its first step, so whichever frame owns the check aborts immediately.
+        tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+        tc.set_trace_limit(0);
+        assert!(tc.is_too_long(), "the walk must start over budget");
+        // Bridge-shaped (pyjitpl.py:2908), so the abort's warm-state half —
+        // `note_root_trace_too_long`, which reaches the driver through the
+        // merge point — is a no-op and the frame that owns the check is the
+        // only thing this fixture measures.
+        tc.clear_merge_points();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let mut wc = WalkContext {
+            callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: FbwWalkMode {
+                transparent_helper_subwalk,
+                ..test_fbw_mode()
+            },
+            session: &session,
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+            store_subscr_fn_addr: None,
+            pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        walk(&caller_code, 0, &mut wc)
+    }
+
+    // The descent runs inside the caller's first step, so the abort coordinate
+    // states which frame took it: pc 0 is the `inline_call_r_v/dR` itself, and
+    // the callee body — whose own offsets index a different JitCode — is never
+    // a legal abort pc for the enclosing walk.
+    assert_eq!(
+        walk_past_the_limit(false),
+        Err(DispatchError::TraceTooLong { pc: 0, ops: 1 }),
+        "an enclosing Python frame must abort at its own step",
+    );
+
+    assert_eq!(
+        walk_past_the_limit(true).map(|(outcome, _)| outcome),
+        Ok(DispatchOutcome::Terminate),
+        "a helper descent must finish its body and leave the check to its caller",
+    );
 }
 
 #[test]
@@ -9113,6 +9318,7 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9215,6 +9421,7 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9296,6 +9503,7 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9380,6 +9588,7 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9462,6 +9671,7 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9549,6 +9759,7 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9634,6 +9845,7 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9708,6 +9920,7 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9803,6 +10016,7 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9876,6 +10090,7 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9937,6 +10152,7 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -10010,6 +10226,7 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -10103,6 +10320,7 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -10186,6 +10404,7 @@ fn setfield_gc_i_redundant_write_skips_recording() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -10247,6 +10466,7 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -10334,6 +10554,7 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -10404,6 +10625,7 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -10548,6 +10770,7 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -10625,6 +10848,7 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -10694,6 +10918,7 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -11012,6 +11237,7 @@ fn walk_undecodable_byte_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -11090,6 +11316,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -11178,6 +11405,7 @@ fn loop_header_stamps_seen_flag() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -11245,6 +11473,7 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -11308,6 +11537,7 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -11649,6 +11879,7 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -11843,6 +12074,7 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -11942,6 +12174,7 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };

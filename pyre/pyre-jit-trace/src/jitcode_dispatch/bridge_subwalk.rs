@@ -404,6 +404,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -1248,6 +1249,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
@@ -1358,7 +1360,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // owns their banks — `drive_bridge_carrier_walk`'s abort tail adopts
         // the image, and a decline there leaves the pre-existing rollback.
         if let Err(ref error) = outcome {
-            let _ = latch_abort_blackhole(&sub_wc, error.stop_pc());
+            let _ = latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361");
         }
         outcome
     };

@@ -1656,6 +1656,19 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// the virtualizable shadow instead of replaying stack effects.  Cleared once
     /// the walk advances past this ceiling (py-pc order is monotonic again).
     pub vstack_reorder_ceiling: u32,
+    /// The py_pc the walk's floor lookup reports while it is inside an
+    /// out-of-line exception LANDING block — the unwind bookkeeping the
+    /// codewriter emits per catch site, after the whole body, which then jumps
+    /// to the handler proper.  `None` when the catch target is in line with its
+    /// handler (nothing to skip).
+    ///
+    /// Those bytes lower no Python opcode, but they are laid out inside some
+    /// other opcode's floor segment, so the walk reports that opcode as a
+    /// boundary and the mirror would replay a stack effect from a block it
+    /// never ran — and, py order having gone backwards, arm the reorder region
+    /// over the whole handler body.  Hold the handler-entry coordinate until
+    /// the walk leaves those bytes instead.
+    pub vstack_handler_landing_py: Option<u32>,
     /// #73: the jitcode offset of the `-live-` byte that
     /// precedes the CURRENT opcode's guard resume point — the `-live-`
     /// BEFORE (`pyjitpl.py`, normal guard resume reads at
@@ -2829,7 +2842,7 @@ pub fn walk<Sym: WalkSym>(
                     && !carrier_owned
                     && !abort_blackhole_latched()
                 {
-                    let _ = latch_abort_blackhole(ctx, error.stop_pc());
+                    let _ = latch_abort_blackhole(ctx, error.stop_pc(), "mod2730");
                 }
                 return Err(error);
             }
@@ -2874,6 +2887,28 @@ pub fn walk<Sym: WalkSym>(
         // enclosing Python `walk()` perform this same post-step limit check at
         // its real per-frame coordinate, matching RPython's one-red-frame
         // ownership.
+        //
+        // The exemption defers the abort, it does not drop it, and the deferral
+        // is bounded by one descent:
+        //
+        // * `run_sub_jitcode_walk` is the only site that sets the flag, and the
+        //   Python-callee sub-walk merely inherits it, which extends the exempt
+        //   region downward.  Every walk ROOT is built with it clear
+        //   (`bridge_subwalk.rs`), so an exempt descent always has a non-exempt
+        //   Python frame above it.
+        // * `is_too_long` is a `num_ops > trace_limit` comparison over the
+        //   shared `TraceCtx`, not an edge, so it still holds when the helper
+        //   returns and the enclosing frame runs this check.
+        //
+        // The exposure is therefore the ops one helper body records after
+        // crossing the limit.  Over the 373 synth fixtures two reach it at all:
+        // `trace_too_long_inline_multiframe` ends at 100 ops against a limit of
+        // 70, and `trace_too_long_effect_replay` at 115 against 100.  The size
+        // of that overshoot is a property of the base, not of this exemption —
+        // it moves whenever the walk records a different number of ops per
+        // helper — so re-measure it rather than inheriting the numbers.
+        // `helper_descent_defers_the_limit_check_to_the_enclosing_frame` pins
+        // both halves.
         if !ctx.fbw_mode.transparent_helper_subwalk && ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
@@ -2885,7 +2920,7 @@ pub fn walk<Sym: WalkSym>(
             // replay would resume the caller without delivering the return or
             // raise that this step produced.
             let snapshot_safe = trace_too_long_blackhole_snapshot_safe(&outcome);
-            let blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc);
+            let blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
             if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(

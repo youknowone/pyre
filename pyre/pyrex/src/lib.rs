@@ -832,15 +832,30 @@ fn maybe_print_jit_stats() {
         pyre_jit::fbw_diag_counter(9),
         pyre_jit::fbw_diag_counter(10),
     );
-    // Walks that ended uncommitted after a residual had already run an
-    // irreversible effect: the store journal cannot undo a residual that wrote
-    // live heap or entered a Python frame, so the replay the caller falls back
-    // to applies those effects twice. `fbw_diag::ROLLED_BACK_WITH_EFFECTS`,
-    // which the wasm runner already exports; a nonzero value names a walk-abort
-    // variant that reaches `run_perfn_walk`'s epilogue without an adopt leg.
+    // Walks that ended uncommitted after a residual had already run an effect
+    // no journal undoes — it wrote live heap or entered a Python frame — so the
+    // replay the caller falls back to applies that effect twice.
+    // `fbw_diag::ROLLED_BACK_WITH_EFFECTS`, which the wasm runner also exports;
+    // a nonzero value names a walk-abort variant that reaches
+    // `run_perfn_walk`'s epilogue without an adopt leg.
+    //
+    // `STORE_JOURNAL_ROLLBACK_FAILED` is the hole that subtraction would
+    // otherwise open: a journaled store the rollback could not restore is
+    // subtracted out of the count above, so it needs one of its own.
+    //
+    // The two adoption tallies are the same population read from the other end:
+    // the walks that DID hand the interpreter a resumable image. Nothing else
+    // counts them, so a change that silently sends a shape back to the legacy
+    // replay moves no gated counter without these.
     eprintln!(
-        "[jit-stats] fbw_rolled_back_with_effects={}",
+        "[jit-stats] fbw_rolled_back_with_effects={} \
+         fbw_store_journal_rollback_failed={} \
+         fbw_blackhole_adopted_single_frame={} \
+         fbw_blackhole_adopted_multi_frame={}",
         pyre_jit::fbw_diag_counter(1),
+        pyre_jit::fbw_diag_counter(11),
+        pyre_jit::fbw_diag_counter(12),
+        pyre_jit::fbw_diag_counter(13),
     );
     let stats = pyre_jit::eval::driver_pair().0.get_stats();
     eprintln!(

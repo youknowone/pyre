@@ -450,6 +450,50 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         }
     }
 
+    // The environment the collector sizes itself from, forwarded the same way
+    // and for the same reason. It is not a diagnostic knob: `PYPY_GC_MIN` and
+    // `PYPY_GC_NURSERY` fix where the major-collection threshold falls, the
+    // major step arms the eval-breaker word, and every compiled loop's back edge
+    // polls that word through a real guard — so a guest that cannot read them
+    // counts a different number of guard failures than the native backends run
+    // beside it, from the same settings. Absent on a module predating the
+    // export, which then keeps its built-in defaults.
+    let gc_env_names = instance
+        .get_typed_func::<(), u64>(&mut store, "pyre_gc_env_names")
+        .ok();
+    let set_gc_env = instance
+        .get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_gc_env")
+        .ok();
+    if let (Some(names), Some(set_gc_env)) = (gc_env_names, set_gc_env) {
+        let packed = names.call(&mut store, ())?;
+        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
+        let mut buf = vec![0u8; nlen as usize];
+        memory.read(&store, nptr as usize, &mut buf)?;
+        dealloc.call(&mut store, (nptr, nlen))?;
+
+        // `env::var`, not `var_os`: the guest parses these as numbers, so a
+        // value that does not decode could not have been one and is left unset
+        // exactly as it would be natively.
+        let blob = String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\0");
+
+        let blen = blob.len() as u32;
+        if blen != 0 {
+            let p = alloc.call(&mut store, blen)?;
+            memory.write(&mut store, p as usize, blob.as_bytes())?;
+            set_gc_env.call(&mut store, (p, blen))?;
+            dealloc.call(&mut store, (p, blen))?;
+        }
+    }
+
     // Name the script so the guest compiles it under its real path: that is
     // what a traceback prints, what its source-line lookup reads back through
     // `pyre_host.host_read`, and the directory that heads `sys.path`. Absent
@@ -620,7 +664,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         // which the guest cannot read. Slot layout in
         // `pyre_jit_trace::trace::fbw_diag`.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
-            const RING_BASE: u32 = 11;
+            const RING_BASE: u32 = 14;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
@@ -628,12 +672,14 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             let walks = slot(0);
             eprintln!(
                 "[jit-stats] fbw_diag walks={walks} ROLLED_BACK_WITH_EFFECTS={} \
-                 midbody_latch={}/{} escape_plain_fallback={}/{}",
+                 midbody_latch={}/{} escape_plain_fallback={}/{} \
+                 fbw_store_journal_rollback_failed={}",
                 slot(1),
                 slot(3),
                 slot(2),
                 slot(5),
                 slot(4),
+                slot(11),
             );
             for entry in 0..RING_ENTRIES.min(walks as u32) {
                 let base = RING_BASE + entry * RING_STRIDE;
@@ -654,7 +700,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 let field = |shift: u32| (flags >> shift) & 0xffff;
                 eprintln!(
                     "[fbw-census] end={end} committed={} leg={} bridge={} exec_mf={} \
-                     effects={} journal={}",
+                     effects={} journaled={}",
                     flags & (1 << 1) != 0,
                     (flags >> 56) & 0xff,
                     flags & (1 << 2) != 0,
@@ -858,14 +904,29 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         // the same key the native backends print, because `_jit_stats_change`
         // compares by name and a name only one backend emits gates nothing on
         // the others.
-        let fbw_rolled_back_with_effects = match instance
+        // Slot 11 is `STORE_JOURNAL_ROLLBACK_FAILED`, the store restores the
+        // rollback could not perform — the one journaled effect the walk-end
+        // subtraction must not silently absorb. Both slots come from one
+        // export lookup so an absent export names itself once.
+        let (
+            fbw_rolled_back_with_effects,
+            fbw_store_journal_rollback_failed,
+            fbw_blackhole_adopted_single_frame,
+            fbw_blackhole_adopted_multi_frame,
+        ) = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")
-            .and_then(|f| f.call(&mut store, 1))
-        {
-            Ok(v) => v,
+            .and_then(|f| {
+                Ok((
+                    f.call(&mut store, 1)?,
+                    f.call(&mut store, 11)?,
+                    f.call(&mut store, 12)?,
+                    f.call(&mut store, 13)?,
+                ))
+            }) {
+            Ok(slots) => slots,
             Err(_) => {
                 missing.push("pyre_fbw_diag");
-                0
+                (0, 0, 0, 0)
             }
         };
         if !missing.is_empty() {
@@ -890,7 +951,10 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
              field_pos_spec_checked={field_pos_spec_checked} \
              field_pos_spec_misplaced={field_pos_spec_misplaced} \
              field_pos_attached_checked={field_pos_attached_checked} \
-             field_pos_attached_misplaced={field_pos_attached_misplaced}"
+             field_pos_attached_misplaced={field_pos_attached_misplaced} \
+             fbw_store_journal_rollback_failed={fbw_store_journal_rollback_failed} \
+             fbw_blackhole_adopted_single_frame={fbw_blackhole_adopted_single_frame} \
+             fbw_blackhole_adopted_multi_frame={fbw_blackhole_adopted_multi_frame}"
         );
     }
     let packed = match run_result {

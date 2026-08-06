@@ -18,6 +18,15 @@ A script whose subject is platform-specific names the platforms it
 applies to in its header (`# pyre-check: platforms=linux,darwin`) and is
 skipped elsewhere.
 
+A script whose defect is only reachable under a particular runtime
+configuration declares it with one or more
+
+    # parity-env: NAME=VALUE
+
+lines, which are added to the environment of every runner for that script
+only. Without this a script can keep passing after the shape it exercises
+stops being reachable, i.e. cover nothing while still looking green.
+
 Usage:
     python3 pyre/extra_tests/parity_tests/run.py
         [--dynasm-only|--cranelift-only] [--gc-poison]
@@ -35,6 +44,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +100,15 @@ def _scripts() -> tuple[list[Path], list[Path]]:
             continue
         (out if _runs_here(p) else skipped).append(p)
     return out, skipped
+
+
+_ENV_DIRECTIVE = re.compile(r"^#\s*parity-env:\s*(\w+)=(\S*)\s*$", re.MULTILINE)
+
+
+def _script_env(script: Path) -> dict[str, str]:
+    """Environment a script pins for itself with `# parity-env: NAME=VALUE`."""
+    text = script.read_text(encoding="utf-8", errors="replace")
+    return {m.group(1): m.group(2) for m in _ENV_DIRECTIVE.finditer(text)}
 
 
 def _run(cmd: list[str], script: Path, env: dict[str, str] | None) -> tuple[bool, str]:
@@ -224,9 +243,11 @@ def main() -> int:
     fail = 0
     for script in scripts:
         name = script.name
+        pinned = _script_env(script)
         row: list[str] = [f"  {name:<36s}"]
         for backend, cmd, env in runners:
-            ok, detail = _run(cmd, script, env)
+            merged = {**(env or {}), **pinned}
+            ok, detail = _run(cmd, script, merged or None)
             mark = "OK" if ok else "FAIL"
             row.append(f"{backend}={mark}")
             if not ok:

@@ -13048,6 +13048,19 @@ pub fn index_int_w_preserve_negative(obj: PyObjectRef) -> Result<i64, PyError> {
     }
 }
 
+/// The index-protocol counterpart of [`c_int_w`], for a 3.14 Argument Clinic
+/// `int` parameter: the value arrives through `__index__` alone, and one
+/// outside a C int's range is an OverflowError rather than a truncation.
+///
+/// [`c_int_w`] cannot serve here because `gateway_int_w` is `int_w`
+/// (baseobjspace.py:2043), which converts through `__int__` first — so an
+/// object carrying both dunders would be read from the wrong one, and one
+/// carrying only `__int__` would be accepted where 3.14 raises TypeError.
+pub fn index_c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
+    let value = int_w(space_index(obj)?)?;
+    i32::try_from(value).map_err(|_| PyError::overflow_error("expected a 32-bit integer"))
+}
+
 /// `objspace.honor__builtins__` default is False — the frame builtin is
 /// `space.builtin`, ignoring a custom `__builtins__` in globals.  The
 /// `pick_builtin*` family below is the `honor__builtins__=True` path,
