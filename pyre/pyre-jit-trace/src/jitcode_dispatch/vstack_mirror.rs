@@ -413,7 +413,19 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             | Instruction::Reraise { .. }
             | Instruction::RaiseVarargs { .. }
     );
-    let cfg_successor = (has_fallthrough && new_pypc as usize == fallthrough)
+    // A boundary that reports the SAME py_pc is not a block transition at all:
+    // the walk has not left this Python opcode, so no source block was visited
+    // out of order.  One opcode's jitcode expansion can carry more than one
+    // boundary marker, and treating the repeat as a backed-off transition armed
+    // the permutation region on the spot, which forces `ShadowReseed` below and
+    // clears every mirror slot — including the ones this opcode did not touch.
+    // The `layout_only_boundary` arm already models a repeat correctly (the
+    // observed depth matches neither successor of the previous opcode, so it
+    // preserves the surviving slots), and it is the arm the reorder region
+    // excludes.  A genuine self-branch is unaffected: `target_pc` reports it,
+    // so the clause below already accepts it.
+    let cfg_successor = new_pypc as usize == prev_pypc
+        || (has_fallthrough && new_pypc as usize == fallthrough)
         || crate::liveness::target_pc(code, &instr, prev_pypc, op_arg) == Some(new_pypc as usize);
     if !cfg_successor && ctx.vstack_reorder_ceiling == u32::MAX {
         ctx.vstack_reorder_ceiling = (new_pypc as usize).max(prev_pypc) as u32;
