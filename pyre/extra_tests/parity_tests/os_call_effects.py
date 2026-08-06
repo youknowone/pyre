@@ -12,6 +12,7 @@ the ones both platforms report.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 
@@ -121,6 +122,57 @@ os.dup2(fd, copy, False)
 assert os.get_inheritable(copy) is False
 os.close(copy)
 os.close(fd)
+
+# os.system runs the command and answers with the status the interpreter
+# exited on — a wait status where the platform has those, the exit code itself
+# on Windows.
+marker = os.path.join(base, "ran")
+if WIN32:
+    status = os.system('echo ran> "%s" & exit 3' % marker)
+    code = status
+else:
+    status = os.system('echo ran > "%s"; exit 3' % marker)
+    code = os.waitstatus_to_exitcode(status)
+assert code == 3, (status, code)
+assert os.path.exists(marker), marker
+os.remove(marker)
+
+# os.times counts the process's own time, which is a float and not negative.
+times = os.times()
+assert len(times) == 5, times
+assert times.user >= 0.0 and times.system >= 0.0, times
+assert times[:2] == (times.user, times.system), times
+
+# os.waitpid has nothing to wait for, which is `ECHILD` and not silence.
+try:
+    os.waitpid(-424242, 0)
+except ChildProcessError as exc:
+    assert exc.errno == 10, exc.errno
+else:
+    raise AssertionError("waitpid on no child must fail")
+
+# os.get_terminal_size measures the terminal a descriptor names; one that
+# names no descriptor at all has none to measure.  (Whether *this* process has
+# a terminal is the caller's business — `shutil.get_terminal_size` is where the
+# fallback lives, and it is reached by catching this.)
+try:
+    os.get_terminal_size(999)
+except OSError as exc:
+    assert exc.errno == 9, exc.errno
+else:
+    raise AssertionError("get_terminal_size on a bad descriptor must fail")
+assert shutil.get_terminal_size().columns > 0
+
+if WIN32:
+    # os.listdrives names the roots, `C:\` among them.
+    drives = os.listdrives()
+    assert drives and all(d.endswith(":\\") for d in drives), drives
+    assert os.path.splitdrive(sys.executable)[0] + "\\" in drives, drives
+    # Every volume is mounted under zero or more of those names.
+    for volume in os.listvolumes():
+        assert volume.startswith("\\\\?\\Volume"), volume
+        for mount in os.listmounts(volume):
+            assert os.path.isabs(mount), mount
 
 # The process-wide answers, which are not `None` on any host that runs this.
 assert isinstance(os.getppid(), int) and os.getppid() > 0

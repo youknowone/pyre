@@ -375,12 +375,19 @@ fn statvfs_result_seq_type() -> PyObjectRef {
 }
 
 /// `os.times_result` structseq — `(user, system, children_user,
-/// children_system, elapsed)`; repr renders "posix.times_result(...)".
+/// children_system, elapsed)`; repr renders "posix.times_result(...)", or
+/// "nt.times_result(...)" on the host whose module is spelled that way.  The
+/// name is the one `pickle` imports to resolve the type, so it has to be the
+/// module the host actually has.
 fn times_result_seq_type() -> PyObjectRef {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
         crate::_structseq::make_struct_seq(
-            "posix.times_result",
+            if cfg!(windows) {
+                "nt.times_result"
+            } else {
+                "posix.times_result"
+            },
             &[
                 "user",
                 "system",
@@ -2174,30 +2181,42 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "uname_result", uname_result_seq_type());
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
-    // Inspects the controlling terminal via ioctl(TIOCGWINSZ); stubbed under
-    // sandbox, so the real body is compiled out.
+    // The size belongs to the terminal the descriptor names, read through
+    // `ioctl(TIOCGWINSZ)` or `GetConsoleScreenBufferInfo`.  A descriptor that
+    // names no terminal has no size, which is reported rather than answered
+    // with a guess — `shutil.get_terminal_size` is where the guess lives, and
+    // it is reached by catching this.  Stubbed under sandbox, so the real body
+    // is compiled out.
     #[cfg(not(feature = "sandbox"))]
     crate::module_ns_store(
         ns,
         "get_terminal_size",
-        crate::make_builtin_function("get_terminal_size", |_args| {
-            let (cols, rows) = {
-                #[cfg(unix)]
-                {
-                    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                    let ret = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
-                    if ret == 0 && ws.ws_col > 0 {
-                        (ws.ws_col as i64, ws.ws_row as i64)
-                    } else {
-                        (80, 24)
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    (80, 24)
-                }
+        crate::make_builtin_function("get_terminal_size", |args| {
+            let fd = match args.first() {
+                Some(&w) => crate::baseobjspace::c_int_w(w)?,
+                None => 1,
             };
-            Ok(make_terminal_size(cols, rows))
+            #[cfg(unix)]
+            {
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                if crate::builtins::crt_call!(libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws)) != 0 {
+                    return Err(errno_err(crate::builtins::crt_errno(), ""));
+                }
+                Ok(make_terminal_size(ws.ws_col as i64, ws.ws_row as i64))
+            }
+            #[cfg(all(windows, feature = "host_env"))]
+            {
+                let handle = rustpython_host_env::nt::handle_from_fd(fd);
+                let (columns, lines) = rustpython_host_env::nt::get_terminal_size_handle(handle)
+                    .map_err(|e| fs_err_with_filename(e, pyre_object::PY_NULL))?;
+                Ok(make_terminal_size(columns as i64, lines as i64))
+            }
+            // A target with neither call has no terminal to measure.
+            #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
+            {
+                let _ = fd;
+                Ok(make_terminal_size(80, 24))
+            }
         }),
     );
     // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.  str/bytes
@@ -6212,6 +6231,139 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     Err(_) => Ok(pyre_object::w_none()),
                 },
                 0,
+            ),
+        );
+
+        // os.system(command) -> the command interpreter's exit status.  The
+        // wide entry point is the one that can spell every command; the narrow
+        // one re-encodes it through the ANSI code page.  Neither reports a
+        // failure other than through the status, which `os_system_impl`
+        // returns as it is.
+        crate::module_ns_store(
+            ns,
+            "system",
+            crate::make_builtin_function_with_arity(
+                "system",
+                |args| {
+                    unsafe extern "C" {
+                        fn _wsystem(command: *const u16) -> libc::c_int;
+                    }
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("system() requires 1 argument"));
+                    }
+                    let command = crate::gateway::fsencode_path_w(args[0])?;
+                    let wide = wide_path(&command.as_bytes)?;
+                    let status = crate::builtins::crt_call!(_wsystem(wide.as_ptr()));
+                    Ok(pyre_object::w_int_new(status as i64))
+                },
+                1,
+            ),
+        );
+
+        // os.waitpid(pid, options) -> (pid, status).  `_cwait` waits for one
+        // process by handle; the status it reports is the exit code, which
+        // `os_waitpid_impl` shifts into the byte a POSIX wait status keeps it
+        // in.
+        crate::module_ns_store(
+            ns,
+            "waitpid",
+            crate::make_builtin_function_with_arity(
+                "waitpid",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("waitpid() requires 2 arguments"));
+                    }
+                    let pid = crate::baseobjspace::int_w(args[0])? as isize;
+                    let options = crate::baseobjspace::c_int_w(args[1])?;
+                    match host_nt::cwait(pid, options) {
+                        Ok((pid, status)) => Ok(pyre_object::w_tuple_new(vec![
+                            pyre_object::w_int_new(pid as i64),
+                            pyre_object::w_int_new((status as i64) << 8),
+                        ])),
+                        Err(e) => Err(errno_err(crt_errno_of(&e), "")),
+                    }
+                },
+                2,
+            ),
+        );
+
+        // os.times() -> posix.times_result.  Windows keeps the process's own
+        // user and kernel time and nothing else, so the three fields that
+        // count a child's are zero (`os_times_impl`).
+        crate::module_ns_store(
+            ns,
+            "times",
+            crate::make_builtin_function_with_arity(
+                "times",
+                |_| {
+                    let times = rustpython_host_env::time::get_process_times_100ns()
+                        .ok_or_else(|| fs_err_with_filename(
+                            std::io::Error::last_os_error(),
+                            pyre_object::PY_NULL,
+                        ))?;
+                    // `GetProcessTimes` counts in hundreds of nanoseconds.
+                    let seconds = |ticks: u64| pyre_object::w_float_new(ticks as f64 * 1e-7);
+                    Ok(crate::_structseq::new_instance(
+                        times_result_seq_type(),
+                        vec![
+                            seconds(times.user),
+                            seconds(times.system),
+                            pyre_object::w_float_new(0.0),
+                            pyre_object::w_float_new(0.0),
+                            pyre_object::w_float_new(0.0),
+                        ],
+                    ))
+                },
+                0,
+            ),
+        );
+
+        // os.listdrives() / os.listvolumes() / os.listmounts(volume) — the
+        // names Windows mounts its filesystems under.
+        fn name_list(
+            names: std::io::Result<Vec<std::ffi::OsString>>,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let names = names.map_err(|e| fs_err_with_filename(e, pyre_object::PY_NULL))?;
+            Ok(pyre_object::w_list_new(
+                names
+                    .iter()
+                    .map(|name| fs_name_obj(false, name.as_encoded_bytes()))
+                    .collect(),
+            ))
+        }
+        crate::module_ns_store(
+            ns,
+            "listdrives",
+            crate::make_builtin_function_with_arity(
+                "listdrives",
+                |_| name_list(host_nt::listdrives()),
+                0,
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "listvolumes",
+            crate::make_builtin_function_with_arity(
+                "listvolumes",
+                |_| name_list(host_nt::listvolumes()),
+                0,
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "listmounts",
+            crate::make_builtin_function_with_arity(
+                "listmounts",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("listmounts() requires 1 argument"));
+                    }
+                    let volume = crate::gateway::fsencode_path_w(args[0])?;
+                    name_list(host_nt::listmounts(
+                        path_from_bytes(&volume.as_bytes).as_ref(),
+                    ))
+                },
+                1,
             ),
         );
 
