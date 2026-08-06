@@ -758,6 +758,19 @@ pub enum PyreHelperKind {
     /// A `bool` (`+True` is int `1`, not identity) and every non-int operand
     /// fall through to the generic residual so their `__pos__` still runs.
     UnaryPositive,
+    /// `bh_unary_negative_fn(value)` — the `UNARY_NEGATIVE` helper
+    /// (`opcode_ops::unary_negative_value` → `space.neg`).  The full-body
+    /// walker folds a provably-exact-int operand to `IntSubOvf(0, value)`
+    /// behind a `guard_class INT`; a bool / subclass / non-int operand, and an
+    /// `INT_MIN` value (whose negation is the `2**63` long), fall through to
+    /// the generic residual.
+    UnaryNegative,
+    /// `bh_unary_invert_fn(value)` — the `UNARY_INVERT` helper
+    /// (`opcode_ops::unary_invert_value` → `space.invert`).  The full-body
+    /// walker folds a provably-exact-int operand to `IntInvert(value)` behind a
+    /// `guard_class INT` (`~x` always fits an int, so no overflow guard); a
+    /// bool / subclass / non-int operand falls through to the generic residual.
+    UnaryInvert,
     /// `bh_unpack_sequence_fn(count, seq)` — the UNPACK_SEQUENCE validator
     /// emitted by the codewriter UNPACK_SEQUENCE arm.  Validates the exact
     /// length and returns the normalized tuple.  The full-body walker

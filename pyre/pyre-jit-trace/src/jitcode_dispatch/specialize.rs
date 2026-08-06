@@ -380,9 +380,10 @@ pub(crate) fn try_walker_specialize_truth_bool<Sym: WalkSym>(
 /// (DCE): the result is the box, not its `intval`.
 ///
 /// Returns `Ok(Some(()))` when the fold was emitted (caller returns
-/// `Continue`); `Ok(None)` for a bool (`+True` is int `1`, not identity) or a
-/// non-int operand — the caller then falls through to the generic
-/// `CallMayForce` residual so a user / subclass `__pos__` still runs.
+/// `Continue`); `Ok(None)` for a bool (`+True` is int `1`, not identity), a
+/// numeric subclass, or a non-int operand — the caller then falls through to
+/// the generic `CallMayForce` residual so a subclass / user `__pos__` still
+/// runs.
 pub(crate) fn try_walker_specialize_unary_positive_int<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -393,11 +394,20 @@ pub(crate) fn try_walker_specialize_unary_positive_int<Sym: WalkSym>(
     let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
         return Ok(None);
     };
-    // `+x` is identity only for an EXACT int: a bool carries `BOOL_TYPE` (its
-    // `+` yields int `1`) and an int subclass may override `__pos__`, so both
-    // decline to the generic residual.
+    // `+x` is identity only for an EXACT builtin int.  A bool shares the
+    // `intval` but `+True` is int `1`, not identity.  A numeric subclass keeps
+    // the builtin `ob_type` (its Python class lives in `w_class`), so the
+    // `GUARD_CLASS INT` below reads `ob_type` and would NOT catch it at
+    // runtime — forwarding the operand would return the subclass instead of
+    // the plain int its `__pos__` yields.  Both decline to the generic
+    // residual.  Mirrors the `is_exact_builtin_instance` gate in
+    // `walker_int_specialization_operands`.
     // SAFETY: `obj` is a live concrete `PyObjectRef` from the walker shadow.
-    if unsafe { !pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
+    if unsafe {
+        !pyre_object::is_int(obj)
+            || pyre_object::is_bool(obj)
+            || !pyre_object::is_exact_builtin_instance(obj)
+    } {
         return Ok(None);
     }
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
@@ -406,6 +416,117 @@ pub(crate) fn try_walker_specialize_unary_positive_int<Sym: WalkSym>(
     // operand box itself.
     let _ = walker_unbox_int(ctx, op_pc, operand, int_type_addr)?;
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, operand)?;
+    Ok(Some(()))
+}
+
+/// Shared gate for the `UNARY_NEGATIVE` / `UNARY_INVERT` int folds: the operand
+/// must be a concrete EXACT builtin non-bool `W_IntObject`.  A bool unboxes
+/// through its own `&BOOL_TYPE` guard (declined here for simplicity — `-True` /
+/// `~True` stay on the residual), and a numeric subclass keeps the builtin
+/// `ob_type` so the `GUARD_CLASS INT` the fold emits would not catch it at
+/// runtime.  Returns the concrete `intval` on success.  Mirrors the
+/// `is_exact_builtin_instance` gate in `walker_int_specialization_operands`.
+fn walker_unary_int_operand<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    operand: OpRef,
+) -> Option<i64> {
+    let obj = walker_concrete_ref_object(ctx, operand)?;
+    // SAFETY: `obj` is a live concrete `PyObjectRef` from the walker shadow.
+    unsafe {
+        if !pyre_object::is_int(obj)
+            || pyre_object::is_bool(obj)
+            || !pyre_object::is_exact_builtin_instance(obj)
+        {
+            return None;
+        }
+        Some(pyre_object::w_int_get_value(obj))
+    }
+}
+
+/// #61: walker-native int specialization for the `UNARY_NEGATIVE` residual
+/// (oopspec [`majit_ir::PyreHelperKind::UnaryNegative`]).  `-x` on an exact
+/// int is `0 - x`; the object-space `neg` promotes only `-INT_MIN` to a
+/// `W_LongObject` (`intobject.py:628` `descr_neg` → `_make_ovf2long`).  Since
+/// majit has no overflow-checked unary negate, the fold expresses `-x` as
+/// `IntSubOvf(0, x)` behind a `GUARD_CLASS INT`, reusing the binary-sub
+/// overflow discipline: a record value of `INT_MIN` declines (the residual
+/// builds the `2**63` long), and any other record value emits a
+/// `GUARD_NO_OVERFLOW` so an `INT_MIN` arrival on the reused trace deopts to
+/// the residual rather than wrapping back to `INT_MIN`.
+///
+/// Returns `Ok(Some(()))` when the fold was emitted (caller returns
+/// `Continue`); `Ok(None)` for a bool / subclass / non-int / `INT_MIN`
+/// operand, or when the residual result box is unavailable.
+pub(crate) fn try_walker_specialize_unary_negative_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some(x) = walker_unary_int_operand(ctx, operand) else {
+        return Ok(None);
+    };
+    // `0 - INT_MIN` overflows i64 → `2**63` long; let the residual build it.
+    if x == i64::MIN {
+        return Ok(None);
+    }
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let x_raw = walker_unbox_int(ctx, op_pc, operand, int_type_addr)?;
+    let zero_raw = ctx.trace_ctx.const_int(0);
+    let result_value = 0i64.wrapping_sub(x);
+    let raw_result = ctx
+        .trace_ctx
+        .record_op(OpCode::IntSubOvf, &[zero_raw, x_raw]);
+    ctx.trace_ctx
+        .set_opref_concrete(raw_result, majit_ir::Value::Int(result_value));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
+    let boxed = walker_box_int(ctx, op_pc, raw_result, result_value)?;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(result_value, boxed_result_i64));
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// #61: walker-native int specialization for the `UNARY_INVERT` residual
+/// (oopspec [`majit_ir::PyreHelperKind::UnaryInvert`]).  `~x` on an exact int
+/// is `!x`, which always fits an i64 (`~INT_MIN == INT_MAX`, `~INT_MAX ==
+/// INT_MIN`), so `descr_invert` never promotes to a long: the fold emits a
+/// plain `IntInvert` behind a `GUARD_CLASS INT`, with no overflow guard.
+///
+/// Returns `Ok(Some(()))` when the fold was emitted (caller returns
+/// `Continue`); `Ok(None)` for a bool / subclass / non-int operand, or when
+/// the residual result box is unavailable.
+pub(crate) fn try_walker_specialize_unary_invert_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some(x) = walker_unary_int_operand(ctx, operand) else {
+        return Ok(None);
+    };
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let x_raw = walker_unbox_int(ctx, op_pc, operand, int_type_addr)?;
+    let result_value = !x;
+    let raw_result = ctx.trace_ctx.record_op(OpCode::IntInvert, &[x_raw]);
+    ctx.trace_ctx
+        .set_opref_concrete(raw_result, majit_ir::Value::Int(result_value));
+    let boxed = walker_box_int(ctx, op_pc, raw_result, result_value)?;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(result_value, boxed_result_i64));
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
 

@@ -6171,7 +6171,7 @@ where
         ctx.unary_negative_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::PyreHelperKind::UnaryNegative,
         dst_reg,
     ))
 }
@@ -6207,7 +6207,7 @@ where
         ctx.unary_invert_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::PyreHelperKind::UnaryInvert,
         dst_reg,
     ))
 }
