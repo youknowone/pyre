@@ -3360,8 +3360,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // An uncommitted walk therefore has nothing to undo and the region it
     // hands back is not irreversible, which is the `is_idempotent_gc_barrier`
     // category one line up.
-    let writes_gc_liveness_root_only =
-        helper == majit_ir::PyreHelperKind::ClearInFlightException;
+    let writes_gc_liveness_root_only = helper == majit_ir::PyreHelperKind::ClearInFlightException;
     if !provably_side_effect_free
         && !is_idempotent_gc_barrier
         && !writes_gc_liveness_root_only
