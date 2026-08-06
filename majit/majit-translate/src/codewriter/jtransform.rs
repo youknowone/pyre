@@ -725,17 +725,29 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         exceptblock: crate::model::BlockId,
     ) {
+        // `jtransform.py:74-75 if block.operations == (): return`.  The
+        // predicate is the empty *tuple* — `flowspace/model.py:196-197
+        // is_final_block` — which only the graph's returnblock and
+        // exceptblock carry.  An ordinary block whose operations happen to
+        // be empty holds a *list*, and `[] == ()` is false, so it is not
+        // skipped.
+        if block_idx == graph.returnblock.0 || block_idx == graph.exceptblock.0 {
+            return;
+        }
+
         let mut new_ops = Vec::with_capacity(graph.blocks[block_idx].operations.len());
 
         let original_ops = graph.blocks[block_idx].operations.clone();
         // `jtransform.py:100 count_before_last_operation = len(newoperations)`
         // — recorded on every iteration, so after the loop it holds the count
-        // from just before the last operation contributed anything.
-        let mut count_before_last_operation = 0;
+        // from just before the last operation contributed anything.  `None`
+        // is upstream's unbound name: the loop body never ran, so there is no
+        // last operation and the elision test below does not apply.
+        let mut count_before_last_operation = None;
         for original_op in &original_ops {
             let op = remap_op(original_op, &self.aliases);
             let rewritten = self.rewrite_operation(&op, graph_name, graph);
-            count_before_last_operation = new_ops.len();
+            count_before_last_operation = Some(new_ops.len());
             match rewritten {
                 RewriteResult::Replace(ops) => {
                     new_ops.extend(ops);
@@ -758,7 +770,8 @@ impl<'a> Transformer<'a> {
         // exits and the `last_exception` exitswitch have to go with it —
         // otherwise the block keeps an exception edge for an operation that
         // is not in it any more.
-        if graph.blocks[block_idx].canraise() && new_ops.len() == count_before_last_operation {
+        if graph.blocks[block_idx].canraise() && count_before_last_operation == Some(new_ops.len())
+        {
             // `jtransform.py:176-179 _killed_exception_raising_operation`
             let block = &mut graph.blocks[block_idx];
             assert!(
@@ -9414,6 +9427,57 @@ mod tests {
         assert!(
             !block.exits.iter().any(|link| link.target == exc_block),
             "no exception edge may survive for an operation that is gone"
+        );
+    }
+
+    /// A block that never had an operation has no *last* operation, so
+    /// `jtransform.py:117 len(newoperations) == count_before_last_operation`
+    /// does not apply to it — upstream never binds the name and the
+    /// comparison cannot come out true.  The exception exits must survive.
+    #[test]
+    fn opless_block_keeps_its_exception_exits() {
+        use crate::model::{ExitSwitch, Link, exception_exitcase};
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("opless_exc_block");
+        let entry = graph.startblock;
+
+        let continuation = graph.create_block();
+        graph.set_return(continuation, None);
+
+        let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
+        let normal_link = Link::from_variables(&graph, vec![], continuation, None);
+        let exc_link = Link::from_variables(
+            &graph,
+            vec![last_exception_var.clone(), last_exc_value_var.clone()],
+            exc_block,
+            Some(exception_exitcase()),
+        )
+        .extravars(
+            Some(LinkArg::Value(last_exception_var)),
+            Some(LinkArg::Value(last_exc_value_var)),
+        );
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![normal_link, exc_link],
+        );
+        assert!(graph.blocks[entry.0].operations.is_empty());
+        assert!(graph.blocks[entry.0].canraise());
+
+        transformer.optimize_block(&mut graph, entry.0, "opless_exc_block", exc_block);
+
+        let block = &graph.blocks[entry.0];
+        assert_eq!(
+            block.exitswitch,
+            Some(ExitSwitch::LastException),
+            "a block with no operations has no elided last operation"
+        );
+        assert_eq!(
+            block.exits.len(),
+            2,
+            "the exception exit must survive a block that never had an operation"
         );
     }
 
