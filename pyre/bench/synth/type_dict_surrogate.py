@@ -1,8 +1,10 @@
 # pyre-check: max-pypy-ratio=350
+# pyre-check: min-pypy-ratio=10
 # pypy's exec time is pinned to the startup-subtraction floor here, so the
 # ratio is not a measurement: the ceiling is the one recorded before the
-# tightening, four times the slowest the CI runners observe (84.7x), and no
-# floor gate is recorded.
+# tightening, four times the slowest the CI runners observe (84.7x), and the
+# floor is half the fastest (21.5x) — a derived floor of ceiling/5 would sit
+# above it.
 N = 200000
 
 S = '\udcff'                  # lone low surrogate

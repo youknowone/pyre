@@ -1,7 +1,9 @@
 # pyre-check: max-pypy-ratio=20
+# pyre-check: min-pypy-ratio=0.5
 # pypy's exec time is pinned to the startup-subtraction floor here, so the
 # ratio is not a measurement: the ceiling is twice the slowest ratio the CI
-# runners observe (9.1x), rounded up, and no floor gate is recorded.
+# runners observe (9.1x), rounded up, and the floor is half the fastest
+# (1.0x) — a derived floor of ceiling/5 would sit above it.
 # PEP 674 integer string-conversion length limit: sys.get/set_int_max_str_digits
 # with the default 4300, enforced on str()/repr()/f-string of a large int and on
 # int() parsing of a long decimal literal, bypassed for power-of-two bases, and
