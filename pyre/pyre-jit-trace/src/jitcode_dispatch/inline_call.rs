@@ -2397,7 +2397,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
-    ctx.fbw_mode.transparent_helper_subwalk = nested_helper_entry.is_some();
+    // `transparent_helper_subwalk` is set by `run_sub_jitcode_walk` on the
+    // sub-context it builds, so every descent into a canonical helper body
+    // carries it — not just the ones entered from another sub-walk.
     let _helper_frame =
         nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, Some(frame)));
     let walk_result = run_sub_jitcode_walk(
@@ -6359,6 +6361,18 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
             // the carried outer Python boundary.
             fbw_mode: FbwWalkMode {
                 inline_subwalk: true,
+                // A canonical sub-jitcode body has no blackhole entry point of
+                // its own — the fact the `op_pc` comment above states — so the
+                // whole descent is transparent to the Python MIFrame stack, no
+                // matter whether the caller happens to be another sub-walk.
+                // Left inherited, a root-level descent walked with
+                // `inline_subwalk` set and the framestack empty, which sends
+                // `latch_abort_blackhole` into its multi-frame arm: that arm
+                // declines on the empty framestack, so the abort latched no
+                // image and fell back to entry replay — the outcome the
+                // transparent-helper exclusions at the abort-coordinate claim
+                // and the post-step trace-limit check exist to prevent.
+                transparent_helper_subwalk: true,
                 ..ctx.fbw_mode
             },
             session: ctx.session,
