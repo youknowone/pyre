@@ -46,7 +46,12 @@ fn pickler_write_barrier(obj: PyObjectRef) {
 pub struct W_Pickler {
     /// Output file (has a `write` method).
     w_file: PyObjectRef,
-    /// Bound `file.write`, resolved once by `__init__`.
+    /// Bound `file.write`, resolved once by `__init__` and reused for every
+    /// write. `interp_pickle.py` resolves it at `:555-560` only to validate,
+    /// discards the result, and re-resolves per write in `_Framer.file_write`
+    /// (`:353`); measured on 3.14.5, rebinding `file.write` after construction
+    /// is *not* observed by a later `dump()`, and `pickle.py:465` captures the
+    /// callable the same way. Reusing the resolution is what matches.
     w_write: PyObjectRef,
     proto: i64,
     bin: bool,
@@ -435,7 +440,10 @@ impl W_Pickler {
         // `fix_imports` gates the `_compat_pickle` py3→py2 name remap that the
         // protocol-< 3 save path would otherwise always apply.
         let proto = normalize_protocol(pyre_object::gc_roots::shadow_stack_get(protocol_slot))?;
-        // `file must have a 'write' attribute` (interp_pickle.py:557).
+        // `file must have a 'write' attribute` (interp_pickle.py:557). This
+        // check precedes the `buffer_callback` one below; `descr__new__`
+        // (`interp_pickle.py:1822`) orders them the other way. Measured on
+        // 3.14.5, a call carrying both faults reports this TypeError.
         let Some(w_write) = crate::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(file_slot),
             "write",
