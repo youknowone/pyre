@@ -974,6 +974,37 @@ impl OptVirtualize {
                     }
                 }
             }
+            // virtualize.py:188-189: a field the trace never stored reads the
+            // zeroed allocation, so `fieldop is None` folds to
+            // `optimizer.new_const(fielddescr)` and the read is dropped.
+            // Without the fold the load survives to the arg-forcing pass,
+            // which materializes the very virtual it reads: an exception
+            // whose traceback slot is read before it is written
+            // (`pytraceback.rs:462`) escapes with its args list and the
+            // traceback node behind it.
+            //
+            // `w_class` and `typeptr` are excluded: both are header fields
+            // resolved from class identity above, and neither is ever zero on
+            // a live object, so folding them to null/0 would answer a read
+            // the allocation does not satisfy. Raw field reads are excluded
+            // because upstream defines this handler for GETFIELD_GC_{I,R,F}
+            // only.
+            let folds_to_zero = !is_raw_op
+                && !is_typeptr
+                && !field_descr.is_w_class()
+                && matches!(info, PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_));
+            if folds_to_zero {
+                // optimizer.py:528-534 new_const: CONST_NULL for a pointer
+                // field, CONST_ZERO_FLOAT for a float field, else CONST_0.
+                let zero = match op.opcode {
+                    majit_ir::OpCode::GetfieldGcR => Value::Ref(majit_ir::GcRef::NULL),
+                    majit_ir::OpCode::GetfieldGcF => Value::Float(0.0),
+                    _ => Value::Int(0),
+                };
+                let b = ctx.materialize_operand_at(op.pos.get());
+                ctx.make_constant_box(&b, zero);
+                return OptimizationResult::Remove;
+            }
         }
         // virtualize.py:192: self.make_nonnull(op.getarg(0))
         // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
