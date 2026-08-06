@@ -2448,8 +2448,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "fspath",
             |args| {
                 let arg = args.first().copied().unwrap_or(pyre_object::w_none());
+                // `str` and `bytes` only — a `bytearray` is a readable buffer
+                // and not a path, so it goes on to be rejected below.
                 unsafe {
-                    if pyre_object::is_str(arg) || pyre_object::bytesobject::is_bytes_like(arg) {
+                    if pyre_object::is_str(arg) || pyre_object::bytesobject::is_bytes(arg) {
                         return Ok(arg);
                     }
                 }
@@ -2460,15 +2462,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if let Some(fspath_fn) =
                         unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
                     {
-                        return crate::call::call_function_impl_result(fspath_fn, &[arg]);
+                        let result = crate::call::call_function_impl_result(fspath_fn, &[arg])?;
+                        // The protocol is only satisfied by what a path can be,
+                        // so an answer that is neither names the object that
+                        // gave it and the type it gave.
+                        if unsafe {
+                            pyre_object::is_str(result)
+                                || pyre_object::bytesobject::is_bytes(result)
+                        } {
+                            return Ok(result);
+                        }
+                        return Err(crate::PyError::type_error(format!(
+                            "expected {}.__fspath__() to return str or bytes, not {}",
+                            crate::gateway::short_type_name(arg),
+                            crate::gateway::short_type_name(result)
+                        )));
                     }
                 }
-                let type_name = match path_type {
-                    Some(pt) => unsafe { pyre_object::typeobject::w_type_get_name(pt.as_ptr()) },
-                    None => "object",
-                };
                 Err(crate::PyError::type_error(format!(
-                    "expected str, bytes or os.PathLike object, not {type_name}"
+                    "expected str, bytes or os.PathLike object, not {}",
+                    crate::gateway::short_type_name(arg)
                 )))
             },
             1,

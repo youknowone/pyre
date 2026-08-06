@@ -1622,7 +1622,7 @@ impl FsEncodedPath {
     }
 
     pub unsafe fn is_bytes(&self) -> bool {
-        unsafe { pyre_object::bytesobject::is_bytes_like(self.w_path()) }
+        unsafe { pyre_object::bytesobject::is_bytes(self.w_path()) }
     }
 }
 
@@ -1656,6 +1656,18 @@ pub fn fsencode_path_or_fd_nullable_w(
     path_or_fd_w(obj, Some(funcname), allow_fd, true)
 }
 
+/// `_PyType_Name` — the type's own name, with any module that qualifies it
+/// dropped. The path boundaries report a rejected argument this way, where the
+/// rest of the interpreter reports the qualified name (`array.array` becomes
+/// `array` here and stays `array.array` in, say, a concatenation error).
+pub(crate) fn short_type_name(obj: pyre_object::PyObjectRef) -> String {
+    let name = crate::type_methods::arg_type_name(obj);
+    match name.rfind('.') {
+        Some(dot) => name[dot + 1..].to_string(),
+        None => name,
+    }
+}
+
 fn path_or_fd_w(
     obj: pyre_object::PyObjectRef,
     funcname: Option<&str>,
@@ -1672,7 +1684,7 @@ fn path_or_fd_w(
         (false, false) => "string, bytes or os.PathLike",
     };
     let reject = |obj: pyre_object::PyObjectRef| -> crate::PyError {
-        let tp = crate::type_methods::arg_type_name(obj);
+        let tp = short_type_name(obj);
         match funcname {
             Some(name) => crate::PyError::type_error(format!(
                 "{name}: path should be {allowed_types}, not {tp}"
@@ -1694,21 +1706,14 @@ fn path_or_fd_w(
             // None, w_None)`), so no boundary has to spell that default again.
             // `None` is not bytes-like, so the names still come back as `str`.
             (b".".to_vec(), obj_slot, -1)
-        } else if pyre_object::bytesobject::is_bytes_like(obj) {
-            // baseobjspace.py:1975-1977: pyre's readable-buffer set here is
-            // bytes | bytearray, so a buffer that is not bytes is bytearray.
-            if !pyre_object::bytesobject::is_bytes(obj) {
-                let type_name = crate::type_methods::arg_type_name(obj);
-                // interp_posix.py:195-197 warns with the same list the type
-                // error names, so the two cannot disagree about what the
-                // boundary takes.
-                crate::warn::warn_deprecation(&format!(
-                    "path should be {allowed_types}, not {type_name}"
-                ))?;
-            }
-            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        } else if pyre_object::bytesobject::is_bytes(obj) {
+            // Only `bytes` itself. `_unwrap_path`'s buffer arm
+            // (`interp_posix.py:188-198`) takes any readable buffer and reports
+            // it as deprecated; 3.14 completed that deprecation, so a
+            // `bytearray` is now turned away by the same message every other
+            // rejected type gets.
             (
-                pyre_object::bytesobject::bytes_like_data(obj).to_vec(),
+                pyre_object::bytesobject::w_bytes_data(obj).to_vec(),
                 obj_slot,
                 -1,
             )
@@ -1770,8 +1775,8 @@ fn path_or_fd_w(
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 return Err(crate::PyError::type_error(format!(
                     "expected {}.__fspath__() to return str or bytes, not {}",
-                    crate::type_methods::arg_type_name(obj),
-                    crate::type_methods::arg_type_name(result)
+                    short_type_name(obj),
+                    short_type_name(result)
                 )));
             }
         }
