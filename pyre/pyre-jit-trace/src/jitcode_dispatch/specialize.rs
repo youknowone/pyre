@@ -4928,8 +4928,8 @@ fn walker_write_const_bool_result<Sym: WalkSym>(
 ///   freed.  This is the same pointer the residual stores
 ///   (`function_new_from_code` borrows it too), so a materialized function is
 ///   indistinguishable from an interpreted one.
-/// * `w_qualname` — the code object's single realized `co_qualname`, shared by
-///   every function built from it.
+/// * `w_name` / `w_qualname` — the code object's single realized `co_name` and
+///   `co_qualname`, shared by every function built from it.
 /// * `w_builtins` — CPython 3.14 `_PyEval_BuiltinsFromGlobals`, frozen at
 ///   construction from `globals['__builtins__']`.  Only the allocation-free
 ///   shape is reproduced: `__builtins__` naming a module, reduced to its dict.
@@ -4978,11 +4978,14 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // Realizing the qualname is the fold's one collection point (it allocates
-    // once per code object and hits the cache afterwards), so it runs here,
-    // while the only live pointers are the `Box::into_raw`'d code wrapper and
-    // its `CodeObject` — neither of which the collector relocates.  Everything
-    // read below is read after it.
+    // Realizing the name/qualname are the fold's collection points (they
+    // allocate once per code object and hit the cache afterwards), so they run
+    // here, while the only live pointers are the `Box::into_raw`'d code wrapper
+    // and its `CodeObject` — neither of which the collector relocates.
+    let w_name = unsafe { pyre_interpreter::pycode::w_code_name_obj(w_code) };
+    if w_name.is_null() {
+        return Ok(None);
+    }
     let w_qualname = unsafe { pyre_interpreter::pycode::w_code_qualname_obj(w_code) };
     if w_qualname.is_null() {
         return Ok(None);
@@ -5009,7 +5012,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     if w_builtins.is_null() {
         return Ok(None);
     }
-    for baked in [w_builtins, w_qualname] {
+    for baked in [w_builtins, w_name, w_qualname] {
         if majit_gc::can_move(majit_ir::GcRef(baked as usize)) {
             return Ok(None);
         }
@@ -5028,6 +5031,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     let name = ctx
         .trace_ctx
         .const_ref(unsafe { &(*code_ptr).obj_name } as *const String as i64);
+    let w_name_const = ctx.trace_ctx.const_ref(w_name as i64);
     let w_builtins_const = ctx.trace_ctx.const_ref(w_builtins as i64);
     let w_qualname_const = ctx.trace_ctx.const_ref(w_qualname as i64);
     let func_op = crate::helpers::emit_make_function_inline(
@@ -5036,6 +5040,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
         code_op,
         can_change_code,
         name,
+        w_name_const,
         globals_op,
         w_builtins_const,
         w_qualname_const,

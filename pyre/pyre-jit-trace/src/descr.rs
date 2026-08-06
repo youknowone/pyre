@@ -1164,6 +1164,7 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // borrowed `co_name`), which the walker's managed-heap guard sorts
             // out.
             field("name", f::FUNCTION_NAME_OFFSET),
+            field("w_name", f::FUNCTION_W_NAME_OFFSET),
             field("closure", f::FUNCTION_CLOSURE_OFFSET),
             field("defs_w", f::FUNCTION_DEFS_W_OFFSET),
             field("w_kw_defs", f::FUNCTION_W_KW_DEFS_OFFSET),
@@ -2436,6 +2437,11 @@ pub fn function_closure_descr() -> DescrRef {
 /// `function.py:51 self.name` — the pointer to the name string's storage.
 pub fn function_name_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_NAME_OFFSET)
+}
+
+/// Wrapped `Function.__name__` object stamped at construction from `co_name`.
+pub fn function_w_name_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_NAME_OFFSET)
 }
 
 /// `Function.w_builtins` — the builtin mapping resolved from the globals

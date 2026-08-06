@@ -50,7 +50,7 @@ pub static CLASSMETHOD_DESCRIPTOR_TYPE: PyType =
 
 /// User-defined function object.
 ///
-/// Layout: `[ob_type | code | can_change_code | name_ptr | closure]`
+/// Layout: `[ob_type | code | can_change_code | name_ptr | w_name | closure]`
 /// - `code`: pointer to a Code object (PyCode for user funcs, BuiltinCode for builtins).
 ///   function.py:47 — `_immutable_fields_ = ['code?', ...]`
 /// - `can_change_code`: function.py:33 — True by default; False for
@@ -69,6 +69,13 @@ pub struct Function {
     pub can_change_code: bool,
     /// Function name (off-GC Box<String>).
     pub name: *const String,
+    /// Application-level `__name__` object.
+    ///
+    /// The raw `name` pointer remains the canonical fast text carrier for
+    /// frames/repr/tracebacks, while this slot preserves object identity across
+    /// repeated `function.__name__` reads. `PY_NULL` means a legacy construction
+    /// path has not stamped it yet.
+    pub w_name: PyObjectRef,
     /// Closure: tuple of cell objects from the enclosing scope,
     /// or PY_NULL if this function has no free variables.
     pub closure: PyObjectRef,
@@ -217,6 +224,8 @@ fn function_write_barrier(obj: PyObjectRef) {
 pub const FUNCTION_CODE_OFFSET: usize = std::mem::offset_of!(Function, code);
 /// Field offset of `name` within `Function`.
 pub const FUNCTION_NAME_OFFSET: usize = std::mem::offset_of!(Function, name);
+/// Field offset of wrapped `__name__` within `Function`.
+pub const FUNCTION_W_NAME_OFFSET: usize = std::mem::offset_of!(Function, w_name);
 /// Field offset of `closure` within `Function`.
 pub const FUNCTION_CLOSURE_OFFSET: usize = std::mem::offset_of!(Function, closure);
 /// Field offset of `defs_w` within `Function`.
@@ -298,11 +307,14 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 17] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 18] = [
     FUNCTION_CODE_OFFSET,
     // `name` — GC-managed `NameStorage` box for a mortal function (skipped by the
     // walker's managed-object guard for an immortal builtin's `malloc_raw` name).
     FUNCTION_NAME_OFFSET,
+    // `function.py:51 self.name` — wrapped `__name__` stamped at construction
+    // or via `f.__name__ = ...`.
+    FUNCTION_W_NAME_OFFSET,
     FUNCTION_CLOSURE_OFFSET,
     FUNCTION_DEFS_W_OFFSET,
     FUNCTION_W_KW_DEFS_OFFSET,
@@ -422,6 +434,10 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     } else {
         FunctionName::Borrowed(unsafe { &(*code_ptr).obj_name } as *const String)
     };
+    // `function.py:51 self.name = code.co_name`; realize it BEFORE the
+    // function so the allocation that can collect runs while no unrooted
+    // function is live.
+    unsafe { crate::pycode::w_code_name_obj(w_code) };
     // `function.py:54 self.qualname = qualname or self.name`.  The code object
     // realizes one wrapped qualname and every function built from it names that
     // object, so a later `__code__ = new_code` assignment leaves
@@ -441,6 +457,10 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     // the realized qualname back through the Box-immortal code wrapper (whose
     // slot the raw-root walker forwards) rather than through a stale pre-call
     // copy.  This second call is a plain cache hit.
+    let w_name = unsafe { crate::pycode::w_code_name_obj(w_code) };
+    if !w_name.is_null() {
+        unsafe { function_set_name_obj(func, w_name) };
+    }
     let w_qualname = unsafe { crate::pycode::w_code_qualname_obj(w_code) };
     if !w_qualname.is_null() {
         unsafe { function_set_qualname(func, w_qualname) };
@@ -541,6 +561,7 @@ pub(crate) fn function_new_impl(
         code,
         can_change_code,
         name: name_ptr,
+        w_name: PY_NULL,
         closure,
         defs_w: PY_NULL,
         w_kw_defs: PY_NULL,
@@ -1285,9 +1306,37 @@ pub unsafe fn _eq(_obj: PyObjectRef, other: PyObjectRef) -> bool {
 }
 
 /// PyPy-compatible descriptor accessor for function name.
+///
+/// CPython 3.14 stores and returns `func_name` directly, so repeated
+/// `f.__name__` reads preserve object identity.  Pyre keeps the raw `name`
+/// pointer for fast internal `&str` users and mirrors the application-level
+/// owner with `w_name`.
 #[inline]
 pub unsafe fn fget_func_name(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { pyre_object::w_str_new(function_get_name(obj)) }
+    unsafe { function_get_name_obj(obj) }
+}
+
+/// Return the application-level `__name__` object, materialising a legacy
+/// fallback exactly once from the raw name pointer.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+pub unsafe fn function_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        if !(*(obj as *const Function)).w_name.is_null() {
+            return (*(obj as *const Function)).w_name;
+        }
+        // `w_str_new` is a collection point that can relocate the function, so
+        // pin the receiver and reload it before storing through it.  The raw
+        // name itself lives in off-GC storage and does not move.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(obj);
+        let w_name = pyre_object::w_str_new(function_get_name(obj));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        function_set_name_obj(obj, w_name);
+        w_name
+    }
 }
 
 /// Return the canonical W_DictObject stored as `function.w_func_globals`.
@@ -1897,19 +1946,34 @@ pub unsafe fn function_get_func_name(obj: PyObjectRef) -> &'static str {
 #[inline]
 pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
     unsafe {
-        if !pyre_object::is_str(name) {
+        if !crate::baseobjspace::isinstance_str_w(name) {
             return;
         }
-        let name = pyre_object::w_str_get_value(name).to_string();
-        let name = if pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_name = name;
+        let raw_name = pyre_object::w_str_get_value(name).to_string();
+        let raw_name = if pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
             pyre_object::gc_storage::gc_alloc_storage_box(
-                name,
+                raw_name,
                 pyre_object::typeobject::name_storage_gc_type_id(),
             ) as *const String
         } else {
-            pyre_object::lltype::malloc_raw(name) as *const String
+            pyre_object::lltype::malloc_raw(raw_name) as *const String
         };
-        (*(obj as *mut Function)).name = name;
+        (*(obj as *mut Function)).name = raw_name;
+    }
+}
+
+/// Construction-time `__name__` stamp from the code object's shared wrapped
+/// `co_name`. The raw `name` pointer is set separately from `CodeObject.obj_name`.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`; `value` must be a string object.
+#[inline]
+pub unsafe fn function_set_name_obj(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_name = value;
     }
 }
 
@@ -3393,10 +3457,28 @@ mod tests {
     }
 
     #[test]
+    fn function_name_getter_preserves_the_stored_object() {
+        crate::test_hooks::install_hash_hook();
+        let raw_code = 0xDEAD_BEEF as *const ();
+        let w_code = crate::w_code_new(raw_code);
+        let w_globals = pyre_object::w_module_dict_new();
+        let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
+        let w_name = pyre_object::w_str_new("renamed");
+
+        unsafe {
+            function_set_func_name(obj, w_name);
+            assert_eq!(function_get_name_obj(obj), w_name);
+            assert_eq!(function_get_name_obj(obj), w_name);
+            assert_eq!(function_get_name(obj), "renamed");
+        }
+    }
+
+    #[test]
     fn test_function_field_offsets() {
         assert_eq!(FUNCTION_CODE_OFFSET, 16); // after PyObject { ob_type(8) + w_class(8) }
         assert_eq!(FUNCTION_NAME_OFFSET, 32); // after code(8) + can_change_code(1) + padding(7)
-        assert_eq!(FUNCTION_CLOSURE_OFFSET, 40); // after name
+        assert_eq!(FUNCTION_W_NAME_OFFSET, 40); // after name
+        assert_eq!(FUNCTION_CLOSURE_OFFSET, 48); // after w_name
     }
 
     /// Guard against drift between the constant colocated with
@@ -3430,6 +3512,7 @@ mod tests {
             [
                 std::mem::offset_of!(Function, code),
                 std::mem::offset_of!(Function, name),
+                std::mem::offset_of!(Function, w_name),
                 std::mem::offset_of!(Function, closure),
                 std::mem::offset_of!(Function, defs_w),
                 std::mem::offset_of!(Function, w_kw_defs),
