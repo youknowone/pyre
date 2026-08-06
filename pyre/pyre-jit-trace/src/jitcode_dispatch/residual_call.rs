@@ -5600,6 +5600,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             allboxes = specialized_allboxes;
                         }
                         WalkerStoreAttrSpecialization::Direct => {
+                            fbw_mark_foriter_body_effect_since_consume();
+                            fbw_bump_executed_effect();
                             return Ok((DispatchOutcome::Continue, op.next_pc));
                         }
                     }
