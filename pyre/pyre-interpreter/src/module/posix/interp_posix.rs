@@ -4730,12 +4730,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "get_inheritable() requires 1 argument",
                         ));
                     }
+                    use std::os::fd::BorrowedFd;
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                    if flags < 0 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
-                    }
-                    Ok(pyre_object::w_bool_from(flags & libc::FD_CLOEXEC == 0))
+                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let inheritable = rustpython_host_env::fcntl::get_inheritable(bfd)
+                        .map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_bool_from(inheritable))
                 },
                 1,
             ),
