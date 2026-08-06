@@ -2303,6 +2303,51 @@ fn compare_f64(f1: f64, f2: f64, op: CompareOp) -> bool {
     }
 }
 
+/// `specialisedtupleobject.py:113-127 descr_eq`, the arm where both operands
+/// are the SAME specialised class: the value slots compare raw, so neither
+/// side pays the box `getitem` would have to build for an `_ii` / `_ff` slot.
+///
+/// `None` means the pair is not same-class — a mixed pair (one specialised,
+/// one array-backed) still walks elementwise, which is what upstream does too.
+///
+/// # Safety
+/// `a` and `b` must point to valid tuple objects.
+unsafe fn specialised_tuple_same_class_eq(
+    a: PyObjectRef,
+    b: PyObjectRef,
+) -> Result<Option<bool>, PyError> {
+    if is_specialised_tuple_ii(a) && is_specialised_tuple_ii(b) {
+        let equal = (0..2).all(|i| {
+            w_specialised_tuple_ii_getvalue(a, i) == w_specialised_tuple_ii_getvalue(b, i)
+        });
+        return Ok(Some(equal));
+    }
+    if is_specialised_tuple_ff(a) && is_specialised_tuple_ff(b) {
+        let equal = (0..2).all(|i| {
+            let va = w_specialised_tuple_ff_getvalue(a, i);
+            let vb = w_specialised_tuple_ff_getvalue(b, i);
+            // Two NaNs compare unequal as doubles, but a tuple checks element
+            // identity first, so the same NaN in both slots must still be
+            // equal — `float2longlong` upstream, the raw bits here. `+0.0`
+            // and `-0.0` differ in bits and are caught by the value compare.
+            va == vb || va.to_bits() == vb.to_bits()
+        });
+        return Ok(Some(equal));
+    }
+    if is_specialised_tuple_oo(a) && is_specialised_tuple_oo(b) {
+        for i in 0..2 {
+            if !crate::baseobjspace::eq_w(
+                w_specialised_tuple_oo_getvalue(a, i),
+                w_specialised_tuple_oo_getvalue(b, i),
+            )? {
+                return Ok(Some(false));
+            }
+        }
+        return Ok(Some(true));
+    }
+    Ok(None)
+}
+
 /// floatobject.py:106-129 `do_compare_bigint` — compare a float against a
 /// bigint without converting the bigint to a double, which would round it.
 fn do_compare_bigint(f1: f64, b2: &BigInt, op: CompareOp) -> bool {
@@ -4852,6 +4897,15 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         if is_tuple(a) && is_tuple(b) {
             let la = w_tuple_len(a);
             let lb = w_tuple_len(b);
+            if matches!(op, CompareOp::Eq | CompareOp::Ne)
+                && let Some(equal) = specialised_tuple_same_class_eq(a, b)?
+            {
+                return Ok(w_bool_from(if matches!(op, CompareOp::Ne) {
+                    !equal
+                } else {
+                    equal
+                }));
+            }
             let min_len = la.min(lb);
             for i in 0..min_len {
                 let ea = w_tuple_getitem(a, i as i64).unwrap_or(PY_NULL);
@@ -5284,6 +5338,11 @@ mod tests {
         }
     }
 
+    fn assert_compare_bool(a: PyObjectRef, b: PyObjectRef, op: CompareOp, expected: bool) {
+        let result = compare(a, b, op).unwrap();
+        assert_eq!(unsafe { w_bool_get_value(result) }, expected);
+    }
+
     #[test]
     fn test_int_add() {
         let a = w_int_new(3);
@@ -5298,6 +5357,47 @@ mod tests {
         let b = w_int_new(10);
         let result = compare(a, b, CompareOp::Lt).unwrap();
         unsafe { assert!(w_bool_get_value(result)) };
+    }
+
+    #[test]
+    fn test_specialised_tuple_equality_uses_same_class_raw_slots() {
+        // The `_oo` case interns its strs, which reaches a str-keyed dict.
+        crate::test_hooks::install_hash_hook();
+        assert_compare_bool(
+            w_tuple_new(vec![w_int_new(1), w_int_new(2)]),
+            w_tuple_new(vec![w_int_new(1), w_int_new(2)]),
+            CompareOp::Eq,
+            true,
+        );
+        assert_compare_bool(
+            w_tuple_new(vec![w_int_new(1), w_int_new(2)]),
+            w_tuple_new(vec![w_int_new(1), w_int_new(3)]),
+            CompareOp::Eq,
+            false,
+        );
+        assert_compare_bool(
+            pyre_object::makespecialisedtuple2(w_float_new(1.0), w_float_new(2.0)),
+            pyre_object::makespecialisedtuple2(w_float_new(1.0), w_float_new(2.0)),
+            CompareOp::Eq,
+            true,
+        );
+
+        let nan = w_float_new(f64::NAN);
+        let nan_pair = pyre_object::makespecialisedtuple2(nan, nan);
+        assert_compare_bool(nan_pair, nan_pair, CompareOp::Eq, true);
+
+        assert_compare_bool(
+            w_tuple_new(vec![w_str_new("a"), w_str_new("b")]),
+            w_tuple_new(vec![w_str_new("a"), w_str_new("b")]),
+            CompareOp::Eq,
+            true,
+        );
+        assert_compare_bool(
+            w_tuple_new(vec![w_int_new(1), w_int_new(2)]),
+            pyre_object::w_tuple_new_array_backed(vec![w_int_new(1), w_int_new(2)]),
+            CompareOp::Eq,
+            true,
+        );
     }
 
     #[test]
