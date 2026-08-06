@@ -3387,6 +3387,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     }
     // heapcache.py: check if this field was already read/written in this trace
     let field_index = descr.index();
+    let field_name = descr_field_name(&descr);
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
         // pyjitpl.py:934-945 cache-hit sanity check (int arm). The
         // line-by-line port runs `executor.execute(cpu, mi, opnum,
@@ -3401,31 +3402,28 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
             _ => None,
         };
         if let Some(cached_int) = expected_int {
-            if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
-                let struct_ptr = struct_ref.0 as i64;
-                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                    if let Some(majit_ir::Value::Int(loaded)) =
-                        ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
-                    {
-                        if loaded != cached_int && crate::probe_subscr_enabled() {
-                            eprintln!(
-                                "[PYRE_PROBE_SUBSCR] sanity-int-mismatch obj={:?} field_index={} struct_ptr={:#x} descr_pure={} cached={} loaded={}",
-                                obj,
-                                field_index,
-                                struct_ptr,
-                                descr.is_always_pure(),
-                                cached_int,
-                                loaded
-                            );
-                        }
-                        assert_eq!(
-                            loaded, cached_int,
-                            "_opimpl_getfield_gc_any_pureornot sanity \
-                             check (int): loaded {loaded} != cached \
-                             {cached_int} (field_index={field_index}, \
-                             struct_ptr={struct_ptr:#x})"
+            if let Some(struct_ptr) = concrete_gc_ptr(ctx, obj) {
+                if let Some(majit_ir::Value::Int(loaded)) =
+                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+                {
+                    if loaded != cached_int && crate::probe_subscr_enabled() {
+                        eprintln!(
+                            "[PYRE_PROBE_SUBSCR] sanity-int-mismatch obj={:?} field_index={} struct_ptr={:#x} descr_pure={} cached={} loaded={}",
+                            obj,
+                            field_index,
+                            struct_ptr,
+                            descr.is_always_pure(),
+                            cached_int,
+                            loaded
                         );
                     }
+                    assert_eq!(
+                        loaded, cached_int,
+                        "_opimpl_getfield_gc_any_pureornot sanity \
+                             check (int): loaded {loaded} != cached \
+                             {cached_int} (field_index={field_index}, \
+                             field={field_name}, struct_ptr={struct_ptr:#x})"
+                    );
                 }
             }
         }
@@ -3479,16 +3477,8 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     // `resbox` carries the loaded value; pair the recorded opref with
     // the live int from `field_sanity_load` so subsequent
     // `box_value(result)` mirrors RPython's executor-returned Box.
-    let live_value = if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
-        let struct_ptr = struct_ref.0 as i64;
-        if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-            ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let live_value = concrete_gc_ptr(ctx, obj)
+        .and_then(|struct_ptr| ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int));
     if let Some(live_value) = live_value {
         ctx.set_opref_concrete(result, live_value);
     }
@@ -3515,6 +3505,7 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         }
     }
     let field_index = descr.index();
+    let field_name = descr_field_name(&descr);
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
         // pyjitpl.py:934-945 cache-hit sanity check (ref arm).
         // `box_value(cached)` resolves the upstream
@@ -3526,9 +3517,8 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
             _ => None,
         };
         if let Some(cached_ref) = expected_ref {
-            if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
-                let struct_ptr = struct_ref.0 as i64;
-                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+            if cached_ref != majit_ir::GcRef::NO_CONCRETE {
+                if let Some(struct_ptr) = concrete_gc_ptr(ctx, obj) {
                     if let Some(majit_ir::Value::Ref(loaded)) =
                         ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
                     {
@@ -3536,7 +3526,7 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                             loaded, cached_ref,
                             "_opimpl_getfield_gc_any_pureornot sanity \
                              check (ref): loaded {:#x} != cached {:#x} \
-                             (field_index={field_index}, struct_ptr=\
+                             (field_index={field_index}, field={field_name}, struct_ptr=\
                              {struct_ptr:#x})",
                             loaded.0, cached_ref.0,
                         );
@@ -3581,21 +3571,34 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     // pyjitpl.py:948-949 `resbox = execute_with_descr(...); upd.getfield_now_known(resbox)`.
     // Pair the recorded opref with the live ref so subsequent
     // `box_value(result)` mirrors RPython's executor-returned Box.
-    let live_value = if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
-        let struct_ptr = struct_ref.0 as i64;
-        if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-            ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let live_value = concrete_gc_ptr(ctx, obj)
+        .and_then(|struct_ptr| ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref));
     if let Some(live_value) = live_value {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
+}
+
+fn descr_field_name(descr: &DescrRef) -> &str {
+    descr
+        .as_field_descr()
+        .map(|field| field.field_name())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("<unnamed>")
+}
+
+fn concrete_gc_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
+    let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) else {
+        return None;
+    };
+    if struct_ref == majit_ir::GcRef::NO_CONCRETE
+        || struct_ref.as_usize() == 0
+        || struct_ref.as_usize() == usize::MAX
+    {
+        return None;
+    }
+    Some(struct_ref.0 as i64)
 }
 
 // Note: pyre does not currently route GetfieldGcF through
@@ -3932,7 +3935,10 @@ fn array_load_for_cache(
         return None;
     };
     let array_ptr = array_ref.0 as i64;
-    if array_ptr == usize::MAX as i64 || array_ptr == 0 {
+    if array_ref == majit_ir::GcRef::NO_CONCRETE
+        || array_ptr == usize::MAX as i64
+        || array_ptr == 0
+    {
         return None;
     }
     let Some(majit_ir::Value::Int(index_value)) = ctx.box_value(index) else {

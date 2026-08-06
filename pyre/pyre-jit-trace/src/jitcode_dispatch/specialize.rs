@@ -8462,8 +8462,7 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
         .heap_cache_mut()
         .replace_box(func_ref, func_const);
 
-    // Recover the receiver list OpRef (the sub-walk reads it as ref-arg 0);
-    // `orthodox_list_append_commit` stamps it concrete.
+    // Recover the receiver list OpRef; the sub-walk reads it as ref-arg 0.
     let self_ref = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         callable_op,
