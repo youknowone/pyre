@@ -9407,6 +9407,10 @@ mod tests {
             1,
             "the exception exit must go with the elided operation"
         );
+        assert_eq!(
+            block.exits[0].target, continuation,
+            "the surviving exit must be the normal continuation"
+        );
         assert!(
             !block.exits.iter().any(|link| link.target == exc_block),
             "no exception edge may survive for an operation that is gone"
