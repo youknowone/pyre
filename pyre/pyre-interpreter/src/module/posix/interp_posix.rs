@@ -374,6 +374,21 @@ fn statvfs_result_seq_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// `posix.waitid_result` structseq — the five `siginfo_t` fields `waitid`
+/// fills (`posixmodule.c waitid_result_fields`). The call is one
+/// `interp_posix.py:1722` names and does not carry, so the shape here is the
+/// one CPython 3.14 publishes.
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn waitid_result_seq_type() -> PyObjectRef {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
+            "posix.waitid_result",
+            &["si_pid", "si_uid", "si_signo", "si_status", "si_code"],
+        ) as usize
+    }) as PyObjectRef
+}
+
 /// `os.times_result` structseq — `(user, system, children_user,
 /// children_system, elapsed)`; repr renders "posix.times_result(...)", or
 /// "nt.times_result(...)" on the host whose module is spelled that way.  The
@@ -1182,6 +1197,39 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ("SCHED_BATCH", libc::SCHED_BATCH as i64),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             ("SCHED_IDLE", libc::SCHED_IDLE as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        // The `cmd` `lockf` takes, which is the whole of its vocabulary and
+        // which os.py neither writes nor names.
+        for (name, val) in [
+            ("F_ULOCK", libc::F_ULOCK as i64),
+            ("F_LOCK", libc::F_LOCK as i64),
+            ("F_TLOCK", libc::F_TLOCK as i64),
+            ("F_TEST", libc::F_TEST as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        // The two `whence` values beyond the three os.py fixes itself: they
+        // seek to the next hole or the next data in a sparse file. A host that
+        // cannot answer that question defines neither, and the OpenBSD/NetBSD
+        // and AIX headers are among those — so the set is named rather than
+        // excluded, and a host left out of it is one short of a name rather
+        // than one carrying a wrong value.
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "solaris",
+            target_os = "illumos",
+            target_os = "hurd",
+        ))]
+        for (name, val) in [
+            ("SEEK_HOLE", libc::SEEK_HOLE as i64),
+            ("SEEK_DATA", libc::SEEK_DATA as i64),
         ] {
             crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
         }
@@ -5064,6 +5112,91 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ] {
             crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
         }
+        // Which process `waitid` is asked about, and what `si_code` says
+        // happened to it once it answers.
+        for (name, val) in [
+            ("P_ALL", libc::P_ALL as i64),
+            ("P_PID", libc::P_PID as i64),
+            ("P_PGID", libc::P_PGID as i64),
+            ("CLD_EXITED", libc::CLD_EXITED as i64),
+            ("CLD_KILLED", libc::CLD_KILLED as i64),
+            ("CLD_DUMPED", libc::CLD_DUMPED as i64),
+            ("CLD_TRAPPED", libc::CLD_TRAPPED as i64),
+            ("CLD_STOPPED", libc::CLD_STOPPED as i64),
+            ("CLD_CONTINUED", libc::CLD_CONTINUED as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+
+        // os.waitid(idtype, id, options) -> waitid_result | None
+        //
+        // `os_waitid_impl` — the call reports on a child without reaping it
+        // when WNOWAIT is among the options, which is what separates it from
+        // `waitpid`. A zero `si_pid` means the options asked about a state no
+        // child is in (WNOHANG with nothing to report), and that is `None`
+        // rather than a result whose every field is zero.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(ns, "waitid_result", waitid_result_seq_type());
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "waitid",
+            crate::make_builtin_function_with_arity(
+                "waitid",
+                |args| {
+                    if args.len() != 3 {
+                        return Err(crate::PyError::type_error(format!(
+                            "waitid expected 3 arguments, got {}",
+                            args.len(),
+                        )));
+                    }
+                    let idtype = crate::baseobjspace::c_int_w(args[0])? as libc::idtype_t;
+                    let id = crate::baseobjspace::int_w(crate::baseobjspace::space_index(args[1])?)
+                        .map_err(|_| {
+                            crate::PyError::overflow_error(
+                                "Python int too large to convert to C long",
+                            )
+                        })? as libc::id_t;
+                    let options = crate::baseobjspace::c_int_w(args[2])?;
+                    // `si.si_pid = 0` before the call: the field is what the
+                    // "nothing to report" answer is read out of, and a call
+                    // that reports nothing does not write it.
+                    let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    loop {
+                        let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
+                            libc::waitid(idtype, id, &mut si, options)
+                        });
+                        if ret >= 0 {
+                            break;
+                        }
+                        crate::builtins::eintr_retry_with(
+                            std::io::Error::from_raw_os_error(errno),
+                            |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
+                        )?;
+                    }
+                    // The three that live in the union `siginfo_t` keeps its
+                    // process fields in are read through the accessors that
+                    // name which arm is meant; `si_signo` and `si_code` are
+                    // outside it.
+                    let (pid, uid, status) =
+                        unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
+                    if pid == 0 {
+                        return Ok(pyre_object::w_none());
+                    }
+                    Ok(crate::_structseq::new_instance(
+                        waitid_result_seq_type(),
+                        vec![
+                            pyre_object::w_int_new(pid as i64),
+                            pyre_object::w_int_new(uid as i64),
+                            pyre_object::w_int_new(si.si_signo as i64),
+                            pyre_object::w_int_new(status as i64),
+                            pyre_object::w_int_new(si.si_code as i64),
+                        ],
+                    ))
+                },
+                3,
+            ),
+        );
 
         // os.dup(fd) -> new_fd
         #[cfg(not(feature = "sandbox"))]
@@ -5348,6 +5481,53 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     Ok(pyre_object::w_none())
                 },
                 2,
+            ),
+        );
+
+        // os.lockf(fd, cmd, len) -> None
+        //
+        // `interp_posix.py:3006-3012` — one `lockf` under the `eintr_retry`
+        // loop, so a lock that waits and is interrupted goes back to waiting
+        // after the signal handler has run rather than surfacing as
+        // `InterruptedError`. F_LOCK blocks, so it is put through the call
+        // gate the way every other waiting call here is.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        crate::module_ns_store(
+            ns,
+            "lockf",
+            crate::make_builtin_function_with_arity(
+                "lockf",
+                |args| {
+                    if args.len() != 3 {
+                        return Err(crate::PyError::type_error(format!(
+                            "lockf expected 3 arguments, got {}",
+                            args.len(),
+                        )));
+                    }
+                    // interp_posix.py:3005 `@unwrap_spec(fd=c_int, cmd=c_int,
+                    // length=r_longlong)` — the length is an offset, so it is
+                    // the same conversion `ftruncate` gives one.
+                    let fd = crate::baseobjspace::c_int_w(args[0])?;
+                    let cmd = crate::baseobjspace::c_int_w(args[1])?;
+                    let length = truncate_length_w(args[2])?;
+                    loop {
+                        let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
+                            libc::lockf(fd, cmd, length)
+                        });
+                        if ret == 0 {
+                            break;
+                        }
+                        crate::builtins::eintr_retry_with(
+                            std::io::Error::from_raw_os_error(errno),
+                            |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
+                        )?;
+                    }
+                    // `os_lockf_impl` answers `None`. `interp_posix.py:3012`
+                    // answers the `0` the call returns on success, which 3.14
+                    // — the oracle the parity suite reads — does not carry.
+                    Ok(pyre_object::w_none())
+                },
+                3,
             ),
         );
 
@@ -8254,10 +8434,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "getpgrp",
             "getpgid",
             // host system-configuration probes; pathconf consults a
-            // guest-controlled path on the real filesystem.
+            // guest-controlled path on the real filesystem, and confstr
+            // answers with the host's own search path among other strings.
             "pathconf",
             "fpathconf",
             "sysconf",
+            "confstr",
+            // a lock on a descriptor the controller owns
+            "lockf",
+            // reports on a child of this process, which the sandbox has none of
+            "waitid",
             // terminal / tty inspection + control
             "tcgetpgrp",
             "tcsetpgrp",

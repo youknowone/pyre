@@ -70,6 +70,13 @@ pub mod sys {
         S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED,
         WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED, X_OK,
     };
+    // `lockf`'s commands and `waitid`'s two vocabularies — which process it is
+    // asked about, and what it reports happened. All are numbers the module
+    // publishes; the calls themselves are refused under sandbox.
+    pub use ::libc::{
+        CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, CLD_TRAPPED, F_LOCK,
+        F_TEST, F_TLOCK, F_ULOCK, P_ALL, P_PGID, P_PID,
+    };
     // `posix`'s `<sched.h>` and `<dlfcn.h>` names, which carry the same gates
     // there as the table that publishes them: the Apple targets declare the
     // scheduling policies outside the `libc` crate, `SCHED_BATCH`/`SCHED_IDLE`
@@ -80,6 +87,20 @@ pub mod sys {
     pub use ::libc::{SCHED_BATCH, SCHED_IDLE};
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     pub use ::libc::RTLD_DEEPBIND;
+    // `SEEK_HOLE`/`SEEK_DATA` carry the same host list as the table that
+    // publishes them: they exist only where the header answers the question.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "hurd",
+    ))]
+    pub use ::libc::{SEEK_DATA, SEEK_HOLE};
     // `posix.sysconf`'s name table names one constant per entry and calls
     // nothing, so the whole table resolves through the seam.
     #[cfg(all(unix, not(target_os = "redox")))]
