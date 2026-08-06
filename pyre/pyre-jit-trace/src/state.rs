@@ -3182,6 +3182,11 @@ pub(crate) fn note_root_trace_too_long(
         // pyjitpl.py:2843-2844.
         warm_state.trace_next_iteration(merge_key);
         warm_state.mark_force_finish_tracing(merge_key);
+        // pyjitpl.py:2846 `warmstate.dont_trace_here(greenkey)`, the third call
+        // of the same arm.  Without it the two above ask for the loop to be
+        // re-traced and force-finished while its callers may still inline it,
+        // so the next attempt can rebuild the very trace that overflowed.
+        warm_state.disable_noninlinable_function(merge_key);
     }
     if let Some(source_jct) = source_token.as_ref() {
         // pyjitpl.py:2857 `loop_token.retraced_count |= FORCE_BRIDGE_SEGMENTING`.
