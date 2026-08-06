@@ -2087,6 +2087,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
             || !lo.option_try_sites.is_empty()
+            || !lo.slice_index_minusone_sites.is_empty()
         {
             // The exception-link transforms run on a simplified graph,
             // as exceptiontransform.py does (graphs reach it after
@@ -2099,6 +2100,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
         }
         let mut tail_forwarded_returns = 0usize;
+        if !lo.slice_index_minusone_sites.is_empty() {
+            crate::front::slice_index::rewire_slice_index_minusone_sites(
+                &mut lo.graph,
+                &lo.slice_index_minusone_sites,
+            );
+        }
         if !lo.result_exc_call_results.is_empty() {
             let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
                 &mut lo.graph,
@@ -2805,6 +2812,9 @@ struct Lowering<'a> {
     /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
     /// the loop (see [`crate::front::range_iter::RangeNewSite`]).
     range_iter_new_sites: Vec<crate::front::range_iter::RangeNewSite>,
+    /// RangeTo aggregates retained as candidates for the exact MinusOne
+    /// slice-index recognizer; general RangeTo remains dormant.
+    slice_index_minusone_sites: Vec<crate::front::slice_index::SliceIndexMinusOneSite>,
     /// `RangeInclusive::contains(&self, &x)` call sites paired with the
     /// `new` sites above by the `front::range_contains` post-pass (see
     /// [`crate::front::range_contains::RangeContainsSite`]).
@@ -3030,6 +3040,7 @@ impl<'a> Lowering<'a> {
             saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
+            slice_index_minusone_sites: Vec::new(),
             range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
@@ -4733,6 +4744,17 @@ impl<'a> Lowering<'a> {
                             start: arg_vars[0].clone(),
                             end: arg_vars[1].clone(),
                         });
+                }
+                if owner_path.as_slice() == ["core", "ops", "range"]
+                    && ctor_name == "RangeTo"
+                    && arg_vars.len() == 1
+                {
+                    self.slice_index_minusone_sites.push(
+                        crate::front::slice_index::SliceIndexMinusOneSite {
+                            range_result: res.clone(),
+                            end: arg_vars[0].clone(),
+                        },
+                    );
                 }
                 // NOTE: RangeFrom and RangeTo capture are DORMANT. Their
                 // rewrites plant `getslice`, which has no blackhole handler.

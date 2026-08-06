@@ -1567,6 +1567,32 @@ pub fn translate_op(
                     if let Some(opname) = nonraising_core_bridge_opname(segments, arg_hls.len()) {
                         return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
                     }
+                    // `slice[..slice.len() - 1]` is emitted by
+                    // `front::slice_index` as an unregistered marker rather
+                    // than frontend `getslice`/`ConstInt` ops.  The marker is
+                    // expanded here, after annotation, to the upstream
+                    // `getslice(slice, 0, -1)` contract.  This mirrors the
+                    // frontend/adapter split used by `__array_repeat`: an
+                    // untyped graph falling to the legacy walker retains an
+                    // ordinary residual call and cannot carry an unwired
+                    // `getslice` op to the assembler.
+                    //
+                    // Upstream: `decompose_slice_args` (`rtyper.rs:2798`)
+                    // selects `SliceKind::MinusOne` for annotated constants
+                    // `0` and `-1`, then `rlist.py:906-911` calls
+                    // `ll_listslice_minusone` (asserting, not clamping).
+                    if segments.as_slice() == ["__getslice_minusone"] && arg_hls.len() == 1 {
+                        let slice = arg_hls.into_iter().next().expect("slice arg");
+                        return Ok(vec![FlowspaceOp::new(
+                            "getslice",
+                            vec![
+                                slice,
+                                Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+                                Hlvalue::Constant(Constant::new(ConstValue::Int(-1))),
+                            ],
+                            result,
+                        )]);
+                    }
                     // `[v; N]` array literal.  `front::mir` lowers
                     // `Rvalue::Repeat` to the `__array_repeat` synthetic
                     // carrying `(fill, count)` whenever the count decodes.
@@ -4689,6 +4715,41 @@ mod tests {
         assert_eq!(translated[1].args[0], translated[0].result);
         assert_eq!(translated[1].args[1], count);
         assert_eq!(translated[1].result, result);
+    }
+
+    #[test]
+    fn translate_op_getslice_minusone_expands_after_annotation() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_getslice_minusone_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let slice = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), slice.clone());
+        value_map.insert(vars[1].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__getslice_minusone".into()],
+                },
+                args: vec![vars[0].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("minus-one marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getslice");
+        assert_eq!(translated[0].args[0], slice);
+        assert_eq!(
+            translated[0].args[1],
+            Hlvalue::Constant(Constant::new(ConstValue::Int(0)))
+        );
+        assert_eq!(
+            translated[0].args[2],
+            Hlvalue::Constant(Constant::new(ConstValue::Int(-1)))
+        );
+        assert_eq!(translated[0].result, result);
     }
 
     #[test]
