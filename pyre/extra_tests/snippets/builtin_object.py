@@ -31,7 +31,6 @@ for method in (
     object.__reduce_ex__,
     object.__getstate__,
     object.__dir__,
-    object.__sizeof__,
 ):
     assert_type_error(method)
 
@@ -39,7 +38,6 @@ assert_type_error(object.__format__, object())
 assert_type_error(object.__reduce__, object(), None)
 assert_type_error(object.__getstate__, object(), None)
 assert_type_error(object.__dir__, object(), None)
-assert_type_error(object.__sizeof__, object(), None)
 
 assert MyObject().__eq__(MyObject()) == NotImplemented
 assert MyObject().__ne__(MyObject()) == NotImplemented

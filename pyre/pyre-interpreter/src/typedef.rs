@@ -4742,28 +4742,6 @@ fn init_list_type(ns: PyObjectRef) {
         )
     };
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none()) };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__sizeof__",
-            make_builtin_function_with_arity(
-                "__sizeof__",
-                |args| {
-                    let list =
-                        crate::type_methods::require_list_receiver(args, "__sizeof__", true)?;
-                    // CPython 3.14's PyListObject header is five machine
-                    // words; the item array contributes one pointer per
-                    // allocated slot. This is the version oracle where PyPy
-                    // does not expose a list-specific descriptor.
-                    let size = 5 * std::mem::size_of::<usize>()
-                        + unsafe { pyre_object::w_list_capacity(list) }
-                            * std::mem::size_of::<PyObjectRef>();
-                    Ok(w_int_new(size as i64))
-                },
-                1,
-            ),
-        )
-    };
     // listobject.py:2486 __class_getitem__ = interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
@@ -5202,41 +5180,6 @@ fn init_str_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__hash__",
                 |args| Ok(w_int_new(crate::builtins::hash_value(args[0]))),
-                1,
-            ),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__sizeof__",
-            make_builtin_function_with_arity(
-                "__sizeof__",
-                |args| {
-                    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-                    let mut maxchar = 0u32;
-                    let mut length = 0usize;
-                    for cp in s.code_points() {
-                        maxchar = maxchar.max(cp.to_u32());
-                        length += 1;
-                    }
-                    // CPython's compact PEP 393 layout, exposed for compatibility
-                    // with test_str.test_raiseMemError.  PyPy documents
-                    // `__sizeof__` on str but sys.getsizeof itself remains a
-                    // default-returning operation for other objects.
-                    let word = std::mem::size_of::<usize>();
-                    let struct_size = if maxchar < 0x80 { 5 * word } else { 7 * word };
-                    let char_size = if maxchar < 0x100 {
-                        1
-                    } else if maxchar < 0x10000 {
-                        2
-                    } else {
-                        4
-                    };
-                    Ok(pyre_object::w_int_new(
-                        (struct_size + char_size * (length + 1)) as i64,
-                    ))
-                },
                 1,
             ),
         )
@@ -6328,32 +6271,6 @@ fn init_dict_type(ns: PyObjectRef) {
             )
         };
     }
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__sizeof__",
-            make_builtin_function_with_arity(
-                "__sizeof__",
-                |args| {
-                    crate::type_methods::arity_slot(args, 0)?;
-                    let backing = crate::type_methods::resolve_dict_backing(args[0]);
-                    if backing.is_null() {
-                        return Err(crate::PyError::type_error(
-                            "descriptor '__sizeof__' for 'dict' objects doesn't apply",
-                        ));
-                    }
-                    let len = unsafe { pyre_object::w_dict_len(backing) };
-                    // W_DictObject plus its strategy/storage bookkeeping and
-                    // the stored hash/key/value lane for each live entry.
-                    let size = pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE
-                        + std::mem::size_of::<usize>()
-                        + len * 3 * std::mem::size_of::<usize>();
-                    Ok(w_int_new(size as i64))
-                },
-                1,
-            ),
-        )
-    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -10366,35 +10283,6 @@ fn init_type_type(ns: PyObjectRef) {
             ),
         )
     };
-    // CPython 3.14 Objects/typeobject.c:6170-6188 `type.__sizeof__`.
-    // PyPy does not expose a type-specific override, so this is one of the
-    // explicit 3.14 compatibility additions: the object-side helper reads
-    // the canonical W_TypeObject heaptype/hasdict fields corresponding to
-    // CPython's PyHeapTypeObject and ht_cached_keys owners.
-    let sizeof_method = crate::gateway::make_builtin_function_with_arity_and_doc(
-        "__sizeof__",
-        |args| {
-            let w_type = args[0];
-            if !unsafe { pyre_object::is_type(w_type) } {
-                return Err(crate::PyError::type_error(format!(
-                    "descriptor '__sizeof__' for 'type' objects doesn't apply to a '{}' object",
-                    crate::baseobjspace::object_functionstr_type_name(w_type),
-                )));
-            }
-            Ok(pyre_object::w_int_new(unsafe {
-                pyre_object::w_type_get_abi_sizeof(w_type)
-            }))
-        },
-        1,
-        "Return memory consumption of the type object.",
-    );
-    unsafe {
-        crate::function::fset_func_text_signature(
-            sizeof_method,
-            pyre_object::w_str_new("($self, /)"),
-        );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__sizeof__", sizeof_method);
-    }
     // typeobject.py:833-841 `W_TypeObject.descr_or` / `descr_ror` delegate
     // to `_pypy_generic_alias._create_union`.
     unsafe {
@@ -14628,15 +14516,6 @@ fn init_code_type(ns: PyObjectRef) {
                 1,
             ),
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__sizeof__",
-            make_builtin_function_with_arity(
-                "__sizeof__",
-                |args| unsafe { crate::pycode::code_sizeof(args[0]) },
-                1,
-            ),
-        );
     }
 
     for name in ["replace", "__replace__"] {
@@ -16922,38 +16801,6 @@ fn init_int_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
-            "__sizeof__",
-            make_builtin_function_with_arity(
-                "__sizeof__",
-                |args| {
-                    let bits = unsafe {
-                        if pyre_object::is_bool(args[0]) {
-                            pyre_object::rbigint::bit_length_int(pyre_object::w_bool_get_value(
-                                args[0],
-                            )
-                                as i64) as usize
-                        } else if pyre_object::is_int(args[0]) {
-                            pyre_object::rbigint::bit_length_int(pyre_object::w_int_get_value(
-                                args[0],
-                            )) as usize
-                        } else {
-                            pyre_object::w_long_get_value(args[0]).bits() as usize
-                        }
-                    };
-                    // CPython 3.14's compact PyLong layout: three pointer-sized
-                    // header words and at least one 30-bit, four-byte digit.
-                    let digits = std::cmp::max(1, (bits + 29) / 30);
-                    Ok(w_int_new(
-                        (3 * std::mem::size_of::<usize>() + digits * 4) as i64,
-                    ))
-                },
-                1,
-            ),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
             "is_integer",
             make_builtin_function_with_arity(
                 "is_integer",
@@ -18676,25 +18523,6 @@ fn object_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_none())
 }
 
-/// `object.__sizeof__` — CPython 3.14's generic object size is the fixed
-/// object header plus one pointer-sized word for every declared slot.  The
-/// instance dict and weakref storage are accounted for separately by
-/// `sys.getsizeof`, so they are deliberately absent here.
-fn object_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_slot(args, 0)?;
-    let mut size = std::mem::size_of::<pyre_object::PyObject>();
-    if let Some(w_type) = crate::typedef::r#type(args[0]) {
-        if unsafe { pyre_object::is_type(w_type.as_ptr()) } {
-            let layout = unsafe { pyre_object::w_type_get_layout_ptr(w_type.as_ptr()) };
-            if !layout.is_null() {
-                size += unsafe { (*layout).nslots as usize }
-                    * std::mem::size_of::<pyre_object::PyObjectRef>();
-            }
-        }
-    }
-    Ok(w_int_new(size as i64))
-}
-
 fn init_object_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -19001,24 +18829,6 @@ fn init_object_type(ns: PyObjectRef) {
                 },
                 1,
             ),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__sizeof__",
-            // No declared arity: the body reports the mismatch itself, under
-            // the class that declares the descriptor rather than under the
-            // receiver's class the gateway would read.
-            make_builtin_function("__sizeof__", |args| {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error(
-                        "unbound method object.__sizeof__() needs an argument",
-                    ));
-                }
-                crate::type_methods::arity_no_args_of(Some("object"), args, "__sizeof__")?;
-                object_descr_sizeof(args)
-            }),
         )
     };
     // typeobject.py descr___init_subclass__ — the default accepts no
@@ -22919,17 +22729,6 @@ fn bytearray_descr_alloc(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     }))
 }
 
-fn bytearray_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_slot(args, 0)?;
-    let alloc = unsafe { pyre_object::bytearrayobject::w_bytearray_capacity(args[0]) };
-    let alloc = if alloc == 0 { 0 } else { alloc + 1 };
-    // Header + data/export fields + the separately allocated Vec descriptor,
-    // followed by its reserved byte payload.
-    let fixed =
-        pyre_object::bytearrayobject::W_BYTEARRAY_OBJECT_SIZE + std::mem::size_of::<Vec<u8>>();
-    Ok(w_int_new((fixed + alloc) as i64))
-}
-
 fn bytearray_descr_resize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 1)?;
     let size = crate::builtins::space_index_w(args[1])?;
@@ -22999,7 +22798,6 @@ fn init_bytearray_type(ns: PyObjectRef) {
         ("__reduce__", bytearray_descr_reduce, 1),
         ("__reduce_ex__", bytearray_descr_reduce_ex, 2),
         ("__alloc__", bytearray_descr_alloc, 1),
-        ("__sizeof__", bytearray_descr_sizeof, 1),
         ("resize", bytearray_descr_resize, 2),
     ] {
         unsafe {
@@ -23737,13 +23535,6 @@ fn setlike_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     }
 }
 
-fn setlike_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let size = std::mem::size_of::<pyre_object::setobject::W_SetObject>()
-        + unsafe { pyre_object::w_set_capacity(args[0]) }
-            * std::mem::size_of::<pyre_object::dictmultiobject::ObjectKey>();
-    Ok(pyre_object::w_int_new(size as i64))
-}
-
 fn setlike_descr_contains_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_bool_from(set_descr_contains(
         args[0], args[1],
@@ -23882,12 +23673,6 @@ setlike_wrapper_gateways!(set_gateway_ge, frozenset_gateway_ge, "__ge__", set_de
 setlike_wrapper_gateways!(set_gateway_lt, frozenset_gateway_lt, "__lt__", set_descr_lt);
 setlike_wrapper_gateways!(set_gateway_gt, frozenset_gateway_gt, "__gt__", set_descr_gt);
 setlike_method_gateways!(
-    set_gateway_sizeof,
-    frozenset_gateway_sizeof,
-    "__sizeof__",
-    setlike_descr_sizeof
-);
-setlike_method_gateways!(
     set_gateway_contains,
     frozenset_gateway_contains,
     "__contains__",
@@ -23961,17 +23746,6 @@ fn setlike_gateway(
 }
 
 fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__sizeof__",
-            make_builtin_function_with_arity(
-                "__sizeof__",
-                setlike_gateway(frozen, set_gateway_sizeof, frozenset_gateway_sizeof),
-                1,
-            ),
-        )
-    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -25587,13 +25361,6 @@ fn async_generator_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     generator_set_name_common(args, true, 2)
 }
 
-fn generator_descr_sizeof(_args: &[PyObjectRef]) -> crate::PyResult {
-    Ok(w_int_new(
-        (pyre_object::generator::W_GENERATOR_OBJECT_SIZE
-            + std::mem::size_of::<crate::pyframe::PyFrame>()) as i64,
-    ))
-}
-
 /// Python 3.14 `PyObject_GenericSetAttr` error for the read-only members in
 /// `gen_getsetlist`. PyPy's `GetSetProperty` reports `readonly attribute
 /// 'name'`; the selected 3.14 surface includes the owning type as well.
@@ -25617,7 +25384,6 @@ fn init_generator_type(ns: PyObjectRef) {
         ("close", crate::baseobjspace::generator_close_method, 1),
         ("__iter__", crate::baseobjspace::iter_self_method, 1),
         ("__del__", crate::baseobjspace::generator_close_method, 1),
-        ("__sizeof__", generator_descr_sizeof, 1),
     ] {
         let function = if name == "__next__" {
             crate::gateway::make_builtin_function_with_arity_and_doc(
@@ -25728,7 +25494,6 @@ fn init_coroutine_type(ns: PyObjectRef) {
             1,
             None,
         ),
-        ("__sizeof__", generator_descr_sizeof, 1, None),
     ] {
         let function = match doc {
             Some(doc) => {
@@ -25831,7 +25596,6 @@ fn init_async_generator_type(ns: PyObjectRef) {
             crate::baseobjspace::async_generator_anext_method,
             1,
         ),
-        ("__sizeof__", generator_descr_sizeof, 1),
     ] {
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
@@ -27433,22 +27197,6 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     )
 }
 
-fn product_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let obj = args[0];
-    unsafe {
-        if !pyre_object::interp_itertools::is_product(obj) {
-            return Err(crate::PyError::type_error(
-                "descriptor '__sizeof__' requires a 'itertools.product' object",
-            ));
-        }
-        let product = &*(obj as *const pyre_object::interp_itertools::W_Product);
-        let npools = pyre_object::w_list_len(product.gears);
-        let size = std::mem::size_of::<pyre_object::interp_itertools::W_Product>()
-            + npools * std::mem::size_of::<isize>();
-        Ok(pyre_object::w_int_new(size as i64))
-    }
-}
-
 fn init_product_type(ns: PyObjectRef) {
     let entries = [
         ("__new__", make_new_descr(product_descr_new)),
@@ -27459,10 +27207,6 @@ fn init_product_type(ns: PyObjectRef) {
         (
             "__next__",
             make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
-        ),
-        (
-            "__sizeof__",
-            make_builtin_function_with_arity("__sizeof__", product_sizeof, 1),
         ),
         (
             "__doc__",
@@ -27477,8 +27221,8 @@ fn init_product_type(ns: PyObjectRef) {
 }
 
 // ── itertools.combinations TypeDef ──────────────────────────────────
-// PyPy W_Combinations with Python 3.14's keyword-capable constructor,
-// reduced pickle surface, and __sizeof__ method.
+// PyPy W_Combinations with Python 3.14's keyword-capable constructor and
+// reduced pickle surface.
 
 fn combinations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exact = gettypefor(&pyre_object::interp_itertools::COMBINATIONS_TYPE)
@@ -27531,21 +27275,6 @@ fn combinations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     )
 }
 
-fn combinations_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let obj = args[0];
-    unsafe {
-        if !pyre_object::interp_itertools::is_combinations(obj) {
-            return Err(crate::PyError::type_error(
-                "descriptor '__sizeof__' requires a 'itertools.combinations' object",
-            ));
-        }
-        let combinations = &*(obj as *const pyre_object::interp_itertools::W_Combinations);
-        let size = std::mem::size_of::<pyre_object::interp_itertools::W_Combinations>()
-            + combinations.r as usize * std::mem::size_of::<isize>();
-        Ok(pyre_object::w_int_new(size as i64))
-    }
-}
-
 fn init_combinations_type(ns: PyObjectRef) {
     let entries = [
         ("__new__", make_new_descr(combinations_descr_new)),
@@ -27556,10 +27285,6 @@ fn init_combinations_type(ns: PyObjectRef) {
         (
             "__next__",
             make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
-        ),
-        (
-            "__sizeof__",
-            make_builtin_function_with_arity("__sizeof__", combinations_sizeof, 1),
         ),
         (
             "__doc__",
@@ -27575,7 +27300,7 @@ fn init_combinations_type(ns: PyObjectRef) {
 
 // ── itertools.combinations_with_replacement TypeDef ────────────────
 // PyPy W_CombinationsWithReplacement with Python 3.14's keyword-capable
-// constructor, reduced pickle surface, and __sizeof__ method.
+// constructor and reduced pickle surface.
 
 fn combinations_with_replacement_descr_new(
     args: &[PyObjectRef],
@@ -27634,25 +27359,6 @@ fn combinations_with_replacement_descr_new(
     )
 }
 
-fn combinations_with_replacement_sizeof(
-    args: &[PyObjectRef],
-) -> Result<PyObjectRef, crate::PyError> {
-    let obj = args[0];
-    unsafe {
-        if !pyre_object::interp_itertools::is_combinations_with_replacement(obj) {
-            return Err(crate::PyError::type_error(
-                "descriptor '__sizeof__' requires a 'itertools.combinations_with_replacement' object",
-            ));
-        }
-        let combinations =
-            &*(obj as *const pyre_object::interp_itertools::W_CombinationsWithReplacement);
-        let size =
-            std::mem::size_of::<pyre_object::interp_itertools::W_CombinationsWithReplacement>()
-                + combinations.r as usize * std::mem::size_of::<isize>();
-        Ok(pyre_object::w_int_new(size as i64))
-    }
-}
-
 fn init_combinations_with_replacement_type(ns: PyObjectRef) {
     let entries = [
         (
@@ -27668,10 +27374,6 @@ fn init_combinations_with_replacement_type(ns: PyObjectRef) {
             make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
         ),
         (
-            "__sizeof__",
-            make_builtin_function_with_arity("__sizeof__", combinations_with_replacement_sizeof, 1),
-        ),
-        (
             "__doc__",
             w_str_new(
                 "Return successive r-length combinations of elements in the iterable allowing individual elements to have successive repeats.\n\ncombinations_with_replacement('ABC', 2) --> ('A','A'), ('A','B'), ('A','C'), ('B','B'), ('B','C'), ('C','C')",
@@ -27684,8 +27386,8 @@ fn init_combinations_with_replacement_type(ns: PyObjectRef) {
 }
 
 // ── itertools.permutations TypeDef ─────────────────────────────────
-// PyPy W_Permutations state machine with Python 3.14's exact-int r
-// conversion, reduced pickle surface, and __sizeof__ method.
+// PyPy W_Permutations state machine with Python 3.14's exact-int r conversion
+// and reduced pickle surface.
 
 fn permutations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exact = gettypefor(&pyre_object::interp_itertools::PERMUTATIONS_TYPE)
@@ -27772,22 +27474,6 @@ fn permutations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     )
 }
 
-fn permutations_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let obj = args[0];
-    unsafe {
-        if !pyre_object::interp_itertools::is_permutations(obj) {
-            return Err(crate::PyError::type_error(
-                "descriptor '__sizeof__' requires a 'itertools.permutations' object",
-            ));
-        }
-        let permutations = &*(obj as *const pyre_object::interp_itertools::W_Permutations);
-        let size = std::mem::size_of::<pyre_object::interp_itertools::W_Permutations>()
-            + (pyre_object::w_list_len(permutations.pool_w) + permutations.r as usize)
-                * std::mem::size_of::<isize>();
-        Ok(pyre_object::w_int_new(size as i64))
-    }
-}
-
 fn init_permutations_type(ns: PyObjectRef) {
     let entries = [
         ("__new__", make_new_descr(permutations_descr_new)),
@@ -27798,10 +27484,6 @@ fn init_permutations_type(ns: PyObjectRef) {
         (
             "__next__",
             make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
-        ),
-        (
-            "__sizeof__",
-            make_builtin_function_with_arity("__sizeof__", permutations_sizeof, 1),
         ),
         (
             "__doc__",

@@ -270,10 +270,8 @@ pub(crate) fn arity_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crat
     arity_no_args_of(None, args, name)
 }
 
-/// [`arity_no_args`] for a method whose declaring class cannot be recovered
-/// from the receiver: `object.__sizeof__` is shadowed on the MRO of every
-/// receiver whose own type declares one, yet the descriptor reached through
-/// `object` still reports `object`.
+/// [`arity_no_args`] with an optional explicit declaring class for methods
+/// whose owner cannot be recovered from the receiver.
 pub(crate) fn arity_no_args_of(
     owner: Option<&str>,
     args: &[PyObjectRef],

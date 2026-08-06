@@ -12,7 +12,6 @@ required = {
     "__reduce_ex__",
     "__repr__",
     "__rmod__",
-    "__sizeof__",
     "__str__",
     "resize",
 }
@@ -28,8 +27,6 @@ assert bytearray.__rmod__(bytearray(b"x"), b"%s") is NotImplemented
 
 assert bytearray().__alloc__() == 0
 assert b.__alloc__() >= len(b) + 1
-assert b.__sizeof__() >= b.__alloc__()
-
 assert bytearray().__reduce__() == (bytearray, (), None)
 assert b.__reduce__() == (bytearray, ("abc", "latin-1"), None)
 assert b.__reduce_ex__(2) == (bytearray, ("abc", "latin-1"), None)

@@ -1189,21 +1189,6 @@ pub unsafe fn code_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
     Ok(pyre_object::w_str_from_wtf8_managed(repr))
 }
 
-pub unsafe fn code_sizeof(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let code = unsafe { require_code(obj, "__sizeof__")? };
-    let size = std::mem::size_of::<PyCode>()
-        + std::mem::size_of::<crate::CodeObject>()
-        + code.instructions.len() * 2
-        + code.locations.len()
-            * std::mem::size_of::<(
-                rustpython_compiler_core::SourceLocation,
-                rustpython_compiler_core::SourceLocation,
-            )>()
-        + code.linetable.len()
-        + code.exceptiontable.len();
-    Ok(w_int_new(size as i64))
-}
-
 pub unsafe fn code_varname_from_oparg(
     obj: PyObjectRef,
     index: PyObjectRef,

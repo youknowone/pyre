@@ -22,7 +22,6 @@ expected = {
     "__reduce_ex__",
     "__repr__",
     "__setattr__",
-    "__sizeof__",
     "__str__",
     "__subclasshook__",
 }
@@ -33,8 +32,6 @@ right = object()
 for name in ("__lt__", "__le__", "__gt__", "__ge__"):
     assert getattr(object, name)(left, right) is NotImplemented
 
-assert object.__sizeof__(object()) == 16
-
 
 class Plain:
     pass
@@ -44,14 +41,11 @@ class Slotted:
     __slots__ = ("first", "second")
 
 
-assert object.__sizeof__(Plain()) == 16
-assert object.__sizeof__(Slotted()) == 32
-
 p = Plain()
 p.answer = 42
 names = object.__dir__(p)
 assert isinstance(names, list)
-assert {"answer", "__class__", "__sizeof__"} <= set(names)
+assert {"answer", "__class__"} <= set(names)
 assert dir(p) == sorted(dir(p))
 
 

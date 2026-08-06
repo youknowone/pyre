@@ -1026,13 +1026,6 @@ pub unsafe fn w_set_len(obj: PyObjectRef) -> usize {
     (*(obj as *const W_SetObject)).len
 }
 
-#[inline]
-pub unsafe fn w_set_capacity(obj: PyObjectRef) -> usize {
-    let _set_guard = w_set_lock(obj);
-    let s = &*(obj as *const W_SetObject);
-    (*s.items).capacity()
-}
-
 /// Cached frozenset hash; `-1` is the uncomputed sentinel.
 #[inline]
 pub unsafe fn w_frozenset_cached_hash(obj: PyObjectRef) -> Option<i64> {

@@ -10,6 +10,40 @@ use crate::{
 use pyre_object::*;
 use std::sync::OnceLock;
 
+const GETSIZEOF_MISSING: &str = r#"getsizeof(...)
+    getsizeof(object, default) -> int
+
+    Return the size of object in bytes.
+
+sys.getsizeof(object, default) will always return default on PyPy, and
+raise a TypeError if default is not provided.
+
+First note that the CPython documentation says that this function may
+raise a TypeError, so if you are seeing it, it means that the program
+you are using is not correctly handling this case.
+
+On PyPy, though, it always raises TypeError.  Before looking for
+alternatives, please take a moment to read the following explanation as
+to why it is the case.  What you are looking for may not be possible.
+
+A memory profiler using this function is most likely to give results
+inconsistent with reality on PyPy.  It would be possible to have
+sys.getsizeof() return a number (with enough work), but that may or
+may not represent how much memory the object uses.  It doesn't even
+make really sense to ask how much *one* object uses, in isolation
+with the rest of the system.  For example, instances have maps,
+which are often shared across many instances; in this case the maps
+would probably be ignored by an implementation of sys.getsizeof(),
+but their overhead is important in some cases if they are many
+instances with unique maps.  Conversely, equal strings may share
+their internal string data even if they are different objects---or
+empty containers may share parts of their internals as long as they
+are empty.  Even stranger, some lists create objects as you read
+them; if you try to estimate the size in memory of range(10**6) as
+the sum of all items' size, that operation will by itself create one
+million integer objects that never existed in the first place.
+"#;
+
 /// Shared stub type for `sys._getframe`, `sys.stdout` and other module-level
 /// sys attributes that expose attribute bags.
 ///
@@ -2146,87 +2180,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "copyright",
         w_str_new("Copyright (c) 2001-2024 Python Software Foundation.\nAll Rights Reserved."),
     );
-    // sys.getsizeof(obj[, default]) — PyPy vm.py returns the supplied default
-    // for untracked objects.  str additionally exposes its PEP 393-compatible
-    // `__sizeof__`, needed by the shared CPython test_str overflow check.
     module_ns_store(
         ns,
         "getsizeof",
-        make_builtin_function(
+        crate::gateway::make_builtin_function_with_doc(
             "getsizeof",
             |args| {
-                // `vm.py:355 getsizeof(space, w_object, w_default=None)` — both
-                // parameters are positional-or-keyword.
                 let scope = crate::builtins::bind_builtin_kwargs(
                     args,
                     &["object", "default"],
                     &[true, false],
                     "getsizeof",
                 )?;
-                let w_obj = scope[0];
-                let w_default = Some(scope[1]).filter(|d| !d.is_null());
-                // `sys_getsizeof` looks `__sizeof__` up on the type and calls
-                // it.  The `default` covers every TypeError along that route —
-                // a missing slot, an uncallable one, and a result that is not
-                // an integer — but not the negative-result ValueError.
-                // `vm.py:355 getsizeof` instead returns the default
-                // unconditionally ("not implemented on PyPy"); 3.14 reports the
-                // real size, and pyre's types all carry a working
-                // `__sizeof__`.  The GC header CPython adds for tracked
-                // objects has no fixed pyre counterpart, so the reported size
-                // is the object's own.
-                let sized = match unsafe {
-                    crate::baseobjspace::lookup_special(w_obj, "__sizeof__")
-                } {
-                    Ok(Some(method)) => crate::call::call_function_impl_result(method, &[]),
-                    Ok(None) => Err(crate::PyError::type_error(format!(
-                        "Type {} doesn't define __sizeof__",
-                        crate::baseobjspace::object_functionstr_type_name(w_obj)
-                    ))),
-                    Err(e) => Err(e),
+                let w_default = scope[1];
+                if w_default.is_null() {
+                    return Err(crate::PyError::type_error(GETSIZEOF_MISSING));
                 }
-                .and_then(|w_size| {
-                    // `PyLong_AsSsize_t(res)` — no `__index__` coercion, so a
-                    // non-integer result is the TypeError the default covers,
-                    // while a result too wide for the word is an OverflowError
-                    // it does not.  Both precede the `size < 0` test below, so
-                    // `__sizeof__` returning `-(1 << 100)` overflows rather
-                    // than reporting the negative.
-                    let is_integer = unsafe {
-                        pyre_object::is_int(w_size) || pyre_object::pyobject::is_long(w_size)
-                    };
-                    if !is_integer {
-                        return Err(crate::PyError::type_error("an integer is required"));
-                    }
-                    crate::baseobjspace::int_w(w_size).map_err(|_| {
-                        crate::PyError::overflow_error(
-                            "Python int too large to convert to C ssize_t",
-                        )
-                    })?;
-                    Ok(w_size)
-                });
-                match (sized, w_default) {
-                    (Ok(w_size), _) => {
-                        let negative = crate::baseobjspace::is_true(
-                            crate::objspace::descroperation::compare(
-                                w_size,
-                                pyre_object::w_int_new(0),
-                                crate::objspace::descroperation::CompareOp::Lt,
-                            )?,
-                        )?;
-                        if negative {
-                            return Err(crate::PyError::value_error(
-                                "__sizeof__() should return >= 0",
-                            ));
-                        }
-                        Ok(w_size)
-                    }
-                    (Err(e), Some(w_default)) if e.kind == crate::PyErrorKind::TypeError => {
-                        Ok(w_default)
-                    }
-                    (Err(e), _) => Err(e),
-                }
+                Ok(w_default)
             },
+            GETSIZEOF_MISSING,
         ),
     );
     // PyPy normally omits CPython's raw refcount API.  The shared ctypes

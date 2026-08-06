@@ -172,8 +172,8 @@ assert safe_path_flag(env, "-E", "-P") == "True"
 assert sys._getframemodulename() == "__main__", sys._getframemodulename()
 
 # PyPy's `vm.getsizeof(space, w_object, w_default=None)` accepts one or two
-# positional arguments.  Python 3.14 likewise rejects every excess argument,
-# including when the object has a working `__sizeof__`.
+# positional arguments. The reference interpreter likewise rejects every
+# excess argument.
 with assert_raises(TypeError):
     sys.getsizeof()
 
@@ -182,18 +182,6 @@ with assert_raises(TypeError):
 
 with assert_raises(TypeError):
     sys.getsizeof("x", 1, 2)
-
-# The default is returned only when `__sizeof__` is missing or raises
-# TypeError; an object with a working `__sizeof__` reports its size.
-default = object()
-assert sys.getsizeof(object(), default) == object().__sizeof__()
-
-
-class NoSizeof:
-    __sizeof__ = None
-
-
-assert sys.getsizeof(NoSizeof(), default) is default
 
 
 def test_getframemodulename():

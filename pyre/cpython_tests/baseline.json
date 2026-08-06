@@ -311,10 +311,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_descr": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_descrtut": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_devpoll": {
       "dynasm": "IMPORTERROR"

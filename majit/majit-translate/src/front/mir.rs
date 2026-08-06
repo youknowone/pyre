@@ -6616,8 +6616,7 @@ impl<'a> Lowering<'a> {
                 // constant `fold_size_const_global` produces for the
                 // NamedConst-initializer form, applied here to the inline
                 // call shape (`gc_alloc_storage_box`'s
-                // `try_gc_alloc_stable_raw(tid, size_of::<T>())`,
-                // `struct::__sizeof__`'s `size_of::<W_Struct>()`).  Removes the
+                // `try_gc_alloc_stable_raw(tid, size_of::<T>())`). Removes the
                 // residual `<host std.mem.size_of>` call the rtyper cannot
                 // register.  Declines (falls through to the ordinary call
                 // path) for a non-ADT type argument, whose size is not read

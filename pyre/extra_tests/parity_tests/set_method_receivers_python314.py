@@ -1,7 +1,6 @@
 METHODS = {
     "__contains__",
     "__reduce__",
-    "__sizeof__",
     "copy",
     "difference",
     "intersection",
@@ -66,8 +65,6 @@ assert set.isdisjoint(set_subclass, (3, 4))
 assert frozenset.isdisjoint(frozen_subclass, (3, 4))
 assert type(set.copy(set_subclass)) is set
 assert type(frozenset.copy(frozen_subclass)) is frozenset
-assert isinstance(set.__sizeof__(set_subclass), int)
-assert isinstance(frozenset.__sizeof__(frozen_subclass), int)
 assert isinstance(set.__reduce__(set_subclass), tuple)
 assert isinstance(frozenset.__reduce__(frozen_subclass), tuple)
 

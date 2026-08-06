@@ -1225,13 +1225,6 @@ impl W_Struct {
         let fmt = unsafe { w_str_get_value(self.format) };
         Ok(format!("Struct('{fmt}')"))
     }
-
-    /// CPython exposes a dedicated `Struct.__sizeof__` and applies the same
-    /// readiness guard before consulting the compiled format allocation.
-    fn __sizeof__(&self) -> Result<i64, crate::PyError> {
-        self.ensure_ready()?;
-        Ok(std::mem::size_of::<W_Struct>() as i64)
-    }
 }
 
 /// Resolve `(buffer, offset=0)` from a positional/keyword argument slice

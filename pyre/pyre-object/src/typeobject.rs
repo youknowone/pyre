@@ -734,25 +734,6 @@ pub unsafe fn w_type_set_hasdict(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).hasdict = v;
 }
 
-/// CPython 3.14 `type.__sizeof__` (`Objects/typeobject.c:6175-6188`).
-///
-/// Static types occupy `PyTypeObject`. Heap types occupy
-/// `PyHeapTypeObject` and additionally own `ht_cached_keys` when their
-/// instances have a dictionary. PyPy's corresponding owner is the
-/// `W_TypeObject.hasdict` / mapdict terminator pair, so use that canonical
-/// field rather than introducing a parallel cache-presence table.
-pub unsafe fn w_type_get_abi_sizeof(obj: PyObjectRef) -> i64 {
-    const PYTYPEOBJECT_SIZE: i64 = 416;
-    const PYHEAPTYPEOBJECT_SIZE: i64 = 936;
-    const CACHED_KEYS_SIZE: i64 = 768;
-
-    let w_type = &*(obj as *const W_TypeObject);
-    if !w_type.flag_heaptype {
-        return PYTYPEOBJECT_SIZE;
-    }
-    PYHEAPTYPEOBJECT_SIZE + if w_type.hasdict { CACHED_KEYS_SIZE } else { 0 }
-}
-
 /// typeobject.py:295 `self._version_tag` — the raw cache-version field
 /// (`0` = `None`/uncacheable).  This is the direct field read; the
 /// `we_are_jitted()` / `_pure_version_tag` (`@elidable_promote`) split of

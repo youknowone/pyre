@@ -23,7 +23,6 @@ assert {
     "__next__",
     "__qualname__",
     "__repr__",
-    "__sizeof__",
     "close",
     "gi_code",
     "gi_frame",
@@ -44,7 +43,6 @@ assert generator.gi_frame is not None
 assert generator.gi_running is False and generator.gi_suspended is False
 assert generator.gi_yieldfrom is None
 assert "generator object" in repr(generator)
-assert generator.__sizeof__() > 0
 assert weakref.ref(generator)() is generator
 
 try:

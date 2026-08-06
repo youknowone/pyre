@@ -24,7 +24,6 @@ surface = {
     "__reversed__",
     "__ror__",
     "__setitem__",
-    "__sizeof__",
     "clear",
     "copy",
     "fromkeys",
@@ -55,8 +54,6 @@ except TypeError:
 else:
     raise AssertionError("dict must remain unhashable")
 
-assert {}.__sizeof__() > 0
-assert {"x": 1}.__sizeof__() > {}.__sizeof__()
 assert dict.__doc__.startswith("dict() -> new empty dictionary")
 print("dict surface: ok")
 

@@ -45,7 +45,6 @@ ORDINARY = [
     (set, "union"),
     (frozenset, "union"),
     (range, "count"),
-    (object, "__sizeof__"),
     (object, "__dir__"),
     (type, "mro"),
 ]
