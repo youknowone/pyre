@@ -637,11 +637,15 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (160, Some(0)),
     // `_io.StringIO` follows `_io.BytesIO` at the append-only tail.
     (161, Some(0)),
-    // `posix.DirEntry` follows `_io.StringIO`, before the bare twister id.
-    // `posix` is compiled out on wasm32, so its object-hierarchy slot is too,
-    // keeping this census consistent with `build_gc`'s gated registration.
-    #[cfg(not(target_arch = "wasm32"))]
+    // `_json.Scanner` and `_json.Encoder` follow with typed managed payloads.
     (162, Some(0)),
+    (163, Some(0)),
+    // `posix.DirEntry` follows them, last of the rclass registrations and
+    // before the bare twister id.  `posix` is compiled out on wasm32, so its
+    // object-hierarchy slot is too, keeping this census consistent with
+    // `build_gc`'s gated registration.
+    #[cfg(not(target_arch = "wasm32"))]
+    (164, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

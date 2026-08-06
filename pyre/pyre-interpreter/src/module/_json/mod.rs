@@ -78,19 +78,6 @@ fn index_i64(obj: PyObjectRef) -> Result<i64, PyError> {
     crate::baseobjspace::int_w(indexed)
 }
 
-// W_Encoder keeps fast_encode_mode in a typed field and has no depth field.
-// These compatibility attributes are Python-writable, so validate them before
-// using the W_IntObject payload layout.
-fn attr_i64(self_obj: PyObjectRef, name: &str) -> Result<i64, PyError> {
-    let value = crate::baseobjspace::getattr_str(self_obj, name)?;
-    if !is_instance(value, &pyre_object::INT_TYPE) {
-        return Err(PyError::type_error(format!(
-            "{name} attribute must be an int"
-        )));
-    }
-    crate::baseobjspace::int_w(value)
-}
-
 fn json_decode_error(msg: String, doc: PyObjectRef, pos: usize) -> PyError {
     let Some(module) = crate::importing::get_sys_module("json.decoder") else {
         return PyError::value_error(format!("{msg}: line 1 column 1 (char {pos})"));
@@ -242,45 +229,29 @@ fn scanner_call_inner(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> Py
 fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyResult {
     // Recursive object/array callbacks invoke this same Scanner.  The memo is
     // context-owned and is cleared only after the outermost token finishes.
-    let depth = attr_i64(self_obj, "_depth")?;
-    // CPython's C scanner brackets recursive container decoding with
-    // Py_EnterRecursiveCall.  The accelerator recursion can be flattened by
-    // the meta-tracing JIT, so the scanner-owned nesting count is the stable
-    // equivalent of that guard rather than the native Rust stack address.
+    let scanner = W_Scanner::from_obj(self_obj).expect("Scanner payload");
+    let depth = scanner.depth;
+    // `scan_once_unicode` brackets recursive container decoding with
+    // `Py_EnterRecursiveCall`.  The meta-tracing JIT can flatten this
+    // recursion, so the scanner-owned counter, not the native stack address,
+    // must remain the guard.
     if depth >= crate::stack_check::get_recursion_limit() as i64 {
         return Err(PyError::recursion_error(
             "maximum recursion depth exceeded while decoding a JSON object",
         ));
     }
-    let _depth_roots = gc_roots::push_roots();
-    let self_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(self_obj);
-    let doc_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(doc);
-    let incremented_depth = pyre_object::w_int_new(depth + 1);
-    crate::baseobjspace::setattr_str(
-        gc_roots::shadow_stack_get(self_slot),
-        "_depth",
-        incremented_depth,
-    )?;
-    let result = scanner_call_inner(
-        gc_roots::shadow_stack_get(self_slot),
-        gc_roots::shadow_stack_get(doc_slot),
-        index,
-    );
-    let _result_roots = gc_roots::push_roots();
-    let result_slots = pin_pyresult_payload(&result);
-    let restored_depth = pyre_object::w_int_new(depth);
-    crate::baseobjspace::setattr_str(
-        gc_roots::shadow_stack_get(self_slot),
-        "_depth",
-        restored_depth,
-    )?;
+    scanner.depth = depth + 1;
+    let result = scanner_call_inner(self_obj, doc, index);
+    W_Scanner::from_obj(self_obj)
+        .expect("Scanner payload")
+        .depth = depth;
     if depth != 0 {
-        return reload_pyresult_payload(result, result_slots);
+        return result;
     }
     // `json.scanner.py:scan_once` clears the context-owned memo in a finally.
-    let memo = crate::baseobjspace::getattr_str(gc_roots::shadow_stack_get(self_slot), "memo")?;
+    let _result_roots = gc_roots::push_roots();
+    let result_slots = pin_pyresult_payload(&result);
+    let memo = crate::baseobjspace::getattr_str(self_obj, "memo")?;
     let clear_result = crate::call::call_function_impl_result(
         crate::baseobjspace::getattr_str(memo, "clear")?,
         &[],
@@ -377,15 +348,137 @@ fn scan_scalar(self_obj: PyObjectRef, doc: PyObjectRef, value: &Wtf8, index: usi
     Err(stop_iteration(index as i64))
 }
 
+#[crate::pyre_class("_json.Scanner")]
+pub struct W_Scanner {
+    parse_object: PyObjectRef,
+    parse_array: PyObjectRef,
+    parse_string: PyObjectRef,
+    strict: PyObjectRef,
+    parse_float: PyObjectRef,
+    parse_int: PyObjectRef,
+    parse_constant: PyObjectRef,
+    object_hook: PyObjectRef,
+    object_pairs_hook: PyObjectRef,
+    memo: PyObjectRef,
+    depth: i64,
+}
+
 mod scanner_class {
     use super::*;
 
-    crate::py_class! {
-        "_json.Scanner",
-        methods: {
-            fn __call__(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> Result<PyObjectRef, PyError> {
-                scanner_call_impl(self_obj, doc, index)
-            }
+    #[crate::pyre_methods]
+    impl W_Scanner {
+        fn __call__(&mut self, doc: PyObjectRef, index: i64) -> Result<PyObjectRef, PyError> {
+            scanner_call_impl(self as *mut Self as PyObjectRef, doc, index)
+        }
+
+        #[getter]
+        fn parse_object(&self) -> PyObjectRef {
+            self.parse_object
+        }
+        #[getter]
+        fn parse_array(&self) -> PyObjectRef {
+            self.parse_array
+        }
+        #[getter]
+        fn parse_string(&self) -> PyObjectRef {
+            self.parse_string
+        }
+        #[getter]
+        fn strict(&self) -> PyObjectRef {
+            self.strict
+        }
+        #[getter]
+        fn parse_float(&self) -> PyObjectRef {
+            self.parse_float
+        }
+        #[getter]
+        fn parse_int(&self) -> PyObjectRef {
+            self.parse_int
+        }
+        #[getter]
+        fn parse_constant(&self) -> PyObjectRef {
+            self.parse_constant
+        }
+        #[getter]
+        fn object_hook(&self) -> PyObjectRef {
+            self.object_hook
+        }
+        #[getter]
+        fn object_pairs_hook(&self) -> PyObjectRef {
+            self.object_pairs_hook
+        }
+        #[getter]
+        fn memo(&self) -> PyObjectRef {
+            self.memo
+        }
+    }
+}
+
+#[crate::pyre_class("_json.Encoder")]
+pub struct W_Encoder {
+    markers: PyObjectRef,
+    default: PyObjectRef,
+    encoder: PyObjectRef,
+    indent: PyObjectRef,
+    key_separator: PyObjectRef,
+    item_separator: PyObjectRef,
+    sort_keys: PyObjectRef,
+    skipkeys: PyObjectRef,
+    allow_nan: PyObjectRef,
+    fast_mode: i64,
+    depth: i64,
+}
+
+mod encoder_class {
+    use super::*;
+
+    #[crate::pyre_methods]
+    impl W_Encoder {
+        fn __call__(
+            &mut self,
+            obj: PyObjectRef,
+            level: PyObjectRef,
+        ) -> Result<PyObjectRef, PyError> {
+            let level = index_i64(level)?;
+            encoder_call_impl(self as *mut Self as PyObjectRef, obj, level)
+        }
+
+        #[getter]
+        fn markers(&self) -> PyObjectRef {
+            self.markers
+        }
+        #[getter]
+        fn default(&self) -> PyObjectRef {
+            self.default
+        }
+        #[getter]
+        fn encoder(&self) -> PyObjectRef {
+            self.encoder
+        }
+        #[getter]
+        fn indent(&self) -> PyObjectRef {
+            self.indent
+        }
+        #[getter]
+        fn key_separator(&self) -> PyObjectRef {
+            self.key_separator
+        }
+        #[getter]
+        fn item_separator(&self) -> PyObjectRef {
+            self.item_separator
+        }
+        #[getter]
+        fn sort_keys(&self) -> PyObjectRef {
+            self.sort_keys
+        }
+        #[getter]
+        fn skipkeys(&self) -> PyObjectRef {
+            self.skipkeys
+        }
+        #[getter]
+        fn allow_nan(&self) -> PyObjectRef {
+            self.allow_nan
         }
     }
 }
@@ -409,7 +502,9 @@ fn encode_string_field(
     out: &mut rustpython_wtf8::Wtf8Buf,
     obj: PyObjectRef,
 ) -> PyResult {
-    let mode = attr_i64(self_obj, "_fast_mode")?;
+    let mode = W_Encoder::from_obj(self_obj)
+        .expect("Encoder payload")
+        .fast_mode;
     if mode == 0 || mode == 1 {
         out.push_wtf8(&machinery::encode_string(require_string(obj)?, mode == 0));
         return Ok(pyre_object::w_none());
@@ -484,44 +579,23 @@ fn encode_child(
     obj: PyObjectRef,
     level: i64,
 ) -> Result<rustpython_wtf8::Wtf8Buf, PyError> {
-    // RPython inserts a stack check on this recursive `_encode` edge; CPython
-    // brackets the equivalent C encoder recursion with Py_EnterRecursiveCall.
+    // RPython inserts a stack check on this recursive `_encode` edge;
+    // `encoder_listencode_obj` brackets the equivalent recursion with
+    // `Py_EnterRecursiveCall`.
     crate::stack_check::stack_check()?;
-    let depth = attr_i64(self_obj, "_depth")?;
+    let encoder = W_Encoder::from_obj(self_obj).expect("Encoder payload");
+    let depth = encoder.depth;
     if depth >= crate::stack_check::get_recursion_limit() as i64 {
         return Err(PyError::recursion_error(
             "maximum recursion depth exceeded while encoding a JSON object",
         ));
     }
-    let _roots = gc_roots::push_roots();
-    let self_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(self_obj);
-    let obj_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(obj);
-    let incremented_depth = pyre_object::w_int_new(depth + 1);
-    crate::baseobjspace::setattr_str(
-        gc_roots::shadow_stack_get(self_slot),
-        "_depth",
-        incremented_depth,
-    )?;
-    let result = encode_value(
-        gc_roots::shadow_stack_get(self_slot),
-        gc_roots::shadow_stack_get(obj_slot),
-        level,
-    );
-    let _result_roots = gc_roots::push_roots();
-    let error_slots = result.as_ref().err().map(pin_pyerror_payload);
-    let restored_depth = pyre_object::w_int_new(depth);
-    crate::baseobjspace::setattr_str(
-        gc_roots::shadow_stack_get(self_slot),
-        "_depth",
-        restored_depth,
-    )?;
-    match (result, error_slots) {
-        (Err(err), Some(slots)) => Err(reload_pyerror_payload(err, slots)),
-        (Ok(value), None) => Ok(value),
-        _ => unreachable!("error slots match the result variant"),
-    }
+    encoder.depth = depth + 1;
+    let result = encode_value(self_obj, obj, level);
+    W_Encoder::from_obj(self_obj)
+        .expect("Encoder payload")
+        .depth = depth;
+    result
 }
 
 fn marker_key(obj: PyObjectRef) -> PyObjectRef {
@@ -840,20 +914,6 @@ fn encoder_call_impl(self_obj: PyObjectRef, obj: PyObjectRef, level: i64) -> PyR
     )]))
 }
 
-mod encoder_class {
-    use super::*;
-
-    crate::py_class! {
-        "_json.Encoder",
-        methods: {
-            fn __call__(self_obj: PyObjectRef, obj: PyObjectRef, level: PyObjectRef) -> Result<PyObjectRef, PyError> {
-                let level = index_i64(level)?;
-                encoder_call_impl(self_obj, obj, level)
-            }
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn make_encoder_impl(
     markers: PyObjectRef,
@@ -908,43 +968,27 @@ fn make_encoder_impl(
     ] {
         gc_roots::pin_root(value);
     }
-    // The two synthesized ints are pinned next so the slots stay in the same
-    // order as the name list below; the receiver is pinned last and sits one
-    // past it.
-    gc_roots::pin_root(pyre_object::w_int_new(fast_mode));
-    gc_roots::pin_root(pyre_object::w_int_new(0));
-    let receiver = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(pyre_object::w_instance_new(encoder_class::type_object()));
-    for (offset, name) in [
-        "markers",
-        "default",
-        "encoder",
-        "indent",
-        "key_separator",
-        "item_separator",
-        "sort_keys",
-        "skipkeys",
-        "allow_nan",
-        "_fast_mode",
-        "_depth",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        crate::baseobjspace::setattr_str(
-            gc_roots::shadow_stack_get(receiver),
-            name,
-            gc_roots::shadow_stack_get(slot + offset),
-        )?;
-    }
-    Ok(gc_roots::shadow_stack_get(receiver))
+    let _ = encoder_class::type_object();
+    Ok(W_Encoder::allocate_stable(W_Encoder {
+        ob: pyre_object::PyObject::default(),
+        markers: gc_roots::shadow_stack_get(slot),
+        default: gc_roots::shadow_stack_get(slot + 1),
+        encoder: gc_roots::shadow_stack_get(slot + 2),
+        indent: gc_roots::shadow_stack_get(slot + 3),
+        key_separator: gc_roots::shadow_stack_get(slot + 4),
+        item_separator: gc_roots::shadow_stack_get(slot + 5),
+        sort_keys: gc_roots::shadow_stack_get(slot + 6),
+        skipkeys: gc_roots::shadow_stack_get(slot + 7),
+        allow_nan: gc_roots::shadow_stack_get(slot + 8),
+        fast_mode,
+        depth: 0,
+    }))
 }
 
 fn make_scanner_impl(context: PyObjectRef) -> PyResult {
-    let scanner = pyre_object::w_instance_new(scanner_class::type_object());
     let _roots = gc_roots::push_roots();
-    let scanner_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(scanner);
+    let slot = gc_roots::shadow_stack_len();
+    gc_roots::pin_root(context);
     for name in [
         "parse_object",
         "parse_array",
@@ -957,18 +1001,27 @@ fn make_scanner_impl(context: PyObjectRef) -> PyResult {
         "object_pairs_hook",
         "memo",
     ] {
-        let value = crate::baseobjspace::getattr_str(context, name)?;
-        let scanner = gc_roots::shadow_stack_get(scanner_slot);
-        crate::baseobjspace::setattr_str(scanner, name, value)?;
+        let value = crate::baseobjspace::getattr_str(gc_roots::shadow_stack_get(slot), name)?;
+        gc_roots::pin_root(value);
     }
     // Match the C accelerator: strict is converted during construction, so
     // an overriding `__bool__` raises before the first token is scanned.
-    let scanner = gc_roots::shadow_stack_get(scanner_slot);
-    let strict = crate::baseobjspace::getattr_str(scanner, "strict")?;
-    let strict = pyre_object::w_bool_from(crate::baseobjspace::is_true(strict)?);
-    crate::baseobjspace::setattr_str(scanner, "strict", strict)?;
-    crate::baseobjspace::setattr_str(scanner, "_depth", pyre_object::w_int_new(0))?;
-    Ok(gc_roots::shadow_stack_get(scanner_slot))
+    let strict = crate::baseobjspace::is_true(gc_roots::shadow_stack_get(slot + 4))?;
+    let _ = scanner_class::type_object();
+    Ok(W_Scanner::allocate_stable(W_Scanner {
+        ob: pyre_object::PyObject::default(),
+        parse_object: gc_roots::shadow_stack_get(slot + 1),
+        parse_array: gc_roots::shadow_stack_get(slot + 2),
+        parse_string: gc_roots::shadow_stack_get(slot + 3),
+        strict: pyre_object::w_bool_from(strict),
+        parse_float: gc_roots::shadow_stack_get(slot + 5),
+        parse_int: gc_roots::shadow_stack_get(slot + 6),
+        parse_constant: gc_roots::shadow_stack_get(slot + 7),
+        object_hook: gc_roots::shadow_stack_get(slot + 8),
+        object_pairs_hook: gc_roots::shadow_stack_get(slot + 9),
+        memo: gc_roots::shadow_stack_get(slot + 10),
+        depth: 0,
+    }))
 }
 
 crate::py_module! {

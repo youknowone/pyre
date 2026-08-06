@@ -1089,11 +1089,16 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // 159 as a bare `with_gc_ptrs` id and carries no vtable of its own.
         subclass_range_alias(160, typed::<crate::module::_io::W_BytesIO>()),
         subclass_range_alias(161, typed::<crate::module::_io::W_StringIO>()),
-        // `posix.DirEntry` — `allocate_stable` type registered right after
-        // `W_StringIO` in `build_gc`, before the bare twister id.  `posix` is
-        // compiled out on wasm32 (`module/mod.rs:91`), so this alias is too.
+        // `_json.Scanner` and `_json.Encoder` extend the append-only managed
+        // payload tail without renumbering an established class.
+        subclass_range_alias(162, typed::<crate::module::_json::W_Scanner>()),
+        subclass_range_alias(163, typed::<crate::module::_json::W_Encoder>()),
+        // `posix.DirEntry` — `allocate_stable` type registered last among the
+        // rclass registrations in `build_gc`, before the bare twister id.
+        // `posix` is compiled out on wasm32 (`module/mod.rs`), so this alias is
+        // too; nothing unconditional follows it, so no id differs per target.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(162, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(164, typed::<crate::module::posix::W_DirEntry>()),
     ]
 }
 

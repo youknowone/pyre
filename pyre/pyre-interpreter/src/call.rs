@@ -1553,13 +1553,13 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, 
     };
     let w_type = w_type.as_ptr();
     // Most fixed-layout builtin payloads are deliberately not generic
-    // instances.  The accelerator key wrapper is the exception: its
-    // TypeDef publishes `__call__`, so admit that one payload explicitly while
-    // retaining the old guard for all other internal objects (which avoids
-    // treating bootstrap implementation objects as recursive callables).
-    let key_wrapper = crate::module::_functools::W_KeyWrapper::from_obj(callable).is_some();
+    // instances.  Admit the accelerator payloads whose TypeDefs publish
+    // `__call__`, while retaining the guard for all other internal objects.
+    let typed_callable = crate::module::_functools::W_KeyWrapper::from_obj(callable).is_some()
+        || crate::module::_json::W_Scanner::from_obj(callable).is_some()
+        || crate::module::_json::W_Encoder::from_obj(callable).is_some();
     if !unsafe { pyre_object::is_instance(callable) || pyre_object::w_type_is_heaptype(w_type) }
-        && !key_wrapper
+        && !typed_callable
     {
         return Ok(None);
     }
