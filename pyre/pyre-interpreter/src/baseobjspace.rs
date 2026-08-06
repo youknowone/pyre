@@ -6417,6 +6417,11 @@ pub(crate) unsafe fn object_delattr_surrogate(
 /// the original name object in the formatted AttributeError, so build the
 /// exception argument as WTF-8 instead of reducing it to a Rust string.
 fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
+    // The name goes in verbatim between the quotes. 3.14 keeps the code point
+    // itself, so `getattr(Sub, '\udcfe')` reports `... has no attribute
+    // '\udcfe'` holding the lone surrogate; `descroperation.py:58` renders it
+    // through `%R` and reports the six-character escape text instead. Measured
+    // on both, 2026-08-06 — do not "restore" the repr form.
     let mut message = Wtf8Buf::from_string(format!(
         "{} has no attribute '",
         missing_attribute_subject(obj)
