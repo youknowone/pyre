@@ -1073,23 +1073,6 @@ pub unsafe fn w_type_set_hasdict(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).hasdict = v;
 }
 
-/// CPython 3.14 `type_members` ABI layout accessors.
-pub unsafe fn w_type_get_abi_basicsize(obj: PyObjectRef) -> i64 {
-    (*(obj as *const W_TypeObject)).abi_basicsize
-}
-
-pub unsafe fn w_type_get_abi_itemsize(obj: PyObjectRef) -> i64 {
-    (*(obj as *const W_TypeObject)).abi_itemsize
-}
-
-pub unsafe fn w_type_get_abi_weakrefoffset(obj: PyObjectRef) -> i64 {
-    (*(obj as *const W_TypeObject)).abi_weakrefoffset
-}
-
-pub unsafe fn w_type_get_abi_dictoffset(obj: PyObjectRef) -> i64 {
-    (*(obj as *const W_TypeObject)).abi_dictoffset
-}
-
 /// CPython 3.14 `type.__sizeof__` (`Objects/typeobject.c:6175-6188`).
 ///
 /// Static types occupy `PyTypeObject`. Heap types occupy
