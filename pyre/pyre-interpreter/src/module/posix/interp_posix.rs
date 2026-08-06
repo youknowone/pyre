@@ -869,6 +869,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("HAVE_LINKAT", HAVE_LINKAT),
         ("HAVE_FSTATVFS", HAVE_FSTATVFS),
         ("HAVE_FTRUNCATE", HAVE_FTRUNCATE),
+        // os.py:182 reads this as `chflags` honouring follow_symlinks, which
+        // is its `lchflags` arm.
+        ("HAVE_LCHFLAGS", HAVE_LCHFLAGS),
         // os.py:183 reads this as `chmod` honouring follow_symlinks; os.py:179
         // shows why HAVE_FCHMODAT is not read for that claim.
         ("HAVE_LCHMOD", HAVE_LCHMOD),
@@ -876,11 +879,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // and os.py:150-151 reads either one as the same `utime` capability.
         ("HAVE_FUTIMENS", HAVE_FUTIMENS),
         ("HAVE_LSTAT", HAVE_LSTAT),
-        // os.py:124-127 reads these as `mkdir`, `mkfifo` and `open` honouring
-        // dir_fd. HAVE_MKNODAT is not listed beside them: `mknod` is still a
-        // noop placeholder that creates nothing.
+        // os.py:124-127 reads these as `mkdir`, `mkfifo`, `mknod` and `open`
+        // honouring dir_fd.
         ("HAVE_MKDIRAT", HAVE_MKDIRAT),
         ("HAVE_MKFIFOAT", HAVE_MKFIFOAT),
+        ("HAVE_MKNODAT", HAVE_MKNODAT),
         ("HAVE_OPENAT", HAVE_OPENAT),
         // os.py:131-132 reads this as `unlink` and `rmdir` honouring dir_fd,
         // which is the one `unlinkat` both of them make. os.remove is not in
@@ -1119,8 +1122,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "fchdir",
             "fchown",
             "faccessat",
-            "chflags",
-            "lchflags",
             "futimens",
             "futimes",
             "fdopendir",
@@ -1145,7 +1146,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "dup3",
             "fdatasync",
             "mkfifo",
-            "mknod",
             "major",
             "minor",
             "makedev",
@@ -1477,20 +1477,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
     }
 
-    /// Bind the positional-or-keyword prefix of an entry point whose only
-    /// keyword-only parameter is `dir_fd`. `params` names that prefix in order,
-    /// `path` first, and the leading `required` of them carry no default; the
-    /// rest are reported absent as `None`. The modifier itself is left in the
-    /// returned kwargs dict, because which `HAVE_*` bit it answers to is the
-    /// caller's.
+    /// Bind the positional-or-keyword prefix of a path-taking entry point.
+    /// `params` names that prefix in order, `path` first, and the leading
+    /// `required` of them carry no default; the rest are reported absent as
+    /// `None`. `kwonly` names the keyword-only tail, which is left in the
+    /// returned kwargs dict — which `HAVE_*` bit each modifier answers to is
+    /// the caller's business.
     ///
-    /// The surplus-positional message distinguishes a signature whose count is
-    /// fixed from one with defaults, the way the generated argument parsers do.
+    /// A surplus argument is reported the way the entry point's own generated
+    /// parser reports it, and the two forms differ. Where there is a
+    /// keyword-only tail the count is over positionals alone, and a signature
+    /// with no defaults says "exactly" where one with defaults says "at most";
+    /// where there is none, every argument counts toward the one limit and it
+    /// is always "at most" — which is why `os.lchflags(p, 0, follow_symlinks=1)`
+    /// is a count error and not an unknown keyword.
     fn bind_path_args(
         args: &[pyre_object::PyObjectRef],
         name: &str,
         params: &[&'static str],
         required: usize,
+        kwonly: &[&'static str],
     ) -> Result<
         (
             Vec<Option<pyre_object::PyObjectRef>>,
@@ -1499,18 +1505,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::PyError,
     > {
         let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-        let mut allowed: Vec<&str> = params.to_vec();
-        allowed.push("dir_fd");
-        crate::builtins::kwarg_reject_unknown(kwargs, &allowed, name)?;
-        if pos.len() > params.len() {
-            let count = params.len();
-            let plural = if count == 1 { "" } else { "s" };
-            let bound = if required == count { "exactly" } else { "at most" };
+        let count = params.len();
+        let plural = if count == 1 { "" } else { "s" };
+        if kwonly.is_empty() {
+            let given = pos.len() + crate::builtins::real_kwarg_count(kwargs);
+            if given > count {
+                return Err(crate::PyError::type_error(format!(
+                    "{name}() takes at most {count} argument{plural} ({given} given)"
+                )));
+            }
+        } else if pos.len() > count {
+            let limit = if required == count { "exactly" } else { "at most" };
             return Err(crate::PyError::type_error(format!(
-                "{name}() takes {bound} {count} positional argument{plural} ({} given)",
+                "{name}() takes {limit} {count} positional argument{plural} ({} given)",
                 pos.len()
             )));
         }
+        let mut allowed: Vec<&str> = params.to_vec();
+        allowed.extend_from_slice(kwonly);
+        crate::builtins::kwarg_reject_unknown(kwargs, &allowed, name)?;
         let mut bound = Vec::with_capacity(params.len());
         for (index, key) in params.iter().enumerate() {
             let value = crate::builtins::bind_pos_or_kw(pos, kwargs, index, key, name, index + 1)?;
@@ -1530,7 +1543,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "open",
         crate::make_builtin_function("open", |args| {
-            let (bound, kwargs) = bind_path_args(args, "open", &["path", "flags", "mode"], 2)?;
+            let (bound, kwargs) = bind_path_args(args, "open", &["path", "flags", "mode"], 2, &["dir_fd"])?;
             let path = crate::gateway::fsencode_path_or_fd_w(
                 bound[0].expect("path is required"),
                 "open",
@@ -1858,7 +1871,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         args: &[pyre_object::PyObjectRef],
         name: &str,
     ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-        let (bound, kwargs) = bind_path_args(args, name, &["path"], 1)?;
+        let (bound, kwargs) = bind_path_args(args, name, &["path"], 1, &["dir_fd"])?;
         let path = crate::gateway::fsencode_path_or_fd_w(
             bound[0].expect("path is required"),
             name,
@@ -1942,7 +1955,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "mkdir",
         crate::make_builtin_function("mkdir", |args| {
-            let (bound, kwargs) = bind_path_args(args, "mkdir", &["path", "mode"], 1)?;
+            let (bound, kwargs) = bind_path_args(args, "mkdir", &["path", "mode"], 1, &["dir_fd"])?;
             let path = crate::gateway::fsencode_path_or_fd_w(
                 bound[0].expect("path is required"),
                 "mkdir",
@@ -2000,7 +2013,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "rmdir",
         crate::make_builtin_function("rmdir", |args| {
-            let (bound, kwargs) = bind_path_args(args, "rmdir", &["path"], 1)?;
+            let (bound, kwargs) = bind_path_args(args, "rmdir", &["path"], 1, &["dir_fd"])?;
             let path = crate::gateway::fsencode_path_or_fd_w(
                 bound[0].expect("path is required"),
                 "rmdir",
@@ -3138,17 +3151,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `lchmod` is a stub returning ENOTSUP, the flag does not work either, so
     /// only the hosts that carry a working `lchmod` may say it — and those are
     /// exactly the ones `os.lchmod` is registered on below.
-    const HAVE_LCHMOD: bool = cfg!(all(
-        not(feature = "sandbox"),
-        any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-        )
+    const HAVE_LCHMOD: bool = HOST_POSIX && BSD_FLAVOURED;
+    /// `os.py:182` reads this as `chflags` honouring `follow_symlinks`, which
+    /// is the `lchflags` arm of the pair. `chflags` is a BSD interface, so the
+    /// two names exist on exactly the hosts this is true for — and where they
+    /// do not, `shutil.copystat`'s `lookup("chflags")` finds nothing and skips
+    /// the flags rather than believing a stub that copied none.
+    const HAVE_LCHFLAGS: bool = HOST_POSIX && BSD_FLAVOURED;
+    /// Where `lchmod` and `chflags` are the host's own calls rather than stubs
+    /// that report ENOTSUP — the platform half of the two bits above.
+    const BSD_FLAVOURED: bool = cfg!(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
     ));
+    /// `rposix.HAVE_MKNODAT` — what `mknod` types its `dir_fd` as
+    /// (`interp_posix.py:1345`). Registered beside `mkfifo`, so it carries the
+    /// same condition.
+    const HAVE_MKNODAT: bool = HOST_POSIX;
     /// `rposix.HAVE_OPENAT` — what `open` types its `dir_fd` as
     /// (`interp_posix.py:308`). `openat` is reached through `libc`, so it needs
     /// no `host_env`; the Windows arm serves the name through `_wopen` and
@@ -4960,7 +4983,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ns,
             "mkfifo",
             crate::make_builtin_function("mkfifo", |args| {
-                let (bound, kwargs) = bind_path_args(args, "mkfifo", &["path", "mode"], 1)?;
+                let (bound, kwargs) = bind_path_args(args, "mkfifo", &["path", "mode"], 1, &["dir_fd"])?;
                 let path = crate::gateway::fsencode_path_or_fd_w(
                     bound[0].expect("path is required"),
                     "mkfifo",
@@ -4991,6 +5014,147 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_none())
             }),
         );
+
+        // os.mknod(path, mode=0o600, device=0, *, dir_fd=None) -> None
+        // The node's kind is carried in `mode` alongside its permissions, so
+        // an unadorned `mode` asks for a regular file — which is why the plain
+        // call is the one a non-root process cannot make. `moduledef.py:160`
+        // registers this only where the host has `mknod` at all.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "mknod",
+            crate::make_builtin_function("mknod", |args| {
+                let (bound, kwargs) =
+                    bind_path_args(args, "mknod", &["path", "mode", "device"], 1, &["dir_fd"])?;
+                let path = crate::gateway::fsencode_path_or_fd_w(
+                    bound[0].expect("path is required"),
+                    "mknod",
+                    false,
+                )?;
+                // interp_posix.py:1345 `@unwrap_spec(mode=c_int, device=c_int,
+                // ...)`.
+                let mode = match bound[1] {
+                    Some(value) => crate::baseobjspace::c_int_w(value)? as libc::mode_t,
+                    None => 0o600,
+                };
+                let device = match bound[2] {
+                    Some(value) => crate::baseobjspace::c_int_w(value)? as libc::dev_t,
+                    None => 0,
+                };
+                // `mknod` types `dir_fd` as `DirFD(rposix.HAVE_MKNODAT)`
+                // (`interp_posix.py:1345`).
+                let dir_fd = dir_fd_kwarg(kwargs, HAVE_MKNODAT)?;
+                let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                    .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                // `mknodat` resolves the name against the descriptor
+                // (`rposix.py:2793-2795`).
+                let r = match dir_fd {
+                    Some(dir_fd) => unsafe {
+                        libc::mknodat(dir_fd, c_path.as_ptr(), mode, device)
+                    },
+                    None => unsafe { libc::mknod(c_path.as_ptr(), mode, device) },
+                };
+                if r < 0 {
+                    return Err(io_err_with_filename(
+                        std::io::Error::last_os_error(),
+                        path.w_path(),
+                    ));
+                }
+                Ok(pyre_object::w_none())
+            }),
+        );
+
+        // os.chflags(path, flags, follow_symlinks=True) -> None
+        // os.lchflags(path, flags) -> None
+        //
+        // One call whose `follow_symlinks=False` arm is `lchflags` under its
+        // own name, which is what `os.py:182` reads `HAVE_LCHFLAGS` as. Only
+        // the hosts that carry the pair are given the names at all: `chflags`
+        // is a BSD interface, and `shutil.copystat` (`shutil.py:467`) reaches
+        // for it through `lookup("chflags")`, which answers `_nop` where the
+        // name is absent — so a name that exists has to work.
+        //
+        // Neither takes a `dir_fd`, so neither has a keyword-only tail, and a
+        // surplus argument is counted the way `bind_path_args` counts one
+        // without: `os.lchflags(p, 0, follow_symlinks=False)` is over the limit
+        // rather than an unknown keyword.
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+            )
+        ))]
+        {
+            // `<sys/stat.h>` declares `lchflags` on the Apple targets, where
+            // the `libc` crate carries only `chflags` and `fchflags`.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            unsafe extern "C" {
+                fn lchflags(path: *const libc::c_char, flags: libc::c_uint) -> libc::c_int;
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            use libc::lchflags;
+
+            fn chflags_entry(
+                args: &[pyre_object::PyObjectRef],
+                name: &str,
+                default_follow: bool,
+            ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+                let params: &[&'static str] = if default_follow {
+                    &["path", "flags", "follow_symlinks"]
+                } else {
+                    &["path", "flags"]
+                };
+                let (bound, _) = bind_path_args(args, name, params, 2, &[])?;
+                let path = crate::gateway::fsencode_path_or_fd_w(
+                    bound[0].expect("path is required"),
+                    name,
+                    false,
+                )?;
+                // The flag word is read as a bit pattern rather than a number:
+                // `SF_SETTABLE` does not fit a C int, and a negative value is
+                // the mask it spells rather than an error.
+                let flags =
+                    crate::baseobjspace::int_w(bound[1].expect("flags is required"))? as u64;
+                let follow = match bound.get(2).copied().flatten() {
+                    Some(value) => crate::baseobjspace::is_true(value)?,
+                    None => default_follow,
+                };
+                let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                    .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                let r = if follow {
+                    unsafe { libc::chflags(c_path.as_ptr(), flags as _) }
+                } else {
+                    unsafe { lchflags(c_path.as_ptr(), flags as _) }
+                };
+                if r < 0 {
+                    return Err(io_err_with_filename(
+                        std::io::Error::last_os_error(),
+                        path.w_path(),
+                    ));
+                }
+                Ok(pyre_object::w_none())
+            }
+            crate::module_ns_store(
+                ns,
+                "chflags",
+                crate::make_builtin_function("chflags", |args| {
+                    chflags_entry(args, "chflags", true)
+                }),
+            );
+            crate::module_ns_store(
+                ns,
+                "lchflags",
+                crate::make_builtin_function("lchflags", |args| {
+                    chflags_entry(args, "lchflags", false)
+                }),
+            );
+        }
 
         // os.kill(pid, sig) / os.killpg(pgid, sig)
         #[cfg(not(feature = "sandbox"))]
