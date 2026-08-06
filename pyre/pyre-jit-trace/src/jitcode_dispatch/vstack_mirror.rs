@@ -427,6 +427,19 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     let cfg_successor = new_pypc as usize == prev_pypc
         || (has_fallthrough && new_pypc as usize == fallthrough)
         || crate::liveness::target_pc(code, &instr, prev_pypc, op_arg) == Some(new_pypc as usize);
+    // #389(b): leave the out-of-order permutation region once the walk has
+    // advanced PAST the py_pc it backed off from — py order is monotonic again
+    // and the per-op reconcile is valid from here, INCLUDING at this boundary.
+    // Tested after the class had already been applied, the region covered one
+    // boundary too many: the exiting step is an ordinary sequential one whose
+    // previous opcode really did produce `vstack_last_ref`, and `ShadowReseed`
+    // dropped that box for the reseed, which cannot recover a slot the shadow
+    // does not carry.  Ordered before the arming below so a boundary that both
+    // passes the old ceiling and is itself out of order opens a new region
+    // instead of running unprotected.
+    if ctx.vstack_reorder_ceiling != u32::MAX && new_pypc > ctx.vstack_reorder_ceiling {
+        ctx.vstack_reorder_ceiling = u32::MAX;
+    }
     if !cfg_successor && ctx.vstack_reorder_ceiling == u32::MAX {
         ctx.vstack_reorder_ceiling = (new_pypc as usize).max(prev_pypc) as u32;
     }
@@ -631,12 +644,6 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
         ctx.vstack_cur_pypc = new_pypc;
         ctx.vstack_depth = new_depth;
         ctx.vstack_last_ref = OpRef::NONE;
-    }
-    // #389(b): leave the out-of-order permutation region once the walk has
-    // advanced PAST the py_pc it backed off from — py order is monotonic again
-    // and the per-op reconcile is valid from here.
-    if ctx.vstack_reorder_ceiling != u32::MAX && new_pypc > ctx.vstack_reorder_ceiling {
-        ctx.vstack_reorder_ceiling = u32::MAX;
     }
 }
 
