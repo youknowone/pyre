@@ -2330,20 +2330,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
 
     // os.utime(path, times=None, *, ns=None, dir_fd=None, follow_symlinks=True)
+    /// One of the two times `utime` writes, kept the way `rposix.futimens` and
+    /// `rposix.utimensat` keep it (`rposix.py:2634-2671`): the seconds and the
+    /// nanoseconds apart, both signed, so a time before the epoch is the
+    /// negative second it names rather than a value with no representation.
+    /// The nanoseconds are always the ones after that second — `1969-12-31
+    /// 23:59:59.999999999` is `(-1, 999999999)`, which is the `ns=-1` a caller
+    /// asked for.
+    #[derive(Clone, Copy)]
+    struct UTime {
+        sec: i64,
+        nsec: i64,
+    }
+
     /// `interp_posix.py:1901-1904` answers a descriptor with `futimens`, which
     /// is the call HAVE_FUTIMENS names.
-    fn utime_fd(
-        fd: i32,
-        access: std::time::Duration,
-        modified: std::time::Duration,
-    ) -> Result<PyObjectRef, crate::PyError> {
+    fn utime_fd(fd: i32, access: UTime, modified: UTime) -> Result<PyObjectRef, crate::PyError> {
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            let ts = |d: std::time::Duration| libc::timespec {
-                tv_sec: d.as_secs() as _,
-                tv_nsec: d.subsec_nanos() as _,
-            };
-            let times = [ts(access), ts(modified)];
+            let times = [timespec_of(access), timespec_of(modified)];
             if unsafe { libc::futimens(fd, times.as_ptr()) } < 0 {
                 return Err(io_err(std::io::Error::last_os_error(), ""));
             }
@@ -2355,6 +2360,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Err(crate::PyError::not_implemented(
                 "utime: fd is unavailable on this platform",
             ))
+        }
+    }
+
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    fn timespec_of(t: UTime) -> libc::timespec {
+        libc::timespec {
+            tv_sec: t.sec as libc::time_t,
+            tv_nsec: t.nsec as _,
         }
     }
 
@@ -2374,17 +2387,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 pos.len()
             )));
         }
+        // `interp_posix.py:1862` puts `__kwonly__` after `w_times`, so `times`
+        // is the one argument here a caller may spell either way.
         crate::builtins::kwarg_reject_unknown(
             kwargs,
-            &["ns", "dir_fd", "follow_symlinks"],
+            &["times", "ns", "dir_fd", "follow_symlinks"],
             "utime",
         )?;
+        let w_times = crate::builtins::kwarg_get(kwargs, "times");
+        if w_times.is_some() && pos.len() > 1 {
+            return Err(crate::PyError::type_error(
+                "utime() got multiple values for argument 'times'",
+            ));
+        }
         // interp_posix.py:1860 `path_or_fd(allow_fd=rposix.HAVE_FUTIMENS or
         // rposix.HAVE_FUTIMES)`.
         let path = crate::gateway::fsencode_path_or_fd_w(pos[0], "utime", HAVE_FUTIMENS)?;
 
         let present = |v: PyObjectRef| (!unsafe { pyre_object::is_none(v) }).then_some(v);
-        let times = pos.get(1).copied().and_then(present);
+        let times = pos.get(1).copied().or(w_times).and_then(present);
         let ns = crate::builtins::kwarg_get(kwargs, "ns").and_then(present);
         let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
             Some(v) => crate::baseobjspace::is_true(v)?,
@@ -2411,18 +2432,42 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     unsafe { pyre_object::w_tuple_getitem(obj, 1) }.unwrap(),
                 ))
             };
-        let dur_from_secs = |v: PyObjectRef| -> Result<std::time::Duration, crate::PyError> {
+        // `_PyTime_ObjectToTimespec(..., _PyTime_ROUND_FLOOR)`: the seconds are
+        // the floor of the value and the nanoseconds are what is left above
+        // that floor, so they stay in `0..1_000_000_000` however negative the
+        // time is. `utime(p, (-1.5, -2.5))` is `(-2, 500000000)` and
+        // `(-3, 500000000)`, which reads back as `-1_500_000_000` and
+        // `-2_500_000_000` nanoseconds.
+        let time_from_secs = |v: PyObjectRef| -> Result<UTime, crate::PyError> {
             let f = crate::builtins::builtin_float(&[v])?;
             let secs = unsafe { pyre_object::w_float_get_value(f) };
-            std::time::Duration::try_from_secs_f64(secs)
-                .map_err(|_| crate::PyError::value_error("utime: timestamp out of range"))
-        };
-        let dur_from_ns = |v: PyObjectRef| -> Result<std::time::Duration, crate::PyError> {
-            let n = crate::builtins::space_index_w(v)?;
-            if n < 0 {
+            let floor = secs.floor();
+            // The floor of a non-finite or too-large value is not a second any
+            // clock names; `i64::MIN`/`MAX` are what an `as` cast would answer
+            // for both, so the range is checked before the cast rather than
+            // read back out of it.
+            if !(floor >= -(2f64.powi(63)) && floor < 2f64.powi(63)) {
                 return Err(crate::PyError::value_error("utime: timestamp out of range"));
             }
-            Ok(std::time::Duration::from_nanos(n as u64))
+            let mut sec = floor as i64;
+            let mut nsec = ((secs - floor) * 1e9).floor() as i64;
+            if nsec >= 1_000_000_000 {
+                nsec -= 1_000_000_000;
+                sec = sec
+                    .checked_add(1)
+                    .ok_or_else(|| crate::PyError::value_error("utime: timestamp out of range"))?;
+            }
+            Ok(UTime { sec, nsec })
+        };
+        let time_from_ns = |v: PyObjectRef| -> Result<UTime, crate::PyError> {
+            let n = crate::builtins::space_index_w(v)?;
+            // `split_py_long_to_s_and_ns` divides by `1_000_000_000` the way
+            // Python's own `//` and `%` do, so a negative count of nanoseconds
+            // lands on the second below it with a positive remainder.
+            Ok(UTime {
+                sec: n.div_euclid(1_000_000_000),
+                nsec: n.rem_euclid(1_000_000_000),
+            })
         };
 
         let (access, modified) = match (times, ns) {
@@ -2433,16 +2478,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             (Some(t), None) => {
                 let (a, m) = unpack_two(t, "times")?;
-                (dur_from_secs(a)?, dur_from_secs(m)?)
+                (time_from_secs(a)?, time_from_secs(m)?)
             }
             (None, Some(n)) => {
                 let (a, m) = unpack_two(n, "ns")?;
-                (dur_from_ns(a)?, dur_from_ns(m)?)
+                (time_from_ns(a)?, time_from_ns(m)?)
             }
             (None, None) => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or(std::time::Duration::ZERO);
+                let now = UTime {
+                    sec: now.as_secs() as i64,
+                    nsec: now.subsec_nanos() as i64,
+                };
                 (now, now)
             }
         };
@@ -2473,22 +2522,51 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "utime: dir_fd and follow_symlinks=False are unavailable on this platform",
                 ));
             }
-            host_os::set_file_times(path_from_bytes(&path.as_bytes).as_ref(), access, modified)
-                .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
+            // The host call here counts from the epoch upwards and has no
+            // second below it, so a pre-epoch time is turned away rather than
+            // written as the wrong one. The descriptor form above and every
+            // POSIX host write it.
+            let since_epoch = |t: UTime| {
+                u64::try_from(t.sec)
+                    .map(|sec| std::time::Duration::new(sec, t.nsec as u32))
+                    .map_err(|_| crate::PyError::value_error("utime: timestamp out of range"))
+            };
+            host_os::set_file_times(
+                path_from_bytes(&path.as_bytes).as_ref(),
+                since_epoch(access)?,
+                since_epoch(modified)?,
+            )
+            .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
             return Ok(pyre_object::w_none());
         }
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-            rustpython_host_env::posix::set_file_times_at(
-                dir_fd.unwrap_or(libc::AT_FDCWD),
-                &c_path,
-                access,
-                modified,
-                follow_symlinks,
-            )
-            .map_err(|e| io_err_with_filename(e, path.w_path()))?;
+            // `rposix.utimensat` (`rposix.py:2650-2671`) — the whole name form
+            // is this one call: the descriptor the name resolves against is
+            // `AT_FDCWD` when the caller named none, and `follow_symlinks=False`
+            // is `AT_SYMLINK_NOFOLLOW`.
+            let flag = if follow_symlinks {
+                0
+            } else {
+                libc::AT_SYMLINK_NOFOLLOW
+            };
+            let times = [timespec_of(access), timespec_of(modified)];
+            let error = unsafe {
+                libc::utimensat(
+                    dir_fd.unwrap_or(libc::AT_FDCWD),
+                    c_path.as_ptr(),
+                    times.as_ptr(),
+                    flag,
+                )
+            };
+            if error < 0 {
+                return Err(io_err_with_filename(
+                    std::io::Error::last_os_error(),
+                    path.w_path(),
+                ));
+            }
             return Ok(pyre_object::w_none());
         }
         #[allow(unreachable_code)]
@@ -5137,7 +5215,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     err
                 }
             })?;
-            Ok(length as libc::off_t)
+            // `off_t` is the width the call takes the length in, and a value
+            // above it is not a size the file can be given. An `as` cast would
+            // wrap it into one the caller never asked for and truncate the file
+            // to that instead.
+            libc::off_t::try_from(length).map_err(|_| {
+                crate::PyError::overflow_error("Python int too large to convert to C long")
+            })
         }
 
         // os.truncate(path, length) -> None
@@ -5171,20 +5255,38 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                    // `open(space, w_path, os.O_WRONLY)` is `rposix.open` with
-                    // `inheritable=False`; nothing here forks between the open
-                    // and the close, but the descriptor is still not the
-                    // caller's to inherit.
-                    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-                    if fd < 0 {
-                        return Err(io_err_with_filename(
-                            std::io::Error::last_os_error(),
-                            path.w_path(),
-                        ));
-                    }
+                    // `truncate` opens the name through the module's own `open`
+                    // (`interp_posix.py:418`), so this is that call and not a
+                    // bare syscall: `inheritable=False`, the interpreter
+                    // released for the duration — a FIFO with no reader waits
+                    // here until another thread opens the other end — and an
+                    // interrupted open re-issued after the signal handler has
+                    // run rather than reported as `InterruptedError`.
+                    let fd = loop {
+                        let (fd, errno) = crate::module::thread::call_external_function(|| unsafe {
+                            libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
+                        });
+                        if fd >= 0 {
+                            break fd;
+                        }
+                        crate::builtins::eintr_retry_with(
+                            std::io::Error::from_raw_os_error(errno),
+                            |e| errno_err_with_filename(e.raw_os_error().unwrap_or(0), path.w_path()),
+                        )?;
+                    };
                     let truncated = ftruncate_retry(fd, length);
-                    unsafe { libc::close(fd) };
+                    // `interp_posix.py:429-431` closes the descriptor it opened
+                    // in a `finally`, through the module's own `close` — so a
+                    // writeback error the close is the first to see is the
+                    // caller's, not something `truncate` reports success over.
+                    // The truncation's own failure is the one reported when
+                    // both fail, which is the order the `finally` gives them.
+                    let closed = unsafe { libc::close(fd) };
+                    let close_errno = (closed < 0).then(crate::builtins::crt_errno);
                     truncated.map_err(|e| errno_err_with_filename(e, path.w_path()))?;
+                    if let Some(errno) = close_errno {
+                        return Err(errno_err_with_filename(errno, path.w_path()));
+                    }
                     Ok(pyre_object::w_none())
                 },
                 2,
