@@ -46,6 +46,8 @@ fn pickler_write_barrier(obj: PyObjectRef) {
 pub struct W_Pickler {
     /// Output file (has a `write` method).
     w_file: PyObjectRef,
+    /// Bound `file.write`, resolved once by `__init__`.
+    w_write: PyObjectRef,
     proto: i64,
     bin: bool,
     framing: bool,
@@ -230,21 +232,24 @@ fn add_reduce_note(err: PyError, w_obj_slot: Option<usize>, role: &str) -> PyErr
 /// boundary, `write_large_bytes`, and the end flush — and those callers pin the
 /// objects they still need across the `file.write` (arbitrary Python).
 ///
-/// `file_slot` is the shadow-stack slot of the destination file (pinned by the
-/// caller for the whole dump). When it is `None` (the `dumps` path) nothing is
+/// `file_slot` is the shadow-stack slot of the destination file and
+/// `write_slot` is the cached bound `file.write` (both pinned by the caller for
+/// the whole dump). When `file_slot` is `None` (the `dumps` path) nothing is
 /// flushed: `pending` accumulates the entire pickle and the caller takes it.
 struct Framer {
     current_frame: Option<Vec<u8>>,
     pending: Vec<u8>,
     file_slot: Option<usize>,
+    write_slot: Option<usize>,
 }
 
 impl Framer {
-    fn new(file_slot: Option<usize>) -> Self {
+    fn new(file_slot: Option<usize>, write_slot: Option<usize>) -> Self {
         Framer {
             current_frame: None,
             pending: Vec::new(),
             file_slot,
+            write_slot,
         }
     }
 
@@ -276,18 +281,24 @@ impl Framer {
         if let Some(slot) = self.file_slot {
             if !self.pending.is_empty() {
                 let w_bytes = pyre_object::w_bytes_from_bytes(&self.pending);
-                // `call_meth` resolves `write` via getattr, which allocates a
-                // bound method and can relocate the freshly-built `w_bytes`;
-                // pin it and pass the re-read root (`w_file` is pinned at `slot`).
+                // Pin the freshly-built bytes and re-read both it and the
+                // cached callable from their roots before arbitrary Python.
                 let _roots = pyre_object::gc_roots::push_roots();
                 pyre_object::gc_roots::pin_root(w_bytes);
                 let bytes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
-                call_meth(
-                    w_file,
-                    "write",
-                    &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
-                )?;
+                if let Some(write_slot) = self.write_slot {
+                    call_fn(
+                        pyre_object::gc_roots::shadow_stack_get(write_slot),
+                        &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
+                    )?;
+                } else {
+                    let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
+                    call_meth(
+                        w_file,
+                        "write",
+                        &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
+                    )?;
+                }
                 self.pending.clear();
             }
         }
@@ -339,17 +350,24 @@ impl Framer {
             Some(slot) => {
                 self.flush()?;
                 let w_payload = pyre_object::w_bytes_from_bytes(&owned);
-                // Pin the freshly-built payload across `call_meth`'s `write`
-                // getattr (which can allocate and relocate it).
+                // Pin the freshly-built payload and re-read the cached
+                // callable from its outer root before arbitrary Python.
                 let _roots = pyre_object::gc_roots::push_roots();
                 pyre_object::gc_roots::pin_root(w_payload);
                 let payload_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
-                call_meth(
-                    w_file,
-                    "write",
-                    &[pyre_object::gc_roots::shadow_stack_get(payload_slot)],
-                )?;
+                if let Some(write_slot) = self.write_slot {
+                    call_fn(
+                        pyre_object::gc_roots::shadow_stack_get(write_slot),
+                        &[pyre_object::gc_roots::shadow_stack_get(payload_slot)],
+                    )?;
+                } else {
+                    let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
+                    call_meth(
+                        w_file,
+                        "write",
+                        &[pyre_object::gc_roots::shadow_stack_get(payload_slot)],
+                    )?;
+                }
             }
             None => self.pending.extend_from_slice(&owned),
         }
@@ -375,6 +393,7 @@ impl W_Pickler {
                 w_class: std::ptr::null_mut(),
             },
             w_file: pyre_object::w_none(),
+            w_write: pyre_object::w_none(),
             proto: 0,
             bin: false,
             framing: false,
@@ -417,14 +436,15 @@ impl W_Pickler {
         // protocol-< 3 save path would otherwise always apply.
         let proto = normalize_protocol(pyre_object::gc_roots::shadow_stack_get(protocol_slot))?;
         // `file must have a 'write' attribute` (interp_pickle.py:557).
-        if crate::baseobjspace::findattr_result(
+        let Some(w_write) = crate::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(file_slot),
             "write",
         )?
-        .is_none()
-        {
+        else {
             return Err(PyError::type_error("file must have a 'write' attribute"));
-        }
+        };
+        pyre_object::gc_roots::pin_root(w_write);
+        let write_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if !unsafe {
             pyre_object::is_none(pyre_object::gc_roots::shadow_stack_get(
                 buffer_callback_slot,
@@ -439,6 +459,7 @@ impl W_Pickler {
         let memo = pyre_object::listobject::w_list_new(Vec::new());
         let current = cur_pickler(self_slot);
         current.w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
+        current.w_write = pyre_object::gc_roots::shadow_stack_get(write_slot);
         current.proto = proto;
         current.bin = proto >= 1;
         current.framing = proto >= 4;
@@ -485,6 +506,7 @@ impl W_Pickler {
             fast,
             w_dispatch_table,
             w_file,
+            w_write,
             buffer_callback,
             w_memo,
         ) = {
@@ -503,6 +525,7 @@ impl W_Pickler {
                 current.fast,
                 current.w_dispatch_table,
                 current.w_file,
+                current.w_write,
                 current.buffer_callback,
                 current.w_memo,
             )
@@ -525,6 +548,8 @@ impl W_Pickler {
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         pyre_object::gc_roots::pin_root(w_file);
         let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        pyre_object::gc_roots::pin_root(w_write);
+        let write_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         pyre_object::gc_roots::pin_root(w_memo);
         let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         pyre_object::gc_roots::pin_root(buffer_callback);
@@ -580,13 +605,15 @@ impl W_Pickler {
         let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_memo = pyre_object::gc_roots::shadow_stack_get(memo_slot);
         let w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
+        let w_write = pyre_object::gc_roots::shadow_stack_get(write_slot);
         let buffer_callback = pyre_object::gc_roots::shadow_stack_get(cb_slot);
         let pers_func = pyre_object::gc_roots::shadow_stack_get(pers_slot);
         let reducer_override = pyre_object::gc_roots::shadow_stack_get(reducer_slot);
         let dispatch_table = pyre_object::gc_roots::shadow_stack_get(dt_slot);
-        pickle_core(
+        pickle_core_impl(
             w_obj,
             w_file,
+            w_write,
             proto,
             bin,
             framing,
@@ -945,6 +972,39 @@ pub(crate) fn pickle_core(
     dispatch_table: PyObjectRef,
     reducer_override: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
+    pickle_core_impl(
+        w_obj,
+        w_file,
+        pyre_object::PY_NULL,
+        proto,
+        bin,
+        framing,
+        fix_imports,
+        pers_func,
+        buffer_callback,
+        w_memo,
+        fast,
+        dispatch_table,
+        reducer_override,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pickle_core_impl(
+    w_obj: PyObjectRef,
+    w_file: PyObjectRef,
+    w_write: PyObjectRef,
+    proto: i64,
+    bin: bool,
+    framing: bool,
+    fix_imports: bool,
+    pers_func: PyObjectRef,
+    buffer_callback: PyObjectRef,
+    w_memo: PyObjectRef,
+    fast: bool,
+    dispatch_table: PyObjectRef,
+    reducer_override: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_obj);
     if !pers_func.is_null() {
@@ -1000,7 +1060,13 @@ pub(crate) fn pickle_core(
         pyre_object::gc_roots::pin_root(w_file);
         Some(pyre_object::gc_roots::shadow_stack_len() - 1)
     };
-    let mut fr = Framer::new(file_slot);
+    let write_slot = if w_write.is_null() {
+        None
+    } else {
+        pyre_object::gc_roots::pin_root(w_write);
+        Some(pyre_object::gc_roots::shadow_stack_len() - 1)
+    };
+    let mut fr = Framer::new(file_slot, write_slot);
     if proto >= 2 {
         fr.push(op::PROTO);
         fr.push(proto as u8);

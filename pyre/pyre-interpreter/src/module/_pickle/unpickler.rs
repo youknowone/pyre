@@ -218,6 +218,12 @@ impl W_Unpickler {
         }
         // The memo persists across `load` calls (a multi-object stream may
         // back-reference an object memoized by an earlier load).
+        let stack = pyre_object::listobject::w_list_new(Vec::new());
+        pyre_object::gc_roots::pin_root(stack);
+        let stack_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let metastack = pyre_object::listobject::w_list_new(Vec::new());
+        pyre_object::gc_roots::pin_root(metastack);
+        let metastack_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let memo = pyre_object::listobject::w_list_new(Vec::new());
         pyre_object::gc_roots::pin_root(memo);
         let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -234,8 +240,8 @@ impl W_Unpickler {
         current.fix_imports = fix_imports;
         current.w_file_read = pyre_object::gc_roots::shadow_stack_get(read_slot);
         current.w_file_readline = pyre_object::gc_roots::shadow_stack_get(readline_slot);
-        current.w_stack = pyre_object::w_none();
-        current.w_metastack = pyre_object::w_none();
+        current.w_stack = pyre_object::gc_roots::shadow_stack_get(stack_slot);
+        current.w_metastack = pyre_object::gc_roots::shadow_stack_get(metastack_slot);
         current.w_memo = pyre_object::gc_roots::shadow_stack_get(memo_slot);
         current.memo_index = 0;
         current.w_frame = pyre_object::w_none();
@@ -291,17 +297,27 @@ impl W_Unpickler {
             );
         }
 
-        // Fresh stack each load; the memo persists across `load` calls so a
-        // later object can back-reference one memoized by an earlier load
-        // (lazily created when the unpickler was built only via `__new__`).
-        let w_stack = pyre_object::listobject::w_list_new(Vec::new());
-        let me = cur(slot);
-        me.w_stack = w_stack;
-        unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
-        let w_metastack = pyre_object::listobject::w_list_new(Vec::new());
-        let me = cur(slot);
-        me.w_metastack = w_metastack;
-        unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+        // Reset the constructor-owned stacks in place. An object built only
+        // via `__new__` still initializes them lazily on its first `load`.
+        if unsafe { pyre_object::is_none(cur(slot).w_stack) } {
+            let w_stack = pyre_object::listobject::w_list_new(Vec::new());
+            let me = cur(slot);
+            me.w_stack = w_stack;
+            unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+        }
+        if unsafe { pyre_object::is_none(cur(slot).w_metastack) } {
+            let w_metastack = pyre_object::listobject::w_list_new(Vec::new());
+            let me = cur(slot);
+            me.w_metastack = w_metastack;
+            unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+        }
+        unsafe {
+            pyre_object::listobject::w_list_clear(cur(slot).w_stack);
+            pyre_object::listobject::w_list_clear(cur(slot).w_metastack);
+        }
+        // The memo persists across `load` calls so a later object can
+        // back-reference one memoized by an earlier load. It is created lazily
+        // only when the unpickler was built via `__new__` without `__init__`.
         if unsafe { pyre_object::is_none(cur(slot).w_memo) } {
             let w_memo = pyre_object::listobject::w_list_new(Vec::new());
             let me = cur(slot);
