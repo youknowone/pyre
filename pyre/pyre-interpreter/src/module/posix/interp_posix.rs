@@ -1099,8 +1099,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "waitstatus_to_exitcode",
             "_exit",
             "abort",
-            "spawnv",
-            "spawnve",
+            // "spawnv"/"spawnve" — os.py:881 builds the spawn family out of
+            // fork+exec+waitpid, but only `if not _exists("spawnv")`, so a name
+            // bound here is not a placeholder waiting to be overwritten: it is
+            // what stops the real implementation from ever being defined.
             "system",
         ],
     );
@@ -1179,8 +1181,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "WNOWAIT",
             "WSTOPPED",
             "_cpu_count",
-            "spawnvp",
-            "spawnvpe",
+            // "spawnvp"/"spawnvpe" — the same os.py:881 branch defines these,
+            // for the same reason the two above are not bound.
             "popen",
         ],
     );
@@ -7733,10 +7735,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "execve",
             "execvp",
             "execvpe",
-            "spawnv",
-            "spawnve",
-            "spawnvp",
-            "spawnvpe",
+            // The spawn family is not an external here: os.py:881 writes it in
+            // Python over fork+exec+waitpid, which the stubs above already
+            // refuse. Binding a name would only stop os.py from defining the
+            // family — and with it P_WAIT and P_NOWAIT.
             "posix_spawn",
             "posix_spawnp",
             "abort",
