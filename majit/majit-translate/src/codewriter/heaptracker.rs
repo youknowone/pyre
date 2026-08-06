@@ -210,7 +210,10 @@ pub fn get_fielddescr_index_in(
             if r >= 0 {
                 return r;
             }
-            cur_index += -r - 1;
+            // the recursion was handed our own `cur_index`, so the index it
+            // reports back already counts the fields walked before the nested
+            // struct; adding it again would count them twice
+            cur_index = -r - 1;
             continue;
         }
         if name == fieldname {
@@ -325,5 +328,37 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 1);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "c", 0), 2);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -4);
+    }
+
+    #[test]
+    fn field_index_after_a_non_leading_nested_struct() {
+        // the nested struct does not start at index 0 here, so the recursive
+        // call is handed a nonzero `cur_index`.  Declaration order is
+        // a, inner.x, inner.y, b -> the walk must number them 0, 1, 2, 3.
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(["Inner".to_string(), "Outer".to_string()].into());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "Inner".to_string(),
+            vec![
+                ("x".to_string(), "i64".to_string()),
+                ("y".to_string(), "i64".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "Outer".to_string(),
+            vec![
+                ("a".to_string(), "i64".to_string()),
+                ("inner".to_string(), "Inner".to_string()),
+                ("b".to_string(), "i64".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "a", 0), 0);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "x", 0), 1);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "y", 0), 2);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 3);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -5);
     }
 }
