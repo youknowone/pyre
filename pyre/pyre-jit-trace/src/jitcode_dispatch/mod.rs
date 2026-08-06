@@ -1656,6 +1656,19 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// the virtualizable shadow instead of replaying stack effects.  Cleared once
     /// the walk advances past this ceiling (py-pc order is monotonic again).
     pub vstack_reorder_ceiling: u32,
+    /// The py_pc the walk's floor lookup reports while it is inside an
+    /// out-of-line exception LANDING block — the unwind bookkeeping the
+    /// codewriter emits per catch site, after the whole body, which then jumps
+    /// to the handler proper.  `None` when the catch target is in line with its
+    /// handler (nothing to skip).
+    ///
+    /// Those bytes lower no Python opcode, but they are laid out inside some
+    /// other opcode's floor segment, so the walk reports that opcode as a
+    /// boundary and the mirror would replay a stack effect from a block it
+    /// never ran — and, py order having gone backwards, arm the reorder region
+    /// over the whole handler body.  Hold the handler-entry coordinate until
+    /// the walk leaves those bytes instead.
+    pub vstack_handler_landing_py: Option<u32>,
     /// #73: the jitcode offset of the `-live-` byte that
     /// precedes the CURRENT opcode's guard resume point — the `-live-`
     /// BEFORE (`pyjitpl.py`, normal guard resume reads at

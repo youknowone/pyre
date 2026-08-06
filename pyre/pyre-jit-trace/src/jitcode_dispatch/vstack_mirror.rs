@@ -455,9 +455,11 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
         crate::liveness::stack_effects(&instr, op_arg, ctx.vstack_depth);
     if std::env::var_os("PYRE_VSTACK_DIAG").is_some() {
         eprintln!(
-            "[vstack-reconcile] prev_pypc={prev_pypc} new_pypc={new_pypc} \
+            "[vstack-reconcile] code={} sub={} prev_pypc={prev_pypc} new_pypc={new_pypc} \
              new_depth={new_depth} prev_depth={} class={class:?} reorder={in_reorder_region} \
              succ=(ft={},br={:?},exc={:?}) last_ref={:?} instr={instr:?}",
+            code.obj_name,
+            ctx.fbw_mode.inline_subwalk,
             ctx.vstack_depth,
             if has_fallthrough {
                 fallthrough as isize
@@ -900,8 +902,24 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
         }
     };
     if new_pypc == ctx.vstack_cur_pypc {
+        // Reporting the mirror's own coordinate: whatever landing block the
+        // walk was crossing is behind it, so stop holding that py_pc.
+        ctx.vstack_handler_landing_py = None;
         return;
     }
+    // Still inside the landing block a catch target opened: these bytes belong
+    // to no Python opcode, so hold the handler-entry coordinate rather than
+    // treating the segment they were laid out in as a boundary.  Any other
+    // py_pc means the walk has left them; the mirror resumes stepping from the
+    // handler entry, which is where the reconstruction placed it.  Together
+    // with the clear above the hold lasts exactly as far as the landing block:
+    // a later boundary that happens to name the same py_pc — the opcode those
+    // bytes were laid out inside really is walked eventually — reconciles
+    // normally.
+    if ctx.vstack_handler_landing_py == Some(new_pypc) {
+        return;
+    }
+    ctx.vstack_handler_landing_py = None;
     // The Python-opcode boundary: sample the executed-effect odometer for any
     // abort leg that resumes the interpreter AT this opcode, which re-executes
     // it whole (`FBW_OPCODE_ENTRY_EFFECTS`).  Top-level only — a sub-walk's
@@ -928,6 +946,7 @@ pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(
     ctx.vstack_depth = 0;
     ctx.vstack_cur_pypc = first_pypc;
     ctx.vstack_last_ref = OpRef::NONE;
+    ctx.vstack_handler_landing_py = None;
     ctx.vstack_valid = true;
 }
 
@@ -1038,7 +1057,65 @@ pub(crate) fn seed_vstack_mirror<Sym: WalkSym>(
     ctx.vstack_depth = depth;
     ctx.vstack_cur_pypc = first_pypc;
     ctx.vstack_last_ref = OpRef::NONE;
+    ctx.vstack_handler_landing_py = None;
     ctx.vstack_valid = true;
+}
+
+/// Python-opcode coordinate of the handler a catch target enters.
+///
+/// The obvious source — the floor segment of the catch target's JitCode offset
+/// — is not reliable here.  A catch target can be an out-of-line block that
+/// only performs the unwind bookkeeping and then jumps to the handler proper,
+/// and such a block carries no py pivot of its own, so the floor answers with
+/// whatever segment it happened to be laid out inside.  Observed: a catch
+/// target near the end of the JitCode floored onto the `RERAISE` that ENDS the
+/// handler (py 53) while the walk went on to report the handler's
+/// `PUSH_EXC_INFO` entry (py 35), which armed the reorder region across the
+/// whole handler body.
+///
+/// `co_exceptiontable` states the same edge exactly, at the Python level the
+/// mirror models: the unwind target of the entry covering the raising opcode.
+/// Fall back to the floor when no entry covers it — the JitCode-level catch
+/// then belongs to a construct the table does not describe.
+fn handler_entry_py_pc(
+    code_ptr: *const pyre_interpreter::CodeObject,
+    raising_py_pc: u32,
+    floor_py: u32,
+) -> u32 {
+    // SAFETY: the caller resolved `code_ptr` from a live jitcode payload.
+    let code = unsafe { &*code_ptr };
+    crate::liveness::exception_target_pc(code, raising_py_pc as usize)
+        .and_then(|py| u32::try_from(py).ok())
+        .unwrap_or(floor_py)
+}
+
+/// Static-liveness operand-stack depth on entry to the Python opcode at `py`.
+fn py_stack_depth(code_ptr: *const pyre_interpreter::CodeObject, py: u32) -> usize {
+    crate::liveness::liveness_for(code_ptr)
+        .depth_at_py_pc()
+        .get(py as usize)
+        .copied()
+        .unwrap_or(0) as usize
+}
+
+/// The handler-entry coordinate the mirror adopted, under `PYRE_VSTACK_DIAG`.
+/// `floor_py` is reported next to it: the two disagreeing is what an
+/// out-of-line catch target looks like from the walk's side, and without both
+/// numbers a spurious reorder region downstream cannot be attributed.
+fn vstack_handler_diag(
+    arm: &str,
+    handler_jit_pc: usize,
+    from_pypc: u32,
+    handler_py: u32,
+    floor_py: u32,
+    handler_depth: usize,
+) {
+    if std::env::var_os("PYRE_VSTACK_DIAG").is_some() {
+        eprintln!(
+            "[vstack-handler] {arm} handler_jit_pc={handler_jit_pc} from_pypc={from_pypc} \
+             handler_py={handler_py} floor_py={floor_py} handler_depth={handler_depth}"
+        );
+    }
 }
 
 /// #370: model the exception-unwind boundary on the operand-stack mirror.
@@ -1087,7 +1164,7 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
         ctx.vstack_valid = false;
         return;
     }
-    let (handler_py, code_ptr, twin_depth, twin_populated) = unsafe {
+    let (floor_py, code_ptr, twin_depth, twin_populated) = unsafe {
         let jc = &*sym.jitcode();
         if jc.payload.code_ptr.is_null() {
             ctx.vstack_valid = false;
@@ -1100,27 +1177,24 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
             jc.payload.depth_containing_populated(),
         )
     };
-    // Raw py_pc-keyed static-liveness read: the unpopulated-twin fallback
-    // (skeleton / fixture) and the audit oracle.
-    let raw_depth = || {
-        crate::liveness::liveness_for(code_ptr)
-            .depth_at_py_pc()
-            .get(handler_py as usize)
-            .copied()
-            .unwrap_or(0) as usize
-    };
-    let handler_depth = if twin_populated {
+    let handler_py = handler_entry_py_pc(code_ptr, ctx.vstack_cur_pypc, floor_py);
+    // The twin is a py_pc-keyed static-liveness read behind a JitCode offset,
+    // so it can only answer for the floor segment; on the exception-table
+    // coordinate it would report the landing block's segment depth.  Read the
+    // handler's own py depth there, and on the unpopulated-twin fallback
+    // (skeleton / fixture).
+    let handler_depth = if twin_populated && handler_py == floor_py {
         let depth = twin_depth.unwrap_or(0) as usize;
         if pcmap_containing_audit_enabled() {
             assert_eq!(
                 depth,
-                raw_depth(),
-                "PYRE_PCMAP_CONTAINING_AUDIT: enter-handler containing-depth twin diverged at jit_pc {handler_jit_pc} (py {handler_py})"
+                py_stack_depth(code_ptr, floor_py),
+                "PYRE_PCMAP_CONTAINING_AUDIT: enter-handler containing-depth twin diverged at jit_pc {handler_jit_pc} (py {floor_py})"
             );
         }
         depth
     } else {
-        raw_depth()
+        py_stack_depth(code_ptr, handler_py)
     };
     ctx.vstack_boxes.clear();
     ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
@@ -1128,9 +1202,18 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
     if handler_depth >= 1 && exc != OpRef::NONE {
         ctx.vstack_boxes[handler_depth - 1] = exc;
     }
+    vstack_handler_diag(
+        "outer",
+        handler_jit_pc,
+        ctx.vstack_cur_pypc,
+        handler_py,
+        floor_py,
+        handler_depth,
+    );
     ctx.vstack_cur_pypc = handler_py;
     ctx.vstack_depth = handler_depth;
     ctx.vstack_last_ref = OpRef::NONE;
+    ctx.vstack_handler_landing_py = (floor_py != handler_py).then_some(floor_py);
     // Revive: the handler-entry state is shadow-sourced, independent of the
     // pre-raise mirror.
     ctx.vstack_valid = true;
@@ -1170,11 +1253,19 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
         ctx.vstack_valid = false;
         return;
     };
-    let Some((handler_py, _code_ptr, handler_depth)) =
+    let Some((floor_py, code_ptr, floor_depth)) =
         frame.vstack_coordinate_for_jitcode_pc(handler_jit_pc)
     else {
         ctx.vstack_valid = false;
         return;
+    };
+    // Same out-of-line catch target as on the full-body arm, resolved against
+    // the callee's own code object.
+    let handler_py = handler_entry_py_pc(code_ptr, ctx.vstack_cur_pypc, floor_py);
+    let handler_depth = if handler_py == floor_py {
+        floor_depth
+    } else {
+        py_stack_depth(code_ptr, handler_py)
     };
     // Truncate to the handler's setup depth, keeping the tracked survivors; a
     // mirror shallower than the handler depth pads with NONE holes, which
@@ -1184,7 +1275,16 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
     if handler_depth >= 1 && exc != OpRef::NONE {
         ctx.vstack_boxes[handler_depth - 1] = exc;
     }
+    vstack_handler_diag(
+        "callee",
+        handler_jit_pc,
+        ctx.vstack_cur_pypc,
+        handler_py,
+        floor_py,
+        handler_depth,
+    );
     ctx.vstack_cur_pypc = handler_py;
     ctx.vstack_depth = handler_depth;
     ctx.vstack_last_ref = OpRef::NONE;
+    ctx.vstack_handler_landing_py = (floor_py != handler_py).then_some(floor_py);
 }

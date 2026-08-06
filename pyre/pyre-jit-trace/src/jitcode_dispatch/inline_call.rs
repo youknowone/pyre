@@ -4161,6 +4161,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
@@ -6401,6 +6402,7 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
