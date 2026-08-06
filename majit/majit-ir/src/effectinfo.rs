@@ -749,6 +749,15 @@ pub enum PyreHelperKind {
     /// + `int_is_true`, eliding the `CALL_MAY_FORCE` (and its
     /// `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the generic residual emits.
     Truth,
+    /// `bh_unary_positive_fn(value)` — the CALL_INTRINSIC_1 UNARY_POSITIVE
+    /// helper (`opcode_ops::unary_positive_value` → `space.pos`).  `int.__pos__`
+    /// returns an exact int unchanged, so the full-body walker recognises this
+    /// tag to fold a provably-int operand to the operand itself behind a
+    /// `guard_class INT`, eliding the `CALL_MAY_FORCE` (and its
+    /// `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the generic residual emits.
+    /// A `bool` (`+True` is int `1`, not identity) and every non-int operand
+    /// fall through to the generic residual so their `__pos__` still runs.
+    UnaryPositive,
     /// `bh_unpack_sequence_fn(count, seq)` — the UNPACK_SEQUENCE validator
     /// emitted by the codewriter UNPACK_SEQUENCE arm.  Validates the exact
     /// length and returns the normalized tuple.  The full-body walker

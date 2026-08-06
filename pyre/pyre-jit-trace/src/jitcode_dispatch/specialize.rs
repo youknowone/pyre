@@ -371,6 +371,44 @@ pub(crate) fn try_walker_specialize_truth_bool<Sym: WalkSym>(
     Ok(Some(truth))
 }
 
+/// #61: walker-native identity fold for the `UNARY_POSITIVE` residual
+/// (oopspec [`majit_ir::PyreHelperKind::UnaryPositive`]).  The object-space
+/// `pos` on an exact int returns the operand unchanged, so a concrete non-bool
+/// `W_IntObject` operand folds to the operand box itself behind the same guard
+/// prefix the truth / binary int folds emit (a low-bit tag test for a tagged
+/// immediate, `GUARD_CLASS INT` for a heap box).  The unboxed raw is discarded
+/// (DCE): the result is the box, not its `intval`.
+///
+/// Returns `Ok(Some(()))` when the fold was emitted (caller returns
+/// `Continue`); `Ok(None)` for a bool (`+True` is int `1`, not identity) or a
+/// non-int operand — the caller then falls through to the generic
+/// `CallMayForce` residual so a user / subclass `__pos__` still runs.
+pub(crate) fn try_walker_specialize_unary_positive_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
+        return Ok(None);
+    };
+    // `+x` is identity only for an EXACT int: a bool carries `BOOL_TYPE` (its
+    // `+` yields int `1`) and an int subclass may override `__pos__`, so both
+    // decline to the generic residual.
+    // SAFETY: `obj` is a live concrete `PyObjectRef` from the walker shadow.
+    if unsafe { !pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
+        return Ok(None);
+    }
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    // Emit the guard prefix (`GUARD_CLASS INT` / tag test) so a later non-int
+    // arrival deopts; the returned raw is unused because the result is the
+    // operand box itself.
+    let _ = walker_unbox_int(ctx, op_pc, operand, int_type_addr)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, operand)?;
+    Ok(Some(()))
+}
+
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
 /// the former int fast path's structure (`guard_class` + `getfield_gc_i` per

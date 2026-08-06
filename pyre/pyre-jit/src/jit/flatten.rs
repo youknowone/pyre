@@ -6243,7 +6243,7 @@ where
         ctx.unary_positive_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::PyreHelperKind::UnaryPositive,
         dst_reg,
     ))
 }
