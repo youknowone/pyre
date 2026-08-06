@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=47
+# pyre-check: max-pypy-ratio=100
+# The ceiling is twice the slowest ratio the CI runners observe (49.3x on the
+# linux runner's cranelift), rounded up. It read 218 before a later tightening
+# fitted it to a single run's numbers.
 # Reassigning obj.__class__ inside a hot loop must actually re-root the
 # instance's type, so method lookup and type() follow the new class.  The
 # STORE_ATTR mapdict inline cache (store_attr_slowpath) used to classify
