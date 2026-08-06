@@ -850,6 +850,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // follow_symlinks. HAVE_LCHOWN is not listed beside it: os.py:186
         // reads either one as the same follow_symlinks capability, and nothing
         // here calls `lchown` — os.lchown is `fchownat` with the flag.
+        // os.py:118 reads this as `chmod` honouring dir_fd.
+        ("HAVE_FCHMODAT", HAVE_FCHMODAT),
         ("HAVE_FCHOWNAT", HAVE_FCHOWNAT),
         // Do not advertise HAVE_FEXECVE until execve() accepts an open file
         // descriptor.  os.py uses this bit to add execve to supports_fd, and
@@ -867,6 +869,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("HAVE_LINKAT", HAVE_LINKAT),
         ("HAVE_FSTATVFS", HAVE_FSTATVFS),
         ("HAVE_FTRUNCATE", HAVE_FTRUNCATE),
+        // os.py:183 reads this as `chmod` honouring follow_symlinks; os.py:179
+        // shows why HAVE_FCHMODAT is not read for that claim.
+        ("HAVE_LCHMOD", HAVE_LCHMOD),
         // HAVE_FUTIMES is not listed beside it: nothing here calls `futimes`,
         // and os.py:150-151 reads either one as the same `utime` capability.
         ("HAVE_FUTIMENS", HAVE_FUTIMENS),
@@ -1060,7 +1065,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "symlink",
             "chmod",
             "fchmod",
-            "lchmod",
             "access",
             "execve",
             "execv",
@@ -2990,6 +2994,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `rposix.HAVE_FSTATAT` — what `DirFD` is parameterised on
     /// (`interp_posix.py:612,660`). `stat_at` calls `fstatat` through `libc`.
     const HAVE_FSTATAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    /// `rposix.HAVE_FCHMODAT` — what `chmod` types its `dir_fd` as
+    /// (`interp_posix.py:1197`), and what `_chmod_path` calls to honour either
+    /// modifier. `os.py:118` reads it as `chmod` honouring `dir_fd`; `os.py:179`
+    /// deliberately does *not* read it for `follow_symlinks`, because a host can
+    /// have `fchmodat` and still not honour `AT_SYMLINK_NOFOLLOW`.
+    const HAVE_FCHMODAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    /// `os.py:183` reads this as `chmod` honouring `follow_symlinks`, which is
+    /// the `AT_SYMLINK_NOFOLLOW` arm of that same `fchmodat`. It is a narrower
+    /// claim than `HAVE_FCHMODAT`: `os.py:159-177` records that where a host's
+    /// `lchmod` is a stub returning ENOTSUP, the flag does not work either, so
+    /// only the hosts that carry a working `lchmod` may say it — and those are
+    /// exactly the ones `os.lchmod` is registered on below.
+    const HAVE_LCHMOD: bool = cfg!(all(
+        not(feature = "sandbox"),
+        any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )
+    ));
     /// `rposix.HAVE_LINKAT` — what `link` takes its `src_dir_fd`/`dst_dir_fd`
     /// from. Its `linkat` call sits with the rest of the `host_env`-backed
     /// entry points, so it carries their condition and not `HAVE_FSTATAT`'s.
@@ -5052,44 +5079,139 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }),
         );
 
-        // os.chmod(path, mode) -> None
+        // os.chmod(path, mode, *, dir_fd=None, follow_symlinks=True) -> None
+        #[cfg(not(feature = "sandbox"))]
+        fn chmod_entry(
+            args: &[pyre_object::PyObjectRef],
+            name: &str,
+            default_follow: bool,
+        ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+            use std::os::fd::BorrowedFd;
+            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            // `lchmod(path, mode)` is `chmod(path, mode,
+            // follow_symlinks=False)` under another name and declares no
+            // keyword of its own.
+            let allowed: &[&str] = if default_follow {
+                &["path", "mode", "dir_fd", "follow_symlinks"]
+            } else {
+                &["path", "mode"]
+            };
+            crate::builtins::kwarg_reject_unknown(kwargs, allowed, name)?;
+            if pos.len() > 2 {
+                let surplus = if default_follow {
+                    format!(
+                        "{name}() takes exactly 2 positional arguments ({} given)",
+                        pos.len()
+                    )
+                } else {
+                    format!("{name}() takes at most 2 arguments ({} given)", pos.len())
+                };
+                return Err(crate::PyError::type_error(surplus));
+            }
+            let arg = |index: usize, key: &'static str| -> Result<PyObjectRef, crate::PyError> {
+                match crate::builtins::bind_pos_or_kw(pos, kwargs, index, key, name, index + 1)? {
+                    Some(value) => Ok(value),
+                    None => Err(crate::PyError::type_error(format!(
+                        "{name}() missing required argument '{key}' (pos {})",
+                        index + 1
+                    ))),
+                }
+            };
+            let (path_obj, mode_obj) = (arg(0, "path")?, arg(1, "mode")?);
+            // interp_posix.py:1228-1243 reads a `chmod` whose path did not
+            // fsencode as a descriptor and answers it with `os.fchmod`.
+            // `lchmod` names no descriptor form.
+            let path = crate::gateway::fsencode_path_or_fd_w(
+                path_obj,
+                name,
+                default_follow && HAVE_FCHMOD,
+            )?;
+            // `posix.chmod` unwraps `mode` as `c_int`, so a non-integer raises
+            // TypeError instead of reinterpreting its layout.
+            let mode = crate::baseobjspace::c_int_w(mode_obj)? as u32;
+            // `chmod` types `dir_fd` as `DirFD(rposix.HAVE_FCHMODAT)`
+            // (`interp_posix.py:1197`), whose `unwrap` converts before it
+            // reports the platform.
+            let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd") {
+                Some(v) if !unsafe { pyre_object::is_none(v) } => {
+                    let fd = unwrap_fd(v, "integer or None")?;
+                    if !HAVE_FCHMODAT {
+                        return Err(dir_fd_unavailable());
+                    }
+                    Some(fd)
+                }
+                _ => None,
+            };
+            let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                Some(v) => crate::baseobjspace::is_true(v)?,
+                None => default_follow,
+            };
+            if path.as_fd != -1 {
+                // A descriptor answers before either modifier is consulted
+                // (`interp_posix.py:1233-1242`), so neither is an error here —
+                // unlike `chown`, which turns both away (`:2481-2486`). The
+                // descriptor already names the file, and `fchmod` is what
+                // `os.chmod(fd, …)` means.
+                let bfd = unsafe { BorrowedFd::borrow_raw(path.as_fd) };
+                host_posix::fchmod(bfd, mode).map_err(|e| io_err(e, ""))?;
+                return Ok(pyre_object::w_none());
+            }
+            let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+            // `_chmod_path` (`interp_posix.py:1254-1258`) keeps the plain
+            // `chmod` for the unmodified call and reaches for `fchmodat` only
+            // where a name has to be resolved against something else or the
+            // final symlink must not be followed (`rposix.py:2569-2575`).
+            let ret = if dir_fd.is_some() || !follow_symlinks {
+                let flag = if follow_symlinks {
+                    0
+                } else {
+                    libc::AT_SYMLINK_NOFOLLOW
+                };
+                unsafe {
+                    libc::fchmodat(
+                        dir_fd.unwrap_or(libc::AT_FDCWD),
+                        c_path.as_ptr(),
+                        mode as libc::mode_t,
+                        flag,
+                    )
+                }
+            } else {
+                unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) }
+            };
+            if ret < 0 {
+                return Err(io_err_with_filename(
+                    std::io::Error::last_os_error(),
+                    path.w_path(),
+                ));
+            }
+            Ok(pyre_object::w_none())
+        }
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
             "chmod",
-            crate::make_builtin_function_with_arity(
-                "chmod",
-                |args| {
-                    use std::os::fd::BorrowedFd;
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error("chmod() requires 2 arguments"));
-                    }
-                    // interp_posix.py:1228-1243 reads a `chmod` whose path did
-                    // not fsencode as a descriptor and answers it with
-                    // `os.fchmod`.
-                    let path =
-                        crate::gateway::fsencode_path_or_fd_w(args[0], "chmod", HAVE_FCHMOD)?;
-                    // `posix.chmod` unwraps `mode` as `c_int`, so a non-integer
-                    // raises TypeError instead of reinterpreting its layout.
-                    let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
-                    if path.as_fd != -1 {
-                        let bfd = unsafe { BorrowedFd::borrow_raw(path.as_fd) };
-                        host_posix::fchmod(bfd, mode).map_err(|e| io_err(e, ""))?;
-                        return Ok(pyre_object::w_none());
-                    }
-                    let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
-                        .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                    let ret = unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) };
-                    if ret < 0 {
-                        return Err(io_err_with_filename(
-                            std::io::Error::last_os_error(),
-                            path.w_path(),
-                        ));
-                    }
-                    Ok(pyre_object::w_none())
-                },
-                2,
-            ),
+            crate::make_builtin_function("chmod", |args| chmod_entry(args, "chmod", true)),
+        );
+        // `os.lchmod` exists only where the host has a working one — os.py:159
+        // records that some platforms carry a stub returning ENOTSUP, and that
+        // `fchmodat`'s `AT_SYMLINK_NOFOLLOW` does not work either where that is
+        // so. It is the same call the `follow_symlinks=False` arm above makes.
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+            )
+        ))]
+        crate::module_ns_store(
+            ns,
+            "lchmod",
+            crate::make_builtin_function("lchmod", |args| chmod_entry(args, "lchmod", false)),
         );
 
         // os.fchmod(fd, mode) -> None
