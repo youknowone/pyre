@@ -19,15 +19,252 @@
 //! `subprocess` picks its Windows implementation on the presence of `msvcrt`
 //! (now installed), so its module body imports the process/priority constants
 //! and captures `CloseHandle`/`WaitForSingleObject`/`GetExitCodeProcess` as
-//! default arguments — those must exist here for `import subprocess` to
-//! succeed.  The `CreateProcess`/pipe/`DuplicateHandle` half a real launch
-//! needs is still absent, so an actual `Popen` spawn is a further follow-up.
+//! default arguments.  The launch itself — `CreatePipe`, `DuplicateHandle`,
+//! `GetStdHandle`, `CreateProcess`, `TerminateProcess`, `GetFileType` — is in
+//! [`process`], which is what `Popen` actually spawns through.
 
 /// Map the current thread's last OS error to an `OSError`
 /// (`PyErr_SetFromWindowsErr`): the code is the one `winerror` reports.
 fn last_os_error() -> crate::PyError {
     let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     crate::PyError::os_error_win32_syscall2(code, pyre_object::PY_NULL, pyre_object::PY_NULL)
+}
+
+/// The process-launch half of the module, which `subprocess.Popen` walks in
+/// order: `CreatePipe` for each redirected stream, `DuplicateHandle` to make
+/// the child's end of it inheritable, `CreateProcess`, then
+/// `WaitForSingleObject` / `GetExitCodeProcess` / `TerminateProcess` on what
+/// comes back.  Backed by `rustpython_host_env::winapi`, so it is compiled
+/// only where that is — which is also the only build that has `msvcrt`, the
+/// module `subprocess` picks its Windows implementation from.
+#[cfg(feature = "host_env")]
+mod process {
+    use pyre_object::{PyObjectRef, w_int_new, w_none, w_tuple_new};
+    use rustpython_host_env::winapi as host_winapi;
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    /// The OSError a failed Win32 call reports (`PyErr_SetFromWindowsErr`).
+    fn win32_err(error: std::io::Error) -> crate::PyError {
+        crate::PyError::os_error_win32_syscall2(
+            error.raw_os_error().unwrap_or(0),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        )
+    }
+
+    /// A handle as Python spells it — an integer, which is what every call
+    /// here takes and gives back.
+    fn handle_w(w_handle: PyObjectRef) -> Result<HANDLE, crate::PyError> {
+        Ok(crate::baseobjspace::int_w(w_handle)? as isize as HANDLE)
+    }
+
+    fn w_handle(handle: HANDLE) -> PyObjectRef {
+        w_int_new(handle as isize as i64)
+    }
+
+    fn arg(args: &[PyObjectRef], index: usize, name: &str) -> Result<PyObjectRef, crate::PyError> {
+        args.get(index).copied().ok_or_else(|| {
+            crate::PyError::type_error(format!("{name}() missing required argument"))
+        })
+    }
+
+    /// `_winapi.GetStdHandle(std_handle)` — `None` for a stream the process
+    /// does not have, which is what the caller tests for before making a pipe
+    /// of its own.
+    pub fn get_std_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let id = crate::baseobjspace::c_uint_w(arg(args, 0, "GetStdHandle")?)?;
+        match host_winapi::get_std_handle(id) {
+            Ok(Some(handle)) => Ok(w_handle(handle)),
+            Ok(None) => Ok(w_none()),
+            Err(e) => Err(win32_err(e)),
+        }
+    }
+
+    /// `_winapi.GetCurrentProcess()` — the pseudo handle, which names this
+    /// process to `DuplicateHandle` without being a handle to close.
+    pub fn get_current_process(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        Ok(w_handle(host_winapi::get_current_process()))
+    }
+
+    /// `_winapi.GetFileType(handle)` — a console handle is the one kind that
+    /// cannot be passed in an inherited handle list.
+    pub fn get_file_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let handle = handle_w(arg(args, 0, "GetFileType")?)?;
+        host_winapi::get_file_type(handle)
+            .map(|file_type| w_int_new(file_type as i64))
+            .map_err(win32_err)
+    }
+
+    /// `_winapi.GetLastError()`
+    pub fn get_last_error(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        Ok(w_int_new(host_winapi::get_last_error() as i64))
+    }
+
+    /// `_winapi.TerminateProcess(handle, exit_code)`
+    pub fn terminate_process(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let handle = handle_w(arg(args, 0, "TerminateProcess")?)?;
+        let exit_code = crate::baseobjspace::c_uint_w(arg(args, 1, "TerminateProcess")?)?;
+        if host_winapi::terminate_process(handle, exit_code) == 0 {
+            return Err(super::last_os_error());
+        }
+        Ok(w_none())
+    }
+
+    /// `_winapi.CreatePipe(pipe_attrs, size)` -> (read, write).  The
+    /// attributes argument is the security descriptor, which the call takes
+    /// the default of; neither end is inheritable until one is duplicated
+    /// into an inheritable copy.
+    pub fn create_pipe(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let size = crate::baseobjspace::c_uint_w(arg(args, 1, "CreatePipe")?)?;
+        let (read, write) = host_winapi::create_pipe(size).map_err(win32_err)?;
+        Ok(w_tuple_new(vec![w_handle(read), w_handle(write)]))
+    }
+
+    /// `_winapi.DuplicateHandle(source_process, source, target_process,
+    /// desired_access, inherit_handle, options=0)` -> handle
+    pub fn duplicate_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let source_process = handle_w(arg(args, 0, "DuplicateHandle")?)?;
+        let source = handle_w(arg(args, 1, "DuplicateHandle")?)?;
+        let target_process = handle_w(arg(args, 2, "DuplicateHandle")?)?;
+        let access = crate::baseobjspace::c_uint_w(arg(args, 3, "DuplicateHandle")?)?;
+        let inherit = crate::baseobjspace::c_int_w(arg(args, 4, "DuplicateHandle")?)?;
+        let options = match args.get(5) {
+            Some(&w) => crate::baseobjspace::c_uint_w(w)?,
+            None => 0,
+        };
+        host_winapi::duplicate_handle(
+            source_process,
+            source,
+            target_process,
+            access,
+            inherit,
+            options,
+        )
+        .map(w_handle)
+        .map_err(win32_err)
+    }
+
+    /// The environment block `CreateProcess` takes: every `KEY=value` in
+    /// order, each terminated, the whole thing terminated again
+    /// (`getenvironment`).
+    fn environment_block(w_env: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
+        if !unsafe { pyre_object::is_dict(w_env) } {
+            return Err(crate::PyError::type_error(
+                "environment must be a mapping object",
+            ));
+        }
+        let mut entries = Vec::new();
+        for (w_key, w_value) in unsafe { pyre_object::w_dict_items(w_env) } {
+            let key = crate::baseobjspace::text_w(w_key)?;
+            let value = crate::baseobjspace::text_w(w_value)?;
+            entries.push((key.to_string(), value.to_string()));
+        }
+        host_winapi::build_environment_block(entries).map_err(|e| {
+            crate::PyError::value_error(match e {
+                host_winapi::BuildEnvironmentBlockError::ContainsNul => "embedded null character",
+                host_winapi::BuildEnvironmentBlockError::IllegalName => {
+                    "illegal environment variable name"
+                }
+            })
+        })
+    }
+
+    /// Read one of `STARTUPINFO`'s fields.  A field left as `None` is the
+    /// zero the structure is built with (`getulong` / `gethandle`).
+    fn startup_info_field(w_info: PyObjectRef, name: &str) -> Result<i64, crate::PyError> {
+        let w_value = crate::baseobjspace::getattr_str(w_info, name)?;
+        if unsafe { pyre_object::is_none(w_value) } {
+            return Ok(0);
+        }
+        crate::baseobjspace::int_w(w_value)
+    }
+
+    /// The handles `lpAttributeList["handle_list"]` names, which are the ones
+    /// the child inherits and the only ones it does.
+    ///
+    /// An empty list is no list: an attribute list has to carry at least one
+    /// handle, and `getattributelist` drops it rather than building one that
+    /// `CreateProcess` answers `ERROR_BAD_LENGTH` to.  `subprocess.STARTUPINFO`
+    /// starts out with exactly that empty list.
+    fn handle_list(w_info: PyObjectRef) -> Result<Option<Vec<usize>>, crate::PyError> {
+        let w_attrs = crate::baseobjspace::getattr_str(w_info, "lpAttributeList")?;
+        if unsafe { pyre_object::is_none(w_attrs) } || w_attrs.is_null() {
+            return Ok(None);
+        }
+        let Some(w_handles) = (unsafe { pyre_object::w_dict_getitem_str(w_attrs, "handle_list") })
+        else {
+            return Ok(None);
+        };
+        let items = crate::baseobjspace::unpackiterable(w_handles, -1)?;
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let mut handles = Vec::with_capacity(items.len());
+        for w_handle in items {
+            handles.push(crate::baseobjspace::int_w(w_handle)? as usize);
+        }
+        Ok(Some(handles))
+    }
+
+    /// `_winapi.CreateProcess(application_name, command_line, proc_attrs,
+    /// thread_attrs, inherit_handles, creation_flags, env_mapping,
+    /// current_directory, startup_info)` -> (process, thread, pid, tid)
+    ///
+    /// The two attribute arguments are security descriptors, which the call
+    /// takes the defaults of.
+    pub fn create_process(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let wide = |w: PyObjectRef| -> Result<Option<widestring::WideCString>, crate::PyError> {
+            if w.is_null() || unsafe { pyre_object::is_none(w) } {
+                return Ok(None);
+            }
+            let text = crate::baseobjspace::text_w(w)?;
+            widestring::WideCString::from_str(text)
+                .map(Some)
+                .map_err(|_| crate::PyError::value_error("embedded null character"))
+        };
+
+        let application_name = wide(arg(args, 0, "CreateProcess")?)?;
+        // `CreateProcessW` writes into the command line it is given, so it
+        // takes a buffer rather than the string itself.
+        let mut command_line =
+            wide(arg(args, 1, "CreateProcess")?)?.map(|line| line.into_vec_with_nul());
+        let inherit_handles = crate::baseobjspace::int_w(arg(args, 4, "CreateProcess")?)?;
+        let creation_flags = crate::baseobjspace::c_uint_w(arg(args, 5, "CreateProcess")?)?;
+        let w_env = arg(args, 6, "CreateProcess")?;
+        let environment = if w_env.is_null() || unsafe { pyre_object::is_none(w_env) } {
+            None
+        } else {
+            Some(environment_block(w_env)?)
+        };
+        let current_directory = wide(arg(args, 7, "CreateProcess")?)?;
+        let w_startup_info = arg(args, 8, "CreateProcess")?;
+        let startup_info = host_winapi::StartupInfoData {
+            flags: startup_info_field(w_startup_info, "dwFlags")? as u32,
+            show_window: startup_info_field(w_startup_info, "wShowWindow")? as u16,
+            std_input: startup_info_field(w_startup_info, "hStdInput")? as isize as HANDLE,
+            std_output: startup_info_field(w_startup_info, "hStdOutput")? as isize as HANDLE,
+            std_error: startup_info_field(w_startup_info, "hStdError")? as isize as HANDLE,
+        };
+        let handles = handle_list(w_startup_info)?;
+
+        let info = host_winapi::create_process(
+            application_name.as_deref(),
+            command_line.as_deref_mut(),
+            inherit_handles as i32,
+            creation_flags,
+            environment.as_deref(),
+            current_directory.as_deref(),
+            startup_info,
+            handles,
+        )
+        .map_err(win32_err)?;
+        Ok(w_tuple_new(vec![
+            w_handle(info.process),
+            w_handle(info.thread),
+            w_int_new(info.process_id as i64),
+            w_int_new(info.thread_id as i64),
+        ]))
+    }
 }
 
 crate::py_module! {
@@ -71,6 +308,20 @@ crate::py_module! {
         "WAIT_TIMEOUT" => 0x0000_0102,
         "INFINITE" => 0xFFFF_FFFFu32,
         "STILL_ACTIVE" => 259,
+        // `DuplicateHandle` options and the handle sentinel (handleapi.h).
+        "DUPLICATE_SAME_ACCESS" => 0x0000_0002,
+        "DUPLICATE_CLOSE_SOURCE" => 0x0000_0001,
+        "INVALID_HANDLE_VALUE" => -1,
+        // `GetFileType` answers.  A console handle is the one a caller drops
+        // from an inherited handle list (`Popen._filter_handle_list`).
+        "FILE_TYPE_UNKNOWN" => 0x0000,
+        "FILE_TYPE_DISK" => 0x0001,
+        "FILE_TYPE_CHAR" => 0x0002,
+        "FILE_TYPE_PIPE" => 0x0003,
+        "FILE_TYPE_REMOTE" => 0x8000,
+        // `OpenProcess`/`DuplicateHandle` access rights (processthreadsapi.h).
+        "PROCESS_ALL_ACCESS" => 0x001F_FFFF,
+        "PROCESS_DUP_HANDLE" => 0x0000_0040,
     },
     inline_functions: {
         fn NeedCurrentDirectoryForExePath(exe_name: &str) -> bool {
@@ -94,8 +345,8 @@ crate::py_module! {
             Ok(())
         }
         // `subprocess.Popen._wait`/`poll` also capture these as default
-        // arguments at import time (a process launch, needing the missing
-        // `CreateProcess`/pipe half, is what actually reaches them).
+        // arguments at import time, and reach them once a launch has a
+        // process to wait on.
         fn WaitForSingleObject(handle: i64, milliseconds: i64) -> i64 {
             unsafe {
                 windows_sys::Win32::System::Threading::WaitForSingleObject(
@@ -114,5 +365,44 @@ crate::py_module! {
             }
             Ok(code as i64)
         }
-    }
+    },
+    extra_init: |ns| {
+        // The launch half, registered by hand: the module is built without
+        // `host_env` too, and there it stops at the constants and the calls
+        // above.
+        #[cfg(feature = "host_env")]
+        {
+            for (name, arity, function) in [
+                ("GetStdHandle", 1, process::get_std_handle as crate::BuiltinCodeFn),
+                ("GetCurrentProcess", 0, process::get_current_process),
+                ("GetFileType", 1, process::get_file_type),
+                ("GetLastError", 0, process::get_last_error),
+                ("TerminateProcess", 2, process::terminate_process),
+                ("CreatePipe", 2, process::create_pipe),
+                ("CreateProcess", 9, process::create_process),
+            ] {
+                crate::module_ns_store(
+                    ns,
+                    name,
+                    crate::gateway::with_module(
+                        "_winapi",
+                        crate::make_module_builtin_function_with_arity(name, function, arity),
+                    ),
+                );
+            }
+            // `options` is the one argument with a default (`0`), so the
+            // count is not fixed.
+            crate::module_ns_store(
+                ns,
+                "DuplicateHandle",
+                crate::gateway::with_module(
+                    "_winapi",
+                    crate::make_module_builtin_function(
+                        "DuplicateHandle",
+                        process::duplicate_handle,
+                    ),
+                ),
+            );
+        }
+    },
 }
