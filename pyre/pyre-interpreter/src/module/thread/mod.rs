@@ -113,10 +113,14 @@ pub fn runtime_thread_entered() -> bool {
 /// ahead of `rgil.acquire()` (rffi.py:207-210).  Taking the GIL back can enter
 /// the stealer loop, whose mutex and condvar waits overwrite `errno`, so a
 /// caller reading it after the guard drops can see the wrong value.
+///
+/// The calls that arrive here are C runtime calls, so the Windows invalid
+/// parameter handler is silenced for the duration (`crt_call`) and the saved
+/// code is the runtime's `errno` rather than `GetLastError`.
 pub(crate) fn call_external_function<R>(f: impl FnOnce() -> R) -> (R, i32) {
     let _blocked = before_external_block();
-    let result = f();
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let result = crate::builtins::crt_call!(f());
+    let errno = crate::builtins::crt_errno();
     (result, errno)
 }
 

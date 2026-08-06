@@ -103,6 +103,41 @@ assert str(exc) == "[Errno 2] %s: %r" % (exc.strerror, missing_deep), str(exc)
 if WIN32:
     assert exc.winerror is None, exc.winerror
 
+# So are the descriptor calls: a descriptor that names nothing is `EBADF`, and
+# on Windows no Win32 code comes with it.  (The C runtime's own answer to one
+# is to abort the process, which is why the calls silence its invalid parameter
+# handler first.)
+BAD_FD = 999
+for call, args in (
+    (os.close, ()),
+    (os.dup, ()),
+    (os.lseek, (0, os.SEEK_SET)),
+    (os.read, (4,)),
+    (os.write, (b"x",)),
+    (os.fsync, ()),
+    (os.ftruncate, (0,)),
+    (os.dup2, (BAD_FD - 1,)),
+):
+    exc = failure(call, BAD_FD, *args)
+    assert exc.errno == 9, (call, exc.errno)
+    assert str(exc) == "[Errno 9] %s" % exc.strerror, (call, str(exc))
+    if WIN32:
+        assert exc.winerror is None, (call, exc.winerror)
+
+# `os.fstat` is the exception: it reaches for the descriptor's handle, and the
+# Win32 error for the one it does not have is what gets reported.
+exc = failure(os.fstat, BAD_FD)
+assert exc.errno == 9, exc.errno
+if WIN32:
+    assert exc.winerror == 6, exc.winerror
+    assert str(exc) == "[WinError 6] %s" % exc.strerror, str(exc)
+else:
+    assert str(exc) == "[Errno 9] %s" % exc.strerror, str(exc)
+
+# A descriptor that names nothing is not a terminal, which is reported rather
+# than raised.
+assert os.isatty(BAD_FD) is False
+
 os.remove(a_file)
 os.rmdir(a_dir)
 os.rmdir(base)

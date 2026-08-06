@@ -6157,6 +6157,43 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
     Some(name)
 }
 
+/// Run a C runtime descriptor call (`close`, `read`, `lseek`, …).
+///
+/// On Windows the MSVC invalid parameter handler is silenced around it
+/// (`_Py_BEGIN_SUPPRESS_IPH`): its default action on a bad descriptor is to
+/// abort the process, where the call is supposed to return -1 and set `EBADF`.
+/// The verdict is then `crt_errno`, never `GetLastError` — the latter describes
+/// whichever Win32 call the runtime made last, not this one.
+/// The call is made for the caller: it is a C runtime entry point taking
+/// arguments the caller has already checked, and silencing the handler is a
+/// thread-local store the runtime itself offers for the purpose.
+macro_rules! crt_call {
+    ($call:expr) => {{
+        #[cfg(all(windows, feature = "host_env"))]
+        #[allow(unused_unsafe)]
+        let ret = unsafe { rustpython_host_env::suppress_iph!($call) };
+        #[cfg(not(all(windows, feature = "host_env")))]
+        #[allow(unused_unsafe)]
+        let ret = unsafe { $call };
+        ret
+    }};
+}
+pub(crate) use crt_call;
+
+/// The errno the last C runtime call reported.
+pub(crate) fn crt_errno() -> i32 {
+    #[cfg(all(windows, feature = "host_env"))]
+    {
+        rustpython_host_env::os::get_errno()
+    }
+    // Off Windows the two are the same table, and a Windows build without the
+    // host_env seam has no `_get_errno` to read.
+    #[cfg(not(all(windows, feature = "host_env")))]
+    {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+}
+
 /// The POSIX errno for a `std::io::Error`, so the errno-specific OSError
 /// subclass (`os_error_errno_subclass`) and the `.errno` slot stay consistent
 /// across platforms.  On Windows `raw_os_error()` reports a Win32 error code
@@ -13503,7 +13540,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                         {
                             #[cfg(not(feature = "sandbox"))]
                             return Ok(w_bool_from(
-                                unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) } >= 0,
+                                crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR)) >= 0,
                             ));
                             #[cfg(feature = "sandbox")]
                             return Ok(w_bool_from(
@@ -13565,9 +13602,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     {
                         #[cfg(not(feature = "sandbox"))]
                         let pos = {
-                            let pos = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
+                            let pos = crt_call!(libc::lseek(fd, offset as libc::off_t, whence));
                             if pos < 0 {
-                                return Err(fd_io_err(std::io::Error::last_os_error()));
+                                return Err(fd_errno_err(crt_errno()));
                             }
                             pos
                         };
@@ -13925,8 +13962,8 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             {
                 #[cfg(not(feature = "sandbox"))]
-                if unsafe { libc::lseek(fd, 0, libc::SEEK_END) } < 0 {
-                    return Err(fd_io_err(std::io::Error::last_os_error()));
+                if crt_call!(libc::lseek(fd, 0, libc::SEEK_END)) < 0 {
+                    return Err(fd_errno_err(crt_errno()));
                 }
                 #[cfg(feature = "sandbox")]
                 crate::host_seam::ops::lseek(fd, 0, libc::SEEK_END)
@@ -14233,8 +14270,8 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if let Some(fd) = file_get_fd(self_obj) {
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
-                return Err(fd_io_err(std::io::Error::last_os_error()));
+            if crt_call!(libc::ftruncate(fd, size as libc::off_t)) < 0 {
+                return Err(fd_errno_err(crt_errno()));
             }
             return Ok(index);
         }
@@ -14269,7 +14306,7 @@ fn file_method_isatty(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     };
     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
     {
-        return Ok(w_bool_from(unsafe { libc::isatty(fd) } != 0));
+        return Ok(w_bool_from(crt_call!(libc::isatty(fd)) != 0));
     }
     #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
     {
@@ -14454,6 +14491,12 @@ fn fd_bytes_to_obj(self_obj: PyObjectRef, data: Vec<u8>) -> Result<PyObjectRef, 
 
 fn fd_io_err(e: std::io::Error) -> crate::PyError {
     crate::PyError::os_error_with_errno(io_error_posix_errno(&e, 5), e.to_string())
+}
+
+/// [`fd_io_err`] for a C runtime call, whose verdict is already an errno.
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+fn fd_errno_err(errno: i32) -> crate::PyError {
+    crate::PyError::os_error_with_errno(errno, "")
 }
 
 fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -14722,12 +14765,8 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 not(feature = "sandbox")
             ))]
             // SAFETY: close(2) on the file object's own fd.
-            if unsafe { libc::close(fd) } < 0 {
-                let e = std::io::Error::last_os_error();
-                return Err(crate::PyError::os_error_with_errno(
-                    io_error_posix_errno(&e, 0),
-                    format!("close: {e}"),
-                ));
+            if crt_call!(libc::close(fd)) < 0 {
+                return Err(crate::PyError::os_error_with_errno(crt_errno(), "close"));
             }
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
             crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
