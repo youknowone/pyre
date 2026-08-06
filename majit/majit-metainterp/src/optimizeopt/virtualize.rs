@@ -983,6 +983,13 @@ impl OptVirtualize {
             // (`pytraceback.rs:462`) escapes with its args list and the
             // traceback node behind it.
             //
+            // Reaching here means `field_val` was `None` and neither header
+            // arm answered.  `virtualstate.py:171-174` tolerates a `None`
+            // fieldstate and `info.py:216-226 _force_elements` emits no
+            // SETFIELD for a `None` field, so upstream itself depends on the
+            // allocation being zeroed -- the fold does not add an assumption
+            // the rest of the optimizer lacks.
+            //
             // `w_class` and `typeptr` are excluded: both are header fields
             // resolved from class identity above, and neither is ever zero on
             // a live object, so folding them to null/0 would answer a read
