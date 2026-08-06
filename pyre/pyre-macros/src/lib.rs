@@ -538,6 +538,14 @@ fn typed_alias(
                 crate::baseobjspace::index_int_w_preserve_negative(args[#idx])?
             },
         ),
+        "PyIndexCInt" => (
+            // The same parameters narrowed to a C int, as an `int` parameter
+            // whose callee compares against a small fixed set is.  `PyCInt`
+            // does not serve: its converter reaches the value through
+            // `__int__` first, which the index protocol does not.
+            quote! { i32 },
+            quote! { crate::baseobjspace::index_c_int_w(args[#idx])? },
+        ),
         // Integer aliases — route through the `space.gateway_nonnegint_w`
         // / `space.c_*_w` converters in baseobjspace.rs so the range / sign
         // checks and their exception messages live in one place.

@@ -389,9 +389,14 @@ impl W_BytesIO {
     fn seek(
         &mut self,
         pos: PyIndexInt,
-        #[default(0)] whence: PyIndexInt,
+        #[default(0)] whence: PyIndexCInt,
     ) -> Result<i64, crate::PyError> {
         // interp_bytesio.py:162-180 validation followed by RStringIO.seek.
+        // `@unwrap_spec(pos=r_longlong, whence=int)` (:162): the position is a
+        // long long but the whence is a C int, so one that does not fit is an
+        // OverflowError from the converter rather than a value the arms below
+        // ever see. Both come through `__index__` alone — 3.14 rejects a whence
+        // carrying only `__int__`, and reads one carrying both from `__index__`.
         self.check_closed()?;
         match whence {
             0 if pos < 0 => {
@@ -416,7 +421,7 @@ impl W_BytesIO {
                 )));
             }
         }
-        self.seek_pos(pos, whence);
+        self.seek_pos(pos, whence as i64);
         Ok(self.tell_pos())
     }
 
