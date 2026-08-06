@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=40
 # pypy's exec time is pinned to the startup-subtraction floor here, so the
 # ratio is not a measurement: the ceiling is twice the slowest ratio observed
-# across CI hosts (18.2x), and no floor gate is recorded.
+# across CI hosts (18.2x), rounded up, and no floor gate is recorded.
 N = 200000
 
 
