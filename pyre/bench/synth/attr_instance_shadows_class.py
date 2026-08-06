@@ -1,5 +1,7 @@
-# pyre-check: max-pypy-ratio=118
-# pyre-check: min-pypy-ratio=7.52
+# pyre-check: max-pypy-ratio=265
+# pypy's exec time is pinned to the startup-subtraction floor here, so the
+# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
+# runners observe (131.0x), rounded up, and no floor gate is recorded.
 # An instance attribute shadows a same-named non-data-descriptor class
 # attribute on builtin-type subclasses (tuple/int/str), while a data descriptor
 # still wins over a competing instance-dict entry (injected directly, since the

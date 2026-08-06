@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=84
+# pyre-check: max-pypy-ratio=90
 # pypy's exec time is pinned to the startup-subtraction floor here, so the
-# ratio is not a measurement and no floor gate is recorded.
+# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
+# runners observe (44.3x), rounded up, and no floor gate is recorded.
 N = 2000000
 
 
