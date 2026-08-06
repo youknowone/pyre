@@ -876,6 +876,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // and os.py:150-151 reads either one as the same `utime` capability.
         ("HAVE_FUTIMENS", HAVE_FUTIMENS),
         ("HAVE_LSTAT", HAVE_LSTAT),
+        // os.py:124-127 reads these as `mkdir`, `mkfifo` and `open` honouring
+        // dir_fd. HAVE_MKNODAT is not listed beside them: `mknod` is still a
+        // noop placeholder that creates nothing.
+        ("HAVE_MKDIRAT", HAVE_MKDIRAT),
+        ("HAVE_MKFIFOAT", HAVE_MKFIFOAT),
+        ("HAVE_OPENAT", HAVE_OPENAT),
+        // os.py:131-132 reads this as `unlink` and `rmdir` honouring dir_fd,
+        // which is the one `unlinkat` both of them make. os.remove is not in
+        // that set — os.py never names it — even though the call takes the
+        // modifier all the same.
+        ("HAVE_UNLINKAT", HAVE_UNLINKAT),
         // os.py:133,191 reads this as `utime` honouring both dir_fd and
         // follow_symlinks, which is the one `utimensat` the name form makes.
         // HAVE_LUTIMES is not listed beside it for the same reason as
@@ -1445,23 +1456,97 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         Ok(result)
     }
 
-    // ── posix.open(path, flags, mode=0o777) → fd ──
+    /// The `*, dir_fd=None` tail, read the way `DirFD(available)` reads it
+    /// (`interp_posix.py:274-292`): `None` and an absent argument are the same
+    /// `DEFAULT_DIR_FD`, and the value is converted before the platform is
+    /// reported, so a wrongly typed one is a TypeError even on a build that
+    /// carries no `*at` call to honour it.
+    fn dir_fd_kwarg(
+        kwargs: Option<pyre_object::PyObjectRef>,
+        have: bool,
+    ) -> Result<Option<i32>, crate::PyError> {
+        match crate::builtins::kwarg_get(kwargs, "dir_fd") {
+            Some(v) if !unsafe { pyre_object::is_none(v) } => {
+                let fd = unwrap_fd(v, "integer or None")?;
+                if !have {
+                    return Err(dir_fd_unavailable());
+                }
+                Ok(Some(fd))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Bind the positional-or-keyword prefix of an entry point whose only
+    /// keyword-only parameter is `dir_fd`. `params` names that prefix in order,
+    /// `path` first, and the leading `required` of them carry no default; the
+    /// rest are reported absent as `None`. The modifier itself is left in the
+    /// returned kwargs dict, because which `HAVE_*` bit it answers to is the
+    /// caller's.
+    ///
+    /// The surplus-positional message distinguishes a signature whose count is
+    /// fixed from one with defaults, the way the generated argument parsers do.
+    fn bind_path_args(
+        args: &[pyre_object::PyObjectRef],
+        name: &str,
+        params: &[&'static str],
+        required: usize,
+    ) -> Result<
+        (
+            Vec<Option<pyre_object::PyObjectRef>>,
+            Option<pyre_object::PyObjectRef>,
+        ),
+        crate::PyError,
+    > {
+        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        let mut allowed: Vec<&str> = params.to_vec();
+        allowed.push("dir_fd");
+        crate::builtins::kwarg_reject_unknown(kwargs, &allowed, name)?;
+        if pos.len() > params.len() {
+            let count = params.len();
+            let plural = if count == 1 { "" } else { "s" };
+            let bound = if required == count { "exactly" } else { "at most" };
+            return Err(crate::PyError::type_error(format!(
+                "{name}() takes {bound} {count} positional argument{plural} ({} given)",
+                pos.len()
+            )));
+        }
+        let mut bound = Vec::with_capacity(params.len());
+        for (index, key) in params.iter().enumerate() {
+            let value = crate::builtins::bind_pos_or_kw(pos, kwargs, index, key, name, index + 1)?;
+            if value.is_none() && index < required {
+                return Err(crate::PyError::type_error(format!(
+                    "{name}() missing required argument '{key}' (pos {})",
+                    index + 1
+                )));
+            }
+            bound.push(value);
+        }
+        Ok((bound, kwargs))
+    }
+
+    // ── posix.open(path, flags, mode=0o777, *, dir_fd=None) → fd ──
     crate::module_ns_store(
         ns,
         "open",
         crate::make_builtin_function("open", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error(
-                    "open() requires at least 2 arguments",
-                ));
-            }
-            let path = crate::gateway::fsencode_path_w(args[0])?;
-            let flags = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
-            let mode: u32 = if args.len() >= 3 {
-                crate::baseobjspace::c_int_w(args[2])? as u32
-            } else {
-                0o777
+            let (bound, kwargs) = bind_path_args(args, "open", &["path", "flags", "mode"], 2)?;
+            let path = crate::gateway::fsencode_path_or_fd_w(
+                bound[0].expect("path is required"),
+                "open",
+                false,
+            )?;
+            let flags = crate::baseobjspace::c_int_w(bound[1].expect("flags is required"))?
+                as libc::c_int;
+            let mode: u32 = match bound[2] {
+                Some(value) => crate::baseobjspace::c_int_w(value)? as u32,
+                None => 0o777,
             };
+            // `open` types `dir_fd` as `DirFD(rposix.HAVE_OPENAT)`
+            // (`interp_posix.py:308`). Only the `openat` arm below reads it;
+            // every other build has already turned a descriptor away, because
+            // `HAVE_OPENAT` is what those builds do not claim.
+            let _dir_fd = dir_fd_kwarg(kwargs, HAVE_OPENAT)?;
             #[cfg(not(feature = "sandbox"))]
             let fd = {
                 // Open the fd non-inheritable (PEP 446) so the descriptor does
@@ -1487,8 +1572,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     // Opening a FIFO without O_NONBLOCK waits for a peer.
-                    crate::module::thread::call_external_function(|| unsafe {
-                        libc::open(c_path.as_ptr(), flags, mode as libc::c_uint)
+                    crate::module::thread::call_external_function(|| {
+                        // `openat` resolves the name against the descriptor;
+                        // the plain `open` is what a name without one means
+                        // (`interp_posix.py:325-329`).
+                        #[cfg(unix)]
+                        if let Some(dir_fd) = _dir_fd {
+                            return unsafe {
+                                libc::openat(dir_fd, c_path.as_ptr(), flags, mode as libc::c_uint)
+                            };
+                        }
+                        unsafe { libc::open(c_path.as_ptr(), flags, mode as libc::c_uint) }
                     })
                 };
                 if fd < 0 {
@@ -1757,14 +1851,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ),
     );
 
-    // ── posix.unlink(path) / posix.remove(path) ──
+    // ── posix.unlink(path, *, dir_fd=None) / posix.remove(path, *, dir_fd=None) ──
+    // `remove` is `unlink` written out a second time under its own name
+    // (`interp_posix.py:827-869`), so it reports itself by that name.
     fn posix_unlink(
         args: &[pyre_object::PyObjectRef],
+        name: &str,
     ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-        if args.is_empty() {
-            return Err(crate::PyError::type_error("unlink() requires 1 argument"));
-        }
-        let path = crate::gateway::fsencode_path_w(args[0])?;
+        let (bound, kwargs) = bind_path_args(args, name, &["path"], 1)?;
+        let path = crate::gateway::fsencode_path_or_fd_w(
+            bound[0].expect("path is required"),
+            name,
+            false,
+        )?;
+        // Both take `DirFD(rposix.HAVE_UNLINKAT)` (`interp_posix.py:826,847`).
+        let _dir_fd = dir_fd_kwarg(kwargs, HAVE_UNLINKAT)?;
         // `DeleteFileW`, except on a directory symlink, which `RemoveDirectoryW`
         // unlinks without following (`os_unlink_impl`).
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -1777,6 +1878,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         {
             let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+            // `unlinkat` without `AT_REMOVEDIR` is the name form resolved
+            // against a descriptor (`rposix.py:2717-2720`).
+            #[cfg(unix)]
+            let ret = match _dir_fd {
+                Some(dir_fd) => unsafe { libc::unlinkat(dir_fd, c_path.as_ptr(), 0) },
+                None => unsafe { libc::unlink(c_path.as_ptr()) },
+            };
+            #[cfg(not(unix))]
             let ret = unsafe { libc::unlink(c_path.as_ptr()) };
             if ret < 0 {
                 return Err(fs_err_with_filename(
@@ -1793,12 +1902,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "unlink",
-        crate::make_builtin_function_with_arity("unlink", posix_unlink, 1),
+        crate::make_builtin_function("unlink", |args| posix_unlink(args, "unlink")),
     );
     crate::module_ns_store(
         ns,
         "remove",
-        crate::make_builtin_function_with_arity("remove", posix_unlink, 1),
+        crate::make_builtin_function("remove", |args| posix_unlink(args, "remove")),
     );
 
     // ── posix.readlink(path, *, dir_fd=None) ──
@@ -1828,20 +1937,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }),
     );
 
-    // ── posix.mkdir(path, mode=0o777) ──
+    // ── posix.mkdir(path, mode=0o777, *, dir_fd=None) ──
     crate::module_ns_store(
         ns,
         "mkdir",
         crate::make_builtin_function("mkdir", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("mkdir() requires 1 argument"));
-            }
-            let path = crate::gateway::fsencode_path_w(args[0])?;
-            let _mode: u32 = if args.len() >= 2 {
-                crate::baseobjspace::c_int_w(args[1])? as u32
-            } else {
-                0o777
+            let (bound, kwargs) = bind_path_args(args, "mkdir", &["path", "mode"], 1)?;
+            let path = crate::gateway::fsencode_path_or_fd_w(
+                bound[0].expect("path is required"),
+                "mkdir",
+                false,
+            )?;
+            let _mode: u32 = match bound[1] {
+                Some(value) => crate::baseobjspace::c_int_w(value)? as u32,
+                None => 0o777,
             };
+            // `mkdir` types `dir_fd` as `DirFD(rposix.HAVE_MKDIRAT)`
+            // (`interp_posix.py:921`).
+            let _dir_fd = dir_fd_kwarg(kwargs, HAVE_MKDIRAT)?;
             // `CreateDirectoryW`; a mode of 0o700 is served by the security
             // descriptor that denies everyone but the owner (`os_mkdir_impl`).
             #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -1854,8 +1967,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             {
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                // `mkdirat` resolves the name against the descriptor
+                // (`rposix.py:2708-2710`).
                 #[cfg(unix)]
-                let ret = unsafe { libc::mkdir(c_path.as_ptr(), _mode as libc::mode_t) };
+                let ret = match _dir_fd {
+                    Some(dir_fd) => unsafe {
+                        libc::mkdirat(dir_fd, c_path.as_ptr(), _mode as libc::mode_t)
+                    },
+                    None => unsafe { libc::mkdir(c_path.as_ptr(), _mode as libc::mode_t) },
+                };
                 #[cfg(windows)]
                 let ret = unsafe { libc::mkdir(c_path.as_ptr()) };
                 if ret < 0 {
@@ -1872,41 +1992,50 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }),
     );
 
-    // ── posix.rmdir(path) ──
+    // ── posix.rmdir(path, *, dir_fd=None) ──
     // Mutates the host filesystem; stubbed under sandbox, so the real body
     // (and its libc call) is compiled out.
     #[cfg(not(feature = "sandbox"))]
     crate::module_ns_store(
         ns,
         "rmdir",
-        crate::make_builtin_function_with_arity(
-            "rmdir",
-            |args| {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error("rmdir() requires 1 argument"));
+        crate::make_builtin_function("rmdir", |args| {
+            let (bound, kwargs) = bind_path_args(args, "rmdir", &["path"], 1)?;
+            let path = crate::gateway::fsencode_path_or_fd_w(
+                bound[0].expect("path is required"),
+                "rmdir",
+                false,
+            )?;
+            // Removing a directory is the same call as removing a file, so
+            // `rmdir` reads the same bit: `DirFD(rposix.HAVE_UNLINKAT)`
+            // (`interp_posix.py:942`).
+            let _dir_fd = dir_fd_kwarg(kwargs, HAVE_UNLINKAT)?;
+            // `RemoveDirectoryW`, which is what `std::fs::remove_dir` is on
+            // Windows (`os_rmdir_impl`).
+            #[cfg(windows)]
+            std::fs::remove_dir(path_from_bytes(&path.as_bytes).as_ref())
+                .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
+            #[cfg(not(windows))]
+            {
+                let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                    .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                // `AT_REMOVEDIR` is what makes the one `unlinkat` a `rmdir`
+                // (`rposix.py:2717-2720` `removedir=True`).
+                let ret = match _dir_fd {
+                    Some(dir_fd) => unsafe {
+                        libc::unlinkat(dir_fd, c_path.as_ptr(), libc::AT_REMOVEDIR)
+                    },
+                    None => unsafe { libc::rmdir(c_path.as_ptr()) },
+                };
+                if ret < 0 {
+                    return Err(fs_err_with_filename(
+                        std::io::Error::last_os_error(),
+                        path.w_path(),
+                    ));
                 }
-                let path = crate::gateway::fsencode_path_w(args[0])?;
-                // `RemoveDirectoryW`, which is what `std::fs::remove_dir` is on
-                // Windows (`os_rmdir_impl`).
-                #[cfg(windows)]
-                std::fs::remove_dir(path_from_bytes(&path.as_bytes).as_ref())
-                    .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
-                #[cfg(not(windows))]
-                {
-                    let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
-                        .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                    let ret = unsafe { libc::rmdir(c_path.as_ptr()) };
-                    if ret < 0 {
-                        return Err(fs_err_with_filename(
-                            std::io::Error::last_os_error(),
-                            path.w_path(),
-                        ));
-                    }
-                }
-                Ok(pyre_object::w_none())
-            },
-            1,
-        ),
+            }
+            Ok(pyre_object::w_none())
+        }),
     );
 
     // ── posix.rename / posix.replace(src, dst, *, src_dir_fd=None,
@@ -3020,6 +3149,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             target_os = "dragonfly",
         )
     ));
+    /// `rposix.HAVE_OPENAT` — what `open` types its `dir_fd` as
+    /// (`interp_posix.py:308`). `openat` is reached through `libc`, so it needs
+    /// no `host_env`; the Windows arm serves the name through `_wopen` and
+    /// resolves nothing against a descriptor.
+    const HAVE_OPENAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    /// `rposix.HAVE_MKDIRAT` — `mkdir`'s (`interp_posix.py:921`).
+    const HAVE_MKDIRAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    /// `rposix.HAVE_UNLINKAT`. `os.py:131-132` reads it twice, for `unlink` and
+    /// for `rmdir`, which are the same `unlinkat` told apart by `AT_REMOVEDIR`
+    /// (`rposix.py:2717-2720`) — so the two cannot be advertised apart.
+    const HAVE_UNLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    /// `rposix.HAVE_MKFIFOAT` — `mkfifo`'s (`interp_posix.py:1322`). Narrower
+    /// than the three above only because `os.mkfifo` itself is registered on
+    /// the `host_env` POSIX builds; elsewhere the name is a noop placeholder
+    /// that resolves nothing.
+    const HAVE_MKFIFOAT: bool = HOST_POSIX;
     /// `rposix.HAVE_LINKAT` — what `link` takes its `src_dir_fd`/`dst_dir_fd`
     /// from. Its `linkat` call sits with the rest of the `host_env`-backed
     /// entry points, so it carries their condition and not `HAVE_FSTATAT`'s.
@@ -4809,25 +4954,34 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
-        // os.mkfifo(path, mode=0o666) -> None
+        // os.mkfifo(path, mode=0o666, *, dir_fd=None) -> None
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
             "mkfifo",
             crate::make_builtin_function("mkfifo", |args| {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error("mkfifo() requires 1 argument"));
-                }
-                let path = crate::gateway::fsencode_path_w(args[0])?;
+                let (bound, kwargs) = bind_path_args(args, "mkfifo", &["path", "mode"], 1)?;
+                let path = crate::gateway::fsencode_path_or_fd_w(
+                    bound[0].expect("path is required"),
+                    "mkfifo",
+                    false,
+                )?;
                 // interp_posix.py:1322 `@unwrap_spec(mode=c_int, ...)`.
-                let mode = if args.len() >= 2 {
-                    crate::baseobjspace::c_int_w(args[1])? as libc::mode_t
-                } else {
-                    0o666
+                let mode = match bound[1] {
+                    Some(value) => crate::baseobjspace::c_int_w(value)? as libc::mode_t,
+                    None => 0o666,
                 };
+                // `mkfifo` types `dir_fd` as `DirFD(rposix.HAVE_MKFIFOAT)`
+                // (`interp_posix.py:1322`).
+                let dir_fd = dir_fd_kwarg(kwargs, HAVE_MKFIFOAT)?;
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                let r = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
+                // `mkfifoat` resolves the name against the descriptor
+                // (`rposix.py:2784-2786`).
+                let r = match dir_fd {
+                    Some(dir_fd) => unsafe { libc::mkfifoat(dir_fd, c_path.as_ptr(), mode) },
+                    None => unsafe { libc::mkfifo(c_path.as_ptr(), mode) },
+                };
                 if r < 0 {
                     return Err(io_err_with_filename(
                         std::io::Error::last_os_error(),
@@ -5143,18 +5297,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // TypeError instead of reinterpreting its layout.
             let mode = crate::baseobjspace::c_int_w(mode_obj)? as u32;
             // `chmod` types `dir_fd` as `DirFD(rposix.HAVE_FCHMODAT)`
-            // (`interp_posix.py:1197`), whose `unwrap` converts before it
-            // reports the platform.
-            let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd") {
-                Some(v) if !unsafe { pyre_object::is_none(v) } => {
-                    let fd = unwrap_fd(v, "integer or None")?;
-                    if !HAVE_FCHMODAT {
-                        return Err(dir_fd_unavailable());
-                    }
-                    Some(fd)
-                }
-                _ => None,
-            };
+            // (`interp_posix.py:1197`).
+            let dir_fd = dir_fd_kwarg(kwargs, HAVE_FCHMODAT)?;
             let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
                 Some(v) => crate::baseobjspace::is_true(v)?,
                 None => default_follow,
@@ -5351,23 +5495,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 };
             let (uid, gid) = (id_of(uid_obj, "uid")?, id_of(gid_obj, "gid")?);
             // `chown` types `dir_fd` as `DirFD(rposix.HAVE_FCHOWNAT)`
-            // (`interp_posix.py:2452-2453`), whose `unwrap` is `_unwrap_dirfd`
-            // (`:274-278`); `lchown` declares no keyword at all, so `allowed`
-            // above has already rejected it.
-            let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd") {
-                Some(v) if !unsafe { pyre_object::is_none(v) } => {
-                    // `_DirFD_Unavailable.unwrap` (`interp_posix.py:285-292`)
-                    // converts first and reports the platform second, so a
-                    // wrongly typed value is a TypeError even on a build that
-                    // carries no `fchownat`.
-                    let fd = unwrap_fd(v, "integer or None")?;
-                    if !HAVE_FCHOWNAT {
-                        return Err(dir_fd_unavailable());
-                    }
-                    Some(fd)
-                }
-                _ => None,
-            };
+            // (`interp_posix.py:2452-2453`); `lchown` declares no keyword at
+            // all, so `allowed` above has already rejected it.
+            let dir_fd = dir_fd_kwarg(kwargs, HAVE_FCHOWNAT)?;
             let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
                 Some(v) => crate::baseobjspace::is_true(v)?,
                 None => default_follow,
