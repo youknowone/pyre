@@ -1493,6 +1493,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // boundaries must not pass through a Rust `String`.
     use crate::gateway::fsencode_bytes_w as extract_path;
 
+    /// The descriptor an `fd` argument names, as the borrowed handle the host
+    /// API takes one as. `-1` is the single value `BorrowedFd::borrow_raw`
+    /// refuses — the standard library reserves it as the niche that makes
+    /// `Option<BorrowedFd>` free — so a caller who names it gets the `EBADF`
+    /// the call would have answered with rather than a handle built out of the
+    /// one integer that may not become one.
+    #[cfg(unix)]
+    fn fd_borrow(fd: libc::c_int) -> Result<std::os::fd::BorrowedFd<'static>, crate::PyError> {
+        if fd == -1 {
+            return Err(errno_err(libc::EBADF, ""));
+        }
+        Ok(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) })
+    }
+
     /// The host-API view of OS bytes — a filename, or a half of an environment
     /// entry. Unix spells both in bytes and takes them back unchanged.
     fn os_str_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
@@ -5918,7 +5932,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // interp_posix.py:1260 `@unwrap_spec(fd=c_int, mode=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
-                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let bfd = fd_borrow(fd)?;
                     host_posix::fchmod(bfd, mode).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
                 },
@@ -6047,7 +6061,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // flagless call follows the final symlink and `AT_SYMLINK_NOFOLLOW`
             // does not, while the directory descriptor it resolves the name
             // against is `AT_FDCWD` when the caller named none.
-            let at = unsafe { BorrowedFd::borrow_raw(dir_fd.unwrap_or(libc::AT_FDCWD)) };
+            let at = fd_borrow(dir_fd.unwrap_or(libc::AT_FDCWD))?;
             host_posix::fchownat(
                 at,
                 path_from_bytes(&path.as_bytes).as_os_str(),
@@ -6093,7 +6107,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let uid = unchanged(crate::baseobjspace::c_uid_t_w(args[1])?);
                     let gid = unchanged(crate::baseobjspace::c_uid_t_w(args[2])?);
                     let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let bfd = fd_borrow(fd)?;
                     host_posix::fchown(bfd, uid, gid).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
                 },
@@ -6116,7 +6130,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     use std::os::fd::BorrowedFd;
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let bfd = fd_borrow(fd)?;
                     let inheritable = rustpython_host_env::fcntl::get_inheritable(bfd)
                         .map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_bool_from(inheritable))
@@ -6141,7 +6155,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // interp_posix.py:1165 `@unwrap_spec(fd=c_int, inheritable=int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let inherit = crate::baseobjspace::int_w(args[1])? != 0;
-                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let bfd = fd_borrow(fd)?;
                     host_posix::set_inheritable(bfd, inherit).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
                 },
@@ -6367,8 +6381,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 // interp_posix.py:2968 `space.gateway_r_longlong_w(w_offset)`.
                 let offset_i64 = crate::baseobjspace::int_w(w_offset)?;
-                let out_b = unsafe { BorrowedFd::borrow_raw(out_fd) };
-                let in_b = unsafe { BorrowedFd::borrow_raw(in_fd) };
+                let out_b = fd_borrow(out_fd)?;
+                let in_b = fd_borrow(in_fd)?;
                 #[cfg(target_os = "linux")]
                 {
                     let count = count_raw as usize;
@@ -6709,7 +6723,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     // interp_posix.py:2382 `@unwrap_spec(fd=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let bfd = fd_borrow(fd)?;
                     let name = host_posix::ttyname(bfd).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_str_new(&name.to_string_lossy()))
                 },
@@ -6730,7 +6744,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     // interp_posix.py:2269 `@unwrap_spec(fd=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let bfd = fd_borrow(fd)?;
                     let pgid = host_posix::tcgetpgrp(bfd).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(pgid as i64))
                 },
@@ -6752,7 +6766,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // interp_posix.py:2281 `@unwrap_spec(fd=c_int, pgid=c_gid_t)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let pgid = crate::baseobjspace::c_uid_t_w(args[1])? as libc::pid_t;
-                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let bfd = fd_borrow(fd)?;
                     host_posix::tcsetpgrp(bfd, pgid).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
                 },
