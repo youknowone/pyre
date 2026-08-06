@@ -1872,7 +1872,22 @@ fn harden_duplicate_leaf_metadata(
 ) {
     let mut by_leaf: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for key in struct_fields.fields.keys() {
-        if let Some((_, leaf)) = key.rsplit_once("::") {
+        if let Some((head, leaf)) = key.rsplit_once("::") {
+            // A `{Enum}::{Variant}` key whose variant leaf ALSO names an
+            // enum base is not a peer type-leaf of that base: its bare
+            // alias is withdrawn by the variant-leaf pass below (keyed on
+            // the `Enum::Variant` tail), so admitting it into this
+            // type-leaf bucket lets the variant (`typedef::BytesSubArg::Buffer`,
+            // rows `[__pos_0]`) withdraw the same-named enum type's bare
+            // alias (`buffer::Buffer`, rows `[__discriminant]`) on a
+            // spurious row divergence.  Restricting the skip to a leaf that
+            // is itself an enum base withdraws only the genuine
+            // type-vs-variant name collision, leaving every other
+            // variant-leaf bucket (whose withdrawal the resume numbering
+            // depends on) intact.
+            if struct_fields.is_enum_base(head) && struct_fields.is_enum_base(leaf) {
+                continue;
+            }
             by_leaf.entry(leaf).or_default().push(key);
         }
     }
