@@ -206,7 +206,15 @@ static TRACING_RESCALL_DUMMY_GC_TYPE_ID: AtomicU32 =
 
 /// Publish the registered leaf type used by the prebuilt
 /// `virtualizable.py:326-330 JITFRAME_DUMMY` object.
+///
+/// Must run before the sentinel is first requested — the address is minted
+/// once and never re-minted, so a late registration would leave the process
+/// with the unmanaged fallback for good.
 pub fn set_tracing_rescall_dummy_gc_type_id(type_id: u32) {
+    assert!(
+        TRACING_RESCALL_DUMMY_PTR.get().is_none(),
+        "JITFRAME_DUMMY type registered after the tracing sentinel was minted",
+    );
     TRACING_RESCALL_DUMMY_GC_TYPE_ID.store(type_id, Ordering::Relaxed);
 }
 
@@ -220,15 +228,16 @@ fn allocate_tracing_rescall_dummy() -> *mut u8 {
         typeptr: JITFRAME_DUMMY_VTABLE,
     };
     let type_id = TRACING_RESCALL_DUMMY_GC_TYPE_ID.load(Ordering::Relaxed);
-    #[cfg(test)]
     if type_id == TRACING_RESCALL_DUMMY_GC_TYPE_ID_UNSET {
-        // Unit tests exercise the token protocol without installing a GC.
+        // The leaf type is registered by the same setup that installs a
+        // collector, so an unset id means there is no managed heap to mint the
+        // prebuilt object in — the token protocol is being driven without one,
+        // as the walker and dispatch unit tests do. A host allocation keeps the
+        // address stable and unique for the process while staying outside the
+        // managed heap, where `is_managed_heap_object` rejects it before any
+        // tracing path reads its header.
         return Box::into_raw(Box::new(value)) as *mut u8;
     }
-    assert_ne!(
-        type_id, TRACING_RESCALL_DUMMY_GC_TYPE_ID_UNSET,
-        "JITFRAME_DUMMY type must be registered before the tracing sentinel is used",
-    );
     let dummy = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<ObjectHeader>());
     assert!(!dummy.is_null(), "JITFRAME_DUMMY old-gen allocation failed");
     unsafe { std::ptr::write(dummy.0 as *mut ObjectHeader, value) };
