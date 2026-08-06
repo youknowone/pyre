@@ -3802,6 +3802,23 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         // on `synth/exception_inline_callee_tb_frames`, each
                         // ~5-9% slower than declining.  Drop this arm once the
                         // backend can chain modules.
+                        //
+                        // Keeping it is what the wasm `guard_failures`
+                        // baselines record.  The declined callee is compiled as
+                        // a loop of its own instead of being inlined, and that
+                        // loop's exit guard reaches `trace_eagerness` on its
+                        // own account, so each affected fixture bills one extra
+                        // ~200-failure bridge toll.  Forcing this arm on for
+                        // dynasm reproduces the wasm counts to the digit on all
+                        // four, as loops/bridges/guard_failures:
+                        // `exception_catching_frame_tb_node` 3/3/401 -> 4/3/601,
+                        // `exception_traceback_lineno_chain` 5/4/607 -> 5/4/804,
+                        // `exception_inline_callee_tb_frames` 6/4/606 -> 6/4/807,
+                        // `gc_bug_bridge_flavor_traceback_names` 4/8/1670 ->
+                        // 4/9/2027.  Raising `trace_eagerness` past the
+                        // fixture's event count bills 7303 on both sides of the
+                        // first: the deopt count is the same either way, and
+                        // only its attribution moves.
                         cfg!(target_arch = "wasm32")
                         // Hazard 1 — kept operands. A branch that leaves slots
                         // on the value stack needs its guard resume to restore
