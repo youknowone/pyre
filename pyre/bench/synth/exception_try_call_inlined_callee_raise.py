@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=24
-# pyre-check: min-pypy-ratio=2.42
 # A conditional raise two call levels below a `try` must reach the enclosing
 # `except`, including once the frame holding the `try` runs as its own compiled
 # trace.

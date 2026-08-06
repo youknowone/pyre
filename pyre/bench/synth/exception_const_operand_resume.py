@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=20
-# pyre-check: min-pypy-ratio=2.68
 # Exception-resume bridge (GuardException) with a CONSTANT pre-call operand.
 # Each `try` divides/indexes with a CONSTANT numerator/addend that lives on the
 # operand stack at the raising bytecode. The loop warms up exception-free

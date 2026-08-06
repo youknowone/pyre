@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=22
-# pyre-check: min-pypy-ratio=2.05
 # An `except E as e:` handler whose exception variable `e` is captured by a
 # nested function makes `e` a cell variable, so the implicit handler cleanup
 # emits DELETE_DEREF (clear the cell contents) rather than DELETE_FAST. The

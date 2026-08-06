@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=19
-# pyre-check: min-pypy-ratio=2.25
 # Hot-loop str/unicode subscript and length over every string kind: ASCII /
 # latin1 (1-byte code units), BMP (2-byte), and non-BMP astral (4-byte). The
 # subscripts emit residual STRGETITEM/UNICODEGETITEM and the lengths STRLEN/

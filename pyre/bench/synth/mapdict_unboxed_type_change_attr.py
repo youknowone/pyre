@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=25
-# pyre-check: min-pypy-ratio=2.12
 # Changing an unboxed int or float slot to the other type creates a boxed map;
 # the promoted-map guard must deopt before the old raw-storage read or write is
 # reused for the new representation (mapdict.py:577-584, 600-619, 905-916).

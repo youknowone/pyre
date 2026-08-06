@@ -1,11 +1,10 @@
 # pyre-check: max-pypy-ratio=73
-# pyre-check: min-pypy-ratio=3.22
 # A hot compiled CALLEE holding a try block the exception does not stay in used
 # to record its own traceback node TWICE.
 #
 # Every iteration of every driver raises and unwinds, so the ratio measures
 # exception throughput rather than the contract under test, and it varies 2.5x
-# across hosts -- hence the explicit floor beside the ceiling.
+# across hosts.
 #
 # N is 4000 because the witness needs the callee compiled: the duplicate node
 # first appears at N=2500 and never at N=1500, and 4000 reproduces every one of

@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=11
-# pyre-check: min-pypy-ratio=1.02
 # A hot `math.sqrt(x)` loop.  The walker specializes the call
 # (`try_walker_specialize_math_sqrt`) to a domain-guarded pure
 # `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` -> `sqrt_nonneg`,

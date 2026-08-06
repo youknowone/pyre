@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=5
-# pyre-check: min-pypy-ratio=0.55
 # STORE_ATTR that ADDS an attribute not yet in the instance's map: the
 # `map -> PlainAttribute` transition plus the grow-by-one storage rewrite
 # (mapdict.py:942-959 `_set_mapdict_increase_storage1`).  The values are

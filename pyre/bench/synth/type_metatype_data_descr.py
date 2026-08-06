@@ -1,9 +1,7 @@
 # pyre-check: max-pypy-ratio=14
-# pyre-check: min-pypy-ratio=0.25
 # pypy's exec time is pinned to the startup-subtraction floor here, so the
 # ratio is not a measurement: the ceiling is twice the slowest ratio the CI
-# runners observe (6.4x), rounded up, and the floor is half the fastest
-# (0.5x) — a derived floor of ceiling/5 would sit above it.
+# runners observe (6.4x), rounded up.
 # typeobject.py W_TypeObject.descr_getattribute: a metatype DATA descriptor
 # wins over the class's own MRO value of the same name; a metatype non-data
 # descriptor and a plain metatype attribute lose to the class's own value.

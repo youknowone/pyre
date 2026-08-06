@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=30
-# pyre-check: min-pypy-ratio=4.55
 # gh#495 guard: reflected-add residual mutation feeds the inlined branch result.
 # radd result feeds the branch condition; branch varies each iter -> sub-walk churn
 N = 40000

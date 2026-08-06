@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=5
-# pyre-check: min-pypy-ratio=0.45
 # A lone-surrogate attribute name reaches the same __getattr__ fallbacks as a
 # normal name: a module-level __getattr__ (PEP 562) and a classmethod hook that
 # must be bound through __get__ before being called.

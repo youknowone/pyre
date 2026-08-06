@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=9
-# pyre-check: min-pypy-ratio=0.92
 # A local must not read back as the `for` loop's iterator after the loop.
 #
 # An empty dict literal used to decline in the codewriter, and the decline

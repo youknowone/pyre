@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=61
-# pyre-check: min-pypy-ratio=4.65
 # dict.__new__ allocates and ignores its arguments; filling the instance is
 # __init__'s job. So dict(x) walks x exactly once: a mapping's keys() and
 # __getitem__ each run one time per key, a one-shot iterable is not re-entered,

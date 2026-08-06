@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=18
-# pyre-check: min-pypy-ratio=2.28
 # The frame holding the `try` contributes its own traceback node, including
 # when its `except` is reached from inside its own compiled trace.
 #

@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=25
-# pyre-check: min-pypy-ratio=1.58
 # Depth > 1 kept-stack branch guards: chained comparisons, nested
 # short-circuits and conditional expressions keep two or more operand-stack
 # temps live across a `goto_if_not`.  The not-taken arm resumes at a merge

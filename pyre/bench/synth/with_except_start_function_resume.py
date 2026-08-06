@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=14
-# pyre-check: min-pypy-ratio=1.35
 # A function-entry trace records only the early-return arm.  The first true
 # call then fails that guard and blackhole-replays the previously unvisited
 # `with` arm.  WITH_EXCEPT_START must read the live handler stack and call

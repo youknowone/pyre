@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=31
-# pyre-check: min-pypy-ratio=4.18
 # Two-argument BUILD_SLICE must pass the Python None singleton as its implicit
 # step.  Negative bounds make a malformed null step observable during slice
 # normalization, including on guard-failure blackhole resume.

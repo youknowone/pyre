@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=61
-# pyre-check: min-pypy-ratio=3.98
 # A lone-surrogate keyword name survives the f(**dict) call path: it lands
 # in **kwargs unchanged and an unmatched one is named in the TypeError.
 # Arguments keeps keyword names as byte-ish str (argument.py keywords: [str]),

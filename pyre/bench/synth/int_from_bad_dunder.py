@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=33
-# pyre-check: min-pypy-ratio=2.48
 # int() rejects a __int__ result that is not an int with TypeError (not an
 # internal RuntimeError). Output verified against CPython/PyPy.
 N = 40000

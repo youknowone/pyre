@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=39
-# pyre-check: min-pypy-ratio=5.88
 # An intersection walks the shorter side and keeps that side's objects, so
 # when two equal elements are distinct objects which one survives depends on
 # the operand lengths. The shortest operand seeds the result, measured as

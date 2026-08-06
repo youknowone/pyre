@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=5
-# pyre-check: min-pypy-ratio=0.55
 # dir() lists lone-surrogate attribute/global names instead of dropping
 # them, and never crashes reading a surrogate str key.  DictStorage keeps
 # names as byte-ish str (entries_wtf8), so a name set via setattr with a

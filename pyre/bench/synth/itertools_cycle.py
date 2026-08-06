@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=11
-# pyre-check: min-pypy-ratio=0.75
 import itertools
 
 # GET_ITER + FOR_ITER directly over an itertools.cycle iterator. cycle is

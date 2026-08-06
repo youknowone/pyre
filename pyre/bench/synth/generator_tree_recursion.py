@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=7.6
-# pyre-check: min-pypy-ratio=0.88
 # Generator-driven accumulation over recursive tree/linear results. The
 # tree_sum recursion once silently miscompiled on cranelift (first checksum
 # already wrong) and recovered a regalloc panic on dynasm. Deterministic;

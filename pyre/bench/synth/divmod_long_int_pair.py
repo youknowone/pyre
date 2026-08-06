@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=18
-# pyre-check: min-pypy-ratio=2.38
 # `divmod(long, int)` at a traced call site. `_int_divmod` keeps the divisor
 # unwrapped and calls `rbigint.int_divmod`, whose rtyped return is a two-item
 # `GcStruct`: the walker emits one elidable call plus two `getfield_gc_r`, then

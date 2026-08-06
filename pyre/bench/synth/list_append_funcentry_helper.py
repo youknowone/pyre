@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=61
-# pyre-check: min-pypy-ratio=3.98
 # #171/#34: the orthodox list.append fold fires in function-entry (no-loop)
 # helper traces, not only loop traces.  `push` is a no-loop helper called in a
 # hot loop on two alternating receivers, so it traces from entry (header_pc==0)

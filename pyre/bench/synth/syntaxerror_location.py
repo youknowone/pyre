@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=6
-# pyre-check: min-pypy-ratio=0.65
 # A compile-time SyntaxError carries its parser location: msg, lineno, offset,
 # text, filename and end_lineno populate the instance (args is
 # (msg, (filename, lineno, offset, text, end_lineno, end_offset))), and __str__

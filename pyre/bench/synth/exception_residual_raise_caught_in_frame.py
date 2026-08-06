@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=34
-# pyre-check: min-pypy-ratio=2.12
 # A frame that catches an exception a residual call raised contributes its own
 # traceback node, including once its `except` is reached from inside its own
 # compiled trace.

@@ -1,10 +1,7 @@
 # pyre-check: max-pypy-ratio=105
-# pyre-check: min-pypy-ratio=4.2
 # pypy's exec time is pinned to the startup-subtraction floor here, so the
 # ratio is not a measurement: the ceiling is twice the slowest ratio the CI
-# runners observe (51.5x), rounded up, and the floor is half the fastest
-# (8.5x) — a derived floor of ceiling/5 would sit above it.
-# observe (51.5x), rounded up, and the floor is
+# runners observe (51.5x), rounded up.
 # A guard failing inside an inlined `__init__` must hand the caller the
 # instance, not `__init__`'s return value.  `typeobject.py descr_call` discards
 # `__init__`'s result and returns the instance; the flattened constructor

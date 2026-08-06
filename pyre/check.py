@@ -127,8 +127,26 @@ EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # floor enough for small relative error: execution time is the difference
 # between two independently measured values.
 FLOOR_GATE_MIN_BASELINE_S = 3 * EXEC_TIME_FLOOR_S
-# The default pypy performance floor is its ceiling divided by this value.
-PERF_GATE_FLOOR_DIVISOR = 5
+# The pypy performance floor is DERIVED from the ceiling and is never stated
+# per bench.  What we want from every bench is parity with pypy, so a
+# hand-written floor would assert that a fixture must STAY some number of times
+# slower than pypy -- not a thing anyone wants to be true, and one more number
+# to re-fit every time the ceiling moves.  The floor is only an instrument for
+# reporting that a ceiling has gone stale, so it sits at parity: reaching it is
+# the event worth a red run, and no ceiling above parity can put the floor
+# anywhere a bench that is merely fast on a fast host can reach.  Ceilings run
+# as far as 194x above the lowest ratio a runner has reported for their fixture,
+# and none of that spread can reach a floor pinned here.
+PERF_GATE_FLOOR_RATIO = 1.0
+# Below a ceiling of this many times parity, a floor AT parity would sit inside
+# the band the ceiling itself allows, so the floor drops proportionally instead.
+# The divisor has to clear the span one fixture reads across the CI runners --
+# the ceiling is an allowance set from the slowest of them, and the fastest can
+# read several times lower.  Among the fixtures whose ceiling is low enough for
+# the divisor to bind, the widest gap between a ceiling and the lowest ratio any
+# runner reported for it is 22x, so a smaller divisor would fail a bench for
+# being fast on the host where it is fastest.
+PERF_GATE_FLOOR_DIVISOR = 25
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
 # quantized (see WIN_TIMER_QUANTUM_S above).
@@ -907,14 +925,25 @@ def synth_perf_gate(path):
 
     The limit is read against the native backends only; `run_synthetic_bench`
     exempts wasm.
+
+    A fixture states its ceiling and nothing else: the floor that goes with it
+    is `perf_gate_floor`'s business, so a leftover `min-pypy-ratio` header is
+    rejected rather than ignored.
     """
     prefix = "# pyre-check: max-pypy-ratio="
+    retired = "# pyre-check: min-pypy-ratio="
+    ratio = None
     with open(path, encoding="utf-8") as source:
         for _ in range(20):
             line = source.readline()
             if not line:
                 break
-            if not line.startswith(prefix):
+            if line.startswith(retired):
+                raise ValueError(
+                    f"{path} states a pypy floor: {line.strip()}\n"
+                    "the floor is derived from max-pypy-ratio; delete the line"
+                )
+            if not line.startswith(prefix) or ratio is not None:
                 continue
             try:
                 ratio = float(line[len(prefix):].strip())
@@ -922,32 +951,17 @@ def synth_perf_gate(path):
                 raise ValueError(f"invalid synthetic performance gate in {path}: {line.strip()}") from e
             if ratio <= 0:
                 raise ValueError(f"synthetic performance gate must be positive in {path}")
-            return ratio
-    return None
+    return ratio
 
 
-def synth_min_perf_gate(path):
-    """Read an optional per-fixture minimum pypy ratio from its header.
+def perf_gate_floor(ceiling):
+    """The pypy ratio a bench with this ceiling must not read below.
 
-    The minimum overrides the floor derived from `max-pypy-ratio`, for example:
-        # pyre-check: min-pypy-ratio=2
+    See `PERF_GATE_FLOOR_RATIO`: a bench is asked to reach parity, never to
+    stay slow, so the floor is parity itself until the ceiling comes close
+    enough that parity would sit inside the allowance.
     """
-    prefix = "# pyre-check: min-pypy-ratio="
-    with open(path, encoding="utf-8") as source:
-        for _ in range(20):
-            line = source.readline()
-            if not line:
-                break
-            if not line.startswith(prefix):
-                continue
-            try:
-                ratio = float(line[len(prefix):].strip())
-            except ValueError as e:
-                raise ValueError(f"invalid synthetic minimum performance gate in {path}: {line.strip()}") from e
-            if ratio <= 0:
-                raise ValueError(f"synthetic minimum performance gate must be positive in {path}")
-            return ratio
-    return None
+    return min(PERF_GATE_FLOOR_RATIO, ceiling / PERF_GATE_FLOOR_DIVISOR)
 
 
 def synth_rss_gate(path):
@@ -1822,7 +1836,7 @@ class Check:
     def _run_backend_bench(
         self, backend, name, script, timeout,
         vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
-        wasm_float_tol=False, max_rss_mb=None, min_pypy_ratio=None,
+        wasm_float_tol=False, max_rss_mb=None,
     ):
         pyre_bin = self._pyre(backend)
         effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
@@ -1904,10 +1918,7 @@ class Check:
                 ratio = _ratio(elapsed, t_pypy)
 
         if vs_pypy and t_pypy not in (None, "-"):
-            minimum = (
-                min_pypy_ratio if min_pypy_ratio is not None
-                else vs_pypy / PERF_GATE_FLOOR_DIVISOR
-            )
+            minimum = perf_gate_floor(vs_pypy)
             passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_pypy, float(t_pypy),
                 [PYPY3, script], pypy_output, "pypy", minimum,
@@ -1979,16 +1990,9 @@ class Check:
         self, name, script, timeout,
         dynasm_vs_cpython=None, dynasm_vs_pypy=None,
         cranelift_vs_cpython=None, cranelift_vs_pypy=None,
-        skip_backends=(), wasm_float_tol=False, min_pypy_ratio=None,
+        skip_backends=(), wasm_float_tol=False,
     ):
-        """Run one benchmark on each enabled backend.
-
-        `min_pypy_ratio` overrides the floor derived from the ceiling, the same
-        way `# pyre-check: min-pypy-ratio` does for a synthetic fixture. The
-        derived floor is `ceiling / PERF_GATE_FLOOR_DIVISOR`, so it can only
-        express a 5x span between the fastest and slowest host; a bench whose
-        hosts spread wider than that needs both bounds stated.
-        """
+        """Run one benchmark on each enabled backend."""
         need_cpython = False
         if (
             self.enabled("dynasm")
@@ -2055,7 +2059,7 @@ class Check:
             self._run_backend_bench(
                 backend, name, script, timeout,
                 vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
-                wasm_float_tol=wasm_float_tol, min_pypy_ratio=min_pypy_ratio,
+                wasm_float_tol=wasm_float_tol,
             )
 
     # ── self-checking regression guard ──
@@ -2122,7 +2126,6 @@ class Check:
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
         try:
             max_pypy_ratio = synth_perf_gate(path)
-            min_pypy_ratio = synth_min_perf_gate(path)
             max_rss_mb = synth_rss_gate(path)
             skip_backends = synth_skip_backends(path)
         except ValueError as e:
@@ -2204,7 +2207,6 @@ class Check:
                 backend, name, path, timeout,
                 None, vs_pypy, t_cpython, t_pypy, pypy_output,
                 max_rss_mb=None if backend == "wasm" else max_rss_mb,
-                min_pypy_ratio=min_pypy_ratio,
             )
 
     def run_synthetic_suite(self):
@@ -2516,12 +2518,11 @@ def main():
         chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       6,       2,       8)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
-        # spectral_norm's hosts spread 0.5x-4.3x against pypy — pypy runs it in
+        # spectral_norm's hosts spread 0.5x-4.3x against pypy: pypy runs it in
         # 0.13s on the linux and macos runners and 0.39s on the windows one, so
-        # pyre reads faster than pypy there and crosses the derived floor of
-        # 5/5 = 1x. The span is wider than a derived floor can express, so the
-        # floor is stated at half the fastest ratio observed.
-        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       1,       5,       1,       5,    min_pypy_ratio=0.25)
+        # pyre reads faster than pypy there. This is the bench that sets the
+        # floor divisor's lower bound among the non-synthetic ones.
+        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       1,       5,       1,       5)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       0.5,     5,       1,       5,    wasm_float_tol=True)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
         # Skipped on wasm: the guard times calls with `time.perf_counter()`, and

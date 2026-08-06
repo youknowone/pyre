@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=13
-# pyre-check: min-pypy-ratio=1.35
 # Regression: a loop-bearing callee whose return value is consumed by a hot
 # caller loop. The inline recursive-call-assembler path (opimpl_recursive_call_
 # assembler) reaches the callee's loop back-edge, pops the inline frame, and

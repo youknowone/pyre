@@ -1,9 +1,7 @@
 # pyre-check: max-pypy-ratio=120
-# pyre-check: min-pypy-ratio=7.5
 # pypy's exec time is pinned to the startup-subtraction floor here, so the
 # ratio is not a measurement: the ceiling is twice the slowest ratio the CI
-# runners observe (58.2x), rounded up, and the floor is half the fastest
-# (15.0x) — a derived floor of ceiling/5 would sit above it.
+# runners observe (58.2x), rounded up.
 # Two sub-walk shapes the multi-frame blackhole build DECLINES, pinned so the
 # decline stays a decline rather than silently becoming a wrong answer.
 #

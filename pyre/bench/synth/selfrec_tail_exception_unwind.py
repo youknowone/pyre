@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=12
-# pyre-check: min-pypy-ratio=1.18
 """Self-recursive CALL_ASSEMBLER exception unwind regression.
 
 The raise happens while evaluating a tail call's accumulator argument.  It

@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=16
-# pyre-check: min-pypy-ratio=1.45
 # Two nested hot loops with a guard-set switch keyed on the outer phase; the
 # inner late arm (touching a None-or-int local) only executes once the global
 # count crosses 5000, forcing bridge deopts mid-run. This once panicked on

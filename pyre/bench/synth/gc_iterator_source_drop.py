@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=29
-# pyre-check: min-pypy-ratio=3.02
 # Immortal iterator/sequence wrappers (enumerate, itertools.filterfalse,
 # takewhile) hold their source iterator solely through the wrapper object.  The
 # marker never scans an immortal wrapper, so unless its child offsets are

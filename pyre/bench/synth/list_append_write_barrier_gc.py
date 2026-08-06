@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=46
-# pyre-check: min-pypy-ratio=3.15
 # GC stress for the in-place Object-append write barrier the tracer does NOT
 # record. `w_list_append`'s in-place arm stores a GC ref into the items block
 # and runs `list_write_barrier`; when the block is GC-managed the backend GC

@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=18
-# pyre-check: min-pypy-ratio=2.18
 # Nested-loop tracer correctness gate.  Every case prints multiple checksums
 # so a dropped or duplicated inner iteration cannot be masked by a count.
 MOD = 1000003

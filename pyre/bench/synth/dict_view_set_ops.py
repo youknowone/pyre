@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=25
-# pyre-check: min-pypy-ratio=3.8
 # A set operation on a dict view builds a set from the left operand and runs
 # the matching in-place set method against the right one, so the result is a
 # plain set. The reflected forms build the set from the other operand, keeping

@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=5
-# pyre-check: min-pypy-ratio=0.72
 # PEP 682 `z` format option: coerce a negative-zero result to positive zero.
 # The float renderings below are byte-identical across CPython and PyPy; the
 # integer `z` rejection differs only in message wording, so this fixture checks

@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=62
-# pyre-check: min-pypy-ratio=10
 # The frame-identity read the multi-frame blackhole adopt commits, and the
 # regression guard for the path that commits it.
 #

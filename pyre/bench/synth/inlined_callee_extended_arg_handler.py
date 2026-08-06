@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=32
-# pyre-check: min-pypy-ratio=4.88
 # A callee whose exception handler is large enough that its jumps need
 # EXTENDED_ARG, inlined into a hot caller loop. The walker dequeues blocks
 # non-sequentially; a block ending on an EXTENDED_ARG code unit must not fold

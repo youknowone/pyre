@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=96
-# pyre-check: min-pypy-ratio=7.58
 # Deep self-recursion whose caller frame is relocated by a minor collection
 # while the recursive callee runs.  The bytecode CALL fast path drops the
 # arguments, runs the callee, then pushes its result onto the caller's value

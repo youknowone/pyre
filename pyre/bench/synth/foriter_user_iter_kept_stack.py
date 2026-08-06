@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=31
-# pyre-check: min-pypy-ratio=2.65
 # User-defined iterator FOR_ITER paths enter a user frame for each item while
 # the caller keeps a depth > 1 operand stack resident across condexpr and
 # short-circuit branch guards.  The kept-stack branch guards must remain

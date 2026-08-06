@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=17
-# pyre-check: min-pypy-ratio=2.6
 # A nested `for` loop whose inner `break` lands on the secondary edge of its
 # guard — reached from `if not cond: break` (a POP_JUMP_IF_TRUE fall-through) or
 # from a break-check that is the last statement in the loop body (a

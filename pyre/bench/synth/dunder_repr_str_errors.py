@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=13
-# pyre-check: min-pypy-ratio=2.45
 # Exceptions raised by `__repr__`/`__str__` overrides propagate out of
 # `repr()`/`str()`/`format`/`%`/f-strings instead of being swallowed,
 # including builtin-leaf subclasses and through container recursion.

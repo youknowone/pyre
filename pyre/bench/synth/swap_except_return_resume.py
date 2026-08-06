@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=20
-# pyre-check: min-pypy-ratio=1.58
 # A hot loop FOLLOWED by a try/except whose handler `return`s.  The
 # `return`-from-`except` cleanup compiles to `SWAP 2; POP_EXCEPT;
 # RETURN_VALUE` (the SWAP exchanges the return value with the saved

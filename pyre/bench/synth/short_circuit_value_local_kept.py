@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=20
-# pyre-check: min-pypy-ratio=1.32
 # Depth-1 kept-stack short-circuit with a BARE loop-varying local on the left
 # and a loop-invariant constant on the right.
 #

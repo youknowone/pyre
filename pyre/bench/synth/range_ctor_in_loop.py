@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=190
-# pyre-check: min-pypy-ratio=20
 # Pins virtual range construction for one-, two-, and three-bound calls while
 # retaining correct residual behavior for exceptional, subclass, index, and
 # escaping-object shapes.

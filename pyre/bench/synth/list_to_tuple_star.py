@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=38
-# pyre-check: min-pypy-ratio=4.72
 N = 50000
 
 

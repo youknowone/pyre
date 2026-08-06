@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=17
-# pyre-check: min-pypy-ratio=1.88
 # A named `except X as m:` handler that raises a SECOND exception of a
 # different class (conditionally, alongside a bare reraise) while the function
 # also has a sibling `except` clause, and a hot `return` path. The func-entry

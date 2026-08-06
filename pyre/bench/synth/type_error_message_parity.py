@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=3.8
-# pyre-check: min-pypy-ratio=0.28
 # Error-message parity across a few type/builtin operations that both
 # reference implementations word identically.
 def main():

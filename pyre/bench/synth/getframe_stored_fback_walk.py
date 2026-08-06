@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=32
-# pyre-check: min-pypy-ratio=5.22
 # Regression guard: a callee stores its OWN frame (sys._getframe(0)); the loop
 # body later walks .f_back.f_locals as a SEPARATE residual. That read forces
 # the traced caller mid-expression; the escape flush must commit with the

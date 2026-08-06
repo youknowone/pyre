@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=25
-# pyre-check: min-pypy-ratio=2.82
 # dict.fromkeys fills a plain dict through the dict's own setitem, so a key
 # whose __hash__ raises propagates that exception instead of being stored
 # unhashed. Only the keys and items views are set-like and therefore

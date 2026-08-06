@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=5
-# pyre-check: min-pypy-ratio=0.52
 # containment on a 2-tuple compares elements with `__eq__`; an exception it
 # raises propagates rather than being swallowed into a False result.
 def main():

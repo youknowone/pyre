@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=41
-# pyre-check: min-pypy-ratio=6.28
 # PEP 479: a StopIteration that escapes a generator body is replaced by
 # RuntimeError("generator raised StopIteration") chained from it, across every
 # drive path (list / for / tuple / next / send) and whether the StopIteration

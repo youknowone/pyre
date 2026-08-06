@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=12
-# pyre-check: min-pypy-ratio=1.88
 # A left shift whose result is too large to allocate raises a catchable
 # MemoryError instead of aborting the process on the big-int allocation
 # failure. Normal and moderately-large shifts still compute, and a negative

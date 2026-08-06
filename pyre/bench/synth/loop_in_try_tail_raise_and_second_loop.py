@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=26
-# pyre-check: min-pypy-ratio=2.02
 # The post-loop tail itself is the raising region, and a second hot loop lives
 # after the handler.
 #

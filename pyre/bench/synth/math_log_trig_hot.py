@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=14
-# pyre-check: min-pypy-ratio=1.48
 # RPython lowers the guarded `ll_math_log/cos/sin` bodies to raw float calls.
 # Keep all inputs in their hot domains so the walker emits those CALL_F ops
 # and the temporary W_FloatObject results can virtualize.

@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=58
-# pyre-check: min-pypy-ratio=4.62
 # A type change on one instance freezes unboxing for the whole class
 # (mapdict.py:623). Instances created before the freeze keep an unboxed slot
 # until something reads it: `_direct_read` migrates them off unboxed storage

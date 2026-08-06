@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=6
-# pyre-check: min-pypy-ratio=0.95
 # `types.SimpleNamespace` is a dedicated type: keyword construction into the
 # instance dict, a `namespace(...)` repr, `__dict__` exposure, structural
 # equality, unhashability, and `type(sys.implementation)` identity. Multi-key

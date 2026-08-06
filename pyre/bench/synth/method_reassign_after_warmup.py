@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=31
-# pyre-check: min-pypy-ratio=2.38
 # The ratio is deliberately loose: pypy folds this loop to near nothing
 # (0.01s at any N tried), so the denominator is collapsed and the number
 # measures pypy's constant folding rather than pyre's throughput. What this
