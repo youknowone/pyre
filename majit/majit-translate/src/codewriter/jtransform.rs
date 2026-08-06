@@ -728,9 +728,15 @@ impl<'a> Transformer<'a> {
         let mut new_ops = Vec::with_capacity(graph.blocks[block_idx].operations.len());
 
         let original_ops = graph.blocks[block_idx].operations.clone();
+        // `jtransform.py:100 count_before_last_operation = len(newoperations)`
+        // — recorded on every iteration, so after the loop it holds the count
+        // from just before the last operation contributed anything.
+        let mut count_before_last_operation = 0;
         for original_op in &original_ops {
             let op = remap_op(original_op, &self.aliases);
-            match self.rewrite_operation(&op, graph_name, graph) {
+            let rewritten = self.rewrite_operation(&op, graph_name, graph);
+            count_before_last_operation = new_ops.len();
+            match rewritten {
                 RewriteResult::Replace(ops) => {
                     new_ops.extend(ops);
                 }
@@ -744,6 +750,23 @@ impl<'a> Transformer<'a> {
                     new_ops.push(op);
                 }
             }
+        }
+
+        // `jtransform.py:116-118`: the block's exception exits belong to its
+        // last operation.  If rewriting that operation contributed nothing,
+        // there is no longer anything here that can raise, so the exception
+        // exits and the `last_exception` exitswitch have to go with it —
+        // otherwise the block keeps an exception edge for an operation that
+        // is not in it any more.
+        if graph.blocks[block_idx].canraise() && new_ops.len() == count_before_last_operation {
+            // `jtransform.py:176-179 _killed_exception_raising_operation`
+            let block = &mut graph.blocks[block_idx];
+            assert!(
+                block.exits[0].exitcase.is_none(),
+                "jtransform.py:177 exits[0].exitcase is None"
+            );
+            block.exits.truncate(1);
+            block.exitswitch = None;
         }
 
         let (exitswitch, exits) = {
@@ -9318,6 +9341,76 @@ mod tests {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
         }
+    }
+
+    /// `jtransform.py:116-118` + `:176-179
+    /// _killed_exception_raising_operation`: the exception exits belong to
+    /// the block's last operation, so once that operation rewrites to
+    /// nothing they have to go too.
+    #[test]
+    fn elided_last_op_drops_the_blocks_exception_exits() {
+        use crate::model::{ExitSwitch, Link, exception_exitcase};
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("killed_exc_op");
+        let entry = graph.startblock;
+
+        // `cast_int_to_uint` is one of the no-op casts that rewrite to
+        // `RewriteResult::Identity`, i.e. contribute no operation at all.
+        let operand = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let cast = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "cast_int_to_uint".to_string(),
+                    operand,
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+
+        let continuation = graph.create_block();
+        let phi = graph.alloc_value_var();
+        graph.push_inputarg_var(continuation, phi.clone());
+        graph.set_return(continuation, Some(phi));
+
+        let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
+        let normal_link = Link::from_variables(&graph, vec![cast], continuation, None);
+        let exc_link = Link::from_variables(
+            &graph,
+            vec![last_exception_var.clone(), last_exc_value_var.clone()],
+            exc_block,
+            Some(exception_exitcase()),
+        )
+        .extravars(
+            Some(LinkArg::Value(last_exception_var)),
+            Some(LinkArg::Value(last_exc_value_var)),
+        );
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![normal_link, exc_link],
+        );
+        assert!(graph.blocks[entry.0].canraise());
+
+        transformer.optimize_block(&mut graph, entry.0, "killed_exc_op", exc_block);
+
+        let block = &graph.blocks[entry.0];
+        assert!(
+            block.exitswitch.is_none(),
+            "the last_exception exitswitch must go with the elided operation"
+        );
+        assert_eq!(
+            block.exits.len(),
+            1,
+            "the exception exit must go with the elided operation"
+        );
+        assert!(
+            !block.exits.iter().any(|link| link.target == exc_block),
+            "no exception edge may survive for an operation that is gone"
+        );
     }
 
     #[test]
