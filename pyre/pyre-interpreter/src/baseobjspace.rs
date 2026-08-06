@@ -4909,6 +4909,25 @@ pub(crate) fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectR
 /// key whose hash collides can run a user `__eq__`, and the raw accessor
 /// reports that as an ordinary miss — the attribute would look absent.
 fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+    // mapdict.py:846-847 `MapdictDictSupport.getdictvalue` overrides the
+    // `W_Root` default for every mapdict carrier:
+    //
+    // ```python
+    // def getdictvalue(self, space, attrname):
+    //     return self._get_mapdict_map().read(self, attrname, DICT)
+    // ```
+    //
+    // Reading through `getdict` instead would materialise the
+    // `("dict", SPECIAL)` wrapper and change the instance's map — see
+    // [`setdictvalue`].
+    if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+        return Ok(unsafe {
+            crate::objspace::std::mapdict::instance_node_getdictvalue(
+                obj,
+                rustpython_wtf8::Wtf8::new(name),
+            )
+        });
+    }
     let w_dict = getdict_backing(obj)?;
     if w_dict.is_null() {
         return Ok(None);
@@ -11668,15 +11687,33 @@ pub(crate) fn setdictvalue(
     name: &str,
     value: PyObjectRef,
 ) -> Result<bool, PyError> {
+    // mapdict.py:849-850 `MapdictDictSupport.setdictvalue` overrides the
+    // `W_Root` default above for every mapdict carrier:
+    //
+    // ```python
+    // def setdictvalue(self, space, attrname, w_value):
+    //     return self._get_mapdict_map().write(self, attrname, DICT, w_value)
+    // ```
+    //
+    // The write goes to the map, not through `getdict`. Routing it through
+    // `getdict` instead materialises the `("dict", SPECIAL)` wrapper, which
+    // adds an attribute to the instance's map — a shape change that must only
+    // happen when app-level code actually asks for `__dict__`. A `NoDict`
+    // terminator answers `false` here (`write_terminator`), which is the
+    // AttributeError signal the caller expects.
+    if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+        return Ok(unsafe {
+            crate::objspace::std::mapdict::instance_node_setdictvalue(
+                obj,
+                rustpython_wtf8::Wtf8::new(name),
+                value,
+            )
+        });
+    }
     let w_dict = getdict_backing(obj)?;
     if w_dict.is_null() {
         return Ok(false);
     }
-    // For a user instance, `getdict` returns the MapDictStrategy view, so this
-    // `setitem_str` routes straight to the instance map+storage
-    // (MapDictStrategy.setitem_str → setdictvalue → map.write DICT,
-    // mapdict.py:849-850). The earlier C1 explicit `instance_node_setdictvalue`
-    // dual-write is now subsumed by that routing and removed.
     unsafe { pyre_object::w_dict_setitem_str(w_dict, name, value) };
     Ok(true)
 }

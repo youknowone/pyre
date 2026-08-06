@@ -603,9 +603,11 @@ pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
 
 /// `setdictvalue` routed to the mapdict node layer (mapdict.py:849-850
 /// `MapdictDictSupport.setdictvalue` → `map.write(self, attrname, DICT,
-/// w_value)`, dispatch at mapdict.py:68-75). C1 calls this alongside the legacy
-/// INSTANCE_DICT store so map+storage tracks every user-instance DICT write and
-/// can become the read authority in C2.
+/// w_value)`, dispatch at mapdict.py:68-75).
+///
+/// Returns `map.write`'s flag: `false` when the map is rooted at a
+/// `NoDictTerminator` (`__slots__`, no instance `__dict__`), which is the
+/// AttributeError signal `object_setattr` raises on.
 ///
 /// `dont_look_inside` makes this a residual-call boundary for the JIT
 /// CodeWriter: `setdictvalue` is JIT-reachable via STORE_ATTR, but the node
@@ -627,12 +629,7 @@ pub unsafe fn instance_node_setdictvalue(
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
-    let flag = node_write(map, inst, name, DICT, value);
-    debug_assert!(
-        flag,
-        "node_write returned false for a DICT attribute on a hasdict instance"
-    );
-    flag
+    node_write(map, inst, name, DICT, value)
 }
 
 /// Whether `map` is rooted at a `DevolvedDictTerminator` (mapdict.py:382),
@@ -4336,9 +4333,12 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     }
 
     /// mapdict.py:1172-1175 `setitem_str` — `flag = w_obj.setdictvalue(...);
-    /// assert flag`. `instance_node_setdictvalue` debug_asserts the flag itself.
+    /// assert flag`. The receiver is the instance behind a materialised
+    /// `__dict__` view, so its terminator has a dict and the write cannot fail.
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        instance_node_setdictvalue(mapdict_strategy_unerase(w_dict), Wtf8::new(key), w_value);
+        let flag =
+            instance_node_setdictvalue(mapdict_strategy_unerase(w_dict), Wtf8::new(key), w_value);
+        debug_assert!(flag, "mapdict.py:1174 assert flag");
     }
 
     /// mapdict.py:1198-1211 `delitem`. pyre's trait returns `bool` (true =
