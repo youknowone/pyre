@@ -296,6 +296,21 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             }
         }
         "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false),
+        // `interp_time.py:926` gates `thread_time` on HAS_THREAD_TIME; expose it
+        // only where the platform carries CLOCK_THREAD_CPUTIME_ID (the same
+        // clocks mod.rs registers the constant for), otherwise it falls through
+        // to the "unknown clock" ValueError.
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "illumos",
+                target_os = "netbsd",
+                target_os = "solaris",
+                target_os = "openbsd",
+                target_os = "redox",
+            ))
+        ))]
+        "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false),
         _ => return Err(crate::PyError::value_error("unknown clock")),
     };
     crate::baseobjspace::setattr_str(info, "implementation", w_str_new(implementation))?;
