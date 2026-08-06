@@ -623,10 +623,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(feature = "host_env")]
                 {
                     let signum = if let Some(&a) = args.first() {
-                        unsafe { pyre_object::w_int_get_value(a) as i32 }
+                        unsafe { pyre_object::w_int_get_value(a) }
                     } else {
                         return Err(crate::PyError::type_error("strsignal() missing argument"));
                     };
+                    // interp_signal.py:593-594 spells this bound inline rather
+                    // than calling `check_signum_in_range`, and its `signalnum
+                    // > NSIG` admits `NSIG` itself.  3.14 rejects it — its own
+                    // `pthread_sigmask` reports the range as `[1; NSIG - 1]` —
+                    // so take the half-open bound the other entry points use:
+                    // `strsignal(NSIG)` is `ValueError` here and
+                    // `'Unknown signal: 32'` on pypy.
+                    check_signum_in_range(signum)?;
+                    let signum = signum as i32;
                     return Ok(rustpython_host_env::signal::strsignal(signum)
                         .map(|s| pyre_object::w_str_new(&s))
                         .unwrap_or(pyre_object::w_none()));
@@ -855,7 +864,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 "siginterrupt() requires 2 arguments",
                             ));
                         }
-                        let sig = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                        // interp_signal.py:388 — `check_signum_in_range` runs
+                        // before the argument reaches `c_siginterrupt`, so the
+                        // narrowing below is exact.
+                        let sig = unsafe { pyre_object::w_int_get_value(args[0]) };
+                        check_signum_in_range(sig)?;
+                        let sig = sig as i32;
                         let flag = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                         rustpython_host_env::signal::siginterrupt(sig, flag).map_err(|e| {
                             crate::PyError::os_error_with_errno(
@@ -1077,7 +1091,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             )
                         })?;
                         for it in items {
-                            let signum = (unsafe { pyre_object::w_int_get_value(it) }) as i32;
+                            // interp_signal.py:492 — `SignalMask.__enter__` is
+                            // shared with `sigwait` and range-checks every
+                            // element before `c_sigaddset`.
+                            let signum = unsafe { pyre_object::w_int_get_value(it) };
+                            check_signum_in_range(signum)?;
+                            let signum = signum as i32;
                             rustpython_host_env::signal::sigaddset(&mut set, signum).map_err(
                                 |e| {
                                     crate::PyError::os_error_with_errno(
