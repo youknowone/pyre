@@ -690,12 +690,16 @@ pub unsafe fn instance_node_getdictvalue_checked(
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
-    let w_res = unsafe { node_read_checked(map, inst, name, DICT) };
+    let w = unsafe { node_read_checked(map, inst, name, DICT) }?;
     // mapdict.py:846-847 getdictvalue → read → _direct_read (592-598): lazily
     // migrate to boxed storage when the read attribute is unboxed and its class
-    // has frozen unboxing.
+    // has frozen unboxing.  A raise in `read` unwinds before the migration tail
+    // (846-847 → 58 → 312-313 returns None on the miss path, never reaching
+    // _direct_read), so migration is skipped whenever the read raised;
+    // propagating the read error here mirrors that — and `maybe_migrate_to_boxed`
+    // re-derives the None on the raising path, so it is a no-op there regardless.
     unsafe { maybe_migrate_to_boxed(map, inst, name, DICT) };
-    w_res
+    Ok(w)
 }
 
 /// `deldictvalue` routed to the mapdict node layer (mapdict.py:852-857

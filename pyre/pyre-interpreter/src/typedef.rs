@@ -2072,8 +2072,16 @@ unsafe fn retag_classmethod_descriptors(type_obj: PyObjectRef) {
 /// it those carry no owner and report their errors under the bare method name,
 /// where the namespace entry for the same method reports `type.name`.
 ///
+/// `dont_look_inside`: reads the prebuilt `method_owner` table's per-type
+/// `static OWNER` — a field-bearing frozen instance carrying a `fn` pointer,
+/// which the annotator cannot model as a prebuilt constant.  Making this a
+/// residual-call boundary keeps the receiver-owner setup opaque to the JIT
+/// so a lifting caller (`getattr_str_impl`'s bound-method assembly) is not
+/// dragged into the unmodellable static read.
+///
 /// # Safety
 /// `func` must be a valid, live function object.
+#[majit_macros::dont_look_inside]
 pub(crate) unsafe fn stamp_builtin_owner(func: PyObjectRef, type_name: &str) {
     let Some(owner) = method_owner(type_name) else {
         return;
