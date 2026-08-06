@@ -831,9 +831,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // (supports_dir_fd / supports_fd / supports_follow_symlinks), which
     // callers like shutil.rmtree consult to choose between fd-relative and
     // path-based implementations. Only the macros whose functionality is
-    // actually implemented may be listed: of the `*at` family only
-    // HAVE_FSTATAT is listed, because stat/lstat are the only calls that
-    // resolve a dir_fd-relative name, and HAVE_FDOPENDIR is omitted because
+    // actually implemented may be listed: of the `*at` family that is
+    // HAVE_FSTATAT, HAVE_FCHOWNAT and HAVE_UTIMENSAT, the three calls that
+    // resolve a dir_fd-relative name, while HAVE_FDOPENDIR is omitted because
     // scandir/listdir do not accept a file descriptor. HAVE_LSTAT remains so
     // os.stat is reported in supports_follow_symlinks (follow_symlinks=False
     // works).
@@ -848,6 +848,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("HAVE_FCHDIR", HAVE_FCHDIR),
         ("HAVE_FCHMOD", HAVE_FCHMOD),
         ("HAVE_FCHOWN", HAVE_FCHOWN),
+        // os.py:119,180 reads this as `chown` honouring both dir_fd and
+        // follow_symlinks. HAVE_LCHOWN is not listed beside it: os.py:186
+        // reads either one as the same follow_symlinks capability, and nothing
+        // here calls `lchown` — os.lchown is `fchownat` with the flag.
+        ("HAVE_FCHOWNAT", HAVE_FCHOWNAT),
         // Do not advertise HAVE_FEXECVE until execve() accepts an open file
         // descriptor.  os.py uses this bit to add execve to supports_fd, and
         // test_posix then runs a fork+fexecve path whose child must never
@@ -864,6 +869,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // and os.py:150-151 reads either one as the same `utime` capability.
         ("HAVE_FUTIMENS", HAVE_FUTIMENS),
         ("HAVE_LSTAT", true),
+        // os.py:133,191 reads this as `utime` honouring both dir_fd and
+        // follow_symlinks, which is the one `utimensat` the name form makes.
+        // HAVE_LUTIMES is not listed beside it for the same reason as
+        // HAVE_FUTIMES above: os.py:188 reads it as the same follow_symlinks
+        // capability and nothing here calls `lutimes`.
+        ("HAVE_UTIMENSAT", HAVE_UTIMENSAT),
     ];
     crate::module_ns_store(
         ns,
@@ -2894,6 +2905,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     const HAVE_FCHDIR: bool = HOST_POSIX;
     const HAVE_FCHMOD: bool = HOST_POSIX;
     const HAVE_FCHOWN: bool = HOST_POSIX;
+    /// `chown` resolves a name against `dir_fd` and honours
+    /// `follow_symlinks=False` through the one `fchownat` call
+    /// (`interp_posix.py:2504`), which is also how `lchown` is spelled.
+    const HAVE_FCHOWNAT: bool = HOST_POSIX;
     const HAVE_FPATHCONF: bool = HOST_POSIX;
     const HAVE_FSTATVFS: bool = HOST_POSIX;
     /// Windows serves this one too — `_chsize_s` behind `os.ftruncate` — so
@@ -2902,6 +2917,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `utime` reaches `futimens` and `utimensat` through `libc` rather than
     /// `host_env`, so it needs one less condition than the rest.
     const HAVE_FUTIMENS: bool = cfg!(all(unix, not(feature = "sandbox")));
+    /// The name form of `utime` is one `utimensat`, so the same bit carries
+    /// both of its modifiers: `dir_fd` is the descriptor the name resolves
+    /// against and `follow_symlinks=False` is `AT_SYMLINK_NOFOLLOW`.
+    const HAVE_UTIMENSAT: bool = cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_FSTATAT` — what `DirFD` is parameterised on
     /// (`interp_posix.py:612,660`). `stat_at` calls `fstatat` through `libc`.
     const HAVE_FSTATAT: bool = cfg!(all(unix, not(feature = "sandbox")));
@@ -4995,22 +5014,38 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     Ok(Some(narrowed))
                 };
             let (uid, gid) = (id_of(uid_obj, "uid")?, id_of(gid_obj, "gid")?);
-            if let Some(dir_fd) = crate::builtins::kwarg_get(kwargs, "dir_fd")
-                && !unsafe { pyre_object::is_none(dir_fd) }
-            {
-                return Err(crate::PyError::not_implemented(format!(
-                    "{name}: dir_fd unavailable on this platform"
-                )));
-            }
+            // `chown` types `dir_fd` as `DirFD(rposix.HAVE_FCHOWNAT)`
+            // (`interp_posix.py:2452-2453`), whose `unwrap` is `_unwrap_dirfd`
+            // (`:274-278`); `lchown` declares no keyword at all, so `allowed`
+            // above has already rejected it.
+            let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd") {
+                Some(v) if !unsafe { pyre_object::is_none(v) } => {
+                    // `_DirFD_Unavailable.unwrap` (`interp_posix.py:285-292`)
+                    // converts first and reports the platform second, so a
+                    // wrongly typed value is a TypeError even on a build that
+                    // carries no `fchownat`.
+                    let fd = unwrap_fd(v, "integer or None")?;
+                    if !HAVE_FCHOWNAT {
+                        return Err(dir_fd_unavailable());
+                    }
+                    Some(fd)
+                }
+                _ => None,
+            };
             let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
                 Some(v) => crate::baseobjspace::is_true(v)?,
                 None => default_follow,
             };
             if path.as_fd != -1 {
-                // interp_posix.py:2492-2494 — a descriptor already names the
-                // file, so the modifier that would reinterpret a name cannot
-                // apply. Upstream spells this one "cannnot"; 3.14, which the
+                // interp_posix.py:2481-2486 — a descriptor already names the
+                // file, so neither modifier, which each reinterpret a name, can
+                // apply. Upstream spells the second "cannnot"; 3.14, which the
                 // parity suite reads as the oracle, spells it "cannot".
+                if dir_fd.is_some() {
+                    return Err(crate::PyError::value_error(format!(
+                        "{name}: can't specify both dir_fd and fd"
+                    )));
+                }
                 if !follow_symlinks {
                     return Err(crate::PyError::value_error(format!(
                         "{name}: cannot use fd and follow_symlinks together"
@@ -5020,12 +5055,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 host_posix::fchown(bfd, uid, gid).map_err(|e| io_err(e, ""))?;
                 return Ok(pyre_object::w_none());
             }
-            // `fchownat` with `AT_FDCWD` is the `chown` / `lchown` pair:
-            // the flagless call follows the final symlink, `AT_SYMLINK_NOFOLLOW`
-            // does not.
-            let cwd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+            // `fchownat` is the whole family (`interp_posix.py:2501-2504`): the
+            // flagless call follows the final symlink and `AT_SYMLINK_NOFOLLOW`
+            // does not, while the directory descriptor it resolves the name
+            // against is `AT_FDCWD` when the caller named none.
+            let at = unsafe { BorrowedFd::borrow_raw(dir_fd.unwrap_or(libc::AT_FDCWD)) };
             host_posix::fchownat(
-                cwd,
+                at,
                 path_from_bytes(&path.as_bytes).as_os_str(),
                 uid,
                 gid,
