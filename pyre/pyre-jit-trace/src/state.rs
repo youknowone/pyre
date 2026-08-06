@@ -3935,9 +3935,7 @@ fn array_load_for_cache(
         return None;
     };
     let array_ptr = array_ref.0 as i64;
-    if array_ref == majit_ir::GcRef::NO_CONCRETE
-        || array_ptr == usize::MAX as i64
-        || array_ptr == 0
+    if array_ref == majit_ir::GcRef::NO_CONCRETE || array_ptr == usize::MAX as i64 || array_ptr == 0
     {
         return None;
     }
