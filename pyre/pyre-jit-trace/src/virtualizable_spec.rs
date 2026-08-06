@@ -50,6 +50,14 @@ pub const PYFRAME_VABLE_ARRAYS: &[(&str, usize)] = &[("locals_cells_stack_w", 0)
 /// index 0 and named `"locals_cells_stack_w"`.
 pub const LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX: usize = 0;
 
+/// Canonical vable-field index for `debugdata`.
+///
+/// A static field's flat shadow index IS its position in
+/// [`PYFRAME_VABLE_FIELDS`] (`initialize_virtualizable` lays the statics out
+/// first, then the arrays, then the identity slot), so this doubles as the
+/// `virtualizable_entry_at` index a reader of `getorcreatedebug()` uses.
+pub const DEBUGDATA_VABLE_FIELD_INDEX: usize = 3;
+
 const _: () = {
     assert!(
         !PYFRAME_VABLE_ARRAYS.is_empty(),
@@ -74,6 +82,27 @@ const _: () = {
         assert!(
             name[i] == expected[i],
             "PYFRAME_VABLE_ARRAYS[0] name mismatch"
+        );
+        i += 1;
+    }
+
+    assert!(
+        PYFRAME_VABLE_FIELDS[DEBUGDATA_VABLE_FIELD_INDEX].1 == DEBUGDATA_VABLE_FIELD_INDEX,
+        "debugdata must be registered at the expected vable field index"
+    );
+    let name = PYFRAME_VABLE_FIELDS[DEBUGDATA_VABLE_FIELD_INDEX]
+        .0
+        .as_bytes();
+    let expected = b"debugdata";
+    assert!(
+        name.len() == expected.len(),
+        "PYFRAME_VABLE_FIELDS[3] name mismatch"
+    );
+    let mut i = 0;
+    while i < expected.len() {
+        assert!(
+            name[i] == expected[i],
+            "PYFRAME_VABLE_FIELDS[3] name mismatch"
         );
         i += 1;
     }

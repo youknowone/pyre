@@ -1773,6 +1773,32 @@ static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
+// `pyframe.py:44 FrameDebugData.w_locals` — the frame's own locals mapping,
+// reached as `self.getorcreatedebug().w_locals` at the head of `fast2locals`
+// (pyframe.py:555-557).  Not a PyObject — no vtable and no allocation type id,
+// because the trace never NEWs one: it arrives as the `debugdata`
+// virtualizable field and is only read.  The field is MUTABLE (`setdictscope`
+// and `fast2locals`' lazy materialisation both rebind it), so the read must
+// not be treated as always-pure.
+static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_interpreter::pyframe::FRAME_DEBUG_DATA_SIZE,
+        0,
+        0,
+        &[(
+            "w_locals",
+            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_LOCALS_OFFSET,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            false,
+            false,
+        )],
+        "FrameDebugData",
+        "pyframe::FrameDebugData",
+    )
+});
+
 // `pypy/objspace/std/sliceobject.py:13` `W_SliceObject._immutable_fields_ =
 // ['w_start', 'w_stop', 'w_step']` — all three Ref fields are immutable
 // once `__init__` runs.  The `space.newslice(w_start, w_end, w_step)` JIT
@@ -3061,6 +3087,12 @@ pub fn rbigint_pair_item0_descr() -> DescrRef {
 /// `RBigIntPair.item1` — the remainder half of a divmod `tuple2`.
 pub fn rbigint_pair_item1_descr() -> DescrRef {
     field_descr_from_group(&RBIGINT_PAIR_DESCR_GROUP, 1)
+}
+
+/// `FrameDebugData.w_locals` — the mapping `getorcreatedebug().w_locals`
+/// reads at the head of `fast2locals` (pyframe.py:555-557).
+pub fn frame_debug_data_w_locals_descr() -> DescrRef {
+    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 0)
 }
 
 pub fn str_len_descr() -> DescrRef {

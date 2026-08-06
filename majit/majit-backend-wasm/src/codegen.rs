@@ -2322,7 +2322,12 @@ fn build_function(
                 for &i in &moved {
                     let label_arg = label_args[i];
                     if value_types[label_arg.raw() as usize] == ValType::F64 {
-                        emit_resolve_f64(&mut sink, constants, value_types, jump_args[i].to_opref());
+                        emit_resolve_f64(
+                            &mut sink,
+                            constants,
+                            value_types,
+                            jump_args[i].to_opref(),
+                        );
                     } else {
                         emit_resolve(&mut sink, constants, value_types, jump_args[i].to_opref());
                     }

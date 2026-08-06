@@ -1389,6 +1389,12 @@ impl Default for FrameDebugData {
     }
 }
 
+/// Byte offset of `w_locals` in `FrameDebugData`.
+pub const FRAME_DEBUG_DATA_W_LOCALS_OFFSET: usize = std::mem::offset_of!(FrameDebugData, w_locals);
+
+/// Allocated size of a `FrameDebugData`.
+pub const FRAME_DEBUG_DATA_SIZE: usize = std::mem::size_of::<FrameDebugData>();
+
 /// pyopcode.py:1875-1897 FrameBlock — linked list node for the block stack.
 /// `previous` forms a singly-linked list; `lastblock` in PyFrame is the head.
 /// It is assigned only during construction and targets a strictly older node,
@@ -4413,19 +4419,18 @@ fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyErr
     }
 }
 
-/// `pyframe.py:557 self.space.newdict(instance=True)` — the mapping half of
-/// `fast2locals`, for a trace that models the fastlocals reads instead of
-/// residualizing `interp_inspect.py:7-11 locals`.
+/// `pyframe.py:557 self.space.newdict(instance=True)` — the mapping
+/// `fast2locals` materialises for a frame that has none yet, for a trace that
+/// models the fastlocals reads instead of residualizing
+/// `interp_inspect.py:7-11 locals`.
 ///
-/// Takes no `PyFrame`: the modelled expansion feeds the slot values in as
-/// ordinary Ref operands, so nothing reachable from here can call
-/// [`crate::executioncontext::force_frame`].  That is the whole point of the
-/// split — a helper that touched the frame would re-arm the escape this
-/// modelling exists to remove.  The frame's own `w_locals` cache is
-/// deliberately NOT populated: an OPTIMIZED frame hands out an independent
-/// copy per read (`frame_locals_snapshot`), so the cache is never the object
-/// application code sees, and a later `f_locals` rebuilds it from the
-/// fastlocals anyway.
+/// Takes no `PyFrame`, so nothing reachable from here can call
+/// [`crate::executioncontext::force_frame`] — a helper that touched the frame
+/// would re-arm the escape this modelling exists to remove.  The store back
+/// into `debugdata.w_locals` is therefore NOT modelled either: the caller
+/// pins the frame's absent mapping with a guard and hands this dict out
+/// directly, which for an OPTIMIZED frame is already the independent copy
+/// `frame_locals_snapshot` returns.
 pub extern "C" fn jit_locals_dict_new() -> i64 {
     unsafe { pyre_object::w_dict_new() as i64 }
 }
@@ -4433,9 +4438,13 @@ pub extern "C" fn jit_locals_dict_new() -> i64 {
 /// `pyframe.py:566-568 fast2locals` for ONE visible fastlocal slot: bind
 /// `code.varnames[index]` to `value` in `dict`.
 ///
-/// Unbound slots are not routed here at all — the modelled expansion emits a
-/// `guard_isnull` for them and skips the store, which is `fast2locals`'
-/// `delitem` arm applied to a mapping that never held the key.
+/// `dict` is the frame's own locals mapping — `getorcreatedebug().w_locals`,
+/// which the modelled expansion reads through the `debugdata` virtualizable
+/// field and hands in as an ordinary Ref operand.  No `PyFrame` reaches this
+/// helper, so nothing under it can call
+/// [`crate::executioncontext::force_frame`]; that is the whole point of the
+/// split, since a helper that touched the frame would re-arm the escape the
+/// modelling exists to remove.
 ///
 /// Returns `dict` so the unrolled slot chain threads the (possibly forwarded)
 /// mapping from one store to the next instead of holding a raw address across
@@ -4465,6 +4474,75 @@ pub extern "C" fn jit_locals_dict_setitem_local(
         );
     }
     pyre_object::gc_roots::shadow_stack_get(dict_slot) as i64
+}
+
+/// `pyframe.py:569-574 fast2locals` for ONE visible fastlocal slot that is
+/// unbound: remove `code.varnames[index]` from `dict`.
+///
+/// The delete is fallible for the same reason
+/// [`crate::baseobjspace::delitem`] is — a stored key whose hash collides
+/// with the varname can reach a user `__eq__` that raises — so it routes
+/// through the checked spelling.  A missing key is not an error here
+/// (`w_dict_delitem_checked` reports it as `Ok(false)`), which is the
+/// `KeyError` arm `delitem_str_object` swallows.  Anything else is reported
+/// as `PY_NULL` and the pending slot is drained, so the guarded side exit
+/// re-runs the residual and raises from the eval loop.
+///
+/// Returns `dict` on success, for the same threading reason as
+/// [`jit_locals_dict_setitem_local`].
+///
+/// # Safety
+/// `dict` must be a live dict and `code` a live `CodeObject` with
+/// `index < varnames.len()`.
+pub extern "C" fn jit_locals_dict_delitem_local(dict: i64, code: i64, index: i64) -> i64 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(dict as PyObjectRef);
+    let code = unsafe { &*(code as usize as *const CodeObject) };
+    let name: &str = &code.varnames[index as usize];
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_str_new(name) });
+    let deleted = unsafe {
+        pyre_object::dictmultiobject::w_dict_delitem_checked(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+        )
+    };
+    match deleted {
+        Ok(_) => pyre_object::gc_roots::shadow_stack_get(dict_slot) as i64,
+        Err(_) => {
+            let _ = crate::baseobjspace::take_pending_dict_key_error(
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+            );
+            pyre_object::PY_NULL as i64
+        }
+    }
+}
+
+/// The copy half of [`PyFrame::frame_locals_snapshot`]: an INDEPENDENT dict
+/// holding what the frame's own locals mapping holds (PEP 667), which is what
+/// `locals()` / `vars()` hand back for an OPTIMIZED frame.
+///
+/// Reports a failing copy as `PY_NULL` rather than publishing it, so the
+/// guarded side exit re-runs the residual and raises from the eval loop.
+///
+/// # Safety
+/// `w_locals` must be a live mapping.
+pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_locals as PyObjectRef);
+    let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_dict_new() });
+    // `dict_update_value` walks a mapping's `keys()`, so both sides are
+    // reloaded across it as well as across the `w_dict_new` above.
+    match crate::opcode_ops::dict_update_value(
+        pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
+        pyre_object::gc_roots::shadow_stack_get(locals_slot),
+    ) {
+        Ok(()) => pyre_object::gc_roots::shadow_stack_get(snapshot_slot) as i64,
+        Err(_) => pyre_object::PY_NULL as i64,
+    }
 }
 
 #[cfg(test)]
