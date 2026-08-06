@@ -8451,15 +8451,16 @@ unsafe fn walker_exact_builtin_class(
     }
 }
 
-/// Canonical Python class for an exact int/bool/float specialization operand.
-/// Tagged ints have no object header, so derive their class without reading
-/// `w_class`; heap operands were already admitted by
+/// Canonical Python class for an exact int/float specialization operand.
+/// Tagged ints have no object header and bool cannot be subclassed, so a null
+/// result tells `walker_guard_exact_w_class` that the existing shape guard is
+/// already sufficient. Heap operands were admitted by
 /// `is_exact_builtin_instance` in the shared operand gate.
 fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
-        pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE)
+        pyre_object::PY_NULL
     } else if unsafe { pyre_object::is_bool(obj) } {
-        pyre_object::get_instantiate(&pyre_object::pyobject::BOOL_TYPE)
+        pyre_object::PY_NULL
     } else if unsafe { pyre_object::is_float(obj) } {
         pyre_object::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE)
     } else {
