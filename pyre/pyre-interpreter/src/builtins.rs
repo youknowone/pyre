@@ -13649,9 +13649,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                         {
                             #[cfg(not(feature = "sandbox"))]
                             let pos = {
-                                let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+                                let pos = crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR));
                                 if pos < 0 {
-                                    return Err(fd_io_err(std::io::Error::last_os_error()));
+                                    return Err(fd_errno_err(crt_errno()));
                                 }
                                 pos
                             };
