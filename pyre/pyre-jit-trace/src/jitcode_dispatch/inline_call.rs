@@ -3977,6 +3977,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             "Collapse::Other"
         });
     }
+    let callee_frame_materialized_has_resume = callee_frame_seeded && parent_frame.is_some();
 
     // CODEX1 parity: snapshot the heap-effect state before the callee
     // sub-walk.  If the prologue (callee pc 0 → its loop header) mutates the
@@ -4241,9 +4242,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // traceback, `f_locals` or `sys._getframe` reads them as
                 // unbound.  Record that here so the store handler demotes just
                 // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
-                // what `_opimpl_setarrayitem_vable` (`pyjitpl.py`) does for a
-                // `_nonstandard_virtualizable`.
-                shadow.frame_materialized = callee_frame_seeded;
+                // what `_opimpl_setarrayitem_vable` does for a
+                // `_nonstandard_virtualizable` (`pyjitpl.py:1120`). Recording
+                // those stores also emits the promote guard in
+                // `vable_getfield_*` (`pyjitpl.py:1916,2582`), whose resume
+                // image must include the paused caller frame
+                // (`opencoder.py:819`). If this sub-walk has no caller image,
+                // keep folding: publishing only the callee frame is unsound.
+                shadow.frame_materialized = callee_frame_materialized_has_resume;
             }
             for i in 0..nparams {
                 let slot = i as i64;
