@@ -2598,10 +2598,9 @@ pub(crate) fn census_record(name: &'static str) {
 }
 
 thread_local! {
-    /// Code objects already counted by
-    /// [`census_record_frame_shape_decline`], so a `CurrentFrameOnly` code
-    /// entered many times (a hot helper) records exactly one census entry
-    /// instead of one per call.  Keyed by the stable `CodeObject` pointer.
+    /// Code objects already counted by a pre-trace frame admission diagnostic,
+    /// so a hot declined helper records exactly one census entry instead of one
+    /// per call. Keyed by the stable `CodeObject` pointer.
     static FRAME_SHAPE_DECLINE_SEEN: std::cell::RefCell<std::collections::BTreeSet<usize>> =
         const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
@@ -2622,6 +2621,18 @@ pub fn census_record_frame_shape_decline(code_ptr: usize, kind: &'static str) {
     if first {
         census_record(kind);
     }
+}
+
+/// Record a frame-level FOR_ITER admission denial once per code object.
+/// `kind` names the predicate that denied the frame, so a pre-trace rejection
+/// remains attributable in the same census as frame-shape and traced-walk
+/// declines. Returns whether this was the first decline recorded for `code_ptr`.
+pub fn census_record_for_iter_gate_decline(code_ptr: usize, kind: &'static str) -> bool {
+    let first = FRAME_SHAPE_DECLINE_SEEN.with(|s| s.borrow_mut().insert(code_ptr));
+    if first {
+        census_record(kind);
+    }
+    first
 }
 
 /// The accumulated decline census as `(variant name, count)` pairs, sorted by
