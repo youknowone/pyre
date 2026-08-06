@@ -4592,8 +4592,10 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         // mapdict.py:1231 reads the value with `getitem_str(w_dict, key)`, but
         // the trait's `getitem_str` takes a `&str` and a node name is WTF-8:
         // `setitem` stores the full name (mapdict.py:1180), so a lone surrogate
-        // is a node here and has no `&str` form. Read the node layer directly.
-        let w_value = instance_node_getdictvalue(w_obj, key)?;
+        // is a node here and has no `&str` form. The `node_search` hit makes
+        // the value-present arm explicit: `node_read` would return
+        // `Some(plain_direct_read(curr, inst))` (mapdict.py:55-66).
+        let w_value = plain_direct_read(curr, inst);
         let w_key = pyre_object::unicodeobject::box_str_constant(key);
         self.delitem(w_dict, w_key);
         Some((w_key, w_value))

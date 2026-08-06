@@ -1204,6 +1204,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage_mut_opt(w_dict)
         {
             let (k, v) = entries.pop()?;
+            crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
             return Some((k.obj, v));
         }
         let module = &mut *(w_dict as *mut crate::dictmultiobject::W_ModuleDictObject);
@@ -1211,6 +1212,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         let storage = &mut *module.dstorage;
         let (key, cell) = storage.entries.pop()?;
         strategy.mutated();
+        crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
         Some((crate::w_str_new(&key), unwrap_cell(cell)))
     }
 

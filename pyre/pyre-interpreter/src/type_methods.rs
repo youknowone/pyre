@@ -6426,7 +6426,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     default.ok_or_else(|| crate::PyError::key_error_with_key(key))
 }
 
-/// `pypy/objspace/std/dictmultiobject.py:1395 W_DictMultiObject.descr_popitem`:
+/// `dictmultiobject.py:257` `W_DictMultiObject.descr_popitem`:
 ///
 /// ```python
 /// def descr_popitem(self, space):
@@ -6437,9 +6437,9 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 ///     return space.newtuple([w_key, w_value])
 /// ```
 ///
-/// In Python 3.7+ `popitem` is LIFO (returns the most recently
-/// inserted pair); pyre's `w_dict_items` preserves insertion order
-/// so popping the last entry matches the spec.
+/// Keep the pre-dispatch empty guard: a receiver whose backing is null, or an
+/// empty mapdict/module strategy, raises before strategy code can initialise or
+/// touch backing storage.
 pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "popitem")?;
     arity_no_args(args, "popitem")?;
@@ -6451,12 +6451,12 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         if pyre_object::w_dict_len(dict) == 0 {
             return Err(crate::PyError::key_error("popitem(): dictionary is empty"));
         }
-        let items = pyre_object::w_dict_items(dict);
-        let (k, v) = items
-            .last()
-            .copied()
+        let (k, v) = pyre_object::dictmultiobject::w_dict_popitem(dict)
             .ok_or_else(|| crate::PyError::key_error("popitem(): dictionary is empty"))?;
-        pyre_object::dictmultiobject::w_dict_delitem(dict, k);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let pair_slot = pyre_object::gc_roots::pin_roots(&[k, v]);
+        let k = pyre_object::gc_roots::shadow_stack_get(pair_slot);
+        let v = pyre_object::gc_roots::shadow_stack_get(pair_slot + 1);
         Ok(pyre_object::w_tuple_new(vec![k, v]))
     }
 }
