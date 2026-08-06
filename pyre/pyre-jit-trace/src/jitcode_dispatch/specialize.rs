@@ -2633,11 +2633,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // the inline value read (`mapdict.py`).  `storageindex` is a green
         // constant (the map guard pinned it); `trace_mapdict_storage_getitem`
         // stamps the dst's concrete shadow from the live block slot.
-        let block = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            obj,
-            crate::descr::object_storage_descr(),
-        );
+        let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
+            crate::descr::mapdict_storage_descr(concrete_obj)
+        });
         let idx_const = ctx.trace_ctx.const_int(storageindex as i64);
         let value = crate::state::trace_mapdict_storage_getitem(ctx.trace_ctx, block, idx_const);
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
@@ -2757,19 +2755,18 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             carrier_op,
             majit_ir::Value::Ref(majit_ir::GcRef(carrier as usize)),
         );
-        let map_op =
-            walker_record_getfield_gc_i_uncached(ctx, carrier_op, crate::descr::object_map_descr());
+        let map_op = walker_record_getfield_gc_i_uncached(ctx, carrier_op, unsafe {
+            crate::descr::mapdict_map_descr(carrier)
+        });
         let map_const = ctx.trace_ctx.const_int(map as i64);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
             .replace_box(map_op, map_const);
 
-        let block = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            carrier_op,
-            crate::descr::object_storage_descr(),
-        );
+        let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, carrier_op, unsafe {
+            crate::descr::mapdict_storage_descr(carrier)
+        });
         let index = ctx.trace_ctx.const_int(storageindex as i64);
         let slot = crate::state::trace_mapdict_storage_getitem(ctx.trace_ctx, block, index);
         let value = match unboxed {
@@ -3045,11 +3042,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             // the chain and the instance stays virtual (a residual Ref arg
             // would force it); an escaped receiver keeps the residual.
             let raw = if ctx.trace_ctx.heap_cache().is_unescaped(obj) {
-                let block = crate::state::opimpl_getfield_gc_r(
-                    ctx.trace_ctx,
-                    obj,
-                    crate::descr::object_storage_descr(),
-                );
+                let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
+                    crate::descr::mapdict_storage_descr(concrete_obj)
+                });
                 let slot = crate::state::trace_mapdict_storage_getitem(
                     ctx.trace_ctx,
                     block,
@@ -3228,7 +3223,9 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     // has no map, and pins the still-unallocated `w_dict` slot instead.
     let (slot_op, slot_const) = match shadow {
         ShadowGuard::InstanceMap(map) => (
-            walker_record_getfield_gc_i_uncached(ctx, obj, crate::descr::object_map_descr()),
+            walker_record_getfield_gc_i_uncached(ctx, obj, unsafe {
+                crate::descr::mapdict_map_descr(concrete_obj)
+            }),
             ctx.trace_ctx.const_int(map as i64),
         ),
         ShadowGuard::ExceptionDictIsNull(kind) => (

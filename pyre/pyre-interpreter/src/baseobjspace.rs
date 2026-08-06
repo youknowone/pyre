@@ -4630,37 +4630,6 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
             return Ok(w_dict);
         }
     }
-    // `tupleobject.W_AbstractTupleObject.user_setup` gives every user tuple
-    // subclass its own mapdict `dict` SPECIAL slot. pyre's tuple-subclass
-    // constructor always uses the canonical array-backed layout, whose
-    // trailing `w_dict` field is that per-object owner. Do not route it
-    // through the address-keyed native-object side table: a reclaimed
-    // structseq address can otherwise leak its extras into a later tuple.
-    if unsafe {
-        pyre_object::is_tuple(obj)
-            && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
-    } {
-        let Some(w_type) = crate::typedef::r#type(obj) else {
-            return Ok(PY_NULL);
-        };
-        if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-            let existing = unsafe { pyre_object::tupleobject::w_tuple_getdict(obj) };
-            if !existing.is_null() {
-                return Ok(existing);
-            }
-            let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(obj);
-            let w_dict = pyre_object::w_dict_new();
-            unsafe {
-                pyre_object::tupleobject::w_tuple_setdict(
-                    pyre_object::gc_roots::shadow_stack_get(root_base),
-                    w_dict,
-                )
-            };
-            return Ok(w_dict);
-        }
-    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return Ok(pyre_object::PY_NULL),
@@ -4871,20 +4840,6 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::interp_array::w_array_setdict(obj, w_dict) };
         return Ok(());
-    }
-    if unsafe {
-        pyre_object::is_tuple(obj)
-            && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
-    } {
-        // A tuple without a dict slot falls through to the generic path so it
-        // still reports `__dict__` as not writable.
-        if let Some(w_type) = crate::typedef::r#type(obj) {
-            if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-                require_dict_for_setdict(w_dict)?;
-                unsafe { pyre_object::tupleobject::w_tuple_setdict(obj, w_dict) };
-                return Ok(());
-            }
-        }
     }
     // W_TypeObject and Module keep their namespace mappings as readonly
     // attributes.  Their Python class/metaclass may itself inherit a regular
@@ -8120,17 +8075,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
 
     // objspace/std/mapdict.py:826-840 `MapdictDictSupport.getdict` parity.
     //
-    // User subclasses of builtin types (`class MyInt(int): ...`) have
-    // `hasdict=True` on the subclass type and their instances are still
-    // laid out as the builtin (W_IntObject etc.), so `is_instance(obj)`
-    // is False and the early descriptor-protocol block at :2858 skipped
-    // the instance dict. `setattr` however stores into
-    // `INSTANCE_DICT[obj as usize]` via `setdictvalue` → `_obj_setdict`,
-    // so the dict is populated but would never be read back.
-    //
-    // Check the per-instance W_DictObject here (same API PyPy's
-    // `descr__getattribute__` uses at descroperation.py:50). This is the
-    // second half of the "hasdict instance dict" protocol.
+    // User subclasses of native-layout builtin types carry the same mapdict
+    // prefix selected by `typedef.py:175-187`. The early descriptor-protocol
+    // block does not cover every such receiver, so perform the corresponding
+    // `MapdictDictSupport.getdict` lookup here as well.
     let w_dict = getdict_backing(obj)?;
     if !w_dict.is_null() {
         // `w_dict` may use MapDictStrategy, whose storage is the backing

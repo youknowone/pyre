@@ -3757,10 +3757,9 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let items: Vec<PyObjectRef> = (0..n)
             .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(value, i as i64) })
             .collect();
-        // Canonical array-backed layout (ob_type == TUPLE_TYPE) so the
-        // subclass tag never lands on an arity-2 specialised tuple.
-        let fresh = pyre_object::w_tuple_new_array_backed(items);
-        unsafe { store_subclass_tag(fresh, sub) };
+        // The generated user-class layout selected by `typedef.py:174-227`,
+        // never an arity-2 specialised tuple.
+        let fresh = pyre_object::w_tuple_subclass_new_array_backed(items, sub);
         pyre_object::gc_hook::maybe_register_finalizer(fresh);
         return Ok(fresh);
     }

@@ -20,6 +20,10 @@ pub struct W_BoolObject {
 /// Layout-identical to `INT_INTVAL_OFFSET` (`bool` inherits `intval`).
 pub const BOOL_INTVAL_OFFSET: usize = std::mem::offset_of!(W_BoolObject, intval);
 
+const _: () = {
+    assert!(BOOL_INTVAL_OFFSET == crate::intobject::INT_INTVAL_OFFSET);
+};
+
 /// Fixed payload size (`framework.py:811`).
 pub const W_BOOL_OBJECT_SIZE: usize = std::mem::size_of::<W_BoolObject>();
 

@@ -737,29 +737,23 @@ unsafe fn tokenizer_iter_destructor(obj_addr: usize) {
 /// guard skips the non-managed type pointer — exactly as
 /// `generator_object_custom_trace` forwards `pycode` ahead of the
 /// code-object migration.
-unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+unsafe fn mapdict_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let obj = obj_addr as pyre_object::PyObjectRef;
-    let inst = unsafe { &mut *(obj_addr as *mut pyre_object::objectobject::W_ObjectObject) };
-    f(&mut inst.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    // Mark the `storage` block (`W_MAPDICT_STORAGE_GC_TYPE_ID`, a stable leaf
-    // GcArray) live: forward the block-pointer field slot itself so a major GC
-    // greys the block (its interior is a GC leaf, so the collector never walks
-    // it — this instance's walk below is the only thing that forwards the boxed
-    // element slots). Non-moving, so the minor-GC forward is a no-op; the value
-    // is keeping the block off the sweep list. Mirrors `list_object_custom_trace`
-    // forwarding `int_items.block` / `float_items.block`. Guard on GC ownership:
-    // a `std::alloc` fallback block (no GC hook) is not GC-managed.
-    if !inst.storage.is_null() && pyre_object::gc_hook::try_gc_owns_object(inst.storage as *mut u8)
-    {
-        let storage_slot = std::ptr::addr_of_mut!(inst.storage);
-        f(storage_slot as *mut majit_ir::GcRef);
-    }
+    f(unsafe { std::ptr::addr_of_mut!((*obj).w_class) } as *mut majit_ir::GcRef);
     pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
         obj,
         &mut |slot: *mut pyre_object::PyObjectRef| {
             f(slot as *mut majit_ir::GcRef);
         },
     );
+}
+
+unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { mapdict_storage_custom_trace(obj_addr, f) };
+}
+
+unsafe fn int_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { mapdict_storage_custom_trace(obj_addr, f) };
 }
 
 /// Custom trace for `_random.Random`.  It carries the mapdict prefix like any
@@ -900,6 +894,37 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
             f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
         }
     }
+}
+
+unsafe fn tuple_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { tuple_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
+unsafe fn unicode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let unicode = unsafe { &mut *(obj_addr as *mut pyre_object::unicodeobject::W_UnicodeObject) };
+    f(&mut unicode.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(unicode.value) as *mut majit_ir::GcRef);
+    f(&mut unicode.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(unicode.index_storage) as *mut majit_ir::GcRef);
+}
+
+unsafe fn unicode_user_object_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    unsafe { unicode_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 /// Custom trace for `W_ListObject` under the Object strategy. `items`
@@ -1393,9 +1418,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     // payload size must be the actual struct size, and they sit one
     // level below the OBJECT root (`int.__bases__ == (object,)`,
     // `float.__bases__ == (object,)`). W_IntObject is a pure leaf;
-    // W_FloatObject additionally traces `w_class`/`w_dict`/`w_slots`, the
-    // last handing slot-value ownership to the list's custom tracer, so it
-    // registers with the gc-pointer offsets below.
+    // W_FloatObject additionally traces `w_class`/`w_dict`/`w_slots`, the last
+    // handing slot-value ownership to the list's custom tracer, so it registers
+    // with the gc-pointer offsets below.
     let w_int_tid = gc.register_type(TypeInfo::object_subclass(
         std::mem::size_of::<W_IntObject>(),
         object_tid,
@@ -2129,15 +2154,10 @@ fn build_gc() -> Box<MiniMarkGC> {
     // traced on the same terms. No `.with_destructor_fn`: the value-box tid's
     // drop glue is the sole reclaimer (a holder destructor would double-free a
     // box swept before its owner).
-    let w_str_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+    let w_str_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
         object_tid,
-        vec![
-            pyre_object::pyobject::W_CLASS_OFFSET,
-            pyre_object::unicodeobject::UNICODE_VALUE_OFFSET,
-            pyre_object::unicodeobject::UNICODE_W_SLOTS_OFFSET,
-            pyre_object::unicodeobject::UNICODE_INDEX_STORAGE_OFFSET,
-        ],
+        unicode_object_custom_trace,
     ));
     debug_assert_eq!(w_str_tid, W_UNICODE_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
@@ -3706,6 +3726,26 @@ fn build_gc() -> Box<MiniMarkGC> {
         vec![],
     ));
     majit_metainterp::virtualref::set_tracing_rescall_dummy_gc_type_id(tracing_rescall_dummy_tid);
+    // `typedef.py:174-227` builds a distinct translated instance class for a
+    // user subclass of a builtin. These private header ids describe those
+    // wider payloads, but are not rclass vtable ids: class identity and
+    // inheritance remain in `PyObject.w_class`. Consequently they must not
+    // enter the GC's subclass-range census.
+    let int_user_tid = gc.register_type(TypeInfo::with_custom_trace(
+        pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
+        int_object_custom_trace,
+    ));
+    pyre_object::intobject::W_INT_USER_GC_TYPE_ID.set(int_user_tid);
+    let unicode_user_tid = gc.register_type(TypeInfo::with_custom_trace(
+        pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
+        unicode_user_object_custom_trace,
+    ));
+    pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID.set(unicode_user_tid);
+    let tuple_user_tid = gc.register_type(TypeInfo::with_custom_trace(
+        pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
+        tuple_user_object_custom_trace,
+    ));
+    pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID.set(tuple_user_tid);
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges

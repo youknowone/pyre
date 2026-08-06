@@ -7245,10 +7245,10 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
     let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
     let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
     let (lhs_val, rhs_val) = unsafe {
-        // `bool` is a `W_IntObject` subclass sharing the 8-byte `intval` at
-        // offset 16; the consumer unboxes it through its own `&BOOL_TYPE`
-        // guard, so it stays on the int path.  Returns the concrete objects
-        // so the consumer can pick the per-operand class/descr.
+        // `bool` is a `W_IntObject` subclass sharing the `intval` layout; the
+        // consumer unboxes it through its own `&BOOL_TYPE` guard, so it stays
+        // on the int path. Returns the concrete objects so the consumer can
+        // pick the per-operand class/descr.
         if !pyre_object::is_int(lhs_obj) || !pyre_object::is_int(rhs_obj) {
             return None;
         }
@@ -8039,8 +8039,9 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // slot value.  Pin the map with `replace_box` after guarding so a later
     // fold on the same receiver correctly elides (matching the trait
     // `implement_guard_value`).
-    let map_op =
-        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, crate::descr::object_map_descr());
+    let map_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, unsafe {
+        crate::descr::mapdict_map_descr(concrete_obj)
+    });
     if !map_op.is_constant() {
         let map_const = ctx.trace_ctx.const_int(map as i64);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;

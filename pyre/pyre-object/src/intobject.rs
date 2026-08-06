@@ -17,6 +17,16 @@ pub struct W_IntObject {
     pub intval: i64,
 }
 
+/// The translated user-subclass layout selected by `typedef.py:174-227`.
+/// `W_IntObject` remains the base payload; `MapdictStorageMixin` contributes
+/// its fields only to the generated user class.
+#[repr(C)]
+pub struct W_IntObjectUser {
+    pub base: W_IntObject,
+    pub map: *const u8,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
 /// Field offset of `intval` within `W_IntObject`, for JIT field access.
 pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 
@@ -27,6 +37,8 @@ pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 /// mismatch panics on startup instead of silently misclassifying the
 /// type at collection time.
 pub const W_INT_GC_TYPE_ID: u32 = 1;
+pub static W_INT_USER_GC_TYPE_ID: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
+pub const W_INT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_IntObjectUser>();
 
 // ── Prebuilt-int cache ───────────────────────────────────────────────
 //
@@ -53,22 +65,40 @@ impl crate::lltype::GcType for W_IntObject {
     const SIZE: usize = W_INT_OBJECT_SIZE;
 }
 
+impl crate::lltype::GcType for W_IntObjectUser {
+    fn type_id() -> u32 {
+        W_INT_USER_GC_TYPE_ID.get()
+    }
+    const SIZE: usize = W_INT_USER_OBJECT_SIZE;
+}
+
 /// `intobject.py:873-880 setup_prebuilt`. Empty when
 /// `WITHPREBUILTINT=false`; populated `[PREBUILTINTFROM, PREBUILTINTTO)`
 /// (stop-exclusive) when `true`.
-static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
+struct PrebuiltInts(Vec<W_IntObject>);
+
+// `intobject.py:873-880 setup_prebuilt` publishes exact, immutable ints for
+// process lifetime. Wrapping the contiguous allocation as Sync preserves that
+// shared upstream owner without making mutable subclass instances globally
+// shareable.
+unsafe impl Send for PrebuiltInts {}
+unsafe impl Sync for PrebuiltInts {}
+
+static SMALL_INTS: LazyLock<PrebuiltInts> = LazyLock::new(|| {
     if !WITHPREBUILTINT {
-        return Vec::new();
+        return PrebuiltInts(Vec::new());
     }
-    (PREBUILTINTFROM..PREBUILTINTTO)
-        .map(|v| W_IntObject {
-            ob_header: PyObject {
-                ob_type: &INT_TYPE as *const PyType,
-                w_class: std::ptr::null_mut(),
-            },
-            intval: v,
-        })
-        .collect()
+    PrebuiltInts(
+        (PREBUILTINTFROM..PREBUILTINTTO)
+            .map(|v| W_IntObject {
+                ob_header: PyObject {
+                    ob_type: &INT_TYPE as *const PyType,
+                    w_class: std::ptr::null_mut(),
+                },
+                intval: v,
+            })
+            .collect(),
+    )
 });
 
 /// `pypy/objspace/std/intobject.py:883-897 wrapint` parity.
@@ -101,7 +131,7 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
     }
     if WITHPREBUILTINT && value >= PREBUILTINTFROM && value < PREBUILTINTTO {
         let idx = (value - PREBUILTINTFROM) as usize;
-        return (&SMALL_INTS[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
+        return (&SMALL_INTS.0[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
     }
     w_int_box_slow(value)
 }
@@ -197,19 +227,26 @@ pub fn w_int_new_unique(value: i64) -> PyObjectRef {
 /// ([`crate::bytesobject::w_bytes_subclass_from_bytes`],
 /// `w_str_subclass_from_wtf8`).
 pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
-    let obj = W_IntObject {
-        ob_header: PyObject {
-            ob_type: &INT_TYPE as *const PyType,
-            w_class: get_instantiate(&INT_TYPE),
+    let obj = W_IntObjectUser {
+        base: W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+                w_class: get_instantiate(&INT_TYPE),
+            },
+            intval: value,
         },
-        intval: value,
+        map: std::ptr::null(),
+        storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        W_INT_USER_GC_TYPE_ID.get(),
+        std::mem::size_of::<W_IntObjectUser>(),
+    );
     if raw.is_null() {
         crate::lltype::malloc_typed(obj) as PyObjectRef
     } else {
         unsafe {
-            std::ptr::write(raw as *mut W_IntObject, obj);
+            std::ptr::write(raw as *mut W_IntObjectUser, obj);
             raw as PyObjectRef
         }
     }
@@ -252,7 +289,7 @@ pub fn w_int_small_cached(value: i64) -> bool {
 
 #[inline]
 pub fn w_int_small_cache_base_ptr() -> PyObjectRef {
-    SMALL_INTS.as_ptr().cast_mut() as PyObjectRef
+    SMALL_INTS.0.as_ptr().cast_mut() as PyObjectRef
 }
 
 /// `intobject.py:516 _bit_count` parity — population count of an i64.
@@ -285,6 +322,24 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn exact_builtin_layouts_do_not_include_mapdict_storage() {
+        use crate::boolobject::W_BoolObject;
+        use crate::tupleobject::W_TupleObject;
+        use crate::unicodeobject::{UNICODE_VALUE_OFFSET, W_UnicodeObject};
+
+        assert_eq!(std::mem::size_of::<W_IntObject>(), 24);
+        assert_eq!(std::mem::size_of::<W_BoolObject>(), 24);
+        assert_eq!(std::mem::size_of::<W_UnicodeObject>(), 64);
+        assert_eq!(std::mem::size_of::<W_TupleObject>(), 40);
+        assert_eq!(INT_INTVAL_OFFSET, 16);
+        assert_eq!(UNICODE_VALUE_OFFSET, 16);
+        assert_eq!(std::mem::offset_of!(W_TupleObject, hash), 16);
+        assert_eq!(std::mem::offset_of!(W_TupleObject, wrappeditems), 24);
+        assert_eq!(std::mem::offset_of!(W_TupleObject, w_dict), 32);
+    }
+
+    #[test]
     fn test_int_create_and_read() {
         let obj = w_int_new(42);
         unsafe {
@@ -304,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_int_field_offset() {
-        assert_eq!(INT_INTVAL_OFFSET, 16); // after PyObject { ob_type(8) + w_class(8) }
+        assert_eq!(INT_INTVAL_OFFSET, 16);
     }
 
     /// `intobject.py:884 wrapint` parity: with `withprebuiltint=False`

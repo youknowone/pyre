@@ -60,6 +60,16 @@ pub struct W_UnicodeObject {
     pub hash: i64,
 }
 
+/// The translated user-subclass layout selected by `typedef.py:174-227`.
+/// The builtin string payload stays unchanged; the generated user class adds
+/// `MapdictStorageMixin` after it.
+#[repr(C)]
+pub struct W_UnicodeObjectUser {
+    pub base: W_UnicodeObject,
+    pub map: *const u8,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
 /// Field offset of `value` within `W_UnicodeObject`, for JIT field access.
 pub const UNICODE_VALUE_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, value);
 /// Field offset of `byte_len` (UTF-8 byte count) for STR STRLEN parity.
@@ -74,6 +84,7 @@ pub const UNICODE_INDEX_STORAGE_OFFSET: usize =
 
 /// GC type id assigned to `W_UnicodeObject` at JitDriver init time.
 pub const W_UNICODE_GC_TYPE_ID: u32 = 34;
+pub static W_UNICODE_USER_GC_TYPE_ID: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
 
 /// GC-managed WTF-8 value buffer of a *mortal* (subclass) `str` instance.
 ///
@@ -119,12 +130,20 @@ pub fn utf8_index_gc_type_id() -> u32 {
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_UNICODE_OBJECT_SIZE: usize = std::mem::size_of::<W_UnicodeObject>();
+pub const W_UNICODE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_UnicodeObjectUser>();
 
 impl crate::lltype::GcType for W_UnicodeObject {
     fn type_id() -> u32 {
         W_UNICODE_GC_TYPE_ID
     }
     const SIZE: usize = W_UNICODE_OBJECT_SIZE;
+}
+
+impl crate::lltype::GcType for W_UnicodeObjectUser {
+    fn type_id() -> u32 {
+        W_UNICODE_USER_GC_TYPE_ID.get()
+    }
+    const SIZE: usize = W_UNICODE_USER_OBJECT_SIZE;
 }
 
 /// Allocate a new exact `str` W_UnicodeObject from a Rust `&str`.
@@ -406,24 +425,31 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     // `value` gc-pointer edge greys it. Falls back to `malloc_raw` when no GC
     // hook is installed (pre-init / unit tests).
     let value = crate::gc_storage::gc_alloc_storage_box(value, unicode_value_gc_type_id());
-    let unicode = W_UnicodeObject {
-        ob_header: PyObject {
-            ob_type: &STR_TYPE as *const PyType,
-            w_class,
+    let unicode = W_UnicodeObjectUser {
+        base: W_UnicodeObject {
+            ob_header: PyObject {
+                ob_type: &STR_TYPE as *const PyType,
+                w_class,
+            },
+            value,
+            byte_len,
+            len: char_len,
+            w_slots: PY_NULL,
+            index_storage: std::ptr::null_mut(),
+            hash: 0,
         },
-        value,
-        byte_len,
-        len: char_len,
-        w_slots: PY_NULL,
-        index_storage: std::ptr::null_mut(),
-        hash: 0,
+        map: std::ptr::null(),
+        storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        W_UNICODE_USER_GC_TYPE_ID.get(),
+        W_UNICODE_USER_OBJECT_SIZE,
+    );
     let obj = if raw.is_null() {
         crate::lltype::malloc_typed(unicode) as PyObjectRef
     } else {
         unsafe {
-            std::ptr::write(raw as *mut W_UnicodeObject, unicode);
+            std::ptr::write(raw as *mut W_UnicodeObjectUser, unicode);
             raw as PyObjectRef
         }
     };
