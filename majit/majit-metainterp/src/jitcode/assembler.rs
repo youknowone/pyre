@@ -624,6 +624,28 @@ impl JitCodeBuilder {
         headerless: bool,
         fields: &[(usize, bool, &str)],
     ) {
+        // Every emit site re-registers the layout it accesses, so the same few
+        // type_ids arrive hundreds of times.  When the spec already lists an
+        // offset for each incoming field the merge below pushes nothing, and
+        // the re-sort/re-index that follow it are no-ops on an already sorted,
+        // already indexed vector — the branch never touches `size`,
+        // `is_gc_managed` or `headerless`, so returning here is exactly
+        // equivalent and skips building `new_fields` (one owned String per
+        // field) only to discard it.
+        if self
+            .struct_size_specs
+            .get(&type_id)
+            .is_some_and(|existing| {
+                fields.iter().all(|&(offset, _, _)| {
+                    existing
+                        .all_fielddescrs
+                        .iter()
+                        .any(|ef| ef.offset == offset)
+                })
+            })
+        {
+            return;
+        }
         let new_fields = Self::field_specs_from_layout(fields);
         // Merge into existing spec if present — each getfield/setfield
         // site registers only the field it accesses, so the complete
@@ -760,8 +782,7 @@ impl JitCodeBuilder {
         type_id: u64,
         field_name: &str,
     ) -> u16 {
-        let parent = self.struct_size_specs.get(&type_id).cloned();
-        let Some(parent_spec) = parent.as_ref() else {
+        let Some(parent_spec) = self.struct_size_specs.get(&type_id) else {
             return self.add_scalar_field_descr(offset, field_type);
         };
         let (field_flag, is_field_signed) = match field_type {
@@ -793,6 +814,22 @@ impl JitCodeBuilder {
             field_slot_in(&parent_spec.all_fielddescrs, field_name, offset)
                 .map(|idx| (idx, parent_spec.all_fielddescrs[idx].name.clone()))
                 .unwrap_or((0, String::new()));
+        // Carry the scalars only.  `patch_field_descr_parents`, called
+        // unconditionally from `try_finish` after the decline early-return,
+        // replaces this snapshot with `struct_size_specs`' final merged spec
+        // for the same `type_id` — and entries there are only inserted or
+        // merged, never removed, so a type_id present now is present then.
+        // `type_id` is therefore the only load-bearing part; deep-copying
+        // `all_fielddescrs` (a String per field) once per field-descr mint
+        // would build a table that is overwritten before anything reads it.
+        let parent = Some(BhSizeSpec {
+            size: parent_spec.size,
+            type_id: parent_spec.type_id,
+            vtable: parent_spec.vtable,
+            is_gc_managed: parent_spec.is_gc_managed,
+            headerless: parent_spec.headerless,
+            all_fielddescrs: Vec::new(),
+        });
         self.add_bh_descr(CanonicalBhDescr::Field {
             offset,
             field_size: scalar_size(field_type),
