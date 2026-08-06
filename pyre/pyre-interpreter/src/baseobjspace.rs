@@ -5739,21 +5739,29 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // lookup without re-dispatching to the override.
             if let Some(w_metatype) = crate::typedef::r#type(obj) {
                 if let Some(slot) = getattribute_if_not_from_object(w_metatype.as_ptr()) {
-                    let name_obj = w_str_new(name);
-                    // objspace.py:666 — bind the metaclass `__getattribute__`
-                    // through `__get__` and call it with the attribute name.
-                    match get_and_call_function(slot, obj, w_metatype.as_ptr(), &[name_obj]) {
-                        Ok(v) => return Ok(v),
-                        Err(e) if e.kind == PyErrorKind::AttributeError => {
-                            return type_getattr_hook_or_err(
-                                obj,
-                                &[Some(w_metatype.as_ptr()), None],
-                                name,
-                                e,
-                                call_getattr,
-                            );
+                    // typeobject.py:811-828 `W_TypeObject.descr_getattribute`
+                    // is the body inlined by `object_getattr_miss` below. Keep
+                    // a metaclass override on the descriptor-call path, but do
+                    // not wrap and then unwrap an already validated name merely
+                    // to re-enter that same canonical body.
+                    if !is_type_getattribute_descr(slot) {
+                        let name_obj = w_str_new(name);
+                        // objspace.py:666 — bind the metaclass
+                        // `__getattribute__` through `__get__` and call it with
+                        // the attribute name.
+                        match get_and_call_function(slot, obj, w_metatype.as_ptr(), &[name_obj]) {
+                            Ok(v) => return Ok(v),
+                            Err(e) if e.kind == PyErrorKind::AttributeError => {
+                                return type_getattr_hook_or_err(
+                                    obj,
+                                    &[Some(w_metatype.as_ptr()), None],
+                                    name,
+                                    e,
+                                    call_getattr,
+                                );
+                            }
+                            Err(e) => return Err(e),
                         }
-                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -9526,6 +9534,13 @@ unsafe fn is_object_getattribute_descr(w_descr: PyObjectRef) -> bool {
         Some(d) => std::ptr::eq(w_descr, d),
         None => false,
     }
+}
+
+/// `typeobject.py:1322` — identity anchor for the canonical
+/// `W_TypeObject.descr_getattribute` wrapper installed on `type`.
+unsafe fn is_type_getattribute_descr(w_descr: PyObjectRef) -> bool {
+    lookup_in_type_where(crate::typedef::w_type(), "__getattribute__")
+        .is_some_and(|d| std::ptr::eq(w_descr, d))
 }
 
 /// module.py `Module.descr_getattribute` is the default attribute slot for
