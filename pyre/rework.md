@@ -27,7 +27,7 @@ the four, has quietly moved to one slot from a hard failure.
 | F2 three executors | trait twin alive | **done, verified** — `is_full_body_walk`, `PYRE_FULL_BODY_WALK`, `OpcodeHandler for MIFrame`: 0 hits each |
 | F3 root-walker registry | 14 of 16 slots | **regressed — 15 of 16**; the 16th registration is a startup `panic!` |
 | F4 translate coverage | ~124-graph gap | gh#346 and gh#373 closed, work still landing (#1065); `abort_permanent` unchanged in scale |
-| F5 gate debt | 119 `PYRE_*` matches | 245 distinct `PYRE_*` identifiers; `gate-triage.md` refreshed 2026-08-02 |
+| F5 gate debt | 119 `PYRE_*` matches | 126 `PYRE_*` names read from the environment; `gate-triage.md` refreshed 2026-08-02 |
 
 Of the fifteen issues this document tracks, **thirteen are closed**. Only gh#376
 (Phase C decision document) and gh#126 (fib_recursive residual) remain open.
@@ -239,11 +239,19 @@ finding as open or closed.
 - **Gate debt**: **119 distinct `PYRE_*` env gates** in the tree (28 in the
   FBW family alone). Charter §3.6: a gate is a staging area, not a home.
   No triage table exists. *No tracking issue.* **2026-08-06: the table now
-  exists (`gate-triage.md`, refreshed 2026-08-02), but the population kept
-  growing — 245 distinct `PYRE_*` identifiers in the tree against the 119
-  matches this audit counted. The triage is a snapshot, not a brake; nothing
-  makes a new gate enter the table at birth, which is what WS4 item 1 asked
-  for.**
+  exists (`gate-triage.md`, refreshed 2026-08-02), and the population has grown
+  only modestly — 126 distinct `PYRE_*` names are read from the environment,
+  against the 119 this audit counted:**
+
+  ```
+  rg -o 'env::var[_a-z]*\("(PYRE_[A-Z0-9_]+)"' -r '$1' --glob '*.rs' | sort -u | wc -l
+  ```
+
+  **Counting identifiers rather than environment reads inflates this — 131
+  distinct `PYRE_*` identifiers appear in tracked `*.rs`, 174 across all tracked
+  files, 548 raw matches — so state which of the four the number is. The triage
+  is still a snapshot, not a brake: nothing makes a new gate enter the table at
+  birth, which is what WS4 item 1 asked for.**
 - **Documentation rot (N7)**: `majit/README.md` documented the deleted
   majit-analyze era (crates majit-opt/meta/codegen/runtime/analyze vs the
   actual majit-translate/metainterp/backend-* tree). **Resolved 2026-07-05:
