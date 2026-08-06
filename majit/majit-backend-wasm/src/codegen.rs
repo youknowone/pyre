@@ -872,6 +872,12 @@ impl HomeLiveness {
     fn live_across_any(&self, raw: u32, positions: &[usize]) -> bool {
         positions.iter().any(|&at| self.live_across(raw, at))
     }
+
+    /// Index of the last op that reads `raw` (arg or fail arg), or `-1` when
+    /// nothing reads it. `regalloc.py` spells this `Lifetime.last_usage`.
+    fn last_use(&self, raw: u32) -> i32 {
+        self.last_use.get(raw as usize).copied().unwrap_or(-1)
+    }
 }
 
 /// Static collecting-call positions whose gcmap-visible homes may be forwarded.
@@ -2114,6 +2120,7 @@ fn build_function(
     let mut in_loop_body = false;
     let mut labels_passed = 0usize;
     let mut ovf_flag_live = false;
+    let mut fused_guard_at: Option<usize> = None;
 
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
@@ -2198,6 +2205,48 @@ fn build_function(
             }),
             (true, true) => Some(1u32),
         };
+        // The guard whose condition the previous op already pushed and tested.
+        // `block_exit_depth` is unchanged across the pair: only a LABEL moves
+        // `labels_passed` or opens the `loop`, and a guard is neither.
+        if fused_guard_at == Some(op_idx) {
+            fused_guard_at = None;
+            continue;
+        }
+        if let Some(kind) = cond_kind_of(op.opcode) {
+            match next_op_can_accept_cc(
+                ops,
+                op_idx,
+                op.pos.get(),
+                &liveness,
+                &label_resume,
+                &ref_homes,
+            ) {
+                Some(guard) => {
+                    push_cond(&mut sink, constants, value_types, op, kind);
+                    // GUARD_TRUE exits when the condition is false. `i32.eqz`
+                    // rather than the inverted comparison: `!(a < b)` is
+                    // `a >= b` for integers but not for floats, where an
+                    // unordered operand makes both forms false.
+                    if guard.opcode == OpCode::GuardTrue {
+                        sink.i32_eqz();
+                    }
+                    emit_guard_if_exit(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        guard_idx,
+                        guard,
+                        block_exit_depth,
+                    );
+                    guard_idx += 1;
+                    fused_guard_at = Some(op_idx + 1);
+                }
+                None => emit_cond(&mut sink, constants, value_types, op, kind),
+            }
+            // A comparison result is never a Ref, so the store-on-def tail has
+            // nothing to do for it.
+            continue;
+        }
         match op.opcode {
             OpCode::Label => {}
 
@@ -2249,14 +2298,36 @@ fn build_function(
                 let label_args = find_label_args(ops, op);
                 let jump_args = op.getarglist();
                 let n = jump_args.len().min(label_args.len());
-                for (jump_arg, label_arg) in jump_args.iter().zip(label_args.iter()).take(n) {
+                // A pair whose jump arg IS its label arg rebinds the local to
+                // the value it already holds, so its read/write contributes
+                // nothing: every read precedes every write, and no other pair
+                // writes the same target (a LABEL's args are distinct boxes,
+                // asserted below), so dropping the pair leaves every remaining
+                // read and write unchanged. The home-refresh loop below already
+                // skips this case for the same reason.
+                let moved: Vec<usize> = (0..n)
+                    .filter(|&i| {
+                        let jarg = jump_args[i].to_opref();
+                        jarg.is_constant() || jarg.raw() != label_args[i].raw()
+                    })
+                    .collect();
+                debug_assert!(
+                    {
+                        let mut seen: Vec<u32> = label_args[..n].iter().map(|a| a.raw()).collect();
+                        seen.sort_unstable();
+                        seen.windows(2).all(|w| w[0] != w[1])
+                    },
+                    "LABEL args must be distinct for the identity-pair skip to be a no-op"
+                );
+                for &i in &moved {
+                    let label_arg = label_args[i];
                     if value_types[label_arg.raw() as usize] == ValType::F64 {
-                        emit_resolve_f64(&mut sink, constants, value_types, jump_arg.to_opref());
+                        emit_resolve_f64(&mut sink, constants, value_types, jump_args[i].to_opref());
                     } else {
-                        emit_resolve(&mut sink, constants, value_types, jump_arg.to_opref());
+                        emit_resolve(&mut sink, constants, value_types, jump_args[i].to_opref());
                     }
                 }
-                for i in (0..n).rev() {
+                for &i in moved.iter().rev() {
                     sink.local_set(1 + label_args[i].raw());
                 }
                 // The parallel move rebinds loop-carried locals without going
@@ -2605,28 +2676,6 @@ fn build_function(
                 );
             }
 
-            // ── Integer comparisons (signed) ──
-            OpCode::IntLt => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64LtS),
-            OpCode::IntLe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64LeS),
-            OpCode::IntEq => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64Eq),
-            OpCode::IntNe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64Ne),
-            OpCode::IntGt => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64GtS),
-            OpCode::IntGe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64GeS),
-
-            // ── Integer comparisons (unsigned) ──
-            OpCode::UintLt => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64LtU),
-            OpCode::UintLe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64LeU),
-            OpCode::UintGt => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64GtU),
-            OpCode::UintGe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64GeU),
-
-            // ── Pointer comparisons ──
-            OpCode::PtrEq | OpCode::InstancePtrEq => {
-                emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64Eq);
-            }
-            OpCode::PtrNe | OpCode::InstancePtrNe => {
-                emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64Ne);
-            }
-
             // ── Unary ops ──
             OpCode::IntNeg => emit_unary_vi(
                 &mut sink,
@@ -2652,26 +2701,6 @@ fn build_function(
                     s.i64_xor();
                 },
             ),
-            OpCode::IntIsTrue => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i64_const(0);
-                    sink.i64_ne();
-                    sink.i64_extend_i32_u();
-                    sink.local_set(1 + vi);
-                }
-            }
-            OpCode::IntIsZero => {
-                let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i64_eqz();
-                    sink.i64_extend_i32_u();
-                    sink.local_set(1 + vi);
-                }
-            }
-
             // ── Extended integer ops ──
             OpCode::IntSignext => {
                 // int_signext(val, num_bytes): sign-extend from num_bytes width
@@ -2718,14 +2747,6 @@ fn build_function(
                     sink.local_set(1 + vi);
                 }
             }
-
-            // ── Float comparisons ──
-            OpCode::FloatLt => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Lt),
-            OpCode::FloatLe => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Le),
-            OpCode::FloatEq => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Eq),
-            OpCode::FloatNe => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Ne),
-            OpCode::FloatGt => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Gt),
-            OpCode::FloatGe => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Ge),
 
             // ── Float floor/mod ──
             OpCode::FloatFloorDiv => {
@@ -5128,6 +5149,66 @@ fn emit_guard_false(
     );
 }
 
+/// `llsupport/regalloc.py:873 next_op_can_accept_cc` — the comparison at `i`
+/// may hand its condition straight to the op at `i + 1` instead of
+/// materialising a boolean, when that op is the condition's only reader. x86
+/// leaves the condition in the flags (`x86/regalloc.py:265
+/// force_allocate_reg_or_cc`, ported to the dynasm sibling at
+/// `majit-backend-dynasm/src/regalloc.rs:3665 next_op_can_accept_cc`); wasm's
+/// operand stack plays that role — [`push_cond`]'s i32 stays on the stack and
+/// the guard's `if` tests it, so the `i64.extend_i32_u`/`local.set` and the
+/// guard's own `local.get`/re-test disappear.
+///
+/// Narrower than the dynasm port on purpose: only `GuardTrue`/`GuardFalse`,
+/// whose wasm arms do nothing but re-test the boolean.
+fn next_op_can_accept_cc<'a>(
+    ops: &'a [Op],
+    i: usize,
+    result: OpRef,
+    liveness: &HomeLiveness,
+    label_resume: &LabelResumeData,
+    ref_homes: &RefHomes,
+) -> Option<&'a Op> {
+    if result == OpRef::NONE || result.is_constant() {
+        return None;
+    }
+    let next_op = ops.get(i + 1)?;
+    if !matches!(next_op.opcode, OpCode::GuardTrue | OpCode::GuardFalse) {
+        return None;
+    }
+    // history.py:213 `Const.is_constant()` — a Const operand is not an
+    // op-result identity, so comparing raw positions against it is invalid.
+    if next_op.num_args() == 0 || next_op.arg(0).is_constant() {
+        return None;
+    }
+    if next_op.arg(0).to_opref().raw() != result.raw() {
+        return None;
+    }
+    // Any later reader (including this guard's own fail args, which
+    // `HomeLiveness` records as uses at `i + 1`) needs the materialised local.
+    if liveness.last_use(result.raw()) > i as i32 + 1 {
+        return None;
+    }
+    if next_op
+        .getfailargs()
+        .is_some_and(|fa| fa.iter().any(|a| a.to_opref() == result))
+    {
+        return None;
+    }
+    // A LABEL resume loader restores its capture set from the frame, so a
+    // captured value must have been bound; skipping the `local.set` would leave
+    // wasm's zero-init in its place.
+    if label_resume.storage(result).is_some() {
+        return None;
+    }
+    // The store-on-def tail reads the result local for a Ref-homed value. A
+    // comparison result is never a Ref, so this only pins the invariant.
+    if ref_homes.home(result).is_some() {
+        return None;
+    }
+    Some(next_op)
+}
+
 /// Common guard exit: condition is on stack (i32), emit if + exit.
 ///
 /// `block_exit_depth` is the statement-level depth of the enclosing exit
@@ -5428,6 +5509,7 @@ fn emit_ovf_binop(
 
 // ── Comparison ops ──
 
+#[derive(Clone, Copy)]
 enum CmpOp {
     I64LtS,
     I64LeS,
@@ -5478,6 +5560,7 @@ fn apply_cmp(sink: &mut InstructionSink<'_>, op: CmpOp) {
 
 // ── Float comparison helper ──
 
+#[derive(Clone, Copy)]
 enum FloatCmp {
     Lt,
     Le,
@@ -5487,57 +5570,110 @@ enum FloatCmp {
     Ge,
 }
 
-fn emit_float_cmp(
-    sink: &mut InstructionSink<'_>,
-    constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &[ValType],
-    op: &Op,
-    cmp: FloatCmp,
-) {
-    let vi = op.pos.get().raw();
-    if OpRef::raw_is_constant(vi) {
-        return;
-    }
-    emit_resolve_f64(sink, constants, value_types, op.arg(0).to_opref());
-    emit_resolve_f64(sink, constants, value_types, op.arg(1).to_opref());
-    match cmp {
-        FloatCmp::Lt => {
-            sink.f64_lt();
-        }
-        FloatCmp::Le => {
-            sink.f64_le();
-        }
-        FloatCmp::Eq => {
-            sink.f64_eq();
-        }
-        FloatCmp::Ne => {
-            sink.f64_ne();
-        }
-        FloatCmp::Gt => {
-            sink.f64_gt();
-        }
-        FloatCmp::Ge => {
-            sink.f64_ge();
-        }
-    }
-    sink.i64_extend_i32_u();
-    sink.local_set(1 + vi);
+/// An op whose result is a 0/1 boolean produced by a single wasm comparison.
+/// [`push_cond`] leaves that comparison's i32 on the operand stack; [`emit_cond`]
+/// is the ordinary spelling that widens and binds it to the result local.
+#[derive(Clone, Copy)]
+enum CondKind {
+    Int(CmpOp),
+    Float(FloatCmp),
+    IsTrue,
+    IsZero,
 }
 
-fn emit_cmp(
+fn cond_kind_of(opcode: OpCode) -> Option<CondKind> {
+    Some(match opcode {
+        // ── Integer comparisons (signed) ──
+        OpCode::IntLt => CondKind::Int(CmpOp::I64LtS),
+        OpCode::IntLe => CondKind::Int(CmpOp::I64LeS),
+        OpCode::IntEq => CondKind::Int(CmpOp::I64Eq),
+        OpCode::IntNe => CondKind::Int(CmpOp::I64Ne),
+        OpCode::IntGt => CondKind::Int(CmpOp::I64GtS),
+        OpCode::IntGe => CondKind::Int(CmpOp::I64GeS),
+        // ── Integer comparisons (unsigned) ──
+        OpCode::UintLt => CondKind::Int(CmpOp::I64LtU),
+        OpCode::UintLe => CondKind::Int(CmpOp::I64LeU),
+        OpCode::UintGt => CondKind::Int(CmpOp::I64GtU),
+        OpCode::UintGe => CondKind::Int(CmpOp::I64GeU),
+        // ── Pointer comparisons ──
+        OpCode::PtrEq | OpCode::InstancePtrEq => CondKind::Int(CmpOp::I64Eq),
+        OpCode::PtrNe | OpCode::InstancePtrNe => CondKind::Int(CmpOp::I64Ne),
+        // ── Float comparisons ──
+        OpCode::FloatLt => CondKind::Float(FloatCmp::Lt),
+        OpCode::FloatLe => CondKind::Float(FloatCmp::Le),
+        OpCode::FloatEq => CondKind::Float(FloatCmp::Eq),
+        OpCode::FloatNe => CondKind::Float(FloatCmp::Ne),
+        OpCode::FloatGt => CondKind::Float(FloatCmp::Gt),
+        OpCode::FloatGe => CondKind::Float(FloatCmp::Ge),
+        // ── Truth tests ──
+        OpCode::IntIsTrue => CondKind::IsTrue,
+        OpCode::IntIsZero => CondKind::IsZero,
+        _ => return None,
+    })
+}
+
+/// Push the comparison's i32 result (0 or 1) onto the operand stack.
+fn push_cond(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &[ValType],
     op: &Op,
-    cmpop: CmpOp,
+    kind: CondKind,
+) {
+    match kind {
+        CondKind::Int(cmpop) => {
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+            apply_cmp(sink, cmpop);
+        }
+        CondKind::Float(cmp) => {
+            emit_resolve_f64(sink, constants, value_types, op.arg(0).to_opref());
+            emit_resolve_f64(sink, constants, value_types, op.arg(1).to_opref());
+            match cmp {
+                FloatCmp::Lt => {
+                    sink.f64_lt();
+                }
+                FloatCmp::Le => {
+                    sink.f64_le();
+                }
+                FloatCmp::Eq => {
+                    sink.f64_eq();
+                }
+                FloatCmp::Ne => {
+                    sink.f64_ne();
+                }
+                FloatCmp::Gt => {
+                    sink.f64_gt();
+                }
+                FloatCmp::Ge => {
+                    sink.f64_ge();
+                }
+            }
+        }
+        CondKind::IsTrue => {
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.i64_const(0);
+            sink.i64_ne();
+        }
+        CondKind::IsZero => {
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+            sink.i64_eqz();
+        }
+    }
+}
+
+fn emit_cond(
+    sink: &mut InstructionSink<'_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
+    op: &Op,
+    kind: CondKind,
 ) {
     let vi = op.pos.get().raw();
     if OpRef::raw_is_constant(vi) {
         return;
     }
-    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
-    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
-    apply_cmp(sink, cmpop);
+    push_cond(sink, constants, value_types, op, kind);
     sink.i64_extend_i32_u();
     sink.local_set(1 + vi);
 }
