@@ -105,7 +105,10 @@ def get_fielddescr_index_in(STRUCT, fieldname, cur_index=0):
             r = get_fielddescr_index_in(FIELD, fieldname, cur_index)
             if r >= 0:
                 return r
-            cur_index += -r - 1
+            # the recursion was given our own cur_index, so the index it
+            # reports back already counts the fields walked before the
+            # inlined sub-struct; adding it again would count them twice
+            cur_index = -r - 1
             continue
         elif name == fieldname:
             return cur_index
