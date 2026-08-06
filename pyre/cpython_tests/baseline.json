@@ -317,7 +317,8 @@
       "dynasm": "CRASH"
     },
     "test.test_decorators": {
-      "dynasm": "FAIL"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_defaultdict": {
       "cranelift": "PASS",
