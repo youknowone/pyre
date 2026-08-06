@@ -3898,10 +3898,9 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// FBW virtualization of the array-backed BUILD_TUPLE, at every arity.
+/// FBW virtualization of the array-backed BUILD_TUPLE, at arity 1 and 3 up.
 /// Sibling of [`try_walker_specialize_newlist`] and
-/// [`try_walker_specialize_newtuple`], which now only picks up the arity-2
-/// plain-int shapes this one declines.
+/// [`try_walker_specialize_newtuple`], which takes the arity-2 plain-int shape.
 ///
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear` +
 /// per-index `setarrayitem_gc` + a `newtuple_from_array` residual.  Re-emit the
@@ -3912,18 +3911,15 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 /// and one that does escape materializes from the same fields the residual
 /// would have written.
 ///
-/// Arity 2 is `makespecialisedtuple2` territory at runtime (`Cls_ii` /
-/// `Cls_ff` / `Cls_oo`, `specialisedtupleobject.py`), and this arm builds the
-/// canonical shape there instead.  Representation is not observable — the
-/// polymorphic readers dispatch on `ob_type` and `w_class` is `tuple` either
-/// way — and the trace stays self-consistent because the concrete shadow, the
-/// emitted virtual, and therefore the object a deopt rebuilds are all the one
-/// shape.  What it buys is every consumer: `wrappeditems` is the form
-/// [`try_walker_specialize_subscr_tuple`], [`try_walker_specialize_builtin_len`],
-/// [`try_walker_specialize_get_iter`] and the array-backed arm of
-/// [`try_walker_specialize_unpack`] already read, whereas a specialised pair
-/// has an unpack fold and nothing else, so every other read of one forces it
-/// out of virtual state.  The empty tuple is declined (no element to recover a
+/// Arity 2 is declined: `makespecialisedtuple2`
+/// (`specialisedtupleobject.py:169-179`) is what the runtime calls there, so a
+/// canonical virtual would be the one shape the interpreter never builds.  The
+/// trace alone stays self-consistent, but a side exit hands a real `Cls_ii` /
+/// `Cls_ff` / `Cls_oo` — inline `value0` / `value1`, no `wrappeditems` block —
+/// to a consumer the trace picked for the canonical layout, and
+/// [`try_walker_specialize_subscr_specialised_pair`] then reads a field that is
+/// not there.  [`try_walker_specialize_newtuple`] takes the pair shapes it can
+/// build faithfully.  The empty tuple is declined too (no element to recover a
 /// length from).
 ///
 /// Returns `Ok(Some(()))` when folded; `Ok(None)` falls through to the opaque
@@ -3955,6 +3951,9 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
             _ => return Ok(None),
         }
     };
+    if len == 2 {
+        return Ok(None);
+    }
 
     // Element boxes the BUILD_TUPLE `setarrayitem_gc` ops stored; a cache miss
     // (clobbered array / non-const index) bails to the opaque residual.
