@@ -4431,6 +4431,89 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
+        // interp_posix.py:407-412: retry EINTR, propagate every other OSError.
+        // Which filename the caller then reports is its own: `os.ftruncate` was
+        // given no name to report, while `os.truncate` names the one it opened.
+        // The call runs through the call gate so a signal handler gets its turn
+        // between the retries.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        fn ftruncate_retry(fd: libc::c_int, length: libc::off_t) -> Result<(), i32> {
+            loop {
+                if crate::builtins::crt_call!(libc::ftruncate(fd, length)) == 0 {
+                    return Ok(());
+                }
+                let errno = crate::builtins::crt_errno();
+                if errno != libc::EINTR {
+                    return Err(errno);
+                }
+            }
+        }
+
+        /// `space.int_w` over the `r_longlong` half of `interp_posix.py:404`.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        fn truncate_length_w(obj: PyObjectRef) -> Result<libc::off_t, crate::PyError> {
+            let w_length = crate::baseobjspace::space_index(obj)?;
+            let length = crate::baseobjspace::int_w(w_length).map_err(|err| {
+                if err.kind == crate::PyErrorKind::OverflowError {
+                    crate::PyError::overflow_error("Python int too large to convert to C long")
+                } else {
+                    err
+                }
+            })?;
+            Ok(length as libc::off_t)
+        }
+
+        // os.truncate(path, length) -> None
+        //
+        // interp_posix.py:414-431 takes a descriptor as it stands and opens a
+        // name write-only, truncates whichever it ended up with, and closes
+        // only the one it opened itself. The descriptor form is what
+        // HAVE_FTRUNCATE advertises through `os.py:149`.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        crate::module_ns_store(
+            ns,
+            "truncate",
+            crate::make_builtin_function_with_arity(
+                "truncate",
+                |args| {
+                    if args.len() != 2 {
+                        return Err(crate::PyError::type_error(format!(
+                            "truncate expected 2 arguments, got {}",
+                            args.len(),
+                        )));
+                    }
+                    let path = crate::gateway::fsencode_path_or_fd_w(
+                        args[0],
+                        "truncate",
+                        HAVE_FTRUNCATE,
+                    )?;
+                    let length = truncate_length_w(args[1])?;
+                    if path.as_fd != -1 {
+                        ftruncate_retry(path.as_fd, length).map_err(|e| errno_err(e, ""))?;
+                        return Ok(pyre_object::w_none());
+                    }
+                    let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                        .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                    // `open(space, w_path, os.O_WRONLY)` is `rposix.open` with
+                    // `inheritable=False`; nothing here forks between the open
+                    // and the close, but the descriptor is still not the
+                    // caller's to inherit.
+                    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+                    if fd < 0 {
+                        return Err(io_err_with_filename(
+                            std::io::Error::last_os_error(),
+                            path.w_path(),
+                        ));
+                    }
+                    let truncated = ftruncate_retry(fd, length);
+                    unsafe { libc::close(fd) };
+                    truncated.map_err(|e| errno_err_with_filename(e, path.w_path()))?;
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
         // rpython/rlib/rposix.py `ftruncate(fd, length)` — this must be a
         // real fd mutation whenever HAVE_FTRUNCATE is advertised.  Shared
         // memory sizes its newly-created object through this call before
@@ -4465,75 +4548,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let fd = libc::c_int::try_from(fd_value).map_err(|_| {
                         crate::PyError::overflow_error("Python int too large to convert to C int")
                     })?;
-                    let w_length = crate::baseobjspace::space_index(args[1])?;
-                    let length = crate::baseobjspace::int_w(w_length).map_err(|err| {
-                        if err.kind == crate::PyErrorKind::OverflowError {
-                            crate::PyError::overflow_error(
-                                "Python int too large to convert to C long",
-                            )
-                        } else {
-                            err
-                        }
-                    })? as libc::off_t;
-                    // interp_posix.py:407-412: retry EINTR, propagate every
-                    // other OSError.
-                    loop {
-                        let r = crate::builtins::crt_call!(libc::ftruncate(fd, length));
-                        if r == 0 {
-                            break;
-                        }
-                        let errno = crate::builtins::crt_errno();
-                        if errno != libc::EINTR {
-                            return Err(errno_err(errno, ""));
-                        }
-                    }
+                    let length = truncate_length_w(args[1])?;
+                    ftruncate_retry(fd, length).map_err(|e| errno_err(e, ""))?;
                     Ok(pyre_object::w_none())
-                },
-                2,
-            ),
-        );
-
-        // os.truncate(path, length) -> None.  `os_truncate_impl`'s path is
-        // `path_t(allow_fd=…)`: an integer names an open descriptor, and the
-        // call is then `ftruncate` on it with no name to report a failure
-        // with.  Both forms run through the call gate so a signal handler gets
-        // its turn between the EINTR retries.
-        #[cfg(all(unix, not(feature = "sandbox")))]
-        crate::module_ns_store(
-            ns,
-            "truncate",
-            crate::make_builtin_function_with_arity(
-                "truncate",
-                |args| {
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error("truncate() requires 2 arguments"));
-                    }
-                    let path = crate::gateway::fsencode_path_or_fd_w(args[0], "truncate", true)?;
-                    let length = crate::baseobjspace::int_w(args[1])? as libc::off_t;
-                    let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
-                        .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                    let fd = path.as_fd;
-                    loop {
-                        let ret = if fd != -1 {
-                            crate::builtins::crt_call!(libc::ftruncate(fd, length))
-                        } else {
-                            crate::builtins::crt_call!(libc::truncate(c_path.as_ptr(), length))
-                        };
-                        if ret == 0 {
-                            return Ok(pyre_object::w_none());
-                        }
-                        // `os_truncate_impl` retries EINTR and propagates every
-                        // other error, the way `ftruncate` above does.
-                        let errno = crate::builtins::crt_errno();
-                        if errno == libc::EINTR {
-                            continue;
-                        }
-                        return Err(if fd != -1 {
-                            errno_err(errno, "")
-                        } else {
-                            errno_err_with_filename(errno, path.w_path())
-                        });
-                    }
                 },
                 2,
             ),
