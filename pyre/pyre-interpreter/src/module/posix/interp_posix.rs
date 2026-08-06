@@ -837,41 +837,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // scandir/listdir do not accept a file descriptor. HAVE_LSTAT remains so
     // os.stat is reported in supports_follow_symlinks (follow_symlinks=False
     // works).
-    // Under sandbox the fd-relative host probes/mutators (fchdir/fchmod/fchown/
-    // fexecve/fpathconf/fstatvfs/ftruncate) are replaced with raising stubs, so
-    // drop their capability bits — otherwise os.py picks an fd-relative path
-    // that deterministically fails.
-    let have_functions: &[&str] = &[
-        #[cfg(not(feature = "sandbox"))]
-        "HAVE_FCHDIR",
-        #[cfg(not(feature = "sandbox"))]
-        "HAVE_FCHMOD",
-        #[cfg(not(feature = "sandbox"))]
-        "HAVE_FCHOWN",
+    //
+    // Each bit is the same constant the entry point itself branches on, so the
+    // advertisement cannot drift from the behaviour: a build where `chdir`
+    // rejects a descriptor is a build that does not claim HAVE_FCHDIR. That is
+    // what drops the whole fd-relative family under sandbox, where the host
+    // probes/mutators are raising stubs, and on the hosts that carry no
+    // `host_env::posix` at all.
+    let have_functions: &[(&str, bool)] = &[
+        ("HAVE_FCHDIR", HAVE_FCHDIR),
+        ("HAVE_FCHMOD", HAVE_FCHMOD),
+        ("HAVE_FCHOWN", HAVE_FCHOWN),
         // Do not advertise HAVE_FEXECVE until execve() accepts an open file
         // descriptor.  os.py uses this bit to add execve to supports_fd, and
         // test_posix then runs a fork+fexecve path whose child must never
         // return to the libregrtest worker.
-        #[cfg(not(feature = "sandbox"))]
-        "HAVE_FPATHCONF",
-        // os.py:120-121 reads this as `stat` and `lstat` honouring dir_fd;
-        // `stat_at` implements it with `fstatat`, which the sandbox seam and
-        // the non-unix hosts do not carry.
-        #[cfg(all(unix, not(feature = "sandbox")))]
-        "HAVE_FSTATAT",
+        ("HAVE_FPATHCONF", HAVE_FPATHCONF),
+        // os.py:120-121 reads this as `stat` and `lstat` honouring dir_fd.
+        ("HAVE_FSTATAT", HAVE_FSTATAT),
         // os.py:122 reads this as `link` honouring `src_dir_fd`/`dst_dir_fd`,
         // which its `linkat` call is.
-        #[cfg(all(unix, not(feature = "sandbox")))]
-        "HAVE_LINKAT",
-        #[cfg(not(feature = "sandbox"))]
-        "HAVE_FSTATVFS",
-        // Windows serves this one too — `_chsize_s` behind `os.ftruncate` — so
-        // `os.truncate` belongs in `supports_fd` on both.
-        #[cfg(not(feature = "sandbox"))]
-        "HAVE_FTRUNCATE",
-        "HAVE_FUTIMENS",
-        "HAVE_FUTIMES",
-        "HAVE_LSTAT",
+        ("HAVE_LINKAT", HAVE_LINKAT),
+        ("HAVE_FSTATVFS", HAVE_FSTATVFS),
+        ("HAVE_FTRUNCATE", HAVE_FTRUNCATE),
+        // HAVE_FUTIMES is not listed beside it: nothing here calls `futimes`,
+        // and os.py:150-151 reads either one as the same `utime` capability.
+        ("HAVE_FUTIMENS", HAVE_FUTIMENS),
+        ("HAVE_LSTAT", true),
     ];
     crate::module_ns_store(
         ns,
@@ -879,7 +871,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         pyre_object::w_list_new(
             have_functions
                 .iter()
-                .map(|&n| pyre_object::w_str_new(n))
+                .filter(|&&(_, have)| have)
+                .map(|&(n, _)| pyre_object::w_str_new(n))
                 .collect(),
         ),
     );
@@ -1980,6 +1973,34 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
 
     // os.utime(path, times=None, *, ns=None, dir_fd=None, follow_symlinks=True)
+    /// `interp_posix.py:1901-1904` answers a descriptor with `futimens`, which
+    /// is the call HAVE_FUTIMENS names.
+    fn utime_fd(
+        fd: i32,
+        access: std::time::Duration,
+        modified: std::time::Duration,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            let ts = |d: std::time::Duration| libc::timespec {
+                tv_sec: d.as_secs() as _,
+                tv_nsec: d.subsec_nanos() as _,
+            };
+            let times = [ts(access), ts(modified)];
+            if unsafe { libc::futimens(fd, times.as_ptr()) } < 0 {
+                return Err(io_err(std::io::Error::last_os_error(), ""));
+            }
+            return Ok(pyre_object::w_none());
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = (fd, access, modified);
+            Err(crate::PyError::not_implemented(
+                "utime: fd is unavailable on this platform",
+            ))
+        }
+    }
+
     // PyPy `interp_posix.utime` → rposix `utimensat`/`SetFileTime`.  `times` is a
     // `(atime, mtime)` pair in seconds; `ns` the same pair in integer
     // nanoseconds; the two are mutually exclusive.  Both `None` means "now".
@@ -2001,7 +2022,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             &["ns", "dir_fd", "follow_symlinks"],
             "utime",
         )?;
-        let path = crate::gateway::fsencode_path_w(pos[0])?;
+        // interp_posix.py:1860 `path_or_fd(allow_fd=rposix.HAVE_FUTIMENS or
+        // rposix.HAVE_FUTIMES)`.
+        let path = crate::gateway::fsencode_path_or_fd_w(pos[0], "utime", HAVE_FUTIMENS)?;
 
         let present = |v: PyObjectRef| (!unsafe { pyre_object::is_none(v) }).then_some(v);
         let times = pos.get(1).copied().and_then(present);
@@ -2066,6 +2089,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 (now, now)
             }
         };
+
+        if path.as_fd != -1 {
+            // interp_posix.py:1893-1900 — both modifiers reinterpret a *name*,
+            // and a descriptor is not one. 3.14, which the parity suite reads
+            // as the oracle, words the first "can't specify dir_fd without
+            // matching path" where `interp_posix.py:1895` says "can't specify
+            // both dir_fd and fd".
+            if dir_fd.is_some() {
+                return Err(crate::PyError::value_error(
+                    "utime: can't specify dir_fd without matching path",
+                ));
+            }
+            if !follow_symlinks {
+                return Err(crate::PyError::value_error(
+                    "utime: cannot use fd and follow_symlinks together",
+                ));
+            }
+            return utime_fd(path.as_fd, access, modified);
+        }
 
         #[cfg(all(windows, feature = "host_env"))]
         {
@@ -2836,9 +2878,37 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
     }
 
+    /// Where the `host_env::posix`-backed implementations below are compiled.
+    /// Elsewhere those names are the noop placeholders registered near the top
+    /// of this function, which cannot serve a descriptor.
+    const HOST_POSIX: bool = cfg!(all(unix, feature = "host_env", not(feature = "sandbox")));
+    /// The same, for the calls Windows serves through the C runtime.
+    const HOST_WINDOWS_CRT: bool =
+        cfg!(all(windows, feature = "host_env", not(feature = "sandbox")));
+
+    /// The `HAVE_*` macros `_have_functions` advertises, each spelled as the
+    /// condition under which the entry point it names really does take an open
+    /// descriptor. `os.py:140-155` reads them into `supports_fd`, so a bit set
+    /// where the call still rejects an integer hands the caller a capability it
+    /// cannot use.
+    const HAVE_FCHDIR: bool = HOST_POSIX;
+    const HAVE_FCHMOD: bool = HOST_POSIX;
+    const HAVE_FCHOWN: bool = HOST_POSIX;
+    const HAVE_FPATHCONF: bool = HOST_POSIX;
+    const HAVE_FSTATVFS: bool = HOST_POSIX;
+    /// Windows serves this one too — `_chsize_s` behind `os.ftruncate` — so
+    /// `os.truncate` belongs in `supports_fd` on both.
+    const HAVE_FTRUNCATE: bool = HOST_POSIX || HOST_WINDOWS_CRT;
+    /// `utime` reaches `futimens` and `utimensat` through `libc` rather than
+    /// `host_env`, so it needs one less condition than the rest.
+    const HAVE_FUTIMENS: bool = cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_FSTATAT` — what `DirFD` is parameterised on
-    /// (`interp_posix.py:612,660`), and what `_have_functions` advertises.
+    /// (`interp_posix.py:612,660`). `stat_at` calls `fstatat` through `libc`.
     const HAVE_FSTATAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    /// `rposix.HAVE_LINKAT` — what `link` takes its `src_dir_fd`/`dst_dir_fd`
+    /// from. Its `linkat` call sits with the rest of the `host_env`-backed
+    /// entry points, so it carries their condition and not `HAVE_FSTATAT`'s.
+    const HAVE_LINKAT: bool = HOST_POSIX;
 
     /// `_DirFD_Unavailable` (`interp_posix.py:285-292`) names the argument and
     /// not the call it was passed to, which is also how
@@ -3960,7 +4030,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("chdir() requires 1 argument"));
                     }
-                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    // interp_posix.py:910-918 dispatches `rposix.chdir` with
+                    // `allow_fd_fn=os.fchdir` when `rposix.HAVE_FCHDIR`.
+                    let path =
+                        crate::gateway::fsencode_path_or_fd_w(args[0], "chdir", HAVE_FCHDIR)?;
+                    if path.as_fd != -1 {
+                        host_posix::fchdir(path.as_fd).map_err(|e| io_err(e, ""))?;
+                        return Ok(pyre_object::w_none());
+                    }
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     host_posix::chdir(&c_path)
@@ -4574,7 +4651,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("statvfs() requires 1 argument"));
                     }
-                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    // interp_posix.py:704-719 dispatches `rposix_stat.statvfs`
+                    // with `allow_fd_fn=rposix_stat.fstatvfs`.
+                    let path =
+                        crate::gateway::fsencode_path_or_fd_w(args[0], "statvfs", HAVE_FSTATVFS)?;
+                    if path.as_fd != -1 {
+                        let info = host_posix::statvfs_fd(path.as_fd).map_err(|e| io_err(e, ""))?;
+                        return Ok(statvfs_to_obj(info));
+                    }
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     let info = host_posix::statvfs_path(&c_path)
@@ -4746,13 +4830,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "chmod",
                 |args| {
+                    use std::os::fd::BorrowedFd;
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("chmod() requires 2 arguments"));
                     }
-                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    // interp_posix.py:1228-1243 reads a `chmod` whose path did
+                    // not fsencode as a descriptor and answers it with
+                    // `os.fchmod`.
+                    let path =
+                        crate::gateway::fsencode_path_or_fd_w(args[0], "chmod", HAVE_FCHMOD)?;
                     // `posix.chmod` unwraps `mode` as `c_int`, so a non-integer
                     // raises TypeError instead of reinterpreting its layout.
                     let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
+                    if path.as_fd != -1 {
+                        let bfd = unsafe { BorrowedFd::borrow_raw(path.as_fd) };
+                        host_posix::fchmod(bfd, mode).map_err(|e| io_err(e, ""))?;
+                        return Ok(pyre_object::w_none());
+                    }
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     let ret = unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) };
@@ -4839,7 +4933,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // object's error, not a statement that the argument was the wrong
             // type.  Rewriting every failure into a `TypeError` here would also
             // swallow the `UnicodeEncodeError` a lone surrogate produces.
-            let path = crate::gateway::fsencode_path_w(path_obj)?;
+            let path = crate::gateway::fsencode_path_or_fd_w(
+                path_obj,
+                name,
+                // `lchown` is `path_t(allow_fd=0)` — only `chown` reads an
+                // integer as a descriptor (`interp_posix.py:2475-2481`).
+                default_follow && HAVE_FCHOWN,
+            )?;
             // `_Py_Uid_Converter` / `_Py_Gid_Converter`: `uid_t` is unsigned, yet
             // -1 is always accepted as the "leave unchanged" sentinel.  Only
             // that one value means unchanged; every other id is judged by
@@ -4885,6 +4985,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Some(v) => crate::baseobjspace::is_true(v)?,
                 None => default_follow,
             };
+            if path.as_fd != -1 {
+                // interp_posix.py:2492-2494 — a descriptor already names the
+                // file, so the modifier that would reinterpret a name cannot
+                // apply. Upstream spells this one "cannnot"; 3.14, which the
+                // parity suite reads as the oracle, spells it "cannot".
+                if !follow_symlinks {
+                    return Err(crate::PyError::value_error(format!(
+                        "{name}: cannot use fd and follow_symlinks together"
+                    )));
+                }
+                let bfd = unsafe { BorrowedFd::borrow_raw(path.as_fd) };
+                host_posix::fchown(bfd, uid, gid).map_err(|e| io_err(e, ""))?;
+                return Ok(pyre_object::w_none());
+            }
             // `fchownat` with `AT_FDCWD` is the `chown` / `lchown` pair:
             // the flagless call follows the final symlink, `AT_SYMLINK_NOFOLLOW`
             // does not.
@@ -5793,14 +5907,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("pathconf() requires path, name"));
                     }
-                    let path = crate::gateway::fsencode_path_w(args[0])?;
-                    let cpath = std::ffi::CString::new(path.as_bytes.as_slice()).map_err(|_| {
-                        crate::PyError::value_error("pathconf: embedded null in path")
-                    })?;
+                    // interp_posix.py:2420-2433 `path_or_fd(allow_fd=hasattr(os,
+                    // 'fpathconf'))`, whose body converts the name before it
+                    // reads `path.as_fd != -1`.
+                    let path =
+                        crate::gateway::fsencode_path_or_fd_w(args[0], "pathconf", HAVE_FPATHCONF)?;
                     let name = confname_arg(args[1])?;
-                    match host_posix::pathconf(&cpath, name)
-                        .map_err(|e| io_err_with_filename(e, path.w_path()))?
-                    {
+                    let limit = if path.as_fd != -1 {
+                        host_posix::fpathconf(path.as_fd, name).map_err(|e| io_err(e, ""))?
+                    } else {
+                        let cpath =
+                            std::ffi::CString::new(path.as_bytes.as_slice()).map_err(|_| {
+                                crate::PyError::value_error("pathconf: embedded null in path")
+                            })?;
+                        host_posix::pathconf(&cpath, name)
+                            .map_err(|e| io_err_with_filename(e, path.w_path()))?
+                    };
+                    match limit {
                         Some(v) => Ok(pyre_object::w_int_new(v as i64)),
                         None => Ok(pyre_object::w_none()),
                     }
