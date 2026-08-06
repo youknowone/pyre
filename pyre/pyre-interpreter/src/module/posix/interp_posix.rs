@@ -3326,8 +3326,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             None => default_follow,
         };
         // interp_posix.py:634-644 `do_stat` tests the descriptor first: with one
-        // in hand neither other argument has anything to apply to, and both
-        // rejections precede the platform's dir_fd availability.
+        // in hand neither other argument has anything to apply to. Only the
+        // `follow_symlinks` rejection precedes the platform's dir_fd
+        // availability, though — `_DirFD_Unavailable` (`interp_posix.py:285-292`,
+        // the `!HAVE_FSTATAT` arm above) turns the argument away while
+        // unwrapping it, a step earlier than this, so where `fstatat` does not
+        // exist a descriptor passed with `dir_fd` reports the platform rather
+        // than the conflict.
         if path.as_fd != -1 {
             if dir_fd.is_some() {
                 // 3.14 words this "can't specify dir_fd without matching
