@@ -68,27 +68,9 @@ pub struct ObjectHeader {
 /// `make_vref_field_descr` (`Type::Ref` per
 /// `optimizeopt/virtualize.rs`) agree on the slot type.
 ///
-/// TODO (GC trace).  Upstream traces both fields as
-/// real GC pointers; pyre traces only `forced` — the type registration
-/// in `eval.rs` derives that one entry from `offset_of!(JitVirtualRef,
-/// forced)`, so it follows the target's pointer width.  The reason
-/// `virtual_token` is left out is that every value it ever holds at
-/// runtime falls outside the GC heap:
-///   - `TOKEN_NONE` — null, safe to walk.
-///   - `token_tracing_rescall()` — program-lifetime leaked
-///     `Box<ObjectHeader>` (see `allocate_tracing_rescall_dummy` /
-///     `TRACING_RESCALL_DUMMY_PTR` below), host-heap allocated and
-///     never freed; not a GC-allocated `_dummy` GcStruct.
-///   - an active JITFRAME address — `libc::calloc`'d on a host-side
-///     pool, not nursery/oldgen.
-/// Routing it through `trace_and_update_object` would either be a
-/// no-op or trip a poison-address check.  The optimizer-side
-/// `Type::Ref` is intentionally retained so that
-/// `setfield_gc_r` / `getfield_gc_r` ops emit correctly during
-/// tracing; only the collector's view of the slot diverges.
-/// Convergence path: would require allocating `_dummy` via the GC
-/// AND routing JITFRAMEs through GC-managed allocation, both outside
-/// the current parity scope.
+/// Both fields are traced GC slots. `virtual_token` contains null, the
+/// prebuilt `JITFRAME_DUMMY`, or a JITFRAME GCREF, matching
+/// `virtualref.py:17-20` and `virtualizable.py:326-330`.
 #[repr(C)]
 pub struct JitVirtualRef {
     /// `('super', rclass.OBJECT)` — typeptr slot at offset 0.
@@ -158,10 +140,10 @@ pub use crate::jit::InvalidVirtualRef;
 /// Returns raw pointer; caller owns the allocation.
 ///
 /// `lltype.malloc(self.JIT_VIRTUAL_REF)` is a GC allocation, and it has to be
-/// one here too: `forced` is the sole traced slot of the type registered with
-/// [`set_vref_gc_type_id`], so once `ExecutionContext.topframeref` holds
-/// the vref instead of the frame, this object is the only edge keeping the
-/// frame it wraps reachable.  A host-heap allocation is invisible to the
+/// one here too: `forced` is a traced slot of the type registered with
+/// [`set_vref_gc_type_id`], so once `ExecutionContext.topframeref` holds the
+/// vref instead of the frame, this edge keeps the frame it wraps reachable.
+/// A host-heap allocation is invisible to the
 /// collector — the root walker's `gc_current_object_address` early-out returns
 /// an unowned address unchanged — which drops that edge and lets a live frame
 /// be collected out from under the walk.
@@ -218,19 +200,44 @@ pub const JITFRAME_DUMMY_VTABLE: usize = 0x4A46_444D; // "JFDM"
 /// raw-pointer types are not.
 static TRACING_RESCALL_DUMMY_PTR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+const TRACING_RESCALL_DUMMY_GC_TYPE_ID_UNSET: u32 = u32::MAX;
+static TRACING_RESCALL_DUMMY_GC_TYPE_ID: AtomicU32 =
+    AtomicU32::new(TRACING_RESCALL_DUMMY_GC_TYPE_ID_UNSET);
+
+/// Publish the registered leaf type used by the prebuilt
+/// `virtualizable.py:326-330 JITFRAME_DUMMY` object.
+pub fn set_tracing_rescall_dummy_gc_type_id(type_id: u32) {
+    TRACING_RESCALL_DUMMY_GC_TYPE_ID.store(type_id, Ordering::Relaxed);
+}
+
 /// `virtualizable.py:327 _dummy = lltype.malloc(_DUMMY)` — allocate
-/// the singleton dummy `JITFRAME_DUMMY` object whose address serves
-/// as the tracing sentinel.  Pyre's `Box::into_raw(Box::new(...))`
-/// produces a heap-allocated, stable, non-null address; the
-/// `Box::leak` semantic (the box is intentionally never freed)
-/// matches upstream's `immortal=True`-equivalent lifetime — `_dummy`
-/// is allocated once at first use and stays live for the rest of
-/// the program.
+/// the singleton dummy `JITFRAME_DUMMY` object whose address serves as the
+/// tracing sentinel. The object is allocated in the GC old generation with a
+/// registered leaf type and held by a program-lifetime root, giving it the
+/// prebuilt lifetime of `_dummy` while remaining a legal GCREF.
 fn allocate_tracing_rescall_dummy() -> *mut u8 {
-    let header = Box::new(ObjectHeader {
+    let value = ObjectHeader {
         typeptr: JITFRAME_DUMMY_VTABLE,
-    });
-    Box::into_raw(header) as *mut u8
+    };
+    let type_id = TRACING_RESCALL_DUMMY_GC_TYPE_ID.load(Ordering::Relaxed);
+    #[cfg(test)]
+    if type_id == TRACING_RESCALL_DUMMY_GC_TYPE_ID_UNSET {
+        // Unit tests exercise the token protocol without installing a GC.
+        return Box::into_raw(Box::new(value)) as *mut u8;
+    }
+    assert_ne!(
+        type_id, TRACING_RESCALL_DUMMY_GC_TYPE_ID_UNSET,
+        "JITFRAME_DUMMY type must be registered before the tracing sentinel is used",
+    );
+    let dummy = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<ObjectHeader>());
+    assert!(!dummy.is_null(), "JITFRAME_DUMMY old-gen allocation failed");
+    unsafe { std::ptr::write(dummy.0 as *mut ObjectHeader, value) };
+
+    // `_dummy` is prebuilt and immortal upstream. A leaked root slot gives the
+    // collector the same lifetime; old-gen makes its identity stable.
+    let root = Box::into_raw(Box::new(dummy));
+    unsafe { majit_gc::gc_add_root(root) };
+    dummy.0 as *mut u8
 }
 
 /// Token value used during tracing when a residual call is in progress.
@@ -238,20 +245,10 @@ fn allocate_tracing_rescall_dummy() -> *mut u8 {
 /// ```python
 /// TOKEN_TRACING_RESCALL = lltype.cast_opaque_ptr(llmemory.GCREF, _dummy)
 /// ```
-/// Pyre returns the address of a real heap-allocated `ObjectHeader`
-/// initialised lazily on first call; subsequent calls return the
-/// same address (program-lifetime immortal).
-///
-/// TODO (GC registration).  Upstream's `_dummy`
-/// is a real GcStruct that the collector knows about; pyre's leaked
-/// `Box<ObjectHeader>` is host-allocated memory the GC has no
-/// record of.  The adaptation is internally consistent because
-/// `virtual_token` is not GC-traced either (see `JitVirtualRef`
-/// doc-comment); if the slot ever becomes GC-traced, the `_dummy`
-/// allocation must move to the GC heap and a JITFRAME_DUMMY type
-/// must be registered with the collector.
+/// The returned address is a registered, rooted GC leaf and remains stable for
+/// the process lifetime.
 #[inline]
-fn token_tracing_rescall() -> *mut u8 {
+pub fn token_tracing_rescall() -> *mut u8 {
     *TRACING_RESCALL_DUMMY_PTR.get_or_init(|| allocate_tracing_rescall_dummy() as usize) as *mut u8
 }
 

@@ -19,19 +19,17 @@ use std::sync::{Arc, Weak};
 
 use majit_ir::{DescrRef, Type, descr::descr_identity};
 
-/// Sentinel value for TOKEN_TRACING_RESCALL.
-///
-/// When the token equals this value, it means JIT tracing is active and
-/// a residual call is in progress. If the callee touches the virtualizable,
-/// it will force the token and clear it.
-///
-/// Any non-zero, non-RESCALL value is an active JIT frame pointer.
-pub const TOKEN_TRACING_RESCALL: u64 = u64::MAX;
+/// `virtualizable.py:330 TOKEN_TRACING_RESCALL`: the GCREF address of the
+/// prebuilt `JITFRAME_DUMMY` object shared with virtual references.
+#[inline]
+pub fn token_tracing_rescall() -> u64 {
+    crate::virtualref::token_tracing_rescall() as usize as u64
+}
 
 /// Token states for virtualizable objects.
 ///
 /// TOKEN_NONE (0): not in JIT.
-/// TOKEN_TRACING_RESCALL (u64::MAX): tracing + residual call in progress.
+/// TOKEN_TRACING_RESCALL (prebuilt GCREF): tracing + residual call in progress.
 /// Any other non-zero value: active JIT frame pointer (FORCE_TOKEN).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VableToken {
@@ -49,7 +47,7 @@ impl VableToken {
     pub fn from_raw(raw: u64) -> Self {
         match raw {
             0 => VableToken::None,
-            TOKEN_TRACING_RESCALL => VableToken::TracingRescall,
+            other if other == token_tracing_rescall() => VableToken::TracingRescall,
             other => VableToken::Active(other),
         }
     }
@@ -58,7 +56,7 @@ impl VableToken {
     pub fn to_raw(self) -> u64 {
         match self {
             VableToken::None => 0,
-            VableToken::TracingRescall => TOKEN_TRACING_RESCALL,
+            VableToken::TracingRescall => token_tracing_rescall(),
             VableToken::Active(ptr) => ptr,
         }
     }
@@ -736,7 +734,7 @@ impl VirtualizableInfo {
             // The all-ones sentinel truncates to `usize::MAX` at that width.
             let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             assert_eq!(*token_ptr, 0, "token should be NONE before residual call");
-            *token_ptr = TOKEN_TRACING_RESCALL as usize;
+            *token_ptr = token_tracing_rescall() as usize;
         }
     }
 
@@ -757,7 +755,7 @@ impl VirtualizableInfo {
             let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             if *token_ptr != 0 {
                 // Not forced — still TOKEN_TRACING_RESCALL
-                assert_eq!(*token_ptr, TOKEN_TRACING_RESCALL as usize);
+                assert_eq!(*token_ptr, token_tracing_rescall() as usize);
                 *token_ptr = 0; // Clear back to TOKEN_NONE
                 false
             } else {
@@ -782,7 +780,7 @@ impl VirtualizableInfo {
         unsafe {
             let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             let token = *token_ptr;
-            if token == TOKEN_TRACING_RESCALL as usize {
+            if token == token_tracing_rescall() as usize {
                 // During tracing — just clear the marker
                 *token_ptr = 0;
             } else if token != 0 {
@@ -804,15 +802,7 @@ impl VirtualizableInfo {
         unsafe {
             let token_ptr = obj_ptr.add(self.token_offset) as *const usize;
             let raw = *token_ptr;
-            // The all-ones sentinel is stored width-truncated (`usize::MAX`
-            // on wasm32); widen it back to the canonical `u64::MAX` so
-            // `from_raw` matches.
-            let raw_u64 = if raw == TOKEN_TRACING_RESCALL as usize {
-                TOKEN_TRACING_RESCALL
-            } else {
-                raw as u64
-            };
-            VableToken::from_raw(raw_u64)
+            VableToken::from_raw(raw as u64)
         }
     }
 
@@ -827,6 +817,12 @@ impl VirtualizableInfo {
         unsafe {
             let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             *token_ptr = token.to_raw() as usize;
+            if matches!(token, VableToken::Active(_)) {
+                // Host-side active-token stores have the same generational
+                // obligation as compiled SETFIELD_GC stores. Unmanaged test
+                // objects are ignored by the barrier hook.
+                majit_gc::gc_write_barrier(majit_ir::GcRef(obj_ptr as usize));
+            }
         }
     }
 
@@ -1564,7 +1560,7 @@ unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool
 ///
 /// Token semantics:
 /// - TOKEN_NONE (0): not in JIT, nothing to do.
-/// - TOKEN_TRACING_RESCALL (u64::MAX): tracing + residual call, just clear.
+/// - TOKEN_TRACING_RESCALL (prebuilt GCREF): tracing + residual call, just clear.
 /// - Any other non-zero value: active JIT frame pointer. Call `force_fn`
 ///   with the frame pointer, which must clear the token itself.
 ///
@@ -2514,15 +2510,16 @@ mod tests {
 
     #[test]
     fn test_vable_token_roundtrip() {
+        let tracing_rescall = token_tracing_rescall();
         assert_eq!(VableToken::from_raw(0), VableToken::None);
         assert_eq!(
-            VableToken::from_raw(TOKEN_TRACING_RESCALL),
+            VableToken::from_raw(tracing_rescall),
             VableToken::TracingRescall
         );
         assert_eq!(VableToken::from_raw(0xBEEF), VableToken::Active(0xBEEF));
 
         assert_eq!(VableToken::None.to_raw(), 0);
-        assert_eq!(VableToken::TracingRescall.to_raw(), TOKEN_TRACING_RESCALL);
+        assert_eq!(VableToken::TracingRescall.to_raw(), tracing_rescall);
         assert_eq!(VableToken::Active(0xBEEF).to_raw(), 0xBEEF);
     }
 
@@ -2577,7 +2574,7 @@ mod tests {
         let obj_ptr = obj.as_mut_ptr();
 
         unsafe {
-            *(obj_ptr as *mut u64) = TOKEN_TRACING_RESCALL;
+            *(obj_ptr as *mut u64) = token_tracing_rescall();
 
             let mut called = false;
             info.force_now(obj_ptr, |_| {
@@ -2656,7 +2653,7 @@ mod tests {
         let obj_ptr = obj.as_mut_ptr();
 
         unsafe {
-            *(obj_ptr as *mut u64) = TOKEN_TRACING_RESCALL;
+            *(obj_ptr as *mut u64) = token_tracing_rescall();
 
             let mut called = false;
             info.clear_vable_token(obj_ptr, |_| {

@@ -1086,11 +1086,13 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 /// Forwarded (mirrors `walk_pyframe_roots` eval.rs:496-556):
 ///   - `f_backref` — the parent frame pointer, or the `JitVirtualRef` standing
 ///     in for it once the JIT virtualizes an inlined callee. The vref is a GC
-///     object registered with `forced` as its one traced slot, so forwarding
+///     object whose `forced` and `virtual_token` slots are traced, so forwarding
 ///     this slot greys the vref and the collector reaches the parent frame
 ///     through it; no hop is needed here.
 ///   - `pycode` — visited to match the walker; inert while code objects
 ///     are Box-immortal (`is_nursery_object_start` short-circuits).
+///   - `vable_token` — null, the prebuilt tracing sentinel, or the active
+///     JITFRAME GCREF (`rvirtualizable.py:29`).
 ///   - `locals_cells_stack_w` — the array pointer.  A GC-managed nursery
 ///     block forwards through its field slot and its type-9 walker owns the
 ///     items. An old-gen GC block also visits the field slot and walks its
@@ -1111,6 +1113,7 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     f(&mut frame.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.f_backref as *mut *mut PyFrame as *mut majit_ir::GcRef);
     f(&mut frame.pycode as *mut *const () as *mut majit_ir::GcRef);
+    f(&mut frame.vable_token as *mut usize as *mut majit_ir::GcRef);
 
     // locals_cells_stack_w: visit the field slot for every GC array so major
     // marking reaches it. A nursery array is subsequently scanned by its own
@@ -1387,41 +1390,20 @@ fn build_gc() -> Box<MiniMarkGC> {
     // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
     let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
     debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
-    // pyre allocates jitframes via `libc::calloc` (not nursery/oldgen),
-    // so the collector's standard `walk_jf_roots` visitor can't
-    // route them through `trace_and_update_object`. Register a
-    // host-side tracer that invokes `jitframe_trace` directly so
-    // Refs pinned to frame slots are visible to GC across minor
-    // collections triggered by CallMallocNursery slow paths.
+    // Dynasm allocates jitframes off-GC, so its shadow-stack roots still need
+    // the host-side tracer. Cranelift's nursery JITFRAMEs use the registered
+    // custom trace directly. Off-GC addresses are inert when encountered in a
+    // traced GCREF slot, preserving the dynasm representation.
     majit_gc::shadow_stack::register_libc_jitframe_tracer(pyre_libc_jitframe_tracer);
     // virtualref.py — JIT_VIRTUAL_REF as a proper GC type.
     // Layout: three pointer-sized words — super_.typeptr | virtual_token |
-    // forced — so the size and the traced offset below are both derived from
-    // the struct rather than spelled out for one word width.
-    //
-    // Note (GC trace divergence).  Upstream
-    // `virtualref.py:17-20` declares both `virtual_token` and
-    // `forced` as GC slots (`llmemory.GCREF` / `OBJECTPTR`); pyre
-    // registers only `forced` in `gc_ptr_offsets`.
-    // The `virtual_token` slot is intentionally outside the GC's
-    // view because every runtime value it can hold lives outside
-    // any GC heap: TOKEN_NONE (null), `token_tracing_rescall()`
-    // (program-lifetime leaked `Box<ObjectHeader>` dummy lazily
-    // allocated by `allocate_tracing_rescall_dummy` and cached in
-    // `TRACING_RESCALL_DUMMY_PTR`), and active JITFRAME addresses
-    // (libc::calloc'd, see `register_libc_jitframe_tracer` above).
-    // The optimizer-side descriptor at
-    // `majit-metainterp/src/optimizeopt/virtualize.rs:make_vref_field_descr`
-    // still uses `Type::Ref` so `setfield_gc_r` / `getfield_gc_r`
-    // emit correctly; only the collector's view of the slot
-    // diverges.  Convergence requires both `_dummy` and JITFRAME
-    // allocation to move under the GC.
+    // forced. `virtualref.py:17-20` declares both payload fields as GC slots.
     let vref_tid = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(
         std::mem::size_of::<majit_metainterp::virtualref::JitVirtualRef>(),
-        vec![std::mem::offset_of!(
-            majit_metainterp::virtualref::JitVirtualRef,
-            forced
-        )],
+        vec![
+            std::mem::offset_of!(majit_metainterp::virtualref::JitVirtualRef, virtual_token),
+            std::mem::offset_of!(majit_metainterp::virtualref::JitVirtualRef, forced),
+        ],
     ));
     debug_assert_eq!(vref_tid, VREF_GC_TYPE_ID);
     // Tell the virtualref optimizer about the registered type id.
@@ -3647,6 +3629,14 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::typeobject::NameStorage>,
         pyre_object::typeobject::set_name_storage_gc_type_id,
     );
+    // `virtualizable.py:326-330 _DUMMY`: a registered GC leaf whose address is
+    // the TOKEN_TRACING_RESCALL sentinel. Append it so established ids do not
+    // move, then publish the id before any tracing protocol can request it.
+    let tracing_rescall_dummy_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        std::mem::size_of::<majit_metainterp::virtualref::ObjectHeader>(),
+        vec![],
+    ));
+    majit_metainterp::virtualref::set_tracing_rescall_dummy_gc_type_id(tracing_rescall_dummy_tid);
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges

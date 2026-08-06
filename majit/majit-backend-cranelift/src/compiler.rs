@@ -4698,21 +4698,13 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> IndexSet<u32> {
     known
 }
 
-fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> IndexSet<u32> {
-    // FORCE_TOKEN (resoperation.py:1090 'FORCE_TOKEN/0/r') yields the raw
-    // jitframe handle. Its Ref result is the frame pointer, not a heap GCREF,
-    // so it is excluded from the ref-root slots the GC traces and relocates.
-    let mut force_tokens = IndexSet::new();
-    for (op_idx, op) in ops.iter().enumerate() {
-        if op.pos.get().is_none() {
-            continue;
-        }
-        if op.opcode == OpCode::ForceToken {
-            let result_var = op_var_index(op, op_idx, inputargs.len()) as u32;
-            force_tokens.insert(result_var);
-        }
-    }
-    force_tokens
+fn build_force_token_set(_inputargs: &[InputArg], _ops: &[Op]) -> IndexSet<u32> {
+    // FORCE_TOKEN is a GCREF to the active JITFRAME
+    // (`virtualizable.py:315-318`, `resoperation.py:1090`). Keep its in-frame
+    // copies in the ordinary Ref root set so moving collectors update them.
+    // The empty compatibility set leaves the existing exit-layout plumbing in
+    // place while giving FORCE_TOKEN the same treatment as every other Ref.
+    IndexSet::new()
 }
 
 /// Auxiliary LABEL type overrides on top of `OpTypeIndex`.
@@ -8753,9 +8745,10 @@ impl CraneliftBackend {
         //    overwrite by index.  That disjoint home is why non-refs (incl.
         //    inputargs) are safe to demote: the ref-inputarg staleness argument
         //    does not apply because the home is re-seeded on every LABEL entry
-        //    edge (preamble fall-through and loader re-entry).  Floats, SIMD
-        //    lanes, and force tokens are excluded — an 8-byte home cannot hold a
-        //    vector and float typing must round-trip through resume.
+        //    edge (preamble fall-through and loader re-entry). Floats and SIMD
+        //    lanes are excluded — an 8-byte home cannot hold a vector and float
+        //    typing must round-trip through resume. FORCE_TOKEN is a Ref and uses
+        //    the forwarded ref-root home.
         if !loop_phi_keep_by_label.is_empty() {
             let input_idxs: indexmap::IndexSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
             loop_phi_keep_by_label.retain(|&label_idx, keep| {
