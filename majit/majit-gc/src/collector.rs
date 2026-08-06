@@ -9,6 +9,7 @@
 use indexmap::IndexSet;
 use majit_ir::GcRef;
 use std::collections::VecDeque;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::address_dict::AddressMap;
@@ -83,6 +84,52 @@ pub struct GcConfig {
     pub taggedpointers: bool,
 }
 
+/// The variables [`GcConfig`] and [`MiniMarkGC::with_config`] resolve against,
+/// for an embedder that has to hand its environment over rather than share it.
+///
+/// Published here so such a host does not keep its own copy of the list in step
+/// with the collector; `PYPY_GC_DEBUG` and the tracing knobs are absent because
+/// nothing in this file reads them.
+pub const GC_ENV_NAMES: &[&str] = &[
+    "PYPY_GC_NURSERY",
+    "PYPY_GC_INCREMENT_STEP",
+    "PYPY_GC_MAJOR_COLLECT",
+    "PYPY_GC_GROWTH",
+    "PYPY_GC_MIN",
+    "PYPY_GC_MAX",
+    "PYPY_GC_MAX_DELTA",
+];
+
+/// Environment an embedder supplies because the platform gives the process
+/// none. Read only where `std::env` misses, so a host that has a real
+/// environment resolves against it exactly as before.
+///
+/// `wasm32-unknown-unknown` is the case that needs it: `std::env::var` there
+/// always fails, so every name in [`GC_ENV_NAMES`] reads as unset and a guest
+/// runs the built-in defaults no matter what its host was configured with. The
+/// interpreter's launcher options have the same problem and the same answer
+/// (`pyre-wasm`'s `LAUNCH_ENV`).
+static SUPPLIED_ENV: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
+/// Install the environment [`GC_ENV_NAMES`] resolves against when the process
+/// has none. Call before the first allocation: the values are read once, when
+/// the collector is built.
+pub fn set_supplied_env(entries: Vec<(String, String)>) {
+    *SUPPLIED_ENV.write().unwrap() = entries;
+}
+
+/// `std::env::var`, falling back to what the embedder supplied.
+fn env_var(varname: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(varname) {
+        return Some(value);
+    }
+    let supplied = SUPPLIED_ENV.read().unwrap();
+    supplied
+        .iter()
+        .find(|(name, _)| name == varname)
+        .map(|(_, value)| value.clone())
+}
+
 /// env.py:17-36 `_read_float_and_factor_from_env`. Parse `varname` as a float
 /// with an optional `k`/`m`/`g` size suffix (optionally followed by `b`/`B`),
 /// returning `(value, factor)`. `None` mirrors PyPy's `(0.0, 0)` absent /
@@ -91,7 +138,7 @@ pub struct GcConfig {
 /// non-finite handling happens at the `int`/`r_uint` conversion sites, as
 /// upstream where `int(inf)`/`r_uint(inf)` raise.
 fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
-    let raw = std::env::var(varname).ok()?;
+    let raw = env_var(varname)?;
     let mut value = raw.trim();
     if value.is_empty() {
         return None;
@@ -5337,6 +5384,29 @@ mod tests {
     use super::*;
 
     static SHADOW_STACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A supplied environment answers a name the process does not define, and
+    /// yields to one it does. The name is not in [`GC_ENV_NAMES`], so a
+    /// concurrently built collector cannot see this table.
+    #[test]
+    fn supplied_env_fills_in_only_what_the_process_lacks() {
+        let absent = "PYRE_TEST_SUPPLIED_ENV_ABSENT";
+        let present = "PYRE_TEST_SUPPLIED_ENV_PRESENT";
+        // SAFETY: single-threaded within this test; the names are unique to it.
+        unsafe { std::env::set_var(present, "2m") };
+
+        assert_eq!(read_uint_from_env(absent), None);
+        set_supplied_env(vec![
+            (absent.to_string(), "1m".to_string()),
+            (present.to_string(), "4m".to_string()),
+        ]);
+        assert_eq!(read_uint_from_env(absent), Some(1024 * 1024));
+        assert_eq!(read_uint_from_env(present), Some(2 * 1024 * 1024));
+
+        set_supplied_env(Vec::new());
+        assert_eq!(read_uint_from_env(absent), None);
+        unsafe { std::env::remove_var(present) };
+    }
 
     /// Helper: create a GC with a small nursery for testing.
     fn test_gc(nursery_size: usize) -> MiniMarkGC {

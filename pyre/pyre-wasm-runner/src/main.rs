@@ -450,6 +450,50 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         }
     }
 
+    // The environment the collector sizes itself from, forwarded the same way
+    // and for the same reason. It is not a diagnostic knob: `PYPY_GC_MIN` and
+    // `PYPY_GC_NURSERY` fix where the major-collection threshold falls, the
+    // major step arms the eval-breaker word, and every compiled loop's back edge
+    // polls that word through a real guard — so a guest that cannot read them
+    // counts a different number of guard failures than the native backends run
+    // beside it, from the same settings. Absent on a module predating the
+    // export, which then keeps its built-in defaults.
+    let gc_env_names = instance
+        .get_typed_func::<(), u64>(&mut store, "pyre_gc_env_names")
+        .ok();
+    let set_gc_env = instance
+        .get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_gc_env")
+        .ok();
+    if let (Some(names), Some(set_gc_env)) = (gc_env_names, set_gc_env) {
+        let packed = names.call(&mut store, ())?;
+        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
+        let mut buf = vec![0u8; nlen as usize];
+        memory.read(&store, nptr as usize, &mut buf)?;
+        dealloc.call(&mut store, (nptr, nlen))?;
+
+        // `env::var`, not `var_os`: the guest parses these as numbers, so a
+        // value that does not decode could not have been one and is left unset
+        // exactly as it would be natively.
+        let blob = String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\0");
+
+        let blen = blob.len() as u32;
+        if blen != 0 {
+            let p = alloc.call(&mut store, blen)?;
+            memory.write(&mut store, p as usize, blob.as_bytes())?;
+            set_gc_env.call(&mut store, (p, blen))?;
+            dealloc.call(&mut store, (p, blen))?;
+        }
+    }
+
     // Name the script so the guest compiles it under its real path: that is
     // what a traceback prints, what its source-line lookup reads back through
     // `pyre_host.host_read`, and the directory that heads `sys.path`. Absent

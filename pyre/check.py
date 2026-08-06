@@ -465,6 +465,11 @@ def pyre_env():
     # (0.125 * total memory) enters only as an upper bound at collector.rs:3570
     # and the `min_heap_size` floor is applied after it (:2452), so the floor
     # wins on every host.
+    #
+    # Both pins reach the wasm backend only because `pyre-wasm-runner` hands
+    # them to the guest explicitly (`pyre_set_gc_env`): a wasm32-unknown-unknown
+    # module's `std::env` is permanently empty, so setting them here does
+    # nothing on its own there.
     env.setdefault("PYPY_GC_MIN", str(256 * 1024 * 1024))
     # Keep the bench directory off `sys.path` (`-P`), so the jit-stats counters
     # describe the fixture rather than the directory it happens to sit in.

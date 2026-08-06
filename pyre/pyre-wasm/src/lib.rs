@@ -793,9 +793,9 @@ pub fn run_python(source: &str) -> String {
 ///      and `pyre_exit_code()` → the status to exit with.
 ///
 /// `pyre_set_script_path(ptr, len)` may precede step 2 to name the file the
-/// source came from, and `pyre_set_launch_env(ptr, len)` to supply the
-/// environment the launcher options resolve against — the guest has none of
-/// its own.
+/// source came from, `pyre_set_launch_env(ptr, len)` to supply the environment
+/// the launcher options resolve against, and `pyre_set_gc_env(ptr, len)` the
+/// one the collector sizes itself from — the guest has none of its own.
 #[cfg(feature = "wasm-host")]
 mod host_abi {
     use super::run_python_impl;
@@ -924,6 +924,41 @@ mod host_abi {
                 .join("\0")
                 .into_bytes(),
         )
+    }
+
+    /// Supply the `PYPY_GC_*` variables the collector sizes itself from, in the
+    /// same NUL-separated `NAME=VALUE` form as [`pyre_set_launch_env`]. The
+    /// guest has no environment, so without this the nursery, the major-collection
+    /// threshold and the growth rates all take their built-in defaults however
+    /// the host was configured — and the threshold decides when the collector
+    /// arms the eval-breaker word, which every compiled loop's back edge polls
+    /// through a real guard. `pyre_gc_env_names` lists the names that are read.
+    ///
+    /// The collector reads them once, when it is built, which the first
+    /// allocation does — so this must precede `pyre_run_python`, not merely the
+    /// script's own first line.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_set_gc_env(ptr: *const u8, len: usize) {
+        let Some(blob) = guest_str(ptr, len) else {
+            return;
+        };
+        let entries = blob
+            .split('\0')
+            .filter_map(|record| {
+                let (name, value) = record.split_once('=')?;
+                (!name.is_empty()).then(|| (name.to_string(), value.to_string()))
+            })
+            .collect();
+        pyre_jit::set_gc_supplied_env(entries);
+    }
+
+    /// The names [`pyre_set_gc_env`] is worth being given, as NUL-separated
+    /// records in a buffer the host must free with `pyre_dealloc`. Returned for
+    /// the same reason as [`pyre_launch_env_names`]: so a host does not keep its
+    /// own copy of the list in step with the collector.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_gc_env_names() -> u64 {
+        pack_into_guest(pyre_jit::GC_ENV_NAMES.join("\0").into_bytes())
     }
 
     /// Set `-P` / PYTHONSAFEPATH for the next `pyre_run_python`, suppressing the

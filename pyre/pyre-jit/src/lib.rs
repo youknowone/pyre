@@ -67,6 +67,12 @@ pub fn fbw_diag_counter(i: usize) -> u64 {
     pyre_jit_trace::trace::fbw_diag::get(i)
 }
 
+/// The `PYPY_GC_*` variables the collector sizes itself from, and the setter
+/// for an embedder whose platform hands the process no environment to read them
+/// out of. Re-exported so such a host reaches them through the crate it already
+/// builds the interpreter with.
+pub use majit_gc::collector::{GC_ENV_NAMES, set_supplied_env as set_gc_supplied_env};
+
 /// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)` of the wasm
 /// backend's GC on this thread. Lets the wasm runner attribute guest
 /// linear-memory growth to GC-retained objects vs. host-heap allocations.
