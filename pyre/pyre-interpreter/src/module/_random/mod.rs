@@ -20,23 +20,37 @@ const MAGIC_CONSTANT_B: u32 = 19650218;
 const MAGIC_CONSTANT_C: u32 = 1664525;
 const MAGIC_CONSTANT_D: u32 = 1566083941;
 
-pub(crate) struct Random {
+/// `rrandom.py:23 class Random` is an ordinary instance that
+/// `interp_random.py:21` allocates on its own — `self._rnd = rrandom.Random()`
+/// — so the twister lives *behind* a reference rather than inside its holder.
+/// Keeping that shape is what makes the holder's `self.rnd` field readable:
+/// borrowing an inline aggregate field has no IR spelling, and the front-end's
+/// `&x ≡ x` model would hand `genrand32` the first word of `state` where its
+/// address was meant.  It owns no object references, so the collector forwards
+/// nothing but its header.
+#[crate::pyre_class("_random._mersenne_twister", static_name = "MERSENNE_TWISTER")]
+pub struct Random {
     state: [u32; N],
     index: usize,
 }
 
-impl Default for Random {
-    fn default() -> Self {
-        let mut rnd = Random {
+impl Random {
+    /// `rrandom.Random.__init__` — a fresh state run through `init_genrand(0)`.
+    fn new_instance() -> PyObjectRef {
+        let obj = Random::allocate_stable(Random {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
             state: [0; N],
             index: 0,
-        };
-        rnd.init_genrand(0);
-        rnd
+        });
+        Random::from_obj(obj)
+            .expect("a freshly allocated twister has the Random layout")
+            .init_genrand(0);
+        obj
     }
-}
 
-impl Random {
     fn init_genrand(&mut self, s: u32) {
         let mt = &mut self.state;
         mt[0] = s;
@@ -128,7 +142,18 @@ pub struct W_Random {
     /// `_random.Random` itself simply retains the empty/null state.
     pub map: *const u8,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
-    rnd: Random,
+    /// `interp_random.py:21 self._rnd = rrandom.Random()` — the reference to a
+    /// separately allocated generator.  `random_object_custom_trace` forwards
+    /// it: the mapdict-prefix trace this class shares knows only `w_class`,
+    /// `storage` and the boxed attribute slots.
+    pub rnd: PyObjectRef,
+}
+
+impl W_Random {
+    /// The generator behind `self._rnd`.
+    fn rnd(&self) -> &'static mut Random {
+        Random::from_obj(self.rnd).expect("_random.Random holds a Mersenne Twister")
+    }
 }
 
 // `has_mapdict_storage` admits a `_random.Random` to the shared mapdict path,
@@ -173,18 +198,27 @@ impl W_Random {
         pyre_object::gc_roots::pin_root(w_anything);
         let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 2;
         let seed_slot = cls_slot + 1;
-        let obj = W_Random::allocate_stable(W_Random::default());
+        // `interp_random.py:21` builds the generator before anything can reach
+        // it through the wrapper, so each allocation has to hold the previous
+        // one down: the twister across the wrapper's allocation, the wrapper
+        // across `seed`'s.
+        pyre_object::gc_roots::pin_root(Random::new_instance());
+        let rnd_slot = seed_slot + 1;
+        pyre_object::gc_roots::pin_root(W_Random::allocate_stable(W_Random::default()));
+        let obj_slot = rnd_slot + 1;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         crate::typedef::tag_subclass_instance(obj, unsafe {
             pyre_object::gc_roots::shadow_stack_get(cls_slot)
         });
         let random = W_Random::from_obj(obj)
             .expect("a freshly allocated _random.Random has the Random layout");
+        random.rnd = pyre_object::gc_roots::shadow_stack_get(rnd_slot);
         random.seed(pyre_object::gc_roots::shadow_stack_get(seed_slot))?;
-        Ok(obj)
+        Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
     }
 
     fn random(&mut self) -> f64 {
-        self.rnd.random()
+        self.rnd().random()
     }
 
     fn seed(
@@ -219,16 +253,17 @@ impl W_Random {
         // Split into little-endian 32-bit chunks.
         let (_sign, key) = n.to_u32_digits();
         let key = if key.is_empty() { vec![0u32] } else { key };
-        self.rnd.init_by_array(&key);
+        self.rnd().init_by_array(&key);
         Ok(())
     }
 
     fn getstate(&self) -> PyObjectRef {
+        let rnd = self.rnd();
         let mut state: Vec<PyObjectRef> = Vec::with_capacity(N + 1);
         for i in 0..N {
-            state.push(w_int_new(self.rnd.state[i] as i64));
+            state.push(w_int_new(rnd.state[i] as i64));
         }
-        state.push(w_int_new(self.rnd.index as i64));
+        state.push(w_int_new(rnd.index as i64));
         w_tuple_new(state)
     }
 
@@ -267,8 +302,9 @@ impl W_Random {
             if index < 0 || index > N as i64 {
                 crate::bail_value_error!("invalid state");
             }
-            self.rnd.state = new_state;
-            self.rnd.index = index as usize;
+            let rnd = self.rnd();
+            rnd.state = new_state;
+            rnd.index = index as usize;
         }
         Ok(())
     }
@@ -283,7 +319,7 @@ impl W_Random {
         }
         if k < 32 {
             // fits an int, skip the bytes-to-long dance
-            let r = self.rnd.genrand32() >> (32 - k);
+            let r = self.rnd().genrand32() >> (32 - k);
             return Ok(w_int_new(r as i64));
         }
         let nbytes = usize::try_from(((k - 1) / 32 + 1) * 4)
@@ -293,7 +329,7 @@ impl W_Random {
             .try_reserve_exact(nbytes)
             .map_err(|_| crate::PyError::memory_error(""))?;
         while k > 0 {
-            let mut r = self.rnd.genrand32();
+            let mut r = self.rnd().genrand32();
             if k < 32 {
                 r >>= 32 - k;
             }

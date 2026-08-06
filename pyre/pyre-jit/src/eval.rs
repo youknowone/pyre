@@ -761,6 +761,18 @@ unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
     );
 }
 
+/// Custom trace for `_random.Random`.  It carries the mapdict prefix like any
+/// other native-layout subclassable object, *and* the reference
+/// `interp_random.py:21` keeps to its own generator (`self._rnd =
+/// rrandom.Random()`).  The shared prefix trace knows nothing of that field, so
+/// forward it here as well — the twister is reachable through nothing else, and
+/// the wrapper keeps answering `random()` through it after a collection.
+unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { object_object_custom_trace(obj_addr, f) };
+    let inst = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_random::W_Random) };
+    f(std::ptr::addr_of_mut!(inst.rnd) as *mut majit_ir::GcRef);
+}
+
 /// Custom trace for `W_ModuleDictObject`
 /// (`dictmultiobject.py:328 W_ModuleDictObject`).
 ///
@@ -2662,7 +2674,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // PyPy's `allocate_instance(W_Random, w_subtype)` composes
     // `MapdictStorageMixin` into Python subclasses. `W_Random` therefore has
     // the same `[PyObject | map | storage]` prefix as `W_ObjectObject` and
-    // needs the same custom trace for boxed attributes. Register it in the
+    // needs the same custom trace for boxed attributes — plus its own `rnd`
+    // edge, which `random_object_custom_trace` adds on top. Register it in the
     // original slot so every later type id remains stable.
     {
         let descr = <pyre_interpreter::module::_random::W_Random
@@ -2670,7 +2683,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         let tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             descr.object_size,
             object_tid,
-            object_object_custom_trace,
+            random_object_custom_trace,
         ));
         if descr.gc_type_id.is_unassigned() {
             descr.gc_type_id.set(tid);
@@ -3475,6 +3488,18 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_StringIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `rrandom.Random` — the Mersenne Twister `interp_random.py:21` allocates
+    // beside its holder. Like W_DequeBlock it is GC-managed without being an
+    // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a
+    // bare `with_gc_ptrs` id rather than a `register_pyre_class` one. Appended
+    // at the tail so no established id moves.
+    let twister_descr = <pyre_interpreter::module::_random::Random
+        as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let twister_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        twister_descr.object_size,
+        twister_descr.ptr_offsets.to_vec(),
+    ));
+    twister_descr.gc_type_id.set(twister_tid);
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
