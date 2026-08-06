@@ -2057,6 +2057,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
     num_regs_r: usize,
     constants_r: &[i64],
     callee_descr_refs: &[DescrRef],
+    method_form_deferred_helpers: bool,
 ) -> CalleeReplaySafety {
     let Some(branch_targets) = body_branch_targets(body_code) else {
         replay_dirty!("BranchTargetsUndecodable", 0, "-");
@@ -2335,22 +2336,35 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 // clears numeric provenance.  Deferring instead of declining is
                 // what lets `self.v + i` inline: at trace time the attribute
                 // read folds to a mapdict slot with a concrete int shadow, so
-                // the walker's numeric specialization erases the residual before
-                // the backstop is reached.  An operand pair that stays opaque
-                // leaves the residual standing, and it reaches
-                // `fbw_abort_nested_unjournaled_residual` like any other — the
-                // helper never runs.
-                if matches!(
-                    ei.pyre_helper,
-                    majit_ir::PyreHelperKind::CallFn
-                        | majit_ir::PyreHelperKind::CallKw
-                        | majit_ir::PyreHelperKind::CallFunctionEx
-                        | majit_ir::PyreHelperKind::RaiseVarargs
-                        | majit_ir::PyreHelperKind::SetCurrentException
-                        | majit_ir::PyreHelperKind::LoadAttr
-                        | majit_ir::PyreHelperKind::BinaryOp
-                        | majit_ir::PyreHelperKind::CompareOp
-                ) {
+                // the walker's specialization erases the residual before the
+                // backstop is reached.
+                //
+                // Method-form bodies get the same treatment for `truth` and
+                // `load_method_self`.  `truth` is the branch predicate sibling
+                // of the binary/compare family, and `load_method_self` is the
+                // pure method-binding half of the same opcode as `load_attr`,
+                // no stronger than the `load_attr` case already deferred here.
+                // An operand that stays opaque leaves the residual standing,
+                // and it reaches `fbw_abort_nested_unjournaled_residual` like
+                // any other — the helper never runs.
+                let defer_method_form_helper = method_form_deferred_helpers
+                    && matches!(
+                        ei.pyre_helper,
+                        majit_ir::PyreHelperKind::LoadMethodSelf | majit_ir::PyreHelperKind::Truth
+                    );
+                let defer_helper = defer_method_form_helper
+                    || matches!(
+                        ei.pyre_helper,
+                        majit_ir::PyreHelperKind::CallFn
+                            | majit_ir::PyreHelperKind::CallKw
+                            | majit_ir::PyreHelperKind::CallFunctionEx
+                            | majit_ir::PyreHelperKind::RaiseVarargs
+                            | majit_ir::PyreHelperKind::SetCurrentException
+                            | majit_ir::PyreHelperKind::LoadAttr
+                            | majit_ir::PyreHelperKind::BinaryOp
+                            | majit_ir::PyreHelperKind::CompareOp
+                    );
+                if defer_helper {
                     deferred_call = true;
                     // The callee this resolves to is a runtime value, so what it
                     // can reach through this frame is unknown here.
