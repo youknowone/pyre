@@ -11,6 +11,7 @@ The permission bits Windows keeps are the read-only attribute alone, which
 the ones both platforms report.
 """
 
+import atexit
 import os
 import shutil
 import stat
@@ -20,6 +21,7 @@ import tempfile
 WIN32 = sys.platform == "win32"
 
 base = tempfile.mkdtemp(prefix="pyre_effects_")
+atexit.register(shutil.rmtree, base, ignore_errors=True)
 os.chdir(base)
 # The name a temporary directory is made under can be reached by a shorter
 # path than the one it is spelled with, so the directory that `getcwd`

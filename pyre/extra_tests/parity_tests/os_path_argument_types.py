@@ -12,7 +12,9 @@ by its own name, without the module that qualifies it in other messages.
 """
 
 import array
+import atexit
 import os
+import shutil
 import tempfile
 
 
@@ -32,6 +34,7 @@ def rejects(fn, arg, what, message=None):
 
 
 d = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, d, ignore_errors=True)
 b = d.encode()
 
 # `array.array` is here for its name alone: the qualified `array.array` is what

@@ -7,7 +7,9 @@ claim is exercised here rather than asserted, since a modifier that is accepted
 and ignored changes the wrong file.
 """
 
+import atexit
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -24,6 +26,7 @@ def mode_of(path, follow=True):
 
 
 d = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, d, ignore_errors=True)
 p = os.path.join(d, "f")
 with open(p, "wb") as f:
     f.write(b"x")

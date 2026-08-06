@@ -6,7 +6,9 @@ whose entry point rejects an integer — or, worse, accepts one and does nothing
 sends the caller down a route that cannot work.
 """
 
+import atexit
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -39,6 +41,7 @@ NULLABLE_ARGS = {
 ALL_ARGS = {**REST_ARGS, **NULLABLE_ARGS}
 
 d = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, d, ignore_errors=True)
 p = os.path.join(d, "f")
 with open(p, "wb") as f:
     f.write(b"0123456789")

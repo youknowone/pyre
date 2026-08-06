@@ -2106,7 +2106,7 @@ class Check:
         self, name, script, timeout,
         dynasm_vs_cpython=None, dynasm_vs_pypy=None,
         cranelift_vs_cpython=None, cranelift_vs_pypy=None,
-        skip_backends=(), wasm_float_tol=False,
+        skip_backends=(), *, wasm_float_tol=False,
     ):
         """Run one benchmark on each enabled backend."""
         need_cpython = False

@@ -12,13 +12,16 @@ The message text is the operating system's and is localized, so only its
 presence is asserted.
 """
 
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 
 WIN32 = sys.platform == "win32"
 
 base = tempfile.mkdtemp(prefix="pyre_oserr_")
+atexit.register(shutil.rmtree, base, ignore_errors=True)
 a_dir = os.path.join(base, "d")
 os.mkdir(a_dir)
 a_file = os.path.join(base, "f")

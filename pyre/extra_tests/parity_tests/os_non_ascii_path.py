@@ -7,13 +7,16 @@ page, which for most of these characters has no spelling at all and answers
 name a directory listing gives back is the name that was created.
 """
 
+import atexit
 import os
+import shutil
 import tempfile
 
 # A name from three scripts, none of which a single legacy code page holds.
 NAME = "한글-日本語-ελλ"
 
 base = tempfile.mkdtemp(prefix="pyre_nonascii_")
+atexit.register(shutil.rmtree, base, ignore_errors=True)
 directory = os.path.join(base, NAME + "_dir")
 plain = os.path.join(base, NAME + ".txt")
 renamed = os.path.join(base, NAME + "_renamed.txt")

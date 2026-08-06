@@ -8,7 +8,9 @@ and the working directory is checked afterwards for the name that should not
 have appeared there.
 """
 
+import atexit
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -32,6 +34,7 @@ def raises(call, exc, message=None):
 here = os.path.abspath(__file__)
 start = os.getcwd()
 d = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, d, ignore_errors=True)
 sub = os.path.join(d, "sub")
 os.mkdir(sub)
 # The working directory now holds "sub" and nothing else, so any other name

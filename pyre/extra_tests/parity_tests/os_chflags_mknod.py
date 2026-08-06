@@ -11,7 +11,9 @@ os.py:126 puts mknod in supports_dir_fd from HAVE_MKNODAT; os.py:182 puts
 chflags in supports_follow_symlinks from HAVE_LCHFLAGS.
 """
 
+import atexit
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -34,6 +36,7 @@ def raises(call, exc, message=None):
 
 start = os.getcwd()
 d = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, d, ignore_errors=True)
 p = os.path.join(d, "f")
 with open(p, "wb") as f:
     f.write(b"x")

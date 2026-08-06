@@ -14,6 +14,7 @@ the same file through the cwd", and follow_symlinks=False is read back through
 lstat against a target whose times must not have moved.
 """
 
+import atexit
 import os
 import shutil
 import sys
@@ -44,6 +45,7 @@ if sys.platform == "win32":
     raise SystemExit
 
 d = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, d, ignore_errors=True)
 p = os.path.join(d, "f")
 with open(p, "wb") as f:
     f.write(b"0123456789")
@@ -62,6 +64,10 @@ for name in ("chown", "stat", "utime"):
 # reads back the value that was written.
 ATIME, MTIME = 1_000_000_000, 2_000_000_000
 LINK_ATIME, LINK_MTIME = 3_000_000_000, 4_000_000_000
+# A second pair for the composed call, so it writes a value the step before it
+# did not — the point being to tell "the two modifiers composed" from "the call
+# did nothing".
+LINK2_ATIME, LINK2_MTIME = 5_000_000_000, 6_000_000_000
 
 dfd = os.open(d, os.O_RDONLY)
 try:
@@ -100,8 +106,8 @@ try:
     check(os.stat(link, follow_symlinks=False).st_mtime_ns == LINK_MTIME, "lstat via stat()")
 
     # The two modifiers compose: a relative name under dir_fd, not followed.
-    os.utime("l", ns=(LINK_ATIME, LINK_MTIME + 1), dir_fd=dfd, follow_symlinks=False)
-    check(os.lstat(link).st_mtime_ns == LINK_MTIME + 1, "utime(dir_fd, follow_symlinks=False)")
+    os.utime("l", ns=(LINK2_ATIME, LINK2_MTIME), dir_fd=dfd, follow_symlinks=False)
+    check(os.lstat(link).st_mtime_ns == LINK2_MTIME, "utime(dir_fd, follow_symlinks=False)")
     check(os.stat(p).st_mtime_ns == MTIME, "utime(dir_fd, follow_symlinks=False) moved the target")
     os.chown("l", -1, -1, dir_fd=dfd, follow_symlinks=False)
 

@@ -21,7 +21,9 @@ which is a step earlier than `do_stat`, and it names the argument rather than
 the call it was passed to.
 """
 
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 import warnings
@@ -31,6 +33,7 @@ WIN32 = sys.platform == "win32"
 assert os.stat in os.supports_fd, "os.stat has always been advertised as fd-capable"
 
 tmp = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, tmp, ignore_errors=True)
 path = os.path.join(tmp, "f")
 with open(path, "wb") as f:
     f.write(b"0123456789")
