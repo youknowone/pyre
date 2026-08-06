@@ -30,6 +30,8 @@ def float_index(rounds):
 
 
 def object_index(rounds):
+    # The object-slot read stays residual — its fold is wrong code and is
+    # declined — so this covers the value the residual has to keep answering.
     acc = 0
     for i in range(rounds):
         acc = (acc * 31 + len(OO[0]) + len(OO[1]) * 2) & 0xFFFFFFFF

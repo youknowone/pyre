@@ -5893,6 +5893,18 @@ fn try_walker_specialize_subscr_specialised_pair<Sym: WalkSym>(
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
     const TYPELEN: i64 = 2;
+    // The object-slot read is WRONG CODE from here and stays residual until it
+    // is understood.  `test.test_datetime` reaches it through
+    // `self.lt = (array('q', ut), array('q', ut))` read as `self.lt[dt.fold]`,
+    // and the next call in that frame comes out one positional argument short —
+    // `bisect.bisect_right(lt, timestamp)` answers `missing 1 required
+    // positional argument: 'x'`.  Declining only this kind restores the module;
+    // the `ii` / `ff` arms, which share the class guard and the pinned index,
+    // are unaffected, and UNPACK reaches the same slots through
+    // [`walker_emit_specialised_pair_item`] with no index operand and is sound.
+    if pair_kind == SpecialisedPairKind::Object {
+        return Ok(None);
+    }
     // `bool` shares int's `intval`, so it indexes through its own &BOOL_TYPE
     // guard in the unbox below.
     let raw_key = unsafe {
