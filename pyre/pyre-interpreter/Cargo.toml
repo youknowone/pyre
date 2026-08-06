@@ -72,14 +72,17 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-# The two nt calls host_env does not wrap (AddDllDirectory/RemoveDllDirectory and
-# GetFileInformationByHandle). Kept on the same 0.61 line rustpython-host_env's
-# nt module resolves to, so HANDLE types match at the boundary.
+# The nt calls host_env does not wrap (AddDllDirectory/RemoveDllDirectory,
+# GetFileInformationByHandle, CreateHardLinkW and ShellExecuteW). Kept on the
+# same 0.61 line rustpython-host_env's nt module resolves to, so HANDLE types
+# match at the boundary.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # Builds the `WideCStr` key/value-name arguments the `rustpython_host_env::winreg`
 # Reg* wrappers take. Same 1.x line host_env resolves to.

@@ -1967,7 +1967,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 modified,
                 follow_symlinks,
             )
-            .map_err(|e| io_err_with_filename(e, path.w_path()))?;
+            // The name stays out of this one error: `os_utime_impl` raises it
+            // through `posix_error()` rather than `path_error(path)`.
+            .map_err(|e| io_err(e, ""))?;
             return Ok(pyre_object::w_none());
         }
         #[allow(unreachable_code)]
@@ -4064,7 +4066,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     // interp_posix.py:722 `@unwrap_spec(fd=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let n = crate::builtins::crt_call!(libc::dup(fd));
+                    // `_Py_dup` makes the copy close-on-exec in the same call
+                    // that makes it, so no fork in between inherits it.
+                    let n = crate::builtins::crt_call!(libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0));
                     if n < 0 {
                         return Err(errno_err(crate::builtins::crt_errno(), ""));
                     }
@@ -4086,9 +4090,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // interp_posix.py:733 `@unwrap_spec(fd=c_int, fd2=c_int, inheritable=bool)`.
                 let fd = crate::baseobjspace::c_int_w(args[0])?;
                 let fd2 = crate::baseobjspace::c_int_w(args[1])?;
+                let inheritable = match args.get(2) {
+                    Some(&w) => crate::baseobjspace::is_true(w)?,
+                    None => true,
+                };
                 let n = crate::builtins::crt_call!(libc::dup2(fd, fd2));
                 if n < 0 {
                     return Err(errno_err(crate::builtins::crt_errno(), ""));
+                }
+                if !inheritable {
+                    use std::os::fd::BorrowedFd;
+                    let bfd = unsafe { BorrowedFd::borrow_raw(n) };
+                    host_posix::set_inheritable(bfd, false).map_err(|e| io_err(e, ""))?;
                 }
                 Ok(pyre_object::w_int_new(n as i64))
             }),
@@ -4211,6 +4224,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         if errno != libc::EINTR {
                             return Err(errno_err(errno, ""));
                         }
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
+        // os.truncate(path, length) -> None.  `os_truncate_impl` names the
+        // file rather than a descriptor of it where the platform has the call.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        crate::module_ns_store(
+            ns,
+            "truncate",
+            crate::make_builtin_function_with_arity(
+                "truncate",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("truncate() requires 2 arguments"));
+                    }
+                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    let length = crate::baseobjspace::int_w(args[1])? as libc::off_t;
+                    let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                        .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                    let ret = unsafe { libc::truncate(c_path.as_ptr(), length) };
+                    if ret < 0 {
+                        return Err(io_err_with_filename(
+                            std::io::Error::last_os_error(),
+                            path.w_path(),
+                        ));
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -4422,6 +4464,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }),
         );
 
+        // os.link(src, dst) -> None — a second name for the file `src` names,
+        // both of which the failure reports.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "link",
+            crate::make_builtin_function("link", |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("link() requires 2 arguments"));
+                }
+                let src = crate::gateway::fsencode_path_w(args[0])?;
+                let dst = crate::gateway::fsencode_path_w(args[1])?;
+                let c_src = std::ffi::CString::new(src.as_bytes.as_slice())
+                    .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
+                let c_dst = std::ffi::CString::new(dst.as_bytes.as_slice())
+                    .map_err(|_| crate::PyError::value_error("embedded null in dst"))?;
+                let ret = unsafe { libc::link(c_src.as_ptr(), c_dst.as_ptr()) };
+                if ret < 0 {
+                    return Err(fs_err_with_filename2(
+                        std::io::Error::last_os_error(),
+                        0,
+                        src.w_path(),
+                        dst.w_path(),
+                    ));
+                }
+                Ok(pyre_object::w_none())
+            }),
+        );
+
         // os.chmod(path, mode) -> None
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
@@ -4623,6 +4694,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     Ok(pyre_object::w_none())
                 },
                 3,
+            ),
+        );
+
+        // os.get_inheritable(fd) -> bool.  `_Py_get_inheritable`: a descriptor
+        // is inheritable exactly when its close-on-exec flag is clear.
+        crate::module_ns_store(
+            ns,
+            "get_inheritable",
+            crate::make_builtin_function_with_arity(
+                "get_inheritable",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "get_inheritable() requires 1 argument",
+                        ));
+                    }
+                    let fd = crate::baseobjspace::c_int_w(args[0])?;
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                    if flags < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_bool_from(flags & libc::FD_CLOEXEC == 0))
+                },
+                1,
             ),
         );
 
@@ -5727,6 +5822,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
         }
 
+        /// The Win32 error a handle call failed with.  A descriptor that names
+        /// no handle never reaches such a call, and `ERROR_INVALID_HANDLE` is
+        /// what the caller reports in its place.
+        fn handle_err(e: &std::io::Error) -> crate::PyError {
+            let winerror = e.raw_os_error().unwrap_or(
+                windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32,
+            );
+            crate::PyError::os_error_win32_syscall2(
+                winerror,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+            )
+        }
+
+        /// The descriptor's handle, or `None` when it names none.
+        fn fd_handle(fd: i32) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+            let handle = host_nt::handle_from_fd(fd);
+            (!handle.is_null()
+                && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE)
+                .then_some(handle)
+        }
+
         // os.dup(fd) -> new_fd.  `_Py_dup` makes the copy non-inheritable, so
         // it does not leak into a child the way the CRT's own copy would.
         crate::module_ns_store(
@@ -5799,6 +5916,374 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     let length = crate::baseobjspace::int_w(args[1])?;
                     crt_result(crt_fd::ftruncate(borrowed_fd(args[0])?, length))
+                },
+                2,
+            ),
+        );
+
+        // os.truncate(path, length) — `_wopen` then the same `_chsize_s`
+        // (`os_truncate_impl`).
+        crate::module_ns_store(
+            ns,
+            "truncate",
+            crate::make_builtin_function_with_arity(
+                "truncate",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("truncate() requires 2 arguments"));
+                    }
+                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    let length = crate::baseobjspace::int_w(args[1])?;
+                    let wide = wide_path(&path.as_bytes)?;
+                    let flags = libc::O_WRONLY | libc::O_BINARY | libc::O_NOINHERIT;
+                    let fd = crt_fd::wopen(&wide, flags, 0)
+                        .map_err(|e| errno_err_with_filename(crt_errno_of(&e), path.w_path()))?;
+                    let result = crt_fd::ftruncate(fd.borrow(), length);
+                    let closed = crt_fd::close(fd);
+                    crt_result(result.and(closed))
+                },
+                2,
+            ),
+        );
+
+        // os.chdir(path) — `SetCurrentDirectoryW`, which is what
+        // `std::env::set_current_dir` is here.
+        crate::module_ns_store(
+            ns,
+            "chdir",
+            crate::make_builtin_function_with_arity(
+                "chdir",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("chdir() requires 1 argument"));
+                    }
+                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    std::env::set_current_dir(path_from_bytes(&path.as_bytes).as_ref())
+                        .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        );
+
+        // os.access(path, mode) -> bool.  Windows has no permission bits to
+        // consult beyond the read-only attribute, so `W_OK` is the only mode
+        // that can answer False for a name that exists (`os_access_impl`).
+        crate::module_ns_store(
+            ns,
+            "access",
+            crate::make_builtin_function("access", |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("access() requires 2 arguments"));
+                }
+                let path = crate::gateway::fsencode_path_w(args[0])?;
+                // Only `W_OK` is read, so the byte holding it is the whole of
+                // the mode as far as the answer goes.
+                let mode = crate::baseobjspace::c_int_w(args[1])? as u8;
+                Ok(pyre_object::w_bool_from(host_nt::access(
+                    path_from_bytes(&path.as_bytes).as_ref(),
+                    mode,
+                )))
+            }),
+        );
+
+        /// The mode bit Windows keeps: with the owner's write bit the
+        /// read-only attribute comes off, without it goes on.
+        const S_IWRITE: u32 = 0o200;
+
+        // os.chmod(path, mode) -> None
+        crate::module_ns_store(
+            ns,
+            "chmod",
+            crate::make_builtin_function_with_arity(
+                "chmod",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("chmod() requires 2 arguments"));
+                    }
+                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
+                    host_nt::chmod_follow(&wide_path(&path.as_bytes)?, mode, S_IWRITE)
+                        .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
+        // os.fchmod(fd, mode) -> None
+        crate::module_ns_store(
+            ns,
+            "fchmod",
+            crate::make_builtin_function_with_arity(
+                "fchmod",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("fchmod() requires 2 arguments"));
+                    }
+                    let fd = crate::baseobjspace::c_int_w(args[0])?;
+                    let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
+                    // Every failure here is the handle call's, reported the
+                    // Win32 way (`os_fchmod_impl`).
+                    match host_nt::fchmod(fd, mode, S_IWRITE) {
+                        Ok(()) => Ok(pyre_object::w_none()),
+                        Err(e) => Err(handle_err(&e)),
+                    }
+                },
+                2,
+            ),
+        );
+
+        // os.link(src, dst) -> None.  `CreateHardLinkW` names the new link
+        // first and the file it points at second.
+        crate::module_ns_store(
+            ns,
+            "link",
+            crate::make_builtin_function("link", |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("link() requires 2 arguments"));
+                }
+                let src = crate::gateway::fsencode_path_w(args[0])?;
+                let dst = crate::gateway::fsencode_path_w(args[1])?;
+                let (wide_src, wide_dst) =
+                    (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);
+                let ok = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::CreateHardLinkW(
+                        wide_dst.as_ptr(),
+                        wide_src.as_ptr(),
+                        std::ptr::null(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(fs_err_with_filename2(
+                        std::io::Error::last_os_error(),
+                        0,
+                        src.w_path(),
+                        dst.w_path(),
+                    ));
+                }
+                Ok(pyre_object::w_none())
+            }),
+        );
+
+        // os.umask(mask) -> previous mask
+        crate::module_ns_store(
+            ns,
+            "umask",
+            crate::make_builtin_function_with_arity(
+                "umask",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("umask() requires 1 argument"));
+                    }
+                    let mask = crate::baseobjspace::c_int_w(args[0])?;
+                    match host_nt::umask(mask) {
+                        Ok(previous) => Ok(pyre_object::w_int_new(previous as i64)),
+                        Err(e) => Err(errno_err(crt_errno_of(&e), "")),
+                    }
+                },
+                1,
+            ),
+        );
+
+        // os.pipe() -> (read_fd, write_fd), both non-inheritable.
+        crate::module_ns_store(
+            ns,
+            "pipe",
+            crate::make_builtin_function_with_arity(
+                "pipe",
+                |_| match host_nt::pipe() {
+                    Ok((read_fd, write_fd)) => Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_int_new(read_fd as i64),
+                        pyre_object::w_int_new(write_fd as i64),
+                    ])),
+                    Err(e) => Err(errno_err(crt_errno_of(&e), "")),
+                },
+                0,
+            ),
+        );
+
+        // os.getppid() — the parent recorded in the process's own entry, which
+        // Windows only offers through a snapshot of the process list.
+        crate::module_ns_store(
+            ns,
+            "getppid",
+            crate::make_builtin_function_with_arity(
+                "getppid",
+                |_| Ok(pyre_object::w_int_new(host_nt::getppid() as i64)),
+                0,
+            ),
+        );
+
+        // os.getlogin() -> str
+        crate::module_ns_store(
+            ns,
+            "getlogin",
+            crate::make_builtin_function_with_arity(
+                "getlogin",
+                |_| match host_nt::getlogin() {
+                    Ok(name) => Ok(pyre_object::w_str_new(&name)),
+                    Err(e) => Err(fs_err_with_filename2(
+                        e,
+                        0,
+                        pyre_object::PY_NULL,
+                        pyre_object::PY_NULL,
+                    )),
+                },
+                0,
+            ),
+        );
+
+        // os.startfile(path, operation=None, arguments=None, cwd=None,
+        // show_cmd=None) -> None.  `ShellExecuteW` hands the file to whatever
+        // program is registered for it, and reports failure by returning 32 or
+        // less rather than through a flag.
+        crate::module_ns_store(
+            ns,
+            "startfile",
+            crate::make_builtin_function("startfile", |args| {
+                use windows_sys::Win32::UI::Shell::ShellExecuteW;
+                use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("startfile() requires 1 argument"));
+                }
+                let path = crate::gateway::fsencode_path_w(args[0])?;
+                let wide_file = wide_path(&path.as_bytes)?;
+                // A missing optional argument is spelled `None`, which stands
+                // for the null the call takes for "no operation", "no
+                // arguments", "the process's own directory".
+                let wide_arg = |index: usize| -> Result<Option<_>, crate::PyError> {
+                    match args.get(index) {
+                        Some(&w) if !unsafe { pyre_object::is_none(w) } => {
+                            let text = crate::baseobjspace::text_w(w)?;
+                            Ok(Some(widestring::WideCString::from_str(text).map_err(|_| {
+                                crate::PyError::value_error("embedded null character")
+                            })?))
+                        }
+                        _ => Ok(None),
+                    }
+                };
+                let operation = wide_arg(1)?;
+                let arguments = wide_arg(2)?;
+                let cwd = match args.get(3) {
+                    Some(&w) if !unsafe { pyre_object::is_none(w) } => {
+                        Some(wide_path(&crate::gateway::fsencode_path_w(w)?.as_bytes)?)
+                    }
+                    _ => None,
+                };
+                let show_cmd = match args.get(4) {
+                    Some(&w) if !unsafe { pyre_object::is_none(w) } => {
+                        crate::baseobjspace::c_int_w(w)?
+                    }
+                    _ => SW_SHOWNORMAL as i32,
+                };
+                let as_ptr = |wide: &Option<widestring::WideCString>| {
+                    wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr())
+                };
+                let rc = unsafe {
+                    ShellExecuteW(
+                        std::ptr::null_mut(),
+                        as_ptr(&operation),
+                        wide_file.as_ptr(),
+                        as_ptr(&arguments),
+                        as_ptr(&cwd),
+                        show_cmd,
+                    )
+                };
+                if rc as isize <= 32 {
+                    return Err(fs_err_with_filename(
+                        std::io::Error::last_os_error(),
+                        path.w_path(),
+                    ));
+                }
+                Ok(pyre_object::w_none())
+            }),
+        );
+
+        // os.cpu_count() -> int | None
+        crate::module_ns_store(
+            ns,
+            "cpu_count",
+            crate::make_builtin_function_with_arity(
+                "cpu_count",
+                |_| match std::thread::available_parallelism() {
+                    Ok(n) => Ok(pyre_object::w_int_new(n.get() as i64)),
+                    Err(_) => Ok(pyre_object::w_none()),
+                },
+                0,
+            ),
+        );
+
+        // os.device_encoding(fd) -> str | None.  `_Py_device_encoding`: only a
+        // terminal has one, and a process with no console attached has no code
+        // page to name it with.
+        crate::module_ns_store(
+            ns,
+            "device_encoding",
+            crate::make_builtin_function_with_arity(
+                "device_encoding",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "device_encoding() requires 1 argument",
+                        ));
+                    }
+                    let fd = crate::baseobjspace::c_int_w(args[0])?;
+                    if !host_os::isatty(fd) {
+                        return Ok(pyre_object::w_none());
+                    }
+                    match host_os::device_encoding(fd) {
+                        // `GetConsoleCP` answers 0 for a process with no console.
+                        Some(name) if name != "cp0" => Ok(pyre_object::w_str_new(&name)),
+                        _ => Ok(pyre_object::w_none()),
+                    }
+                },
+                1,
+            ),
+        );
+
+        // os.get_inheritable(fd) / os.set_inheritable(fd, inheritable) — the
+        // flag lives on the descriptor's handle (`HANDLE_FLAG_INHERIT`).
+        crate::module_ns_store(
+            ns,
+            "get_inheritable",
+            crate::make_builtin_function_with_arity(
+                "get_inheritable",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "get_inheritable() requires 1 argument",
+                        ));
+                    }
+                    let fd = crate::baseobjspace::c_int_w(args[0])?;
+                    let handle = fd_handle(fd).ok_or_else(|| errno_err(libc::EBADF, ""))?;
+                    match host_nt::get_handle_inheritable(handle as _) {
+                        Ok(inheritable) => Ok(pyre_object::w_bool_from(inheritable)),
+                        Err(e) => Err(handle_err(&e)),
+                    }
+                },
+                1,
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "set_inheritable",
+            crate::make_builtin_function_with_arity(
+                "set_inheritable",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "set_inheritable() requires 2 arguments",
+                        ));
+                    }
+                    let fd = crate::baseobjspace::c_int_w(args[0])?;
+                    let inherit = crate::baseobjspace::is_true(args[1])?;
+                    let handle = fd_handle(fd).ok_or_else(|| errno_err(libc::EBADF, ""))?;
+                    match host_nt::set_handle_inheritable(handle as _, inherit) {
+                        Ok(()) => Ok(pyre_object::w_none()),
+                        Err(e) => Err(handle_err(&e)),
+                    }
                 },
                 2,
             ),

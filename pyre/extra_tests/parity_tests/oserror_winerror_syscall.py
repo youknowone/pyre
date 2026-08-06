@@ -51,9 +51,10 @@ def check(exc, cls, errno, winerror, filename, filename2=None):
     else:
         assert not hasattr(exc, "winerror")
         expected = "[Errno %d] %s" % (errno, exc.strerror)
-    expected += ": %r" % (filename,)
-    if filename2 is not None:
-        expected += " -> %r" % (filename2,)
+    if filename is not None:
+        expected += ": %r" % (filename,)
+        if filename2 is not None:
+            expected += " -> %r" % (filename2,)
     assert str(exc) == expected, (str(exc), expected)
 
 
@@ -69,7 +70,9 @@ check(failure(os.mkdir, missing_deep), FileNotFoundError, 2, 3, missing_deep)
 check(failure(os.rmdir, missing), FileNotFoundError, 2, 2, missing)
 check(failure(os.remove, missing), FileNotFoundError, 2, 2, missing)
 check(failure(os.unlink, missing), FileNotFoundError, 2, 2, missing)
-check(failure(os.utime, missing), FileNotFoundError, 2, 2, missing)
+# `os_utime_impl` is the one path call whose POSIX arm leaves the name out of
+# the error it raises; the Windows arm names the file like the rest of them.
+check(failure(os.utime, missing), FileNotFoundError, 2, 2, missing if WIN32 else None)
 
 check(failure(os.mkdir, a_dir), FileExistsError, 17, 183, a_dir)
 check(failure(os.listdir, a_file), NotADirectoryError, 20, 267, a_file)
@@ -137,6 +140,14 @@ else:
 # A descriptor that names nothing is not a terminal, which is reported rather
 # than raised.
 assert os.isatty(BAD_FD) is False
+
+# `os.startfile` is Windows' alone: it hands the file to whatever program is
+# registered for it, and a name no file answers to never reaches one.
+if WIN32:
+    check(failure(os.startfile, missing), FileNotFoundError, 2, 2, missing)
+    check(failure(os.startfile, missing, "open"), FileNotFoundError, 2, 2, missing)
+else:
+    assert not hasattr(os, "startfile")
 
 os.remove(a_file)
 os.rmdir(a_dir)
