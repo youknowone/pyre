@@ -13,6 +13,7 @@ the ones both platforms report.
 
 import os
 import shutil
+import stat
 import sys
 import tempfile
 
@@ -61,13 +62,18 @@ if WIN32 or (hasattr(os, "geteuid") and os.geteuid() != 0):
     os.chmod(a_file, 0o666)
     assert os.access(a_file, os.W_OK)
 
-# os.truncate / os.ftruncate
+# os.truncate / os.ftruncate.  `truncate` takes either a name or an open
+# descriptor — its path argument is `path_t(allow_fd=…)`, which is also what
+# puts it in `supports_fd`.
 os.truncate(a_file, 3)
 assert os.stat(a_file).st_size == 3, os.stat(a_file).st_size
 fd = os.open(a_file, os.O_RDWR)
 os.ftruncate(fd, 1)
-os.close(fd)
 assert os.stat(a_file).st_size == 1, os.stat(a_file).st_size
+os.truncate(fd, 2)
+assert os.fstat(fd).st_size == 2, os.fstat(fd).st_size
+os.close(fd)
+assert os.truncate in os.supports_fd
 
 # os.link — a second name for the one file, so what one name reads the other
 # wrote.  Not every filesystem holds more than one name per file; the ones
@@ -84,6 +90,89 @@ else:
     with open(link, "rb") as fp:
         assert fp.read() == b"linked"
     os.remove(link)
+
+# A directory descriptor to resolve either name against is honoured where the
+# platform has `linkat` and refused where it does not — never ignored, which
+# would link a same-named file from the process's own directory instead.
+if os.link in os.supports_dir_fd:
+    with open(os.path.join(a_dir, "inner"), "wb") as fp:
+        fp.write(b"inner")
+    dir_fd = os.open(a_dir, os.O_RDONLY)
+    try:
+        os.link("inner", "l2", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    # The working directory is `base`, so a link that landed there is one whose
+    # names were resolved against it rather than against the descriptor.
+    assert os.path.exists(os.path.join(a_dir, "l2"))
+    assert not os.path.exists(os.path.join(base, "l2"))
+    os.remove(os.path.join(a_dir, "l2"))
+    os.remove(os.path.join(a_dir, "inner"))
+else:
+    try:
+        os.link(a_file, os.path.join(base, "l3"), src_dir_fd=0)
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("link ignored src_dir_fd")
+    assert not os.path.exists(os.path.join(base, "l3"))
+
+# Whether the source symlink is followed or linked is the platform's to say;
+# what it cannot do is take the argument and ignore it.
+l4 = os.path.join(base, "l4")
+if os.link in os.supports_follow_symlinks:
+    os.link(a_file, l4, follow_symlinks=True)
+    os.remove(l4)
+else:
+    try:
+        os.link(a_file, l4, follow_symlinks=True)
+    except (NotImplementedError, OSError):
+        pass
+    else:
+        raise AssertionError("link ignored follow_symlinks")
+    assert not os.path.exists(l4)
+
+# Both descriptors and `follow_symlinks` are keyword-only, so a third
+# positional argument is not one of them being passed.
+try:
+    os.link(a_file, os.path.join(base, "l5"), 0)
+except TypeError:
+    pass
+else:
+    raise AssertionError("link took a third positional argument")
+assert not os.path.exists(os.path.join(base, "l5"))
+
+# os.symlink — a name that resolves to another, which `lstat` reports as the
+# link and `stat` as what it points at.  The target is stored as it was given,
+# so a relative one reads back the way it was written.  Creating a link at all
+# is a privilege on Windows that the account may not hold, so a refusal is an
+# answer too.
+sym = os.path.join(base, "s")
+try:
+    os.symlink("f", sym)
+except (OSError, NotImplementedError):
+    pass
+else:
+    assert os.path.islink(sym), sym
+    assert os.readlink(sym) == "f", os.readlink(sym)
+    assert stat.S_ISLNK(os.lstat(sym).st_mode)
+    assert stat.S_ISREG(os.stat(sym).st_mode)
+    with open(sym, "rb") as fp, open(a_file, "rb") as original:
+        assert fp.read() == original.read()
+    # Removing the link removes the link.
+    os.remove(sym)
+    assert os.path.exists(a_file)
+    # A link to a directory is a directory to whatever follows it, and the
+    # execute bits belong to the link's own format.
+    dsym = os.path.join(base, "ds")
+    os.symlink("d", dsym, target_is_directory=True)
+    assert stat.S_ISLNK(os.lstat(dsym).st_mode)
+    assert stat.S_ISDIR(os.stat(dsym).st_mode)
+    assert os.lstat(dsym).st_mode & 0o111 == 0o111, oct(os.lstat(dsym).st_mode)
+    # `unlink` takes the link whichever it names, though what Windows has to
+    # call to take a directory one is `RemoveDirectory`.
+    os.remove(dsym)
+    assert os.path.isdir(a_dir)
 
 # os.pipe, whose two descriptors carry bytes one way and are closed to
 # children — which `os.set_inheritable` is what changes.

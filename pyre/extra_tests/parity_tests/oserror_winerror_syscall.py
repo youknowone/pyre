@@ -111,6 +111,14 @@ if WIN32:
 # is to abort the process, which is why the calls silence its invalid parameter
 # handler first.)
 BAD_FD = 999
+# The loop closes, truncates and writes to this descriptor, so the run has to
+# start by establishing that it names nothing.
+try:
+    os.fstat(BAD_FD)
+except OSError:
+    pass
+else:
+    raise AssertionError("fd %d is open; the loop below would write to it" % BAD_FD)
 for call, args in (
     (os.close, ()),
     (os.dup, ()),
@@ -146,6 +154,31 @@ assert os.isatty(BAD_FD) is False
 if WIN32:
     check(failure(os.startfile, missing), FileNotFoundError, 2, 2, missing)
     check(failure(os.startfile, missing, "open"), FileNotFoundError, 2, 2, missing)
+    # Its four optional arguments are positional-or-keyword, and the keyword
+    # spelling is the one `webbrowser` and `os.startfile(..., cwd=)` callers
+    # use — a call that drops them opens the file in the wrong directory.
+    check(
+        failure(
+            lambda p: os.startfile(p, operation="open", arguments="", cwd=base, show_cmd=0),
+            missing,
+        ),
+        FileNotFoundError,
+        2,
+        2,
+        missing,
+    )
+    try:
+        os.startfile(missing, bogus=1)
+    except TypeError as exc:
+        assert "unexpected keyword argument 'bogus'" in str(exc), str(exc)
+    else:
+        raise AssertionError("startfile must reject an unknown keyword")
+    try:
+        os.startfile()
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("startfile must require a file")
 else:
     assert not hasattr(os, "startfile")
 
