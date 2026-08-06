@@ -9,6 +9,7 @@ sequence reject every later state once it goes negative.
 """
 
 import array
+import sys
 
 
 def check(condition, message):
@@ -20,6 +21,13 @@ def state(it):
     """The cursor `__reduce__` pickles, or EXHAUSTED for the empty form."""
     reduced = it.__reduce__()
     return reduced[2] if len(reduced) > 2 else "EXHAUSTED"
+
+
+def restored(make, index):
+    """The cursor `__setstate__(index)` leaves on a fresh iterator."""
+    it = make()
+    it.__setstate__(index)
+    return state(it)
 
 
 def remaining(it):
@@ -162,13 +170,23 @@ for label, make in makers:
                   label + " rejects a non-integer state: " + str(exc))
         else:
             raise AssertionError(label + " accepted a non-integer state")
-    try:
-        make().__setstate__(1 << 100)
-    except OverflowError as exc:
-        check(str(exc) == "Python int too large to convert to C ssize_t",
-              label + " overflow message: " + str(exc))
-    else:
-        raise AssertionError(label + " accepted an oversized state")
+    for oversized in (1 << 100, sys.maxsize + 1, -sys.maxsize - 2):
+        try:
+            make().__setstate__(oversized)
+        except OverflowError as exc:
+            check(str(exc) == "Python int too large to convert to C ssize_t",
+                  label + " overflow message: " + str(exc))
+        else:
+            raise AssertionError(label + " accepted an oversized state")
+    # The two extremes that do fit are accepted, and land where any other value
+    # of their sign lands: the cursor is what gets clamped, not the width of the
+    # incoming int.  The generic iterator is the exception on the positive side,
+    # having no length to clamp against (`seq_iter_clamp_length`).
+    check(restored(make, -sys.maxsize - 1) == restored(make, -1),
+          label + " accepts the smallest cursor")
+    check(restored(make, sys.maxsize)
+          == (sys.maxsize if label == "generic" else restored(make, 99)),
+          label + " accepts the largest cursor")
     it = make()
     it.__setstate__(MyInt(1))
     check(state(it) == 1, label + " accepts an int subclass")
