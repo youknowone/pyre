@@ -4530,11 +4530,11 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let inst = &*(w_obj as *const pyre_object::W_ObjectObject);
         let curr = node_search(inst._get_mapdict_map(), DICT)?;
         let key = &(*curr).as_plain().name;
-        let w_value = self.getitem_str(
-            w_dict,
-            key.as_str()
-                .expect("mapdict key is valid UTF-8 for DictStrategy::getitem_str"),
-        )?;
+        // mapdict.py:1231 reads the value with `getitem_str(w_dict, key)`, but
+        // the trait's `getitem_str` takes a `&str` and a node name is WTF-8:
+        // `setitem` stores the full name (mapdict.py:1180), so a lone surrogate
+        // is a node here and has no `&str` form. Read the node layer directly.
+        let w_value = instance_node_getdictvalue(w_obj, key)?;
         let w_key = pyre_object::unicodeobject::box_str_constant(key);
         self.delitem(w_dict, w_key);
         Some((w_key, w_value))
@@ -5657,6 +5657,48 @@ mod tests {
             MAP_DICT_STRATEGY.clear(w_dict);
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 0);
             assert_eq!(MAP_DICT_STRATEGY.getitem_str(w_dict, "y"), None);
+        }
+    }
+
+    #[test]
+    fn map_dict_strategy_popitem_preserves_surrogate_node_name() {
+        use pyre_object::dictmultiobject::DictStrategy;
+
+        unsafe {
+            // Install the surrogate-named attribute last so the DICT search
+            // reaches it first. The mapdict node name is WTF-8; popitem must
+            // preserve that name when materialising the returned key.
+            let term = boxed_dict_terminator();
+            let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
+            obj._set_mapdict_map(term);
+
+            let mut sur = Wtf8Buf::new();
+            sur.push(rustpython_wtf8::CodePoint::from_u32(0xD800).unwrap());
+
+            assert!(instance_node_setdictvalue(
+                obj_ref,
+                wn("ascii"),
+                sentinel(0x44)
+            ));
+            assert!(instance_node_setdictvalue(obj_ref, &sur, sentinel(0x55)));
+
+            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY, obj_ref as *mut u8);
+            assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
+
+            let (w_sur_key, w_sur_value) = MAP_DICT_STRATEGY.popitem(w_dict).unwrap();
+            assert_eq!(pyre_object::w_str_get_wtf8(w_sur_key), &*sur);
+            assert_eq!(w_sur_value, sentinel(0x55));
+            assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 1);
+            assert_eq!(MAP_DICT_STRATEGY.getitem(w_dict, w_sur_key), None);
+            assert_eq!(instance_node_getdictvalue(obj_ref, &sur), None);
+
+            let (w_ascii_key, w_ascii_value) = MAP_DICT_STRATEGY.popitem(w_dict).unwrap();
+            assert_eq!(pyre_object::w_str_get_value(w_ascii_key), "ascii");
+            assert_eq!(w_ascii_value, sentinel(0x44));
+            assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 0);
+            assert_eq!(MAP_DICT_STRATEGY.getitem_str(w_dict, "ascii"), None);
+            assert_eq!(instance_node_getdictvalue(obj_ref, wn("ascii")), None);
         }
     }
 
