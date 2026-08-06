@@ -1269,9 +1269,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "setregid",
             "getgroups",
             "setgroups",
-            "getpgrp",
             "setpgrp",
-            "getpgid",
             "nice",
             // "pipe2"/"dup3" — the flag-taking forms, which Linux adds and the
             // other hosts do not have. Neither is served here on any of them.
@@ -1299,7 +1297,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "login_tty",
             "tcgetpgrp",
             "tcsetpgrp",
-            "ctermid",
             // "get_exec_path" — `os.py:565` writes it in Python and lists it in
             // its own `__all__`, so a name bound here is not overwritten by that
             // definition; it is counted a second time, through the star-import.
@@ -4746,6 +4743,92 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
+        // `interp_posix.py:2167-2172` — the caller's own group, which cannot
+        // fail and so is not checked.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "getpgrp",
+            crate::make_builtin_function_with_arity(
+                "getpgrp",
+                |_| Ok(pyre_object::w_int_new(unsafe { libc::getpgrp() } as i64)),
+                0,
+            ),
+        );
+
+        // `interp_posix.py:2201-2210` — another process's group, which can be
+        // one this process may not ask about.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "getpgid",
+            crate::make_builtin_function_with_arity(
+                "getpgid",
+                |args| {
+                    let pid = match args.first() {
+                        // interp_posix.py:2200 `@unwrap_spec(pid=c_int)`.
+                        Some(&obj) => crate::baseobjspace::c_int_w(obj)? as libc::pid_t,
+                        None => {
+                            return Err(crate::PyError::type_error(
+                                "getpgid() requires 1 argument",
+                            ));
+                        }
+                    };
+                    let pgid = unsafe { libc::getpgid(pid) };
+                    if pgid == -1 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_int_new(pgid as i64))
+                },
+                1,
+            ),
+        );
+
+        // `interp_posix.py:2603-2608` — the controlling terminal's name, which
+        // `rposix.py:1724-1728` reads by handing the call a null pointer and
+        // taking the static buffer it answers with. It is a filename, so it is
+        // decoded the way every other name from the host is.
+        #[cfg(not(feature = "sandbox"))]
+        {
+            // `<stdio.h>` declares `ctermid` on every POSIX host; the `libc`
+            // crate carries it for a few of them.
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "aix",
+                target_os = "haiku",
+                target_os = "hurd",
+                target_os = "nto",
+            )))]
+            unsafe extern "C" {
+                fn ctermid(s: *mut libc::c_char) -> *mut libc::c_char;
+            }
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "aix",
+                target_os = "haiku",
+                target_os = "hurd",
+                target_os = "nto",
+            ))]
+            use libc::ctermid;
+
+            crate::module_ns_store(
+                ns,
+                "ctermid",
+                crate::make_builtin_function_with_arity(
+                    "ctermid",
+                    |_| {
+                        let name = unsafe { ctermid(std::ptr::null_mut()) };
+                        if name.is_null() {
+                            return Err(io_err(std::io::Error::last_os_error(), ""));
+                        }
+                        let bytes = unsafe { std::ffi::CStr::from_ptr(name) };
+                        Ok(crate::gateway::fsdecode_filename_bytes(bytes.to_bytes()))
+                    },
+                    0,
+                ),
+            );
+        }
+
         // os.waitpid(pid, options) -> (pid, status)
         crate::module_ns_store(
             ns,
@@ -7933,6 +8016,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "_cpu_count",
             "getresuid",
             "getresgid",
+            "getpgrp",
+            "getpgid",
             // host system-configuration probes; pathconf consults a
             // guest-controlled path on the real filesystem.
             "pathconf",
@@ -7943,6 +8028,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "tcsetpgrp",
             "get_terminal_size",
             "ttyname",
+            "ctermid",
         ] {
             crate::module_ns_store(
                 ns,
