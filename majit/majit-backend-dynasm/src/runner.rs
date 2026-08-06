@@ -160,7 +160,7 @@ pub(crate) fn dynasm_write_barrier_descr() -> Option<majit_gc::WriteBarrierDescr
 pub(crate) fn with_dynasm_active_gc_mut<R>(
     f: impl FnOnce(&mut dyn majit_gc::GcAllocator) -> R,
 ) -> Option<R> {
-    if DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+    if majit_gc::gc_box_installed() && DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
         return DYNASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             let raw: *mut dyn majit_gc::GcAllocator = guard.as_deref_mut()?;
@@ -594,9 +594,10 @@ fn bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> *mut libc::
 /// Python value stack, or on the shadow stack — Rust-stack PyObjectRef
 /// in nursery would dangle after the embedded minor cycle.
 fn dynasm_collect_full() {
-    if DYNASM_ACTIVE_GC
-        .with(|c| c.borrow_mut().as_deref_mut().map(|g| g.collect_full()))
-        .is_some()
+    if majit_gc::gc_box_installed()
+        && DYNASM_ACTIVE_GC
+            .with(|c| c.borrow_mut().as_deref_mut().map(|g| g.collect_full()))
+            .is_some()
     {
         return;
     }
@@ -611,13 +612,14 @@ fn debug_validate_oldgen_freeblocks(site: std::fmt::Arguments<'_>) {
         return;
     }
     let site = site.to_string();
-    if DYNASM_ACTIVE_GC
-        .with(|c| {
-            c.borrow()
-                .as_deref()
-                .map(|g| g.debug_validate_oldgen_freeblocks(&site))
-        })
-        .is_some()
+    if majit_gc::gc_box_installed()
+        && DYNASM_ACTIVE_GC
+            .with(|c| {
+                c.borrow()
+                    .as_deref()
+                    .map(|g| g.debug_validate_oldgen_freeblocks(&site))
+            })
+            .is_some()
     {
         return;
     }
@@ -642,13 +644,14 @@ pub extern "C" fn dynasm_debug_validate_oldgen_freeblocks(site: u64, frame: usiz
 
 fn dynasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
-    if DYNASM_ACTIVE_GC
-        .with(|c| {
-            c.borrow_mut()
-                .as_deref_mut()
-                .map(|g| g.get_objects(generation, &mut visit))
-        })
-        .is_some()
+    if majit_gc::gc_box_installed()
+        && DYNASM_ACTIVE_GC
+            .with(|c| {
+                c.borrow_mut()
+                    .as_deref_mut()
+                    .map(|g| g.get_objects(generation, &mut visit))
+            })
+            .is_some()
     {
         return;
     }
@@ -657,13 +660,14 @@ fn dynasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
 
 fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
-    if DYNASM_ACTIVE_GC
-        .with(|c| {
-            c.borrow_mut()
-                .as_deref_mut()
-                .map(|g| g.get_referents(obj, &mut visit))
-        })
-        .is_some()
+    if majit_gc::gc_box_installed()
+        && DYNASM_ACTIVE_GC
+            .with(|c| {
+                c.borrow_mut()
+                    .as_deref_mut()
+                    .map(|g| g.get_referents(obj, &mut visit))
+            })
+            .is_some()
     {
         return;
     }
@@ -673,8 +677,9 @@ fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisit
 }
 
 fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
-    if let Some(tracked) =
-        DYNASM_ACTIVE_GC.with(|c| c.borrow_mut().as_deref_mut().map(|g| g.is_tracked(obj)))
+    if majit_gc::gc_box_installed()
+        && let Some(tracked) =
+            DYNASM_ACTIVE_GC.with(|c| c.borrow_mut().as_deref_mut().map(|g| g.is_tracked(obj)))
     {
         return tracked;
     }
@@ -686,13 +691,14 @@ fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
 /// an active JIT (nursery non-empty) — unlike [`dynasm_collect_full`], whose
 /// embedded minor would relocate a Rust-stack nursery PyObjectRef.
 fn dynasm_collect_oldgen_nonmoving() {
-    if DYNASM_ACTIVE_GC
-        .with(|c| {
-            c.borrow_mut()
-                .as_deref_mut()
-                .map(|g| g.collect_oldgen_nonmoving())
-        })
-        .is_some()
+    if majit_gc::gc_box_installed()
+        && DYNASM_ACTIVE_GC
+            .with(|c| {
+                c.borrow_mut()
+                    .as_deref_mut()
+                    .map(|g| g.collect_oldgen_nonmoving())
+            })
+            .is_some()
     {
         return;
     }
@@ -709,8 +715,9 @@ fn dynasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
 
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
 fn dynasm_heap_stats() -> (usize, usize) {
-    if let Some(r) =
-        DYNASM_ACTIVE_GC.with(|c| c.borrow_mut().as_deref_mut().map(|g| g.heap_byte_stats()))
+    if majit_gc::gc_box_installed()
+        && let Some(r) =
+            DYNASM_ACTIVE_GC.with(|c| c.borrow_mut().as_deref_mut().map(|g| g.heap_byte_stats()))
     {
         return r;
     }
@@ -739,13 +746,14 @@ fn dynasm_major_threshold_reached() -> bool {
 /// Caller must keep `slot` valid until [`dynasm_gc_remove_root`] is
 /// called with the same pointer.
 unsafe fn dynasm_gc_add_root(slot: *mut GcRef) {
-    if DYNASM_ACTIVE_GC
-        .with(|c| {
-            c.borrow_mut()
-                .as_deref_mut()
-                .map(|g| unsafe { g.add_root(slot) })
-        })
-        .is_some()
+    if majit_gc::gc_box_installed()
+        && DYNASM_ACTIVE_GC
+            .with(|c| {
+                c.borrow_mut()
+                    .as_deref_mut()
+                    .map(|g| unsafe { g.add_root(slot) })
+            })
+            .is_some()
     {
         return;
     }
@@ -754,9 +762,10 @@ unsafe fn dynasm_gc_add_root(slot: *mut GcRef) {
 
 /// Companion to [`dynasm_gc_add_root`].
 fn dynasm_gc_remove_root(slot: *mut GcRef) {
-    if DYNASM_ACTIVE_GC
-        .with(|c| c.borrow_mut().as_deref_mut().map(|g| g.remove_root(slot)))
-        .is_some()
+    if majit_gc::gc_box_installed()
+        && DYNASM_ACTIVE_GC
+            .with(|c| c.borrow_mut().as_deref_mut().map(|g| g.remove_root(slot)))
+            .is_some()
     {
         return;
     }
@@ -766,9 +775,10 @@ fn dynasm_gc_remove_root(slot: *mut GcRef) {
 /// Host-side write-barrier trampoline for GC-managed objects updated
 /// outside compiled code.
 fn dynasm_gc_write_barrier(obj: GcRef) {
-    if DYNASM_ACTIVE_GC
-        .with(|c| c.borrow_mut().as_deref_mut().map(|g| g.write_barrier(obj)))
-        .is_some()
+    if majit_gc::gc_box_installed()
+        && DYNASM_ACTIVE_GC
+            .with(|c| c.borrow_mut().as_deref_mut().map(|g| g.write_barrier(obj)))
+            .is_some()
     {
         return;
     }
@@ -776,13 +786,14 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
 }
 
 fn dynasm_gc_write_barrier_managed(obj: GcRef) {
-    if DYNASM_ACTIVE_GC
-        .with(|c| {
-            c.borrow_mut()
-                .as_deref_mut()
-                .map(|g| g.write_barrier_managed(obj))
-        })
-        .is_some()
+    if majit_gc::gc_box_installed()
+        && DYNASM_ACTIVE_GC
+            .with(|c| {
+                c.borrow_mut()
+                    .as_deref_mut()
+                    .map(|g| g.write_barrier_managed(obj))
+            })
+            .is_some()
     {
         return;
     }
