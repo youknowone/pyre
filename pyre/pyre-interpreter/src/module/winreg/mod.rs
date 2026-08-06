@@ -101,8 +101,10 @@ mod imp {
     // The raw `HKEY` is stored on the instance dict under `_handle` as its
     // pointer value; `int(key)` and passing a key where a handle is expected
     // read it back.  A closed handle is left as 0.
+    // Qualified, so the type reports `winreg` as its `__module__` the way a
+    // static type with a dotted `tp_name` does; `__name__` stays `PyHKEY`.
     crate::py_class! {
-        "PyHKEY",
+        "winreg.PyHKEY",
         methods: {
             fn Close(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
                 let raw = take_handle(self_obj);
@@ -223,11 +225,46 @@ mod imp {
         crate::baseobjspace::int_w(arg(args, idx)?)
     }
 
-    /// Map a Win32 error code to an `OSError`.
+    /// An access mask or `reserved` word, which `OpenKeyEx`, `CreateKeyEx` and
+    /// `DeleteKeyEx` each take positionally or by name, defaulting where the
+    /// caller passed neither.
+    fn uint_arg(
+        pos: &[PyObjectRef],
+        kwargs: Option<PyObjectRef>,
+        idx: usize,
+        name: &str,
+        default: u32,
+    ) -> Result<u32, crate::PyError> {
+        let value = match crate::builtins::kwarg_get(kwargs, name) {
+            Some(value) => value,
+            None => match pos.get(idx) {
+                Some(&value) => value,
+                None => return Ok(default),
+            },
+        };
+        Ok(crate::baseobjspace::int_w(value)? as u32)
+    }
+
+    /// The sub-key argument as a wide string; absent and `None` both mean the
+    /// key itself, which the Win32 calls spell as the empty name.
+    fn sub_key_wide(
+        args: &[PyObjectRef],
+        idx: usize,
+    ) -> Result<WideCString, crate::PyError> {
+        Ok(WideCString::from_str_truncate(
+            opt_str(args, idx)?.as_deref().unwrap_or(""),
+        ))
+    }
+
+    /// The `OSError` a failed `Reg*` call raises.  These report `LSTATUS`
+    /// codes, which are Win32 error codes, so the code is kept in `.winerror`
+    /// and `str(e)` opens `[WinError 2]` rather than `[Errno 2]`
+    /// (`PyErr_SetFromWindowsErrWithFunction`) -- the errno and its subclass
+    /// are derived from it.
     fn win_err(code: u32) -> crate::PyError {
-        let error = std::io::Error::from_raw_os_error(code as i32);
-        crate::PyError::os_error_syscall(
-            crate::builtins::io_error_posix_errno(&error, 0),
+        crate::PyError::os_error_win32_syscall2(
+            code as i32,
+            pyre_object::PY_NULL,
             pyre_object::PY_NULL,
         )
     }
@@ -352,21 +389,76 @@ mod imp {
         // (key, sub_key, reserved=0, access=KEY_READ)
         let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
         let key = key_arg(pos, 0)?;
-        let sub_key = opt_str(pos, 1)?;
-        let access = match crate::builtins::kwarg_get(kwargs, "access") {
-            Some(v) => crate::baseobjspace::int_w(v)? as u32,
-            None => match pos.get(3) {
-                Some(&v) => crate::baseobjspace::int_w(v)? as u32,
-                None => host_reg::KEY_READ,
-            },
-        };
-        let wide = WideCString::from_str_truncate(sub_key.as_deref().unwrap_or(""));
+        let wide = sub_key_wide(pos, 1)?;
+        let reserved = uint_arg(pos, kwargs, 2, "reserved", 0)?;
+        let access = uint_arg(pos, kwargs, 3, "access", host_reg::KEY_READ)?;
         let mut out: HKEY = core::ptr::null_mut();
-        let rc = unsafe { host_reg::open_key_ex(key, &wide, 0, access, &mut out) };
+        let rc = unsafe { host_reg::open_key_ex(key, &wide, reserved, access, &mut out) };
         if rc != 0 {
             return Err(win_err(rc));
         }
         Ok(make_pyhkey(out))
+    }
+
+    fn create_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        // (key, sub_key, reserved=0, access=KEY_WRITE) — `CreateKey`'s form
+        // with the mask to open it under, which is the only way to reach a
+        // 32-bit view (`KEY_WOW64_32KEY`) of a key.
+        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        let key = key_arg(pos, 0)?;
+        let wide = sub_key_wide(pos, 1)?;
+        let reserved = uint_arg(pos, kwargs, 2, "reserved", 0)?;
+        let access = uint_arg(pos, kwargs, 3, "access", host_reg::KEY_WRITE)?;
+        let mut out: HKEY = core::ptr::null_mut();
+        let rc = unsafe {
+            host_reg::create_key_ex(
+                key,
+                &wide,
+                reserved,
+                core::ptr::null_mut(),
+                host_reg::REG_OPTION_NON_VOLATILE,
+                access,
+                core::ptr::null(),
+                &mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(win_err(rc));
+        }
+        Ok(make_pyhkey(out))
+    }
+
+    fn delete_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        // (key, sub_key, access=KEY_WOW64_64KEY, reserved=0) — the access mask
+        // comes before `reserved` here, the other way round from CreateKeyEx.
+        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        let key = key_arg(pos, 0)?;
+        let sub_key = req_str(pos, 1)?;
+        let access = uint_arg(pos, kwargs, 2, "access", host_reg::KEY_WOW64_64KEY)?;
+        let reserved = uint_arg(pos, kwargs, 3, "reserved", 0)?;
+        let wide = WideCString::from_str_truncate(&sub_key);
+        check(unsafe { host_reg::delete_key_ex(key, &wide, access, reserved) })
+    }
+
+    fn load_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        // (key, sub_key, file_name) — restores a hive a `SaveKey` wrote.  Both
+        // it and SaveKey need SE_RESTORE_NAME/SE_BACKUP_NAME, so an ordinary
+        // account gets ERROR_PRIVILEGE_NOT_HELD rather than a result.
+        let key = key_arg(args, 0)?;
+        let sub_key = req_str(args, 1)?;
+        let file_name = req_str(args, 2)?;
+        let wide_sub = WideCString::from_str_truncate(&sub_key);
+        let wide_file = WideCString::from_str_truncate(&file_name);
+        check(unsafe { host_reg::load_key(key, &wide_sub, &wide_file) })
+    }
+
+    fn save_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        // (key, file_name)
+        let key = key_arg(args, 0)?;
+        let file_name = req_str(args, 1)?;
+        let wide = WideCString::from_str_truncate(&file_name);
+        check(unsafe { host_reg::save_key(key, &wide) })
     }
 
     fn close_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -486,8 +578,7 @@ mod imp {
 
     fn create_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let key = key_arg(args, 0)?;
-        let sub_key = opt_str(args, 1)?;
-        let wide = WideCString::from_str_truncate(sub_key.as_deref().unwrap_or(""));
+        let wide = sub_key_wide(args, 1)?;
         let mut out: HKEY = core::ptr::null_mut();
         let rc = unsafe { host_reg::create_key(key, &wide, &mut out) };
         if rc != 0 {
@@ -595,7 +686,14 @@ mod imp {
     }
 
     pub fn install(ns: PyObjectRef) {
-        crate::module_ns_store(ns, "PyHKEY", type_object());
+        // The handle type is bound under one name only: the class calls itself
+        // `PyHKEY`, and `winreg` publishes it as `HKEYType`.
+        crate::module_ns_store(ns, "HKEYType", type_object());
+        // `winreg.error` is `OSError` itself rather than a module-specific
+        // class, so `except winreg.error` catches what the Reg* calls raise.
+        if let Some(os_error) = crate::builtins::lookup_exc_class("OSError") {
+            crate::module_ns_store(ns, "error", os_error);
+        }
         // The predefined roots are exposed as their full (sign-extended)
         // pointer value, matching `PyLong_FromVoidPtr` — this overrides the
         // 32-bit fallbacks the always-present `int_constants` set.
@@ -616,6 +714,10 @@ mod imp {
                 open_key as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
             ),
             ("OpenKeyEx", open_key),
+            ("CreateKeyEx", create_key_ex),
+            ("DeleteKeyEx", delete_key_ex),
+            ("LoadKey", load_key),
+            ("SaveKey", save_key),
             ("CloseKey", close_key),
             ("QueryValue", query_value),
             ("QueryValueEx", query_value_ex),
