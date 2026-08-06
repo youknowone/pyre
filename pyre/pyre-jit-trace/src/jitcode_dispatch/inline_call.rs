@@ -23,48 +23,87 @@ struct BoundMethodInline {
     receiver: pyre_object::PyObjectRef,
 }
 
+/// Where an element of a `defs_w` tuple lives, and therefore what the trace
+/// emits to read one.  `w_tuple_new` routes EVERY arity-2 tuple through
+/// `makespecialisedtuple2` (`specialisedtupleobject.py:169-179`), so a callee
+/// with exactly two defaulted parameters — an extremely ordinary signature —
+/// never has an array-backed `defs_w` at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefaultsRepr {
+    /// Array-backed `W_TupleObject`: the elements live in the `wrappeditems`
+    /// block, the shape upstream's `defs_w?[*]` lowers to.
+    ItemsBlock,
+    /// `Cls_ii`: two inline machine ints.  `wraps[i]` is `wrapint`
+    /// (`specialisedtupleobject.py:138-141`), which is what
+    /// `_flat_pycall_defaults` already runs per call through
+    /// `w_tuple_getitem`, so the emitted box is the same fresh box the
+    /// interpreter would have made.
+    PairInt,
+    /// `Cls_oo`: two inline object slots, for which `wraps[i]` is the identity
+    /// (`specialisedtupleobject.py:26-27`) — the field read IS the element.
+    PairObject,
+}
+
 struct PositionalDefaultsInline {
     tuple: pyre_object::PyObjectRef,
+    repr: DefaultsRepr,
     /// `(parameter index, tuple index, concrete value)`.
     values: Vec<(usize, usize, pyre_object::PyObjectRef)>,
 }
 
-/// `function.py:188-193,217-231` — determine the tail of `defs_w` used by a
-/// flat positional call with missing arguments.  The trace currently accepts
-/// the ordinary translated `W_TupleObject` representation only: its
-/// `wrappeditems[*]` storage has the exact immutable-array shape upstream's
-/// `defs_w?[*]` lowers to.  Specialised numeric tuples are a different
-/// unboxed representation and safely remain on the residual call path.
+/// `function.py:188-193,217-231` — which `defs_w` element fills each parameter
+/// the call left unbound.  `defs_w` covers the LAST `len(defs_w)` parameters,
+/// so parameter `p` takes `defs_w[p - (nparams - ndefaults)]`; a `missing`
+/// parameter below that floor has no default and the call would raise, so the
+/// whole inline declines.
+///
+/// `Cls_ff` is left out: its slots are inline `f64` and the walker has no
+/// float-field read to pair with `wrapfloat` here, so a two-float defaults
+/// tuple safely stays on the residual call path.
 unsafe fn positional_defaults_for_inline(
     callable: pyre_object::PyObjectRef,
-    nargs: usize,
+    missing: &[usize],
     nparams: usize,
 ) -> Option<PositionalDefaultsInline> {
-    if nargs >= nparams {
+    if missing.is_empty() {
         return None;
     }
     let tuple = unsafe { pyre_interpreter::function_get_defaults(callable) };
-    if tuple.is_null()
-        || !std::ptr::eq(
-            unsafe { (*tuple).ob_type },
-            &pyre_object::pyobject::TUPLE_TYPE,
-        )
-    {
+    if tuple.is_null() {
         return None;
     }
+    // The layout is what `ob_type` names, and the identity guard the emitting
+    // half records pins this exact object — so the type test here decides
+    // which read to emit, and nothing later can invalidate it.
+    let ob_type = unsafe { (*tuple).ob_type };
+    let repr = if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
+        DefaultsRepr::ItemsBlock
+    } else if std::ptr::eq(
+        ob_type,
+        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE,
+    ) {
+        DefaultsRepr::PairInt
+    } else if std::ptr::eq(
+        ob_type,
+        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
+    ) {
+        DefaultsRepr::PairObject
+    } else {
+        return None;
+    };
     let ndefaults = unsafe { pyre_object::w_tuple_len(tuple) };
-    let missing = nparams - nargs;
-    if missing > ndefaults {
-        return None;
-    }
-    let start = ndefaults - missing;
-    let mut values = Vec::with_capacity(missing);
-    for offset in 0..missing {
-        let tuple_index = start + offset;
+    let first_defaulted = nparams.checked_sub(ndefaults)?;
+    let mut values = Vec::with_capacity(missing.len());
+    for &param_index in missing {
+        let tuple_index = param_index.checked_sub(first_defaulted)?;
         let value = unsafe { pyre_object::w_tuple_getitem(tuple, tuple_index as i64) }?;
-        values.push((nargs + offset, tuple_index, value));
+        values.push((param_index, tuple_index, value));
     }
-    Some(PositionalDefaultsInline { tuple, values })
+    Some(PositionalDefaultsInline {
+        tuple,
+        repr,
+        values,
+    })
 }
 
 /// Path-1 (#68): resolve a scalar `getfield_vable_r` read off an inlined
@@ -1381,11 +1420,14 @@ unsafe fn fbw_reorder_call_kw_args(
         return None;
     }
     let nkw = unsafe { pyre_object::w_tuple_len(kwnames) };
-    // Every positional parameter must be filled exactly once from a passed arg:
-    // no defaults, no *args/**kwargs/keyword-only slots the seeding would leave
-    // unbound.
+    // No positional parameter may be filled more than once, and the call may
+    // not pass more than the callee takes — `*args` / `**kwargs` /
+    // keyword-only slots are ruled out separately by
+    // `fbw_callee_scope_is_positional_only`.  A parameter left unbound is
+    // allowed through as a hole; the caller fills it from `defs_w` or declines
+    // when it has no default.
     let receiver_count = usize::from(receiver.is_some());
-    if nparams == 0 || nkw > nargs || nargs + receiver_count != nparams {
+    if nparams == 0 || nkw > nargs || nargs + receiver_count > nparams {
         return None;
     }
     let raw = unsafe {
@@ -1442,8 +1484,8 @@ unsafe fn fbw_reorder_call_kw_args(
     let mut out_args = Vec::with_capacity(nparams);
     let mut out_conc = Vec::with_capacity(nparams);
     for k in 0..nparams {
-        out_args.push(slot_args[k]?);
-        out_conc.push(slot_conc[k]?);
+        out_args.push(slot_args[k].unwrap_or(OpRef::NONE));
+        out_conc.push(slot_conc[k].unwrap_or(ConcreteValue::Null));
     }
     Some((out_args, out_conc))
 }
@@ -2567,23 +2609,36 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if !fbw_callee_scope_is_positional_only(w_code) {
         return Ok(None);
     }
-    // `Function.funccall_valuestack` fills a missing positional tail from
-    // `defs_w` before entering the frame (`function.py:188-193,217-231`).
-    // Mirror that frame shape here.  Placeholder boxes are replaced by live
-    // guarded tuple-item reads after all non-emitting eligibility checks.
-    let positional_defaults = if callee_args.len() < nparams {
+    // `Function.funccall_valuestack` fills every parameter the call left
+    // unbound from `defs_w` before entering the frame
+    // (`function.py:188-193,217-231`); `Arguments.parse` reaches the same frame
+    // shape for a keyword call.  Mirror that shape here.  Placeholder boxes are
+    // replaced by live guarded tuple-item reads after all non-emitting
+    // eligibility checks.
+    //
+    // A positional call leaves the unbound parameters as a missing tail, but a
+    // keyword one can leave a hole anywhere — `f(i, c=7)` on `def f(a, b=3,
+    // c=5)` binds slots 0 and 2 and leaves 1 — so the seeding vectors carry
+    // `OpRef::NONE` for a hole and the set is collected rather than assumed
+    // contiguous.  Only the seeding writes that sentinel, so it cannot collide
+    // with a genuinely passed argument.
+    let missing: Vec<usize> = (0..nparams)
+        .filter(|&i| callee_args.get(i).is_none_or(|arg| *arg == OpRef::NONE))
+        .collect();
+    let positional_defaults = if missing.is_empty() {
+        None
+    } else {
         let Some(defaults) =
-            (unsafe { positional_defaults_for_inline(callable, callee_args.len(), nparams) })
+            (unsafe { positional_defaults_for_inline(callable, &missing, nparams) })
         else {
             return Ok(None);
         };
-        for &(_, _, value) in &defaults.values {
-            callee_args.push(OpRef::NONE);
-            callee_arg_concretes.push(ConcreteValue::Ref(value));
+        callee_args.resize(nparams, OpRef::NONE);
+        callee_arg_concretes.resize(nparams, ConcreteValue::Null);
+        for &(param_index, _, value) in &defaults.values {
+            callee_arg_concretes[param_index] = ConcreteValue::Ref(value);
         }
         Some(defaults)
-    } else {
-        None
     };
     // Does any incoming binding land a value the callee's register banks can
     // hold unboxed?  Only the `is`-against-None scan below consults this; see
@@ -3400,18 +3455,62 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             .record_guard(OpCode::GuardValue, &[defaults_op, tuple_expected], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
 
-        let items = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            defaults_op,
-            crate::descr::tuple_wrappeditems_descr(),
-        );
-
         // Preserve the actual Ref boxes instead of baking one anchor's
-        // concrete value.
-        for (param_index, tuple_index, _) in defaults.values {
-            let index = ctx.trace_ctx.const_int(tuple_index as i64);
-            callee_args[param_index] =
-                crate::state::trace_items_block_getitem_value_pure(ctx.trace_ctx, items, index);
+        // concrete value.  Which read that is depends on where the element
+        // lives; the identity guard above already proved the layout, so no
+        // arm needs a class guard of its own.
+        match defaults.repr {
+            DefaultsRepr::ItemsBlock => {
+                let items = crate::state::opimpl_getfield_gc_r(
+                    ctx.trace_ctx,
+                    defaults_op,
+                    crate::descr::tuple_wrappeditems_descr(),
+                );
+                for (param_index, tuple_index, _) in defaults.values {
+                    let index = ctx.trace_ctx.const_int(tuple_index as i64);
+                    callee_args[param_index] = crate::state::trace_items_block_getitem_value_pure(
+                        ctx.trace_ctx,
+                        items,
+                        index,
+                    );
+                }
+            }
+            DefaultsRepr::PairObject => {
+                for (param_index, tuple_index, _) in defaults.values {
+                    let descr = if tuple_index == 0 {
+                        crate::descr::specialised_tuple_oo_value0_descr()
+                    } else {
+                        crate::descr::specialised_tuple_oo_value1_descr()
+                    };
+                    callee_args[param_index] =
+                        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, defaults_op, descr);
+                }
+            }
+            DefaultsRepr::PairInt => {
+                for (param_index, tuple_index, value) in defaults.values {
+                    let descr = if tuple_index == 0 {
+                        crate::descr::specialised_tuple_ii_value0_descr()
+                    } else {
+                        crate::descr::specialised_tuple_ii_value1_descr()
+                    };
+                    let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, defaults_op, descr);
+                    let elem = unsafe { pyre_object::w_int_get_value(value) };
+                    let boxed = walker_box_int(ctx, op.pc, raw, elem)?;
+                    // `wrapint` emits a heap `NewWithVtable`, so the stamped
+                    // concrete has to be a heap pointer too — the walk-time
+                    // `w_tuple_getitem` box above may be a tagged immediate.
+                    // Re-home the argument's concrete onto whatever
+                    // `box_int_concrete` picked, or the seeding loop below
+                    // would re-stamp the op with the other one.
+                    let concrete = box_int_concrete(elem, value as i64);
+                    if let majit_ir::Value::Ref(gcref) = concrete {
+                        callee_arg_concretes[param_index] =
+                            ConcreteValue::Ref(gcref.as_usize() as pyre_object::PyObjectRef);
+                    }
+                    ctx.trace_ctx.set_opref_concrete(boxed, concrete);
+                    callee_args[param_index] = boxed;
+                }
+            }
         }
     }
 
@@ -3518,6 +3617,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // below met).  For a strict callee this gates routing its guards through the
     // multi-frame snapshot vs. falling back to collapse.
     let mut callee_frame_seeded = false;
+    // Names the `break 'seed` arm that left `callee_frame_seeded` false, for
+    // the `[fbw-census]` collapse tally at the `parent_frame` decision below.
+    // Empty means the seed block was never entered or ran to completion.
+    let mut seed_break_reason: &'static str = "";
     // The concrete callee frame the seed block materializes, retained so the
     // sub-walk can put it on the interpreter frame chain: the walk executes
     // the callee's residuals for real, and a residual that reads the chain
@@ -3645,6 +3748,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     if try_multiframe {
                         return Ok(None);
                     }
+                    seed_break_reason = "Collapse::IsNoneBranch";
                     break 'seed;
                 }
             }
@@ -3658,6 +3762,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 if try_multiframe {
                     return Ok(None);
                 }
+                seed_break_reason = "Collapse::NoCalleeJitcode";
                 break 'seed;
             };
             let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jitcode_index as i32);
@@ -3669,6 +3774,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 if try_multiframe {
                     return Ok(None);
                 }
+                seed_break_reason = "Collapse::NoPortalRedRegs";
                 break 'seed;
             }
 
@@ -3684,6 +3790,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 if try_multiframe {
                     return Ok(None);
                 }
+                seed_break_reason = "Collapse::NoSnapshotSym";
                 break 'seed;
             }
             let sym = unsafe { &*sym_ptr };
@@ -3848,6 +3955,28 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // straight-line callee (its pre-multiframe behavior).
         None
     };
+    // Name the population a collapsing CALL falls into, so the
+    // `PYRE_FBW_DEBUG_ABORT` corpus can rank the remaining collapse sources
+    // the same way it ranks walk declines.  A collapse is not an abort and
+    // discards no trace, so this counts a resume-SHAPE choice, not a failure;
+    // it is read only to decide which population to retire next.
+    if fbw_debug_abort_enabled() && parent_frame.is_none() {
+        census_record(if !seed_break_reason.is_empty() {
+            seed_break_reason
+        } else if callee_frame_seeded {
+            // Seeded, but `compute_inline_caller_frame` could not build the
+            // caller side (`InlineCallerFrameDecline::Unavailable`).
+            "Collapse::ParentUnavailable"
+        } else if inline_depth >= fbw_max_multiframe_depth() {
+            "Collapse::DepthCap"
+        } else if !callee_code.cellvars.is_empty() {
+            "Collapse::CellVars"
+        } else if constructor_result.is_some() {
+            "Collapse::Constructor"
+        } else {
+            "Collapse::Other"
+        });
+    }
 
     // CODEX1 parity: snapshot the heap-effect state before the callee
     // sub-walk.  If the prologue (callee pc 0 → its loop header) mutates the

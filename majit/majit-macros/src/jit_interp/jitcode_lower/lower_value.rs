@@ -588,6 +588,7 @@ impl<'c> Lowerer<'c> {
                             #value_reg,
                             ::core::mem::offset_of!(#struct_path, #member),
                             #type_id,
+                            stringify!(#member),
                         );
                     },
                 ),
@@ -599,6 +600,7 @@ impl<'c> Lowerer<'c> {
                             #value_reg,
                             ::core::mem::offset_of!(#struct_path, #member),
                             #type_id,
+                            stringify!(#member),
                         );
                     },
                 ),

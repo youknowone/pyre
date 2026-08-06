@@ -142,6 +142,44 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
         } => {
             if let Some(p) = parent {
                 if !p.all_fielddescrs.is_empty() {
+                    // The descr's own two halves, before any of the branches
+                    // below hand it to a reader that would reconcile them:
+                    // `index_in_parent` (`descr.py:228`) must name the slot of
+                    // the attached parent's list that this field's offset
+                    // occupies.  `get_field_descr`'s `derive_index_in_parent`
+                    // cannot answer this — it runs only on the mint path, only
+                    // once `_cache_size` already holds the parent, and it
+                    // overwrites the number it disagrees with.
+                    //
+                    // Keyed by field name, `heaptracker.py:60-72
+                    // get_fielddescr_index_in(STRUCT, fieldname)`; the byte
+                    // offset stands in only for the mint sites that carry no
+                    // name, and only when exactly one field sits there. A
+                    // flattened layout puts an inline aggregate and its first
+                    // leaf at one address, so an offset-keyed census would
+                    // report a correctly-named descr as misplaced and put a
+                    // false reading behind `JITSTATS_BADNESS_FIELDS`.
+                    //
+                    // A miss is the inline-aggregate floor (`ob_header`,
+                    // `int_items`, an enum's `__pos_0`) carrying the documented
+                    // `(0, "")` fallback the branches below already describe,
+                    // not this defect, so it is not counted either way.
+                    let expected = p
+                        .all_fielddescrs
+                        .iter()
+                        .position(|f| !name.is_empty() && f.name == *name)
+                        .or_else(|| {
+                            let mut at = p
+                                .all_fielddescrs
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, f)| f.offset == *offset);
+                            let (idx, _) = at.next()?;
+                            at.next().is_none().then_some(idx)
+                        });
+                    if let Some(expected) = expected {
+                        majit_ir::descr::census_attached_index(expected, *index_in_parent);
+                    }
                     let mut specs: Vec<_> =
                         p.all_fielddescrs.iter().map(field_spec_from_bh).collect();
                     if p.type_id == 0 {
@@ -10765,10 +10803,10 @@ mod tests {
             &[(0, false, "value"), (8, true, "next")],
         ); // ref reg 0 = Node*
         builder.load_const_i_value(0, 99); // int reg 0 = 99
-        builder.setfield_gc_i(0, 0, 0, 0xCD); // Node.value = 99
-        builder.setfield_gc_r(0, 0, 8, 0xCD); // Node.next  = Node (self-ref)
-        builder.getfield_gc_i(1, 0, 0, 0xCD); // int reg 1 = Node.value
-        builder.getfield_gc_r(1, 0, 8, 0xCD); // ref reg 1 = Node.next
+        builder.setfield_gc_i(0, 0, 0, 0xCD, "value"); // Node.value = 99
+        builder.setfield_gc_r(0, 0, 8, 0xCD, "next"); // Node.next  = Node (self-ref)
+        builder.getfield_gc_i(1, 0, 0, 0xCD, "value"); // int reg 1 = Node.value
+        builder.getfield_gc_r(1, 0, 8, 0xCD, "next"); // ref reg 1 = Node.next
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -10836,7 +10874,7 @@ mod tests {
             false,
             &[(0, false, "value"), (8, true, "next")],
         );
-        builder.setfield_gc_i_c(0, -7, 0, 0xCE); // Node.value = -7 (inline const)
+        builder.setfield_gc_i_c(0, -7, 0, 0xCE, "value"); // Node.value = -7 (inline const)
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);

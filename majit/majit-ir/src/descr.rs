@@ -690,6 +690,63 @@ static FIELD_INDEX_REDERIVED: std::sync::atomic::AtomicUsize =
 static FIELD_INDEX_UNRESOLVED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Counters behind [`GcCache::spec_position_census`] — the same question the
+/// four above ask, put to the producer instead of to the reader.
+static FIELD_SPEC_CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FIELD_SPEC_MISPLACED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counters behind [`GcCache::attached_position_census`].
+static FIELD_ATTACHED_CHECKED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_ATTACHED_MISPLACED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// One field descr's two halves, compared against each other.
+///
+/// `expected` is the slot of the attached parent's `all_fielddescrs` that this
+/// field's own offset occupies; `actual` is the `index_in_parent`
+/// (`descr.py:228`) the producer stamped on it. Upstream cannot disagree —
+/// `heaptracker.py:60-72` and `:96-112` are one walker — so every disagreement
+/// is a descr declaring itself to be at a slot its parent fills with a
+/// different field.
+///
+/// Caller supplies `expected`, because only it holds the parent the producer
+/// actually attached. Once the descr reaches `get_field_descr` the parent is
+/// whatever `_cache_size` holds for the key, which is a different question.
+pub fn census_attached_index(expected: usize, actual: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    FIELD_ATTACHED_CHECKED.fetch_add(1, Relaxed);
+    if expected != actual {
+        FIELD_ATTACHED_MISPLACED.fetch_add(1, Relaxed);
+    }
+}
+
+/// `field_specs[i].index_in_parent == i`, counted on the list as handed in.
+///
+/// This is [`GcCache::positional_invariant_census`]'s predicate moved from the
+/// published list to the submitted one, and the move is the whole point.
+/// `get_field_descr` re-derives every index against the parent before the list
+/// is frozen, so a census taken afterwards reads the reader's answer; the
+/// producer's own number survives nowhere else. Taken here it needs no parent,
+/// no name and no cache — the caller supplies both halves of the claim.
+///
+/// Both factories feed this, so it also covers the `cache_key == 0` fresh-mint
+/// groups that never enter `_cache_size` and are therefore outside
+/// `positional_invariant_census`'s domain entirely.
+fn census_spec_positions(field_specs: &[SimpleFieldDescrSpec]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    FIELD_SPEC_CHECKED.fetch_add(field_specs.len(), Relaxed);
+    let misplaced = field_specs
+        .iter()
+        .enumerate()
+        .filter(|(i, spec)| spec.index_in_parent != *i)
+        .count();
+    if misplaced > 0 {
+        FIELD_SPEC_MISPLACED.fetch_add(misplaced, Relaxed);
+    }
+}
+
 /// descr.py:14-23 GcCache.
 ///
 /// Per-type descriptor caches keyed by LLType (structural equality).
@@ -931,6 +988,53 @@ impl GcCache {
             FIELD_PARENT_EMPTY.load(Relaxed),
             FIELD_INDEX_REDERIVED.load(Relaxed),
             FIELD_INDEX_UNRESOLVED.load(Relaxed),
+        ]
+    }
+
+    /// `[checked, misplaced]` over every field spec handed to a group factory.
+    ///
+    /// Read this next to [`field_position_census`]'s `rederived`, which cannot
+    /// answer the same question: `derive_index_in_parent` is both the judge and
+    /// the repairman. It counts only the disagreements it *reached* — a parent
+    /// already in `_cache_size`, a non-empty list, a name that resolves — and it
+    /// overwrites the caller's number in the same expression, so a nonzero
+    /// `rederived` is a repair log, not a defect report, and a zero one is
+    /// silence about a population it mostly never examined
+    /// (`parent_absent` is the count of mints where the question was skipped
+    /// outright, and it dwarfs `rederived` by three orders of magnitude, because
+    /// `make_simple_descr_group_keyed_with_headerless` mints every field BEFORE
+    /// `register_keyed_size` publishes the parent they will be indexed against).
+    ///
+    /// `misplaced` here is the same defect measured where nothing can have
+    /// repaired it yet.
+    ///
+    /// [`field_position_census`]: Self::field_position_census
+    pub fn spec_position_census() -> [usize; 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            FIELD_SPEC_CHECKED.load(Relaxed),
+            FIELD_SPEC_MISPLACED.load(Relaxed),
+        ]
+    }
+
+    /// `[checked, misplaced]` over field descrs compared against the parent
+    /// their own producer attached — see [`census_attached_index`].
+    ///
+    /// This is the surface [`spec_position_census`] does NOT cover. That one
+    /// reads a parent's positional list, which every producer builds by
+    /// enumerating the list it just sorted, so it is self-consistent by
+    /// construction and reads zero even while a standalone field descr pointing
+    /// INTO that list carries a stale rank. The assembler mints exactly such a
+    /// descr: `add_struct_field_descr` resolves the rank against the layout as
+    /// it stands at the emit site, and `register_struct_layout` re-indexes the
+    /// layout on every later merge.
+    ///
+    /// [`spec_position_census`]: Self::spec_position_census
+    pub fn attached_position_census() -> [usize; 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            FIELD_ATTACHED_CHECKED.load(Relaxed),
+            FIELD_ATTACHED_MISPLACED.load(Relaxed),
         ]
     }
 
@@ -4868,6 +4972,9 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
 ) -> SimpleDescrGroup {
     let struct_key = LLType::struct_key(cache_key);
+    // Before `get_field_descr` below can normalise anything: the producer's own
+    // `index_in_parent` against the position it hands the field in.
+    census_spec_positions(field_specs);
     let mut gc = gc_cache().lock().unwrap();
     // descr.py:218-239 — cache-or-mint each FieldDescr by
     // `(STRUCT, fieldname)` before freezing this producer's positional list.
@@ -4935,6 +5042,7 @@ fn make_simple_descr_group_inner(
     headerless: bool,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
+    census_spec_positions(field_specs);
     let field_descrs_cell = std::cell::RefCell::new(Vec::<Arc<SimpleFieldDescr>>::new());
     let field_specs = field_specs.to_vec();
     let size_descr = Arc::new_cyclic(|weak_size: &Weak<SimpleSizeDescr>| {

@@ -176,6 +176,18 @@ thread_local! {
     /// via [`fbw_finish_concrete_root_walker`].  `None` for ungated /
     /// loop-closing / float (no concrete float shadow bank) walks → the
     /// portal degrades to the legacy `ContinueRunningNormally` replay.
+    ///
+    /// This root exists because of the *outliving*, not because a walk-time
+    /// concrete is otherwise unrooted.  Every value the walk computes is
+    /// stamped onto its frontend op (`set_opref_concrete` →
+    /// `history.py:803-807` `*FrontendOp(pos, value)`), and
+    /// `MetaInterp::walk_active_trace_refs` forwards every recorder
+    /// `Op`/`InputArg` `value` cell holding a `Value::Ref` — so for the
+    /// duration of the walk the recorder IS the root set.  The compile path
+    /// then does `self.tracing.take()`, dropping that recorder while this
+    /// stash is still live, which is exactly the window no op-graph slot
+    /// covers.  A walk-scoped side list of the same values would be a second
+    /// source of truth for a window the op graph already owns.
     static FBW_FINISH_CONCRETE: std::cell::Cell<Option<FinishConcrete>> =
         const { std::cell::Cell::new(None) };
 

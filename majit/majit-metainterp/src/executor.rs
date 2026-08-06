@@ -85,6 +85,50 @@ pub fn do_getfield_gc_f(
     cpu.bh_getfield_gc_f(struct_, fielddescr)
 }
 
+// executor.py:215-222
+//
+//     def do_setfield_gc(cpu, _, structbox, itembox, fielddescr):
+//         struct = structbox.getref_base()
+//         if fielddescr.is_pointer_field():
+//             cpu.bh_setfield_gc_r(struct, itembox.getref_base(), fielddescr)
+//         elif fielddescr.is_float_field():
+//             cpu.bh_setfield_gc_f(struct, itembox.getfloatstorage(), fielddescr)
+//         else:
+//             cpu.bh_setfield_gc_i(struct, itembox.getint(), fielddescr)
+//
+// One RPython function covering all three banks, so the type dispatch is
+// the descr's own `is_pointer_field()` / `is_float_field()` — not the
+// caller's.  `itembox` arrives here already projected to its concrete
+// `Value`, the flat-box analog of the `getref_base()` / `getint()` /
+// `getfloatstorage()` accessors upstream calls on the box.  Returns
+// `false` when the value's bank disagrees with the descr's, which
+// upstream cannot express (its boxes are typed by construction).
+pub fn do_setfield_gc(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    structbox: i64,
+    itembox: majit_ir::Value,
+    fielddescr: &majit_translate::jitcode::BhDescr,
+    field_type: majit_ir::Type,
+) -> bool {
+    let struct_ = structbox;
+    match (field_type, itembox) {
+        (majit_ir::Type::Ref, majit_ir::Value::Ref(r)) => {
+            cpu.bh_setfield_gc_r(struct_, r, fielddescr);
+            true
+        }
+        (majit_ir::Type::Float, majit_ir::Value::Float(f)) => {
+            cpu.bh_setfield_gc_f(struct_, f, fielddescr);
+            true
+        }
+        (majit_ir::Type::Int, majit_ir::Value::Int(i)) => {
+            cpu.bh_setfield_gc_i(struct_, i, fielddescr);
+            true
+        }
+        _ => false,
+    }
+}
+
 // executor.py:206-212 do_getarrayitem_gc_{i,r,f}: project box → gcref +
 // concrete index, dispatch to `cpu.bh_getarrayitem_gc_*`.  Pyre's flat
 // box analog passes `(array, index)` as plain `i64` values projected

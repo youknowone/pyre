@@ -12,7 +12,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::dictmultiobject::{DictStrategy, OBJECT_DICT_STRATEGY};
+use crate::dictmultiobject::DictStrategy;
 use crate::pyobject::PyObjectRef;
 
 /// `identitydict.py:12-83 IdentityDictStrategy` key type — identity
@@ -170,7 +170,7 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
         new_map,
         crate::dictmultiobject::object_dict_storage_gc_type_id(),
     ) as *mut u8;
-    dict.dstrategy = &OBJECT_DICT_STRATEGY;
+    dict.dstrategy = &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF;
 }
 
 #[inline]
@@ -212,6 +212,13 @@ pub struct IdentityDictStrategy;
 /// `pypy/objspace/std/identitydict.py:12 IdentityDictStrategy`
 /// singleton — matches PyPy's `space.fromcache(IdentityDictStrategy)`.
 pub static IDENTITY_DICT_STRATEGY: IdentityDictStrategy = IdentityDictStrategy;
+
+/// The [`crate::dictmultiobject::DictStrategyRef`] holder a dict's `dstrategy`
+/// slot points at.
+pub static IDENTITY_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
+    crate::dictmultiobject::DictStrategyRef {
+        imp: &IDENTITY_DICT_STRATEGY,
+    };
 
 impl IdentityDictStrategy {
     /// `identitydict.py:36-37 IdentityDictStrategy.is_correct_type` —
@@ -346,7 +353,7 @@ impl DictStrategy for IdentityDictStrategy {
             storage.clone(),
             identity_dict_storage_gc_type_id(),
         );
-        crate::dictmultiobject::w_dict_new_with(&IDENTITY_DICT_STRATEGY, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_new_with(&IDENTITY_DICT_STRATEGY_REF, new_storage as *mut u8)
     }
 
     /// `pypy.objspace.std.identitydict.IdentityDictStrategy` stores

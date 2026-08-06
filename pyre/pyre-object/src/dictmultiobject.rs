@@ -746,11 +746,11 @@ pub trait W_DictMultiObject {
     /// `dictmultiobject.py:52-53 W_DictMultiObject.set_strategy`
     /// abstract method, overridden by `W_DictObject` (`:324-325`) and
     /// `W_ModuleDictObject` (`:341-342`).  Pyre limits the setter to
-    /// `&'static dyn DictStrategy` (the singleton dispatch surface);
+    /// a `&'static DictStrategyRef` (the singleton dispatch surface);
     /// W_ModuleDictObject strategy promotion to ObjectDictStrategy
     /// continues to go through `w_module_dict_switch_to_object_strategy`
     /// per `celldict.py:173-186`.
-    fn set_strategy(&mut self, strategy: &'static dyn crate::dictmultiobject::DictStrategy);
+    fn set_strategy(&mut self, strategy: &'static DictStrategyRef);
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:313-325 W_DictObject(W_DictMultiObject)`
@@ -789,7 +789,17 @@ pub struct W_DictObject {
     /// holder ([`w_dict_new_unmanaged_side_table_value`]) keeps an off-GC
     /// `malloc_raw` box.
     pub dstorage: *mut u8,
-    pub dstrategy: &'static dyn crate::dictmultiobject::DictStrategy,
+    /// `dstrategy` from `W_DictObject.__slots__` (`dictmultiobject.py:325`) —
+    /// **one word**, like `W_ModuleDictObject.mstrategy` beside it and like the
+    /// single instance pointer upstream stores.  The strategy singletons are
+    /// unit structs, so a `&'static dyn DictStrategy` here would be a fat
+    /// pointer carrying the vtable in the *reference*: no field for the JIT to
+    /// read, and a data word that Rust may collapse to one address across
+    /// distinct ZST statics.  [`DictStrategyRef`] holds the trait object
+    /// instead and derefs to it, so this slot is a plain pointer that a
+    /// `guard_class` can pin the way RPython pins an inlined virtual call's
+    /// receiver.
+    pub dstrategy: &'static DictStrategyRef,
     /// Mutation state carried implicitly by PyPy's live strategy iterator.
     /// `IndexMap::shift_remove` compacts its storage, so pyre records key-set
     /// changes explicitly; value-only overwrites leave this unchanged.
@@ -1006,11 +1016,11 @@ impl crate::lltype::GcType for W_DictObject {
 impl W_DictMultiObject for W_DictObject {
     #[inline]
     fn get_strategy(&self) -> &dyn crate::dictmultiobject::DictStrategy {
-        self.dstrategy
+        self.dstrategy.imp
     }
 
     #[inline]
-    fn set_strategy(&mut self, strategy: &'static dyn crate::dictmultiobject::DictStrategy) {
+    fn set_strategy(&mut self, strategy: &'static DictStrategyRef) {
         self.dstrategy = strategy;
     }
 }
@@ -1047,7 +1057,7 @@ pub unsafe fn w_dict_get_strategy(
         return &*strat_ptr;
     }
     let dict = &*(obj as *const W_DictObject);
-    dict.dstrategy
+    dict.dstrategy.imp
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:52-53 W_DictMultiObject.set_strategy`
@@ -1067,10 +1077,7 @@ pub unsafe fn w_dict_get_strategy(
 /// `obj` must be a valid PyObjectRef pointing at a `W_DictObject` or
 /// `W_ModuleDictObject`.
 #[inline]
-pub unsafe fn w_dict_set_strategy(
-    obj: PyObjectRef,
-    strategy: &'static dyn crate::dictmultiobject::DictStrategy,
-) {
+pub unsafe fn w_dict_set_strategy(obj: PyObjectRef, strategy: &'static DictStrategyRef) {
     if is_module_dict(obj) {
         panic!(
             "w_dict_set_strategy: W_ModuleDictObject strategy swap is not the canonical \
@@ -1246,7 +1253,7 @@ pub fn w_dict_new() -> PyObjectRef {
                 w_class: get_instantiate(&DICT_TYPE),
             },
             dstorage: entries as *mut u8,
-            dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY,
+            dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY_REF,
             keys_version: 0,
             clear_gen: 0,
         },
@@ -1268,7 +1275,7 @@ pub fn w_dict_new_kwargs() -> PyObjectRef {
                 w_class: get_instantiate(&DICT_TYPE),
             },
             dstorage: std::ptr::null_mut(),
-            dstrategy: &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
+            dstrategy: &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF,
             keys_version: 0,
             clear_gen: 0,
         },
@@ -1282,10 +1289,7 @@ pub fn w_dict_new_kwargs() -> PyObjectRef {
 /// to allocate a fresh W_DictObject that preserves the source's
 /// strategy + a freshly cloned typed storage box.  Length is computed
 /// on demand by `strategy.length(self)` from the typed storage shape.
-pub fn w_dict_new_with(
-    strategy: &'static dyn crate::dictmultiobject::DictStrategy,
-    dstorage: *mut u8,
-) -> PyObjectRef {
+pub fn w_dict_new_with(strategy: &'static DictStrategyRef, dstorage: *mut u8) -> PyObjectRef {
     alloc_dict_object(
         W_DictObject {
             ob_header: PyObject {
@@ -1320,7 +1324,7 @@ pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
             w_class: get_instantiate(&DICT_TYPE),
         },
         dstorage: entries as *mut u8,
-        dstrategy: &crate::dictmultiobject::OBJECT_DICT_STRATEGY,
+        dstrategy: &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF,
         keys_version: 0,
         clear_gen: 0,
     }) as PyObjectRef
@@ -1518,13 +1522,11 @@ impl W_DictMultiObject for W_ModuleDictObject {
     /// `w_dict.dstorage = strategy.erase(d_new)`).  The trait method
     /// hides that adapter from callers; the side-field layout retires
     /// alongside typed-strategy storage migration.
-    fn set_strategy(&mut self, strategy: &'static dyn crate::dictmultiobject::DictStrategy) {
-        let target =
-            strategy as *const dyn crate::dictmultiobject::DictStrategy as *const () as usize;
-        let object_singleton = &crate::dictmultiobject::OBJECT_DICT_STRATEGY
-            as *const crate::dictmultiobject::ObjectDictStrategy
-            as *const () as usize;
-        if target != object_singleton {
+    fn set_strategy(&mut self, strategy: &'static DictStrategyRef) {
+        // Distinct holders have distinct addresses; the singletons they carry
+        // are zero-sized, and comparing *those* addresses is not a valid
+        // identity test.
+        if !std::ptr::eq(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF) {
             panic!(
                 "W_ModuleDictObject::set_strategy: only ObjectDictStrategy transition is \
                  implemented (celldict.py:173-186 is the only documented swap target)"
@@ -1972,11 +1974,15 @@ pub unsafe fn w_dict_strategy_id(obj: PyObjectRef) -> usize {
         return m.mstrategy as usize;
     }
     let d = &*(obj as *const W_DictObject);
-    // `&'static dyn DictStrategy` — the fat pointer carries both a
-    // vtable and a data pointer; the data pointer alone uniquely
-    // identifies the strategy singleton (`OBJECT_DICT_STRATEGY` etc.).
-    let raw: *const dyn crate::dictmultiobject::DictStrategy = d.dstrategy;
-    raw as *const () as usize
+    // The holder's own address, not `imp`'s data pointer.  Every strategy
+    // singleton is a unit struct, so the data half of the `&'static dyn
+    // DictStrategy` inside the holder is the address of a zero-sized static and
+    // Rust does not guarantee those differ between distinct strategies — two
+    // strategies could stamp the same id and a transition between them would be
+    // invisible to the iterators that compare this.  `DictStrategyRef` is not
+    // zero-sized, so one holder per singleton gives one distinct address per
+    // strategy.
+    d.dstrategy as *const DictStrategyRef as usize
 }
 
 /// Key-set mutation state captured by dict iterators.
@@ -2381,7 +2387,7 @@ pub unsafe fn w_dict_is_empty_strategy(obj: PyObjectRef) -> bool {
     if is_module_dict(obj) {
         return false;
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY)
         || strategy_is(
             strategy,
@@ -2403,7 +2409,7 @@ pub unsafe fn w_dict_lookup_checked(
     if is_module_dict(obj) {
         return w_module_dict_lookup_inner_checked(obj, key);
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY)
         || strategy_is(
             strategy,
@@ -2433,7 +2439,7 @@ pub unsafe fn w_dict_lookup_checked(
         if _never_equal_to_string(key) {
             return Ok(None);
         }
-        w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY);
+        w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
@@ -2761,7 +2767,7 @@ unsafe fn w_dict_store_checked_inner(
     if is_module_dict(obj) {
         return w_module_dict_store_inner_checked(obj, key, value);
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY) {
         crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
         return w_dict_store_checked_inner(obj, key, value, hash);
@@ -2786,7 +2792,7 @@ unsafe fn w_dict_store_checked_inner(
     }
     if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
         if !crate::is_exact_type(key, &crate::STR_TYPE) {
-            w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY);
+            w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF);
         }
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
@@ -2867,7 +2873,7 @@ pub unsafe fn w_dict_setdefault_checked(
         w_module_dict_store_inner_checked(obj, key, value)?;
         return Ok(value);
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     // `dictmultiobject.py:749-753 EmptyDictStrategy.setdefault`:
     //   self.switch_to_correct_strategy(w_dict, w_key)
     //   w_dict.setitem(w_key, w_default)
@@ -2980,7 +2986,7 @@ pub unsafe fn w_dict_pop_checked(
             None => Ok(None),
         }
     } else {
-        let strategy = (*(obj as *const W_DictObject)).dstrategy;
+        let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
         if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
             // `AbstractTypedStrategy.pop` (`dictmultiobject.py:1123`) performs
             // one r_dict lookup followed by removal.  Run that probe
@@ -3483,7 +3489,7 @@ pub unsafe fn w_dict_delitem_checked(
     if is_module_dict(obj) {
         return w_module_dict_delitem_inner_checked(obj, key);
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY)
         || strategy_is(
             strategy,
@@ -3507,7 +3513,7 @@ pub unsafe fn w_dict_delitem_checked(
         if crate::is_exact_type(key, &crate::STR_TYPE) {
             return w_dict_delitem_object_strategy_checked(obj, key);
         }
-        w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY);
+        w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
@@ -3574,7 +3580,7 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
         return Err(DictKeyError);
     }
 
-    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     if strategy.strategy_kind() != StrategyKind::Object {
         strategy.switch_to_object_strategy(obj);
     }
@@ -3709,7 +3715,7 @@ pub unsafe fn w_dict_move_to_end_checked(
         return Err(DictKeyError);
     }
 
-    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     // `EmptyDictStrategy.move_to_end` (dictmultiobject.py:820-821) raises
     // `KeyError` for the requested key without hashing it: an unhashable key
     // reports `KeyError`, not the object strategy's unhashable `TypeError`, and
@@ -4223,7 +4229,7 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
     dict.dstorage =
         crate::gc_storage::gc_alloc_storage_box(new_map, object_dict_storage_gc_type_id())
             as *mut u8;
-    dict.dstrategy = &OBJECT_DICT_STRATEGY;
+    dict.dstrategy = &OBJECT_DICT_STRATEGY_REF;
 }
 
 /// Internal helper: `BytesDictStrategy::setitem` body —
@@ -4361,7 +4367,7 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
     dict.dstorage =
         crate::gc_storage::gc_alloc_storage_box(new_map, object_dict_storage_gc_type_id())
             as *mut u8;
-    dict.dstrategy = &OBJECT_DICT_STRATEGY;
+    dict.dstrategy = &OBJECT_DICT_STRATEGY_REF;
 }
 
 /// Internal helper: `ObjectDictStrategy::items` body for pyre's
@@ -4390,6 +4396,143 @@ pub unsafe fn w_dict_nth_item_object_strategy(
     let dict = &*(obj as *const W_DictObject);
     let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
     entries.get_index(index).map(|(k, &v)| (k.obj, v))
+}
+
+/// `rordereddict.py:46-48 ll_call_lookup_function` — the `dict.lookup` oopspec
+/// residual, answering the entry index for `w_key` (or -1 for a miss) under a
+/// hash the caller already computed.
+///
+/// `flag` is the `FLAG_LOOKUP` / `FLAG_STORE` / `FLAG_DELETE` selector
+/// `ll_dict_lookup` takes (`rordereddict.py:1041-1060`), and **only
+/// `FLAG_LOOKUP` is implemented here**.  The argument exists because the
+/// optimizer reads it off `arg(4)` (`heap.py:497-500`) and requires it to be a
+/// constant; the recorder only ever emits 0.
+///
+/// The other two are not "the same answer" — they are not expressible.  On a
+/// miss `FLAG_STORE` answers the free slot the caller is to write into, and
+/// `FLAG_DELETE` walks to the tombstone, both of which read the free-slot
+/// bookkeeping an `IndexMap` does not keep.  This helper answers -1 for every
+/// miss, so a store or delete lookup would be wrong rather than merely
+/// conservative.
+///
+/// Only a Unicode-strategy dict reaches here, so every stored key is an exact
+/// `str` and the probe's comparisons are WTF-8 byte equality.  The
+/// callback-free probe bracket enforces that: a pair that would need user code
+/// breaks the probe and reports a miss, which side-exits the compiled trace to
+/// the generic residual rather than running `__eq__` inside a call the recorder
+/// promised cannot raise.
+///
+/// The object parameters are spelled `*mut PyObject` rather than
+/// [`PyObjectRef`]: `dont_look_inside` decides syntactically whether it can
+/// emit the `__majit_call_target_*` word-ABI trampoline, and an alias path is
+/// not a raw-pointer token, so the alias spelling silently yields no
+/// trampoline — which is what the wasm backend's `call_indirect` needs.
+///
+/// The table read holds the dict's own lock, like every other reader of
+/// `dstorage`, so a concurrent `setitem` cannot resize the `IndexMap` under the
+/// scan.  Holding it across the probe cannot deadlock: `dict_keys_equal` runs no
+/// user code while the bracket is active — a pair the builtin ladder cannot
+/// decide breaks the probe instead — so nothing under the lock can re-enter a
+/// dict operation.
+///
+/// # Safety
+/// `w_dict` must be a live `W_DictObject` on a strategy whose storage is an
+/// `ObjectDictStorage`, and `hash` the digest `object_key_for` produces for
+/// `w_key`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_unicode_lookup_index(
+    w_dict: *mut PyObject,
+    w_key: *mut PyObject,
+    hash: i64,
+    flag: i64,
+) -> i64 {
+    debug_assert_eq!(flag, 0, "only FLAG_LOOKUP is implemented");
+    lock_dict_refs!(_dict_guard, w_dict, w_key);
+    let dict = &*(w_dict as *const W_DictObject);
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    crate::dict_eq_hook::take_eq_error();
+    crate::dict_eq_hook::begin_callback_free_probe();
+    let found = entries.get_index_of(&ObjectKey { hash, obj: w_key });
+    let probe_needed_user_code = crate::dict_eq_hook::end_callback_free_probe();
+    match found {
+        Some(i) if !probe_needed_user_code => i as i64,
+        _ => -1,
+    }
+}
+
+/// `rstr.ll_strhash` — the digest [`object_key_for`] caches for an exact `str`
+/// key, isolated so a recorder that has already guarded the key's exact type
+/// can emit it as one elidable call and let the optimizer hoist it out of a
+/// loop.  Memoized on the string object, content-derived and identity-stable,
+/// which is what `@jit.elidable` asserts.
+///
+/// `w_key` is spelled `*mut PyObject` for [`w_dict_unicode_lookup_index`]'s
+/// reason.
+///
+/// # Safety
+/// `w_key` must be a live exact `str`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_unicode_key_hash(w_key: *mut PyObject) -> i64 {
+    crate::dict_eq_hook::try_hash_w(w_key)
+        .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook())
+}
+
+/// `rordereddict.py:709 ll_dict_getitem` — the value half of the lookup, read
+/// at the entry index [`w_dict_unicode_lookup_index`] settled on, and answering
+/// null for anything the index no longer describes.
+///
+/// The index is re-validated against the key that produced it, because the two
+/// halves are two residuals and the lock is not held across the gap.  Upstream
+/// runs them as one translated sequence under the GIL and can index straight
+/// in; here another thread's `del` compacts the table (`IndexMap::shift_remove`
+/// closes the hole), so an index that was in range and correct at lookup time
+/// can name a *different* live key by the time it is read.  A bounds check does
+/// not see that — the index is still in range — and the answer would be a wrong
+/// value rather than a crash.  Re-validating also makes the optimizer's own CSE
+/// safe: `_optimize_call_dict_lookup` may delete a repeat of the same
+/// `(dict, key)` probe, so the index arriving here can have been produced by an
+/// earlier iteration.
+///
+/// The strategy is re-checked under the lock for the same reason: the trace
+/// guarded it before the call, and only the Unicode and Object strategies share
+/// this `IndexMap<ObjectKey, _>` storage shape.
+///
+/// A null answer fails the caller's `GuardNonnull` and side-exits to the generic
+/// residual, which redoes the whole subscript.
+///
+/// # Safety
+/// `obj` must be a live regular `W_DictObject` (not a module dict), and `hash`
+/// the digest `object_key_for` produces for `w_key`.
+pub unsafe fn w_dict_unicode_value_at_checked(
+    obj: PyObjectRef,
+    index: usize,
+    w_key: PyObjectRef,
+    hash: i64,
+) -> PyObjectRef {
+    lock_dict_refs!(_dict_guard, obj, w_key);
+    if !matches!(
+        w_dict_get_strategy(obj).strategy_kind(),
+        StrategyKind::Unicode | StrategyKind::Object
+    ) {
+        return std::ptr::null_mut();
+    }
+    let dict = &*(obj as *const W_DictObject);
+    let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    let Some((entry_key, &value)) = entries.get_index(index) else {
+        return std::ptr::null_mut();
+    };
+    if entry_key.hash != hash {
+        return std::ptr::null_mut();
+    }
+    crate::dict_eq_hook::take_eq_error();
+    crate::dict_eq_hook::begin_callback_free_probe();
+    let same_key = dict_keys_equal(entry_key.obj, w_key);
+    let probe_needed_user_code = crate::dict_eq_hook::end_callback_free_probe();
+    if same_key && !probe_needed_user_code {
+        value
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 /// Internal helper: `ModuleDictStrategy::items` body for pyre's
@@ -5126,7 +5269,7 @@ pub trait DictStrategy {
     /// `w_dict` must point at a valid `W_DictObject` whose
     /// `dstrategy` is `self`.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY);
+        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
     }
 
     /// `dictmultiobject.py:559-560 listview_bytes` — default returns
@@ -5200,6 +5343,43 @@ pub trait DictStrategy {
     }
 }
 
+/// The one-word strategy slot a dict stores, holding the trait object that
+/// does the dispatch.
+///
+/// PyPy's `dstrategy` is one instance pointer and the strategy's *type* lives
+/// in the instance header, which is what the JIT's `guard_class` reads when it
+/// inlines `self.get_strategy().getitem(...)`.  A Rust `&dyn` inverts that —
+/// the vtable rides in the reference — so a dict holding one directly has no
+/// field to guard, and its data word is the address of a zero-sized static,
+/// which Rust is free to make identical across distinct strategies.  Boxing
+/// the trait object in this `#[repr(C)]` holder restores both properties: the
+/// dict slot is a single pointer, and each strategy's holder is a distinct,
+/// non-zero-sized address.
+///
+/// It derefs to `dyn DictStrategy`, so `dict.dstrategy.getitem(..)` and every
+/// other call through the slot reads exactly as before.
+#[repr(C)]
+pub struct DictStrategyRef {
+    pub imp: &'static dyn crate::dictmultiobject::DictStrategy,
+}
+
+/// The holders below wrap only the stateless unit-struct singletons, which are
+/// shared process-wide exactly as `space.fromcache(StrategyCls)` shares them
+/// upstream.  `DictStrategy` itself cannot carry a `Sync` bound —
+/// `ModuleDictStrategy`'s `GlobalCache` holds `*mut PyObject` — and a module
+/// dict never uses a holder anyway: its strategy lives behind
+/// `W_ModuleDictObject.mstrategy`.
+unsafe impl Sync for DictStrategyRef {}
+
+impl std::ops::Deref for DictStrategyRef {
+    type Target = dyn crate::dictmultiobject::DictStrategy;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.imp
+    }
+}
+
 /// `pypy/objspace/std/dictmultiobject.py:1195+ ObjectDictStrategy`
 /// process-wide singleton.  PyPy's `space.fromcache(ObjectDictStrategy)`
 /// returns the same instance for every space, and `W_DictObject`'s
@@ -5234,6 +5414,28 @@ pub static UNICODE_DICT_STRATEGY: UnicodeDictStrategy = UnicodeDictStrategy;
 /// `pypy/objspace/std/dictmultiobject.py:1339 IntDictStrategy`
 /// singleton.
 pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
+
+/// The [`DictStrategyRef`] holders a dict's `dstrategy` slot points at — one
+/// per singleton above.  Each is a distinct address; the singletons themselves
+/// are zero-sized and need not be.
+pub static OBJECT_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    imp: &OBJECT_DICT_STRATEGY,
+};
+pub static EMPTY_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    imp: &EMPTY_DICT_STRATEGY,
+};
+pub static EMPTY_KWARGS_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    imp: &EMPTY_KWARGS_DICT_STRATEGY,
+};
+pub static BYTES_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    imp: &BYTES_DICT_STRATEGY,
+};
+pub static UNICODE_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    imp: &UNICODE_DICT_STRATEGY,
+};
+pub static INT_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    imp: &INT_DICT_STRATEGY,
+};
 
 /// `dictmultiobject.py:684-790 EmptyDictStrategy`.
 ///
@@ -5277,10 +5479,7 @@ pub struct EmptyDictStrategy;
 /// RPython's `w_dict.dstorage = strategy.erase(storage)` is a `setfield_gc`:
 /// the GC transform roots and reloads `w_dict` across the storage allocation,
 /// then records the old-to-young edge.  Do the same explicitly here.
-unsafe fn install_empty_strategy(
-    w_dict: PyObjectRef,
-    strategy: &'static dyn crate::dictmultiobject::DictStrategy,
-) {
+unsafe fn install_empty_strategy(w_dict: PyObjectRef, strategy: &'static DictStrategyRef) {
     let _roots = crate::gc_roots::push_roots();
     let dict_slot = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(w_dict);
@@ -5311,7 +5510,7 @@ impl EmptyDictStrategy {
         // `:696-698 type(w_key) is self.space.UnicodeObjectCls`
         // (Python 2 unicode / Python 3 str).
         if crate::is_exact_type(w_key, &crate::STR_TYPE) {
-            install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY);
+            install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY_REF);
             return;
         }
         // `:700-701 is_w(w_type, self.space.w_int)` — plain int only;
@@ -5356,7 +5555,7 @@ impl EmptyDictStrategy {
     /// `w_dict` must point at a valid `W_DictObject` whose strategy
     /// is currently `EmptyDictStrategy`.
     unsafe fn switch_to_int_strategy(&self, w_dict: PyObjectRef) {
-        install_empty_strategy(w_dict, &INT_DICT_STRATEGY);
+        install_empty_strategy(w_dict, &INT_DICT_STRATEGY_REF);
     }
 
     /// `dictmultiobject.py:707-711 switch_to_bytes_strategy`:
@@ -5375,7 +5574,7 @@ impl EmptyDictStrategy {
     /// # Safety
     /// Same as [`switch_to_int_strategy`].
     unsafe fn switch_to_bytes_strategy(&self, w_dict: PyObjectRef) {
-        install_empty_strategy(w_dict, &BYTES_DICT_STRATEGY);
+        install_empty_strategy(w_dict, &BYTES_DICT_STRATEGY_REF);
     }
 
     /// `dictmultiobject.py:725-730 switch_to_identity_strategy`:
@@ -5397,7 +5596,7 @@ impl EmptyDictStrategy {
     /// # Safety
     /// Same as [`switch_to_int_strategy`].
     unsafe fn switch_to_identity_strategy(&self, w_dict: PyObjectRef) {
-        install_empty_strategy(w_dict, &crate::identitydict::IDENTITY_DICT_STRATEGY);
+        install_empty_strategy(w_dict, &crate::identitydict::IDENTITY_DICT_STRATEGY_REF);
     }
 }
 
@@ -5429,7 +5628,7 @@ impl EmptyKwargsDictStrategy {
     /// `w_dict` must be a W_DictObject whose strategy is
     /// `EMPTY_KWARGS_DICT_STRATEGY`.
     unsafe fn switch_to_kwargs_strategy(&self, w_dict: PyObjectRef) {
-        install_empty_strategy(w_dict, &crate::kwargsdict::KWARGS_DICT_STRATEGY);
+        install_empty_strategy(w_dict, &crate::kwargsdict::KWARGS_DICT_STRATEGY_REF);
     }
 
     /// `dictmultiobject.py:692-705 switch_to_correct_strategy`
@@ -5596,7 +5795,7 @@ impl DictStrategy for EmptyDictStrategy {
     /// pointer.  The field overwrite is a `setfield_gc`; the unreachable
     /// old placeholder box is reclaimed by the sweep.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        install_empty_strategy(w_dict, &OBJECT_DICT_STRATEGY);
+        install_empty_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
     }
 
     unsafe fn getitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
@@ -5656,7 +5855,7 @@ impl DictStrategy for EmptyDictStrategy {
         //   w_dict.setitem_str(key, w_value)
         // Unicode-strategy promotion is direct since the caller has
         // already chosen the str-keyed path.
-        install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY);
+        install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY_REF);
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 
@@ -5867,7 +6066,7 @@ impl DictStrategy for ObjectDictStrategy {
             storage.clone(),
             crate::dictmultiobject::object_dict_storage_gc_type_id(),
         );
-        crate::dictmultiobject::w_dict_new_with(&OBJECT_DICT_STRATEGY, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_new_with(&OBJECT_DICT_STRATEGY_REF, new_storage as *mut u8)
     }
 }
 
@@ -6040,7 +6239,7 @@ impl DictStrategy for BytesDictStrategy {
             storage.clone(),
             crate::dictmultiobject::bytes_dict_storage_gc_type_id(),
         );
-        crate::dictmultiobject::w_dict_new_with(&BYTES_DICT_STRATEGY, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_new_with(&BYTES_DICT_STRATEGY_REF, new_storage as *mut u8)
     }
 }
 
@@ -6109,7 +6308,7 @@ impl DictStrategy for UnicodeDictStrategy {
         if crate::dictmultiobject::_never_equal_to_string(w_key) {
             return None;
         }
-        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY);
+        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
         crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
     }
 
@@ -6144,7 +6343,7 @@ impl DictStrategy for UnicodeDictStrategy {
             crate::dictmultiobject::w_dict_store_object_strategy(w_dict, w_key, w_value);
             return;
         }
-        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY);
+        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
         crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
     }
 
@@ -6153,7 +6352,7 @@ impl DictStrategy for UnicodeDictStrategy {
         if crate::is_exact_type(w_key, &crate::STR_TYPE) {
             return crate::dictmultiobject::w_dict_delitem_object_strategy(w_dict, w_key);
         }
-        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY);
+        crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
         crate::dictmultiobject::w_dict_delitem(w_dict, w_key)
     }
 
@@ -6237,7 +6436,7 @@ impl DictStrategy for UnicodeDictStrategy {
             storage.clone(),
             crate::dictmultiobject::object_dict_storage_gc_type_id(),
         );
-        crate::dictmultiobject::w_dict_new_with(&UNICODE_DICT_STRATEGY, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_new_with(&UNICODE_DICT_STRATEGY_REF, new_storage as *mut u8)
     }
 }
 
@@ -6418,7 +6617,7 @@ impl DictStrategy for IntDictStrategy {
             storage.clone(),
             crate::dictmultiobject::int_dict_storage_gc_type_id(),
         );
-        crate::dictmultiobject::w_dict_new_with(&INT_DICT_STRATEGY, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_new_with(&INT_DICT_STRATEGY_REF, new_storage as *mut u8)
     }
 }
 
@@ -6493,6 +6692,55 @@ mod tests {
             assert_eq!(w_int_get_value(str_entries[0].1), 1);
             assert_eq!(str_entries[1].0, "beta");
             assert_eq!(w_int_get_value(str_entries[1].1), 2);
+        }
+    }
+
+    #[test]
+    fn test_w_dict_unicode_lookup_index_helpers() {
+        install_test_hash_hook();
+        let dict = w_dict_new();
+        unsafe {
+            w_dict_setitem_str(dict, "alpha", w_int_new(1));
+            w_dict_setitem_str(dict, "beta", w_int_new(2));
+
+            let alpha = w_str_new("alpha");
+            let beta = w_str_new("beta");
+            let gamma = w_str_new("gamma");
+            assert_eq!(
+                w_dict_unicode_lookup_index(dict, alpha, w_dict_unicode_key_hash(alpha), 0),
+                0,
+            );
+            assert_eq!(
+                w_dict_unicode_lookup_index(dict, beta, w_dict_unicode_key_hash(beta), 0),
+                1,
+            );
+            assert_eq!(
+                w_dict_unicode_lookup_index(dict, gamma, w_dict_unicode_key_hash(gamma), 0),
+                -1,
+            );
+
+            // The value read answers for the key that produced the index, not
+            // for whatever now sits at it.
+            w_dict_setitem_str(dict, "gamma", w_int_new(3));
+            let beta_hash = w_dict_unicode_key_hash(beta);
+            let beta_value = w_dict_getitem_str(dict, "beta").unwrap();
+            assert_eq!(w_dict_unicode_lookup_index(dict, beta, beta_hash, 0), 1);
+            assert_eq!(
+                w_dict_unicode_value_at_checked(dict, 1, beta, beta_hash),
+                beta_value,
+            );
+
+            // Deleting an earlier key compacts the table, so index 1 now names
+            // "gamma".  It is still IN RANGE and still holds a live entry, so a
+            // bounds check passes and would answer gamma's value for beta's
+            // index — only the key re-validation catches it.
+            w_dict_delitem_str(dict, "alpha");
+            assert_eq!(w_dict_unicode_lookup_index(dict, beta, beta_hash, 0), 0);
+            assert!(w_dict_unicode_value_at_checked(dict, 1, beta, beta_hash).is_null());
+            assert_eq!(
+                w_dict_unicode_value_at_checked(dict, 0, beta, beta_hash),
+                beta_value,
+            );
         }
     }
 

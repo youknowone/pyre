@@ -3721,7 +3721,7 @@ pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
     // w_dict.dstorage = strategy.erase(dict_w).
     let dict = unsafe { &mut *(w_dict as *mut pyre_object::W_DictObject) };
     dict.dstorage = pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.get_empty_storage();
-    dict.dstrategy = &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY;
+    dict.dstrategy = &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY_REF;
     // materialize_r_dict(space, w_obj, dict_w).
     unsafe { materialize_dict(w_obj, w_dict) };
 }
@@ -3739,7 +3739,7 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
     let w_obj = unsafe { mapdict_strategy_unerase(w_dict) };
     let dict = unsafe { &mut *(w_dict as *mut pyre_object::W_DictObject) };
     dict.dstorage = pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
-    dict.dstrategy = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY;
+    dict.dstrategy = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
     // materialize_str_dict(space, w_obj, str_dict).
     unsafe { materialize_dict(w_obj, w_dict) };
 }
@@ -3754,6 +3754,13 @@ pub struct MapDictStrategy;
 /// `space.fromcache(MapDictStrategy)` process-wide singleton — same `&'static`
 /// ZST contract as [`pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY`].
 pub static MAP_DICT_STRATEGY: MapDictStrategy = MapDictStrategy;
+
+/// The [`pyre_object::dictmultiobject::DictStrategyRef`] holder a dict's
+/// `dstrategy` slot points at.
+pub static MAP_DICT_STRATEGY_REF: pyre_object::dictmultiobject::DictStrategyRef =
+    pyre_object::dictmultiobject::DictStrategyRef {
+        imp: &MAP_DICT_STRATEGY,
+    };
 
 impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     fn strategy_kind(&self) -> pyre_object::dictmultiobject::StrategyKind {
@@ -3956,7 +3963,7 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
         let self_slot = pyre_object::gc_roots::pin_roots(&[self_ref]);
         let dict_slot = self_slot + 1;
         pyre_object::gc_roots::pin_root(pyre_object::w_dict_new_with(
-            &MAP_DICT_STRATEGY,
+            &MAP_DICT_STRATEGY_REF,
             pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8,
         ));
         unsafe {
@@ -4885,7 +4892,7 @@ mod tests {
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
             assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
 
-            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY, obj_ref as *mut u8);
+            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY_REF, obj_ref as *mut u8);
 
             assert_eq!(MAP_DICT_STRATEGY.strategy_kind(), StrategyKind::Map);
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
@@ -4947,7 +4954,7 @@ mod tests {
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
             assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
 
-            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY, obj_ref as *mut u8);
+            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY_REF, obj_ref as *mut u8);
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
 
             // A non-str key forces switch_to_object_strategy → materialise.
@@ -4988,7 +4995,7 @@ mod tests {
             obj._set_mapdict_map(term);
             assert!(instance_node_setdictvalue(obj_ref, wn("a"), sentinel(0x55)));
 
-            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY, obj_ref as *mut u8);
+            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY_REF, obj_ref as *mut u8);
 
             // The LIMIT-devolve path (mapdict.py:317-323) switches to text.
             mapdict_switch_to_text_strategy(w_dict);

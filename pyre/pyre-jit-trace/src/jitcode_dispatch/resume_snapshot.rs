@@ -1167,6 +1167,16 @@ pub(crate) enum InlineCallerFrameDecline {
     Unavailable,
 }
 
+/// Name the `Unavailable` site for the `[fbw-census]` tally, then return it.
+/// Report-only: gated on `fbw_debug_abort_enabled`, so the cost on a build
+/// without the flag is one predictable branch on an already-cold path.
+fn unavail(site: &'static str) -> InlineCallerFrameDecline {
+    if fbw_debug_abort_enabled() {
+        crate::jitcode_dispatch::census_record(site);
+    }
+    InlineCallerFrameDecline::Unavailable
+}
+
 pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     after_residual_call_resume: Option<usize>,
     caller_jitcode: &[u8],
@@ -1497,18 +1507,18 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     }
     let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
     if caller_sym_ptr.is_null() {
-        return Err(InlineCallerFrameDecline::Unavailable);
+        return Err(unavail("Unavail::Top/NoSym"));
     }
     // SAFETY: set for the lifetime of the top-level `dispatch_via_miframe`;
     // read-only access to immutable layout fields.
     let caller_sym = unsafe { &*caller_sym_ptr };
     if caller_sym.jitcode().is_null() {
-        return Err(InlineCallerFrameDecline::Unavailable);
+        return Err(unavail("Unavail::Top/NoJitCode"));
     }
     let (jitcode_index, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
         let jc = &*caller_sym.jitcode();
         if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
-            return Err(InlineCallerFrameDecline::Unavailable);
+            return Err(unavail("Unavail::Top/NotPopulated"));
         }
         // A CALL inside a try-block: inline it only when its exception handler
         // rejoins the loop (the exc-edge-bridgeable shape); otherwise decline so
@@ -1596,7 +1606,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         }
     };
     if depth == 0 {
-        return Err(InlineCallerFrameDecline::Unavailable);
+        return Err(unavail("Unavail::Top/DepthZero"));
     }
     let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc);
     // #73: the result slot's color comes from the codewriter-precomputed
@@ -1621,7 +1631,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             })
             .map(|color| color as usize)
     }
-    .ok_or(InlineCallerFrameDecline::Unavailable)?;
+    .ok_or_else(|| unavail("Unavail::Top/NoResultColor"))?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume).
@@ -1679,11 +1689,11 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     callee_has_freevars: bool,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
-        .ok_or(InlineCallerFrameDecline::Unavailable)? as u32;
+        .ok_or_else(|| unavail("Unavail::Nested/NoJitcodeIndex"))? as u32;
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
-        .ok_or(InlineCallerFrameDecline::Unavailable)?;
+        .ok_or_else(|| unavail("Unavail::Nested/NoPjc"))?;
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
-        return Err(InlineCallerFrameDecline::Unavailable);
+        return Err(unavail("Unavail::Nested/NotPopulated"));
     }
     let resume_marker_jit_pc = inline_call_return_marker(&pjc, call_jit_pc);
     let after_residual_call_resume = pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc);
@@ -1734,21 +1744,28 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         }
     };
     if depth == 0 {
-        return Err(InlineCallerFrameDecline::Unavailable);
+        return Err(unavail("Unavail::Nested/DepthZero"));
     }
     // #73: result slot color from the precomputed `result_color_at_pc`, not
     // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).
-    let result_color = match resume_marker_jit_pc {
-        Some(marker) => pjc
-            .result_color_trivia_for_jitcode_pc(marker)
-            .filter(|&color| color != u16::MAX)
-            .map(|color| color as usize),
-        None => pjc
-            .result_color_after_residual_for_jitcode_pc(call_jit_pc)
-            .filter(|&color| color != u16::MAX)
-            .map(|color| color as usize),
-    }
-    .ok_or(InlineCallerFrameDecline::Unavailable)?;
+    //
+    // Both twins are consulted, in that order, for the reason the top-level
+    // sibling states: the trivia twin resolves the return marker only while
+    // that marker doubles as the fallthrough pc's own resume marker (a pc_map
+    // block head).  A CALL whose fallthrough carries its own per-pc marker
+    // leaves the trailing marker un-keyed in the trivia twin, and only the
+    // after-residual twin — which keys the same fallthrough coordinate by the
+    // CALL's byte offset — answers for it.  Selecting one twin on whether a
+    // marker exists reports "no result color" for exactly that shape.
+    let result_color = resume_marker_jit_pc
+        .and_then(|marker| pjc.result_color_trivia_for_jitcode_pc(marker))
+        .filter(|&color| color != u16::MAX)
+        .or_else(|| {
+            pjc.result_color_after_residual_for_jitcode_pc(call_jit_pc)
+                .filter(|&color| color != u16::MAX)
+        })
+        .map(|color| color as usize)
+        .ok_or_else(|| unavail("Unavail::Nested/NoResultColor"))?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume) — same as the top-level
@@ -1779,7 +1796,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     }
     let boxes = match boxes {
         Ok(b) => b,
-        Err(_) => return Err(InlineCallerFrameDecline::Unavailable),
+        Err(_) => return Err(unavail("Unavail::Nested/BoxesErr")),
     };
     // #343 depth-2 operand flush.  `emit_new_pyframe_inline_with_params` seeds
     // this inlined-callee frame's `locals_cells_stack_w` virtual array with LOCALS
@@ -1909,17 +1926,17 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         .framestack
         .last()
         .map(|frame| frame.w_code)
-        .ok_or(InlineCallerFrameDecline::Unavailable)?;
+        .ok_or_else(|| unavail("Unavail::Helper/NoFramestack"))?;
     let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
-        .ok_or(InlineCallerFrameDecline::Unavailable)? as u32;
+        .ok_or_else(|| unavail("Unavail::Helper/NoJitcodeIndex"))? as u32;
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
-        .ok_or(InlineCallerFrameDecline::Unavailable)?;
+        .ok_or_else(|| unavail("Unavail::Helper/NoPjc"))?;
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
-        return Err(InlineCallerFrameDecline::Unavailable);
+        return Err(unavail("Unavail::Helper/NotPopulated"));
     }
     let resume_marker_jit_pc = pjc
         .resume_marker_for_jitcode_pc(call_jit_pc)
-        .ok_or(InlineCallerFrameDecline::Unavailable)?;
+        .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
     let boxes = collect_callee_active_boxes(
         ctx.registers_i,
         ctx.registers_r,
@@ -1928,7 +1945,7 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         call_jit_pc,
         resume_marker_jit_pc as i32,
     )
-    .map_err(|_| InlineCallerFrameDecline::Unavailable)?;
+    .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?;
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,

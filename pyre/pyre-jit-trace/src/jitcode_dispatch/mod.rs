@@ -9971,6 +9971,11 @@ fn handle<Sym: WalkSym>(
         "new/d>r" => {
             let descr = read_descr(code, op, 0, ctx)?;
             let concrete = ctx.trace_ctx.execute_new_allocation(&descr, false);
+            // The `set_opref_concrete` below is what roots this object: it
+            // stamps the allocation onto the recorded op's `value` cell, which
+            // `MetaInterp::walk_active_trace_refs` forwards.  Nothing between
+            // here and there allocates from the GC heap, so no collection can
+            // observe the object before it is reachable from that root.
             // pyjitpl.py:624-629 `execute_new`.
             ctx.trace_ctx
                 .profiler()
@@ -10006,6 +10011,7 @@ fn handle<Sym: WalkSym>(
         "new_with_vtable/d>r" => {
             let descr = read_descr(code, op, 0, ctx)?;
             let concrete = ctx.trace_ctx.execute_new_allocation(&descr, true);
+            // Rooted by the `set_opref_concrete` stamp below, as in `new/d>r`.
             if let Some(Value::Ref(majit_ir::GcRef(ptr))) = concrete
                 && let Some(w_class) = descr.as_size_descr().and_then(|size| size.w_class_obj())
             {

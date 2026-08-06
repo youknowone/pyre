@@ -409,12 +409,39 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
             .profiler()
             .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::RECORDED_OPS);
         ctx.trace_ctx
-            .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr);
+            .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr.clone());
         // Write-through with alias-clearing semantics
         // (`heapcache.py do_write_with_aliasing`).  Mirrors
         // `upd.setfield(valuebox)` (heapcache.py).
         ctx.trace_ctx
             .heapcache_setfield_cached(obj, descr_index, valuebox);
+        // Authoritative-executor eager store, the same posture as the
+        // module-global cell fold in `mod.rs`: `_opimpl_setfield_gc_any`
+        // reaches `executor.execute` → `cpu.bh_setfield_gc_*` through
+        // `execute_and_record` (`pyjitpl.py:979`), so the store really
+        // happens while the op is recorded.  Recording alone leaves the
+        // concrete object holding its pre-store bytes while the trace
+        // heapcache carries `valuebox`, and the next `getfield_gc_*` on the
+        // same field hits the cache and trips its `executor.execute`
+        // sanity check (`pyjitpl.py:934-945`) on the divergence.
+        //
+        // Restricted to boxes this walk allocated (`heapcache.new`'s
+        // HF_SEEN_ALLOCATION, set by `new/d>r` and `new_with_vtable/d>r`
+        // right after `execute_new_allocation` hands back a real, zeroed
+        // object).  Nothing outside the walk holds such an object, so the
+        // write needs no journal entry to survive a non-commit rollback —
+        // the abandoned allocation goes with it.  A store into a
+        // pre-existing object stays record-only: that write *is* observable
+        // and would double-apply against the walk's own concrete execution.
+        if ctx.trace_ctx.heap_cache().saw_allocation(obj)
+            && let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj)
+            && let Some(value) = ctx.trace_ctx.box_value(valuebox)
+        {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                ctx.trace_ctx.field_store(struct_ptr, &descr, value);
+            }
+        }
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }

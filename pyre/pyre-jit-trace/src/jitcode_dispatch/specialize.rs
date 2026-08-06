@@ -5148,9 +5148,14 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
 /// The authentic boxed result is taken from the same `execute_may_force_call`
 /// path the generic leg uses.
 ///
-/// Tuples, empty-strategy lists, negative indices, and non-`list[int]`
-/// operands fall through to the generic `CallMayForce` record (`Ok(None)`),
-/// preserving Python `__getitem__` semantics.
+/// A canonical Unicode-strategy dict with an exact-str key and a concrete hit
+/// records the `rordereddict.py dict.lookup` oopspec producer: exact dict/key
+/// guards, a strategy guard, elidable `rstr.ll_strhash`, `dict.lookup`, a
+/// non-negative guard on the returned entry index, then a guarded value read.
+///
+/// Tuples, dict misses, empty-strategy lists, negative indices, and
+/// non-`list[int]` operands fall through to the generic `CallMayForce` record
+/// (`Ok(None)`), preserving Python `__getitem__` semantics.
 pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -5199,6 +5204,162 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         return try_walker_specialize_subscr_tuple(
             ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
         );
+    }
+
+    // The `dict.lookup` gate.  Both `w_class` checks are load-bearing: a dict
+    // SUBCLASS shares `ob_type == &DICT_TYPE` but retags `w_class` and reaches
+    // `__missing__` on a miss, and a str SUBCLASS key may override `__hash__` /
+    // `__eq__`, so neither may take the exact-str probe.  The strategy check is
+    // what makes the probe non-raising: `UnicodeDictStrategy` hands the dict to
+    // `ObjectDictStrategy` the moment a non-exact-str key is stored, so while
+    // it holds, every stored key is an exact str and the comparisons are WTF-8
+    // byte equality (`dictmultiobject.py:1286+` `r_dict(unicode_eq,
+    // unicode_hash)`).
+    let canonical_dict = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
+    let dict_unicode = !canonical_dict.is_null()
+        && unsafe {
+            std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::DICT_TYPE)
+                && std::ptr::eq((*list_obj).w_class, canonical_dict)
+                && pyre_object::dictmultiobject::w_dict_get_strategy(list_obj).strategy_kind()
+                    == pyre_object::dictmultiobject::StrategyKind::Unicode
+        };
+    let canonical_str = if dict_unicode {
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE)
+    } else {
+        std::ptr::null_mut()
+    };
+    let dict_unicode_hit = !canonical_str.is_null()
+        && unsafe {
+            std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::STR_TYPE)
+                && std::ptr::eq((*key_obj).w_class, canonical_str)
+        };
+    if dict_unicode_hit {
+        let hash = unsafe { pyre_object::dictmultiobject::w_dict_unicode_key_hash(key_obj) };
+        let index = unsafe {
+            pyre_object::dictmultiobject::w_dict_unicode_lookup_index(list_obj, key_obj, hash, 0)
+        };
+        if index < 0 {
+            return Ok(None);
+        }
+
+        let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr)
+        else {
+            return Ok(None);
+        };
+
+        walker_guard_class(
+            ctx,
+            op_pc,
+            list_op,
+            &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+        )?;
+        walker_guard_exact_w_class(ctx, op_pc, list_op, canonical_dict)?;
+        let strategy = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            list_op,
+            crate::descr::dict_strategy_word_descr(),
+        );
+        let unicode_strategy_const = ctx
+            .trace_ctx
+            .const_int(&pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[strategy, unicode_strategy_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(strategy, unicode_strategy_const);
+        walker_guard_class(
+            ctx,
+            op_pc,
+            key_op,
+            &pyre_object::pyobject::STR_TYPE as *const _ as i64,
+        )?;
+        walker_guard_exact_w_class(ctx, op_pc, key_op, canonical_str)?;
+
+        let hash_effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::ElidableCannotRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        // Both residuals bind the macro-emitted `__majit_call_target_*`
+        // trampoline rather than the raw fn: the wasm backend derives a
+        // residual's `call_indirect` type from the descr alone — `(i64 x n) ->
+        // i64` — so a raw `*mut PyObject` argument, `i32` on wasm32, traps
+        // `indirect call type mismatch`. The trampoline takes and returns the
+        // uniform machine word everywhere, and is the address `jit_fnaddr`
+        // registers for these paths.
+        let hash_fn = {
+            let f: extern "C" fn(i64) -> i64 =
+                pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_key_hash;
+            f as *const ()
+        };
+        let hash_op = ctx.trace_ctx.call_typed_with_effect_pure(
+            OpCode::CallI,
+            hash_fn,
+            &[key_op],
+            &[majit_ir::Type::Ref],
+            majit_ir::Type::Int,
+            hash_effect,
+            &[
+                majit_ir::Value::Int(hash_fn as i64),
+                majit_ir::Value::Ref(majit_ir::GcRef(key_obj as usize)),
+            ],
+            majit_ir::Value::Int(hash),
+        );
+
+        let mut lookup_effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::DictLookup,
+        );
+        lookup_effect.extradescrs = Some(vec![
+            crate::descr::dict_lookup_namespace_descr(),
+            crate::descr::dict_lookup_entries_array_descr(),
+        ]);
+        let lookup_flag = ctx.trace_ctx.const_int(0);
+        let lookup_fn: extern "C" fn(i64, i64, i64, i64) -> i64 =
+            pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_lookup_index;
+        let index_op = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallI,
+            lookup_fn as *const (),
+            &[list_op, key_op, hash_op, lookup_flag],
+            &[
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+            ],
+            majit_ir::Type::Int,
+            lookup_effect,
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(index_op, majit_ir::Value::Int(index));
+
+        let zero = ctx.trace_ctx.const_int(0);
+        let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[index_op, zero]);
+        ctx.trace_ctx
+            .set_opref_concrete(nonneg, majit_ir::Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
+
+        let value = ctx.trace_ctx.call_ref_typed_with_effect(
+            crate::helpers::jit_dict_value_at as *const (),
+            &[list_op, index_op, key_op, hash_op],
+            &[
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+            ],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[value])?;
+        ctx.trace_ctx.set_opref_concrete(
+            value,
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+        );
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+        return Ok(Some(()));
     }
 
     // Gate: EXACT list[int], non-negative index in bounds, int- or

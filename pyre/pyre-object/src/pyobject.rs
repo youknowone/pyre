@@ -1022,6 +1022,24 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(6, &crate::functional::RANGE_ITER_TYPE),
         subclass_range_alias(7, &LIST_TYPE),
         subclass_range_alias(8, &TUPLE_TYPE),
+        // The three arity-2 specialisations each carry their own `ob_type`
+        // (`specialisedtupleobject.py` `Cls_ii / Cls_ff / Cls_oo`), so they
+        // need their own vtable binding: without one, `subclass_range` on a
+        // specialised tuple answers "unknown" and every pure field fold on a
+        // constant one — `f.__defaults__` pinned by an identity guard, say —
+        // fails `protect_speculative_field` and invalidates the whole loop.
+        subclass_range_alias(
+            10,
+            &crate::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE,
+        ),
+        subclass_range_alias(
+            11,
+            &crate::specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE,
+        ),
+        subclass_range_alias(
+            12,
+            &crate::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
+        ),
         subclass_range_alias(15, &crate::nestedscope::CELL_TYPE),
         subclass_range_alias(16, &crate::function::METHOD_TYPE),
         subclass_range_alias(17, &crate::sliceobject::SLICE_TYPE),

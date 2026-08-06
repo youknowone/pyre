@@ -1196,20 +1196,50 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// bumps it; value-only replacement deliberately does not.  A promoted
 /// identity-key lookup can therefore guard this field to pin the resolved
 /// entry index while continuing to read that entry's value live.
+///
+/// The `dstrategy_word` and `dstorage_lookup_ns` keys deliberately do NOT match
+/// the Rust field names they cover.  `gc_cache().get_field_descr` is keyed by
+/// `(struct_key, field_name)` and a cache HIT returns the cached descriptor with
+/// the caller's declared type ignored, while the LLBC analyzer resolves a real
+/// struct field access by name — so a key spelled `dstrategy` would share one
+/// descriptor with the analyzer's own mint and whichever side initialised first
+/// would decide the field's type for both.  A distinct key is a distinct cache
+/// slot, which is what keeps these raw-word views honest.  They are appended
+/// rather than placed in offset order so `keys_version` keeps census index 0.
 static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE,
         W_DICT_GC_TYPE_ID,
         &pyre_object::pyobject::DICT_TYPE as *const _ as usize,
-        &[(
-            "keys_version",
-            std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, keys_version),
-            std::mem::size_of::<usize>(),
-            Type::Int,
-            false,
-            false,
-            false,
-        )],
+        &[
+            (
+                "keys_version",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, keys_version),
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "dstrategy_word",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstrategy),
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "dstorage_lookup_ns",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstorage),
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+        ],
         "W_DictObject",
         "dictmultiobject::W_DictObject",
     )
@@ -2405,6 +2435,41 @@ pub fn w_function_size_descr() -> DescrRef {
 
 pub fn dict_keys_version_descr() -> DescrRef {
     field_descr_from_group(&W_DICT_DESCR_GROUP, 0)
+}
+
+/// `W_DictObject.dstrategy` as a raw word, for the `GuardValue` that pins a
+/// dict to one strategy singleton.  The census key is deliberately not the
+/// struct field name — see the group's doc comment.
+pub fn dict_strategy_word_descr() -> DescrRef {
+    field_descr_from_group(&W_DICT_DESCR_GROUP, 1)
+}
+
+/// The cache-namespace half of the `dict.lookup` oopspec's `extradescrs`
+/// (`heap.py:504-511 descrs[0]`), naming the entry table a lookup probes.
+/// Only its identity is read; the slot is never loaded.
+pub fn dict_lookup_namespace_descr() -> DescrRef {
+    field_descr_from_group(&W_DICT_DESCR_GROUP, 2)
+}
+
+/// `extradescrs[1]` — the entry-array descr `_optimize_CALL_DICT_LOOKUP`
+/// registers in `corresponding_array_descrs` so a call that writes the table
+/// drops the cached lookups.  No pyre helper declares it in
+/// `write_descrs_arrays` yet, so its `ei_index` stays `u32::MAX` and
+/// `check_write_descr_array` never fires for it; the cache is dropped instead
+/// by `clean_caches`, which every dict-mutating residual triggers.
+pub fn dict_lookup_entries_array_descr() -> DescrRef {
+    static DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+        make_array_descr_with_full_id(
+            0,
+            8,
+            0,
+            None,
+            Type::Ref,
+            false,
+            Some("dict.lookup.entries".to_string()),
+        )
+    });
+    DESCR.clone()
 }
 
 /// `Method.w_self` — the receiver object. The bound-method
@@ -5167,6 +5232,17 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                             spec.offset == *offset && spec.field_key() == field_key
                         })
                     {
+                        // `pos` is the slot this reader will index; the descr's
+                        // own `index_in_parent` (`descr.py:228`) is what every
+                        // later consumer indexes by
+                        // (`optimizeopt/info.rs force_box`).  They are two
+                        // producers' answers to one question and nothing else
+                        // compares them: the cache-hit return above and
+                        // `get_field_descr`'s own `derive_index_in_parent` both
+                        // resolve by NAME, so a stale rank is silently replaced
+                        // rather than reported.  Count it where it is still
+                        // visible.
+                        majit_ir::descr::census_attached_index(pos, *index_in_parent);
                         if let Some(descr) = group.field_descrs.get(pos) {
                             return descr.clone() as DescrRef;
                         }
