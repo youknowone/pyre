@@ -122,7 +122,9 @@ struct Host {
 ///
 /// Where a guest-side probe has a host-side replacement, use that instead:
 /// `PYRE_FBW_DEBUG_ABORT`'s decline census is `PYRE_WASM_FBW_CENSUS` here,
-/// read back through the `pyre_fbw_census` export.
+/// read back through the `pyre_fbw_census` export, and `MAJIT_GUARD_CENSUS`'s
+/// per-guard deopt census is `PYRE_WASM_GUARD_CENSUS`, armed through
+/// `pyre_jit_guard_census_enable` and read through `pyre_jit_guard_census`.
 ///
 /// Exempt: the names this runner interprets host-side (`PYRE_WASM_*`,
 /// `PYRE_STDLIB`, `MAJIT_STATS`) and `check.py`'s own `PYRE_CHECK_*`
@@ -508,6 +510,19 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             memory.write(&mut store, p as usize, name.as_bytes())?;
             set_path.call(&mut store, (p, nlen))?;
             dealloc.call(&mut store, (p, nlen))?;
+        }
+    }
+
+    // Arm the per-guard deopt census before the run, not after: it records on
+    // the deopt path and stays off until asked. `MAJIT_GUARD_CENSUS` is inert
+    // here for the usual reason, so the switch travels as a call. Absent on a
+    // module predating the export, in which case the readout below finds
+    // nothing and says so.
+    if std::env::var_os("PYRE_WASM_GUARD_CENSUS").is_some() {
+        if let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_guard_census_enable")
+        {
+            arm.call(&mut store, ())?;
         }
     }
 
@@ -1017,6 +1032,31 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             if let Err(err) = census_result {
                 eprintln!("pyre-wasm-runner: fbw census failed: {err}");
             }
+        }
+    }
+    // The per-guard deopt census armed before the run, printed in the shape
+    // `pyrex` prints it natively so the two are directly comparable. A bare
+    // `guard_failures` total cannot say whether the excess is one guard the
+    // guest keeps returning through or a spread of cold ones.
+    if std::env::var_os("PYRE_WASM_GUARD_CENSUS").is_some() {
+        match instance.get_typed_func::<(), u64>(&mut store, "pyre_jit_guard_census") {
+            Ok(census) => {
+                let census_result: Result<()> = (|| {
+                    let packed = census.call(&mut store, ())?;
+                    let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+                    let mut bytes = vec![0u8; clen as usize];
+                    if clen != 0 {
+                        memory.read(&store, ptr as usize, &mut bytes)?;
+                        dealloc.call(&mut store, (ptr, clen))?;
+                    }
+                    eprintln!("[jit-stats] {}", String::from_utf8_lossy(&bytes));
+                    Ok(())
+                })();
+                if let Err(err) = census_result {
+                    eprintln!("pyre-wasm-runner: guard census failed: {err}");
+                }
+            }
+            Err(_) => eprintln!("[jit-stats] guard_census=unexported"),
         }
     }
     let exit_code = instance

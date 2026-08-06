@@ -770,7 +770,25 @@ pub fn mc_diag_summary() -> String {
 /// path, which is exactly the path under study.
 static GUARD_CENSUS: std::sync::Mutex<Option<Vec<((u64, u32), u64)>>> = std::sync::Mutex::new(None);
 
+/// Turn the census on where `MAJIT_GUARD_CENSUS` cannot be read.
+///
+/// `wasm32-unknown-unknown` has a permanently empty `std::env`, so the variable
+/// never selects anything from inside the guest and the one distribution that
+/// distinguishes a bridge-less hot guard from a spread of cold ones is
+/// unreadable on exactly the target whose `guard_failures` totals disagree with
+/// native. The host runner calls this through `pyre_jit_guard_census_enable`
+/// before the run instead.
+pub fn guard_census_enable() {
+    GUARD_CENSUS_FORCED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static GUARD_CENSUS_FORCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn guard_census_enabled() -> bool {
+    if GUARD_CENSUS_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAJIT_GUARD_CENSUS").is_some())
 }

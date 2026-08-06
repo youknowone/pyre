@@ -1030,6 +1030,24 @@ mod host_abi {
         pack_into_guest(pyre_jit_trace::jitcode_dispatch::census_report().into_bytes())
     }
 
+    /// Arm the per-guard deopt census before `pyre_run_python`.
+    ///
+    /// `MAJIT_GUARD_CENSUS` selects it on a native build; the guest reads no
+    /// environment, so the switch has to arrive as a call. It must precede the
+    /// run — the census records on the deopt path and is off until armed.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_guard_census_enable() {
+        majit_metainterp::guard_census_enable();
+    }
+
+    /// The armed census as the same packed pair, for the host to print under
+    /// `PYRE_WASM_GUARD_CENSUS`. Same `top` as `pyrex` prints natively, so the
+    /// two lines compare directly. Reading, not draining.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_guard_census() -> u64 {
+        pack_into_guest(majit_metainterp::guard_census_summary(12).into_bytes())
+    }
+
     /// Status the last `pyre_run_python` ended with: `SystemExit`'s code, 1 for
     /// an uncaught exception or a `SyntaxError`, else 0. The host exits with
     /// it, as `pyrex` does with `targetpypystandalone.py:37 entry_point`'s
