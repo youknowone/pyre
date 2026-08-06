@@ -1,4 +1,9 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=14
+# pyre-check: min-pypy-ratio=0.5
+# pypy's exec time is pinned to the startup-subtraction floor here, so the
+# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
+# runners observe (6.8x), rounded up, and the floor is half the fastest
+# (1.0x) — a derived floor of ceiling/5 would sit above it.
 # typeobject.py:1006 _set_names — type.__new__ calls __set_name__(owner, name)
 # for each descriptor in the type's final __dict__.  Each descriptor is visited
 # once, with the class as owner and its own attribute name.

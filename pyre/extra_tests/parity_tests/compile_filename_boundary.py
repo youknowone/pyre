@@ -1,3 +1,7 @@
+# pyre-check: platforms=linux,darwin
+# `b"\xff.py"` only survives the filesystem-encoding converter where that
+# encoding is UTF-8 with `surrogateescape`; on Windows the same call raises
+# UnicodeDecodeError in the reference too.
 """`compile()` takes its filename through the filesystem-encoding converter.
 
 `compiling.py:13` declares `@unwrap_spec(filename='fsencode', mode='text')`, so

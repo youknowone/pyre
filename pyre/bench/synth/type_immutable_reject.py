@@ -1,5 +1,10 @@
-# pyre-check: max-pypy-ratio=9.1
-# pyre-check: min-pypy-ratio=1.25
+# pyre-check: max-pypy-ratio=40
+# pyre-check: min-pypy-ratio=2
+# pypy's exec time is pinned to the startup-subtraction floor here, so the
+# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
+# runners observe (18.2x), rounded up, and the floor is half the fastest
+# (4.0x) — a derived floor of ceiling/5 would sit above it.
+# across CI hosts (18.2x), rounded up, and the floor is
 N = 200000
 
 

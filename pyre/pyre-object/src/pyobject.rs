@@ -632,6 +632,11 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // `w_class` is the only edge their marker forwards.
     (157, Some(0)),
     (158, Some(0)),
+    // `_io.BytesIO` follows the `rbigint` result pair, which holds 159 as a
+    // bare `with_gc_ptrs` id and is not an rclass.OBJECT type.
+    (160, Some(0)),
+    // `_io.StringIO` follows `_io.BytesIO` at the append-only tail.
+    (161, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

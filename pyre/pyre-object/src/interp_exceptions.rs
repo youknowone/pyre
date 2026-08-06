@@ -1021,7 +1021,7 @@ pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let exc = obj as *mut W_BaseException;
         if (*exc).w_dict.is_null() {
-            (*exc).w_dict = crate::w_dict_new();
+            (*exc).w_dict = crate::dictmultiobject::w_dict_new_instance();
             exception_write_barrier(obj);
         }
         (*exc).w_dict

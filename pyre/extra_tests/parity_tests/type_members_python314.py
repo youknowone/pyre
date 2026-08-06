@@ -1,3 +1,7 @@
+# pyre-check: platforms=linux
+# The table holds absolute C-struct sizes, so it is one ABI's: the reference
+# itself reports `OSError.__basicsize__` 120 on Windows (the extra `winerror`
+# member) and `BaseExceptionGroup.__basicsize__` 88 on macOS arm64.
 """CPython 3.14 member-descriptor surface for values backed by PyPy type state."""
 
 import types

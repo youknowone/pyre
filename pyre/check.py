@@ -1979,8 +1979,16 @@ class Check:
         self, name, script, timeout,
         dynasm_vs_cpython=None, dynasm_vs_pypy=None,
         cranelift_vs_cpython=None, cranelift_vs_pypy=None,
-        skip_backends=(), wasm_float_tol=False,
+        skip_backends=(), wasm_float_tol=False, min_pypy_ratio=None,
     ):
+        """Run one benchmark on each enabled backend.
+
+        `min_pypy_ratio` overrides the floor derived from the ceiling, the same
+        way `# pyre-check: min-pypy-ratio` does for a synthetic fixture. The
+        derived floor is `ceiling / PERF_GATE_FLOOR_DIVISOR`, so it can only
+        express a 5x span between the fastest and slowest host; a bench whose
+        hosts spread wider than that needs both bounds stated.
+        """
         need_cpython = False
         if (
             self.enabled("dynasm")
@@ -2047,7 +2055,7 @@ class Check:
             self._run_backend_bench(
                 backend, name, script, timeout,
                 vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
-                wasm_float_tol=wasm_float_tol,
+                wasm_float_tol=wasm_float_tol, min_pypy_ratio=min_pypy_ratio,
             )
 
     # ── self-checking regression guard ──
@@ -2508,7 +2516,12 @@ def main():
         chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       6,       2,       8)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
-        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       1,       5,       1,       5)
+        # spectral_norm's hosts spread 0.5x-4.3x against pypy — pypy runs it in
+        # 0.13s on the linux and macos runners and 0.39s on the windows one, so
+        # pyre reads faster than pypy there and crosses the derived floor of
+        # 5/5 = 1x. The span is wider than a derived floor can express, so the
+        # floor is stated at half the fastest ratio observed.
+        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       1,       5,       1,       5,    min_pypy_ratio=0.25)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       0.5,     5,       1,       5,    wasm_float_tol=True)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
         # Skipped on wasm: the guard times calls with `time.perf_counter()`, and

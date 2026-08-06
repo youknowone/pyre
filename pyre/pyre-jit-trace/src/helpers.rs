@@ -106,39 +106,33 @@ pub fn emit_trace_call_ref_typed(
     ctx.call_ref_typed_with_effect(helper, args, arg_types, default_effect_info())
 }
 
-/// Read the value at a promoted exact-dict entry index, re-checking
-/// `W_DictObject.keys_version` — the explicit pyre representation of PyPy's
-/// live strategy-iterator state — under the dict's own lock.
+/// Run one strategy's lookup on raw JIT arguments.
 ///
-/// The trace's `keys_version` guard is an unlocked field read, so another
-/// thread can mutate the key set between that guard and this call.
-/// `IndexMap::shift_remove_index` compacts, so a stale index names a
-/// different key or none at all; one `w_dict_lock` held across the version
-/// re-check and the indexed read keeps `index` attached to the guarded
-/// identity key.  A mismatch or an out-of-range index returns `PY_NULL` for
-/// the caller's `guard_nonnull` to side-exit on.  Value overwrites do not bump
-/// the version and are observed by this live read, matching the r_dict
-/// entry-value load.
-pub extern "C" fn jit_dict_nth_value_versioned(
+/// A contended stripe acquire enters `before_external_block`, which is a GC
+/// safepoint, so `dict` and `key` arrive as raw arguments that must be
+/// shadow-rooted across the lock and re-read afterwards — `DictOperationGuard`
+/// is that bracket.  The stripe is reentrant, so the nested acquire inside the
+/// lookup neither blocks nor releases this guard.  A miss returns `PY_NULL` for
+/// the caller's `guard_nonnull` to side-exit on.
+unsafe fn jit_dict_exact_lookup_or_null(
     dict: i64,
-    index: i64,
-    expected_version: i64,
+    key: i64,
+    lookup: unsafe fn(PyObjectRef, PyObjectRef) -> Option<PyObjectRef>,
 ) -> i64 {
-    let dict = dict as PyObjectRef;
+    let guard = pyre_object::dictmultiobject::DictOperationGuard::new(
+        dict as PyObjectRef,
+        &[key as PyObjectRef],
+    );
+    lookup(guard.root(0), guard.root(1)).map_or(PY_NULL as i64, |value| value as i64)
+}
+
+pub extern "C" fn jit_dict_exact_int_lookup_or_null(dict: i64, key: i64) -> i64 {
     unsafe {
-        // A contended acquire enters `before_external_block`, which is a GC
-        // safepoint, so `dict` arrives as a raw JIT argument that must be
-        // shadow-rooted across the lock and re-read afterwards —
-        // `DictOperationGuard` is that bracket. The stripe is reentrant, so the
-        // nested acquire inside `w_dict_nth_item` neither blocks nor releases
-        // this guard.
-        let dict_guard = pyre_object::dictmultiobject::DictOperationGuard::new(dict, &[]);
-        let dict = dict_guard.root(0);
-        if pyre_object::dictmultiobject::w_dict_keys_version(dict) != expected_version as usize {
-            return PY_NULL as i64;
-        }
-        pyre_object::dictmultiobject::w_dict_nth_item(dict, index as usize)
-            .map_or(PY_NULL as i64, |(_, value)| value as i64)
+        jit_dict_exact_lookup_or_null(
+            dict,
+            key,
+            pyre_object::dictmultiobject::w_dict_lookup_or_null_int_strategy,
+        )
     }
 }
 
@@ -163,6 +157,16 @@ pub extern "C" fn jit_dict_value_at(dict: i64, index: i64, key: i64, hash: i64) 
             key as PyObjectRef,
             hash,
         ) as i64
+    }
+}
+
+pub extern "C" fn jit_dict_exact_unicode_lookup_or_null(dict: i64, key: i64) -> i64 {
+    unsafe {
+        jit_dict_exact_lookup_or_null(
+            dict,
+            key,
+            pyre_object::dictmultiobject::w_dict_lookup_or_null_unicode_strategy,
+        )
     }
 }
 

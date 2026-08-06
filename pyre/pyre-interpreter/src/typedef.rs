@@ -10324,7 +10324,7 @@ fn init_type_type(ns: PyObjectRef) {
                     }
                     let name = pyre_object::w_str_get_wtf8(args[1]);
                     match name.as_str() {
-                        Ok(name) => crate::baseobjspace::object_getattribute(w_type, name),
+                        Ok(name) => crate::baseobjspace::type_getattribute(w_type, name),
                         Err(_) => crate::baseobjspace::object_getattribute_surrogate(
                             w_type, args[1], name,
                         ),
@@ -18627,12 +18627,13 @@ fn init_object_type(ns: PyObjectRef) {
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", object_new)
     };
+    let object_init = make_builtin_function("__init__", object_descr_init);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__init__",
-            make_builtin_function("__init__", object_descr_init),
-        )
+        crate::function::fset_func_text_signature(
+            object_init,
+            pyre_object::w_str_new("($self, /, *args, **kwargs)"),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__init__", object_init)
     };
     // PyPy: objectobject.py — default comparison/hash/repr for all objects
     unsafe {

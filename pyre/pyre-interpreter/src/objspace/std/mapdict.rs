@@ -1618,6 +1618,95 @@ pub unsafe fn load_attr_fast_path(
     Some((w_type, version_tag, map, p.storageindex))
 }
 
+/// The [`load_attr_fast_path`] twin for a receiver that keeps its attributes in
+/// a `newdict(instance=True)` dictionary rather than in header mapdict storage
+/// (`mapdict.py:1299-1303 make_instance_dict`). It applies the same
+/// `load_attr_slowpath` gates (mapdict.py:1496-1527) and differs only in where
+/// the map comes from — the fake carrier the dictionary erases into rather than
+/// the receiver's own header. Returns the type and its version tag alongside
+/// the fold ingredients: the carrier, its map, the `storageindex`, and the
+/// `(typ, listindex)` pair when the attribute took an unboxed transition.
+///
+/// The carrier's map holds only dictionary attributes, so a `__slots__` member
+/// — which mapdict.py:1518 would resolve through the receiver's own map — is
+/// declined here rather than looked up under the `"slot"` name.
+///
+/// Declines a dictionary that is not `MapDictStrategy`-backed. The caller must
+/// still prove that at trace time before dereferencing `dstorage` as a carrier:
+/// a devolved dictionary erases a smaller storage box, and reading a carrier
+/// field off it is out of bounds.
+///
+/// # Safety
+/// `w_obj` must be live, and `w_dict` must point at its live `W_DictObject`.
+pub unsafe fn instance_dict_attr_fast_path(
+    w_obj: PyObjectRef,
+    w_dict: PyObjectRef,
+    name: &str,
+) -> Option<(
+    PyObjectRef,
+    u64,
+    PyObjectRef,
+    MapRef,
+    usize,
+    Option<(UnboxType, usize)>,
+)> {
+    // mapdict.py:1496 `w_type = map.terminator.w_cls` — the carrier's own
+    // terminator is the shared fake one, so the type comes off the receiver.
+    let w_type = unsafe { (*w_obj).w_class };
+    if w_type.is_null() {
+        return None;
+    }
+    // mapdict.py:1497-1499 — a custom `__getattribute__` handles the access.
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // mapdict.py:1504-1526 `_pure_lookup_where_with_method_cache` + classify.
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
+    if attrkind != DICT || is_slot {
+        return None;
+    }
+    let dict = unsafe { &*(w_dict as *const pyre_object::dictmultiobject::W_DictObject) };
+    if dict.dstrategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map {
+        return None;
+    }
+    let carrier = dict.dstorage as PyObjectRef;
+    if carrier.is_null() {
+        return None;
+    }
+    let map = unsafe { (*(carrier as *const pyre_object::W_ObjectObject)).map as MapRef };
+    if map.is_null() || unsafe { map_is_devolved(map) } {
+        return None;
+    }
+    // mapdict.py:1527 `attr = map.find_map_attr(attrname, attrkind)`.
+    let attr = unsafe { find_map_attr(map, Wtf8::new(name), DICT) }?;
+    let plain = unsafe { (*attr).as_plain() };
+    // `_direct_read` migrates the instance off unboxed storage once its class
+    // has frozen unboxing (mapdict.py:594-596); the fold performs
+    // `_prim_direct_read` alone, so a frozen class stays on the residual that
+    // still runs the migration.
+    if plain.unboxed.is_some()
+        && !unsafe { (*plain.terminator).as_terminator() }
+            .allow_unboxing
+            .get()
+    {
+        return None;
+    }
+    Some((
+        w_type,
+        version_tag,
+        carrier,
+        map,
+        plain.storageindex,
+        plain.unboxed.as_ref().map(|u| (u.typ, u.listindex)),
+    ))
+}
+
 /// Shared resolution for [`property_get_fast_path`] / [`property_set_fast_path`]:
 /// when `name` on `w_obj`'s type resolves to a `property` data descriptor,
 /// return the type, its cacheable version tag, and the property object.  Applies
@@ -2659,11 +2748,11 @@ impl MapdictObject for pyre_object::W_ObjectObject {
     }
 }
 
-/// mapdict.py:978-985 `Object` — the generic `MapdictStorageMixin` carrier used
-/// to back instance dictionaries and to hold the result of `delete`/`copy`
-/// (its `storage`/`map` are transplanted into the real instance by
-/// `_set_mapdict_storage_and_map`). pyre uses this lightweight owned-`Vec`
-/// carrier rather than allocating a throwaway `W_ObjectObject`.
+/// mapdict.py:978-985 `Object` — the transient `MapdictStorageMixin` carrier
+/// for the result of `delete`/`copy` (its `storage`/`map` are transplanted
+/// into the real instance by `_set_mapdict_storage_and_map`). pyre keeps that
+/// lightweight owned-`Vec` role here, while a real `W_ObjectObject` provides
+/// the fake-instance-dict-backing role.
 pub(crate) struct Object {
     map: MapRef,
     storage: Vec<PyObjectRef>,
@@ -2734,10 +2823,12 @@ impl MapdictObject for Object {
         self.map = map;
     }
     fn getdict(&self) -> PyObjectRef {
-        // The `Object` carrier (mapdict.py:978) lacks `MapdictDictSupport`; a
-        // `DevolvedDictTerminator`'s read/write/delete only ever runs on the live
-        // instance, never on this transient copy/materialize carrier.
-        unimplemented!("Object carrier has no __dict__ (no MapdictDictSupport)")
+        // mapdict.py:979-985 gives `Object` both transient-copy and fake-dict
+        // roles. pyre gives the fake-dict role to `W_ObjectObject`, whose
+        // getdict is implemented, leaving this carrier transient only. The
+        // terminator_read Devolved arm, write_terminator's Devolved and LIMIT
+        // arms, and node_delete's Devolved arm must therefore never reach it.
+        unimplemented!("transient Object carrier has no __dict__")
     }
 }
 
@@ -4256,9 +4347,32 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
 /// mapdict.py:1123-1279 `MapDictStrategy` — the dict strategy a user instance's
 /// `__dict__` adopts. `dstorage` erases the backing `W_ObjectObject`
 /// (mapdict.py:1502), so every routed get/set/del/iter funnels into the
-/// instance's mapdict map+storage. Unwired — the `_obj_getdict` flip
-/// installs it; defined now so that flip is a one-line strategy swap.
+/// instance's mapdict map+storage. `_obj_getdict` installs this view.
 pub struct MapDictStrategy;
+
+// mapdict.py:310: allow_unboxing remains true on this shared terminator. A
+// type conflict in holder_pick_attr consequently freezes unboxing for every
+// instance dictionary sharing this transition tree.
+static TERMINATOR_FOR_DICTS: LazyLock<usize> =
+    LazyLock::new(|| new_dict_terminator(pyre_object::PY_NULL) as usize);
+
+pub fn get_terminator_for_dicts() -> MapRef {
+    *TERMINATOR_FOR_DICTS as MapRef
+}
+
+/// mapdict.py:1299-1303 `make_instance_dict`.
+#[majit_macros::dont_look_inside]
+pub fn make_instance_dict() -> PyObjectRef {
+    let w_fake_object = pyre_object::w_instance_new(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let fake_slot = pyre_object::gc_roots::pin_roots(&[w_fake_object]);
+    unsafe {
+        (&mut *(pyre_object::gc_roots::shadow_stack_get(fake_slot)
+            as *mut pyre_object::W_ObjectObject))
+            ._set_mapdict_map(get_terminator_for_dicts());
+    }
+    _obj_getdict(pyre_object::gc_roots::shadow_stack_get(fake_slot))
+}
 
 /// `space.fromcache(MapDictStrategy)` process-wide singleton — same `&'static`
 /// ZST contract as [`pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY`].
@@ -4277,14 +4391,16 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     }
 
     /// mapdict.py:1132-1137 `get_empty_storage` — "mainly used for tests": a
-    /// fresh `Object` carrier on a dict terminator, erased. pyre's production
-    /// MapDictStrategy dstorage is always the backing instance (mapdict.py:1502);
-    /// this Object-backed storage is the faithful test constructor and is not
-    /// consumed by the instance-routing trait methods below.
+    /// fresh fake `W_ObjectObject` carrier on the shared dict terminator,
+    /// erased. Production dstorage is likewise the backing instance
+    /// (mapdict.py:1502).
     fn get_empty_storage(&self) -> *mut u8 {
-        let terminator = new_dict_terminator(pyre_object::PY_NULL);
-        let w_result = Object::new_empty(terminator);
-        Box::into_raw(Box::new(w_result)) as *mut u8
+        let w_result = pyre_object::w_instance_new(pyre_object::PY_NULL);
+        unsafe {
+            (&mut *(w_result as *mut pyre_object::W_ObjectObject))
+                ._set_mapdict_map(get_terminator_for_dicts());
+        }
+        w_result as *mut u8
     }
 
     /// mapdict.py:1157-1166 `getitem`.
@@ -4341,6 +4457,28 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         debug_assert!(flag, "mapdict.py:1174 assert flag");
     }
 
+    /// mapdict.py:1185-1196 `setdefault`.
+    unsafe fn setdefault(
+        &self,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+        w_default: PyObjectRef,
+    ) -> PyObjectRef {
+        if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
+            let key = pyre_object::w_str_get_wtf8(w_key);
+            if let Some(w_result) =
+                instance_node_getdictvalue(mapdict_strategy_unerase(w_dict), key)
+            {
+                return w_result;
+            }
+            instance_node_setdictvalue(mapdict_strategy_unerase(w_dict), key, w_default);
+            return w_default;
+        }
+        self.switch_to_object_strategy(w_dict);
+        pyre_object::dictmultiobject::w_dict_setdefault_checked(w_dict, w_key, w_default)
+            .unwrap_or(w_default)
+    }
+
     /// mapdict.py:1198-1211 `delitem`. pyre's trait returns `bool` (true =
     /// removed) where PyPy raises KeyError on a miss; the caller raises.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
@@ -4382,6 +4520,74 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     /// mapdict.py:1222-1225 `clear`.
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         instance_node_dict_clear(mapdict_strategy_unerase(w_dict));
+    }
+
+    /// mapdict.py:1227-1235 `popitem`.
+    unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
+        let w_obj = mapdict_strategy_unerase(w_dict);
+        let _instance_guard = instance_lock(w_obj);
+        ensure_mapdict_initialized(w_obj);
+        let inst = &*(w_obj as *const pyre_object::W_ObjectObject);
+        let curr = node_search(inst._get_mapdict_map(), DICT)?;
+        let key = &(*curr).as_plain().name;
+        // mapdict.py:1231 reads the value with `getitem_str(w_dict, key)`, but
+        // the trait's `getitem_str` takes a `&str` and a node name is WTF-8:
+        // `setitem` stores the full name (mapdict.py:1180), so a lone surrogate
+        // is a node here and has no `&str` form. Read the node layer directly.
+        let w_value = instance_node_getdictvalue(w_obj, key)?;
+        let w_key = pyre_object::unicodeobject::box_str_constant(key);
+        self.delitem(w_dict, w_key);
+        Some((w_key, w_value))
+    }
+
+    /// mapdict.py:1237-1253 `copy`.
+    unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
+        use pyre_object::dictmultiobject::DictStrategy;
+
+        let copy = pyre_object::w_dict_new_with(
+            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
+            pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage(),
+        );
+        for (w_key, w_value) in instance_node_dict_items(mapdict_strategy_unerase(w_dict)) {
+            pyre_object::w_dict_store(copy, w_key, w_value);
+        }
+        copy
+    }
+
+    /// mapdict.py:1268-1276 iterator order.
+    unsafe fn nth_item(
+        &self,
+        w_dict: PyObjectRef,
+        index: usize,
+    ) -> Option<(PyObjectRef, PyObjectRef)> {
+        let w_obj = mapdict_strategy_unerase(w_dict);
+        let _instance_guard = instance_lock(w_obj);
+        ensure_mapdict_initialized(w_obj);
+        let inst = &*(w_obj as *const pyre_object::W_ObjectObject);
+        let nodes = dict_nodes_in_order(inst);
+        let node = *nodes.get(index)?;
+        Some((
+            pyre_object::unicodeobject::box_str_constant(&(*node).as_plain().name),
+            plain_direct_read(node, inst),
+        ))
+    }
+
+    /// mapdict.py:1278-1279 `MapDictKeyIteratorReversed`.
+    unsafe fn getiterreversed(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
+        let w_obj = mapdict_strategy_unerase(w_dict);
+        let _instance_guard = instance_lock(w_obj);
+        ensure_mapdict_initialized(w_obj);
+        let inst = &*(w_obj as *const pyre_object::W_ObjectObject);
+        let mut items = Vec::new();
+        let mut curr = node_search(inst._get_mapdict_map(), DICT);
+        while let Some(node) = curr {
+            items.push((
+                pyre_object::unicodeobject::box_str_constant(&(*node).as_plain().name),
+                plain_direct_read(node, inst),
+            ));
+            curr = node_search((*node).as_plain().back, DICT);
+        }
+        items
     }
 
     /// mapdict.py:1139-1146 `switch_to_object_strategy` — Slice E (#196). The
@@ -5451,6 +5657,179 @@ mod tests {
             MAP_DICT_STRATEGY.clear(w_dict);
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 0);
             assert_eq!(MAP_DICT_STRATEGY.getitem_str(w_dict, "y"), None);
+        }
+    }
+
+    #[test]
+    fn map_dict_strategy_popitem_preserves_surrogate_node_name() {
+        use pyre_object::dictmultiobject::DictStrategy;
+
+        unsafe {
+            // Install the surrogate-named attribute last so the DICT search
+            // reaches it first. The mapdict node name is WTF-8; popitem must
+            // preserve that name when materialising the returned key.
+            let term = boxed_dict_terminator();
+            let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
+            obj._set_mapdict_map(term);
+
+            let mut sur = Wtf8Buf::new();
+            sur.push(rustpython_wtf8::CodePoint::from_u32(0xD800).unwrap());
+
+            assert!(instance_node_setdictvalue(
+                obj_ref,
+                wn("ascii"),
+                sentinel(0x44)
+            ));
+            assert!(instance_node_setdictvalue(obj_ref, &sur, sentinel(0x55)));
+
+            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY_REF, obj_ref as *mut u8);
+            assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
+
+            let (w_sur_key, w_sur_value) = MAP_DICT_STRATEGY.popitem(w_dict).unwrap();
+            assert_eq!(pyre_object::w_str_get_wtf8(w_sur_key), &*sur);
+            assert_eq!(w_sur_value, sentinel(0x55));
+            assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 1);
+            assert_eq!(MAP_DICT_STRATEGY.getitem(w_dict, w_sur_key), None);
+            assert_eq!(instance_node_getdictvalue(obj_ref, &sur), None);
+
+            let (w_ascii_key, w_ascii_value) = MAP_DICT_STRATEGY.popitem(w_dict).unwrap();
+            assert_eq!(pyre_object::w_str_get_value(w_ascii_key), "ascii");
+            assert_eq!(w_ascii_value, sentinel(0x44));
+            assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 0);
+            assert_eq!(MAP_DICT_STRATEGY.getitem_str(w_dict, "ascii"), None);
+            assert_eq!(instance_node_getdictvalue(obj_ref, wn("ascii")), None);
+        }
+    }
+
+    #[test]
+    fn make_instance_dict_uses_shared_fake_carriers() {
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
+
+        crate::test_hooks::install_hash_hook();
+        unsafe {
+            let first = make_instance_dict();
+            let second = make_instance_dict();
+            assert_eq!(
+                (*(first as *const pyre_object::W_DictObject))
+                    .dstrategy
+                    .strategy_kind(),
+                StrategyKind::Map
+            );
+            assert_eq!(MAP_DICT_STRATEGY.length(first), 0);
+
+            // `Object.getdict` stores the wrapper in its SPECIAL slot, so a
+            // second lookup must preserve wrapper identity.
+            let first_carrier =
+                (*(first as *const pyre_object::W_DictObject)).dstorage as PyObjectRef;
+            assert_eq!(_obj_getdict(first_carrier), first);
+            // The carrier is allocated with `w_class = PY_NULL`, so it reaches
+            // `maybe_register_user_finalizer`. Its type resolves through the
+            // `INSTANCE_TYPE` fallback, whose `hasuserdel` is false — but the
+            // app-level type registry is not initialized in a bare lib test,
+            // so `r#type` answers None here and the check only runs once a
+            // registry exists.
+            if let Some(carrier_type) = crate::typedef::r#type(first_carrier) {
+                assert!(
+                    !pyre_object::w_type_get_hasuserdel(carrier_type.as_ptr()),
+                    "the fake carrier must not enter the user-finalizer queue"
+                );
+            }
+
+            // The shared terminator keeps mapdict.py:310's `allow_unboxing`
+            // default, so every write type-inspects its value. `sentinel` is a
+            // bare integer cast to a pointer and would be dereferenced here;
+            // this test uses real objects throughout for that reason.
+            let first_shared = pyre_object::w_str_new("first");
+            let second_shared = pyre_object::w_str_new("second");
+            pyre_object::w_dict_setitem_str(first, "shared", first_shared);
+            pyre_object::w_dict_setitem_str(second, "shared", second_shared);
+            assert_eq!(
+                pyre_object::w_dict_getitem_str(first, "shared"),
+                Some(first_shared)
+            );
+            assert_eq!(
+                pyre_object::w_dict_getitem_str(second, "shared"),
+                Some(second_shared)
+            );
+            let first_node = node_search(
+                (&*(first_carrier as *const pyre_object::W_ObjectObject))._get_mapdict_map(),
+                DICT,
+            );
+            let second_carrier =
+                (*(second as *const pyre_object::W_DictObject)).dstorage as PyObjectRef;
+            let second_node = node_search(
+                (&*(second_carrier as *const pyre_object::W_ObjectObject))._get_mapdict_map(),
+                DICT,
+            );
+            assert_eq!(first_node, second_node);
+
+            // The process-shared terminator preserves mapdict.py:310's true
+            // allow_unboxing default, so an int takes the unboxed transition.
+            pyre_object::w_dict_setitem_str(first, "number", pyre_object::w_int_new(42));
+            let number_node = node_search(
+                (&*(first_carrier as *const pyre_object::W_ObjectObject))._get_mapdict_map(),
+                DICT,
+            )
+            .unwrap();
+            assert!(
+                (*number_node).as_plain().unboxed.is_some(),
+                "int attribute did not use the shared terminator's unboxed transition"
+            );
+
+            // A non-str write devolves while retaining previous string keys.
+            MAP_DICT_STRATEGY.setitem(
+                first,
+                pyre_object::w_int_new(7),
+                pyre_object::w_str_new("v"),
+            );
+            assert_eq!(
+                (*(first as *const pyre_object::W_DictObject))
+                    .dstrategy
+                    .strategy_kind(),
+                StrategyKind::Object
+            );
+            assert_eq!(
+                pyre_object::w_dict_getitem_str(first, "shared"),
+                Some(first_shared)
+            );
+
+            // A separate carrier drives the LIMIT arm, which reads its wrapper
+            // back through getdict before changing to a Unicode dictionary.
+            let limit_dict = make_instance_dict();
+            for i in 0..LIMIT_MAP_ATTRIBUTES {
+                pyre_object::w_dict_setitem_str(
+                    limit_dict,
+                    &format!("k{i}"),
+                    pyre_object::w_str_new(&format!("v{i}")),
+                );
+            }
+            assert_eq!(
+                (*(limit_dict as *const pyre_object::W_DictObject))
+                    .dstrategy
+                    .strategy_kind(),
+                StrategyKind::Unicode
+            );
+
+            // A new carrier devolves on a non-str key; reads and deletes then
+            // use the Devolved read and delete arms' fake-carrier getdict.
+            let devolved_dict = make_instance_dict();
+            let kept = pyre_object::w_str_new("kept-value");
+            pyre_object::w_dict_setitem_str(devolved_dict, "kept", kept);
+            MAP_DICT_STRATEGY.setitem(
+                devolved_dict,
+                pyre_object::w_int_new(8),
+                pyre_object::w_str_new("devolve"),
+            );
+            assert_eq!(
+                pyre_object::w_dict_getitem_str(devolved_dict, "kept"),
+                Some(kept)
+            );
+            assert!(
+                (*(devolved_dict as *const pyre_object::W_DictObject))
+                    .dstrategy
+                    .delitem(devolved_dict, pyre_object::w_str_new("kept"))
+            );
         }
     }
 

@@ -1515,11 +1515,15 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     if caller_sym.jitcode().is_null() {
         return Err(unavail("Unavail::Top/NoJitCode"));
     }
-    let (jitcode_index, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
+    let (jitcode_index, fallthrough_py_pc, resume_marker_jit_pc, code_ptr, call_is_void) = unsafe {
         let jc = &*caller_sym.jitcode();
         if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
             return Err(unavail("Unavail::Top/NotPopulated"));
         }
+        let call_is_void =
+            crate::jitcode_runtime::decode_op_at(jc.payload.jitcode.code.as_slice(), call_jit_pc)
+                .and_then(|op| op.argcodes.chars().last())
+                .is_some_and(|bank| bank == 'v');
         // A CALL inside a try-block: inline it only when its exception handler
         // rejoins the loop (the exc-edge-bridgeable shape); otherwise decline so
         // the residual path handles the raise via its after-residual catch
@@ -1569,9 +1573,12 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             fallthrough,
             inline_call_return_marker(&jc.payload, call_jit_pc),
             jc.payload.code_ptr,
+            call_is_void,
         )
     };
-    // The call result is the top operand-stack slot at the return point.
+    // The call result is the top operand-stack slot only when it remains live
+    // at the return point; a call whose value is immediately discarded can
+    // resume with depth zero.
     let depth = match resume_marker_jit_pc {
         Some(marker) => unsafe { &(*caller_sym.jitcode()).payload }
             .depth_trivia_for_jitcode_pc(marker)
@@ -1605,15 +1612,20 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             }
         }
     };
-    if depth == 0 {
+    // A depth read that finds no trivia entry falls back to zero, so a zero
+    // depth only reliably means "empty operand stack" for a CALL that produces
+    // no result at all. Keep declining it otherwise.
+    if depth == 0 && !call_is_void {
         return Err(unavail("Unavail::Top/DepthZero"));
     }
     let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc);
     // #73: the result slot's color comes from the codewriter-precomputed
     // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
-    // `stack_slot_color_map` — the result is not a live Variable here, so it
-    // carries no pcdep entry.
-    let result_color = {
+    // `stack_slot_color_map` — when the result remains live, it is not a live
+    // Variable here, so it carries no pcdep entry.
+    let result_color = if call_is_void {
+        None
+    } else {
         let payload = unsafe { &(*caller_sym.jitcode()).payload };
         // The trivia twin resolves the return marker only while that marker
         // doubles as the fallthrough PC's own resume marker (a pc_map
@@ -1630,14 +1642,16 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
                     .filter(|&color| color != u16::MAX)
             })
             .map(|color| color as usize)
+    };
+    if !call_is_void && result_color.is_none() {
+        return Err(unavail("Unavail::Top/NoResultColor"));
     }
-    .ok_or_else(|| unavail("Unavail::Top/NoResultColor"))?;
-    // Null the not-yet-produced result slot, build the box list, then restore
-    // the caller's register (the inlined callee, not the walk, produces the
-    // result; the inner frame supplies it on resume).
+    // Null the not-yet-produced result slot when one is live, build the box
+    // list, then restore the caller's register (the inlined callee, not the
+    // walk, produces the result; the inner frame supplies it on resume).
     let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-    let saved = ctx.registers_r.get(result_color).copied();
-    if result_color < ctx.registers_r.len() {
+    let saved = result_color.and_then(|color| ctx.registers_r.get(color).copied());
+    if let Some(result_color) = result_color.filter(|&color| color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = null_ref;
     }
     // Keep the caller at the immediate post-call `-live-`, matching the
@@ -1661,7 +1675,10 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         None,
         &[],
     );
-    if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
+    if let (Some(result_color), Some(saved)) = (
+        result_color.filter(|&color| color < ctx.registers_r.len()),
+        saved,
+    ) {
         ctx.registers_r[result_color] = saved;
     }
     Ok(InlineParentFrame {
@@ -1696,6 +1713,10 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         return Err(unavail("Unavail::Nested/NotPopulated"));
     }
     let resume_marker_jit_pc = inline_call_return_marker(&pjc, call_jit_pc);
+    let call_is_void =
+        crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)
+            .and_then(|op| op.argcodes.chars().last())
+            .is_some_and(|bank| bank == 'v');
     let after_residual_call_resume = pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc);
     // A CALL inside a try-block at inline depth ≥2: the rejoin-loop lift is
     // scoped to the top-level caller (`compute_inline_caller_frame`) for now, so
@@ -1712,7 +1733,9 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         let code = &*pjc.code_ptr;
         crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
     };
-    // The call result is the top operand-stack slot at the return point.
+    // The call result is the top operand-stack slot only when it remains live
+    // at the return point; a call whose value is immediately discarded can
+    // resume with depth zero.
     let depth = match resume_marker_jit_pc {
         Some(marker) => pjc.depth_trivia_for_jitcode_pc(marker).unwrap_or(0) as usize,
         None => {
@@ -1743,7 +1766,9 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
             }
         }
     };
-    if depth == 0 {
+    // Zero depth is only known to be an empty operand stack for a result-less
+    // CALL — see the top-level sibling.
+    if depth == 0 && !call_is_void {
         return Err(unavail("Unavail::Nested/DepthZero"));
     }
     // #73: result slot color from the precomputed `result_color_at_pc`, not
@@ -1757,22 +1782,28 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // after-residual twin — which keys the same fallthrough coordinate by the
     // CALL's byte offset — answers for it.  Selecting one twin on whether a
     // marker exists reports "no result color" for exactly that shape.
-    let result_color = resume_marker_jit_pc
-        .and_then(|marker| pjc.result_color_trivia_for_jitcode_pc(marker))
-        .filter(|&color| color != u16::MAX)
-        .or_else(|| {
-            pjc.result_color_after_residual_for_jitcode_pc(call_jit_pc)
-                .filter(|&color| color != u16::MAX)
-        })
-        .map(|color| color as usize)
-        .ok_or_else(|| unavail("Unavail::Nested/NoResultColor"))?;
-    // Null the not-yet-produced result slot, build the box list, then restore
-    // the caller's register (the inlined callee, not the walk, produces the
-    // result; the inner frame supplies it on resume) — same as the top-level
-    // `in_a_call=true` shape.
+    let result_color = if call_is_void {
+        None
+    } else {
+        resume_marker_jit_pc
+            .and_then(|marker| pjc.result_color_trivia_for_jitcode_pc(marker))
+            .filter(|&color| color != u16::MAX)
+            .or_else(|| {
+                pjc.result_color_after_residual_for_jitcode_pc(call_jit_pc)
+                    .filter(|&color| color != u16::MAX)
+            })
+            .map(|color| color as usize)
+    };
+    if !call_is_void && result_color.is_none() {
+        return Err(unavail("Unavail::Nested/NoResultColor"));
+    }
+    // Null the not-yet-produced result slot when one is live, build the box
+    // list, then restore the caller's register (the inlined callee, not the
+    // walk, produces the result; the inner frame supplies it on resume) — same
+    // as the top-level `in_a_call=true` shape.
     let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-    let saved = ctx.registers_r.get(result_color).copied();
-    if result_color < ctx.registers_r.len() {
+    let saved = result_color.and_then(|color| ctx.registers_r.get(color).copied());
+    if let Some(result_color) = result_color.filter(|&color| color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = null_ref;
     }
     // Keep the caller at the immediate post-call `-live-`, matching the
@@ -1791,7 +1822,10 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         call_jit_pc,
         caller_liveness_word,
     );
-    if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
+    if let (Some(result_color), Some(saved)) = (
+        result_color.filter(|&color| color < ctx.registers_r.len()),
+        saved,
+    ) {
         ctx.registers_r[result_color] = saved;
     }
     let boxes = match boxes {

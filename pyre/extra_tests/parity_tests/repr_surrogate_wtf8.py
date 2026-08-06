@@ -1,3 +1,7 @@
+# pyre-check: platforms=linux,darwin
+# The lone surrogate is produced by compiling with a `b"\xff.py"` filename,
+# which only decodes where the filesystem encoding is UTF-8 with
+# `surrogateescape`.
 """A container's repr concatenates its items' reprs as encoded bytes.
 
 `listobject.py:206-225 _listrepr_inner` builds with a `rutf8.Utf8StringBuilder`

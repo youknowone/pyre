@@ -1373,7 +1373,7 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
             // Marking first would leave the young dict stored under a clean
             // bit, so the next minor walk skips the slot and the dict goes
             // stale (`walk_raw_function_roots` then drags a dead pointer).
-            let w_dict = pyre_object::w_dict_new();
+            let w_dict = crate::objspace::std::mapdict::make_instance_dict();
             function_write_barrier(obj);
             (*func).w_func_dict = w_dict;
         }

@@ -3884,10 +3884,8 @@ mod tests {
     }
 
     /// Phase B4 + S smoke test: `_encode_descr` returns `global_index
-    /// + 1` for descrs with a global index, else appends to `_descrs`
-    /// and returns `all_descrs_len + len(_descrs) - 1 + 1` where
-    /// `all_descrs_len = len(metainterp_sd.all_descrs)`
-    /// (RPython opencoder.py:702-707).
+    /// + 1` for descrs with a global index and appends local descrs to
+    /// `_descrs` (RPython opencoder.py:702-707).
     #[test]
     fn test_encode_descr_reads_metainterp_sd() {
         use std::sync::Arc;
@@ -3905,25 +3903,23 @@ mod tests {
             }
         }
 
-        let sd = crate::MetaInterpStaticData::new();
-        // Seed all_descrs with 7 dummies so the length drives the encoding.
-        // The list is process-wide (`descr_registry::all_descrs`), so set it
-        // rather than append — a sibling test's leftovers would otherwise
-        // shift the encoding this asserts on.
-        *sd.all_descrs().lock().unwrap() = (0..7)
-            .map(|_| Arc::new(D { idx: 0 }) as majit_ir::descr::DescrRef)
-            .collect();
-        let mut buf = TraceRecordBuffer::new(0, Arc::new(sd));
+        let mut buf = TraceRecordBuffer::new(0, empty_sd());
 
         // Global descr returns `get_descr_index() + 1`.
         let d_global: majit_ir::DescrRef = Arc::new(D { idx: 3 });
         assert_eq!(buf._encode_descr(&d_global), 4);
         assert_eq!(buf._descrs.len(), 1, "global descr must not append");
 
-        // Local descr encodes to all_descrs.len() + local_slot + 1 = 7 + 2.
+        // A local descr's encoded index includes the process-global registry
+        // length, so only assert properties independent of that shared value.
         let d_local: majit_ir::DescrRef = Arc::new(D { idx: -1 });
-        assert_eq!(buf._encode_descr(&d_local), 9);
+        let encoded = buf._encode_descr(&d_local);
+        assert!(encoded >= 2);
         assert_eq!(buf._descrs.len(), 2);
+        assert!(Arc::ptr_eq(
+            buf._descrs[1].as_ref().expect("local descr appended"),
+            &d_local
+        ));
     }
 
     /// Phase B3 smoke test: fixed-arity record_op* does NOT write a
@@ -4078,7 +4074,7 @@ mod tests {
 
     // ── M2 Step 2d · guard / close_loop / finish helpers tests ───────
 
-    fn dummy_descr() -> majit_ir::DescrRef {
+    fn fixed_descr() -> majit_ir::DescrRef {
         use std::sync::Arc;
         #[derive(Debug)]
         struct D;
@@ -4087,7 +4083,7 @@ mod tests {
                 0
             }
             fn get_descr_index(&self) -> i32 {
-                -1
+                0
             }
         }
         Arc::new(D)
@@ -4113,7 +4109,7 @@ mod tests {
     /// `record_op(Jump, args, Some(&descr))`.
     #[test]
     fn test_close_loop_oprefs_with_descr_2d() {
-        let descr = dummy_descr();
+        let descr = fixed_descr();
         let mut expected = TraceRecordBuffer::new(1, empty_sd());
         let mut actual = TraceRecordBuffer::new(1, empty_sd());
         expected.record_input_arg(Type::Int);
@@ -4128,7 +4124,7 @@ mod tests {
     /// FailDescr.
     #[test]
     fn test_finish_oprefs_2d() {
-        let descr = dummy_descr();
+        let descr = fixed_descr();
         let mut expected = TraceRecordBuffer::new(1, empty_sd());
         let mut actual = TraceRecordBuffer::new(1, empty_sd());
         expected.record_input_arg(Type::Int);
@@ -4143,18 +4139,7 @@ mod tests {
     /// exactly as `record_op(&[Box], Some(&descr))` would.
     #[test]
     fn test_record_op_oprefs_with_descr_2b() {
-        use std::sync::Arc;
-        #[derive(Debug)]
-        struct D;
-        impl majit_ir::Descr for D {
-            fn index(&self) -> u32 {
-                0
-            }
-            fn get_descr_index(&self) -> i32 {
-                -1
-            }
-        }
-        let descr: majit_ir::DescrRef = Arc::new(D);
+        let descr = fixed_descr();
         let mut expected = TraceRecordBuffer::new(1, empty_sd());
         let mut actual = TraceRecordBuffer::new(1, empty_sd());
         let pos_e = expected.record_op(OpCode::CallN, &[Box::ResOp(0)], Some(&descr));

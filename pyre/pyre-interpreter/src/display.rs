@@ -1287,6 +1287,86 @@ pub unsafe fn py_str_display(obj: PyObjectRef) -> String {
     }
 }
 
+/// The encoded length of the character a WTF-8 lead byte opens.
+///
+/// A stray continuation byte answers 1: the buffer is malformed, and stepping
+/// one byte keeps the scan in bounds.
+fn wtf8_sequence_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
+}
+
+/// `ntpath.splitroot`'s drive, as a byte length.
+///
+/// `ntpath.py splitroot` normalizes `/` to `\` first and then recognizes three
+/// shapes. Two leading separators open a UNC or device root that runs to the
+/// second separator after its prefix — `\\?\UNC\`, matched case-insensitively,
+/// where present, and the two leading separators otherwise — or to the end of
+/// a path holding fewer separators than that. One leading separator is a
+/// rooted relative path with no drive. Otherwise a colon as the SECOND
+/// CHARACTER makes those two characters the drive, which is not two bytes
+/// unless the first character is single-byte.
+fn nt_drive_len(path: &[u8]) -> usize {
+    const UNC_PREFIX: &[u8] = br"\\?\UNC\";
+    let is_sep = |b: u8| b == b'/' || b == b'\\';
+    let Some(&lead) = path.first() else {
+        return 0;
+    };
+    if !is_sep(lead) {
+        let head = wtf8_sequence_len(lead);
+        return if path.get(head) == Some(&b':') {
+            head + 1
+        } else {
+            0
+        };
+    }
+    if !path.get(1).is_some_and(|&b| is_sep(b)) {
+        return 0;
+    }
+    let device = path.len() >= UNC_PREFIX.len()
+        && path.iter().zip(UNC_PREFIX).all(|(&b, &want)| {
+            if is_sep(want) {
+                is_sep(b)
+            } else {
+                b.to_ascii_uppercase() == want
+            }
+        });
+    let start = if device { UNC_PREFIX.len() } else { 2 };
+    let mut seen = 0;
+    for (i, &b) in path.iter().enumerate().skip(start) {
+        if is_sep(b) {
+            seen += 1;
+            if seen == 2 {
+                return i;
+            }
+        }
+    }
+    path.len()
+}
+
+/// Where `os.path.basename` starts its result.
+///
+/// `interp_exceptions.py:875` calls `os.path.basename`, so the split is the
+/// platform's. `ntpath` peels [`nt_drive_len`] off first and takes what
+/// follows the last `\` or `/` in the remainder — which is empty for a bare
+/// UNC root; `posixpath` takes what follows the last `/`, with no drive.
+///
+/// A separator is ASCII and no continuation byte can collide with one, so the
+/// remainder scan is safe over encoded bytes.
+fn basename_start(path: &[u8]) -> usize {
+    let windows = cfg!(windows);
+    let drive = if windows { nt_drive_len(path) } else { 0 };
+    path[drive..]
+        .iter()
+        .rposition(|&b| b == b'/' || (windows && b == b'\\'))
+        .map_or(drive, |i| drive + i + 1)
+}
+
 /// The WTF-8 carrying subset of `W_BaseException.descr_str`: a base
 /// exception whose `args_w` is a single `str` stringifies to that str
 /// verbatim (`interp_exceptions.py:131 space.str(self.args_w[0])`).
@@ -1361,12 +1441,7 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
             let w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
             if pyre_object::pyobject::is_exact_type(w_filename, &STR_TYPE) {
                 let fbuf = pyre_object::w_str_get_wtf8(w_filename).to_wtf8_buf();
-                let start = fbuf
-                    .as_bytes()
-                    .iter()
-                    .rposition(|&b| b == b'/')
-                    .map_or(0, |i| i + 1);
-                let mut inner = fbuf[start..].to_wtf8_buf();
+                let mut inner = fbuf[basename_start(fbuf.as_bytes())..].to_wtf8_buf();
                 if let Some(l) = lineno_str {
                     inner.push_str(", ");
                     inner.push_wtf8(&l);
@@ -1781,5 +1856,53 @@ impl fmt::Display for PyDisplay {
                 unsafe { py_str(self.0) }.unwrap_or_else(|_| "<exception in __str__>".to_string());
             write!(f, "{s}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nt_drive_len;
+
+    /// Every expectation is `len(ntpath.splitdrive(p)[0].encode())` for the
+    /// same input.
+    #[test]
+    fn nt_drive_len_matches_ntpath_splitroot() {
+        // `X:` drives, absolute and drive-relative.
+        assert_eq!(nt_drive_len(br"C:\dir\enc.py"), 2);
+        assert_eq!(nt_drive_len(b"C:enc.py"), 2);
+        assert_eq!(nt_drive_len(b"C:"), 2);
+        // The colon must follow the first CHARACTER, not the first byte.
+        assert_eq!(nt_drive_len("\u{e9}:foo.py".as_bytes()), 3);
+        assert_eq!(nt_drive_len(b"\xed\xb3\xbf:f.py"), 4); // lone surrogate
+        assert_eq!(nt_drive_len(b":"), 0);
+        assert_eq!(nt_drive_len(b"ab:c.py"), 0);
+        // A UNC root is the whole `\\server\share`, so a bare one basenames
+        // to the empty string rather than to the share.
+        assert_eq!(nt_drive_len(br"\\server\share"), 14);
+        assert_eq!(nt_drive_len(br"\\server\share\enc.py"), 14);
+        assert_eq!(nt_drive_len(b"//server/share/enc.py"), 14);
+        // Fewer components than a share: the root is the whole path.
+        assert_eq!(nt_drive_len(br"\\server"), 8);
+        assert_eq!(nt_drive_len(br"\\server\"), 9);
+        assert_eq!(nt_drive_len(br"\\"), 2);
+        // `\\?\UNC\` shifts the two-separator count past the prefix, and is
+        // matched case-insensitively and through `/`.
+        assert_eq!(nt_drive_len(br"\\?\UNC\server\share"), 20);
+        assert_eq!(nt_drive_len(br"\\?\UNC\server\share\f.py"), 20);
+        assert_eq!(nt_drive_len(br"\\?\unc\server\share"), 20);
+        assert_eq!(nt_drive_len(b"//?/UNC/server/share"), 20);
+        assert_eq!(nt_drive_len(br"\\?\UNC\server"), 14);
+        assert_eq!(nt_drive_len(br"\\?\UNC\a\b\c.py"), 11);
+        assert_eq!(nt_drive_len(br"\\?\UNC"), 7);
+        // A prefix that only looks like it: `UNCX` is an ordinary device name.
+        assert_eq!(nt_drive_len(br"\\?\UNCX\server\share"), 8);
+        // Other device roots take the plain two-separator count.
+        assert_eq!(nt_drive_len(br"\\?\C:\dir\f.py"), 6);
+        assert_eq!(nt_drive_len(br"\\.\PhysicalDrive0"), 18);
+        assert_eq!(nt_drive_len(br"\\?\"), 4);
+        // One leading separator is a rooted relative path: no drive.
+        assert_eq!(nt_drive_len(br"\dir\enc.py"), 0);
+        assert_eq!(nt_drive_len(b"enc.py"), 0);
+        assert_eq!(nt_drive_len(b""), 0);
     }
 }

@@ -15,6 +15,10 @@ mod buffered_rwpair;
 pub use buffered_rwpair::W_BufferedRWPair;
 mod buffered_random;
 pub use buffered_random::W_BufferedRandom;
+mod bytesio;
+pub use bytesio::W_BytesIO;
+mod stringio;
+pub use stringio::W_StringIO;
 mod textio;
 pub use textio::W_TextIOWrapper;
 
@@ -429,10 +433,33 @@ pub(crate) fn tag_io_instance_with_finalizer(
     cls: PyObjectRef,
     needs_finalizer: bool,
 ) -> PyObjectRef {
+    tag_io_instance_impl(obj, cls, needs_finalizer, true)
+}
+
+/// `W_IOBase.__init__(add_to_autoflusher=False)` with the same subclass
+/// finalizer rule as [`tag_io_instance_with_finalizer`].
+pub(crate) fn tag_io_instance_without_autoflusher(
+    obj: PyObjectRef,
+    cls: PyObjectRef,
+    needs_finalizer: bool,
+) -> PyObjectRef {
+    tag_io_instance_impl(obj, cls, needs_finalizer, false)
+}
+
+fn tag_io_instance_impl(
+    obj: PyObjectRef,
+    cls: PyObjectRef,
+    needs_finalizer: bool,
+    add_to_autoflusher: bool,
+) -> PyObjectRef {
     if !cls.is_null() {
         crate::typedef::tag_subclass_instance(obj, cls);
     }
-    let obj = autoflusher_add(obj);
+    let obj = if add_to_autoflusher {
+        autoflusher_add(obj)
+    } else {
+        obj
+    };
     if needs_finalizer {
         crate::executioncontext::register_finalizer(obj);
     }
@@ -1261,6 +1288,8 @@ crate::py_module! {
         let buffered_rwpair = buffered_rwpair::type_object();
         for (name, t) in [
             ("FileIO", file_io),
+            ("BytesIO", bytesio::type_object()),
+            ("StringIO", stringio::type_object()),
             ("BufferedReader", buffered_reader),
             ("BufferedWriter", buffered_writer),
             ("BufferedRWPair", buffered_rwpair),
@@ -1284,22 +1313,16 @@ crate::py_module! {
         }
         crate::module_ns_store(ns, "TextIOWrapper", text_io_wrapper);
 
-        // The pure-Python in-memory streams: pickle's Pickler/Unpickler use
-        // BytesIO; logging / traceback / csv use StringIO.  `W_BytesIO` derives
-        // `W_BufferedIOBase` (interp_bytesio.py:65) and `W_StringIO`
-        // `W_TextIOBase` (interp_stringio.py:390), so both bases have to be
-        // bound before the source runs; that is what puts this install here
-        // rather than in the `appleveldefs:` table, which the macro expands
-        // ahead of `extra_init`.
+        // The remaining pure-Python newline decoder needs `_TextIOBase` bound
+        // before this source runs; that is what puts
+        // this install here rather than in the `appleveldefs:` table, which
+        // the macro expands ahead of `extra_init`.
         crate::importing::appleveldef_install_seeded(
             ns,
             include_str!("_io_app.py"),
             "_io_app.py",
-            &["BytesIO", "StringIO", "IncrementalNewlineDecoder"],
-            &[
-                ("_BufferedIOBase", buffered_base),
-                ("_TextIOBase", text_base),
-            ],
+            &["IncrementalNewlineDecoder"],
+            &[("_TextIOBase", text_base)],
         );
     }
 }
