@@ -5698,13 +5698,29 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 }
             }
         }
-        if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
-
+        // objspace.py:664-670 gates the slot dispatch on `space.type(w_obj)`
+        // with no layout test, so a receiver that is neither a type nor a
+        // module reaches it whatever its representation.  `is_instance` alone
+        // means `W_ObjectObject`, which an exception, a `list` subclass and
+        // every other non-default layout fail, leaving their override
+        // uncalled.  `setattr_str` already resolves the type this way.
+        //
+        // `call_getattr` false is the bare `object.__getattribute__` slot:
+        // `object_getattribute` hands its non-instance, non-type receivers
+        // straight back here, so dispatching the override again would recurse
+        // through every `super().__getattribute__(name)` an override makes.
+        let instance_like_type = if is_instance(obj) {
+            Some(w_instance_get_type(obj))
+        } else if call_getattr && !is_type(obj) && !is_module(obj) {
+            crate::typedef::r#type(obj).map(|p| p.as_ptr())
+        } else {
+            None
+        };
+        if let Some(w_type) = instance_like_type {
             // `pypy/objspace/descroperation.py descr__getattribute__`
             // dispatches through the receiver type's `__getattribute__`
             // slot before running the default descriptor protocol
-            // (objspace.py:663-666).  Users routinely override this to
+            // (objspace.py:664-670).  Users routinely override this to
             // customise *all* attribute access (e.g. lazy proxies,
             // validating wrappers).  `getattribute_if_not_from_object`
             // returns a non-default override or `None`, memoizing the
@@ -5717,6 +5733,25 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // still routes through the type's custom `__getattribute__`, so the
             // slot dispatch runs for every name, including "__getattribute__".
             if let Some(slot) = getattribute_if_not_from_object(w_type) {
+                // `super`, bound `method`, `types.GenericAlias`,
+                // `types.UnionType` and the two weakref proxies each register
+                // a `__getattribute__` of their own, so the identity compare
+                // against `object`'s answers `Some` for them too.  Those
+                // receivers are served by the shims above — the bound-method
+                // one just above forwards to `__func__` — and running their
+                // slot through `get_and_call_function` here would re-enter
+                // it.  Restricting the dispatch to a heap-type owner
+                // admits exactly the app-level overrides, and leaves every
+                // other receiver on the descriptor protocol it already took.
+                // A `W_ObjectObject` receiver reaches this arm only through
+                // its own class, so the check is skipped for it.
+                let owned_by_heap_type = is_instance(obj)
+                    || lookup_where(w_type, "__getattribute__").is_some_and(|(owner, found)| {
+                        std::ptr::eq(found, slot) && pyre_object::w_type_is_heaptype(owner)
+                    });
+                if !owned_by_heap_type {
+                    return object_getattr_miss(obj, name, call_getattr);
+                }
                 let name_obj = w_str_new(name);
                 // objspace.py:666 / descroperation.py:238
                 // `space.get_and_call_function(w_descr, w_obj, w_name)` —
@@ -5729,6 +5764,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                     Err(e) => return Err(e),
                 }
             }
+        }
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
 
             // Step 1: look up in type MRO
             let w_descr = lookup_in_type_where(w_type, name);
@@ -18134,6 +18172,48 @@ mod tests {
             mutated(t, None);
             assert!(!pyre_object::typeobject::w_type_get_uses_object_getattribute(t));
             assert!(!pyre_object::typeobject::w_type_get_uses_object_setattr(t));
+        }
+    }
+
+    /// typeobject.py:303-326 — builtin types and a plain user class that
+    /// inherit object.__getattribute__ answer `None`, so the layout-agnostic
+    /// receiver gate does not route them through an app-level call.
+    #[test]
+    fn getattribute_if_not_from_object_answers_none_for_object_default_types() {
+        crate::typedef::init_typeobjects();
+        let checked = [
+            (
+                "list",
+                crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE),
+            ),
+            (
+                "tuple",
+                crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE),
+            ),
+            (
+                "str",
+                crate::typedef::gettypeobject(&pyre_object::pyobject::STR_TYPE),
+            ),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE),
+            ),
+            (
+                "Exception",
+                crate::typedef::gettypeobject(&pyre_object::interp_exceptions::EXCEPTION_TYPE),
+            ),
+        ];
+        unsafe {
+            for (name, w_type) in checked {
+                assert!(!w_type.is_null(), "{name} type is registered");
+                assert!(
+                    getattribute_if_not_from_object(w_type).is_none(),
+                    "{name} inherits object.__getattribute__"
+                );
+            }
+            let plain = make_user_instance();
+            let plain_type = w_instance_get_type(plain);
+            assert!(getattribute_if_not_from_object(plain_type).is_none());
         }
     }
 

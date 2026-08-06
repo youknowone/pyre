@@ -3310,8 +3310,18 @@ pub fn with_except_start_values(
     val: PyObjectRef,
 ) -> PyObjectRef {
     let exc_type = crate::typedef::r#type(val).map_or(pyre_object::w_none(), |p| p.as_ptr());
-    let exc_tb =
-        crate::baseobjspace::getattr_str(val, "__traceback__").unwrap_or(pyre_object::w_none());
+    // pyopcode.py:1358-1362 reads W_BaseException.w_traceback directly while
+    // building the `__exit__(type, value, traceback)` arguments.
+    let exc_tb = if unsafe { pyre_object::is_exception(val) } {
+        let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(val) };
+        if tb.is_null() {
+            pyre_object::w_none()
+        } else {
+            tb
+        }
+    } else {
+        pyre_object::w_none()
+    };
     if exit_self.is_null() {
         crate::call_function(exit_func, &[exc_type, val, exc_tb])
     } else {
