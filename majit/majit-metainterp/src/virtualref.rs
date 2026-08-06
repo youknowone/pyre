@@ -13,7 +13,7 @@
 //!
 //! Mirrors `rpython/jit/metainterp/virtualref.py`.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// The value [`VREF_GC_TYPE_ID`] holds before `set_vref_gc_type_id` runs.  Zero
 /// is a legitimate id, so the sentinel has to be a value the registry never
@@ -195,10 +195,10 @@ pub const TOKEN_NONE: *mut u8 = std::ptr::null_mut();
 /// the translated identity word is pointer-sized too.
 pub const JITFRAME_DUMMY_VTABLE: usize = 0x4A46_444D; // "JFDM"
 
-/// Lazy initialisation of the `_dummy` address.  `OnceLock<usize>`
-/// (instead of `OnceLock<*mut u8>`) so the cell is `Sync` —
-/// raw-pointer types are not.
-static TRACING_RESCALL_DUMMY_PTR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// Lazy initialisation of the `_dummy` address, as a `usize` because raw
+/// pointers are not `Sync`.  Zero means "not minted yet"; a null sentinel would
+/// collide with `TOKEN_NONE`, so it is not a value this can ever hold.
+static TRACING_RESCALL_DUMMY_PTR: AtomicUsize = AtomicUsize::new(0);
 
 const TRACING_RESCALL_DUMMY_GC_TYPE_ID_UNSET: u32 = u32::MAX;
 static TRACING_RESCALL_DUMMY_GC_TYPE_ID: AtomicU32 =
@@ -207,15 +207,15 @@ static TRACING_RESCALL_DUMMY_GC_TYPE_ID: AtomicU32 =
 /// Publish the registered leaf type used by the prebuilt
 /// `virtualizable.py:326-330 JITFRAME_DUMMY` object.
 ///
-/// Must run before the sentinel is first requested — the address is minted
-/// once and never re-minted, so a late registration would leave the process
-/// with the unmanaged fallback for good.
+/// Registration comes from `build_gc`, so a second call means a second heap.
+/// A sentinel minted in the previous one is no longer part of the live heap —
+/// `is_managed_heap_object` would stop recognising it and the traced
+/// `virtual_token` / `vable_token` slots would be back to holding an address
+/// the collector does not own. Drop it so the next request mints in the heap
+/// that is now current.
 pub fn set_tracing_rescall_dummy_gc_type_id(type_id: u32) {
-    assert!(
-        TRACING_RESCALL_DUMMY_PTR.get().is_none(),
-        "JITFRAME_DUMMY type registered after the tracing sentinel was minted",
-    );
     TRACING_RESCALL_DUMMY_GC_TYPE_ID.store(type_id, Ordering::Relaxed);
+    TRACING_RESCALL_DUMMY_PTR.store(0, Ordering::Relaxed);
 }
 
 /// `virtualizable.py:327 _dummy = lltype.malloc(_DUMMY)` — allocate
@@ -254,11 +254,27 @@ fn allocate_tracing_rescall_dummy() -> *mut u8 {
 /// ```python
 /// TOKEN_TRACING_RESCALL = lltype.cast_opaque_ptr(llmemory.GCREF, _dummy)
 /// ```
-/// The returned address is a registered, rooted GC leaf and remains stable for
-/// the process lifetime.
+/// The returned address is a registered, rooted GC leaf, and stays the same for
+/// as long as the heap it was minted in is the current one.
 #[inline]
 pub fn token_tracing_rescall() -> *mut u8 {
-    *TRACING_RESCALL_DUMMY_PTR.get_or_init(|| allocate_tracing_rescall_dummy() as usize) as *mut u8
+    let minted = TRACING_RESCALL_DUMMY_PTR.load(Ordering::Relaxed);
+    if minted != 0 {
+        return minted as *mut u8;
+    }
+    let fresh = allocate_tracing_rescall_dummy() as usize;
+    // Racing minters both produce a valid sentinel, but the token protocol
+    // compares tokens by address, so exactly one may be published. The loser's
+    // object is immortal either way — upstream's `_dummy` is prebuilt.
+    match TRACING_RESCALL_DUMMY_PTR.compare_exchange(
+        0,
+        fresh,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        Ok(_) => fresh as *mut u8,
+        Err(published) => published as *mut u8,
+    }
 }
 
 /// Virtual reference state for a single reference.

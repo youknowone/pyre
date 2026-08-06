@@ -1640,3 +1640,45 @@ while i < 40:
         "module dict move_to_end reentrant scan callback GC rooting program failed",
     );
 }
+
+/// `virtualizable.py:326-330` makes `TOKEN_TRACING_RESCALL` the address of a
+/// prebuilt GC object, so the sentinel has to belong to the heap that is
+/// current when a traced slot holds it. `reset_gc_fresh_for_test` builds a
+/// second heap and leaks the first, which leaves any sentinel minted in the
+/// first outside the live heap — `is_managed_heap_object` stops recognising it,
+/// and the traced `virtual_token` / `vable_token` slots would be back to
+/// holding an address the collector does not own.
+///
+/// Mint the sentinel between two resets and require a fresh address, which is
+/// what tells the two heaps apart. This is the ordering the GC-stress harness
+/// itself produces the moment any of its programs reaches a traced residual
+/// call; none does today, so nothing else in this binary covers it.
+#[test]
+fn tracing_sentinel_is_reminted_for_a_rebuilt_heap() {
+    let _serial = GC_STRESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| {
+            init_jit_hooks();
+            reset_gc_fresh_for_test();
+            let first = majit_metainterp::virtualref::token_tracing_rescall();
+            assert!(!first.is_null(), "sentinel must never be TOKEN_NONE");
+
+            reset_gc_fresh_for_test();
+            let second = majit_metainterp::virtualref::token_tracing_rescall();
+            assert!(!second.is_null(), "sentinel must never be TOKEN_NONE");
+            assert_ne!(
+                first, second,
+                "the sentinel stayed in the heap that was replaced",
+            );
+
+            // Stable within one heap: the token protocol compares by address.
+            assert_eq!(
+                second,
+                majit_metainterp::virtualref::token_tracing_rescall(),
+                "the sentinel moved without the heap being rebuilt",
+            );
+        })
+        .expect("spawn worker thread");
+    handle.join().expect("worker thread panicked");
+}
