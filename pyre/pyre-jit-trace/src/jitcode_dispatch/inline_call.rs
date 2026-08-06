@@ -3786,40 +3786,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                             _
                         ))
                     ) && (
-                        // Hazard 3 — the wasm backend cannot run the widened
-                        // shape at all, so it keeps the blanket decline.
-                        // Admitting a callee here traces into its body, and the
-                        // helper this widening exists for carries its own loop
-                        // (`while tb is not None:`), so the enclosing trace
-                        // closes with a CALL_ASSEMBLER into that loop.  Every
-                        // wasm trace is its own module and there is no
-                        // inter-module chaining, so the backend declines any
-                        // CALL_ASSEMBLER outright; that decline is the `Err`
-                        // arm of the compile step, so the enclosing loop is
-                        // aborted rather than merely left interpreted.
-                        // Measured `loops_aborted` 0 -> 3 on
-                        // `synth/exception_traceback_lineno_chain` and 0 -> 5
-                        // on `synth/exception_inline_callee_tb_frames`, each
-                        // ~5-9% slower than declining.  Drop this arm once the
-                        // backend can chain modules.
-                        //
-                        // Keeping it is what the wasm `guard_failures`
-                        // baselines record.  The declined callee is compiled as
-                        // a loop of its own instead of being inlined, and that
-                        // loop's exit guard reaches `trace_eagerness` on its
-                        // own account, so each affected fixture bills one extra
-                        // ~200-failure bridge toll.  Forcing this arm on for
-                        // dynasm reproduces the wasm counts to the digit on all
-                        // four, as loops/bridges/guard_failures:
-                        // `exception_catching_frame_tb_node` 3/3/401 -> 4/3/601,
-                        // `exception_traceback_lineno_chain` 5/4/607 -> 5/4/804,
-                        // `exception_inline_callee_tb_frames` 6/4/606 -> 6/4/807,
-                        // `gc_bug_bridge_flavor_traceback_names` 4/8/1670 ->
-                        // 4/9/2027.  Raising `trace_eagerness` past the
-                        // fixture's event count bills 7303 on both sides of the
-                        // first: the deopt count is the same either way, and
-                        // only its attribution moves.
-                        cfg!(target_arch = "wasm32")
                         // Hazard 1 — kept operands. A branch that leaves slots
                         // on the value stack needs its guard resume to restore
                         // them, and the inline sub-walk's mirror does not model
@@ -3831,7 +3797,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         // instruction and the branch pops the tested value, so
                         // `depth > 1` is exactly "a kept slot survives".  An
                         // unreachable pc has no depth and cannot fire a guard.
-                        || liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
+                        liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
                             // Hazard 2 — the tested operand itself.  When the
                             // multiframe inline int-specializes the tested
                             // local, the mid-body guard resume cannot source

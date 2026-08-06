@@ -1422,9 +1422,11 @@ fn wasm_unsupported_trace_reason(ops: &[Op], allow_ca: bool) -> Option<String> {
     for op in ops {
         if op.opcode.is_call_assembler() && !allow_ca {
             // CALL_ASSEMBLER inlines a loop-bearing callee by jumping into another
-            // trace's compiled token. The wasm backend has no inter-module trace
-            // chaining (each trace is its own module), so it cannot execute the
-            // target — decline (#62 loop-callee gap).
+            // trace's compiled token. `general_int_call_assembler_target` resolves
+            // that token to a published guest function the CA arm reaches with a
+            // `call_indirect`, so reaching here means some target did not resolve
+            // — an unpublished token, a signature outside Int/Ref, or a missing
+            // deopt-helper slot — and there is nothing to call.
             return Some(format!(
                 "wasm backend: {:?} (loop-callee inline)",
                 op.opcode
@@ -2003,11 +2005,9 @@ impl majit_backend::Backend for WasmBackend {
 
         // Decline traces the wasm backend cannot compile correctly, so the
         // metainterp falls back to the interpreter (correct, if unaccelerated)
-        // rather than installing a structurally-invalid trace module:
-        // CALL_ASSEMBLER inlines a loop-bearing callee by jumping into another
-        // trace's compiled token. The wasm backend has no inter-module trace
-        // chaining (each trace is its own module), so it cannot execute the
-        // target — declining is the #62 loop-callee gap.
+        // rather than installing a structurally-invalid trace module. For
+        // CALL_ASSEMBLER that is the unresolved-target case only, judged by
+        // `allow_ca` above; see `wasm_unsupported_trace_reason`.
         if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
             diag_bump(25);
             return Err(BackendError::Unsupported(reason));
