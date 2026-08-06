@@ -5176,11 +5176,17 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `decode_object`, which turns a buffer operand into a fill char rather than
 /// refusing it.
 ///
-/// That decode is not imported here — `ljust`/`rjust` refuse a
-/// bytearray/memoryview/array fill that upstream would accept, as they already
-/// did before this function grew a per-method message. What the two arms below
-/// carry is the wording, so the operand upstream also refuses reads the same
-/// on both, and neither arm claims a conversion that was never attempted.
+/// `decode_object` reports a failed conversion as `"decoding to str: %S"` over
+/// the buffer error (unicodeobject.py:1727-1739). apptest_unicode.py:1247-1252
+/// pins that in either of two wordings; the arm below is the one pypy prints,
+/// down to `None` rendering unquoted where a type name is quoted.
+///
+/// The decode itself is not imported — `ljust`/`rjust` refuse a
+/// bytearray/memoryview/array fill that upstream turns into a fill char, as
+/// they already did before this function grew a per-method message. So the
+/// three arms below reproduce upstream's message for every operand upstream
+/// also refuses, and a buffer operand takes the last arm as the one place the
+/// missing decode still shows.
 ///
 /// A str of the wrong length is a separate refusal, and the one upstream
 /// words per method.
@@ -5192,8 +5198,15 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
         let type_name = arg_type_name(args[2]);
         let message = if method == "center" {
             format!("expected str, got {type_name} object")
-        } else {
+        } else if unsafe { pyre_object::is_bytes(args[2]) } {
             format!("Can't convert '{type_name}' object to str implicitly")
+        } else {
+            let operand = if unsafe { pyre_object::is_none(args[2]) } {
+                "None".to_string()
+            } else {
+                format!("'{type_name}'")
+            };
+            format!("decoding to str: a bytes-like object is required, not {operand}")
         };
         return Err(crate::PyError::type_error(message));
     }
