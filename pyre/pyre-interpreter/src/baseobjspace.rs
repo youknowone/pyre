@@ -11038,7 +11038,7 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // objectobject.py:150 — w_obj.setclass(space, w_newcls).  For a mapdict
         // instance this re-roots the map chain onto the new class's terminator
         // (mapdict.py:754-756); pyre then keeps w_class authoritative for type().
-        if pyre_object::is_instance(w_obj) {
+        if crate::objspace::std::mapdict::has_mapdict_storage(w_obj) {
             crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
         }
         (*w_obj).w_class = w_newcls;

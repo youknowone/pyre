@@ -370,6 +370,12 @@ pub struct TypeInfo {
     /// reads it through the materialized `TYPE_INFO` table's `infobits`
     /// byte (gc.py:631-642).
     pub is_object: bool,
+    /// Whether this type corresponds to an RPython classdef and therefore
+    /// contributes peers to `assign_inheritance_ids`. Some frontend-private
+    /// storage layouts still carry an `rclass.OBJECT` header (and must set
+    /// `is_object`) while sharing a classdef/vtable with another registered
+    /// type; those layouts must not perturb the classdef census.
+    pub has_subclass_range: bool,
     /// CPython-internal object that remains an OBJECT-layout GC boundary but
     /// is omitted from app-level `gc.get_objects()` enumeration.  This models
     /// 3.11+ interpreter frames: owning coroutine/traceback objects expose
@@ -426,6 +432,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: false,
+            has_subclass_range: false,
             hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
@@ -449,6 +456,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: false,
+            has_subclass_range: false,
             hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
@@ -491,6 +499,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: false,
+            has_subclass_range: false,
             hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
@@ -520,6 +529,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: true,
+            has_subclass_range: true,
             hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
@@ -548,6 +558,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: true,
+            has_subclass_range: true,
             hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
@@ -574,6 +585,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: true,
+            has_subclass_range: true,
             hide_from_app_level_inspector: false,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
@@ -609,6 +621,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: true,
+            has_subclass_range: true,
             hide_from_app_level_inspector: false,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
@@ -634,6 +647,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: Some(trace_fn),
             is_object: true,
+            has_subclass_range: true,
             hide_from_app_level_inspector: false,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
@@ -656,6 +670,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: false,
+            has_subclass_range: false,
             hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
@@ -682,6 +697,7 @@ impl TypeInfo {
             items_have_gc_ptrs,
             custom_trace: None,
             is_object: false,
+            has_subclass_range: false,
             hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
@@ -704,6 +720,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: Some(trace_fn),
             is_object: false,
+            has_subclass_range: false,
             hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
@@ -711,6 +728,16 @@ impl TypeInfo {
             is_weakref: false,
             destructor: None,
         }
+    }
+
+    /// Mark an `rclass.OBJECT`-shaped private storage layout that shares the
+    /// classdef/vtable of another registered type. It remains visible to
+    /// `check_is_object` and app-level GC inspection, but contributes no
+    /// duplicate peer to the subclass-range numbering.
+    pub fn object_layout_without_subclass_range(mut self) -> Self {
+        self.is_object = true;
+        self.has_subclass_range = false;
+        self
     }
 
     /// Create a varsize type info with a custom trace hook.
@@ -732,6 +759,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false, // custom_trace handles ref tracing
             custom_trace: Some(trace_fn),
             is_object: false,
+            has_subclass_range: false,
             hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
@@ -857,7 +885,7 @@ impl TypeRegistry {
 
     /// `gctypelayout.encode_type_shapes_now` parity
     /// (gctypelayout.py:393-398): freezes the registry so subsequent
-    /// `register_type` calls panic and assigns each `is_object`
+    /// `register_type` calls panic and assigns each registered classdef
     /// type its preorder `subclassrange_{min,max}`.
     ///
     /// The bounds come from `rtyper/normalizecalls.py:373-389
@@ -875,7 +903,7 @@ impl TypeRegistry {
         }
         self.can_add_new_types = false;
         self.assign_inheritance_ids();
-        // Refresh layout_table rows for is_object types whose
+        // Refresh layout_table rows for object types whose
         // subclassrange_{min,max} just changed.
         for (i, info) in self.entries.iter().enumerate() {
             self.layout_table[i] = TypeEntry::from_type_info(info, i as u32);
@@ -885,7 +913,7 @@ impl TypeRegistry {
     /// `rtyper/normalizecalls.py:373-389 assign_inheritance_ids` /
     /// `TotalOrderSymbolic` parity (normalizecalls.py:302-354).
     ///
-    /// For each `is_object` type, builds
+    /// For each type representing a registered classdef, builds
     /// `witness = reversed(MRO of cdef ids)` and pairs it with a
     /// matching `witness + [MAX]` peer:
     ///
@@ -909,12 +937,12 @@ impl TypeRegistry {
     /// list without relying on a magic numeric sentinel.
     fn assign_inheritance_ids(&mut self) {
         let n = self.entries.len();
-        // Build reversed-MRO witness for each is_object type.
+        // Build reversed-MRO witness for each registered classdef type.
         // Witness for typeid T = [T_root, ..., T_grandparent, T_parent, T]
         // where T_root is the topmost rclass.OBJECT-layout ancestor.
         let mut witness: Vec<Option<Vec<WitnessElement>>> = vec![None; n];
         for id in 0..n {
-            if !self.entries[id].is_object {
+            if !self.entries[id].has_subclass_range {
                 continue;
             }
             let mut mro: Vec<WitnessElement> = Vec::new();
@@ -927,7 +955,7 @@ impl TypeRegistry {
             witness[id] = Some(mro);
         }
 
-        // Build the peer list: each is_object type contributes a
+        // Build the peer list: each registered classdef contributes a
         // `(witness, owner)` Min peer and a `(witness + [Max], owner)`
         // Max peer. Sort lexicographically by witness; the peer's
         // position becomes its preorder value (TotalOrderSymbolic
@@ -1161,6 +1189,38 @@ mod tests {
         assert!(
             p.subclassrange_min < c.subclassrange_min || p.subclassrange_max > c.subclassrange_max
         );
+    }
+
+    #[test]
+    fn test_private_object_layout_does_not_perturb_subclass_ranges() {
+        unsafe fn trace_nothing(_: usize, _: &mut dyn FnMut(*mut majit_ir::GcRef)) {}
+
+        let build = |with_private_layout| {
+            let mut reg = TypeRegistry::new();
+            let parent = reg.register(TypeInfo::object(16));
+            let child = reg.register(TypeInfo::object_subclass(16, parent));
+            if with_private_layout {
+                let private = reg.register(
+                    TypeInfo::with_custom_trace(24, trace_nothing)
+                        .object_layout_without_subclass_range(),
+                );
+                assert!(reg.get(private).is_object);
+                assert!(!reg.get(private).has_subclass_range);
+            }
+            reg.freeze_types();
+            (
+                (
+                    reg.get(parent).subclassrange_min,
+                    reg.get(parent).subclassrange_max,
+                ),
+                (
+                    reg.get(child).subclassrange_min,
+                    reg.get(child).subclassrange_max,
+                ),
+            )
+        };
+
+        assert_eq!(build(false), build(true));
     }
 
     #[test]

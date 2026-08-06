@@ -3017,7 +3017,15 @@ fn build_native_user_mapdict_group(
         type_id,
         vtable,
         &[
-            ("map", map_offset, 8, Type::Int, false, false, false),
+            (
+                "map",
+                map_offset,
+                core::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
             ("storage", storage_offset, 8, Type::Ref, false, false, false),
         ],
         simple_name,
@@ -3102,7 +3110,10 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_INT_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_str(obj) } {
         field_descr_from_group(&W_UNICODE_USER_DESCR_GROUP, 0)
-    } else if unsafe { pyre_object::is_tuple(obj) } {
+    } else if unsafe {
+        pyre_object::is_tuple(obj)
+            && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
+    } {
         field_descr_from_group(&W_TUPLE_USER_DESCR_GROUP, 0)
     } else {
         object_map_descr()
@@ -3115,7 +3126,10 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_INT_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_str(obj) } {
         field_descr_from_group(&W_UNICODE_USER_DESCR_GROUP, 1)
-    } else if unsafe { pyre_object::is_tuple(obj) } {
+    } else if unsafe {
+        pyre_object::is_tuple(obj)
+            && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
+    } {
         field_descr_from_group(&W_TUPLE_USER_DESCR_GROUP, 1)
     } else {
         object_storage_descr()
@@ -4276,6 +4290,18 @@ mod tests {
         assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
+        );
+        assert_eq!(
+            W_INT_USER_DESCR_GROUP.field_descrs[0].field_size(),
+            core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            W_UNICODE_USER_DESCR_GROUP.field_descrs[0].field_size(),
+            core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            W_TUPLE_USER_DESCR_GROUP.field_descrs[0].field_size(),
+            core::mem::size_of::<usize>()
         );
     }
 

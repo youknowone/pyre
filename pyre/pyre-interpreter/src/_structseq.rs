@@ -516,12 +516,22 @@ pub fn new_instance_with_extra(
     let rooted_items = (0..items.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(items_slot + index))
         .collect();
-    let obj = pyre_object::w_tuple_new_array_backed(rooted_items);
+    let rooted_cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    let obj = if unsafe { pyre_object::w_type_get_hasdict(rooted_cls) } {
+        // `_getusercls` gives a has-dict tuple subclass the generated tuple
+        // payload plus MapdictStorageMixin (`typedef.py:174-227`). Structseq
+        // extras therefore live on their owner rather than in the native
+        // address-keyed fallback table.
+        pyre_object::w_tuple_subclass_new_array_backed(rooted_items, rooted_cls)
+    } else {
+        pyre_object::w_tuple_new_array_backed(rooted_items)
+    };
     pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    unsafe {
-        (*pyre_object::gc_roots::shadow_stack_get(obj_slot)).w_class =
-            pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    if !unsafe { pyre_object::w_type_get_hasdict(rooted_cls) } {
+        unsafe {
+            (*pyre_object::gc_roots::shadow_stack_get(obj_slot)).w_class = rooted_cls;
+        }
     }
     if !extras.is_empty() {
         let w_dict = pyre_object::w_dict_new();

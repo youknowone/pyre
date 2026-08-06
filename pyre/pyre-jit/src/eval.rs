@@ -3728,23 +3728,33 @@ fn build_gc() -> Box<MiniMarkGC> {
     majit_metainterp::virtualref::set_tracing_rescall_dummy_gc_type_id(tracing_rescall_dummy_tid);
     // `typedef.py:174-227` builds a distinct translated instance class for a
     // user subclass of a builtin. These private header ids describe those
-    // wider payloads, but are not rclass vtable ids: class identity and
-    // inheritance remain in `PyObject.w_class`. Consequently they must not
-    // enter the GC's subclass-range census.
-    let int_user_tid = gc.register_type(TypeInfo::with_custom_trace(
-        pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
-        int_object_custom_trace,
-    ));
+    // wider payloads. They remain app-level rclass.OBJECT instances: the
+    // collector's object/referent inspection and T_IS_RPYTHON_INSTANCE bit
+    // must treat them exactly like the builtin payloads they extend. Class
+    // identity remains in `PyObject.w_class`.
+    let int_user_tid = gc.register_type(
+        TypeInfo::with_custom_trace(
+            pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
+            int_object_custom_trace,
+        )
+        .object_layout_without_subclass_range(),
+    );
     pyre_object::intobject::W_INT_USER_GC_TYPE_ID.set(int_user_tid);
-    let unicode_user_tid = gc.register_type(TypeInfo::with_custom_trace(
-        pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
-        unicode_user_object_custom_trace,
-    ));
+    let unicode_user_tid = gc.register_type(
+        TypeInfo::with_custom_trace(
+            pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
+            unicode_user_object_custom_trace,
+        )
+        .object_layout_without_subclass_range(),
+    );
     pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID.set(unicode_user_tid);
-    let tuple_user_tid = gc.register_type(TypeInfo::with_custom_trace(
-        pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
-        tuple_user_object_custom_trace,
-    ));
+    let tuple_user_tid = gc.register_type(
+        TypeInfo::with_custom_trace(
+            pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
+            tuple_user_object_custom_trace,
+        )
+        .object_layout_without_subclass_range(),
+    );
     pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID.set(tuple_user_tid);
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
@@ -3772,7 +3782,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     let actual_hierarchy: Vec<_> = (0..gc.types.len())
         .filter_map(|id| {
             let info = gc.types.get(id as u32);
-            info.is_object.then_some((id as u32, info.parent))
+            info.has_subclass_range.then_some((id as u32, info.parent))
         })
         .collect();
     assert_eq!(
