@@ -8451,6 +8451,22 @@ unsafe fn walker_exact_builtin_class(
     }
 }
 
+/// Canonical Python class for an exact int/bool/float specialization operand.
+/// Tagged ints have no object header, so derive their class without reading
+/// `w_class`; heap operands were already admitted by
+/// `is_exact_builtin_instance` in the shared operand gate.
+fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE)
+    } else if unsafe { pyre_object::is_bool(obj) } {
+        pyre_object::get_instantiate(&pyre_object::pyobject::BOOL_TYPE)
+    } else if unsafe { pyre_object::is_float(obj) } {
+        pyre_object::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE)
+    } else {
+        pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE)
+    }
+}
+
 /// Walker-native mirror of the trait `trace_guard_exact_w_class`
 /// (`trace_opcode.rs`): emit `getfield_gc_r(w_class)` → `ptr_eq(expected)`
 /// → `guard_true` so the spec_ii fast path only stays live for an element

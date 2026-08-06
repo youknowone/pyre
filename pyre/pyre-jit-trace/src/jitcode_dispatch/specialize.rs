@@ -858,7 +858,9 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
         let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
         let _lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
+        walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
         let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
+        walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
         let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, 1);
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[rhs_zero])?;
 
@@ -982,7 +984,9 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
     let lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
     let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
     if overflows {
         let concrete_value = match op_code {
             OpCode::IntAddOvf => la.wrapping_add(rb),
@@ -5871,8 +5875,10 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
 
         let _lhs_raw =
             walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64, false)?;
+        walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
         let rhs_raw =
             walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64, false)?;
+        walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
         let rhs_zero = walker_float_eq_const(ctx, rhs_raw, 0.0, 1);
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[rhs_zero])?;
         return Ok(Some(walker_emit_recorded_builtin_raise(ctx, exc, kind)));
@@ -5900,8 +5906,10 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
     // --- emit the specialized IR (walker-native) ---
     let lhs_raw =
         walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64, false)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
     let rhs_raw =
         walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64, false)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
     // rint.py `_ovf_zer` analogue for float true-division: emit a
     // `float_eq(rhs, 0.0) → guard_false` precondition ahead of the bare
     // `FloatTrueDiv` llop so a future zero divisor deopts to the checked
