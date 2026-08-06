@@ -768,46 +768,20 @@ impl OptVirtualize {
                             return Some(OptimizationResult::Remove);
                         }
                         set_field(&mut vinfo.fields, field_idx, value_op.clone());
-                        debug_assert!(
-                            (field_idx as usize)
-                                < vinfo
-                                    .descr
-                                    .as_size_descr()
-                                    .map(|sd| sd.all_fielddescrs().len())
-                                    .unwrap_or(0),
-                            "Virtual field slot {} is outside its own descr's field list \
-                             (len {}, descr index {}); `set_field` just wrote past the \
-                             struct this PtrInfo describes",
-                            field_idx,
-                            vinfo
-                                .descr
-                                .as_size_descr()
-                                .map(|sd| sd.all_fielddescrs().len())
-                                .unwrap_or(0),
-                            vinfo.descr.index(),
-                        );
+                        if let Some(err) =
+                            field_slot_disagreement(&vinfo.descr, field_idx, field_descr)
+                        {
+                            panic!("Virtual {err}");
+                        }
                         Some(OptimizationResult::Remove)
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
                         set_field(&mut vinfo.fields, field_idx, value_op.clone());
-                        debug_assert!(
-                            (field_idx as usize)
-                                < vinfo
-                                    .descr
-                                    .as_size_descr()
-                                    .map(|sd| sd.all_fielddescrs().len())
-                                    .unwrap_or(0),
-                            "VirtualStruct field slot {} is outside its own descr's field list \
-                             (len {}, descr index {}); `set_field` just wrote past the \
-                             struct this PtrInfo describes",
-                            field_idx,
-                            vinfo
-                                .descr
-                                .as_size_descr()
-                                .map(|sd| sd.all_fielddescrs().len())
-                                .unwrap_or(0),
-                            vinfo.descr.index(),
-                        );
+                        if let Some(err) =
+                            field_slot_disagreement(&vinfo.descr, field_idx, field_descr)
+                        {
+                            panic!("VirtualStruct {err}");
+                        }
                         Some(OptimizationResult::Remove)
                     }
                     PtrInfo::Virtualizable(vstate) => {
@@ -2373,6 +2347,79 @@ impl Optimization for OptVirtualize {
 // PtrInfo helpers (is_nonnull, is_virtual, etc.) are in info.rs.
 
 // ── Field list helpers ──
+
+/// The postcondition of a virtual `set_field`: slot `field_idx` of the struct
+/// descr this PtrInfo carries is the field that supplied the index.
+///
+/// `info.py:206` writes `self._fields[fielddescr.get_index()]`, and
+/// `info.py:219-220 _force_elements` reads it back as
+/// `for i, fielddescr in enumerate(descr.get_all_fielddescrs()): fld =
+/// self._fields[i]` — two descrs, one index. Upstream cannot
+/// disagree, because `heaptracker.py:60-72 all_fielddescrs` and `:97-109
+/// get_fielddescr_index_in` are one declaration-order walk. Nor can the two
+/// descrs be a mismatched pair: `rclass.py:549` declares a subclass as
+/// `MkStruct(name, ('super', rbase.object_type), *llfields)`, so the inherited
+/// fields are walked first and a field's index is the same in a class as in
+/// every subclass of it. `info.py:184-188` spends exactly that guarantee when
+/// it swaps `self.descr` for "a more precise descr" and keeps the index.
+///
+/// pyre reaches one such list from two producers that rank fields differently —
+/// the codewriter walks declarations (`codewriter/assembler.rs
+/// bh_all_field_specs_for_struct_into`), `jitcode/assembler.rs
+/// register_struct_layout` sorts by byte offset — so the pairing above is a
+/// postcondition to state rather than a property of the construction. Measured
+/// over 120928 virtual setfields (1172 programs) it holds everywhere, including
+/// the 2286 that did index a descr other than the field's own parent; the
+/// reachable failure needs a reordered list AND that cross-descr step at once,
+/// which nothing in the corpus produces. A census over what ran cannot promise
+/// what the producers can emit, so check it here — the same argument
+/// `jitcode/assembler.rs field_descr_position_disagreement` already makes for
+/// the other end of this pipe.
+///
+/// Returns the disagreement as a message so the caller's panic names both the
+/// slot and the field. Compiled out of release builds: it is a debug assertion,
+/// written as a function only because the message needs the same walk the
+/// predicate does.
+fn field_slot_disagreement(
+    descr: &DescrRef,
+    field_idx: u32,
+    field: &dyn FieldDescr,
+) -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let fields = descr.as_size_descr()?.all_fielddescrs();
+    let Some(slot) = fields.get(field_idx as usize) else {
+        return Some(format!(
+            "field slot {field_idx} is outside its own descr's field list (len {}, descr \
+             index {}); `set_field` just wrote past the struct this PtrInfo describes",
+            fields.len(),
+            descr.index(),
+        ));
+    };
+    // Both halves must agree. The name is the better key but is not always
+    // carried — the flattened inline aggregates (`ob_header`, an enum's
+    // `__pos_0`) reach here under the documented empty-name fallback — so the
+    // name is compared only when both sides have one, and the offset is
+    // compared always. Neither alone is sufficient: a name can be absent, and a
+    // flattened layout puts an aggregate and its first leaf at one address
+    // (`heaptracker.py:68-69`).
+    let named_apart = !field.field_name().is_empty()
+        && !slot.field_name().is_empty()
+        && slot.field_name() != field.field_name();
+    if named_apart || slot.offset() != field.offset() {
+        return Some(format!(
+            "field {:?} at offset {} claims slot {field_idx} of descr index {}, but that \
+             slot holds {:?} at offset {}",
+            field.field_name(),
+            field.offset(),
+            descr.index(),
+            slot.field_name(),
+            slot.offset(),
+        ));
+    }
+    None
+}
 
 fn set_field(fields: &mut Vec<(u32, Operand)>, field_idx: u32, value: Operand) {
     for entry in fields.iter_mut() {
