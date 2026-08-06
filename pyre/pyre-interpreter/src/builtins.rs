@@ -360,6 +360,37 @@ unsafe fn w_memoryview_new_plain(
     }
 }
 
+/// Build the `BytesIOView` returned by `W_BytesIO.getbuffer_w`
+/// (`interp_bytesio.py:149-152`): its `BytesIOBuffer` reads the bytearray
+/// backing, while `BytesIOView.__init__` reports the `W_BytesIO` as `.obj`
+/// (`interp_bytesio.py:52-62`).
+pub(crate) fn w_memoryview_new_simple_with_owner(
+    w_backing: PyObjectRef,
+    w_obj: PyObjectRef,
+) -> PyObjectRef {
+    use pyre_object::bufferview::BufferView;
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_backing);
+        pyre_object::gc_roots::pin_root(w_obj);
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
+        let r_backing = pyre_object::gc_roots::shadow_stack_get(sp);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        pyre_object::bytearrayobject::w_bytearray_exports_incref(r_backing);
+        let length = pyre_object::bytearrayobject::w_bytearray_len(r_backing) as i64;
+        let backing = memoryview_backing_buffer(r_backing);
+        let view = BufferView::Simple {
+            backing,
+            w_obj: r_obj,
+            length,
+        };
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
+    }
+}
+
 /// Build the `W_MMap.readbuf_w`/`writebuf_w` view: one contiguous external
 /// byte window whose owner remains the mmap object.
 #[cfg(all(unix, not(feature = "sandbox")))]
