@@ -5407,10 +5407,6 @@ impl TraceCtx {
         self.inline_frames.len()
     }
 
-    pub fn inline_trace_depth(&self) -> usize {
-        self.inline_trace_positions.len()
-    }
-
     /// Update the green key for this trace.
     ///
     /// RPython pyjitpl.py reached_loop_header(): when func-entry tracing
@@ -5485,36 +5481,6 @@ impl TraceCtx {
     /// Pop an inline frame (returning from a callee).
     pub(crate) fn pop_inline_frame(&mut self) {
         self.inline_frames.pop();
-    }
-
-    pub fn push_inline_trace_position(&mut self, green_key: u64) {
-        self.inline_trace_positions
-            .push((green_key, self.recorder.num_ops()));
-    }
-
-    pub fn pop_inline_trace_position(&mut self) {
-        self.inline_trace_positions.pop();
-    }
-
-    pub fn truncate_inline_trace_positions(&mut self, depth: usize) {
-        self.inline_trace_positions.truncate(depth);
-    }
-
-    /// pyjitpl.py:3538-3570 find_biggest_function
-    ///
-    /// RPython only considers portal frames recorded in
-    /// `portal_trace_positions`.  The root frame created by
-    /// `initialize_state_from_start()` has no greenkey and is not added to
-    /// that stack, so a non-inlined root trace returns `None` and the caller
-    /// falls back to `prepare_trace_segmenting()`.
-    pub fn find_biggest_function(&self) -> Option<u64> {
-        let current_pos = self.recorder.num_ops();
-        self.inline_trace_positions
-            .iter()
-            .copied()
-            .map(|(green_key, start_pos)| (green_key, current_pos.saturating_sub(start_pos)))
-            .max_by_key(|&(_, size)| size)
-            .map(|(green_key, _)| green_key)
     }
 }
 

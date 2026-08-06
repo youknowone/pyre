@@ -239,12 +239,6 @@ pub struct TraceCtx {
     /// doing tuple-equality comparisons in [`recursive_depth`] and
     /// [`is_tracing_key`].
     pub(crate) inline_frames: Vec<(usize, usize)>,
-    /// Start positions for currently active inlined trace-through frames.
-    ///
-    /// This mirrors the subset of PyPy's `portal_trace_positions` that we
-    /// need for `find_biggest_function()`: active inlined callees and the
-    /// trace length at which each one started tracing.
-    pub(crate) inline_trace_positions: Vec<(u64, usize)>,
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
@@ -1502,7 +1496,6 @@ impl TraceCtx {
             green_key_raw: (0, 0),
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
-            inline_trace_positions: Vec::new(),
             green_key_values: None,
             driver_descriptor: None,
             virtualizable_boxes: None,
@@ -1589,7 +1582,6 @@ impl TraceCtx {
             green_key_raw: (0, 0),
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
-            inline_trace_positions: Vec::new(),
             green_key_values: Some(green_key_values),
             driver_descriptor: None,
             virtualizable_boxes: None,

@@ -1405,12 +1405,14 @@ pub struct MetaInterp<M: Clone> {
     /// longest-traced inlined function for abort reporting; the reset
     /// to `None` at pyjitpl.py:2795 signals that the trace aborted.
     ///
-    /// pyre's existing `find_biggest_function` (trace_ctx.rs:625) uses
-    /// `TraceCtx::inline_trace_positions` — a narrower subset that only
-    /// tracks active inlined callees.  Keeping this field here mirrors
-    /// RPython's shape so a future port of `find_biggest_function` can
-    /// line-by-line read the start/end stack; callers that merely want
-    /// the active-frame list should keep using `inline_trace_positions`.
+    /// This is the log `find_biggest_function` reads. It replaced a
+    /// `TraceCtx::inline_trace_positions` that held only the *active*
+    /// inlined callees: a live stack pops a callee on return, so the
+    /// frame that grew the trace and then returned — the usual culprit —
+    /// was gone by the time the limit was crossed.
+    ///
+    /// `arm_portal_trace_positions` re-arms it per trace; upstream instead
+    /// builds one `MetaInterp` per tracing attempt.
     pub portal_trace_positions: Option<Vec<(usize, Option<u64>, crate::recorder::TracePosition)>>,
 
     /// pyjitpl.py:2401 `self.current_call_id = 0`.
@@ -4243,6 +4245,7 @@ impl<M: Clone> MetaInterp<M> {
                         (input_types, num_inputs, index_of_virtualizable)
                     });
                 self.tracing = Some(ctx);
+                self.arm_portal_trace_positions();
                 // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
                 // `setup_tracing` for rationale.  Bridge-trace
                 // distinction now flows through
@@ -4526,6 +4529,7 @@ impl<M: Clone> MetaInterp<M> {
             (input_types, num_inputs, index_of_virtualizable)
         });
         self.tracing = Some(ctx);
+        self.arm_portal_trace_positions();
         // pyjitpl.py:1547-1556 `opimpl_jit_merge_point` auto-stamp
         // gate inputs.  Both `portal_call_depth` and
         // `has_compiled_targets(ptoken)` feed the primary-trace gate;
@@ -5196,16 +5200,16 @@ impl<M: Clone> MetaInterp<M> {
     fn blackhole_trace_too_long_slow(&mut self) -> Option<AbortReason> {
         let ctx = self.tracing.as_ref().expect("tracing is Some");
         let green_key = ctx.green_key;
+        // pyjitpl.py:2801 `if self.current_merge_points:` — outermost
+        // loop's greenkey, used only when one exists (never for bridges).
+        let outermost_merge_key = ctx.current_merge_points_first_greenkey();
         // pyjitpl.py:2793: find_biggest_function — if an inlined function
         // caused the bloat, disable just that function.
-        let huge_fn_key = ctx.find_biggest_function();
+        let huge_fn_key = self.find_biggest_function();
         // pyjitpl.py:2795: `self.portal_trace_positions = None` marks the
         // abort boundary so post-abort consumers (e.g. test inspections
         // at pyjitpl.py:3547) can detect a terminated trace session.
         self.portal_trace_positions = None;
-        // pyjitpl.py:2801 `if self.current_merge_points:` — outermost
-        // loop's greenkey, used only when one exists (never for bridges).
-        let outermost_merge_key = ctx.current_merge_points_first_greenkey();
         if let Some(huge_fn_key) = huge_fn_key {
             self.warm_state.disable_noninlinable_function(huge_fn_key);
             // pyjitpl.py:2799-2800: stash the aborted jd_sd + greenkey so
@@ -12590,6 +12594,7 @@ impl<M: Clone> MetaInterp<M> {
         ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
         ctx.callinfocollection = self.callinfocollection.clone();
         self.tracing = Some(ctx);
+        self.arm_portal_trace_positions();
         // pyjitpl.py:2411 `self.jitdriver_sd = jitdriver_sd`: bridges
         // inherit the parent's driver. The bridge entry path does not
         // thread `driver_descriptor`, so fall back to scanning for the
@@ -14146,6 +14151,74 @@ impl<M: Clone> MetaInterp<M> {
         // re-entrant — leave the stack in the same shape it came in.
         let _ = self.framestack.pop();
         action
+    }
+
+    /// pyjitpl.py:3538-3575 `MetaInterp.find_biggest_function`.
+    ///
+    /// `portal_trace_positions` is a flat log, not a stack: `newframe`
+    /// appends `(jd_no, Some(greenkey), pos)` on entry and `popframe`
+    /// `(jd_no, None, pos)` on exit, so a callee that already returned still
+    /// has both of its entries. Walking it with a side stack therefore sizes
+    /// every portal frame the trace ever entered, which is the point — the
+    /// function to stop inlining is usually one that finished long before the
+    /// limit was crossed. A frame still open when the trace overflowed has no
+    /// closing entry; upstream measures only the outermost of those
+    /// (`start_stack[0]`) against the current trace position.
+    ///
+    /// `size` is the distance between two `TracePosition::_pos` cursors, the
+    /// `pos[0]` upstream subtracts (opencoder.py:475).
+    ///
+    /// Returns the green key of the largest frame, or `None` when the log
+    /// holds no closed or open portal frame — the root frame is created by
+    /// `initialize_state_from_start` without a greenkey and never enters the
+    /// log, so a trace that inlined nothing answers `None` and the caller
+    /// falls through to `prepare_trace_segmenting`.
+    pub fn find_biggest_function(&self) -> Option<u64> {
+        let positions = self.portal_trace_positions.as_ref()?;
+        let mut start_stack: Vec<(u64, usize)> = Vec::new();
+        let mut max_size = 0usize;
+        let mut max_key = None;
+        for &(_jd_no, key, pos) in positions {
+            match key {
+                // pyjitpl.py:3547-3548 `if key is not None: start_stack.append`.
+                Some(key) => start_stack.push((key, pos._pos)),
+                // pyjitpl.py:3549-3559 the closing entry sizes the frame it
+                // closes. An unmatched close cannot happen while `newframe` /
+                // `popframe` are the only writers, so it is left to `pop`'s
+                // `None` rather than given a recovery path.
+                None => {
+                    if let Some((green_key, start_pos)) = start_stack.pop() {
+                        let size = pos._pos.saturating_sub(start_pos);
+                        if size > max_size {
+                            max_size = size;
+                            max_key = Some(green_key);
+                        }
+                    }
+                }
+            }
+        }
+        // pyjitpl.py:3560-3570 `if start_stack:` — one frame, the outermost,
+        // measured against where the trace stopped.
+        if let Some(&(green_key, start_pos)) = start_stack.first() {
+            let current = self.tracing.as_ref()?.get_trace_position()._pos;
+            if current.saturating_sub(start_pos) > max_size {
+                max_key = Some(green_key);
+            }
+        }
+        max_key
+    }
+
+    /// pyjitpl.py:2391 `self.portal_trace_positions = []`.
+    ///
+    /// Upstream gets this for free: it builds a `MetaInterp` per tracing
+    /// attempt, so the log starts empty and dies with the trace. pyre's
+    /// `MetaInterp` outlives every trace, so the list is re-armed at each
+    /// trace start instead. Without it the log would carry frames from
+    /// previous traces — whose `_pos` cursors index a different recorder —
+    /// and `blackhole_if_trace_too_long`'s `= None` would retire it for the
+    /// rest of the process after the first overflow.
+    fn arm_portal_trace_positions(&mut self) {
+        self.portal_trace_positions = Some(Vec::new());
     }
 
     /// pyjitpl.py:2427-2429 `MetaInterp.is_main_jitcode(jitcode)`.
@@ -20305,6 +20378,122 @@ mod metainterp_static_data_tests {
                 .expect("Some")
                 .is_empty(),
             "non-recursive jitdriver must not record"
+        );
+    }
+
+    /// A MetaInterp with one recursive portal registered — the shape whose
+    /// frames `is_main_jitcode` admits to `portal_trace_positions` — and the
+    /// jitcode `perform_call` takes. Not yet tracing.
+    fn meta_with_recursive_portal() -> (MetaInterp<()>, std::sync::Arc<crate::jitcode::JitCode>) {
+        use crate::jitcode::JitCodeBuilder;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd.is_recursive = true;
+        let idx = {
+            let MetaInterp {
+                staticdata,
+                backend,
+                ..
+            } = &mut meta;
+            std::sync::Arc::get_mut(staticdata)
+                .unwrap()
+                .register_jitdriver_sd(jd, backend)
+        };
+        let mut jc = JitCodeBuilder::new().finish();
+        jc.replace_jitdriver_sd(Some(idx));
+        (meta, std::sync::Arc::new(jc))
+    }
+
+    fn start_tracing(meta: &mut MetaInterp<()>) {
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
+    }
+
+    fn record_ops(meta: &mut MetaInterp<()>, n: usize) {
+        let ctx = meta.tracing.as_mut().expect("tracing is Some");
+        for _ in 0..n {
+            ctx.record_op(majit_ir::OpCode::PtrEq, &[]);
+        }
+    }
+
+    #[test]
+    fn find_biggest_function_sizes_a_callee_that_already_returned() {
+        // pyjitpl.py:3538-3559. The frame that grew the trace is usually one
+        // that returned before the limit was crossed; `portal_trace_positions`
+        // keeps both of its entries, so the walk can still size it. The
+        // `inline_trace_positions` stack this replaced popped on return and
+        // could only ever see the frames still open at the overflow.
+        let (mut meta, jc) = meta_with_recursive_portal();
+        start_tracing(&mut meta);
+
+        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        record_ops(&mut meta, 5);
+        meta.popframe(true);
+
+        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        record_ops(&mut meta, 1);
+        meta.popframe(true);
+
+        assert_eq!(
+            meta.find_biggest_function(),
+            Some(0xa11),
+            "the larger frame wins even though both have returned"
+        );
+    }
+
+    #[test]
+    fn find_biggest_function_measures_an_open_frame_against_the_current_position() {
+        // pyjitpl.py:3560-3570 `if start_stack:` — a frame the overflow
+        // interrupted has no closing entry, so its size is measured against
+        // where the trace stopped.
+        let (mut meta, jc) = meta_with_recursive_portal();
+        start_tracing(&mut meta);
+
+        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        record_ops(&mut meta, 1);
+        meta.popframe(true);
+
+        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        record_ops(&mut meta, 5);
+
+        assert_eq!(meta.find_biggest_function(), Some(0xb22));
+    }
+
+    #[test]
+    fn find_biggest_function_is_none_without_an_inlined_portal_frame() {
+        // The root frame carries no greenkey, so a trace that inlined nothing
+        // leaves the log empty and the caller takes the segmenting arm.
+        let (mut meta, _jc) = meta_with_recursive_portal();
+        start_tracing(&mut meta);
+        record_ops(&mut meta, 5);
+        assert_eq!(meta.find_biggest_function(), None);
+    }
+
+    #[test]
+    fn portal_trace_positions_are_rearmed_for_each_trace() {
+        // pyjitpl.py:2391. Upstream builds a MetaInterp per tracing attempt;
+        // pyre re-arms the log instead. Without it the `= None` that
+        // `blackhole_trace_too_long_slow` writes would retire the log for the
+        // rest of the process, and a surviving list would mix `_pos` cursors
+        // from a recorder the next trace does not use.
+        let (mut meta, jc) = meta_with_recursive_portal();
+        // The state `blackhole_trace_too_long_slow` leaves behind: this
+        // MetaInterp already overflowed one trace and retired its log.
+        meta.portal_trace_positions = None;
+
+        start_tracing(&mut meta);
+        assert_eq!(
+            meta.portal_trace_positions.as_ref().map(Vec::len),
+            Some(0),
+            "the next trace starts from an empty log, not from None"
+        );
+        meta.perform_call(jc, &[], Some(0xa11)).unwrap_err();
+        assert_eq!(
+            meta.portal_trace_positions.as_ref().expect("Some").len(),
+            1,
+            "and newframe records into it again"
         );
     }
 
