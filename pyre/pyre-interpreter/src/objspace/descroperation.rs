@@ -776,6 +776,11 @@ fn bigint_neg(a: &BigInt) -> BigInt {
 }
 
 #[majit_macros::elidable]
+fn bigint_clone(a: &BigInt) -> BigInt {
+    a.clone()
+}
+
+#[majit_macros::elidable]
 fn bigint_invert(a: &BigInt) -> BigInt {
     a.invert()
 }
@@ -5188,10 +5193,17 @@ pub fn pos(a: PyObjectRef) -> PyResult {
         }
         if is_long(a) {
             // intobject.py:182-191 `_self_unaryop('pos')` delegates to
-            // `self.int(space)`, and W_LongObject.int returns `self` for the
-            // exact builtin representation.  Do not allocate another wrapper
-            // or shallow-cloned rbigint payload for unary plus.
-            return Ok(a);
+            // `self.int(space)`, which returns `self` only for the exact
+            // builtin representation.  A subclass returns a plain-int copy
+            // (long_pos: exact → self, else `_PyLong_Copy`), so leaking the
+            // subclass instance would be wrong; an exact long returns `self`
+            // without allocating another wrapper or shallow-cloned payload.
+            if pyre_object::is_exact_builtin_instance(a) {
+                return Ok(a);
+            }
+            return Ok(pyre_object::longobject::w_long_new_fresh_rbigint_handle(
+                bigint_clone(w_long_get_value(a)),
+            ));
         }
         if is_float(a) {
             return Ok(w_float_new(w_float_get_value(a)));
