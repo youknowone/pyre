@@ -328,8 +328,8 @@ impl RootScope {
     /// [`push_roots`] so the API surface stays uniform across phases.
     #[inline]
     fn new() -> Self {
-        let (save_point, stack_slot) =
-            with_shadow_stack(|stack| (stack.len(), stack as *const RootStack));
+        let stack_slot = shadow_stack_cell();
+        let save_point = shadow_stack_cell_len(stack_slot);
         Self {
             save_point,
             stack_slot,
@@ -445,9 +445,7 @@ impl Drop for RootScope {
         assert_shadow_stack_not_walking();
         // `truncate` is a no-op if `save_point >= len()`, which is
         // the steady-state case for an empty bracket.
-        // SAFETY: `stack_slot` is this thread's root-stack cell; `_not_send`
-        // keeps the bracket on the thread that resolved it.
-        unsafe { (*self.stack_slot).truncate(self.save_point) };
+        shadow_stack_cell_truncate(self.stack_slot, self.save_point);
     }
 }
 
@@ -592,6 +590,28 @@ pub fn normalize_roots(base: usize, len: usize) {
 #[majit_macros::dont_look_inside]
 pub fn shadow_stack_len() -> usize {
     with_shadow_stack(RootStack::len)
+}
+
+/// The thread's root-stack cell.  The JIT residualises the resolution instead
+/// of tracing into it (`@dont_look_inside`, `rlib/jit.py:139`), the
+/// `shadow_stack_len` twin.
+#[majit_macros::dont_look_inside]
+fn shadow_stack_cell() -> *const RootStack {
+    with_shadow_stack(|stack| stack as *const RootStack)
+}
+
+#[majit_macros::dont_look_inside]
+fn shadow_stack_cell_len(cell: *const RootStack) -> usize {
+    // SAFETY: `cell` is this thread's root-stack cell, and `_not_send` keeps
+    // the bracket on the thread that resolved it.
+    unsafe { (*cell).len() }
+}
+
+#[majit_macros::dont_look_inside]
+fn shadow_stack_cell_truncate(cell: *const RootStack, len: usize) {
+    // SAFETY: `cell` is this thread's root-stack cell, and `_not_send` keeps
+    // the bracket on the thread that resolved it.
+    unsafe { (*cell).truncate(len) };
 }
 
 /// Read a single shadow-stack slot by index, panicking if the index

@@ -3190,12 +3190,14 @@ pub fn call_function_impl_result(
     let mut inline_args = [PY_NULL; INLINE_ARGS];
     let mut wide_args = Vec::new();
     let args = if args.len() <= INLINE_ARGS {
-        for (i, slot) in inline_args[..args.len()].iter_mut().enumerate() {
-            *slot = _roots.get(root_base + 1 + i);
+        // The index loop lowers to `setarrayitem`; iterator adapters are residual calls.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..args.len() {
+            inline_args[i] = _roots.get(root_base + 1 + i);
         }
         &inline_args[..args.len()]
     } else {
-        wide_args.reserve_exact(args.len());
+        wide_args = Vec::with_capacity(args.len());
         for i in 0..args.len() {
             wide_args.push(_roots.get(root_base + 1 + i));
         }
@@ -3294,9 +3296,10 @@ pub fn call_function_impl_result(
             // have been updated to forwarded addresses; reconstruct the
             // argument view before recursively dispatching the bound call.
             let current_callable = pyre_object::gc_roots::shadow_stack_get(root_base);
-            let current_args: Vec<PyObjectRef> = (0..args.len())
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i))
-                .collect();
+            let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+            for i in 0..args.len() {
+                current_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+            }
             if prepend_receiver {
                 let mut call_args = Vec::with_capacity(1 + current_args.len());
                 call_args.push(current_callable);
