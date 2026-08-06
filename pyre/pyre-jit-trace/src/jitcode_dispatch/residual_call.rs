@@ -6405,9 +6405,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             // `_make_descr_binop` gives shifts with an Int
                             // count their own `_int_lshift` / `_int_rshift`
                             // path before Long/Long.
-                            specialized = try_walker_specialize_binary_op_long_int_shift(
+                            if let Some(outcome) = try_walker_specialize_binary_op_long_int_shift(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?;
+                            )? {
+                                return Ok((outcome, op.next_pc));
+                            }
                         }
                         if specialized.is_none() {
                             // `_int_floordiv` / `_int_mod` are the same family:

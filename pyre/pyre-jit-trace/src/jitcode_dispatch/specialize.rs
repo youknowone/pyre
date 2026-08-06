@@ -1739,7 +1739,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
@@ -1769,10 +1769,32 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
         };
         (lhs_class, rhs_class, pyre_object::w_int_get_value(rhs_obj))
     };
-    // The negative-count arm raises before calling rbigint.  Record it through
-    // the generic helper so no partial specialization is emitted.
     if rhs_value < 0 {
-        return Ok(None);
+        let Some(Err(exc_i64)) = walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)
+        else {
+            return Ok(None);
+        };
+        if let Some(cb) = crate::callbacks::try_get() {
+            (cb.drain_backend_jit_exc)();
+        }
+        let exc = exc_i64 as usize as pyre_object::PyObjectRef;
+        let kind = pyre_object::interp_exceptions::ExcKind::ValueError;
+        if !walker_recorded_builtin_raise_is_supported(exc, kind) {
+            return Ok(None);
+        }
+
+        let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+        walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
+        walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
+        let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
+        let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
+        walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
+        let zero = ctx.trace_ctx.const_int(0);
+        let is_negative = ctx.trace_ctx.record_op(OpCode::IntLt, &[rhs_raw, zero]);
+        ctx.trace_ctx
+            .set_opref_concrete(is_negative, majit_ir::Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_negative])?;
+        return Ok(Some(walker_emit_recorded_builtin_raise(ctx, exc, kind)));
     }
 
     // Execute the authentic Python operation first.  It supplies both the
@@ -1862,7 +1884,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
+    Ok(Some(DispatchOutcome::Continue))
 }
 
 /// Walker-native W_LongObject (bigint) arithmetic specialization for the
