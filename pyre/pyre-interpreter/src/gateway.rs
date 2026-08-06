@@ -1627,7 +1627,7 @@ impl FsEncodedPath {
 }
 
 pub fn fsencode_path_w(obj: pyre_object::PyObjectRef) -> Result<FsEncodedPath, crate::PyError> {
-    path_or_fd_w(obj, None, false)
+    path_or_fd_w(obj, None, false, false)
 }
 
 /// [`fsencode_path_w`] for a boundary that also takes an open file descriptor —
@@ -1640,28 +1640,43 @@ pub fn fsencode_path_or_fd_w(
     funcname: &str,
     allow_fd: bool,
 ) -> Result<FsEncodedPath, crate::PyError> {
-    path_or_fd_w(obj, Some(funcname), allow_fd)
+    path_or_fd_w(obj, Some(funcname), allow_fd, false)
+}
+
+/// [`fsencode_path_or_fd_w`] for a boundary whose path argument also takes
+/// `None` — `interp_scandir.py:20 path_or_fd(allow_fd=…, nullable=True)`, which
+/// `listdir` and `scandir` declare. `None` itself is the caller's to resolve
+/// (both spell it `"."` and report no filename); what the flag carries here is
+/// the allowed-type list, which names `None` alongside the rest.
+pub fn fsencode_path_or_fd_nullable_w(
+    obj: pyre_object::PyObjectRef,
+    funcname: &str,
+    allow_fd: bool,
+) -> Result<FsEncodedPath, crate::PyError> {
+    path_or_fd_w(obj, Some(funcname), allow_fd, true)
 }
 
 fn path_or_fd_w(
     obj: pyre_object::PyObjectRef,
     funcname: Option<&str>,
     allow_fd: bool,
+    nullable: bool,
 ) -> Result<FsEncodedPath, crate::PyError> {
     // interp_posix.py:170-180 builds this list from the same two flags, and the
     // caller-named form is the only one CPython ever shows for these entry
     // points; the unnamed form is what every path-only boundary already emits.
+    let allowed_types = match (nullable, allow_fd) {
+        (true, true) => "string, bytes, os.PathLike, integer or None",
+        (true, false) => "string, bytes, os.PathLike or None",
+        (false, true) => "string, bytes, os.PathLike or integer",
+        (false, false) => "string, bytes or os.PathLike",
+    };
     let reject = |obj: pyre_object::PyObjectRef| -> crate::PyError {
         let tp = crate::type_methods::arg_type_name(obj);
         match funcname {
-            Some(name) => {
-                let allowed = if allow_fd {
-                    "string, bytes, os.PathLike or integer"
-                } else {
-                    "string, bytes or os.PathLike"
-                };
-                crate::PyError::type_error(format!("{name}: path should be {allowed}, not {tp}"))
-            }
+            Some(name) => crate::PyError::type_error(format!(
+                "{name}: path should be {allowed_types}, not {tp}"
+            )),
             None => crate::PyError::type_error(format!(
                 "expected str, bytes or os.PathLike object, not {tp}"
             )),
@@ -1673,13 +1688,22 @@ fn path_or_fd_w(
 
     let (data, w_path_slot, as_fd) = unsafe {
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        if pyre_object::bytesobject::is_bytes_like(obj) {
+        if nullable && pyre_object::is_none(obj) {
+            // `_unwrap_path` answers the omitted argument itself, with the
+            // directory it stands for (`interp_posix.py:181` `Path(-1, '.',
+            // None, w_None)`), so no boundary has to spell that default again.
+            // `None` is not bytes-like, so the names still come back as `str`.
+            (b".".to_vec(), obj_slot, -1)
+        } else if pyre_object::bytesobject::is_bytes_like(obj) {
             // baseobjspace.py:1975-1977: pyre's readable-buffer set here is
             // bytes | bytearray, so a buffer that is not bytes is bytearray.
             if !pyre_object::bytesobject::is_bytes(obj) {
                 let type_name = crate::type_methods::arg_type_name(obj);
+                // interp_posix.py:195-197 warns with the same list the type
+                // error names, so the two cannot disagree about what the
+                // boundary takes.
                 crate::warn::warn_deprecation(&format!(
-                    "path should be string, bytes, or os.PathLike, not {type_name}"
+                    "path should be {allowed_types}, not {type_name}"
                 ))?;
             }
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);

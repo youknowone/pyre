@@ -833,10 +833,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // path-based implementations. Only the macros whose functionality is
     // actually implemented may be listed: of the `*at` family that is
     // HAVE_FSTATAT, HAVE_FCHOWNAT and HAVE_UTIMENSAT, the three calls that
-    // resolve a dir_fd-relative name, while HAVE_FDOPENDIR is omitted because
-    // scandir/listdir do not accept a file descriptor. HAVE_LSTAT remains so
-    // os.stat is reported in supports_follow_symlinks (follow_symlinks=False
-    // works).
+    // resolve a dir_fd-relative name. HAVE_LSTAT remains so os.stat is reported
+    // in supports_follow_symlinks (follow_symlinks=False works).
     //
     // Each bit is the same constant the entry point itself branches on, so the
     // advertisement cannot drift from the behaviour: a build where `chdir`
@@ -857,6 +855,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // descriptor.  os.py uses this bit to add execve to supports_fd, and
         // test_posix then runs a fork+fexecve path whose child must never
         // return to the libregrtest worker.
+        //
+        // os.py:145-146 reads this as `listdir` and `scandir` taking a
+        // descriptor, which `fdlistdir` serves through `fdopendir`.
+        ("HAVE_FDOPENDIR", HAVE_FDOPENDIR),
         ("HAVE_FPATHCONF", HAVE_FPATHCONF),
         // os.py:120-121 reads this as `stat` and `lstat` honouring dir_fd.
         ("HAVE_FSTATAT", HAVE_FSTATAT),
@@ -2227,31 +2229,79 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
     }
 
+    /// The names a directory descriptor holds, `.` and `..` left out
+    /// (`rposix.py:810-845` `_listdir`/`fdlistdir`).
+    ///
+    /// `fdopendir` takes the descriptor over and `closedir` closes it, so the
+    /// caller's own is duplicated first — `interp_posix.py:1118` spells that
+    /// `rposix.dup(fd, inheritable=False)`, which is `F_DUPFD_CLOEXEC`.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    fn fdlistdir(fd: i32) -> Result<Vec<Vec<u8>>, i32> {
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(crate::builtins::crt_errno());
+        }
+        let dirp = unsafe { libc::fdopendir(dup) };
+        if dirp.is_null() {
+            let errno = crate::builtins::crt_errno();
+            unsafe { libc::close(dup) };
+            return Err(errno);
+        }
+        let mut names = Vec::new();
+        let errno = loop {
+            // `readdir` reports the end of the directory and a failure the
+            // same way — a null return — so errno is cleared before the call
+            // and read back after it (`rposix.py:797` RFFI_FULL_ERRNO_ZERO).
+            rustpython_host_env::os::set_errno(0);
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
+                break crate::builtins::crt_errno();
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let name = name.to_bytes();
+            if name != b"." && name != b".." {
+                names.push(name.to_vec());
+            }
+        };
+        // The duplicate shares its file description — and so its directory
+        // offset — with the caller's descriptor, which would be left at the end
+        // of the directory and read as empty next time. `_listdir`'s
+        // `rewind=True` (`rposix.py:844`) puts it back before the close.
+        unsafe { libc::rewinddir(dirp) };
+        // `closedir` closes the duplicate, so nothing here outlives the call.
+        unsafe { libc::closedir(dirp) };
+        if errno != 0 {
+            return Err(errno);
+        }
+        Ok(names)
+    }
+
     // ── posix.listdir(path=".") → list of str ──
     crate::module_ns_store(
         ns,
         "listdir",
         crate::make_builtin_function("listdir", |args| {
             // One resolution yields both the path and its bytes-ness, so
-            // `__fspath__` runs exactly once.
-            let resolved = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
-                None
-            } else {
-                Some(crate::gateway::fsencode_path_w(args[0])?)
-            };
-            let bytes_mode = unsafe { resolved.as_ref().is_some_and(|path| path.is_bytes()) };
-            let path = resolved
-                .as_ref()
-                .map(|path| path.as_bytes.as_slice())
-                .unwrap_or(b".");
-            // The omitted argument defaults to `"."` but reports no filename,
-            // since there was no path object for the failure to name.
-            let w_path = || {
-                resolved
-                    .as_ref()
-                    .map(|path| path.w_path())
-                    .unwrap_or(pyre_object::PY_NULL)
-            };
+            // `__fspath__` runs exactly once. The omitted argument is the same
+            // `None` the signature names, which resolves to `"."` there.
+            let arg = args.first().copied().unwrap_or(pyre_object::w_none());
+            let resolved = crate::gateway::fsencode_path_or_fd_nullable_w(
+                arg,
+                "listdir",
+                HAVE_FDOPENDIR,
+            )?;
+            // A descriptor names no directory to prefix and is not `bytes`, so
+            // its names come back as `str` whatever the caller held
+            // (`interp_posix.py:1112-1121`).
+            #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+            if resolved.as_fd != -1 {
+                let names = fdlistdir(resolved.as_fd).map_err(|errno| errno_err(errno, ""))?;
+                let items = names.iter().map(|n| fs_name_obj(false, n)).collect();
+                return Ok(pyre_object::w_list_new(items));
+            }
+            let bytes_mode = unsafe { resolved.is_bytes() };
+            let path = resolved.as_bytes.as_slice();
+            let w_path = || resolved.w_path();
             #[cfg(feature = "sandbox")]
             {
                 let names = crate::host_seam::ops::listdir(path)
@@ -2931,6 +2981,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// from. Its `linkat` call sits with the rest of the `host_env`-backed
     /// entry points, so it carries their condition and not `HAVE_FSTATAT`'s.
     const HAVE_LINKAT: bool = HOST_POSIX;
+    /// `os.py:145-146` reads this as `listdir` and `scandir` taking a
+    /// descriptor, which `fdlistdir` serves through `fdopendir`. `readdir`
+    /// reports the end of a directory and a failure alike, so reading it apart
+    /// needs the errno seam the host layer wraps — hence `HOST_POSIX` and not
+    /// `HAVE_FSTATAT`'s weaker condition, which `HOST_POSIX` implies anyway for
+    /// the `fstatat` a descriptor's entries stat themselves with.
+    const HAVE_FDOPENDIR: bool = HOST_POSIX;
     /// `os.py:118` reads this as `lstat` honouring `dir_fd`, which is the same
     /// `fstatat` `stat` resolves one with — so the two cannot be advertised
     /// apart. `os.py:189` reads it a second time as `stat` honouring
@@ -3066,6 +3123,40 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let path = extract_path(p)?;
         Ok((p, path))
     }
+    /// The descriptor the `scandir` that produced this entry was handed, or
+    /// `-1` where it was given a name instead. An entry from a descriptor
+    /// carries no directory in its `path` — `interp_scandir.py:50` leaves the
+    /// prefix empty — so its own stat calls have to resolve the name against
+    /// that descriptor rather than against the process's working directory.
+    fn dir_entry_dir_fd(self_obj: PyObjectRef) -> Result<i32, crate::PyError> {
+        let w = crate::baseobjspace::getattr_str(self_obj, "_dir_fd")?;
+        Ok(crate::baseobjspace::int_w(w)? as i32)
+    }
+    /// `rposix_stat.fstatat(name, dirfd, follow)` — the call
+    /// `interp_scandir.py:252-254,297-299` makes for exactly that reason. The
+    /// errno comes back raw because the entry's own `path` is what names the
+    /// failure (`:328` `wrap_oserror2(…, self.fget_path(space))`), and only the
+    /// callers that report one hold it.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    fn dir_entry_stat_at(
+        name: &[u8],
+        dir_fd: i32,
+        follow_symlinks: bool,
+    ) -> Result<libc::stat, i32> {
+        let c_name = std::ffi::CString::new(name).map_err(|_| libc::EINVAL)?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let flags = if follow_symlinks {
+            0
+        } else {
+            libc::AT_SYMLINK_NOFOLLOW
+        };
+        let ret = unsafe { libc::fstatat(dir_fd, c_name.as_ptr(), st.as_mut_ptr(), flags) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(crate::builtins::io_error_posix_errno(&err, libc::EBADF));
+        }
+        Ok(unsafe { st.assume_init() })
+    }
     fn dir_entry_follow(args: &[PyObjectRef]) -> Result<bool, crate::PyError> {
         let (_pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
         match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
@@ -3073,36 +3164,61 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             None => Ok(true),
         }
     }
-    fn dir_entry_is_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    /// The `S_IFMT` half of a mode, which is all `is_dir`/`is_file`/
+    /// `is_symlink` read. The values are the same on every POSIX host, and
+    /// spelling them here keeps the two arms below comparable.
+    const S_IFMT: u32 = 0o170_000;
+    const S_IFDIR: u32 = 0o040_000;
+    const S_IFREG: u32 = 0o100_000;
+    const S_IFLNK: u32 = 0o120_000;
+
+    /// The file type an entry's name resolves to, or `None` where nothing
+    /// answers — `is_dir`/`is_file`/`is_symlink` all report `False` for a name
+    /// that has gone away rather than raising.
+    fn dir_entry_kind(args: &[PyObjectRef], follow: bool) -> Result<Option<u32>, crate::PyError> {
         let (_, path) = dir_entry_path(args[0])?;
-        let follow = dir_entry_follow(args)?;
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            let dir_fd = dir_entry_dir_fd(args[0])?;
+            if dir_fd != -1 {
+                return Ok(dir_entry_stat_at(&path, dir_fd, follow)
+                    .ok()
+                    .map(|st| st.st_mode as u32 & S_IFMT));
+            }
+        }
         let meta = if follow {
             host_fs::metadata(path_from_bytes(&path).as_ref())
         } else {
             host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
         };
+        Ok(meta.ok().map(|m| {
+            let ft = m.file_type();
+            if ft.is_dir() {
+                S_IFDIR
+            } else if ft.is_symlink() {
+                S_IFLNK
+            } else if ft.is_file() {
+                S_IFREG
+            } else {
+                0
+            }
+        }))
+    }
+    fn dir_entry_is_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let follow = dir_entry_follow(args)?;
         Ok(pyre_object::w_bool_from(
-            meta.map(|m| m.is_dir()).unwrap_or(false),
+            dir_entry_kind(args, follow)? == Some(S_IFDIR),
         ))
     }
     fn dir_entry_is_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (_, path) = dir_entry_path(args[0])?;
         let follow = dir_entry_follow(args)?;
-        let meta = if follow {
-            host_fs::metadata(path_from_bytes(&path).as_ref())
-        } else {
-            host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
-        };
         Ok(pyre_object::w_bool_from(
-            meta.map(|m| m.is_file()).unwrap_or(false),
+            dir_entry_kind(args, follow)? == Some(S_IFREG),
         ))
     }
     fn dir_entry_is_symlink(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (_, path) = dir_entry_path(args[0])?;
         Ok(pyre_object::w_bool_from(
-            host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false),
+            dir_entry_kind(args, false)? == Some(S_IFLNK),
         ))
     }
     fn dir_entry_is_junction(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -3111,6 +3227,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
     fn dir_entry_inode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (w_path, path) = dir_entry_path(args[0])?;
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            let dir_fd = dir_entry_dir_fd(args[0])?;
+            if dir_fd != -1 {
+                let st = dir_entry_stat_at(&path, dir_fd, false)
+                    .map_err(|errno| errno_err_with_filename(errno, w_path))?;
+                return Ok(pyre_object::w_int_new(st.st_ino as i64));
+            }
+        }
         let meta = host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
             .map_err(|e| fs_err_with_filename(e, w_path))?;
         #[cfg(unix)]
@@ -3128,6 +3253,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (w_path, path) = dir_entry_path(args[0])?;
         let follow = dir_entry_follow(args)?;
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            let dir_fd = dir_entry_dir_fd(args[0])?;
+            if dir_fd != -1 {
+                let st = dir_entry_stat_at(&path, dir_fd, follow)
+                    .map_err(|errno| errno_err_with_filename(errno, w_path))?;
+                #[cfg(target_os = "macos")]
+                let st_flags = st.st_flags;
+                #[cfg(not(target_os = "macos"))]
+                let st_flags = 0u32;
+                return Ok(stat_result_from_fields(
+                    &stat_fields_from_libc(&st),
+                    st_flags,
+                ));
+            }
+        }
         let meta = if follow {
             host_fs::metadata(path_from_bytes(&path).as_ref())
         } else {
@@ -3294,44 +3435,66 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
     fn scandir_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // One resolution yields both the path and its bytes-ness, so
-        // `__fspath__` runs exactly once.
-        let resolved = if args.is_empty() || unsafe { pyre_object::is_none(args[0]) } {
-            None
-        } else {
-            Some(crate::gateway::fsencode_path_w(args[0])?)
-        };
-        let bytes_mode = unsafe { resolved.as_ref().is_some_and(|path| path.is_bytes()) };
-        let path = resolved
-            .as_ref()
-            .map(|path| path.as_bytes.as_slice())
-            .unwrap_or(b".");
-        // The omitted argument defaults to `"."` but reports no filename,
-        // since there was no path object for the failure to name.
-        let w_path = || {
-            resolved
-                .as_ref()
-                .map(|path| path.w_path())
-                .unwrap_or(pyre_object::PY_NULL)
-        };
-        let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
-            .map_err(|e| fs_err_with_filename(e, w_path()))?;
+        // `__fspath__` runs exactly once. The omitted argument is the same
+        // `None` the signature names, which resolves to `"."` there.
+        let arg = args.first().copied().unwrap_or(pyre_object::w_none());
+        let resolved =
+            crate::gateway::fsencode_path_or_fd_nullable_w(arg, "scandir", HAVE_FDOPENDIR)?;
+        let bytes_mode = unsafe { resolved.is_bytes() };
+        let path = resolved.as_bytes.as_slice();
+        let w_path = || resolved.w_path();
         let list = pyre_object::w_list_new(Vec::new());
-        for entry in entries {
-            let entry = entry.map_err(|e| fs_err_with_filename(e, w_path()))?;
-            let name = entry.file_name();
-            let full = entry.path().into_os_string();
-            let de = pyre_object::w_instance_new(dir_entry_type());
-            let _ = crate::baseobjspace::setattr_str(
-                de,
-                "name",
-                fs_name_obj(bytes_mode, name.as_encoded_bytes()),
-            );
-            let _ = crate::baseobjspace::setattr_str(
-                de,
-                "path",
-                fs_name_obj(bytes_mode, full.as_encoded_bytes()),
-            );
-            unsafe { pyre_object::w_list_append(list, de) };
+        // Every entry records the descriptor it must resolve its own name
+        // against, which is `-1` for the entries a name produced.
+        let mut entry_dir_fd = -1i32;
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        let from_fd = Some(resolved.as_fd).filter(|&fd| fd != -1);
+        #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
+        let from_fd: Option<i32> = None;
+        if let Some(fd) = from_fd {
+            entry_dir_fd = fd;
+            #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+            for name in fdlistdir(fd).map_err(|errno| errno_err(errno, ""))? {
+                // `interp_scandir.py:50` leaves the path prefix empty for a
+                // descriptor — there is no directory name to join — so an
+                // entry's `path` is its bare name, and a descriptor is not
+                // `bytes`, so both come back as `str`.
+                let w_name = fs_name_obj(false, &name);
+                let de = pyre_object::w_instance_new(dir_entry_type());
+                let _ = crate::baseobjspace::setattr_str(de, "name", w_name);
+                let _ = crate::baseobjspace::setattr_str(de, "path", w_name);
+                let _ = crate::baseobjspace::setattr_str(
+                    de,
+                    "_dir_fd",
+                    pyre_object::w_int_new(i64::from(fd)),
+                );
+                unsafe { pyre_object::w_list_append(list, de) };
+            }
+        } else {
+            let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
+                .map_err(|e| fs_err_with_filename(e, w_path()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| fs_err_with_filename(e, w_path()))?;
+                let name = entry.file_name();
+                let full = entry.path().into_os_string();
+                let de = pyre_object::w_instance_new(dir_entry_type());
+                let _ = crate::baseobjspace::setattr_str(
+                    de,
+                    "name",
+                    fs_name_obj(bytes_mode, name.as_encoded_bytes()),
+                );
+                let _ = crate::baseobjspace::setattr_str(
+                    de,
+                    "path",
+                    fs_name_obj(bytes_mode, full.as_encoded_bytes()),
+                );
+                let _ = crate::baseobjspace::setattr_str(
+                    de,
+                    "_dir_fd",
+                    pyre_object::w_int_new(i64::from(entry_dir_fd)),
+                );
+                unsafe { pyre_object::w_list_append(list, de) };
+            }
         }
         let it = pyre_object::w_instance_new(scandir_iter_type());
         let _ = crate::baseobjspace::setattr_str(it, "_entries", list);

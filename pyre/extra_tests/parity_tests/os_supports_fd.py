@@ -30,6 +30,14 @@ REST_ARGS = {
     "utime": (),
 }
 
+# The two whose path argument also takes None, which widens the same list again.
+NULLABLE_ARGS = {
+    "listdir": (),
+    "scandir": (),
+}
+
+ALL_ARGS = {**REST_ARGS, **NULLABLE_ARGS}
+
 d = tempfile.mkdtemp()
 p = os.path.join(d, "f")
 with open(p, "wb") as f:
@@ -114,9 +122,14 @@ names = {f.__name__ for f in os.supports_fd}
 # up front is what keeps the guarded blocks below from covering less and less
 # in silence if a capability is ever dropped rather than fixed.
 check(
-    set(REST_ARGS) <= names,
-    f"missing from supports_fd: {sorted(set(REST_ARGS) - names)}",
+    set(ALL_ARGS) <= names,
+    f"missing from supports_fd: {sorted(set(ALL_ARGS) - names)}",
 )
+
+# Two more names so a descriptor's entries have each kind to report.
+os.mkdir(os.path.join(d, "sub"))
+os.symlink("f", os.path.join(d, "lnk"))
+CONTENTS = sorted(["f", "sub", "lnk"])
 
 fd = os.open(p, os.O_RDWR)
 dfd = os.open(d, os.O_RDONLY)
@@ -160,11 +173,81 @@ try:
         check(os.stat(fd).st_mtime == 54321, "utime(fd) mtime")
         check(os.stat(fd).st_atime == 12345, "utime(fd) atime")
 
+    if "listdir" in names:
+        check(sorted(os.listdir(dfd)) == CONTENTS, "listdir(dfd) did not read the directory")
+        # fdopendir takes the descriptor over and closedir closes it, so the
+        # call works on a duplicate — which shares the directory offset, and
+        # would leave the caller's own at the end. A second read is what says
+        # the offset was put back (rposix.py:844 `_listdir(rewind=True)`).
+        check(sorted(os.listdir(dfd)) == CONTENTS, "listdir(dfd) is not repeatable")
+        # A descriptor carries no encoding to answer in, so the names are str.
+        check(all(isinstance(n, str) for n in os.listdir(dfd)), "listdir(dfd) names are not str")
+
+    if "scandir" in names:
+        with os.scandir(dfd) as it:
+            entries = {e.name: e for e in it}
+        check(sorted(entries) == CONTENTS, "scandir(dfd) did not read the directory")
+        # interp_scandir.py:50 leaves the path prefix empty for a descriptor —
+        # there is no directory name to join onto.
+        check(all(e.path == e.name for e in entries.values()), "scandir(dfd) entry.path")
+
+        # Each entry resolves its own name against that descriptor rather than
+        # the working directory, which is the only reason these can answer at
+        # all: none of these names exists relative to the cwd.
+        check(not any(os.path.exists(n) for n in CONTENTS), "cwd already holds the probe names")
+        e = entries["f"]
+        check(e.is_file(), "scandir(dfd) file is_file")
+        check(not e.is_dir(), "scandir(dfd) file is_dir")
+        check(e.stat().st_size == os.stat(p).st_size, "scandir(dfd) file stat")
+        check(e.inode() == os.stat(p).st_ino, "scandir(dfd) file inode")
+
+        check(entries["sub"].is_dir(), "scandir(dfd) subdir is_dir")
+        check(not entries["sub"].is_file(), "scandir(dfd) subdir is_file")
+
+        lnk = entries["lnk"]
+        check(lnk.is_symlink(), "scandir(dfd) symlink is_symlink")
+        # follow_symlinks defaults to True, so the target's kind is what shows.
+        check(lnk.is_file(), "scandir(dfd) symlink is_file")
+        check(not lnk.is_file(follow_symlinks=False), "scandir(dfd) symlink is_file(nofollow)")
+        check(
+            stat.S_ISLNK(lnk.stat(follow_symlinks=False).st_mode),
+            "scandir(dfd) symlink lstat mode",
+        )
+
+    # ── the same two also take None, which is what nullable means ────────
+    before = os.getcwd()
+    os.chdir(d)
+    try:
+        if "listdir" in names:
+            check(sorted(os.listdir(None)) == CONTENTS, "listdir(None) did not read the cwd")
+        if "scandir" in names:
+            with os.scandir(None) as it:
+                check(sorted(e.name for e in it) == CONTENTS, "scandir(None) did not read the cwd")
+    finally:
+        os.chdir(before)
+
+    # The failure a stat raises names the entry (interp_scandir.py:328
+    # `wrap_oserror2(…, self.fget_path(space))`) — which for a descriptor is
+    # the bare name, since that is the whole of its path. `is_dir`/`is_file`
+    # are not read here: those answer from the type readdir already reported,
+    # so a removal does not reach them.
+    if "scandir" in names:
+        gone = os.path.join(d, "gone")
+        open(gone, "w").close()
+        with os.scandir(dfd) as it:
+            entry = next(e for e in it if e.name == "gone")
+        os.remove(gone)
+        try:
+            entry.stat()
+        except FileNotFoundError as e:
+            check(e.filename == "gone", f"vanished entry filename: {e.filename!r}")
+        else:
+            raise AssertionError("stat of a vanished entry did not raise")
+
     # ── an argument that is neither a path nor a descriptor ──────────────
     # path_or_fd names its caller and widens the allowed-type list with the
     # descriptor form, so the message itself reports the capability. Only the
-    # names carrying a recipe below are exercised; listdir/scandir take a
-    # *nullable* path and word the list differently, and execve takes an argv.
+    # names carrying a recipe below are exercised — execve takes an argv.
     for name in sorted(names & set(REST_ARGS)):
         fn = getattr(os, name)
         try:
@@ -172,6 +255,20 @@ try:
         except TypeError as e:
             check(
                 str(e) == f"{name}: path should be string, bytes, os.PathLike or integer, not float",
+                f"{name} type error: {e}",
+            )
+        else:
+            raise AssertionError(f"{name}(1.5) did not raise")
+
+    # A nullable path names None in the same list (interp_posix.py:170-172).
+    for name in sorted(names & set(NULLABLE_ARGS)):
+        fn = getattr(os, name)
+        try:
+            fn(1.5, *NULLABLE_ARGS[name])
+        except TypeError as e:
+            check(
+                str(e)
+                == f"{name}: path should be string, bytes, os.PathLike, integer or None, not float",
                 f"{name} type error: {e}",
             )
         else:
@@ -237,6 +334,12 @@ try:
     # ── a bad descriptor is an OSError, not a TypeError ──────────────────
     # The errno differs between platforms (EBADF and EFAULT both appear), so
     # only the class is pinned.
+    # listdir and scandir are left out: -1 is the sentinel for "no descriptor"
+    # (interp_posix.py:269-271 `unwrap_fd`), and where the path is nullable
+    # CPython's own sentinel makes -1 indistinguishable from the omitted
+    # argument, so it lists the working directory instead of reporting the bad
+    # descriptor. The two references disagree, and the explicit rejection is
+    # the one that cannot answer a wrong question with a right-looking list.
     for name in sorted(names & set(REST_ARGS)):
         fn = getattr(os, name)
         try:
