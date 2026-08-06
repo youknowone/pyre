@@ -5168,14 +5168,19 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// for an *omitted* argument (`w_fillchar=WrappedDefault(u' ')`); a supplied
 /// `None` is an ordinary value and is refused here like any other non-str.
 ///
-/// Upstream converts the operand with two different helpers — `descr_center`
-/// uses `space.utf8_w`, `descr_ljust`/`descr_rjust` use
-/// `convert_arg_to_w_unicode`, which decodes a buffer operand into a fill
-/// char rather than refusing it. That acceptance is a PyPy-only divergence
-/// (CPython refuses a memoryview/array/bytearray fill for all three) and is
-/// deliberately not imported, so all three share one rejection here — and
-/// with the acceptance goes the wording it comes with, leaving the rejection
-/// to name the offending type the way the three refusals uniformly do.
+/// The operand is converted by two different helpers, and each refuses in its
+/// own words. `descr_center` uses `space.utf8_w` (unicodeobject.py:1101),
+/// which takes a str and nothing else. `descr_ljust`/`descr_rjust` use
+/// `convert_arg_to_w_unicode` (unicodeobject.py:175-184): it declines `bytes`
+/// with the message reproduced below, and hands every other non-str to
+/// `decode_object`, which turns a buffer operand into a fill char rather than
+/// refusing it.
+///
+/// That decode is not imported here — `ljust`/`rjust` refuse a
+/// bytearray/memoryview/array fill that upstream would accept, as they already
+/// did before this function grew a per-method message. What the two arms below
+/// carry is the wording, so the operand upstream also refuses reads the same
+/// on both, and neither arm claims a conversion that was never attempted.
 ///
 /// A str of the wrong length is a separate refusal, and the one upstream
 /// words per method.
@@ -5185,9 +5190,12 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
     }
     if !unsafe { pyre_object::is_str(args[2]) } {
         let type_name = arg_type_name(args[2]);
-        return Err(crate::PyError::type_error(format!(
-            "The fill character must be a unicode character, not {type_name}"
-        )));
+        let message = if method == "center" {
+            format!("expected str, got {type_name} object")
+        } else {
+            format!("Can't convert '{type_name}' object to str implicitly")
+        };
+        return Err(crate::PyError::type_error(message));
     }
     let raw = unsafe { w_str_get_wtf8(args[2]) };
     let mut iter = raw.code_points();
