@@ -3445,6 +3445,28 @@ pub unsafe fn w_dict_getitem_wtf8(
     }
 }
 
+/// Fallible sibling of [`w_dict_getitem_wtf8`], the shape
+/// [`w_dict_getitem_str_checked`] has for `&str` keys.
+///
+/// The probe compares against whatever the bucket holds, so a stored
+/// non-string key whose hash collides with `key` can reach a user `__eq__`
+/// that raises.  The unchecked spelling reports that as a miss; this one
+/// surfaces it, and the caller recovers the concrete exception from the
+/// interpreter-side error slot.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_getitem_wtf8_checked(
+    obj: PyObjectRef,
+    key: &rustpython_wtf8::Wtf8,
+) -> Result<Option<PyObjectRef>, DictKeyError> {
+    let hit = w_dict_getitem_wtf8(obj, key);
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    Ok(hit)
+}
+
 /// WTF-8 keyed equivalent of `space.setitem_str` — `setitem_str` is itself
 /// a fast path of `space.setitem`, so a key that is valid UTF-8 takes the
 /// str fast path (keeping an ASCII/Unicode dict on its strategy) and a

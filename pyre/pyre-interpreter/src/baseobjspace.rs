@@ -4921,12 +4921,12 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
     // `("dict", SPECIAL)` wrapper and change the instance's map — see
     // [`setdictvalue`].
     if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
-        return Ok(unsafe {
-            crate::objspace::std::mapdict::instance_node_getdictvalue(
+        return unsafe {
+            crate::objspace::std::mapdict::instance_node_getdictvalue_checked(
                 obj,
                 rustpython_wtf8::Wtf8::new(name),
             )
-        });
+        };
     }
     let w_dict = getdict_backing(obj)?;
     if w_dict.is_null() {
@@ -5692,8 +5692,11 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // same `instance_node_getdictvalue`, so the value is identical and the
             // `__dict__` wrapper is built only on explicit `__dict__` access.
             let value = unsafe {
-                crate::objspace::std::mapdict::instance_node_getdictvalue(obj, Wtf8::new(name))
-            };
+                crate::objspace::std::mapdict::instance_node_getdictvalue_checked(
+                    obj,
+                    Wtf8::new(name),
+                )
+            }?;
             if let Some(value) = value {
                 return Ok(value);
             }
@@ -6369,7 +6372,10 @@ pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
             // mapdict.py:846-847); a type receiver uses only its canonical
             // dictionary, which is the corresponding `getdictvalue` result.
             let value = if instance {
-                crate::objspace::std::mapdict::instance_node_getdictvalue(obj, Wtf8::new(name))
+                crate::objspace::std::mapdict::instance_node_getdictvalue_checked(
+                    obj,
+                    Wtf8::new(name),
+                )?
             } else {
                 crate::type_dict_lookup(obj, name)
             };

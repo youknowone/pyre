@@ -666,11 +666,31 @@ pub unsafe fn map_is_devolved(map: MapRef) -> bool {
 /// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_node_getdictvalue(obj: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+    unsafe { instance_node_getdictvalue_checked(obj, name) }.unwrap_or(None)
+}
+
+/// Fallible [`instance_node_getdictvalue`], for the callers that have an error
+/// channel to propagate a raising `__eq__` on.
+///
+/// Only the devolved terminator's dict probe can raise; the swallowing
+/// spelling above is written in terms of this one and its `unwrap_or` consumes
+/// the pending error slot, so a dropped error cannot surface on a later
+/// operation.
+///
+/// `dont_look_inside` for the same reason as [`instance_node_getdictvalue`].
+///
+/// # Safety
+/// `obj` must be a live `W_ObjectObject` (caller guards with `is_instance`).
+#[majit_macros::dont_look_inside]
+pub unsafe fn instance_node_getdictvalue_checked(
+    obj: PyObjectRef,
+    name: &Wtf8,
+) -> Result<Option<PyObjectRef>, PyError> {
     let _instance_guard = instance_lock(obj);
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
-    let w_res = unsafe { node_read(map, inst, name, DICT) };
+    let w_res = unsafe { node_read_checked(map, inst, name, DICT) };
     // mapdict.py:846-847 getdictvalue → read → _direct_read (592-598): lazily
     // migrate to boxed storage when the read attribute is unboxed and its class
     // has frozen unboxing.
@@ -3092,18 +3112,43 @@ unsafe fn terminator_read<O: MapdictObject>(
     name: &Wtf8,
     attrkind: u16,
 ) -> Option<PyObjectRef> {
+    unsafe { terminator_read_checked(term, obj, name, attrkind) }.unwrap_or(None)
+}
+
+/// Fallible [`terminator_read`].  The devolved arm is the only one that can
+/// raise, and `space.finditem_str` propagates there upstream; the swallowing
+/// spelling above exists for the callers that have no error channel and is
+/// written in terms of this one.  Its `unwrap_or` also consumes the pending
+/// error slot, so a dropped error cannot surface on a later operation.
+///
+/// # Safety
+/// `term` must point to a live Terminator map node.
+unsafe fn terminator_read_checked<O: MapdictObject>(
+    term: MapRef,
+    obj: &O,
+    name: &Wtf8,
+    attrkind: u16,
+) -> Result<Option<PyObjectRef>, PyError> {
     let t = unsafe { (*term).as_terminator() };
     match t.kind {
         TerminatorKind::Devolved if attrkind == DICT => {
             // mapdict.py:383-388: the devolved terminator reads DICT attributes
             // from the materialised instance dict (`space.finditem_str(
-            // obj.getdict(space), name)`).
+            // obj.getdict(space), name)`).  `finditem_str` is fallible: the
+            // probe compares against whatever the bucket holds, so a stored
+            // non-string key whose hash collides can reach a user `__eq__`
+            // that raises, and that must not read back as a miss.
             let w_dict = obj.getdict();
             let backing = crate::type_methods::resolve_dict_backing(w_dict);
-            unsafe { pyre_object::w_dict_getitem_wtf8(backing, name) }
+            unsafe { pyre_object::dictmultiobject::w_dict_getitem_wtf8_checked(backing, name) }
+                .map_err(|_| {
+                    crate::baseobjspace::take_pending_dict_key_error(pyre_object::w_str_from_wtf8(
+                        name.to_wtf8_buf(),
+                    ))
+                })
         }
         // Terminator / DictTerminator / NoDictTerminator read nothing.
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -3117,14 +3162,28 @@ pub unsafe fn node_read<O: MapdictObject>(
     name: &Wtf8,
     attrkind: u16,
 ) -> Option<PyObjectRef> {
+    unsafe { node_read_checked(self_node, obj, name, attrkind) }.unwrap_or(None)
+}
+
+/// Fallible [`node_read`], for the callers that can propagate the raising
+/// `__eq__` a devolved terminator's dict probe may reach.
+///
+/// # Safety
+/// `self_node` and its chain must point to live map nodes.
+pub unsafe fn node_read_checked<O: MapdictObject>(
+    self_node: MapRef,
+    obj: &O,
+    name: &Wtf8,
+    attrkind: u16,
+) -> Result<Option<PyObjectRef>, PyError> {
     match unsafe { find_map_attr(self_node, name, attrkind) } {
         // The `jit.isconstant(attr) and jit.isconstant(obj) and not
         // attr.ever_mutated` guard selects `_pure_direct_read`
         // (mapdict.py:60-65). The PlainAttribute variants have the same body;
         // UnboxedPlainAttribute._direct_read's conversion tail lives in
         // `maybe_migrate_to_boxed`.
-        Some(attr) => Some(unsafe { plain_direct_read(attr, obj) }),
-        None => unsafe { terminator_read((*self_node).terminator(), obj, name, attrkind) },
+        Some(attr) => Ok(Some(unsafe { plain_direct_read(attr, obj) })),
+        None => unsafe { terminator_read_checked((*self_node).terminator(), obj, name, attrkind) },
     }
 }
 
