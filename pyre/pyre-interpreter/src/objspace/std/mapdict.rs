@@ -5683,7 +5683,7 @@ mod tests {
             ));
             assert!(instance_node_setdictvalue(obj_ref, &sur, sentinel(0x55)));
 
-            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY, obj_ref as *mut u8);
+            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY_REF, obj_ref as *mut u8);
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
 
             let (w_sur_key, w_sur_value) = MAP_DICT_STRATEGY.popitem(w_dict).unwrap();
