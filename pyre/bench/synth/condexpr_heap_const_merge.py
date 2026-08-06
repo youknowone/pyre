@@ -1,10 +1,10 @@
-# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
-# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
-# rather than any generated code, and reads whatever the host's process
-# spawn cost happens to be that run. The jitstats baselines gate it.
-# Conditional expression whose taken arm loads a heap-int constant (>= 256, a
-# LOAD_CONST rather than the inline LoadSmallInt).  That arm value reaches the
-# branch-merge block as a flow-graph Constant link arg.
+# pyre-check: max-pypy-ratio=38
+# pypy's exec time stays pinned to the startup-subtraction floor at this
+# size, so the ratio is not a measurement; the trip count is what makes
+# PYRE's side one. At the 1000 it was recorded with, the loop never reached
+# the JIT at all -- `loops_compiled=0` on every backend -- so the gate was
+# reading two interpreters' startup. The ceiling is four times the slowest
+# observed (9.4x), the way `type_dict_surrogate` records its own.
 #
 # `insert_renamings` skipped any arg whose `as_variable()` equalled
 # `last_exception` / `last_exc_value`.  A Constant has `as_variable() == None`,
@@ -18,7 +18,7 @@
 # shapes are kept for the small-vs-heap contrast, and `ce_big` is correct even
 # when the branch never diverges (the merge structure alone triggered the
 # drop).  Pure arithmetic -> deterministic checksum.
-N = 1000
+N = 64000
 
 
 def ce_small():
