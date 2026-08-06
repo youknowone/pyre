@@ -3906,16 +3906,20 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             callee_regs_r[frame_reg as usize] = callee_frame;
             // `perform_call` creates one concrete frame per MIFrame before
             // `setup_call` installs the argument boxes (pyjitpl.py:2445-2476,
-            // 1862-1874).  Mirror that recording-time object.  Root each
-            // freshly boxed argument immediately: `ConcreteValue::to_pyobj`
+            // 1862-1874).  Mirror that recording-time object.  `setup_call`
+            // installs the whole box list, so seed every local the symbolic
+            // frame above got from `param_boxes` — a `*args` callee's packed
+            // vararg tuple is one of them, and a frame short of it publishes
+            // that name as unbound to any residual the sub-walk runs.  Root
+            // each freshly boxed argument immediately: `ConcreteValue::to_pyobj`
             // can allocate, and a later argument must not collect an earlier
             // one before the frame constructor takes ownership of the slice.
             let arg_roots = pyre_object::gc_roots::push_roots();
             let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
-            for concrete in callee_arg_concretes.iter().take(nparams).copied() {
+            for concrete in callee_arg_concretes.iter().take(seeded_locals).copied() {
                 pyre_object::gc_roots::pin_root(concrete.to_pyobj());
             }
-            let concrete_args: Vec<pyre_object::PyObjectRef> = (0..nparams)
+            let concrete_args: Vec<pyre_object::PyObjectRef> = (0..seeded_locals)
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
                 .collect();
             let concrete_ec = sym.concrete_execution_context();
