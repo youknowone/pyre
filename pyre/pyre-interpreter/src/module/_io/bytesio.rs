@@ -443,6 +443,10 @@ impl W_BytesIO {
     fn close(&mut self) -> Result<(), crate::PyError> {
         // Any replacement of the exported bytearray would invalidate the
         // view, so it takes the same resize lock as write/truncate/__init__.
+        // `interp_bytesio.py:194` `close_w` omits the check and drops the
+        // storage from under a live `getbuffer()` result; closing an exported
+        // buffer has to raise `BufferError: Existing exports of data: object
+        // cannot be re-sized`, so the check runs ahead of the store.
         if self.closed {
             return Ok(());
         }
