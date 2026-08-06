@@ -2657,7 +2657,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // answer is this, not the descriptor conflict `do_stat`
                 // would reach first.
                 if !HAVE_FSTATAT {
-                    return Err(dir_fd_unavailable(name));
+                    return Err(dir_fd_unavailable());
                 }
                 Some(fd)
             }
@@ -2720,10 +2720,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// (`interp_posix.py:612,660`), and what `_have_functions` advertises.
     const HAVE_FSTATAT: bool = cfg!(all(unix, not(feature = "sandbox")));
 
-    fn dir_fd_unavailable(name: &str) -> crate::PyError {
-        crate::PyError::not_implemented(format!(
-            "{name}: dir_fd unavailable on this platform"
-        ))
+    /// `_DirFD_Unavailable` (`interp_posix.py:285-292`) names the argument and
+    /// not the call it was passed to, which is also how
+    /// `dir_fd_unavailable` reports it.
+    fn dir_fd_unavailable() -> crate::PyError {
+        crate::PyError::not_implemented("dir_fd unavailable on this platform")
     }
 
     /// `do_stat` (`interp_posix.py:649`) resolves a name against an open
@@ -2770,7 +2771,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         #[allow(unreachable_code)]
         {
             let _ = (path, dir_fd, follow_symlinks);
-            Err(dir_fd_unavailable(name))
+            Err(dir_fd_unavailable())
         }
     }
 

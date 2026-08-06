@@ -14,13 +14,19 @@ different allowed types.
 works"), so this is the capability the set has always advertised.
 
 `do_stat` (`interp_posix.py:634-644`) tests the descriptor before anything else:
-holding one, neither `dir_fd` nor `follow_symlinks` has a path to apply to, and
-both rejections come before the platform's `dir_fd` availability is consulted.
+holding one, neither `dir_fd` nor `follow_symlinks` has a path to apply to. The
+`dir_fd` half of that is only reachable where the platform has one to reject:
+`_DirFD_Unavailable` (`:285-292`) turns the argument away while unwrapping it,
+which is a step earlier than `do_stat`, and it names the argument rather than
+the call it was passed to.
 """
 
 import os
+import sys
 import tempfile
 import warnings
+
+WIN32 = sys.platform == "win32"
 
 assert os.stat in os.supports_fd, "os.stat has always been advertised as fd-capable"
 
@@ -44,13 +50,20 @@ try:
         warnings.simplefilter("ignore")
         assert os.stat(True).st_dev == os.fstat(1).st_dev
 
-    # Neither other argument has anything to apply to.
+    # Neither other argument has anything to apply to — except that a platform
+    # with no `fstatat` has nothing to apply `dir_fd` to in the first place, and
+    # says so before the descriptor conflict is ever reached.
+    expected_dir_fd_error = NotImplementedError if WIN32 else ValueError
     try:
         os.stat(fd, dir_fd=fd)
-    except ValueError as exc:
-        assert str(exc) == "stat: can't specify dir_fd without matching path", str(exc)
+    except expected_dir_fd_error as exc:
+        if WIN32:
+            assert str(exc) == "dir_fd unavailable on this platform", str(exc)
+        else:
+            assert str(exc) == "stat: can't specify dir_fd without matching path", str(exc)
     else:
         raise AssertionError("stat accepted dir_fd with a descriptor")
+    assert (os.stat in os.supports_dir_fd) is not WIN32, os.supports_dir_fd
 
     try:
         os.stat(fd, follow_symlinks=False)
