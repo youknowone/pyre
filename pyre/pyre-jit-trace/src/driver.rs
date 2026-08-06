@@ -31,3 +31,15 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
     let ptr = (callbacks::get().driver_pair)();
     unsafe { &mut *(ptr as *mut JitDriverPair) }
 }
+
+/// Get the JIT driver pair, or `None` when no callback table is installed.
+///
+/// A skeleton walk drives `jitcode_dispatch` directly with no pyre-jit eval
+/// behind it, so there is no driver to reach. Cold bookkeeping paths that only
+/// annotate an outcome take this spelling and skip themselves, rather than
+/// panicking in `callbacks::get`.
+#[inline]
+pub fn try_driver_pair() -> Option<&'static mut JitDriverPair> {
+    let ptr = (callbacks::try_get()?.driver_pair)();
+    Some(unsafe { &mut *(ptr as *mut JitDriverPair) })
+}
