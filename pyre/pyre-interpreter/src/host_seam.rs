@@ -65,10 +65,21 @@ pub mod sys {
     pub use ::libc::{
         AT_FDCWD, CODESET, EBADF, EINTR, EINVAL, F_OK, LC_ALL, LC_COLLATE, LC_CTYPE, LC_MESSAGES,
         LC_MONETARY, LC_NUMERIC, LC_TIME, O_APPEND, O_CREAT, O_DSYNC, O_EXCL, O_NONBLOCK, O_RDONLY,
-        O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, R_OK, RUSAGE_SELF,
-        S_IFDIR, S_IFMT, S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, TIOCGWINSZ, W_OK, WCONTINUED,
+        O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, R_OK, RTLD_GLOBAL,
+        RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW, RUSAGE_SELF, S_IFDIR, S_IFMT,
+        S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED,
         WNOHANG, WUNTRACED, X_OK,
     };
+    // `posix`'s `<sched.h>` and `<dlfcn.h>` names, which carry the same gates
+    // there as the table that publishes them: the Apple targets declare the
+    // scheduling policies outside the `libc` crate, `SCHED_BATCH`/`SCHED_IDLE`
+    // are Linux's own, and `RTLD_DEEPBIND` is glibc's.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub use ::libc::{SCHED_FIFO, SCHED_OTHER, SCHED_RR};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub use ::libc::{SCHED_BATCH, SCHED_IDLE};
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub use ::libc::RTLD_DEEPBIND;
     // `posix.sysconf`'s name table names one constant per entry and calls
     // nothing, so the whole table resolves through the seam.
     #[cfg(all(unix, not(target_os = "redox")))]

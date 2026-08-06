@@ -977,60 +977,111 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     ] {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
     }
-    // Non-critical constants — zero stubs are fine for os.py init.
+    // Placeholders the POSIX blocks further down overwrite with the real libc
+    // values — the wait options beside the `W*` predicates, the `PRIO_*` trio
+    // beside `getpriority`. A build that reaches neither keeps the zero.
     fn install_zero_constants(ns: PyObjectRef, names: &[&str]) {
         for &name in names {
             crate::module_ns_store(ns, name, pyre_object::w_int_new(0));
         }
     }
 
-    install_zero_constants(ns, &["EX_OK"]);
-
-    // The exit codes, wait flags and scheduling knobs are `nt`'s absentees for
-    // the same reason its calls are: `os.EX_*` and `os.SCHED_*` exist only
-    // where the platform defines them, and code reads their presence to decide
-    // whether the facility is there at all.
+    // The wait flags and the priority classes are `nt`'s absentees for the same
+    // reason its calls are: they exist only where the platform defines them,
+    // and code reads their presence to decide whether the facility is there at
+    // all.
     #[cfg(unix)]
     install_zero_constants(
         ns,
         &[
-            "EX_USAGE",
-            "EX_DATAERR",
-            "EX_NOINPUT",
-            "EX_NOUSER",
-            "EX_NOHOST",
-            "EX_UNAVAILABLE",
-            "EX_SOFTWARE",
-            "EX_OSERR",
-            "EX_OSFILE",
-            "EX_CANTCREAT",
-            "EX_IOERR",
-            "EX_TEMPFAIL",
-            "EX_PROTOCOL",
-            "EX_NOPERM",
-            "EX_CONFIG",
             "WNOHANG",
             "WCONTINUED",
             "WUNTRACED",
-            "ST_RDONLY",
-            "ST_NOSUID",
-            "SCHED_OTHER",
-            "SCHED_FIFO",
-            "SCHED_RR",
-            "SCHED_BATCH",
-            "SCHED_IDLE",
-            "RTLD_LAZY",
-            "RTLD_NOW",
-            "RTLD_GLOBAL",
-            "RTLD_LOCAL",
-            "RTLD_NODELETE",
-            "RTLD_NOLOAD",
-            "RTLD_DEEPBIND",
             "PRIO_PROCESS",
             "PRIO_PGRP",
             "PRIO_USER",
         ],
     );
+
+    // The four families below are `nt`'s absentees on the same reading — none
+    // of `<sysexits.h>`, `<sys/statvfs.h>`, `<dlfcn.h>` and `<sched.h>` is a
+    // header Windows carries.
+    #[cfg(unix)]
+    {
+        // `<sysexits.h>`. The header is a verbatim descendant of the 4.3BSD one
+        // wherever it is carried, so the values are the same on every host that
+        // has it and the `libc` crate binds none of them.
+        for (name, val) in [
+            ("EX_OK", 0i64),
+            ("EX_USAGE", 64),
+            ("EX_DATAERR", 65),
+            ("EX_NOINPUT", 66),
+            ("EX_NOUSER", 67),
+            ("EX_NOHOST", 68),
+            ("EX_UNAVAILABLE", 69),
+            ("EX_SOFTWARE", 70),
+            ("EX_OSERR", 71),
+            ("EX_OSFILE", 72),
+            ("EX_CANTCREAT", 73),
+            ("EX_IOERR", 74),
+            ("EX_TEMPFAIL", 75),
+            ("EX_PROTOCOL", 76),
+            ("EX_NOPERM", 77),
+            ("EX_CONFIG", 78),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        // The `f_flag` bits `statvfs` answers with, which is the only reader
+        // there is for them.
+        for (name, val) in [
+            ("ST_RDONLY", libc::ST_RDONLY as i64),
+            ("ST_NOSUID", libc::ST_NOSUID as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        // `<dlfcn.h>` — `rdynload.py:50-82` reads the same set, and
+        // `sys.setdlopenflags` and `ctypes` hand them straight back to
+        // `dlopen`, where a zero would ask for `RTLD_LOCAL | RTLD_LAZY`
+        // whatever was named.
+        for (name, val) in [
+            ("RTLD_LAZY", libc::RTLD_LAZY as i64),
+            ("RTLD_NOW", libc::RTLD_NOW as i64),
+            ("RTLD_GLOBAL", libc::RTLD_GLOBAL as i64),
+            ("RTLD_LOCAL", libc::RTLD_LOCAL as i64),
+            ("RTLD_NODELETE", libc::RTLD_NODELETE as i64),
+            ("RTLD_NOLOAD", libc::RTLD_NOLOAD as i64),
+            // A glibc extension, absent from the header anywhere else.
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            ("RTLD_DEEPBIND", libc::RTLD_DEEPBIND as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        // `<sched.h>`, read as `rposix.py:296-300` reads it: present where the
+        // header defines it, and with the host's own numbering rather than a
+        // shared one — the three disagree between Linux, the BSDs and Darwin.
+        // The Apple targets declare them in `<pthread/pthread_impl.h>`, which
+        // the `libc` crate does not mirror.
+        for (name, val) in [
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            ("SCHED_OTHER", libc::SCHED_OTHER as i64),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            ("SCHED_OTHER", 1i64),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            ("SCHED_FIFO", libc::SCHED_FIFO as i64),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            ("SCHED_FIFO", 4i64),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            ("SCHED_RR", libc::SCHED_RR as i64),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            ("SCHED_RR", 2i64),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ("SCHED_BATCH", libc::SCHED_BATCH as i64),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ("SCHED_IDLE", libc::SCHED_IDLE as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+    }
 
     // `nt`'s own constants. The spawn modes are the C runtime's `_P_*`
     // (process.h) and carry its values: registering the set at zero made
@@ -1055,6 +1106,82 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS", 0x1000),
     ] {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+    }
+    #[cfg(unix)]
+    {
+        // `<sysexits.h>`. The header is a verbatim descendant of the 4.3BSD one
+        // wherever it is carried, so the values are the same on every host that
+        // has it and the `libc` crate binds none of them.
+        for (name, val) in [
+            ("EX_OK", 0i64),
+            ("EX_USAGE", 64),
+            ("EX_DATAERR", 65),
+            ("EX_NOINPUT", 66),
+            ("EX_NOUSER", 67),
+            ("EX_NOHOST", 68),
+            ("EX_UNAVAILABLE", 69),
+            ("EX_SOFTWARE", 70),
+            ("EX_OSERR", 71),
+            ("EX_OSFILE", 72),
+            ("EX_CANTCREAT", 73),
+            ("EX_IOERR", 74),
+            ("EX_TEMPFAIL", 75),
+            ("EX_PROTOCOL", 76),
+            ("EX_NOPERM", 77),
+            ("EX_CONFIG", 78),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        // The `f_flag` bits `statvfs` answers with, which is the only reader
+        // there is for them.
+        for (name, val) in [
+            ("ST_RDONLY", libc::ST_RDONLY as i64),
+            ("ST_NOSUID", libc::ST_NOSUID as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        // `<dlfcn.h>` — `rdynload.py:50-82` reads the same set, and
+        // `sys.setdlopenflags` and `ctypes` hand them straight back to
+        // `dlopen`, where a zero would ask for `RTLD_LOCAL | RTLD_LAZY`
+        // whatever was named.
+        for (name, val) in [
+            ("RTLD_LAZY", libc::RTLD_LAZY as i64),
+            ("RTLD_NOW", libc::RTLD_NOW as i64),
+            ("RTLD_GLOBAL", libc::RTLD_GLOBAL as i64),
+            ("RTLD_LOCAL", libc::RTLD_LOCAL as i64),
+            ("RTLD_NODELETE", libc::RTLD_NODELETE as i64),
+            ("RTLD_NOLOAD", libc::RTLD_NOLOAD as i64),
+            // A glibc extension, absent from the header anywhere else.
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            ("RTLD_DEEPBIND", libc::RTLD_DEEPBIND as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        // `<sched.h>`, read as `rposix.py:296-300` reads it: present where the
+        // header defines it, and with the host's own numbering rather than a
+        // shared one — the three disagree between Linux, the BSDs and Darwin.
+        // The Apple targets declare them in `<pthread/pthread_impl.h>`, which
+        // the `libc` crate does not mirror.
+        for (name, val) in [
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            ("SCHED_OTHER", libc::SCHED_OTHER as i64),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            ("SCHED_OTHER", 1i64),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            ("SCHED_FIFO", libc::SCHED_FIFO as i64),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            ("SCHED_FIFO", 4i64),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            ("SCHED_RR", libc::SCHED_RR as i64),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            ("SCHED_RR", 2i64),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ("SCHED_BATCH", libc::SCHED_BATCH as i64),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ("SCHED_IDLE", libc::SCHED_IDLE as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
     }
     // Remaining noop stubs — functions os.py references at module level.
     // Functions with real implementations are registered individually below.
