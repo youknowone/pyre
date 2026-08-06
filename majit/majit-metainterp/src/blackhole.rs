@@ -207,9 +207,11 @@ pub struct BlackholeInterpreter {
     /// of `AbstractDescr` objects carrying field offsets, array item sizes,
     /// etc. In pyre, we store raw offsets (usize) as a simplification —
     /// descriptor-index argcode ('d', 2 bytes) indexes into this table.
-    /// RPython `blackhole.py:288` `self.descrs = builder.descrs`.
-    /// Descriptor table — heterogeneous like RPython AbstractDescr list.
-    pub descrs: Vec<BhDescr>,
+    /// `blackhole.py:288` binds `builder.descrs` by reference and :102-103
+    /// stores the assembler list itself, so the table is shared and never
+    /// copied; :154 is its only consumer and only reads. This has the same
+    /// lifetime shape as the sibling `cpu: Option<&'static dyn Backend>`.
+    pub descrs: &'static [BhDescr],
     /// RPython `blackhole.py:289` `self.op_catch_exception = builder.op_catch_exception`.
     pub op_catch_exception: u8,
     /// RPython `blackhole.py:290` `self.op_rvmprof_code = builder.op_rvmprof_code`.
@@ -392,7 +394,8 @@ impl Default for BlackholeInterpreter {
     fn default() -> Self {
         Self {
             cpu: None,
-            descrs: Vec::new(),
+            // blackhole.py:280 `EMPTY_LIST_I = [] # shared`.
+            descrs: &[],
             // RPython blackhole.py:289 — copied from builder in `acquire_interp`.
             // Sentinel `u8::MAX` matches RPython's `insns.get('…', -1)` fallback.
             op_catch_exception: u8::MAX,
@@ -546,7 +549,7 @@ impl BlackholeInterpreter {
         // Six builder-shared fields per `BlackholeInterpBuilder::acquire_interp`
         // (`blackhole.rs:3825-3842`).
         self.cpu = parent.cpu;
-        self.descrs = parent.descrs.clone();
+        self.descrs = parent.descrs;
         self.op_catch_exception = parent.op_catch_exception;
         self.op_rvmprof_code = parent.op_rvmprof_code;
         self.op_live = parent.op_live;
@@ -593,55 +596,6 @@ impl BlackholeInterpreter {
         let jd = &self.jitdrivers_sd[jdindex];
         let fnptr = jd.portal_runner_ptr.map(|f| f as usize as i64).unwrap_or(0);
         (fnptr, jd.mainjitcode_calldescr.clone())
-    }
-
-    /// Resolve field descriptor offsets in this interpreter's descrs table.
-    /// Delegates to the same logic as BlackholeInterpBuilder::resolve_field_offsets.
-    pub fn resolve_field_offsets(&mut self, resolver: impl Fn(&str, &str) -> usize) {
-        for descr in &mut self.descrs {
-            if let BhDescr::Field {
-                offset,
-                name,
-                owner,
-                parent,
-                ..
-            } = descr
-            {
-                if *offset == 0 && !name.is_empty() {
-                    *offset = resolver(owner, name);
-                    if let Some(parent) = parent {
-                        let full_name = if owner.is_empty() || name.contains('.') {
-                            name.clone()
-                        } else {
-                            format!("{owner}.{name}")
-                        };
-                        if let Some(field) = parent
-                            .all_fielddescrs
-                            .iter_mut()
-                            .find(|field| field.name == full_name)
-                        {
-                            field.offset = *offset;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Resolve JitCode fnaddr values in this interpreter's descrs table.
-    pub fn resolve_jitcode_fnaddrs(&mut self, resolver: impl Fn(usize) -> i64) {
-        for descr in &mut self.descrs {
-            if let BhDescr::JitCode {
-                jitcode_index,
-                fnaddr,
-                ..
-            } = descr
-            {
-                if *fnaddr == 0 {
-                    *fnaddr = resolver(*jitcode_index);
-                }
-            }
-        }
     }
 
     /// `blackhole.py:1102-1132` — the four `bhimpl_recursive_call_{i,r,f,v}`
@@ -2016,7 +1970,7 @@ pub struct BlackholeInterpBuilder {
     pub op_rvmprof_code: u8,
     /// RPython `blackhole.py:103` `self.descrs`.
     /// Populated by `setup_descrs()` from the assembler's descriptor table.
-    pub descrs: Vec<BhDescr>,
+    pub descrs: &'static [BhDescr],
     /// Dispatch table: opcode byte → handler fn pointer.
     /// RPython builds `dispatch_loop` closure via `unrolling_iterable`;
     /// Rust uses indirect call through this table.
@@ -2052,7 +2006,8 @@ impl BlackholeInterpBuilder {
             op_live: u8::MAX,
             op_catch_exception: u8::MAX,
             op_rvmprof_code: u8::MAX,
-            descrs: Vec::new(),
+            // blackhole.py:280 `EMPTY_LIST_I = [] # shared`.
+            descrs: &[],
             dispatch_table: std::sync::Arc::new(Vec::new()),
             jitdrivers_sd: Vec::new(),
         }
@@ -2194,7 +2149,7 @@ impl BlackholeInterpBuilder {
     }
 
     /// RPython `blackhole.py:102-103` `setup_descrs(descrs)`.
-    pub fn setup_descrs(&mut self, descrs: Vec<BhDescr>) {
+    pub fn setup_descrs(&mut self, descrs: &'static [BhDescr]) {
         self.descrs = descrs;
     }
 
@@ -2207,60 +2162,6 @@ impl BlackholeInterpBuilder {
     /// directly.
     pub fn setup_jitdrivers_sd(&mut self, jitdrivers_sd: Vec<BhJitDriverSd>) {
         self.jitdrivers_sd = jitdrivers_sd;
-    }
-
-    /// Resolve JitCode fnaddr values from a mapping function.
-    /// RPython: fnaddr is already set on JitCode objects when they're stored in descrs.
-    /// pyre: fnaddr is 0 at assembly time, resolved here after compilation.
-    /// `resolver(jitcode_index) -> fnaddr`.
-    pub fn resolve_jitcode_fnaddrs(&mut self, resolver: impl Fn(usize) -> i64) {
-        for descr in &mut self.descrs {
-            if let BhDescr::JitCode {
-                jitcode_index,
-                fnaddr,
-                ..
-            } = descr
-            {
-                if *fnaddr == 0 {
-                    *fnaddr = resolver(*jitcode_index);
-                }
-            }
-        }
-    }
-
-    /// Resolve field descriptor offsets from a mapping function.
-    /// RPython: FieldDescr carries actual byte offset from rtyper.
-    /// pyre: offset is 0 at assembly time, resolved here from runtime layout.
-    /// `resolver(owner, field_name) -> byte_offset`.
-    pub fn resolve_field_offsets(&mut self, resolver: impl Fn(&str, &str) -> usize) {
-        for descr in &mut self.descrs {
-            if let BhDescr::Field {
-                offset,
-                name,
-                owner,
-                parent,
-                ..
-            } = descr
-            {
-                if *offset == 0 && !name.is_empty() {
-                    *offset = resolver(owner, name);
-                    if let Some(parent) = parent {
-                        let full_name = if owner.is_empty() || name.contains('.') {
-                            name.clone()
-                        } else {
-                            format!("{owner}.{name}")
-                        };
-                        if let Some(field) = parent
-                            .all_fielddescrs
-                            .iter_mut()
-                            .find(|field| field.name == full_name)
-                        {
-                            field.offset = *offset;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// RPython `blackhole.py:83-100` `dispatch_loop(self, code, position)`.
@@ -2407,7 +2308,7 @@ impl BlackholeInterpBuilder {
         //   self.op_rvmprof_code = builder.op_rvmprof_code
         bh.cpu = self.cpu;
         // RPython blackhole.py:288: self.descrs = builder.descrs
-        bh.descrs = self.descrs.clone();
+        bh.descrs = self.descrs;
         bh.op_catch_exception = self.op_catch_exception;
         bh.op_rvmprof_code = self.op_rvmprof_code;
         //   self.op_live = builder.op_live
@@ -4655,6 +4556,14 @@ mod tests {
         fn test_clone_context_from_mirrors_acquire_interp_fields() {
             let mut builder = super::build_inline_call_only_bh_builder();
             let mut parent = builder.acquire_interp();
+            let table: &'static [BhDescr] = Box::leak(
+                vec![
+                    BhDescr::VableField { index: 1 },
+                    BhDescr::VableArray { index: 2 },
+                ]
+                .into_boxed_slice(),
+            );
+            parent.descrs = table;
             // Make the parent's vable / jitdriver state non-default so
             // the assertion below distinguishes "copied" from
             // "callee-default".
@@ -4671,7 +4580,10 @@ mod tests {
             assert_eq!(callee.op_catch_exception, parent.op_catch_exception);
             assert_eq!(callee.op_rvmprof_code, parent.op_rvmprof_code);
             assert_eq!(callee.op_live, parent.op_live);
-            assert_eq!(callee.descrs.len(), parent.descrs.len());
+            assert!(
+                std::ptr::eq(callee.descrs.as_ptr(), parent.descrs.as_ptr()),
+                "clone_context_from must alias the parent table"
+            );
             assert_eq!(callee.virtualizable_ptr, parent.virtualizable_ptr);
             assert_eq!(
                 callee.virtualizable_stack_base,
