@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=22
+# pypy's exec time is pinned to the startup-subtraction floor here, so the
+# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
+# runners observe (10.7x), rounded up, and no floor gate is recorded.
 # argument.py _match_keywords: a positional-only parameter passed by keyword is
 # absorbed into **kwargs when present, else raises; a keyword that duplicates an
 # already-bound positional raises "multiple values".  Exercised through the
