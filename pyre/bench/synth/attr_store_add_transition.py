@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=5
+# pyre-check: skip-cpython
+# cpython >5s (it already timed out) vs pyre 0.20s, and it is not gated on — only pypy is.
 # STORE_ATTR that ADDS an attribute not yet in the instance's map: the
 # `map -> PlainAttribute` transition plus the grow-by-one storage rewrite
 # (mapdict.py:942-959 `_set_mapdict_increase_storage1`).  The values are

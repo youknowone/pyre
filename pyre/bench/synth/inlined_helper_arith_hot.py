@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=11
+# pyre-check: skip-cpython
+# cpython 2.71s vs pyre 0.26s (10x), and it is not gated on — only pypy is.
 # One-line arithmetic helpers called from a hot `for` loop body. The inline
 # lever gates a FOR_ITER-in-flight callee on `fbw_callee_body_replay_safety`:
 # a body whose only residual is a BINARY_OP the walker will specialize to a

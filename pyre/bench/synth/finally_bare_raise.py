@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=7.2
+# pyre-check: skip-cpython
+# cpython 1.78s vs pyre 0.10s (18x), and it is not gated on — only pypy is.
 # A hot loop FOLLOWED by a `finally` (or nested `finally`) containing a
 # bare `raise` (RAISE_VARARGS argc==0).  When such a bare re-raise is
 # reached by normal fall-through — no `PUSH_EXC_INFO` seeded the handler

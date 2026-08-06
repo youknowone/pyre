@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=6.2
+# pyre-check: skip-cpython
+# cpython 1.67s vs pyre 0.13s (13x), and it is not gated on — only pypy is.
 # A hot loop FOLLOWED by a try/except whose body raises through a
 # *may-force residual call* (`//`, subscript) rather than an explicit
 # `raise`.  The try/except is reached only after the loop's exit guard

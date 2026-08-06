@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=16
+# pyre-check: skip-cpython
+# cpython 0.38s vs pyre 0.09s (4.2x), and it is not gated on — only pypy is.
 # Builds a container (tuple / list / set / dict / str) AFTER a hot loop and
 # returns it.  The loop-exit guard failure resumes via the blackhole, which
 # then walks the forward path through the container-build residual

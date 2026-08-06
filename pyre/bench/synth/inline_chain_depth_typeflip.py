@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=24
+# pyre-check: skip-cpython
+# cpython 1.86s vs pyre 0.32s (5.8x), and it is not gated on — only pypy is.
 # Inline chain of increasing depth whose argument flips int -> float partway
 # through the loop, so the type guard deopts with 2, 3 and 7 frames inlined.
 # Each depth keeps its own driver loop and its own chain so the trace shape is

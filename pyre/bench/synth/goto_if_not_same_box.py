@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=5.6
+# pyre-check: skip-cpython
+# cpython 1.98s vs pyre 0.09s (22x), and it is not gated on — only pypy is.
 # Fused `goto_if_not_<cmp>` with the SAME box on both sides (`b1 is b2`).
 #
 # `record_or_fold_fused_guard` mirrors `opimpl_goto_if_not_<cmp>`

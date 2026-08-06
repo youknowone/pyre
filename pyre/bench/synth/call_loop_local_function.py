@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=8
+# pyre-check: skip-cpython
+# cpython 1.00s vs pyre 0.07s (14x), and it is not gated on — only pypy is.
 # A loop that defines a function in its own body and calls it.
 #
 # `pyopcode.py:1457 MAKE_FUNCTION` runs `function.py:47-57 Function.__init__`

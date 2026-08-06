@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=4.2
+# pyre-check: skip-cpython
+# cpython 1.08s vs pyre 0.32s (3.4x), and it is not gated on — only pypy is.
 
 # Overflow-crossing int multiply on a JIT-hot path. The inner loop is traced
 # while `scale` is small (a*a stays in machine-int range, so the recorded
