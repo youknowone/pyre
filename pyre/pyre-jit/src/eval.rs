@@ -6691,94 +6691,214 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     let instructions = &code.instructions;
     let mut arg_state = pyre_interpreter::OpArgState::default();
     for (pc, unit) in instructions.iter().copied().enumerate() {
+        let (instr, _) = arg_state.get(unit);
+        if matches!(instr, I::ForIter { .. }) && !for_iter_body_is_jit_safe_at(code, pc) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Apply the FOR_ITER safety gate only to loops inside the natural loop region
+/// whose backedge is being considered.  `interp_jit.py:118-120` invokes
+/// `can_enter_jit` for that backedge; a later, disjoint loop in the same frame
+/// cannot execute in the trace starting there and must not blacklist it.
+fn loop_region_for_iter_bodies_all_jit_safe(
+    code: &pyre_interpreter::CodeObject,
+    loop_header_pc: usize,
+) -> bool {
+    use pyre_interpreter::Instruction as I;
+    let mut region_end = None;
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
         let (instr, op_arg) = arg_state.get(unit);
-        if let pyre_interpreter::Instruction::ForIter { delta } = instr {
-            let exit = pyre_interpreter::jump_target_forward(
+        let target = match instr {
+            I::JumpBackward { delta } => {
+                Some(skip_caches(code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            I::JumpBackwardNoInterrupt { delta } => {
+                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            _ => None,
+        };
+        if target == Some(loop_header_pc) {
+            region_end = Some(region_end.map_or(pc, |end: usize| end.max(pc)));
+        }
+    }
+    let Some(region_end) = region_end else {
+        return true;
+    };
+    let mut scan_state = pyre_interpreter::OpArgState::default();
+    for pc in loop_header_pc..=region_end {
+        let (instr, _) = scan_state.get(code.instructions[pc]);
+        if matches!(instr, I::ForIter { .. }) && !for_iter_body_is_jit_safe_at(code, pc) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Recognize the narrow range-specific exception to the whole-frame FOR_ITER
+/// gate: a natural loop that passes a freshly called `range(...)` directly to
+/// `list.append`. A disjoint unsafe loop elsewhere in the frame cannot execute
+/// in this backedge trace. This deliberately does not admit arbitrary earlier
+/// loops in an unsafe frame.
+fn loop_region_contains_escaping_range_append(
+    code: &pyre_interpreter::CodeObject,
+    loop_header_pc: usize,
+) -> bool {
+    use pyre_interpreter::Instruction as I;
+    #[derive(Clone, Copy)]
+    enum State {
+        Searching,
+        AwaitRange,
+        AwaitRangeCall,
+        AwaitAppendCall,
+    }
+
+    let mut region_end = None;
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
+        let (instr, op_arg) = arg_state.get(unit);
+        let target = match instr {
+            I::JumpBackward { delta } => {
+                Some(skip_caches(code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            I::JumpBackwardNoInterrupt { delta } => {
+                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            _ => None,
+        };
+        if target == Some(loop_header_pc) {
+            region_end = Some(region_end.map_or(pc, |end: usize| end.max(pc)));
+        }
+    }
+    let Some(region_end) = region_end else {
+        return false;
+    };
+
+    let mut state = State::Searching;
+    let mut decode = pyre_interpreter::OpArgState::default();
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
+        let (instr, op_arg) = decode.get(unit);
+        if pc < loop_header_pc {
+            continue;
+        }
+        if pc > region_end {
+            break;
+        }
+        match instr {
+            I::LoadAttr { namei }
+                if code.names[namei.get(op_arg).name_idx() as usize].as_str() == "append" =>
+            {
+                state = State::AwaitRange;
+            }
+            I::LoadGlobal { namei }
+                if matches!(state, State::AwaitRange)
+                    && code.names[(namei.get(op_arg) as usize) >> 1].as_str() == "range" =>
+            {
+                state = State::AwaitRangeCall;
+            }
+            I::Call { .. } | I::CallKw { .. } => {
+                state = match state {
+                    State::AwaitRangeCall => State::AwaitAppendCall,
+                    State::AwaitAppendCall => return true,
+                    _ => State::Searching,
+                };
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
+    use pyre_interpreter::Instruction as I;
+    let instructions = &code.instructions;
+    let Some((I::ForIter { delta }, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc)
+    else {
+        return true;
+    };
+    let exit =
+        pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
+    // A `LIST_APPEND` (inlined-comprehension accumulator) body is
+    // admitted only when the body performs no CALL: a per-element call
+    // that enters a user Python frame (a class ctor / user function)
+    // bumps the eval-loop entry odometer, and a subsequent mid-body
+    // abort routes through `fbw_foriter_inflight_take`, which REFUSES
+    // delivery to avoid a double-apply — dropping the trace-attempt
+    // iteration's item. That user-frame in-flight-delivery gap is a
+    // separate concern (single-executor tracing, gh#73/#34); decline
+    // call-bearing bodies to interpretation until it is closed.
+    //
+    // A value-producing but call-free body — arithmetic, subscript, or
+    // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
+    // `[{i: i} …]`, `[f"{i}" …]`) — is admissible. Its append is
+    // exact-resume safe: the only residual an Object-strategy append
+    // leaves in the folded body is the idempotent `list_write_barrier`,
+    // now exempt from the FBW body-effect accounting (it is not a body
+    // effect, mirroring RPython's `COND_CALL_GC_WB`, which pyjitpl never
+    // executes and the optimizer never treats as a side effect).
+    //
+    // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is admitted
+    // too: the fold virtualizes the inner list, whose separately
+    // allocated backing block (`NewArray` / `NewArrayClear`) carries no
+    // jitcode-liveness slot, and with the trace-time single-executor
+    // forks retired the append body no longer runs under a
+    // speculative-replay sub-walk, so the block is bound at every
+    // guard-exit deopt and the shape compiles bit-exact on all backends
+    // (`bench/synth/nested_list_comprehension_hot.py`).
+    let body_has_call = {
+        let mut scan_state = pyre_interpreter::OpArgState::default();
+        let mut scan_pc = pc + 1;
+        let mut has_call = false;
+        while scan_pc < exit && scan_pc < instructions.len() {
+            let (scan_instr, scan_arg) = scan_state.get(instructions[scan_pc]);
+            if let I::ForIter { delta } = scan_instr {
+                // A nested loop owns its body.  It is validated when
+                // the outer instruction walk reaches that FOR_ITER;
+                // calls inside it must not taint a LIST_APPEND owned by
+                // this lexical loop (and vice versa).
+                scan_pc = pyre_interpreter::jump_target_forward(
+                    instructions,
+                    scan_pc + 1,
+                    delta.get(scan_arg).as_usize(),
+                );
+                scan_state = pyre_interpreter::OpArgState::default();
+                continue;
+            }
+            if matches!(
+                scan_instr,
+                I::Call { .. } | I::CallKw { .. } | I::CallFunctionEx | I::CallIntrinsic1 { .. }
+            ) {
+                has_call = true;
+                break;
+            }
+            scan_pc += 1;
+        }
+        has_call
+    };
+    let mut body_state = pyre_interpreter::OpArgState::default();
+    let mut body_pc = pc + 1;
+    while body_pc < exit && body_pc < instructions.len() {
+        let (body_instr, body_arg) = body_state.get(instructions[body_pc]);
+        if let I::ForIter { delta } = body_instr {
+            // Validate the nested body exactly once, under its own
+            // lexical FOR_ITER.  Scanning it again as part of the
+            // outer body conflates unrelated calls with its
+            // LIST_APPEND and declines safe PEP 709 comprehensions.
+            body_pc = pyre_interpreter::jump_target_forward(
                 instructions,
-                pc + 1,
-                delta.get(op_arg).as_usize(),
+                body_pc + 1,
+                delta.get(body_arg).as_usize(),
             );
-            // A `LIST_APPEND` (inlined-comprehension accumulator) body is
-            // admitted only when the body performs no CALL: a per-element call
-            // that enters a user Python frame (a class ctor / user function)
-            // bumps the eval-loop entry odometer, and a subsequent mid-body
-            // abort routes through `fbw_foriter_inflight_take`, which REFUSES
-            // delivery to avoid a double-apply — dropping the trace-attempt
-            // iteration's item. That user-frame in-flight-delivery gap is a
-            // separate concern (single-executor tracing, gh#73/#34); decline
-            // call-bearing bodies to interpretation until it is closed.
-            //
-            // A value-producing but call-free body — arithmetic, subscript, or
-            // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
-            // `[{i: i} …]`, `[f"{i}" …]`) — is admissible. Its append is
-            // exact-resume safe: the only residual an Object-strategy append
-            // leaves in the folded body is the idempotent `list_write_barrier`,
-            // now exempt from the FBW body-effect accounting (it is not a body
-            // effect, mirroring RPython's `COND_CALL_GC_WB`, which pyjitpl never
-            // executes and the optimizer never treats as a side effect).
-            //
-            // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is admitted
-            // too: the fold virtualizes the inner list, whose separately
-            // allocated backing block (`NewArray` / `NewArrayClear`) carries no
-            // jitcode-liveness slot, and with the trace-time single-executor
-            // forks retired the append body no longer runs under a
-            // speculative-replay sub-walk, so the block is bound at every
-            // guard-exit deopt and the shape compiles bit-exact on all backends
-            // (`bench/synth/nested_list_comprehension_hot.py`).
-            let body_has_call = {
-                let mut scan_state = pyre_interpreter::OpArgState::default();
-                let mut scan_pc = pc + 1;
-                let mut has_call = false;
-                while scan_pc < exit && scan_pc < instructions.len() {
-                    let (scan_instr, scan_arg) = scan_state.get(instructions[scan_pc]);
-                    if let I::ForIter { delta } = scan_instr {
-                        // A nested loop owns its body.  It is validated when
-                        // the outer instruction walk reaches that FOR_ITER;
-                        // calls inside it must not taint a LIST_APPEND owned by
-                        // this lexical loop (and vice versa).
-                        scan_pc = pyre_interpreter::jump_target_forward(
-                            instructions,
-                            scan_pc + 1,
-                            delta.get(scan_arg).as_usize(),
-                        );
-                        scan_state = pyre_interpreter::OpArgState::default();
-                        continue;
-                    }
-                    if matches!(
-                        scan_instr,
-                        I::Call { .. }
-                            | I::CallKw { .. }
-                            | I::CallFunctionEx
-                            | I::CallIntrinsic1 { .. }
-                    ) {
-                        has_call = true;
-                        break;
-                    }
-                    scan_pc += 1;
-                }
-                has_call
-            };
-            let mut body_state = pyre_interpreter::OpArgState::default();
-            let mut body_pc = pc + 1;
-            while body_pc < exit && body_pc < instructions.len() {
-                let (body_instr, body_arg) = body_state.get(instructions[body_pc]);
-                if let I::ForIter { delta } = body_instr {
-                    // Validate the nested body exactly once, under its own
-                    // lexical FOR_ITER.  Scanning it again as part of the
-                    // outer body conflates unrelated calls with its
-                    // LIST_APPEND and declines safe PEP 709 comprehensions.
-                    body_pc = pyre_interpreter::jump_target_forward(
-                        instructions,
-                        body_pc + 1,
-                        delta.get(body_arg).as_usize(),
-                    );
-                    body_state = pyre_interpreter::OpArgState::default();
-                    continue;
-                }
-                let permitted = for_iter_body_op_is_jit_safe(body_instr)
-                    || matches!(
-                        body_instr,
-                        I::StoreSubscr
+            body_state = pyre_interpreter::OpArgState::default();
+            continue;
+        }
+        let permitted = for_iter_body_op_is_jit_safe(body_instr)
+            || matches!(
+                body_instr,
+                I::StoreSubscr
                             | I::StoreAttr { .. }
                             | I::StoreName { .. }
                             | I::StoreGlobal { .. }
@@ -6790,14 +6910,12 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                             // spelled as one opcode; void residuals, not folds.
                             | I::SetAdd { .. }
                             | I::MapAdd { .. }
-                    )
-                    || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
-                if !permitted {
-                    return false;
-                }
-                body_pc += 1;
-            }
+            )
+            || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
+        if !permitted {
+            return false;
         }
+        body_pc += 1;
     }
     true
 }
@@ -7116,7 +7234,7 @@ fn const_pool_slot_upper_bound(c: &pyre_interpreter::ConstantData) -> usize {
 /// already relies on.
 ///
 /// The second element is the census key for the decline, naming the specific
-/// arm that produced it. `CurrentFrameOnly` is reached from five unrelated
+/// arm that produced it. `CurrentFrameOnly` is reached from four unrelated
 /// predicates, so the shape alone does not say which defect kept the frame
 /// interpreted; the key does. It is `""` for [`UnsupportedJitShape::None`].
 fn unsupported_jit_shape(
@@ -7158,14 +7276,10 @@ fn unsupported_jit_shape_uncached(
     // census entry so the interpreted frame is visible rather than a silent
     // no-token gap.
     //
-    // `FOR_ITER`: a FOR_ITER frame may enter the JIT only when
-    // every loop body contains exclusively allow-listed opcodes
-    // (`for_iter_bodies_all_jit_safe`). The exclusion exists because a FBW walk
-    // that aborts mid-loop while an inlined sub-walk has performed a direct
-    // `list.append`/`STORE_SUBSCR` cannot deliver or rewind that effect, so the
-    // iteration is silently dropped (#57). Bodies with no explicit
-    // mutation/call and no nested `FOR_ITER` cannot reach that path — verified
-    // against the battery and adversarial mutation probes.
+    // FOR_ITER body safety is not a frame shape: backedge entry applies it to
+    // the requested natural loop region, while function entry applies it to
+    // the whole reachable frame. Keeping it out of this frame-wide classifier
+    // prevents a cold, disjoint loop from blacklisting an earlier hot loop.
 
     // Single-byte register-or-constant index ceiling (`assembler.py:72`
     // `chr(reg)`; `assembler.py:132-133` / `check_result` assert
@@ -7246,12 +7360,6 @@ fn unsupported_jit_shape_uncached(
         // `for_iter_frame_has_raising_named_handler`).
         // Tested one at a time rather than as one `||` so the census names the
         // predicate that fired; the three are unrelated defects.
-        if !for_iter_bodies_all_jit_safe(code) {
-            return (
-                UnsupportedJitShape::CurrentFrameOnly,
-                "FrameShape::CurrentFrameOnly/ForIterBodyNotJitSafe",
-            );
-        }
         if for_iter_frame_is_finally_duplicated(code) {
             return (
                 UnsupportedJitShape::CurrentFrameOnly,
@@ -7312,7 +7420,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // Every declining shape runs the frame in the plain interpreter, so the
     // tracer never sees it. Record the decline in the census — keyed by the
     // predicate that fired, not just the shape — rather than leaving a silent
-    // no-token gap. `CurrentFrameOnly` covers five unrelated defects and
+    // no-token gap. `CurrentFrameOnly` covers four unrelated defects and
     // `ConstEncodingOverflow` is not a defect at all (the frame genuinely
     // cannot be encoded), so one key per shape cannot rank them. The key comes
     // from the memoized `unsupported_jit_shape`, read only on the decline path
@@ -7329,6 +7437,10 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
             );
             return frame_root.frame().execute_frame(None, None);
         }
+    }
+    if !cached_for_iter_bodies_all_jit_safe(code) && !frame_has_traceable_escaping_range_loop(code)
+    {
+        return frame_root.frame().execute_frame(None, None);
     }
     frame_root.frame().fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
@@ -7652,6 +7764,54 @@ fn cached_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> std::sync::Arc
     crate::jit::codewriter::CodeWriter::instance()
         .callcontrol()
         .get_loop_header_pcs(code)
+}
+
+fn cached_loop_region_for_iter_bodies_all_jit_safe(
+    code: &pyre_interpreter::CodeObject,
+    loop_header_pc: usize,
+) -> bool {
+    let key = (code as *const _ as usize, loop_header_pc);
+    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
+    if let Some(&safe) = callcontrol.loop_region_jit_safe.get(&key) {
+        return safe;
+    }
+    let safe = loop_region_for_iter_bodies_all_jit_safe(code, loop_header_pc);
+    callcontrol.loop_region_jit_safe.insert(key, safe);
+    safe
+}
+
+fn cached_for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
+    let key = code as *const _ as usize;
+    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
+    if let Some(&safe) = callcontrol.for_iter_bodies_jit_safe.get(&key) {
+        return safe;
+    }
+    let safe = for_iter_bodies_all_jit_safe(code);
+    callcontrol.for_iter_bodies_jit_safe.insert(key, safe);
+    safe
+}
+
+fn cached_loop_region_contains_escaping_range_append(
+    code: &pyre_interpreter::CodeObject,
+    loop_header_pc: usize,
+) -> bool {
+    let key = (code as *const _ as usize, loop_header_pc);
+    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
+    if let Some(&contains) = callcontrol.escaping_range_loop_regions.get(&key) {
+        return contains;
+    }
+    let contains = loop_region_contains_escaping_range_append(code, loop_header_pc);
+    callcontrol
+        .escaping_range_loop_regions
+        .insert(key, contains);
+    contains
+}
+
+fn frame_has_traceable_escaping_range_loop(code: &pyre_interpreter::CodeObject) -> bool {
+    cached_loop_header_pcs(code).iter().copied().any(|header| {
+        cached_loop_region_for_iter_bodies_all_jit_safe(code, header)
+            && cached_loop_region_contains_escaping_range_append(code, header)
+    })
 }
 
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
@@ -8122,6 +8282,13 @@ fn maybe_compile_and_run(
     // whole-bytecode walk that used to run on every back-edge.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
+        return None;
+    }
+    let region_safe = cached_loop_region_for_iter_bodies_all_jit_safe(code, loop_header_pc);
+    if !region_safe
+        || (!cached_for_iter_bodies_all_jit_safe(code)
+            && !cached_loop_region_contains_escaping_range_append(code, loop_header_pc))
+    {
         return None;
     }
     if let Some(expected_vsd) =
@@ -9376,6 +9543,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // object in `CallControl.graph_jit_shapes`, so this is a pointer-keyed
     // lookup, not the whole-frame scan that charged every Python call.
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
+        return None;
+    }
+    // A function-entry walk can reach every loop in the frame, unlike a
+    // backedge walk, so retain the conservative whole-frame gate here.
+    if !cached_for_iter_bodies_all_jit_safe(code) {
         return None;
     }
     if dump_bytecode_enabled() {
@@ -12420,7 +12592,7 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_call_bearing_list_append_comprehension_body_declines() {
+    fn for_iter_call_bearing_list_append_comprehension_is_unsafe_for_entry_trace() {
         // A per-element CALL enters a user Python frame; a mid-body abort then
         // refuses the in-flight FOR_ITER delivery (a separate user-frame gap,
         // gh#73/#34), so a call-bearing LIST_APPEND body stays interpreter-only.
@@ -12432,13 +12604,7 @@ mod tests {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
             assert!(!for_iter_bodies_all_jit_safe(&code));
-            assert_eq!(
-                unsupported_jit_shape(&code),
-                (
-                    UnsupportedJitShape::CurrentFrameOnly,
-                    "FrameShape::CurrentFrameOnly/ForIterBodyNotJitSafe"
-                )
-            );
+            assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
 
@@ -12493,6 +12659,51 @@ mod tests {
         let code = function_code_from_module(&module, "k");
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn unsafe_later_comprehension_does_not_blacklist_an_earlier_loop() {
+        use pyre_interpreter::{Instruction as I, compile_exec};
+        let module = compile_exec(
+            "def run(n):\n    escaped = []\n    i = 0\n    while i < n:\n        for value in range(3):\n            pass\n        escaped.append(range(i, i + 3))\n        i += 1\n    return [len(item) for item in escaped]\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "run");
+        assert!(!for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+
+        let mut outer_header = usize::MAX;
+        let mut final_for_iter = None;
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        for (pc, unit) in code.instructions.iter().copied().enumerate() {
+            let (instr, op_arg) = arg_state.get(unit);
+            match instr {
+                I::ForIter { .. } => final_for_iter = Some(pc),
+                I::JumpBackward { delta } => {
+                    let target =
+                        skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize());
+                    outer_header = outer_header.min(target);
+                }
+                I::JumpBackwardNoInterrupt { delta } => {
+                    let target = (pc + 1).saturating_sub(delta.get(op_arg).as_usize());
+                    outer_header = outer_header.min(target);
+                }
+                _ => {}
+            }
+        }
+        assert_ne!(outer_header, usize::MAX);
+        assert!(loop_region_for_iter_bodies_all_jit_safe(
+            &code,
+            outer_header
+        ));
+        assert!(loop_region_contains_escaping_range_append(
+            &code,
+            outer_header
+        ));
+        assert!(!for_iter_body_is_jit_safe_at(
+            &code,
+            final_for_iter.expect("fixture must contain the final comprehension")
+        ));
     }
 
     #[test]
