@@ -1358,7 +1358,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // owns their banks — `drive_bridge_carrier_walk`'s abort tail adopts
         // the image, and a decline there leaves the pre-existing rollback.
         if let Err(ref error) = outcome {
-            let _ = latch_abort_blackhole(&sub_wc, error.stop_pc());
+            let _ = latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361");
         }
         outcome
     };

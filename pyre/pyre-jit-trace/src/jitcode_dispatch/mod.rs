@@ -2829,7 +2829,7 @@ pub fn walk<Sym: WalkSym>(
                     && !carrier_owned
                     && !abort_blackhole_latched()
                 {
-                    let _ = latch_abort_blackhole(ctx, error.stop_pc());
+                    let _ = latch_abort_blackhole(ctx, error.stop_pc(), "mod2730");
                 }
                 return Err(error);
             }
@@ -2885,7 +2885,7 @@ pub fn walk<Sym: WalkSym>(
             // replay would resume the caller without delivering the return or
             // raise that this step produced.
             let snapshot_safe = trace_too_long_blackhole_snapshot_safe(&outcome);
-            let blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc);
+            let blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
             if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(

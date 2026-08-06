@@ -263,9 +263,10 @@ macro_rules! latchdbg {
 /// whole image, leaving the abort on the legacy entry replay.
 fn capture_vstack_mirror_image<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
+    origin: &'static str,
 ) -> Option<MirrorStackImage> {
     if !ctx.vstack_valid {
-        latchdbg!("mirror-invalid");
+        latchdbg!("origin={origin} mirror-invalid");
         return None;
     }
     let mut slots = Vec::with_capacity(ctx.vstack_boxes.len());
@@ -276,7 +277,7 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
             }
             other => {
                 latchdbg!(
-                    "mirror-slot {}/{} unresolved opref={opref:?} concrete={other:?}",
+                    "origin={origin} mirror-slot {}/{} unresolved opref={opref:?} concrete={other:?}",
                     slots.len(),
                     ctx.vstack_boxes.len(),
                 );
@@ -293,9 +294,10 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
+    origin: &'static str,
 ) -> bool {
     if !ctx.is_authoritative_executor {
-        latchdbg!("not-authoritative");
+        latchdbg!("origin={origin} not-authoritative");
         return false;
     }
     let last_exc_value = match ctx.last_exc_value_concrete {
@@ -323,12 +325,12 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
                 })
             }
         }) else {
-            latchdbg!("no-snapshot-sym-jitcode");
+            latchdbg!("origin={origin} no-snapshot-sym-jitcode");
             return false;
         };
         let Some(miframe) = build_trace_too_long_single_frame_miframe(ctx, jitcode, resume_pc)
         else {
-            latchdbg!("sf-build-miframe");
+            latchdbg!("origin={origin} sf-build-miframe");
             return false;
         };
         // `walk()` has already executed this step, so returning TraceTooLong
@@ -337,13 +339,13 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // to entry replay. Keep the same boundary: incomplete images merely
         // keep recording until a later step supplies a complete handoff.
         let Some(jitcode_index) = i32::try_from(miframe.jitcode.index()).ok() else {
-            latchdbg!("sf-jitcode-index");
+            latchdbg!("origin={origin} sf-jitcode-index");
             return false;
         };
         if ctx.trace_ctx.virtualizable_info().is_none()
             || crate::state::concrete_nlocals(cf_addr).is_none()
         {
-            latchdbg!("sf-no-vinfo-or-nlocals");
+            latchdbg!("origin={origin} sf-no-vinfo-or-nlocals");
             return false;
         }
         let root_addr = if live_root_addr != 0 {
@@ -364,7 +366,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
             || !crate::state::can_write_back_outer_locals(ctx.trace_ctx, vable_frame)
             || !crate::state::can_publish_frame_stack(cf_addr, vable_frame)
         {
-            latchdbg!("sf-vable-frame-mismatch");
+            latchdbg!("origin={origin} sf-vable-frame-mismatch");
             return false;
         }
         // Keep the per-frame red identity seeded by `frame_box`.  The
@@ -378,7 +380,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // operand stack the adopter publishes.  `ABORT_TOO_LONG` stops at an
         // opcode boundary and keeps the snapshot-array source; a capability-gap
         // abort stops mid-opcode and needs this.
-        let mirror_stack = capture_vstack_mirror_image(ctx);
+        let mirror_stack = capture_vstack_mirror_image(ctx, origin);
         FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
             *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
                 miframe,
@@ -390,13 +392,13 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         true
     } else if ctx.fbw_mode.inline_subwalk {
         let Some(framestack) =
-            build_multi_frame_miframe(ctx, resume_pc, InnermostMiframeBuild::TraceTooLong)
+            build_multi_frame_miframe(ctx, resume_pc, InnermostMiframeBuild::TraceTooLong, origin)
         else {
-            latchdbg!("mf-build-miframe");
+            latchdbg!("origin={origin} mf-build-miframe");
             return false;
         };
-        if !multi_frame_blackhole_preflight(ctx, &framestack) {
-            latchdbg!("mf-preflight");
+        if !multi_frame_blackhole_preflight(ctx, &framestack, origin) {
+            latchdbg!("origin={origin} mf-preflight");
             return false;
         }
         FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
@@ -419,7 +421,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         true
     } else {
         latchdbg!(
-            "no-arm framestack_empty={} inline_subwalk={}",
+            "origin={origin} no-arm framestack_empty={} inline_subwalk={}",
             ctx.session.borrow().framestack.is_empty(),
             ctx.fbw_mode.inline_subwalk
         );
@@ -436,9 +438,10 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
 fn multi_frame_blackhole_preflight<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     framestack: &majit_metainterp::MIFrameStack,
+    origin: &'static str,
 ) -> bool {
     if ctx.trace_ctx.virtualizable_info().is_none() || ctx.fbw_mode.snapshot_sym.is_null() {
-        latchdbg!("pf-no-vinfo-or-sym");
+        latchdbg!("origin={origin} pf-no-vinfo-or-sym");
         return false;
     }
     let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
@@ -449,7 +452,7 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
     };
     let root = if live_root != 0 { live_root } else { snapshot };
     latchdbg!(
-        "pf-root-caps snapshot={snapshot:#x} root={root:#x} nlocals={} locals={} writeback={} publish={}",
+        "origin={origin} pf-root-caps snapshot={snapshot:#x} root={root:#x} nlocals={} locals={} writeback={} publish={}",
         crate::state::concrete_nlocals(snapshot).is_some(),
         crate::state::capture_frame_locals(root).is_some(),
         crate::state::can_write_back_outer_locals(ctx.trace_ctx, root),
@@ -466,17 +469,17 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
     let mut seen = Vec::with_capacity(framestack.frames.len());
     for (index, frame) in framestack.frames.iter().enumerate() {
         let Ok(jitcode_index) = i32::try_from(frame.jitcode.index()) else {
-            latchdbg!("pf-jitcode-index");
+            latchdbg!("origin={origin} pf-jitcode-index");
             return false;
         };
         let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
         if frame_reg == u16::MAX {
-            latchdbg!("pf-frame-reg-none");
+            latchdbg!("origin={origin} pf-frame-reg-none");
             return false;
         }
         let Some(frame_ptr) = frame.ref_values.get(frame_reg as usize).copied().flatten() else {
             latchdbg!(
-                "pf-frame-ptr-unset index={index}/{} jitcode={} frame_reg={frame_reg}",
+                "origin={origin} pf-frame-ptr-unset index={index}/{} jitcode={} frame_reg={frame_reg}",
                 framestack.frames.len(),
                 frame.jitcode.name()
             );
@@ -484,15 +487,15 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
         };
         let frame_ptr = frame_ptr as usize;
         let Some(stack_base) = crate::state::concrete_nlocals(frame_ptr) else {
-            latchdbg!("pf-nlocals");
+            latchdbg!("origin={origin} pf-nlocals");
             return false;
         };
         let Some(stack_depth) = crate::state::concrete_stack_depth(frame_ptr) else {
-            latchdbg!("pf-stack-depth");
+            latchdbg!("origin={origin} pf-stack-depth");
             return false;
         };
         let Some(array_len) = crate::state::concrete_frame_array_len(frame_ptr) else {
-            latchdbg!("pf-array-len");
+            latchdbg!("origin={origin} pf-array-len");
             return false;
         };
         if stack_depth < stack_base
@@ -501,7 +504,7 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             || (index > 0 && frame_ptr == root)
             || seen.contains(&frame_ptr)
         {
-            latchdbg!("pf-shape");
+            latchdbg!("origin={origin} pf-shape");
             return false;
         }
         seen.push(frame_ptr);
@@ -832,11 +835,8 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
     innermost_build: InnermostMiframeBuild,
+    origin: &'static str,
 ) -> Option<majit_metainterp::MIFrameStack> {
-    let session = ctx.session.borrow();
-    if session.framestack.is_empty() {
-        return None;
-    }
     macro_rules! s2dbg {
         ($($a:tt)*) => {
             if fbw_debug_abort_enabled() {
@@ -844,30 +844,68 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
             }
         };
     }
+    let session = ctx.session.borrow();
+    if session.framestack.is_empty() {
+        s2dbg!(
+            "origin={origin} framestack empty depth={} transparent_helper_subwalk={}",
+            session.framestack.len(),
+            ctx.fbw_mode.transparent_helper_subwalk
+        );
+        return None;
+    }
     let mut frames = majit_metainterp::MIFrameStack::empty();
 
     for (index, inline) in session.framestack.iter().enumerate() {
         let Some(parent) = inline.parent.as_ref() else {
-            s2dbg!("frame {index}: no parent");
+            s2dbg!("origin={origin} frame {index}: no parent");
             return None;
         };
         let Some(concrete) = parent.blackhole.as_ref() else {
-            s2dbg!("frame {index}: parent.blackhole None (capture missing)");
+            s2dbg!("origin={origin} frame {index}: parent.blackhole None (capture missing)");
             return None;
         };
-        let pjc = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)?;
+        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
+        else {
+            s2dbg!(
+                "origin={origin} frame {index}: no pyjitcode for parent jitcode_index={}",
+                parent.jitcode_index
+            );
+            return None;
+        };
         let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
         for &(color, value) in &concrete.int_values {
-            *miframe.int_values.get_mut(color)? = Some(value);
+            let bank_len = miframe.int_values.len();
+            let Some(slot) = miframe.int_values.get_mut(color) else {
+                s2dbg!(
+                    "origin={origin} frame {index}: int color {color} out of range (len {bank_len})"
+                );
+                return None;
+            };
+            *slot = Some(value);
         }
         for &(color, value) in &concrete.ref_values {
-            *miframe.ref_values.get_mut(color)? = Some(value as i64);
+            let bank_len = miframe.ref_values.len();
+            let Some(slot) = miframe.ref_values.get_mut(color) else {
+                s2dbg!(
+                    "origin={origin} frame {index}: ref color {color} out of range (len {bank_len})"
+                );
+                return None;
+            };
+            *slot = Some(value as i64);
         }
         for &(color, opref) in &concrete.float_values {
             let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+                s2dbg!("origin={origin} frame {index}: float opref {opref:?} not a stamped Float");
                 return None;
             };
-            *miframe.float_values.get_mut(color)? = Some(value.to_bits() as i64);
+            let bank_len = miframe.float_values.len();
+            let Some(slot) = miframe.float_values.get_mut(color) else {
+                s2dbg!(
+                    "origin={origin} frame {index}: float color {color} out of range (len {bank_len})"
+                );
+                return None;
+            };
+            *slot = Some(value.to_bits() as i64);
         }
         frames.push(miframe);
     }
@@ -880,13 +918,19 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     // callee's own jitcode so all three share its coordinate space; fall back
     // to `snapshot_sym` for a top-level (non-sub-walk) abort.
     let innermost_jitcode = if let Some(consts) = ctx.inline_callee_consts {
-        let jc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
+        let Some(jc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
+            s2dbg!(
+                "origin={origin} innermost: no pyjitcode for callee jitcode_index={}",
+                consts.jitcode_index
+            );
+            return None;
+        };
         jc.jitcode.clone()
     } else {
         unsafe {
             let sym = &*ctx.fbw_mode.snapshot_sym;
             if sym.jitcode().is_null() {
-                s2dbg!("innermost snapshot_sym jitcode null");
+                s2dbg!("origin={origin} innermost snapshot_sym jitcode null");
                 return None;
             }
             (&(*sym.jitcode()).payload).jitcode.clone()
@@ -901,11 +945,14 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         }
     };
     let Some(innermost) = innermost else {
-        s2dbg!("innermost build_single_frame_miframe declined");
+        s2dbg!("origin={origin} innermost build_single_frame_miframe declined");
         return None;
     };
     frames.push(innermost);
-    s2dbg!("BUILT multi-frame depth={}", frames.frames.len());
+    s2dbg!(
+        "origin={origin} BUILT multi-frame depth={}",
+        frames.frames.len()
+    );
     Some(frames)
 }
 
@@ -3113,7 +3160,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                         // blackhole can reach a `getarrayitem_vable_r` that
                         // reloads an operand from the virtualizable array, so
                         // publish the root stack from the walker's mirror.
-                        let mirror_stack = capture_vstack_mirror_image(ctx);
+                        let mirror_stack = capture_vstack_mirror_image(ctx, "escape-flush");
                         FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
                             *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
                                 miframe,
@@ -3154,6 +3201,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                         ctx,
                         resume_pc,
                         InnermostMiframeBuild::LiveMarker(lastop_result),
+                        "escape-flush",
                     )
                 {
                     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
