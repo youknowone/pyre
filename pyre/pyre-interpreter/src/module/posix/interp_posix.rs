@@ -910,26 +910,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("O_CREAT", libc::O_CREAT as i64),
         ("O_EXCL", libc::O_EXCL as i64),
         ("O_TRUNC", libc::O_TRUNC as i64),
-        // O_NONBLOCK, O_DSYNC, O_SYNC are Unix-only.
+        // O_NONBLOCK, O_DSYNC, O_SYNC are Unix-only, and `nt` does not carry
+        // them -- a zero there is a flag that silently does nothing. The
+        // targets that are neither keep the zero they were given.
         #[cfg(unix)]
         ("O_NONBLOCK", libc::O_NONBLOCK as i64),
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         ("O_NONBLOCK", 0i64),
         #[cfg(unix)]
         ("O_NDELAY", libc::O_NONBLOCK as i64),
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         ("O_NDELAY", 0i64),
         #[cfg(unix)]
         ("O_DSYNC", libc::O_DSYNC as i64),
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         ("O_DSYNC", 0i64),
         #[cfg(unix)]
         ("O_SYNC", libc::O_SYNC as i64),
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         ("O_SYNC", 0i64),
-        ("SEEK_SET", libc::SEEK_SET as i64),
-        ("SEEK_CUR", libc::SEEK_CUR as i64),
-        ("SEEK_END", libc::SEEK_END as i64),
+        // SEEK_SET/CUR/END are os.py's own (`SEEK_SET = 0`, os.py:204) on every
+        // platform, and neither `posix` nor `nt` carries them.
     ] {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
     }
@@ -949,176 +950,227 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
     }
     // Non-critical constants — zero stubs are fine for os.py init.
-    for name in [
-        "EX_OK",
-        "EX_USAGE",
-        "EX_DATAERR",
-        "EX_NOINPUT",
-        "EX_NOUSER",
-        "EX_NOHOST",
-        "EX_UNAVAILABLE",
-        "EX_SOFTWARE",
-        "EX_OSERR",
-        "EX_OSFILE",
-        "EX_CANTCREAT",
-        "EX_IOERR",
-        "EX_TEMPFAIL",
-        "EX_PROTOCOL",
-        "EX_NOPERM",
-        "EX_CONFIG",
-        "WNOHANG",
-        "WCONTINUED",
-        "WUNTRACED",
-        "P_WAIT",
-        "P_NOWAIT",
-        "P_NOWAITO",
-        "ST_RDONLY",
-        "ST_NOSUID",
-        "SCHED_OTHER",
-        "SCHED_FIFO",
-        "SCHED_RR",
-        "SCHED_BATCH",
-        "SCHED_IDLE",
-        "RTLD_LAZY",
-        "RTLD_NOW",
-        "RTLD_GLOBAL",
-        "RTLD_LOCAL",
-        "RTLD_NODELETE",
-        "RTLD_NOLOAD",
-        "RTLD_DEEPBIND",
-        "PRIO_PROCESS",
-        "PRIO_PGRP",
-        "PRIO_USER",
+    fn install_zero_constants(ns: PyObjectRef, names: &[&str]) {
+        for &name in names {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(0));
+        }
+    }
+
+    install_zero_constants(ns, &["EX_OK"]);
+
+    // The exit codes, wait flags and scheduling knobs are `nt`'s absentees for
+    // the same reason its calls are: `os.EX_*` and `os.SCHED_*` exist only
+    // where the platform defines them, and code reads their presence to decide
+    // whether the facility is there at all.
+    #[cfg(unix)]
+    install_zero_constants(
+        ns,
+        &[
+            "EX_USAGE",
+            "EX_DATAERR",
+            "EX_NOINPUT",
+            "EX_NOUSER",
+            "EX_NOHOST",
+            "EX_UNAVAILABLE",
+            "EX_SOFTWARE",
+            "EX_OSERR",
+            "EX_OSFILE",
+            "EX_CANTCREAT",
+            "EX_IOERR",
+            "EX_TEMPFAIL",
+            "EX_PROTOCOL",
+            "EX_NOPERM",
+            "EX_CONFIG",
+            "WNOHANG",
+            "WCONTINUED",
+            "WUNTRACED",
+            "ST_RDONLY",
+            "ST_NOSUID",
+            "SCHED_OTHER",
+            "SCHED_FIFO",
+            "SCHED_RR",
+            "SCHED_BATCH",
+            "SCHED_IDLE",
+            "RTLD_LAZY",
+            "RTLD_NOW",
+            "RTLD_GLOBAL",
+            "RTLD_LOCAL",
+            "RTLD_NODELETE",
+            "RTLD_NOLOAD",
+            "RTLD_DEEPBIND",
+            "PRIO_PROCESS",
+            "PRIO_PGRP",
+            "PRIO_USER",
+        ],
+    );
+
+    // `nt`'s own constants. The spawn modes are the C runtime's `_P_*`
+    // (process.h) and carry its values: registering the set at zero made
+    // `P_NOWAIT` mean `P_WAIT`. On POSIX these are os.py's, not the module's —
+    // it defines `P_WAIT = 0` and `P_NOWAIT = P_NOWAITO = 1` for itself in the
+    // branch that has `fork`.
+    #[cfg(windows)]
+    for (name, val) in [
+        ("P_WAIT", 0i64),
+        ("P_NOWAIT", 1),
+        ("P_OVERLAY", 2),
+        ("P_NOWAITO", 3),
+        ("P_DETACH", 4),
+        // The number of names `tempfile` will try before giving up.
+        ("TMP_MAX", 2_147_483_647),
+        // LoadLibraryEx search flags, which `os.add_dll_directory` and
+        // `ctypes` pass through.
+        ("_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR", 0x100),
+        ("_LOAD_LIBRARY_SEARCH_APPLICATION_DIR", 0x200),
+        ("_LOAD_LIBRARY_SEARCH_USER_DIRS", 0x400),
+        ("_LOAD_LIBRARY_SEARCH_SYSTEM32", 0x800),
+        ("_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS", 0x1000),
     ] {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(0));
+        crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
     }
     // Remaining noop stubs — functions os.py references at module level.
     // Functions with real implementations are registered individually below.
-    for name in [
-        "fstatat",
-        // Only the POSIX builds reach a real `statvfs` below, and the pair is
-        // probed for presence rather than called blind: `os.py` gates
-        // `supports_fd` on `_exists`, and `shutil` picks its `disk_usage`
-        // implementation on `hasattr(os, 'statvfs')`, falling back to the
-        // Windows one. A stub answering those probes with `None` would win the
-        // POSIX branch on a host that cannot serve it.
-        #[cfg(unix)]
-        "statvfs",
-        #[cfg(unix)]
-        "fstatvfs",
-        "dup",
-        "dup2",
-        "chdir",
-        "fchdir",
-        "link",
-        "symlink",
-        "chmod",
-        "fchmod",
-        "lchmod",
-        "fchown",
-        "access",
-        "faccessat",
-        "chflags",
-        "lchflags",
-        "futimens",
-        "futimes",
-        "fdopendir",
-        "execve",
-        "execv",
-        "fork",
-        "forkpty",
-        "wait",
-        "waitpid",
-        "truncate",
-        "ftruncate",
-        "pathconf",
-        "fpathconf",
-        "getppid",
-        "setuid",
-        "setgid",
-        "setsid",
-        "setpgid",
-        "setreuid",
-        "setregid",
-        "getgroups",
-        "setgroups",
-        "getpgrp",
-        "setpgrp",
-        "getpgid",
-        "umask",
-        "getlogin",
-        "nice",
-        "pipe",
-        "pipe2",
-        "dup3",
-        "fsync",
-        "fdatasync",
-        "mkfifo",
-        "mknod",
-        "major",
-        "minor",
-        "makedev",
-        "get_inheritable",
-        "set_inheritable",
-        // "get_terminal_size" — implemented below
-        "cpu_count",
-        "getloadavg",
-        "kill",
-        "killpg",
-        "getpriority",
-        "setpriority",
-        "sched_get_priority_max",
-        "sched_get_priority_min",
-        "sched_getparam",
-        "sched_setparam",
-        "sched_getscheduler",
-        "sched_setscheduler",
-        "sched_yield",
-        "confstr",
-        "confstr_names",
-        "sysconf",
-        "sysconf_names",
-        "setenv",
-        // putenv/unsetenv are implemented above unless the host environment is
-        // out of reach.
-        #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
-        "unsetenv",
-        #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
-        "putenv",
-        "device_encoding",
-        "ttyname",
-        "openpty",
-        "login_tty",
-        "tcgetpgrp",
-        "tcsetpgrp",
-        "ctermid",
-        "get_exec_path",
-        "WIFEXITED",
-        "WEXITSTATUS",
-        "WIFSIGNALED",
-        "WTERMSIG",
-        "WIFSTOPPED",
-        "WSTOPSIG",
-        "WEXITED",
-        "WNOWAIT",
-        "WSTOPPED",
-        "waitstatus_to_exitcode",
-        "_exit",
-        "_cpu_count",
-        "abort",
-        "spawnv",
-        "spawnve",
-        "spawnvp",
-        "spawnvpe",
-        "system",
-        "popen",
-    ] {
-        crate::module_ns_store(
-            ns,
-            name,
-            crate::make_builtin_function(name, |_| Ok(pyre_object::w_none())),
-        );
+    fn install_noop_stubs(ns: PyObjectRef, names: &[&'static str]) {
+        for &name in names {
+            crate::module_ns_store(
+                ns,
+                name,
+                crate::make_builtin_function(name, |_| Ok(pyre_object::w_none())),
+            );
+        }
     }
+
+    // Names both `posix` and `nt` answer to.
+    install_noop_stubs(
+        ns,
+        &[
+            "dup",
+            "dup2",
+            "chdir",
+            "link",
+            "symlink",
+            "chmod",
+            "fchmod",
+            "lchmod",
+            "access",
+            "execve",
+            "execv",
+            "waitpid",
+            "truncate",
+            "ftruncate",
+            "getppid",
+            "umask",
+            "getlogin",
+            "pipe",
+            "fsync",
+            "get_inheritable",
+            "set_inheritable",
+            // "get_terminal_size" — implemented below
+            "cpu_count",
+            "kill",
+            "device_encoding",
+            "waitstatus_to_exitcode",
+            "_exit",
+            "abort",
+            "spawnv",
+            "spawnve",
+            "system",
+        ],
+    );
+
+    // The calls `nt` has not got. Each is probed for presence rather than
+    // called blind — `os.py` gates `supports_fd` on `_exists`, `shutil` picks
+    // its `disk_usage` implementation on `hasattr(os, 'statvfs')`, and
+    // `multiprocessing` picks a start method on `hasattr(os, 'fork')` — so a
+    // stub answering `None` here does not add a call, it wins the POSIX branch
+    // on a host that cannot serve it. Registered where the platform is one that
+    // can, which is the only place the name exists at all.
+    #[cfg(unix)]
+    install_noop_stubs(
+        ns,
+        &[
+            "fstatat",
+            "statvfs",
+            "fstatvfs",
+            "fchdir",
+            "fchown",
+            "faccessat",
+            "chflags",
+            "lchflags",
+            "futimens",
+            "futimes",
+            "fdopendir",
+            "fork",
+            "forkpty",
+            "wait",
+            "pathconf",
+            "fpathconf",
+            "setuid",
+            "setgid",
+            "setsid",
+            "setpgid",
+            "setreuid",
+            "setregid",
+            "getgroups",
+            "setgroups",
+            "getpgrp",
+            "setpgrp",
+            "getpgid",
+            "nice",
+            "pipe2",
+            "dup3",
+            "fdatasync",
+            "mkfifo",
+            "mknod",
+            "major",
+            "minor",
+            "makedev",
+            "getloadavg",
+            "killpg",
+            "getpriority",
+            "setpriority",
+            "sched_get_priority_max",
+            "sched_get_priority_min",
+            "sched_getparam",
+            "sched_setparam",
+            "sched_getscheduler",
+            "sched_setscheduler",
+            "sched_yield",
+            "confstr",
+            "confstr_names",
+            "sysconf",
+            "sysconf_names",
+            "setenv",
+            "ttyname",
+            "openpty",
+            "login_tty",
+            "tcgetpgrp",
+            "tcsetpgrp",
+            "ctermid",
+            "get_exec_path",
+            "WIFEXITED",
+            "WEXITSTATUS",
+            "WIFSIGNALED",
+            "WTERMSIG",
+            "WIFSTOPPED",
+            "WSTOPSIG",
+            "WEXITED",
+            "WNOWAIT",
+            "WSTOPPED",
+            "_cpu_count",
+            "spawnvp",
+            "spawnvpe",
+            "popen",
+        ],
+    );
+
+    // putenv/unsetenv are implemented above unless the host environment is out
+    // of reach.
+    #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
+    install_noop_stubs(ns, &["unsetenv", "putenv"]);
+    // There is no fork to register against on Windows, and `os.py` reaches for
+    // the name to decide whether it has one.
+    #[cfg(not(windows))]
     crate::module_ns_store(
         ns,
         "register_at_fork",
@@ -1460,6 +1512,63 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 crate::host_seam::ops::close(fd)
                     .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_none())
+            },
+            1,
+        ),
+    );
+
+    // ── posix.closerange(fd_low, fd_high) ──
+    // Half-open, and every failure is dropped: the point of the call is to shut
+    // whatever is open in the range without first asking what that is, which is
+    // how `subprocess` closes the parent's descriptors in the child. Closing one
+    // the process does not have is the ordinary case, not an error — on Windows
+    // it is what would take the C runtime's invalid-parameter handler and abort
+    // the process, so the close goes through `crt_call!` like every other.
+    crate::module_ns_store(
+        ns,
+        "closerange",
+        crate::make_builtin_function_with_arity(
+            "closerange",
+            |args| {
+                if args.len() != 2 {
+                    return Err(crate::PyError::type_error(format!(
+                        "closerange() takes exactly 2 arguments ({} given)",
+                        args.len()
+                    )));
+                }
+                let low = crate::baseobjspace::c_int_w(args[0])? as libc::c_int;
+                let high = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
+                for fd in low..high {
+                    #[cfg(not(feature = "sandbox"))]
+                    let _ = crate::builtins::crt_call!(libc::close(fd));
+                    #[cfg(feature = "sandbox")]
+                    let _ = crate::host_seam::ops::close(fd);
+                }
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
+
+    // ── posix.strerror(code) ──
+    // The C runtime's message table, which is the one `OSError.strerror`
+    // already reports from — the two answer alike for the same errno.
+    crate::module_ns_store(
+        ns,
+        "strerror",
+        crate::make_builtin_function_with_arity(
+            "strerror",
+            |args| {
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(format!(
+                        "strerror() takes exactly 1 argument ({} given)",
+                        args.len()
+                    )));
+                }
+                let code = crate::baseobjspace::c_int_w(args[0])?;
+                Ok(pyre_object::w_str_new(&crate::PyError::clean_strerror(
+                    code,
+                )))
             },
             1,
         ),
@@ -3370,6 +3479,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         fn getgid() -> u32;
         fn getegid() -> u32;
     }
+    // The user and group ids are POSIX's; `nt` has none of the four, and code
+    // reads `hasattr(os, 'geteuid')` to decide whether an ownership check is
+    // meaningful at all.
+    #[cfg(not(windows))]
     crate::module_ns_store(
         ns,
         "getuid",
@@ -3392,6 +3505,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    #[cfg(not(windows))]
     crate::module_ns_store(
         ns,
         "geteuid",
@@ -3414,6 +3528,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    #[cfg(not(windows))]
     crate::module_ns_store(
         ns,
         "getgid",
@@ -3436,6 +3551,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    #[cfg(not(windows))]
     crate::module_ns_store(
         ns,
         "getegid",
@@ -3470,7 +3586,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     // os.environ lookups from setenv / unsetenv / putenv / getenv — mutate
     // posix.environ (the dict) rather than calling libc; os.py writes back
-    // into that dict in its _Environ wrapper.
+    // into that dict in its _Environ wrapper. `getenv` is the module's on POSIX
+    // alone: os.py defines its own off `environ` for every platform, and `nt`
+    // has none.
+    #[cfg(not(windows))]
     crate::module_ns_store(
         ns,
         "getenv",
