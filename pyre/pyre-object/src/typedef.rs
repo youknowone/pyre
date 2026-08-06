@@ -364,10 +364,6 @@ pub const MEMBER_SUPER_THISCLASS: u32 = MEMBER_DIRECT_FLAG | 52;
 pub const MEMBER_SUPER_SELF: u32 = MEMBER_DIRECT_FLAG | 53;
 /// CPython 3.14 `super_members.__self_class__`, backed by PyPy's `w_objtype`.
 pub const MEMBER_SUPER_SELF_CLASS: u32 = MEMBER_DIRECT_FLAG | 54;
-/// CPython 3.14 `type_members.__flags__`, computed from PyPy's type flags.
-pub const MEMBER_TYPE_FLAGS: u32 = MEMBER_DIRECT_FLAG | 55;
-/// CPython 3.14 `type_members.__base__`, backed by PyPy's best-base lookup.
-pub const MEMBER_TYPE_BASE: u32 = MEMBER_DIRECT_FLAG | 56;
 /// CPython 3.14 `OSError_members.winerror`, backed by PyPy's `w_winerror`.
 /// Declared on every platform, registered on `OSError` only where the
 /// platform has Windows error codes (`interp_exceptions.py:723-728`).

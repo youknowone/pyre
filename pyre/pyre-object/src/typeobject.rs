@@ -133,21 +133,6 @@ pub struct W_TypeObject {
     pub hasdict: bool,
     /// typeobject.py:181 `weakrefable` — True when instances support weakrefs.
     pub weakrefable: bool,
-    /// CPython 3.14 `PyTypeObject.tp_basicsize`, exposed through the readonly
-    /// `type.__basicsize__` member.  PyPy has no public equivalent; pyre keeps
-    /// the compatibility value on the type object itself, matching CPython's
-    /// owner and avoiding a parallel type-keyed side table.
-    pub abi_basicsize: i64,
-    /// CPython 3.14 `PyTypeObject.tp_itemsize` compatibility value.
-    pub abi_itemsize: i64,
-    /// CPython 3.14 `PyTypeObject.tp_weaklistoffset` compatibility value.
-    pub abi_weakrefoffset: i64,
-    /// CPython 3.14 `PyTypeObject.tp_dictoffset` compatibility value.
-    pub abi_dictoffset: i64,
-    /// CPython 3.14 static/inherited `Py_TPFLAGS_*` capabilities.  Runtime
-    /// mutable bits (abstract/disallow/map-or-sequence/baseability) are folded
-    /// in by `w_type_get_flags` from their canonical PyPy-owned fields.
-    pub abi_static_flags: i64,
     /// typeobject.py:210 `hasuserdel` — True when instances have a user
     /// `__del__` (computed at type creation, typeobject.py:1406/1475, and
     /// kept fresh by `mutated`).
@@ -398,11 +383,6 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
-        abi_basicsize: std::mem::size_of::<PyObject>() as i64,
-        abi_itemsize: 0,
-        abi_weakrefoffset: 0,
-        abi_dictoffset: 0,
-        abi_static_flags: ABI_HEAPTYPE | ABI_BASETYPE | ABI_READY | ABI_HAVE_GC,
         hasuserdel: false,
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
@@ -493,8 +473,6 @@ pub fn w_type_new_builtin(
     dict_ptr: *mut u8,
     _layout_pytype: *const PyType,
 ) -> PyObjectRef {
-    let abi = cpython314_builtin_abi(name);
-    let abi_flags = cpython314_builtin_flags(name);
     let qualname_value = name.rsplit('.').next().unwrap_or(name).to_string();
     let name = crate::lltype::malloc_raw(name.to_string());
     let qualname = crate::lltype::malloc_raw(qualname_value);
@@ -524,11 +502,6 @@ pub fn w_type_new_builtin(
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
-        abi_basicsize: abi.0,
-        abi_itemsize: abi.1,
-        abi_weakrefoffset: abi.2,
-        abi_dictoffset: abi.3,
-        abi_static_flags: abi_flags,
         hasuserdel: false,
         // typeobject.py:216 default; built-in dict/list/tuple
         // override via `w_type_set_flag_map_or_seq` at typedef
@@ -564,319 +537,7 @@ pub fn w_type_new_builtin(
     w_type
 }
 
-/// CPython 3.14's static `PyTypeObject` layout members for the builtin types
-/// materialised by pyre.  CPython spells these values on the individual
-/// static type objects; pyre's TypeDef registry funnels their construction
-/// through one helper, so the same declarations are centralised here and
-/// copied into each `W_TypeObject` exactly once.
-fn cpython314_builtin_abi(name: &str) -> (i64, i64, i64, i64) {
-    match name {
-        "object" => (16, 0, 0, 0),
-        "type" => (936, 40, 368, 264),
-        "int" | "bool" => (24, 4, 0, 0),
-        "float" => (24, 0, 0, 0),
-        "complex" => (32, 0, 0, 0),
-        "str" => (64, 0, 0, 0),
-        "bytes" => (33, 1, 0, 0),
-        "bytearray" => (56, 0, 0, 0),
-        "list" => (40, 0, 0, 0),
-        "tuple" => (32, 8, 0, 0),
-        "dict" => (48, 0, 0, 0),
-        "set" | "frozenset" => (200, 0, 192, 0),
-        "memoryview" => (144, 8, 136, 0),
-        "range" | "zip" => (48, 0, 0, 0),
-        "slice" | "super" | "map" => (40, 0, 0, 0),
-        "enumerate" => (56, 0, 0, 0),
-        "filter" | "reversed" => (32, 0, 0, 0),
-        "staticmethod" | "classmethod" => (32, 0, 0, 24),
-        "property" => (64, 0, 0, 0),
-        // The interpreter objects `types` re-exports.  They are not in the
-        // `builtins` namespace but `types.FunctionType.__basicsize__` and its
-        // siblings are just as reachable, so the fallback below would report a
-        // bare object header for a 152-byte layout.
-        "function" => (152, 0, 96, 88),
-        "module" => (56, 0, 40, 16),
-        "method" => (48, 0, 32, 0),
-        "builtin_function_or_method" => (56, 0, 40, 0),
-        "code" => (208, 2, 144, 0),
-        "generator" | "coroutine" | "async_generator" => (152, 8, 16, 0),
-        "frame" => (152, 8, 0, 0),
-        "traceback" => (40, 0, 0, 0),
-        "cell" | "mappingproxy" => (24, 0, 0, 0),
-        "types.SimpleNamespace" => (24, 0, 0, 16),
-        "types.GenericAlias" => (64, 0, 40, 0),
-        // `types.UnionType` is an alias for the canonically-named type.
-        "typing.Union" => (56, 0, 48, 0),
-        // Descriptor kinds.  `method-wrapper` is the bound form of
-        // `wrapper_descriptor`, hence the smaller header.
-        "wrapper_descriptor" | "method_descriptor" | "classmethod_descriptor" => (56, 0, 0, 0),
-        "getset_descriptor" | "member_descriptor" => (48, 0, 0, 0),
-        "method-wrapper" => (32, 0, 0, 0),
-        // Iterator kinds, grouped by the state each one carries: an index plus
-        // a container, a 64-bit range cursor, a hash-table position, or a
-        // dictionary position with its size guard.
-        "bytes_iterator"
-        | "bytearray_iterator"
-        | "list_iterator"
-        | "list_reverseiterator"
-        | "tuple_iterator"
-        | "str_ascii_iterator"
-        | "callable_iterator" => (32, 0, 0, 0),
-        "range_iterator" | "longrange_iterator" => (40, 0, 0, 0),
-        "set_iterator" | "memory_iterator" => (48, 0, 0, 0),
-        "dict_keyiterator"
-        | "dict_valueiterator"
-        | "dict_itemiterator"
-        | "dict_reversekeyiterator"
-        | "dict_reversevalueiterator"
-        | "dict_reverseitemiterator" => (56, 0, 0, 0),
-        "dict_keys" | "dict_values" | "dict_items" => (24, 0, 0, 0),
-        "AttributeError" => (88, 0, 0, 16),
-        "BaseExceptionGroup" => (96, 0, 0, 16),
-        "ExceptionGroup" => (96, 0, -32, 16),
-        "ImportError" | "ModuleNotFoundError" => (104, 0, 0, 16),
-        "NameError" | "UnboundLocalError" | "StopIteration" | "SystemExit" => (80, 0, 0, 16),
-        "SyntaxError" | "IndentationError" | "TabError" | "_IncompleteInputError" => {
-            (144, 0, 0, 16)
-        }
-        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => (112, 0, 0, 16),
-        // The OSError family carries one member more where the platform has a
-        // Windows error code to hold (`interp_exceptions.py:723-728` gates the
-        // `winerror` attrproperty on `rwin32.WIN32`), so its instances are a
-        // word wider there.
-        "OSError"
-        | "BlockingIOError"
-        | "BrokenPipeError"
-        | "ChildProcessError"
-        | "ConnectionAbortedError"
-        | "ConnectionError"
-        | "ConnectionRefusedError"
-        | "ConnectionResetError"
-        | "FileExistsError"
-        | "FileNotFoundError"
-        | "InterruptedError"
-        | "IsADirectoryError"
-        | "NotADirectoryError"
-        | "PermissionError"
-        | "ProcessLookupError"
-        | "TimeoutError" => {
-            if cfg!(windows) {
-                (120, 0, 0, 16)
-            } else {
-                (112, 0, 0, 16)
-            }
-        }
-        "BaseException"
-        | "Exception"
-        | "ArithmeticError"
-        | "AssertionError"
-        | "BufferError"
-        | "BytesWarning"
-        | "DeprecationWarning"
-        | "EOFError"
-        | "EncodingWarning"
-        | "FloatingPointError"
-        | "FutureWarning"
-        | "GeneratorExit"
-        | "ImportWarning"
-        | "IndexError"
-        | "KeyError"
-        | "KeyboardInterrupt"
-        | "LookupError"
-        | "MemoryError"
-        | "NotImplementedError"
-        | "OverflowError"
-        | "PendingDeprecationWarning"
-        | "PythonFinalizationError"
-        | "RecursionError"
-        | "ReferenceError"
-        | "ResourceWarning"
-        | "RuntimeError"
-        | "RuntimeWarning"
-        | "StopAsyncIteration"
-        | "SyntaxWarning"
-        | "SystemError"
-        | "TypeError"
-        | "UnicodeError"
-        | "UnicodeWarning"
-        | "UserWarning"
-        | "ValueError"
-        | "Warning"
-        | "ZeroDivisionError" => (72, 0, 0, 16),
-        // CPython's remaining fixed-size builtin objects are at least the
-        // two-word object header.  Their exact declarations can be added as
-        // each corresponding TypeDef is ported; the arms above cover the whole
-        // `builtins` namespace plus what `types` re-exports.  Structseq
-        // classes stay on the fallback on purpose — their header grows with
-        // the field count, so it belongs to the structseq constructor rather
-        // than to a per-name table.
-        _ => (std::mem::size_of::<PyObject>() as i64, 0, 0, 0),
-    }
-}
-
-const ABI_STATIC_BUILTIN: i64 = 1 << 1;
-const ABI_INLINE_VALUES: i64 = 1 << 2;
-const ABI_MANAGED_WEAKREF: i64 = 1 << 3;
-const ABI_MANAGED_DICT: i64 = 1 << 4;
-const ABI_SEQUENCE: i64 = 1 << 5;
-const ABI_MAPPING: i64 = 1 << 6;
-const ABI_DISALLOW_INSTANTIATION: i64 = 1 << 7;
-const ABI_IMMUTABLETYPE: i64 = 1 << 8;
-const ABI_HEAPTYPE: i64 = 1 << 9;
-const ABI_BASETYPE: i64 = 1 << 10;
-const ABI_HAVE_VECTORCALL: i64 = 1 << 11;
-const ABI_READY: i64 = 1 << 12;
-const ABI_HAVE_GC: i64 = 1 << 14;
-const ABI_METHOD_DESCRIPTOR: i64 = 1 << 17;
-const ABI_IS_ABSTRACT: i64 = 1 << 20;
-const ABI_MATCH_SELF: i64 = 1 << 22;
-const ABI_ITEMS_AT_END: i64 = 1 << 23;
-const ABI_LONG_SUBCLASS: i64 = 1 << 24;
-const ABI_LIST_SUBCLASS: i64 = 1 << 25;
-const ABI_TUPLE_SUBCLASS: i64 = 1 << 26;
-const ABI_BYTES_SUBCLASS: i64 = 1 << 27;
-const ABI_UNICODE_SUBCLASS: i64 = 1 << 28;
-const ABI_DICT_SUBCLASS: i64 = 1 << 29;
-const ABI_BASE_EXC_SUBCLASS: i64 = 1 << 30;
-const ABI_TYPE_SUBCLASS: i64 = 1 << 31;
-const ABI_SUBCLASS_MASK: i64 = ABI_LONG_SUBCLASS
-    | ABI_LIST_SUBCLASS
-    | ABI_TUPLE_SUBCLASS
-    | ABI_BYTES_SUBCLASS
-    | ABI_UNICODE_SUBCLASS
-    | ABI_DICT_SUBCLASS
-    | ABI_BASE_EXC_SUBCLASS
-    | ABI_TYPE_SUBCLASS;
-const ABI_INHERITED_CAPABILITIES: i64 = ABI_SEQUENCE
-    | ABI_MAPPING
-    | ABI_HAVE_VECTORCALL
-    | ABI_MATCH_SELF
-    | ABI_ITEMS_AT_END
-    | ABI_SUBCLASS_MASK;
-
-/// CPython 3.14 static type declarations.  Dynamic flags are intentionally
-/// omitted here and read from W_TypeObject at access time.
-fn cpython314_builtin_flags(name: &str) -> i64 {
-    let base = ABI_STATIC_BUILTIN | ABI_IMMUTABLETYPE | ABI_READY;
-    match name {
-        "object" | "complex" => base | ABI_BASETYPE,
-        "type" => {
-            base | ABI_BASETYPE
-                | ABI_HAVE_VECTORCALL
-                | ABI_HAVE_GC
-                | ABI_ITEMS_AT_END
-                | ABI_TYPE_SUBCLASS
-        }
-        "int" => base | ABI_BASETYPE | ABI_MATCH_SELF | ABI_LONG_SUBCLASS,
-        "bool" => base | ABI_MATCH_SELF | ABI_LONG_SUBCLASS,
-        "float" | "bytearray" => base | ABI_BASETYPE | ABI_MATCH_SELF,
-        "str" => base | ABI_BASETYPE | ABI_MATCH_SELF | ABI_UNICODE_SUBCLASS,
-        "bytes" => base | ABI_BASETYPE | ABI_MATCH_SELF | ABI_BYTES_SUBCLASS,
-        "list" => {
-            base | ABI_BASETYPE | ABI_SEQUENCE | ABI_HAVE_GC | ABI_MATCH_SELF | ABI_LIST_SUBCLASS
-        }
-        "tuple" => {
-            base | ABI_BASETYPE | ABI_SEQUENCE | ABI_HAVE_GC | ABI_MATCH_SELF | ABI_TUPLE_SUBCLASS
-        }
-        "dict" => {
-            base | ABI_BASETYPE | ABI_MAPPING | ABI_HAVE_GC | ABI_MATCH_SELF | ABI_DICT_SUBCLASS
-        }
-        "set" | "frozenset" => base | ABI_BASETYPE | ABI_HAVE_GC | ABI_MATCH_SELF,
-        "memoryview" => base | ABI_SEQUENCE | ABI_HAVE_GC,
-        "range" => base | ABI_SEQUENCE,
-        "slice" => base | ABI_HAVE_GC,
-        "NoneType" | "NotImplementedType" | "ellipsis" => base,
-        "function" => base | ABI_HAVE_VECTORCALL | ABI_HAVE_GC,
-        "builtin_function_or_method" | "method" | "method_descriptor" => {
-            base | ABI_HAVE_VECTORCALL | ABI_HAVE_GC
-        }
-        "code" => base,
-        "traceback" | "cell" => base | ABI_HAVE_GC,
-        "mappingproxy" => base | ABI_MAPPING | ABI_HAVE_GC,
-        "ExceptionGroup" => {
-            ABI_HEAPTYPE
-                | ABI_BASETYPE
-                | ABI_READY
-                | ABI_HAVE_GC
-                | ABI_MANAGED_WEAKREF
-                | ABI_BASE_EXC_SUBCLASS
-        }
-        "BaseException"
-        | "Exception"
-        | "ArithmeticError"
-        | "AssertionError"
-        | "AttributeError"
-        | "BaseExceptionGroup"
-        | "BlockingIOError"
-        | "BrokenPipeError"
-        | "BufferError"
-        | "BytesWarning"
-        | "ChildProcessError"
-        | "ConnectionAbortedError"
-        | "ConnectionError"
-        | "ConnectionRefusedError"
-        | "ConnectionResetError"
-        | "DeprecationWarning"
-        | "EOFError"
-        | "EncodingWarning"
-        | "FileExistsError"
-        | "FileNotFoundError"
-        | "FloatingPointError"
-        | "FutureWarning"
-        | "GeneratorExit"
-        | "ImportError"
-        | "ImportWarning"
-        | "IndentationError"
-        | "IndexError"
-        | "InterruptedError"
-        | "IsADirectoryError"
-        | "KeyError"
-        | "KeyboardInterrupt"
-        | "LookupError"
-        | "MemoryError"
-        | "ModuleNotFoundError"
-        | "NameError"
-        | "NotADirectoryError"
-        | "NotImplementedError"
-        | "OSError"
-        | "OverflowError"
-        | "PendingDeprecationWarning"
-        | "PermissionError"
-        | "ProcessLookupError"
-        | "PythonFinalizationError"
-        | "RecursionError"
-        | "ReferenceError"
-        | "ResourceWarning"
-        | "RuntimeError"
-        | "RuntimeWarning"
-        | "StopAsyncIteration"
-        | "StopIteration"
-        | "SyntaxError"
-        | "SyntaxWarning"
-        | "SystemError"
-        | "SystemExit"
-        | "TabError"
-        | "TimeoutError"
-        | "TypeError"
-        | "UnboundLocalError"
-        | "UnicodeDecodeError"
-        | "UnicodeEncodeError"
-        | "UnicodeError"
-        | "UnicodeTranslateError"
-        | "UnicodeWarning"
-        | "UserWarning"
-        | "ValueError"
-        | "Warning"
-        | "ZeroDivisionError"
-        | "_IncompleteInputError" => base | ABI_BASETYPE | ABI_HAVE_GC | ABI_BASE_EXC_SUBCLASS,
-        // Most remaining builtin interpreter objects own traced references.
-        // Their baseability/disallow/method bits are folded in from the
-        // canonical TypeDef-derived W_TypeObject fields below.
-        _ => base | ABI_HAVE_GC,
-    }
-}
-
-/// `dictmultiobject.py:153 UNKNOWN` — cache miss; recompute via
+/// `dictmultiobject.py` `UNKNOWN` — cache miss; recompute via
 /// `compares_by_identity` lookup.
 pub const COMPARES_BY_IDENTITY_UNKNOWN: u8 = 0;
 /// `dictmultiobject.py:154 COMPARES_BY_IDENTITY` — type uses
@@ -1090,62 +751,6 @@ pub unsafe fn w_type_get_abi_sizeof(obj: PyObjectRef) -> i64 {
         return PYTYPEOBJECT_SIZE;
     }
     PYHEAPTYPEOBJECT_SIZE + if w_type.hasdict { CACHED_KEYS_SIZE } else { 0 }
-}
-
-/// Finish CPython 3.14 ABI-member layout for a heap type after PyPy's
-/// `create_all_slots` has established its best base, visible slots, dict and
-/// weakref capabilities.  CPython inherits the variable-item width and the
-/// base's native dict/weakref offsets; new managed dict/weakref storage uses
-/// its negative sentinel offsets.
-pub unsafe fn w_type_finish_heap_abi_layout(
-    obj: PyObjectRef,
-    best_base: PyObjectRef,
-    visible_newslots: u32,
-) {
-    let word = std::mem::size_of::<PyObjectRef>() as i64;
-    let (base_size, itemsize, base_weakref, base_dict) = if best_base.is_null() {
-        (std::mem::size_of::<PyObject>() as i64, 0, 0, 0)
-    } else {
-        let base = &*(best_base as *const W_TypeObject);
-        (
-            base.abi_basicsize,
-            base.abi_itemsize,
-            base.abi_weakrefoffset,
-            base.abi_dictoffset,
-        )
-    };
-    let ty = &mut *(obj as *mut W_TypeObject);
-    ty.abi_basicsize = base_size + i64::from(visible_newslots) * word;
-    ty.abi_itemsize = itemsize;
-    ty.abi_dictoffset = if base_dict != 0 {
-        base_dict
-    } else if ty.hasdict {
-        -1
-    } else {
-        0
-    };
-    ty.abi_weakrefoffset = if base_weakref != 0 {
-        base_weakref
-    } else if itemsize == 0 && ty.weakrefable {
-        -4 * word
-    } else {
-        0
-    };
-    let inherited = if best_base.is_null() {
-        0
-    } else {
-        (*(best_base as *const W_TypeObject)).abi_static_flags & ABI_INHERITED_CAPABILITIES
-    };
-    ty.abi_static_flags = ABI_HEAPTYPE | ABI_BASETYPE | ABI_READY | ABI_HAVE_GC | inherited;
-    if ty.abi_dictoffset == -1 {
-        ty.abi_static_flags |= ABI_MANAGED_DICT;
-        if ty.abi_itemsize == 0 {
-            ty.abi_static_flags |= ABI_INLINE_VALUES;
-        }
-    }
-    if ty.abi_weakrefoffset < 0 {
-        ty.abi_static_flags |= ABI_MANAGED_WEAKREF;
-    }
 }
 
 /// typeobject.py:295 `self._version_tag` — the raw cache-version field
@@ -1557,41 +1162,34 @@ pub unsafe fn w_type_set_heaptype(obj: PyObjectRef, value: bool) {
     (*(obj as *mut W_TypeObject)).flag_heaptype = value;
 }
 
-/// PyPy `descr__flags`, extended to CPython 3.14's complete public
-/// `Py_TPFLAGS_*` surface.  Static and inherited capabilities live directly
-/// on W_TypeObject; runtime-mutable PyPy flags remain their canonical owners
-/// and are folded into the returned mask here.
+/// typeobject.py `W_TypeObject.get_flags` — compute PyPy's public type flags
+/// from their canonical fields on `W_TypeObject`.
 pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     if obj.is_null() || !is_type(obj) {
         return 0;
     }
+    const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
+    const ABSTRACT: i64 = 1 << 20;
+    const PATMA_SEQUENCE: i64 = 1 << 5;
+    const PATMA_MAPPING: i64 = 1 << 6;
+    const METHOD_DESCRIPTOR: i64 = 1 << 17;
+
     let t = &*(obj as *const W_TypeObject);
-    let mut flags = t.abi_static_flags;
-    flags &= !(ABI_STATIC_BUILTIN | ABI_IMMUTABLETYPE | ABI_HEAPTYPE);
+    let mut flags = 0;
     if t.flag_heaptype {
-        flags |= ABI_HEAPTYPE;
-    } else {
-        flags |= ABI_STATIC_BUILTIN | ABI_IMMUTABLETYPE;
+        flags |= HEAPTYPE;
     }
-    flags &= !ABI_BASETYPE;
-    if w_type_get_acceptable_as_base_class(obj) {
-        flags |= ABI_BASETYPE;
-    }
-    flags &= !(ABI_IS_ABSTRACT | ABI_DISALLOW_INSTANTIATION | ABI_METHOD_DESCRIPTOR);
+    // typeobject.py `flag_cpytype` marks cpyext-defined static types; pyre has
+    // no equivalent type owner, so its bit is always absent.
     if t.flag_abstract.load(std::sync::atomic::Ordering::Acquire) {
-        flags |= ABI_IS_ABSTRACT;
-    }
-    if t.flag_disallow_instantiation
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        flags |= ABI_DISALLOW_INSTANTIATION;
+        flags |= ABSTRACT;
     }
     if t.flag_method_descriptor {
-        flags |= ABI_METHOD_DESCRIPTOR;
+        flags |= METHOD_DESCRIPTOR;
     }
     match t.flag_map_or_seq.load(std::sync::atomic::Ordering::Acquire) {
-        b'M' => flags |= ABI_MAPPING,
-        b'S' => flags |= ABI_SEQUENCE,
+        b'M' => flags |= PATMA_MAPPING,
+        b'S' => flags |= PATMA_SEQUENCE,
         _ => {}
     }
     flags

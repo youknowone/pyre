@@ -1513,19 +1513,19 @@ pub fn init_typeobjects() {
             let w_typeobject = w_typeobject_addr as PyObjectRef;
             pyre_object::pyobject::set_instantiate(tp, w_typeobject);
         }
-        // pypy/objspace/std/objspace.py:104-108 — set
-        // `flag_map_or_seq` on W_TypeObject for dict / list / tuple.
-        // PyPy stores this marker on `W_TypeObject` (typeobject.py:169),
-        // not on the low-level OBJECT_VTABLE / PyType.  Heap types copy
-        // it from their bases in `inherit_flag_map_or_seq`, mirroring
-        // typeobject.py:1495.
+        // typeobject.py `flag_patma_collection` — store the public mapping and
+        // sequence marker on W_TypeObject. Heap types inherit it from bases in
+        // `inherit_flag_map_or_seq`.
         for (pytype, flag) in [
             (&pyre_object::pyobject::DICT_TYPE, b'M'),
+            (&pyre_object::pyobject::MAPPING_PROXY_TYPE, b'M'),
+            (&pyre_object::pyobject::STR_TYPE, b'S'),
+            (&pyre_object::bytesobject::BYTES_TYPE, b'S'),
+            (&pyre_object::bytearrayobject::BYTEARRAY_TYPE, b'S'),
             (&pyre_object::pyobject::LIST_TYPE, b'S'),
             (&pyre_object::pyobject::TUPLE_TYPE, b'S'),
-            // rangeobject.c PyRange_Type carries Py_TPFLAGS_SEQUENCE.
             (&pyre_object::functional::RANGE_TYPE, b'S'),
-            // arraymodule.c arraytype carries Py_TPFLAGS_SEQUENCE.
+            (&pyre_object::memoryview::MEMORYVIEW_TYPE, b'S'),
             (&pyre_object::interp_array::ARRAY_TYPE, b'S'),
         ] {
             let w_typeobject = *reg
@@ -10721,18 +10721,26 @@ fn init_type_type(ns: PyObjectRef) {
         )
     };
 
-    // PyPy typeobject.py `W_TypeObject.typedef` exposes `__flags__` and
-    // `__base__`. Its object model has no C-struct layout members, so those
-    // members are deliberately absent.
-    for (name, kind) in [
-        ("__flags__", pyre_object::MEMBER_TYPE_FLAGS),
-        ("__base__", pyre_object::MEMBER_TYPE_BASE),
-    ] {
+    // typeobject.py `W_TypeObject.typedef` installs both as GetSetProperty.
+    let flags_getter = make_builtin_function_with_arity(
+        "__flags__",
+        |args| Ok(w_int_new(unsafe { pyre_object::w_type_get_flags(args[1]) })),
+        2,
+    );
+    let base_getter = make_builtin_function_with_arity(
+        "__base__",
+        |args| {
+            let value = unsafe { pyre_object::typeobject::w_type_get_best_base(args[1]) };
+            Ok(if value.is_null() { w_none() } else { value })
+        },
+        2,
+    );
+    for (name, getter) in [("__flags__", flags_getter), ("__base__", base_getter)] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                pyre_object::w_member_new_direct(kind, name.to_owned(), PY_NULL),
+                make_getset_descriptor_named(getter, name),
             )
         };
     }
@@ -12242,13 +12250,6 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         }
         pyre_object::MEMBER_SUPER_SELF_CLASS => {
             let value = unsafe { pyre_object::descriptor::w_super_get_obj_type(obj) };
-            Ok(if value.is_null() { w_none() } else { value })
-        }
-        pyre_object::MEMBER_TYPE_FLAGS => {
-            Ok(w_int_new(unsafe { pyre_object::w_type_get_flags(obj) }))
-        }
-        pyre_object::MEMBER_TYPE_BASE => {
-            let value = unsafe { pyre_object::typeobject::w_type_get_best_base(obj) };
             Ok(if value.is_null() { w_none() } else { value })
         }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
