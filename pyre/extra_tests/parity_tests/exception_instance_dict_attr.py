@@ -113,3 +113,5 @@ assert read_sum(o) == 5 * N
 
 # The typed `args` slot is not a dictionary attribute.
 assert E(1, 2).args == (1, 2)
+
+print("OK")

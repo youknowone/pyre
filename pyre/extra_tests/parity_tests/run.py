@@ -100,7 +100,16 @@ def _run(cmd: list[str], script: Path, env: dict[str, str] | None) -> tuple[bool
     lines = [line for line in out.splitlines() if line.strip()]
     last = lines[-1] if lines else ""
     ok = proc.returncode == 0 and last == "OK"
-    detail = "" if ok else f"rc={proc.returncode} last={last!r} stderr={err.strip()!r}"
+    if ok:
+        detail = ""
+    elif proc.returncode == 0:
+        # The script ran to completion and never announced itself. Reporting
+        # this as `rc=0 last=''` reads like an interpreter that produced
+        # nothing, and it is reported once per runner, so three of them make a
+        # sound fixture that forgot its last line look like a pyre failure.
+        detail = f"exited 0 without a final 'OK' line (last non-empty line {last!r})"
+    else:
+        detail = f"rc={proc.returncode} last={last!r} stderr={err.strip()!r}"
     return ok, detail
 
 

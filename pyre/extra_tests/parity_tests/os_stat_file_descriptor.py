@@ -1,3 +1,8 @@
+# pyre-check: platforms=linux,darwin
+# Windows has no `dir_fd`, so the reference raises NotImplementedError where
+# this pins the ValueError that precedes it. pyre reads EBADF from
+# `os.stat(fd)` there as well, which this file cannot gate: a comparison
+# against a failing reference measures nothing.
 """`os.stat` takes an open file descriptor where `os.lstat` does not.
 
 `interp_posix.py:611` declares stat's path as `path_or_fd(allow_fd=True)` and

@@ -18,3 +18,5 @@ assert str(inspect.signature(object.__init__)) == "(self, /, *args, **kwargs)"
 # consumed and does not survive into the rendered signature.
 assert str(inspect.signature(object.__new__)) == "(*args, **kwargs)"
 assert str(inspect.signature(int.__dict__["__pow__"])) == "(self, value, mod=None, /)"
+
+print("OK")

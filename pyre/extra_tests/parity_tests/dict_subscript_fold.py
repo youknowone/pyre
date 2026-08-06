@@ -135,3 +135,5 @@ assert read_varying_int_keys(varying) == (N * (N - 1)) // 2 + 5 * N
 mutating = {0: 11}
 assert write_new_keys_and_read_first(mutating) == 0
 assert mutating[N - 1] == (N - 1) * 3
+
+print("OK")
