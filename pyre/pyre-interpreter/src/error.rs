@@ -2423,7 +2423,12 @@ fn dict_string_keys(dict: PyObjectRef, names: &mut Vec<String>) {
     }
     for (key, _) in unsafe { pyre_object::w_dict_items(dict) } {
         if unsafe { pyre_object::is_str(key) } {
-            names.push(unsafe { pyre_object::w_str_get_value(key) }.to_string());
+            // A name carrying a lone surrogate has no `&str` view, and the
+            // distance below is computed over `char`s.  Drop it from the
+            // candidate set rather than reading it as UTF-8.
+            if let Some(name) = unsafe { pyre_object::w_str_get_value_opt(key) } {
+                names.push(name.to_string());
+            }
         }
     }
 }
@@ -2615,7 +2620,10 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
     {
         return None;
     }
-    let wrong_name = unsafe { pyre_object::w_str_get_value(wrong) }.to_string();
+    // The distance below is computed over `char`s, so a name carrying a lone
+    // surrogate has nothing to compare; answer no suggestion instead of
+    // reading it as UTF-8.
+    let wrong_name = unsafe { pyre_object::w_str_get_value_opt(wrong) }?.to_string();
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
     let tb_slot = if tb.is_null() {
@@ -2646,28 +2654,35 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
         ExcKind::ImportError => {
             let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
             let module_name = unsafe { pyre_object::interp_exceptions::w_exception_get_name(exc) };
-            if module_name.is_null() || !unsafe { pyre_object::is_str(module_name) } {
-                None
-            } else {
-                let module_name = unsafe { pyre_object::w_str_get_value(module_name) }.to_string();
-                crate::importing::get_sys_module(&module_name)
-                    .or_else(|| {
-                        crate::importing::importhook(
-                            &module_name,
-                            pyre_object::w_none(),
-                            pyre_object::w_none(),
-                            0,
-                            crate::call::take_last_exec_ctx(),
-                        )
-                        .ok()
-                    })
-                    .and_then(object_dir_strings)
-                    .and_then(|mut names| {
-                        if !wrong_name.starts_with('_') {
-                            names.retain(|name| !name.starts_with('_'));
-                        }
-                        best_suggestion(&names, &wrong_name)
-                    })
+            let module_name =
+                if module_name.is_null() || !unsafe { pyre_object::is_str(module_name) } {
+                    None
+                } else {
+                    unsafe { pyre_object::w_str_get_value_opt(module_name) }
+                };
+            match module_name {
+                None => None,
+                Some(module_name) => {
+                    let module_name = module_name.to_string();
+                    crate::importing::get_sys_module(&module_name)
+                        .or_else(|| {
+                            crate::importing::importhook(
+                                &module_name,
+                                pyre_object::w_none(),
+                                pyre_object::w_none(),
+                                0,
+                                crate::call::take_last_exec_ctx(),
+                            )
+                            .ok()
+                        })
+                        .and_then(object_dir_strings)
+                        .and_then(|mut names| {
+                            if !wrong_name.starts_with('_') {
+                                names.retain(|name| !name.starts_with('_'));
+                            }
+                            best_suggestion(&names, &wrong_name)
+                        })
+                }
             }
         }
         ExcKind::NameError => {
