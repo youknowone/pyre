@@ -1891,21 +1891,36 @@ class Check:
         def failed_bound(measured, baseline_value):
             exec_measured = self._exec_time(backend, measured)
             exec_baseline = self._exec_time(baseline_key, baseline_value)
-            # A perf ratio is dominated by timer resolution only when BOTH
-            # sides are: a baseline pinned to EXEC_TIME_FLOOR_S by startup
-            # subtraction over-estimates its real (sub-floor) work, so the
-            # reported ratio measured/floor is a LOWER bound on the true ratio.
-            # Exempting on a clamped baseline alone would therefore hide a
-            # provable slowdown -- if measured/floor already clears the gate,
-            # the true ratio clears it by even more. Require the backend to be
-            # at the floor too, so the exemption fires only when neither side
-            # has measurable work; a backend above the floor is a real
-            # measurement the gate still applies to (this is the actual-clamping
-            # test the 100ms absolute threshold failed to be).
-            if (
-                self._baseline_exec_time_clamped(baseline_key, baseline_value)
-                and exec_measured <= EXEC_TIME_FLOOR_S
-            ):
+            # A baseline pinned to EXEC_TIME_FLOOR_S by startup subtraction is
+            # not a measurement of the baseline, it is the floor constant. The
+            # ratio built on it is `exec_measured / EXEC_TIME_FLOOR_S`, so the
+            # recorded ceiling it is compared against is an absolute wall-clock
+            # budget of `limit * EXEC_TIME_FLOOR_S` seconds -- and that budget
+            # was fitted on whichever host last wrote the header. Applying it
+            # elsewhere compares two hosts' wall clocks with no baseline
+            # standing between them, which is what the printed line already
+            # says ("ratio not a measurement") while failing the run on it.
+            # Measured: `class_reassign_hot` read 27.0x and 27.3x on one host
+            # and 49.2x on a CI runner against the same code, because only the
+            # numerator moves.
+            #
+            # The earlier reading kept the ceiling armed here because
+            # measured/floor is a LOWER bound on the true ratio, so a failure
+            # does prove the fixture is at least that many times slower than
+            # pypy. It is still not a bound this ceiling can judge: the
+            # recorded number carries the same clamp, so no pypy measurement
+            # enters the comparison on either side. Three consecutive `main`
+            # runs failed exactly this way on three different fixtures and two
+            # runners -- global_cell_shortpreamble_hot 24.1x > 19x,
+            # class_reassign_hot 49.2x > 47x, reentrant_key_eq_mutation 10.3x >
+            # 5x -- which is a population, not three regressions.
+            #
+            # Only the ceiling relaxes: the floor declines to arm below
+            # FLOOR_GATE_MIN_BASELINE_S for the neighbouring reason, which a
+            # clamped baseline is always under. The number stays visible either
+            # way -- the comparison table prints it with a `~`. A fixture that
+            # wants a ratio gate has to give pypy enough work to measure.
+            if self._baseline_exec_time_clamped(baseline_key, baseline_value):
                 return None
             if exec_measured > exec_baseline * limit + compare_buffer:
                 return "ceiling"
@@ -1953,7 +1968,6 @@ class Check:
             ratio = "-"
         else:
             ratio = f"{float(exec_m) / float(exec_b):.1f}x"
-        clamped = self._baseline_exec_time_clamped(baseline, baseline_time)
         if bound == "floor":
             detail = (
                 f"exec {exec_m:.2f}s vs {baseline} {exec_b:.2f}s  "
@@ -1965,8 +1979,6 @@ class Check:
                 f"exec {exec_m:.2f}s > {baseline} {exec_b:.2f}s  "
                 f"ratio {ratio} > gate {float(limit):g}x"
             )
-        if clamped:
-            detail += f"  [{baseline} exec clamped to floor; ratio not a measurement]"
         return detail
 
     def _run_backend_bench(
@@ -2420,7 +2432,10 @@ class Check:
         header += "".join(f" {b:>18s}" for b in cols)
         print(header)
         if any("~" in c[b] for c in self.comparisons for b in cols):
-            print("  ~ pypy exec clamped to floor; ratio is not a measurement")
+            print(
+                "  ~ pypy exec clamped to floor; ratio is not a measurement, "
+                "and no ratio gate is applied to it"
+            )
         print("  " + "─" * (54 + 19 * len(cols)))
         for c in self.comparisons:
             row = f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
