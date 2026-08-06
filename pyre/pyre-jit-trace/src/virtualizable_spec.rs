@@ -32,8 +32,8 @@ pub const PYFRAME_VABLE_FIELDS: &[(&str, usize)] = &[
     ("pycode", 1),          // interp_jit.py:25 pycode
     ("valuestackdepth", 2), // interp_jit.py:26 valuestackdepth
     ("debugdata", 3),       // interp_jit.py:28 debugdata
-    ("lastblock", 4),       // interp_jit.py:30 lastblock
-    ("w_globals", 5),       // interp_jit.py:31 w_globals
+    ("lastblock", 4),       // no `_virtualizable_` entry — see above
+    ("w_globals", 5),       // interp_jit.py:29 w_globals
 ];
 
 /// Virtualizable array fields in canonical index order.
