@@ -2363,8 +2363,8 @@ class Check:
             # below: `cpython_output = None` leaves pypy as the only baseline
             # the backends are compared against.
             cpython_output = None
-            # As wide as the timeout spelling below, so the comparison table's
-            # cpython column lines up the same way for either kind of skip.
+            # Spelled the same way as the timeout skip below, so the comparison
+            # table's cpython column reads the same for every kind of skip.
             t_cpython = "skip (pypy oracle)" if no_cpython else "skip (opt)"
             print(dim(t_cpython))
             self.cpython_declared_skips.append(name)
