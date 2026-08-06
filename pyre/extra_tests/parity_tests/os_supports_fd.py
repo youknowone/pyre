@@ -7,6 +7,7 @@ sends the caller down a route that cannot work.
 """
 
 import os
+import stat
 import sys
 import tempfile
 
@@ -15,25 +16,6 @@ def check(cond, what):
     if not cond:
         raise AssertionError(what)
 
-
-d = tempfile.mkdtemp()
-p = os.path.join(d, "f")
-with open(p, "wb") as f:
-    f.write(b"0123456789")
-
-# os.py:148 adds `stat` to supports_fd with no HAVE_* bit behind it — "fstat
-# always works" — so this one claim holds on every platform, Windows included,
-# where the descriptor is a CRT one wrapping a handle rather than a fd.
-if sys.platform == "win32":
-    fd = os.open(p, os.O_RDONLY)
-    try:
-        check(os.stat in os.supports_fd, "stat missing from supports_fd")
-        check(os.stat(fd).st_size == 10, "stat(fd) size")
-        check(os.fstat(fd).st_size == 10, "fstat(fd) size")
-    finally:
-        os.close(fd)
-    print("OK")
-    raise SystemExit
 
 # What each entry point wants after its path, for the calls that probe the path
 # argument alone.
@@ -47,6 +29,84 @@ REST_ARGS = {
     "truncate": (0,),
     "utime": (),
 }
+
+d = tempfile.mkdtemp()
+p = os.path.join(d, "f")
+with open(p, "wb") as f:
+    f.write(b"0123456789")
+
+# Windows reaches supports_fd through three of os.py's rules rather than the
+# HAVE_F* family: `stat` unconditionally (os.py:148, "fstat always works"),
+# `chmod` through MS_WINDOWS (os.py:143), and `truncate` through HAVE_FTRUNCATE
+# (os.py:149). The descriptor there is a CRT one wrapping a handle rather than a
+# kernel fd, which is exactly why each of the three needs exercising and not
+# just asserting.
+if sys.platform == "win32":
+    WIN32_PROBES = {"stat", "chmod", "truncate"}
+    names = {f.__name__ for f in os.supports_fd}
+    # A name advertised here and not exercised below would be a capability
+    # claimed and never tested — the defect this whole file exists to catch.
+    check(
+        names <= WIN32_PROBES,
+        f"supports_fd names with no probe here: {sorted(names - WIN32_PROBES)}",
+    )
+    check(WIN32_PROBES <= names, f"missing from supports_fd: {sorted(WIN32_PROBES - names)}")
+
+    fd = os.open(p, os.O_RDWR)
+    try:
+        check(os.stat(fd).st_size == 10, "stat(fd) size")
+        check(os.fstat(fd).st_size == 10, "fstat(fd) size")
+
+        # MS_WINDOWS makes the same claim twice — the descriptor form
+        # (os.py:143) and follow_symlinks (os.py:184) — so both are read back.
+        check(os.chmod in os.supports_follow_symlinks, "chmod missing from supports_follow_symlinks")
+        # The mode Windows keeps is the owner's write bit, which is the
+        # read-only attribute inverted.
+        os.chmod(fd, 0o444)
+        check(not os.stat(p).st_mode & stat.S_IWRITE, "chmod(fd) did not clear the write bit")
+        os.chmod(fd, 0o644)
+        check(os.stat(p).st_mode & stat.S_IWRITE, "chmod(fd) did not restore the write bit")
+
+        # follow_symlinks reaches the name's own attributes. A plain file is
+        # its own final component, so this needs no symlink privilege and the
+        # bit still has to move.
+        os.chmod(p, 0o444, follow_symlinks=False)
+        check(not os.stat(p).st_mode & stat.S_IWRITE, "chmod(follow_symlinks=False) did not clear it")
+        os.chmod(p, 0o644, follow_symlinks=False)
+        check(os.stat(p).st_mode & stat.S_IWRITE, "chmod(follow_symlinks=False) did not restore it")
+
+        # dir_fd is the one modifier Windows cannot honour, and os.py never
+        # puts chmod in supports_dir_fd there.
+        check(os.chmod not in os.supports_dir_fd, "chmod claims dir_fd on windows")
+        try:
+            os.chmod(p, 0o644, dir_fd=fd)
+        except NotImplementedError:
+            pass
+        else:
+            raise AssertionError("chmod accepted dir_fd on windows")
+
+        os.truncate(fd, 4)
+        check(os.stat(fd).st_size == 4, "truncate(fd) did not shrink the file")
+        os.truncate(p, 2)
+        check(os.stat(p).st_size == 2, "truncate(path) did not shrink the file")
+
+        # The widened allowed-type list appears wherever the descriptor form
+        # does, and names the entry point that answered.
+        for name in sorted(WIN32_PROBES):
+            try:
+                getattr(os, name)(1.5, *REST_ARGS[name])
+            except TypeError as e:
+                check(
+                    str(e)
+                    == f"{name}: path should be string, bytes, os.PathLike or integer, not float",
+                    f"{name} type error: {e}",
+                )
+            else:
+                raise AssertionError(f"{name}(1.5) did not raise")
+    finally:
+        os.close(fd)
+    print("OK")
+    raise SystemExit
 
 names = {f.__name__ for f in os.supports_fd}
 # `stat` is unconditional (os.py:148 "fstat always works"); the rest are the

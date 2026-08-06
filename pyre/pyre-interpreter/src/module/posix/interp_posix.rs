@@ -868,13 +868,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // HAVE_FUTIMES is not listed beside it: nothing here calls `futimes`,
         // and os.py:150-151 reads either one as the same `utime` capability.
         ("HAVE_FUTIMENS", HAVE_FUTIMENS),
-        ("HAVE_LSTAT", true),
+        ("HAVE_LSTAT", HAVE_LSTAT),
         // os.py:133,191 reads this as `utime` honouring both dir_fd and
         // follow_symlinks, which is the one `utimensat` the name form makes.
         // HAVE_LUTIMES is not listed beside it for the same reason as
         // HAVE_FUTIMES above: os.py:188 reads it as the same follow_symlinks
         // capability and nothing here calls `lutimes`.
         ("HAVE_UTIMENSAT", HAVE_UTIMENSAT),
+        // `interp_posix.py:2854-2855` appends this after the HAVE_* loop, so
+        // it keeps that position here too.
+        ("MS_WINDOWS", MS_WINDOWS),
     ];
     crate::module_ns_store(
         ns,
@@ -2928,6 +2931,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// from. Its `linkat` call sits with the rest of the `host_env`-backed
     /// entry points, so it carries their condition and not `HAVE_FSTATAT`'s.
     const HAVE_LINKAT: bool = HOST_POSIX;
+    /// `os.py:118` reads this as `lstat` honouring `dir_fd`, which is the same
+    /// `fstatat` `stat` resolves one with — so the two cannot be advertised
+    /// apart. `os.py:189` reads it a second time as `stat` honouring
+    /// `follow_symlinks`; where this bit is false, `MS_WINDOWS` carries that
+    /// second claim instead (`os.py:192`).
+    const HAVE_LSTAT: bool = HAVE_FSTATAT;
+    /// `_WIN32` (`interp_posix.py:2854-2855`). `os.py` reads it as `chmod`
+    /// taking a descriptor (`:143`), and as `chmod` and `stat` honouring
+    /// `follow_symlinks` (`:184`, `:192`) — all three of which the C runtime
+    /// block below serves, and the noop placeholders do not.
+    const MS_WINDOWS: bool = HOST_WINDOWS_CRT;
 
     /// `_DirFD_Unavailable` (`interp_posix.py:285-292`) names the argument and
     /// not the call it was passed to, which is also how
@@ -6425,24 +6439,73 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         /// read-only attribute comes off, without it goes on.
         const S_IWRITE: u32 = 0o200;
 
-        // os.chmod(path, mode) -> None
+        // os.chmod(path, mode, *, dir_fd=None, follow_symlinks=True) -> None
+        //
+        // `MS_WINDOWS` is what puts this name in `supports_fd` (`os.py:143`)
+        // and in `supports_follow_symlinks` (`os.py:184`), so all three forms
+        // are served here: a descriptor through the handle it wraps, a name
+        // through the file the link resolves to, and `follow_symlinks=False`
+        // through the link's own attributes.  `dir_fd` is the one modifier
+        // Windows cannot honour — `chmod` types it as
+        // `dir_fd(requires='fchmodat')`, which is `_DirFD_Unavailable`.
         crate::module_ns_store(
             ns,
             "chmod",
-            crate::make_builtin_function_with_arity(
-                "chmod",
-                |args| {
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error("chmod() requires 2 arguments"));
-                    }
-                    let path = crate::gateway::fsencode_path_w(args[0])?;
-                    let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
+            crate::make_builtin_function("chmod", |args| {
+                let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                crate::builtins::kwarg_reject_unknown(
+                    kwargs,
+                    &["dir_fd", "follow_symlinks"],
+                    "chmod",
+                )?;
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("chmod() requires 2 arguments"));
+                }
+                // Both modifiers are keyword-only.
+                if args.len() > 2 {
+                    return Err(crate::PyError::type_error(format!(
+                        "chmod() takes exactly 2 positional arguments ({} given)",
+                        args.len()
+                    )));
+                }
+                // `_DirFD_Unavailable.unwrap` (`interp_posix.py:285-292`)
+                // converts first and reports the platform second, so a wrongly
+                // typed value is a TypeError here as well.
+                if let Some(w) = crate::builtins::kwarg_get(kwargs, "dir_fd")
+                    .filter(|&w| !unsafe { pyre_object::is_none(w) })
+                {
+                    unwrap_fd(w, "integer or None")?;
+                    return Err(dir_fd_unavailable());
+                }
+                let path = crate::gateway::fsencode_path_or_fd_w(args[0], "chmod", MS_WINDOWS)?;
+                // `posix.chmod` unwraps `mode` as `c_int`, so a non-integer
+                // raises TypeError instead of reinterpreting its layout.
+                let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
+                // The descriptor form has no name to resolve, so neither
+                // modifier applies to it and it dispatches straight to
+                // `os.fchmod` (`interp_posix.py:1233-1241`).
+                if path.as_fd != -1 {
+                    return match host_nt::fchmod(path.as_fd, mode, S_IWRITE) {
+                        Ok(()) => Ok(pyre_object::w_none()),
+                        Err(e) => Err(handle_err(&e)),
+                    };
+                }
+                let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                    Some(w) => crate::baseobjspace::is_true(w)?,
+                    None => true,
+                };
+                let result = if follow_symlinks {
                     host_nt::chmod_follow(&wide_path(&path.as_bytes)?, mode, S_IWRITE)
-                        .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
-                    Ok(pyre_object::w_none())
-                },
-                2,
-            ),
+                } else {
+                    // `SetFileAttributesW` on the name itself, which is what
+                    // "modify the link rather than its target" means where the
+                    // mode is one attribute bit.
+                    let name = os_str_from_bytes(&path.as_bytes);
+                    host_nt::win32_lchmod(&name, mode, S_IWRITE)
+                };
+                result.map_err(|e| fs_err_with_filename(e, path.w_path()))?;
+                Ok(pyre_object::w_none())
+            }),
         );
 
         // os.fchmod(fd, mode) -> None
