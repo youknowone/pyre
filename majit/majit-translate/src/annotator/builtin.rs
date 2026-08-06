@@ -384,7 +384,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         longlong2float_analyzer,
     );
     // Foreign Rust container constructors — `Vec::new` /
-    // `Vec::with_capacity` / `indexmap::IndexMap::new` / `Box::new`.
+    // `Vec::with_capacity` / `indexmap::IndexMap::new` / `Box::new` /
+    // `Box::new_uninit`.
     // Each returns the classdef-less opaque `SomeInstance` shell (twin
     // `bigint_from`), retiring the "no analyser registered" wall the
     // two-phase prepass hits when residualizing bodies that build these
@@ -396,6 +397,18 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "vec.Vec.with_capacity", foreign_container_ctor);
     analyzer_for(&mut reg, "indexmap.IndexMap.new", foreign_container_ctor);
     analyzer_for(&mut reg, "Box.new", foreign_container_ctor);
+    // `Box::new_uninit() -> Box<MaybeUninit<T>>` returns the same foreign,
+    // opaque allocation shell as `Box::new`; this retires the
+    // `boxed.Box.new_uninit` no-analyser wall.
+    analyzer_for(&mut reg, "boxed.Box.new_uninit", foreign_container_ctor);
+    // `Box::into_raw(Box<T>) -> *mut T` preserves the allocation represented
+    // by its argument, so its analyser passes that annotation through.  The
+    // pointer and box denote one allocation; re-minting an opaque shell would
+    // discard a class already established by the producer, while
+    // `project_pyre_field_type` already folds a raw pointer to its pointee
+    // shell.  Both host spellings retire the corresponding no-analyser wall.
+    analyzer_for(&mut reg, "Box.into_raw", box_into_raw);
+    analyzer_for(&mut reg, "boxed.Box.into_raw", box_into_raw);
     // `<[T]>::into_vec` producer — returns a fresh `Vec<T>`, the same
     // opaque container shell as `Vec::new`.
     analyzer_for(
@@ -1574,11 +1587,36 @@ fn foreign_container_ctor(
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    Ok(SomeValue::Instance(SomeInstance::new(
+    Ok(foreign_opaque_instance())
+}
+
+/// The classdef-less `SomeInstance` every foreign-opaque analyser answers —
+/// the GcRef shell `annotation_state::ref_fallback_instance` gives an
+/// unregistered host-struct pointee, projecting to `ValueType::Ref(None)`.
+fn foreign_opaque_instance() -> SomeValue {
+    SomeValue::Instance(SomeInstance::new(
         None,
         false,
         std::collections::BTreeMap::new(),
-    )))
+    ))
+}
+
+/// Analyzer for `Box::into_raw(Box<T>) -> *mut T`.  The raw pointer and the
+/// consumed box denote the same allocation, so pass through the argument's
+/// annotation rather than minting a fresh opaque shell.  This preserves any
+/// class established by the box's producer; `project_pyre_field_type` already
+/// folds a raw pointer to its pointee shell.  An absent argument annotation
+/// falls back to the classdef-less foreign shell, retiring the
+/// `Box.into_raw` / `boxed.Box.into_raw` no-analyser walls.
+fn box_into_raw(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(args_s
+        .first()
+        .and_then(Clone::clone)
+        .unwrap_or_else(foreign_opaque_instance))
 }
 
 /// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag
