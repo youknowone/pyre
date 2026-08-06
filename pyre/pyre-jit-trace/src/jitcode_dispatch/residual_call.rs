@@ -5217,9 +5217,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)?.is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        if let Some(outcome) = try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)? {
+            return Ok((outcome, op.next_pc));
+        }
     }
 
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
