@@ -424,9 +424,16 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // preserves the surviving slots), and it is the arm the reorder region
     // excludes.  A genuine self-branch is unaffected: `target_pc` reports it,
     // so the clause below already accepts it.
+    // The handler an exception raised at `prev_pypc` transfers to is a CFG
+    // successor as much as a branch delta is; it just lives in
+    // `co_exceptiontable` instead of the opcode's operand, so `target_pc`
+    // cannot report it.  Left out, an unwind to the handler read as a block
+    // permutation and armed the reorder region over the whole handler body,
+    // where `ShadowReseed` drops every operand box the shadow does not carry.
     let cfg_successor = new_pypc as usize == prev_pypc
         || (has_fallthrough && new_pypc as usize == fallthrough)
-        || crate::liveness::target_pc(code, &instr, prev_pypc, op_arg) == Some(new_pypc as usize);
+        || crate::liveness::target_pc(code, &instr, prev_pypc, op_arg) == Some(new_pypc as usize)
+        || crate::liveness::exception_target_pc(code, prev_pypc) == Some(new_pypc as usize);
     // #389(b): leave the out-of-order permutation region once the walk has
     // advanced PAST the py_pc it backed off from — py order is monotonic again
     // and the per-op reconcile is valid from here, INCLUDING at this boundary.
@@ -450,8 +457,16 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
         eprintln!(
             "[vstack-reconcile] prev_pypc={prev_pypc} new_pypc={new_pypc} \
              new_depth={new_depth} prev_depth={} class={class:?} reorder={in_reorder_region} \
-             last_ref={:?} instr={instr:?}",
-            ctx.vstack_depth, ctx.vstack_last_ref
+             succ=(ft={},br={:?},exc={:?}) last_ref={:?} instr={instr:?}",
+            ctx.vstack_depth,
+            if has_fallthrough {
+                fallthrough as isize
+            } else {
+                -1
+            },
+            crate::liveness::target_pc(code, &instr, prev_pypc, op_arg),
+            crate::liveness::exception_target_pc(code, prev_pypc),
+            ctx.vstack_last_ref
         );
     }
     // A JitCode's block layout can visit source-PC floor segments out of
