@@ -2805,6 +2805,43 @@ mod tests {
         );
     }
 
+    /// `format.py:45-50 getlabelname` — labels are numbered lazily, in
+    /// order of their first *printed* mention, and a label line counts as
+    /// a mention just as much as a jump operand.  A loop is the shape
+    /// that separates the two orders: the header's label line prints
+    /// before the back edge that targets it, so the header takes L1 even
+    /// though the forward exit is the first target the instruction stream
+    /// mentions.
+    #[test]
+    fn parity_back_edge_labels_number_by_first_printed_mention() {
+        let mut graph = FunctionGraph::new("loop");
+        let entry = graph.startblock;
+        let header = graph.create_block();
+        let exit = graph.create_block();
+
+        graph.set_goto(entry, header, vec![]);
+        let cond_var = graph
+            .push_op_var(header, OpKind::ConstInt(1), true)
+            .unwrap();
+        graph.set_branch(header, cond_var, header, vec![], exit, vec![]);
+        graph.set_return(exit, None);
+
+        let text = flat_to_text(&graph);
+        // Per-op result registers render `Variable.id()` (the
+        // PRE-EXISTING-ADAPTATION documented on `format_assembler`), a
+        // process-wide counter, so pin the label-bearing lines rather
+        // than the whole body.
+        let label_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("L1") || line.contains("L2"))
+            .collect();
+        assert_eq!(
+            label_lines,
+            vec!["L1:", "goto_if_not %i1, L2", "goto L1", "L2:"],
+            "loop header must be L1 and the forward exit L2: {text}",
+        );
+    }
+
     /// `flatten.py:108-109` — a `make_link` whose target is the final
     /// returnblock collapses into `make_return(link.args)`, so the
     /// flattened text never carries a separate `Jump` to the final

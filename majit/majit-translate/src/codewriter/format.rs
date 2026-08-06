@@ -8,8 +8,9 @@
 //!
 //! - Registers print as `%i<n>`, `%r<n>`, `%f<n>`.
 //! - Constants print as `$<value>` (matching `format.py:23`).
-//! - Labels print as `L<index>` (assigned in textual order, matching
-//!   `format.py`'s `getlabelname`).
+//! - Labels print as `L<index>`, numbered by first printed mention —
+//!   label line or jump operand, whichever comes first (matching
+//!   `format.py:45-50 getlabelname`).
 //! - `ListOfKind` argument groups print as `I[…]`, `R[…]`, `F[…]`
 //!   (matching `format.py:27`).
 //! - Call descriptors print via their `Debug` repr (matching
@@ -51,6 +52,28 @@ fn regorconst_repr(arg: &RegOrConst) -> String {
     }
 }
 
+/// `format.py:45-50 getlabelname(lbl)`.
+///
+/// Numbering is lazy: a label takes the next ordinal the first time it is
+/// *printed*, whether that mention is a jump operand (`format.py:24-25`
+/// `repr(TLabel)`) or the label line itself (`format.py:61-63`).  In a
+/// graph with a back edge the two orders differ — the loop header's label
+/// line prints before the back edge that targets it.  `None` is the
+/// `-1` sentinel the marking pass stores.
+fn getlabelname(
+    label: Label,
+    seenlabels: &mut HashMap<Label, Option<usize>>,
+    labelcount: &mut usize,
+) -> usize {
+    let slot = seenlabels.entry(label).or_insert(None);
+    if let Some(num) = *slot {
+        return num;
+    }
+    *labelcount += 1;
+    *slot = Some(*labelcount);
+    *labelcount
+}
+
 /// `format.py:12-81 format_assembler(ssarepr)`.  Per-arg kinds for
 /// `OpKind::Call` argument lists resolve via `getkind(v.concretetype)`
 /// read directly from each operand `Variable`'s `concretetype` cell
@@ -70,17 +93,11 @@ fn regorconst_repr(arg: &RegOrConst) -> String {
 /// `SSARepr` becomes self-contained and this formatter reads
 /// `Register.index` with neither a graph nor the regalloc result.
 pub fn format_assembler(ssarepr: &SSARepr) -> String {
-    // First pass: collect every label that appears as a target so the
-    // numbering matches format.py's getlabelname (labels are numbered in
-    // first-seen order).
-    let mut seenlabels: HashMap<Label, usize> = HashMap::new();
-    let mut next_label = 0usize;
-    let name_label = |label: Label, seen: &mut HashMap<Label, usize>, next: &mut usize| {
-        *seen.entry(label).or_insert_with(|| {
-            *next += 1;
-            *next
-        })
-    };
+    // format.py:37-44: the first pass only *marks* every label that
+    // appears as a jump target (`seenlabels[x.name] = -1`).  It assigns
+    // no numbers — those come from `getlabelname` during the output loop
+    // below.
+    let mut seenlabels: HashMap<Label, Option<usize>> = HashMap::new();
     for op in &ssarepr.insns {
         match op {
             FlatOp::Jump(label)
@@ -89,16 +106,17 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             | FlatOp::IntBinOpJumpIfOvf { target: label, .. }
             | FlatOp::GotoIfNot { target: label, .. }
             | FlatOp::GotoIfNotOp { target: label, .. } => {
-                name_label(*label, &mut seenlabels, &mut next_label);
+                seenlabels.insert(*label, None);
             }
             FlatOp::Switch { targets, .. } => {
                 for (_, label) in targets {
-                    name_label(*label, &mut seenlabels, &mut next_label);
+                    seenlabels.insert(*label, None);
                 }
             }
             _ => {}
         }
     }
+    let mut labelcount = 0usize;
 
     // format.py:53-55:
     //   insns = ssarepr.insns
@@ -120,8 +138,12 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             None => String::new(),
         };
         match op {
+            // format.py:61-63 — only a label the marking pass saw as a
+            // jump target gets a line, and printing that line is itself a
+            // first mention that can claim the next ordinal.
             FlatOp::Label(label) => {
-                if let Some(num) = seenlabels.get(label) {
+                if seenlabels.contains_key(label) {
+                    let num = getlabelname(*label, &mut seenlabels, &mut labelcount);
                     let _ = writeln!(out, "{prefix}L{num}:");
                 }
             }
@@ -134,22 +156,22 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 }
             }
             FlatOp::Jump(label) => {
-                let num = name_label(*label, &mut seenlabels, &mut next_label);
+                let num = getlabelname(*label, &mut seenlabels, &mut labelcount);
                 let _ = writeln!(out, "{prefix}goto L{num}");
             }
             FlatOp::CatchException { target } => {
-                let num = name_label(*target, &mut seenlabels, &mut next_label);
+                let num = getlabelname(*target, &mut seenlabels, &mut labelcount);
                 let _ = writeln!(out, "{prefix}catch_exception L{num}");
             }
             FlatOp::GotoIfExceptionMismatch { llexitcase, target } => {
-                let num = name_label(*target, &mut seenlabels, &mut next_label);
+                let num = getlabelname(*target, &mut seenlabels, &mut labelcount);
                 let _ = writeln!(
                     out,
                     "{prefix}goto_if_exception_mismatch ${llexitcase}, L{num}"
                 );
             }
             FlatOp::GotoIfNot { cond, target } => {
-                let num = name_label(*target, &mut seenlabels, &mut next_label);
+                let num = getlabelname(*target, &mut seenlabels, &mut labelcount);
                 let _ = writeln!(out, "{prefix}goto_if_not {}, L{num}", cond.repr());
             }
             FlatOp::GotoIfNotOp {
@@ -157,7 +179,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 args,
                 target,
             } => {
-                let num = name_label(*target, &mut seenlabels, &mut next_label);
+                let num = getlabelname(*target, &mut seenlabels, &mut labelcount);
                 let arglist = args
                     .iter()
                     .map(|reg| reg.repr())
@@ -169,7 +191,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let cases: Vec<String> = targets
                     .iter()
                     .map(|(key, label)| {
-                        let num = name_label(*label, &mut seenlabels, &mut next_label);
+                        let num = getlabelname(*label, &mut seenlabels, &mut labelcount);
                         format!("{key}:L{num}")
                     })
                     .collect();
@@ -192,7 +214,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                     crate::flatten::IntOvfOp::Sub => "int_sub_jump_if_ovf",
                     crate::flatten::IntOvfOp::Mul => "int_mul_jump_if_ovf",
                 };
-                let num = name_label(*target, &mut seenlabels, &mut next_label);
+                let num = getlabelname(*target, &mut seenlabels, &mut labelcount);
                 let _ = writeln!(
                     out,
                     "{prefix}{opname} L{num}, {}, {} -> {}",
@@ -818,6 +840,39 @@ mod tests {
         let text = format_assembler(&ssa);
         assert!(text.contains("goto L1"));
         assert!(text.contains("L1:"));
+    }
+
+    #[test]
+    fn format_label_numbering_follows_first_printed_mention() {
+        // `format.py:37-44` only marks the labels that appear as jump
+        // targets; `format.py:45-50 getlabelname` assigns the numbers
+        // lazily, so a label takes its ordinal from its first *printed*
+        // mention — the label line counts just as much as a jump operand.
+        //
+        // In a loop the header's label line prints before the back edge
+        // that targets it, so the header is L1 even though the forward
+        // exit is the first target the instruction stream mentions.
+        let header = Label(10);
+        let exit = Label(20);
+        let mut ssa = empty_ssa();
+        ssa.insns.push(FlatOp::Label(header));
+        ssa.insns.push(FlatOp::GotoIfNot {
+            cond: crate::flatten::Register::new(RegKind::Int, 0),
+            target: exit,
+        });
+        ssa.insns.push(FlatOp::Jump(header));
+        ssa.insns.push(FlatOp::EndOfBlock);
+        ssa.insns.push(FlatOp::Label(exit));
+        assert_format(
+            &ssa,
+            "
+            L1:
+            goto_if_not %i0, L2
+            goto L1
+            ---
+            L2:
+            ",
+        );
     }
 
     #[test]
