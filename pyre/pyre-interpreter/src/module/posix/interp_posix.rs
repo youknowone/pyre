@@ -3374,6 +3374,47 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
     }
 
+    /// The Windows counterpart of `stat_fields_from_libc`.  `win32_xstat` and
+    /// `fstat` fill the same `StatStruct`, so routing both entry points
+    /// through it is what lets a name and a descriptor for one file report one
+    /// identity — `st_ino`/`st_dev` were previously reported as 0 from a path,
+    /// which made every file look like every other one.
+    ///
+    /// `st_ctime` carries the creation time, which is the value the field has
+    /// always held here; `StatStruct` keeps that under `st_birthtime` and
+    /// leaves its own `st_ctime` at zero.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    fn stat_fields_from_statstruct(
+        st: &rustpython_host_env::fileutils::StatStruct,
+    ) -> StatFields {
+        StatFields {
+            mode: st.st_mode as i64,
+            ino: st.st_ino as i64,
+            dev: st.st_dev as i64,
+            nlink: st.st_nlink as i64,
+            uid: st.st_uid as i64,
+            gid: st.st_gid as i64,
+            size: st.st_size as i64,
+            atime: st.st_atime as i64,
+            mtime: st.st_mtime as i64,
+            ctime: st.st_birthtime as i64,
+            atime_ns: st.st_atime as i64 * 1_000_000_000 + st.st_atime_nsec as i64,
+            mtime_ns: st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
+            ctime_ns: st.st_birthtime as i64 * 1_000_000_000 + st.st_birthtime_nsec as i64,
+        }
+    }
+
+    /// `win32_xstat` for a byte path.  `os.stat`, `DirEntry.stat` and
+    /// `DirEntry.inode` all go through here so that one file has one identity
+    /// however it was reached; reaching only some of them would leave
+    /// `entry.inode()` and `os.stat(entry.path).st_ino` disagreeing.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    fn win_stat_fields(path: &[u8], follow_symlinks: bool) -> std::io::Result<StatFields> {
+        let os_path = os_str_from_bytes(path);
+        rustpython_host_env::nt::win32_xstat(&os_path, follow_symlinks)
+            .map(|st| stat_fields_from_statstruct(&st))
+    }
+
     /// Where the `host_env::posix`-backed implementations below are compiled.
     /// Elsewhere those names are the noop placeholders registered near the top
     /// of this function, which cannot serve a descriptor.
@@ -3564,7 +3605,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path.w_path()))?;
             return Ok(make_stat_result_from_statbuf(&buf));
         }
-        #[cfg(not(feature = "sandbox"))]
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        {
+            return match win_stat_fields(&path.as_bytes, follow_symlinks) {
+                Ok(fields) => Ok(stat_result_from_fields(&fields, 0)),
+                Err(e) => Err(fs_err_with_filename2(
+                    e,
+                    2,
+                    path.w_path(),
+                    pyre_object::PY_NULL,
+                )),
+            };
+        }
+        #[cfg(all(
+            not(feature = "sandbox"),
+            not(all(windows, feature = "host_env"))
+        ))]
         {
             let meta = if follow_symlinks {
                 host_fs::metadata(path_from_bytes(&path.as_bytes).as_ref())
@@ -3725,19 +3781,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 return Ok(pyre_object::w_int_new(st.st_ino as i64));
             }
         }
-        let meta = host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
-            .map_err(|e| fs_err_with_filename(e, w_path))?;
-        #[cfg(unix)]
-        let ino = {
-            use std::os::unix::fs::MetadataExt;
-            meta.ino() as i64
-        };
-        #[cfg(not(unix))]
-        let ino = {
-            let _ = &meta;
-            0i64
-        };
-        Ok(pyre_object::w_int_new(ino))
+        // `posixmodule.c DirEntry_inode` reads the same file index `os.stat`
+        // reports, so the 0 this used to answer with on Windows disagreed with
+        // `os.stat(entry.path).st_ino`.
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        {
+            let fields =
+                win_stat_fields(&path, false).map_err(|e| fs_err_with_filename(e, w_path))?;
+            return Ok(pyre_object::w_int_new(fields.ino));
+        }
+        #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
+        {
+            let meta = host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
+                .map_err(|e| fs_err_with_filename(e, w_path))?;
+            #[cfg(unix)]
+            let ino = {
+                use std::os::unix::fs::MetadataExt;
+                meta.ino() as i64
+            };
+            #[cfg(not(unix))]
+            let ino = {
+                let _ = &meta;
+                0i64
+            };
+            Ok(pyre_object::w_int_new(ino))
+        }
     }
     fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (w_path, path) = dir_entry_path(args[0])?;
@@ -3758,20 +3826,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 ));
             }
         }
-        let meta = if follow {
-            host_fs::metadata(path_from_bytes(&path).as_ref())
-        } else {
-            host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
-        };
-        match meta {
-            Ok(m) => {
-                #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
-                let st_flags = macos_path_st_flags(&path, follow);
-                #[cfg(not(all(target_os = "macos", not(feature = "sandbox"))))]
-                let st_flags = 0u32;
-                Ok(make_stat_result(&m, st_flags))
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        {
+            return match win_stat_fields(&path, follow) {
+                Ok(fields) => Ok(stat_result_from_fields(&fields, 0)),
+                Err(e) => Err(fs_err_with_filename(e, w_path)),
+            };
+        }
+        #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
+        {
+            let meta = if follow {
+                host_fs::metadata(path_from_bytes(&path).as_ref())
+            } else {
+                host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
+            };
+            match meta {
+                Ok(m) => {
+                    #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
+                    let st_flags = macos_path_st_flags(&path, follow);
+                    #[cfg(not(all(target_os = "macos", not(feature = "sandbox"))))]
+                    let st_flags = 0u32;
+                    Ok(make_stat_result(&m, st_flags))
+                }
+                Err(e) => Err(fs_err_with_filename(e, w_path)),
             }
-            Err(e) => Err(fs_err_with_filename(e, w_path)),
         }
     }
     fn dir_entry_fspath(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
