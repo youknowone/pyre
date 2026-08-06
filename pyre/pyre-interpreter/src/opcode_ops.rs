@@ -246,7 +246,15 @@ pub fn match_mapping_value(subject: PyObjectRef) -> PyObjectRef {
 pub fn match_sequence_value(subject: PyObjectRef) -> PyObjectRef {
     let is_sequence = unsafe {
         let ty = crate::typedef::r#type(subject).map_or(std::ptr::null_mut(), |p| p.as_ptr());
-        pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) == b'S'
+        match pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) {
+            b'M' => false,
+            flag => {
+                let is_sequence = flag == b'S';
+                is_sequence
+                    && !crate::baseobjspace::isinstance_str_w(subject)
+                    && !crate::baseobjspace::isinstance_bytes_like_w(subject)
+            }
+        }
     };
     w_bool_from(is_sequence)
 }
@@ -346,6 +354,15 @@ pub fn match_class_value(
                 )));
             }
             for attr_obj in ma.into_iter().take(count) {
+                // pyopcode.py:2105-2108 — reject a non-string element before it
+                // reaches the attribute lookup.  The bundled test only asserts
+                // the exception type, so the quoted `%T` wording is kept.
+                if unsafe { !crate::baseobjspace::isinstance_str_w(attr_obj) } {
+                    let got = crate::type_methods::arg_type_name(attr_obj);
+                    return Err(PyError::type_error(format!(
+                        "__match_args__ elements must be strings (got '{got}')"
+                    )));
+                }
                 let attr_name = match unsafe { pyre_object::w_str_get_value_opt(attr_obj) } {
                     Some(s) => s,
                     None => {
