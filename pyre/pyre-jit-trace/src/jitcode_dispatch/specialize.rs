@@ -805,7 +805,6 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
             .class_now_known(raised, exc_type);
         ctx.trace_ctx
             .set_opref_concrete(raised, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
-        fbw_built_exc_insert(raised);
 
         // This replaces one concretely executed may-force residual.  Publish
         // the same pending-exception state its executor arm would establish so

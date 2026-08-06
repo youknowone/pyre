@@ -476,6 +476,8 @@ pub const EXC_ARGS_W_OFFSET: usize = std::mem::offset_of!(W_BaseException, args_
 pub const EXC_W_CAUSE_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_cause);
 pub const EXC_W_CONTEXT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_context);
 pub const EXC_W_TRACEBACK_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_traceback);
+pub const EXC_SUPPRESS_CONTEXT_OFFSET: usize =
+    std::mem::offset_of!(W_BaseException, suppress_context);
 pub const EXC_W_OBJECT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_object);
 pub const EXC_W_START_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_start);
 pub const EXC_W_END_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_end);

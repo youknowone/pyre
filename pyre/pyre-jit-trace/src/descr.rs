@@ -2279,18 +2279,18 @@ use pyre_object::functional::{
     RANGE_LENGTH_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
 };
 use pyre_object::interp_exceptions::{
-    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET,
-    EXC_W_CODE_OFFSET, EXC_W_CONTEXT_OFFSET, EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET,
-    EXC_W_END_OFFSET, EXC_W_ERRNO_OFFSET, EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET,
-    EXC_W_GROUP_EXCEPTIONS_OFFSET, EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET,
-    EXC_W_IMPORT_MSG_OFFSET, EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET,
-    EXC_W_NAME_OFFSET, EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET,
-    EXC_W_STRERROR_OFFSET, EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET,
-    EXC_W_SYNTAX_FILENAME_OFFSET, EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET,
-    EXC_W_SYNTAX_MSG_OFFSET, EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
-    EXC_W_SYNTAX_TEXT_OFFSET, EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET,
-    EXC_W_WINERROR_OFFSET, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE,
-    exc_kind_to_pytype,
+    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_SUPPRESS_CONTEXT_OFFSET,
+    EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET, EXC_W_CODE_OFFSET, EXC_W_CONTEXT_OFFSET,
+    EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET, EXC_W_END_OFFSET, EXC_W_ERRNO_OFFSET,
+    EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET, EXC_W_GROUP_EXCEPTIONS_OFFSET,
+    EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET, EXC_W_IMPORT_MSG_OFFSET,
+    EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET, EXC_W_NAME_OFFSET,
+    EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET, EXC_W_STRERROR_OFFSET,
+    EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET, EXC_W_SYNTAX_FILENAME_OFFSET,
+    EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET, EXC_W_SYNTAX_MSG_OFFSET,
+    EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET, EXC_W_SYNTAX_TEXT_OFFSET,
+    EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET, EXC_W_WINERROR_OFFSET,
+    ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::W_CLASS_OFFSET;
@@ -3484,9 +3484,10 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// SizeDescr + field descrs for `W_BaseException` allocation via
 /// NewWithVtable, one set per `ExcKind`.  The vtable (`ob_type`) differs
 /// per kind (`exc_kind_to_pytype`), so each kind owns its group; the
-/// three SetField'd fields — `kind`, `w_class`, `args_w` — share the
-/// same offsets across kinds.  `w_cause`/`w_context`/… stay zeroed by
-/// the `NewWithVtable` memzero (PY_NULL), matching
+/// four SetField'd fields — `kind`, `w_class`, `args_w`, and
+/// `suppress_context` — share the same offsets across kinds.
+/// `w_cause`/`w_context`/… stay zeroed by
+/// GC pointer clearing (PY_NULL), matching
 /// `w_exception_new_empty`.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
     build_object_descr_group_with_def_path(
@@ -3838,6 +3839,17 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
                 false,
             ),
+            // This plain byte is not included in gc_fielddescrs, so a nursery
+            // allocation must initialize it explicitly.
+            (
+                "W_BaseException.suppress_context",
+                EXC_SUPPRESS_CONTEXT_OFFSET,
+                1,
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
         ],
         // Empty name: the per-kind vtable means a shared "W_BaseException"
         // name-registry slot would be first-write-wins and lose the other
@@ -3906,6 +3918,22 @@ pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
         .iter()
         .position(|d| d.offset() == pyre_object::interp_exceptions::EXC_W_DICT_OFFSET)
         .expect("exception descr group has no w_dict field");
+    field_descr_from_group(group, field)
+}
+
+/// Field descr for the plain `W_BaseException.suppress_context` byte.
+pub fn w_exception_suppress_context_descr(kind: ExcKind) -> DescrRef {
+    let idx = kind as u8 as usize;
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let group = cache[idx].as_ref().unwrap();
+    let field = group
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == EXC_SUPPRESS_CONTEXT_OFFSET)
+        .expect("exception descr group has no suppress_context field");
     field_descr_from_group(group, field)
 }
 
