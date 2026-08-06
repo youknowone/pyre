@@ -5175,6 +5175,17 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `getattr(type, name)` whose class-MRO value is returned unchanged:
+    // pin receiver, name, and the receiver version, then use the green value.
+    // Non-matching shapes fall through to the generic residual.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_builtin_type_getattr(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // An exact `range(...)` constructor call becomes a virtual W_Range whose
     // four wrapped-int fields can fold directly into GET_ITER virtualization.
     // Non-canonical callables and arguments fall through to the residual.
@@ -6128,6 +6139,21 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     dst_bank,
                 )? {
                     return Ok(inlined);
+                }
+                // A type receiver whose class-MRO value needs no descriptor
+                // binding folds to that value under receiver + version pins.
+                if try_walker_specialize_load_type_attr(
+                    ctx,
+                    op.pc,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
         }

@@ -16,6 +16,7 @@
 //! call into these entry points.
 
 use super::*;
+use rustpython_wtf8::Wtf8;
 
 /// `residual_call` shape `iRd>X` dispatcher. Reads `funcptr (i)`,
 /// R-list args, and `descr`, runs `_build_allboxes` to produce the
@@ -3323,6 +3324,55 @@ pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(w_name as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, name_op)?;
+    Ok(Some(()))
+}
+
+/// Fold `LOAD_ATTR` on a type receiver when
+/// [`pyre_interpreter::type_attr_value_fast_path`] proves that
+/// `typeobject.py:811-828` returns the class-MRO value unchanged.  The exact
+/// receiver and its version tag are pinned before the value is written as a
+/// green constant.  [`pyre_interpreter::mutated`] recursively invalidates
+/// subclasses, so the one receiver pin covers reassignment or deletion on any
+/// base class as well.
+///
+/// The name needs no operand guard: the codewriter baked its `co_names` index
+/// into the residual.  This read-only, present-attribute fold cannot raise, so
+/// unlike the classmethod method-load fold it is safe inside an inlined callee
+/// sub-walk; resuming past it cannot repeat a side effect.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, _version_tag, w_value)) = (unsafe {
+        pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name.as_str()))
+    }) else {
+        return Ok(None);
+    };
+
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(obj, w_type_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+
+    let value_const = ctx.trace_ctx.const_ref(w_value as i64);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value_const)?;
     Ok(Some(()))
 }
 
@@ -6745,6 +6795,122 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
         box_int_concrete(concrete_len as i64, boxed_result as i64),
     );
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
+/// Fold plain `getattr(type, name)` when
+/// [`pyre_interpreter::type_attr_value_fast_path`] proves that
+/// `typeobject.py:811-828` returns the class-MRO value unchanged.  The exact
+/// callable, exact receiver, exact name object, and receiver version are pinned
+/// before the value is written as a green constant.  Pinning the callable makes
+/// a rebound `getattr` side-exit instead of continuing to use the folded value.
+/// The operand guards are tautologies when their inputs are already constants
+/// and disappear during optimization.
+/// [`pyre_interpreter::mutated`] recursively invalidates subclasses, so the
+/// receiver's one quasi-immutable version watcher covers base-class mutation
+/// and emits no per-iteration operations.
+///
+/// Like the `len` fold this is safe in an inlined callee sub-walk: the oracle
+/// proves a read-only present attribute, so it cannot raise or introduce a
+/// side effect that resume would repeat.  Every other shape declines before
+/// emitting IR and falls through to the generic residual.
+pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, obj, name)` shape only.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_name),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
+    // prepends as arg0 — not a plain `getattr(type, name)` call.
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || concrete_obj.is_null()
+        || concrete_name.is_null()
+    {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_getattr_function(concrete_callable) {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
+        return Ok(None);
+    }
+    let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+    let Some((w_type, _version_tag, w_value)) =
+        (unsafe { pyre_interpreter::type_attr_value_fast_path(concrete_obj, name) })
+    else {
+        return Ok(None);
+    };
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[callable_op, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+
+    let obj_ref = r_args[2];
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    if !obj_ref.is_constant() {
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[obj_ref, w_type_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(obj_ref, w_type_const);
+    }
+
+    // The baked WTF-8 bytes remain constant only while this exact string is
+    // the name operand.  Constant operands make this guard a removable
+    // tautology, so it costs nothing in the steady loop.
+    let name_ref = r_args[3];
+    let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+    if !name_ref.is_constant() {
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[name_ref, name_const],
+        )?;
+    }
+
+    // typeobject.py `promote(self.version_tag())`: this quasi-immutable watcher
+    // emits no per-iteration op. `mutated` (baseobjspace.rs) recurses through
+    // subclasses, so changing the attribute on any base invalidates this pin.
+    walker_pin_type_version_tag(ctx, op.pc, w_type_const)?;
+
+    let value_const = ctx.trace_ctx.const_ref(w_value as i64);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', value_const)?;
     Ok(Some(()))
 }
 

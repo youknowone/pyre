@@ -9636,6 +9636,58 @@ pub unsafe fn type_name_obj_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef
     (!w_name.is_null()).then_some((metatype, w_name))
 }
 
+/// `typeobject.py:811-828 W_TypeObject.descr_getattribute` fast path for the
+/// exact shape that returns a value from the class namespace unchanged.  The
+/// receiver must be a cacheable type whose metaclass is exactly `type`; a
+/// metatype data descriptor, a missing class-MRO value, or any value with a
+/// descriptor protocol declines.
+///
+/// The value type must additionally be a non-heap builtin type.  Its namespace
+/// cannot be mutated from Python and it cannot be the target of a `__class__`
+/// assignment, so an absent `__get__` remains absent for the life of the trace.
+/// Consequently the fold needs only the receiver type's one version pin.
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
+pub unsafe fn type_attr_value_fast_path(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+        return None;
+    }
+    let w_type = w_obj;
+    // `is_type` answers for the object's physical layout — every type object
+    // carries the same `ob_type` — so it says nothing about the metaclass.
+    // `getclass()` (baseobjspace.py) reads the metaclass off `w_class`; only
+    // `type` itself resolves the name through `type.__getattribute__`, so any
+    // other metaclass declines rather than have its `__getattribute__`
+    // override bypassed.
+    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    if !std::ptr::eq(metatype, crate::typedef::w_type()) {
+        return None;
+    }
+    let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
+    if version_tag == 0 {
+        return None;
+    }
+    // typeobject.py:814-823: a metatype data descriptor preempts the class's
+    // own MRO, while a non-data metatype entry loses to the class value.
+    if lookup_in_type_wtf8(metatype, name).is_some_and(|descr| is_data_descr(descr)) {
+        return None;
+    }
+    let w_value = lookup_in_type_wtf8(w_type, name)?;
+    // typeobject.py:822 calls `space.get(w_value, w_None, self)`.  Only a
+    // value with no descriptor protocol is returned unchanged.
+    let value_type = crate::typedef::r#type(w_value)?.as_ptr();
+    if lookup_in_type(value_type, "__get__").is_some()
+        || pyre_object::w_type_is_heaptype(value_type)
+    {
+        return None;
+    }
+    Some((w_type, version_tag, w_value))
+}
+
 /// `callmethod.py`'s `w_obj.getdictvalue(space, name)` shadowing check,
 /// restricted to a probe that neither allocates nor runs Python.
 ///

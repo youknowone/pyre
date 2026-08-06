@@ -4045,6 +4045,13 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
     }
 }
 
+/// True iff `callable` is the builtin `getattr` function object — a
+/// builtin-code function whose code wraps [`builtin_getattr`].  The JIT
+/// walker uses this to recognize a plain `getattr(type, name)` residual.
+pub fn is_builtin_getattr_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, builtin_getattr)
+}
+
 /// True iff `callable` is the builtin `locals` function object.
 ///
 /// The JIT walker uses this to recognize the `locals()` residual it can
