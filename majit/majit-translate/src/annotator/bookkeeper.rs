@@ -756,26 +756,34 @@ impl Bookkeeper {
         pairs.sort();
 
         for (root, variant_names) in pairs {
-            // Materialize the discriminant-only base classdef before a
-            // variant references it through `getmro`; idempotent with the
-            // struct-root loop.  `canonical_struct_name(root)` is the same
-            // spelling `intern_enum_variant_host` resolves the base under,
-            // so the pre-mint and the discriminant-narrowing resolver share
-            // one base lineage and the variant subtree numbers as one
-            // bracket.
-            let canon_root = majit_ir::descr::canonical_struct_name(&root);
-            let base = self.intern_class_by_qualname(&canon_root);
-            let _ = self.getuniqueclassdef(&base);
-            for variant in variant_names {
-                // The SAME interning primitive the discriminant-narrowing
-                // resolver ([`Self::getuniqueclassdef_for_enum_variant`])
-                // and the variant ctor arm (`flowspace_adapter`) use, so
-                // all three sites resolve ONE variant classdef under the
-                // `::`-qualified key — no `.`-vs-`::` split that would mint
-                // a second, distinct sibling the single numbering pass never
-                // reaches.
-                let variant_host = self.intern_enum_variant_host(&root, &variant);
-                let _ = self.getuniqueclassdef(&variant_host);
+            // Each variant is resolved through the canonical resolver, which
+            // materializes the discriminant-only base first
+            // ([`Self::getuniqueclassdef_for_struct_root`]) before interning
+            // the variant subclass — so the pre-mint and the
+            // discriminant-narrowing resolver share one base lineage and the
+            // variant subtree still numbers as one contiguous bracket.
+            for variant in &variant_names {
+                // Resolve each variant through the canonical resolver rather
+                // than a bare intern.  It mints the discriminant-only base,
+                // interns the variant subclass under the same `::`-qualified
+                // key the discriminant-narrowing resolver and the variant ctor
+                // arm use (so all three resolve ONE variant classdef, no
+                // `.`-vs-`::` sibling split the single numbering pass misses),
+                // AND projects the variant's payload rows — draining any
+                // struct the payload first reaches — before it returns.
+                //
+                // The payload projection is what a bare intern skipped: a
+                // variant field typed `*mut PyObject` would otherwise stay an
+                // untyped FORCE shell until subject-flow narrowing first
+                // resolves it (`enum_variant_narrowing_knowntypedata` ->
+                // `getuniqueclassdef_for_enum_variant`), where a first-intern
+                // of the pointee struct mid-fixpoint generalises an
+                // already-annotated cell.  Projecting here — at prologue time,
+                // before `assign_inheritance_ids` and any subject flow, with
+                // the pending drain inside the call — makes the variant's
+                // payload classdefs order-independent, the same contract the
+                // struct-root loop above relies on.
+                let _ = self.getuniqueclassdef_for_enum_variant(&root, variant);
             }
         }
     }
