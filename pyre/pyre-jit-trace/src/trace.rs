@@ -2702,8 +2702,21 @@ fn try_adopt_multi_frame_blackhole(
             }
         };
     }
+    // Same gate, for a line that reports recovered state rather than a refusal.
+    // A census groups these lines by their tag, so a report emitted under the
+    // decline tag is counted as one.
+    macro_rules! mfstate {
+        ($($a:tt)*) => {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!("[s2-adopt-state] {}", format!($($a)*));
+            }
+        };
+    }
     let Some(mut latched) = crate::jitcode_dispatch::take_multi_frame_blackhole() else {
-        mfdbg!("no latched multi-frame image");
+        // `try_adopt_blackhole` tries this arm first and the single-frame arm
+        // second, so an absent multi-frame image is the ordinary dispatch
+        // fallthrough for every single-frame latch, not a capability gap.
+        mfdbg!("no latched multi-frame image; single-frame adopt follows");
         return false;
     };
     let depth = latched.framestack.len();
@@ -2807,7 +2820,7 @@ fn try_adopt_multi_frame_blackhole(
     // The root gate stays regardless: a residual-intermediate chain is not an
     // MIFrame stack rooted at this portal and cannot reuse this walk's restart
     // coordinate.
-    mfdbg!(
+    mfstate!(
         "chain root={root_addr:#x} cf_addr={cf_addr:#x} levels=[{}]",
         per_frame
             .iter()

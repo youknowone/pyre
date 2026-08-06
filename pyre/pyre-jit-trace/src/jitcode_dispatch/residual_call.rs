@@ -451,18 +451,25 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
         _ => sym.live_vable_frame_addr(),
     };
     let root = if live_root != 0 { live_root } else { snapshot };
-    latchdbg!(
-        "origin={origin} pf-root-caps snapshot={snapshot:#x} root={root:#x} nlocals={} locals={} writeback={} publish={}",
-        crate::state::concrete_nlocals(snapshot).is_some(),
-        crate::state::capture_frame_locals(root).is_some(),
-        crate::state::can_write_back_outer_locals(ctx.trace_ctx, root),
-        crate::state::can_publish_frame_stack(snapshot, root)
-    );
-    if crate::state::concrete_nlocals(snapshot).is_none()
-        || crate::state::capture_frame_locals(root).is_none()
-        || !crate::state::can_write_back_outer_locals(ctx.trace_ctx, root)
-        || !crate::state::can_publish_frame_stack(snapshot, root)
-    {
+    // Named by the first capability that refuses, and reported only then.
+    // Emitted ahead of the test, the line announced every passing preflight
+    // under the decline tag as well, so a census could not tell a rejected root
+    // from an accepted one.
+    let refused = if crate::state::concrete_nlocals(snapshot).is_none() {
+        Some("nlocals")
+    } else if crate::state::capture_frame_locals(root).is_none() {
+        Some("locals")
+    } else if !crate::state::can_write_back_outer_locals(ctx.trace_ctx, root) {
+        Some("writeback")
+    } else if !crate::state::can_publish_frame_stack(snapshot, root) {
+        Some("publish")
+    } else {
+        None
+    };
+    if let Some(refused) = refused {
+        latchdbg!(
+            "origin={origin} pf-root-caps snapshot={snapshot:#x} root={root:#x} refused={refused}"
+        );
         return false;
     }
 
@@ -844,6 +851,16 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
             }
         };
     }
+    // The build's one success report.  It has to carry its own tag: a census
+    // groups these lines by their `[…-decline]` prefix, so a completed build
+    // announced under that prefix is counted as a refusal.
+    macro_rules! s2built {
+        ($($a:tt)*) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[s2-build-ok] {}", format!($($a)*));
+            }
+        };
+    }
     let session = ctx.session.borrow();
     if session.framestack.is_empty() {
         s2dbg!(
@@ -949,7 +966,7 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         return None;
     };
     frames.push(innermost);
-    s2dbg!(
+    s2built!(
         "origin={origin} BUILT multi-frame depth={}",
         frames.frames.len()
     );
