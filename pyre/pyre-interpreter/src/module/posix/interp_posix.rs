@@ -1286,8 +1286,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // which hand a `sched_param` back and forth; there is no such type
             // here.
             "sched_yield",
-            "confstr",
-            "confstr_names",
+            // "confstr"/"confstr_names" — the host's string-valued configuration
+            // table, published below where the host defines one. A build with no
+            // `<unistd.h>` behind it has no `confstr` at all, which is what the
+            // name being absent says.
             "sysconf",
             "sysconf_names",
             // "setenv" — the entry point is spelled `putenv`, and there is no
@@ -6891,31 +6893,43 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ];
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
         const PATHCONF_NAMES: &[(&str, i32)] = &[];
-        let _pathconf_roots = pyre_object::gc_roots::push_roots();
-        let names_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
-        for (name, value) in PATHCONF_NAMES {
-            // The value is allocated before the store, and the dict is reloaded
-            // from its root slot every iteration because the insert itself can
-            // grow — and so relocate — the dict.
-            let w_value = pyre_object::w_int_new(*value as i64);
-            unsafe {
-                pyre_object::w_dict_setitem_str(
-                    pyre_object::gc_roots::shadow_stack_get(names_slot),
-                    name,
-                    w_value,
-                )
-            };
+        /// The dict a `conv_confname` table is published as — `pathconf_names`
+        /// for `pathconf`, `confstr_names` for `confstr`.
+        fn store_names_dict(ns: PyObjectRef, key: &str, table: &[(&str, i32)]) {
+            let _names_roots = pyre_object::gc_roots::push_roots();
+            let names_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+            for (name, value) in table {
+                // The value is allocated before the store, and the dict is
+                // reloaded from its root slot every iteration because the
+                // insert itself can grow — and so relocate — the dict.
+                let w_value = pyre_object::w_int_new(*value as i64);
+                unsafe {
+                    pyre_object::w_dict_setitem_str(
+                        pyre_object::gc_roots::shadow_stack_get(names_slot),
+                        name,
+                        w_value,
+                    )
+                };
+            }
+            crate::module_ns_store(ns, key, pyre_object::gc_roots::shadow_stack_get(names_slot));
         }
-        crate::module_ns_store(
-            ns,
-            "pathconf_names",
-            pyre_object::gc_roots::shadow_stack_get(names_slot),
-        );
+        store_names_dict(ns, "pathconf_names", PATHCONF_NAMES);
 
-        /// `posixmodule.c conv_path_confname`: an `int` passes through, a
-        /// `str` is resolved through `pathconf_names`.
-        fn confname_arg(w: PyObjectRef) -> Result<i32, crate::PyError> {
+        /// A limit the host has no determinate answer for. `pathconf` reports
+        /// it as `-1` with the errno left alone, which the host wrapper spells
+        /// `None` — but `interp_posix.py:2433` hands whatever `pathconf`
+        /// returned straight to `space.newint`, so what the caller sees is the
+        /// number `-1`. `PC_ASYNC_IO` and `PC_SYMLINK_MAX` answer this way on
+        /// hosts that do not implement them, and `None` is neither the value
+        /// nor the type the caller can compare against a limit.
+        fn indeterminate_limit(limit: Option<libc::c_long>) -> i64 {
+            limit.map_or(-1, |v| v as i64)
+        }
+
+        /// `posixmodule.c conv_confname`: an `int` passes through, a `str` is
+        /// resolved through the table the caller's entry point publishes.
+        fn confname_arg(w: PyObjectRef, table: &[(&str, i32)]) -> Result<i32, crate::PyError> {
             if unsafe { pyre_object::is_str(w) } {
                 // A str carrying a lone surrogate has no `&str` view.  It simply
                 // matches no known name, which is the ValueError below — not an
@@ -6924,7 +6938,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let name = unsafe { pyre_object::w_str_get_value_opt(w) };
                 return name
                     .and_then(|name| {
-                        PATHCONF_NAMES
+                        table
                             .iter()
                             .find(|(known, _)| *known == name)
                             .map(|(_, value)| *value)
@@ -6971,7 +6985,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // reads `path.as_fd != -1`.
                     let path =
                         crate::gateway::fsencode_path_or_fd_w(args[0], "pathconf", HAVE_FPATHCONF)?;
-                    let name = confname_arg(args[1])?;
+                    let name = confname_arg(args[1], PATHCONF_NAMES)?;
                     let limit = if path.as_fd != -1 {
                         host_posix::fpathconf(path.as_fd, name).map_err(|e| io_err(e, ""))?
                     } else {
@@ -6982,10 +6996,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         host_posix::pathconf(&cpath, name)
                             .map_err(|e| io_err_with_filename(e, path.w_path()))?
                     };
-                    match limit {
-                        Some(v) => Ok(pyre_object::w_int_new(v as i64)),
-                        None => Ok(pyre_object::w_none()),
-                    }
+                    Ok(pyre_object::w_int_new(indeterminate_limit(limit)))
                 },
                 2,
             ),
@@ -7003,11 +7014,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     // interp_posix.py:2411 `@unwrap_spec(fd=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let name = confname_arg(args[1])?;
-                    match host_posix::fpathconf(fd, name).map_err(|e| io_err(e, ""))? {
-                        Some(v) => Ok(pyre_object::w_int_new(v as i64)),
-                        None => Ok(pyre_object::w_none()),
-                    }
+                    let name = confname_arg(args[1], PATHCONF_NAMES)?;
+                    let limit = host_posix::fpathconf(fd, name).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_int_new(indeterminate_limit(limit)))
                 },
                 2,
             ),
@@ -7072,6 +7081,116 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ns,
             "sysconf_names",
             pyre_object::gc_roots::shadow_stack_get(names_slot),
+        );
+
+        // `posixmodule.c` `posix_constants_confstr` — the `_CS_*` table
+        // `conv_confstr_confname` resolves a string `name` argument through,
+        // and the same candidate set `rposix.py:2248-2300` names. Every entry
+        // there is `#ifdef`-guarded, so a host publishes exactly the names its
+        // own `<unistd.h>` defines; `libc` carries `_CS_PATH` alone, and the
+        // two numberings disagree from that first entry on — it is 1 on the
+        // Apple targets and 0 in glibc's `bits/confname.h` enum. The ten names
+        // the candidate set carries for the System V hosts (`CS_ARCHITECTURE`,
+        // `CS_HOSTNAME`, `CS_HW_PROVIDER`, `CS_HW_SERIAL`, `CS_INITTAB_NAME`,
+        // `CS_MACHINE`, `CS_RELEASE`, `CS_SRPC_DOMAIN`, `CS_SYSNAME`,
+        // `CS_VERSION`) are defined by neither header, so neither table has
+        // them.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        const CONFSTR_NAMES: &[(&str, i32)] = &[
+            ("CS_PATH", 1),
+            ("CS_XBS5_ILP32_OFF32_CFLAGS", 20),
+            ("CS_XBS5_ILP32_OFF32_LDFLAGS", 21),
+            ("CS_XBS5_ILP32_OFF32_LIBS", 22),
+            ("CS_XBS5_ILP32_OFF32_LINTFLAGS", 23),
+            ("CS_XBS5_ILP32_OFFBIG_CFLAGS", 24),
+            ("CS_XBS5_ILP32_OFFBIG_LDFLAGS", 25),
+            ("CS_XBS5_ILP32_OFFBIG_LIBS", 26),
+            ("CS_XBS5_ILP32_OFFBIG_LINTFLAGS", 27),
+            ("CS_XBS5_LP64_OFF64_CFLAGS", 28),
+            ("CS_XBS5_LP64_OFF64_LDFLAGS", 29),
+            ("CS_XBS5_LP64_OFF64_LIBS", 30),
+            ("CS_XBS5_LP64_OFF64_LINTFLAGS", 31),
+            ("CS_XBS5_LPBIG_OFFBIG_CFLAGS", 32),
+            ("CS_XBS5_LPBIG_OFFBIG_LDFLAGS", 33),
+            ("CS_XBS5_LPBIG_OFFBIG_LIBS", 34),
+            ("CS_XBS5_LPBIG_OFFBIG_LINTFLAGS", 35),
+        ];
+        // glibc numbers the enum from zero and restarts it twice, at 1000 for
+        // the large-file names and at 1100 for the XBS5 ones.
+        #[cfg(target_os = "linux")]
+        const CONFSTR_NAMES: &[(&str, i32)] = &[
+            ("CS_PATH", 0),
+            ("CS_GNU_LIBC_VERSION", 2),
+            ("CS_GNU_LIBPTHREAD_VERSION", 3),
+            ("CS_LFS_CFLAGS", 1000),
+            ("CS_LFS_LDFLAGS", 1001),
+            ("CS_LFS_LIBS", 1002),
+            ("CS_LFS_LINTFLAGS", 1003),
+            ("CS_LFS64_CFLAGS", 1004),
+            ("CS_LFS64_LDFLAGS", 1005),
+            ("CS_LFS64_LIBS", 1006),
+            ("CS_LFS64_LINTFLAGS", 1007),
+            ("CS_XBS5_ILP32_OFF32_CFLAGS", 1100),
+            ("CS_XBS5_ILP32_OFF32_LDFLAGS", 1101),
+            ("CS_XBS5_ILP32_OFF32_LIBS", 1102),
+            ("CS_XBS5_ILP32_OFF32_LINTFLAGS", 1103),
+            ("CS_XBS5_ILP32_OFFBIG_CFLAGS", 1104),
+            ("CS_XBS5_ILP32_OFFBIG_LDFLAGS", 1105),
+            ("CS_XBS5_ILP32_OFFBIG_LIBS", 1106),
+            ("CS_XBS5_ILP32_OFFBIG_LINTFLAGS", 1107),
+            ("CS_XBS5_LP64_OFF64_CFLAGS", 1108),
+            ("CS_XBS5_LP64_OFF64_LDFLAGS", 1109),
+            ("CS_XBS5_LP64_OFF64_LIBS", 1110),
+            ("CS_XBS5_LP64_OFF64_LINTFLAGS", 1111),
+            ("CS_XBS5_LPBIG_OFFBIG_CFLAGS", 1112),
+            ("CS_XBS5_LPBIG_OFFBIG_LDFLAGS", 1113),
+            ("CS_XBS5_LPBIG_OFFBIG_LIBS", 1114),
+            ("CS_XBS5_LPBIG_OFFBIG_LINTFLAGS", 1115),
+        ];
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+        const CONFSTR_NAMES: &[(&str, i32)] = &[];
+        store_names_dict(ns, "confstr_names", CONFSTR_NAMES);
+
+        // os.confstr(name) -> str | None
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "confstr",
+            crate::make_builtin_function_with_arity(
+                "confstr",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("confstr() requires name"));
+                    }
+                    let name = confname_arg(args[0], CONFSTR_NAMES)?;
+                    // `rposix.confstr` (`rposix.py:2129-2143`) asks for the
+                    // length first and fills a buffer of exactly that size on
+                    // the second call. A zero length is either a name this host
+                    // has no string for, which is `None`, or a name it does not
+                    // know at all, which is the errno it set — so errno is
+                    // cleared before the question is put.
+                    rustpython_host_env::os::clear_errno();
+                    let len = unsafe { libc::confstr(name, std::ptr::null_mut(), 0) };
+                    if len == 0 {
+                        let errno = crate::builtins::crt_errno();
+                        if errno != 0 {
+                            return Err(errno_err(errno, ""));
+                        }
+                        return Ok(pyre_object::w_none());
+                    }
+                    let mut buf = vec![0u8; len];
+                    unsafe { libc::confstr(name, buf.as_mut_ptr() as *mut libc::c_char, len) };
+                    // The length counts the terminator, which is not part of
+                    // the string — `os_confstr_impl` decodes `len - 1` bytes.
+                    // (`rffi.charp2strn(buf, n)` keeps it, so upstream's
+                    // `space.newtext` carries a trailing NUL.)
+                    buf.truncate(len - 1);
+                    // The value can be a search path, so it is decoded the way
+                    // every other name from the host is.
+                    Ok(crate::gateway::fsdecode_filename_bytes(&buf))
+                },
+                1,
+            ),
         );
 
         // os.initgroups(username, gid) -> None
