@@ -3338,16 +3338,6 @@ pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usi
     }
 }
 
-/// `PYRE_CARRIER_EXC_RESUME=1` enables the multi-frame (carrier) exception
-/// resume: seed the grabbed guard exception onto the bridge sym and route the
-/// inlined callee's carrier sub-walk into its own `catch_exception` handler
-/// (`finishframe_exception` parity, pyjitpl.py:2530).  Default-off while the
-/// #343/#126 depth-2 exception-resume slice is validated bit-exact.
-pub fn carrier_exc_resume_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_CARRIER_EXC_RESUME").is_some())
-}
-
 /// Mirror of `blackhole.rs BlackholeInterpreter::handle_exception_in_frame`
 /// for the walker: locate the `catch_exception/L` that owns an exception-guard
 /// resume position, forward case first, then the backward scan.
@@ -4204,6 +4194,16 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut
     // exception state a previous walk left on the sym.  A preseeded sym is
     // kept only when no fresh signal exists — the multi-frame carrier walk
     // re-seeds per frame after the first frame drained the cell.
+    // For the walks that reach here this cell is the delivery path for
+    // `_prepare_exception_resumption`: `call_jit.rs` publishes
+    // `cpu.grab_exc_value`'s result before bridge tracing starts, zeroes it when
+    // the guard carried no exception, and declines the bridge outright in the
+    // third case.  On an exception-guard bridge one of the two arms below always
+    // returns, so a pre-seed placed on the sym in `setup_bridge_sym` could only
+    // rewrite the pointer this read applies anyway.  Scoped to this leg: the
+    // multi-frame carrier walk never runs this function — `trace.rs` routes it
+    // through `drive_bridge_carrier_walk`, whose sub-walk seeds itself off
+    // `root_sym.last_exc_box()` instead.
     let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
     if bh_exc != 0 {
         let exc = bh_exc as pyre_object::PyObjectRef;

@@ -4773,14 +4773,8 @@ impl<S: JitState> JitDriver<S> {
                         // already recovered `state` to the resume point, so the
                         // bridge sees the post-guard-failure values.
                         if should_bridge && !portal_crn_handled && pc != usize::MAX {
-                            let bridge_ok = self.start_bridge_tracing(
-                                &descr_arc,
-                                state,
-                                env,
-                                &raw_values,
-                                pc,
-                                guard_exc,
-                            );
+                            let bridge_ok =
+                                self.start_bridge_tracing(&descr_arc, state, env, &raw_values, pc);
                             if crate::majit_log_enabled() {
                                 eprintln!(
                                     "[bridge] start_bridge_tracing (green resume) key={} trace={} fail={} resume_pc={} ok={}",
@@ -6262,11 +6256,6 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         raw_fail_values: &[i64],
         resume_pc: usize,
-        // llmodel.py:240 `cpu.grab_exc_value(deadframe)`: the pending exception
-        // grabbed at the guard failure, threaded so `setup_bridge_sym` seeds the
-        // bridge sym's standing exception (pyjitpl.py:3125). 0 when the guard
-        // carried no exception.
-        guard_exc: i64,
     ) -> bool {
         majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
         // Same reason as the primary trace entry: the bridge compile decodes
@@ -6489,11 +6478,6 @@ impl<S: JitState> JitDriver<S> {
             ctx.set_virtualizable_heap_ptr(ptr);
         }
         ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
-        // pyjitpl.py:3125 `_prepare_exception_resumption` grabs the exception
-        // BEFORE frame reconstruction; thread it onto the ctx so the pyre
-        // `setup_bridge_sym` override can seed the standing exception before it
-        // drains the inline-callee carrier.
-        ctx.set_bridge_guard_exc(guard_exc);
         ctx.bridge_target_header_pc = parent_header_pc;
         ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
             let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
@@ -6906,14 +6890,8 @@ impl<S: JitState> JitDriver<S> {
                 let resume_pc = resume_pc.unwrap_or(guard_resume_pc);
                 self.sync_after(state, &result_meta, descriptor.as_deref());
 
-                let bridge_ok = self.start_bridge_tracing(
-                    &descr_arc,
-                    state,
-                    env,
-                    &raw_values,
-                    resume_pc,
-                    result_exc,
-                );
+                let bridge_ok =
+                    self.start_bridge_tracing(&descr_arc, state, env, &raw_values, resume_pc);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[bridge] start_bridge_tracing key={} trace={} fail={} resume_pc={} ok={}",
@@ -8016,14 +7994,8 @@ mod tests {
         let descr_arc = std::sync::Arc::clone(&failure.descr_arc);
         drop(failure);
 
-        let started = driver.start_bridge_tracing(
-            &descr_arc,
-            &mut NonTraceableState,
-            &(),
-            &fail_values,
-            0,
-            0,
-        );
+        let started =
+            driver.start_bridge_tracing(&descr_arc, &mut NonTraceableState, &(), &fail_values, 0);
         assert!(!started);
         assert!(!driver.meta.is_tracing());
     }

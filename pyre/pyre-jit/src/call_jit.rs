@@ -3276,14 +3276,7 @@ pub fn trace_and_compile_from_bridge(
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.start_bridge_tracing(
-            descr_arc,
-            &mut jit_state,
-            &env,
-            raw_values,
-            resume_pc,
-            guard_exc,
-        )
+        driver.start_bridge_tracing(descr_arc, &mut jit_state, &env, raw_values, resume_pc)
     };
     if !started {
         if majit_metainterp::majit_log_enabled() {

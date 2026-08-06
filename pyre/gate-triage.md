@@ -81,49 +81,90 @@ here as "S0 seam of the vable-owner rework toward `direct_assembler_call` scalar
 args" — **that judgement was wrong and is reversed in §1d**: the 2026-07-25
 parity pass read `direct_assembler_call` and found its ON design is what
 upstream's `num_red_args` assert forbids. Retired.
-Still kept: `PYRE_CARRIER_EXC_RESUME` (default-off; threads the guard-failure exception
-into the bridge sym for the depth-2 carrier exception-resume slice #343/#126 —
-inert until validated).  Two parity gaps were listed here as pre-flip work.  The
-`bridge_guard_exc` GC-rooting is closed by §1e — which also measures the seed
-site as **reachable** (170 bridge-route guard failures carry a live exception),
-so this gate is a live adoption target rather than an inert one.
+**`PYRE_CARRIER_EXC_RESUME` — RETIRED 2026-08-06, ON path deleted.**  It was kept
+here as "default-off; threads the guard-failure exception into the bridge sym for
+the depth-2 carrier exception-resume slice #343/#126 — inert until validated",
+with two parity gaps booked as pre-flip work, and was then upgraded to "a live
+adoption target rather than an inert one" on the strength of §1e's reachability
+census.  **That upgrade was wrong and is reversed here.**  §1e instruments
+`handle_fail`, one layer above the seed site; the seed additionally required
+`sym.current_exc_value.is_null()`, and — decisively — its write is discarded by
+the walk-start seed.  The site is reachable AND the gate was inert.  Reachability
+was never the question it failed.
 
-The second is still open, and the row described it as "the unconditional
-`execute_ll_raised` exception assign", which is not what the divergence is.
+The account this replaces ran: pyre's standing-exception maintenance for an
+exception-guard bridge lives in `seed_bridge_standing_exception_from_current`
+(`state.rs`), not gated, sourcing the exception from `sym.current_exc_value`
+falling back to `get_current_exception()` — the *execution context's* current
+exception, the `sys.exc_info()` mirror, a different slot with different lifetime
+rules than upstream's `cpu.grab_exc_value(deadframe)` — so the gate's only effect
+was to write `guard_exc` into `current_exc_value` beforehand and let the ungated
+code pick it up.  **That was already only half true on the day it was written.**
+`seed_standing_exception_for_walk` (`jitcode_dispatch/mod.rs`, called at walk
+start from `bridge_subwalk.rs`) already had its present shape: it runs AFTER
+`setup_bridge_sym` and sources from `BH_LAST_EXC_VALUE`, which
+`trace_and_compile_from_bridge` (`call_jit.rs`) publishes from
+`cpu.grab_exc_value`'s result on the exc-edge route, zeroes when the guard
+carried no exception, and whose third combination (`pending_exc &&
+!route_exc_edge`) declines before any walk.  For an exception-guard bridge that
+function returns from one of its first two arms in every case — overwriting all
+five exception slots on a non-null read, clearing them on a null one — so it
+never reaches its own `last_exc_box` short-circuit on that flavour.  On the
+single-frame walk the pre-seed's only possible effect was to write a pointer the
+walk seed then rewrote, and the source divergence named above is closed.
 
-pyre's standing-exception maintenance for an exception-guard bridge lives in
-`seed_bridge_standing_exception_from_current` (`state.rs`), which is **not
-gated** and already mirrors upstream's branch: it assigns `last_exc_value` /
-`last_exc_box` when it finds an exception, and clears all four exception slots
-when it does not (`_prepare_exception_resumption`'s
-`else: clear_exception()`).  The divergence is the **source**.  Upstream takes it
-from `cpu.grab_exc_value(deadframe)` — the exception the failing guard carried.
-pyre takes it from `sym.current_exc_value`, falling back to
-`get_current_exception()` — the *execution context's* current exception, which is
-the `sys.exc_info()` mirror, a different slot with different lifetime rules.
+Measured 2026-08-06 with a probe at BOTH seed sites across 369 synth benches: 23
+exception-guard bridges in 14 benches, 7 of which the gate would have seeded, and
+in all 23 the value at the walk seed equalled the value at the setup seed,
+pointer for pointer (the non-seeding cases read `0x0` at both).
+`PYRE_CARRIER_EXC_RESUME=1` over the whole `bench/synth` corpus is dynasm
+386/386, byte-identical to gate-off, with zero jit-stats movement — agreeing with
+the earlier corpus run under the gate (**dynasm 336/336 with the gate forced
+on**, correctness results matching the default run, and the seven live-exception
+producers of §1e among them, despite the seed site being entered 170 times).
 
-`PYRE_CARRIER_EXC_RESUME` is a **back-channel into that function**: its only
-effect is to write `guard_exc` into `current_exc_value` beforehand so the ungated
-code picks it up.  Hence the `is_null` conjunct — it exists to avoid clobbering a
-live `sys.exc_info` value, which also means the injection is suppressed exactly
-when the EC already holds an exception.  That is why forcing the gate on measures
-as a no-op: **dynasm 336/336 with the gate forced on**, correctness results
-matching the default run, and the seven live-exception producers of §1e among
-them, despite the seed site being entered 170 times.
+"A green corpus under the gate is not evidence about the gate" still stands, and
+it is why the 2026-08-06 evidence is the seed-site probe rather than the corpus:
+the corpus could only ever show the no-op, never its cause.  It also revises the
+cause inferred here.  The `is_null` conjunct was read as suppressing the
+injection exactly when the EC already holds an exception; 7 of the 23 were not
+suppressed at all, and the value they would have seeded is the value the walk
+seed applies regardless.  Inert by redundancy, not by suppression.
 
-So "inert until validated" should read **inert because the guard's exception
-reaches `last_exc_value` only through a slot it does not belong in**.  A green
-corpus under the gate is not evidence about the gate.  Two further deltas to
-settle before any flip, both in that function: it early-returns when
-`last_exc_box` is already set, and it sets `class_of_last_exc_is_const = true`,
-whereas the `_prepare_exception_resumption` path reaches `execute_ll_raised` with
-the default `constant=False`.
+**Scope of that redundancy, and what outlives the gate.**  It is a property of
+the `dispatch_via_miframe` leg.  The multi-frame carrier leg does NOT run the
+walk seed: `setup_bridge_sym` installs the inline carrier whenever
+`resume_data.frames.len() > 1`, `trace_bytecode` returns through
+`drive_bridge_carrier_walk` before the full-body-walk leg, and
+`drive_bridge_frame_subwalk` seeds its sub-walk's `current_exception_seed` and
+`class_of_last_exc_is_const` straight off `root_sym.last_exc_box()` — i.e. off
+`seed_bridge_standing_exception_from_current`, with no `BH_LAST_EXC_VALUE` reader
+anywhere on that leg.  So for a multi-frame exception-guard bridge (only the
+`unwind_to_live_frame` shape survives `call_jit.rs`'s pre-walk decline) both
+original complaints are still live: the `sys.exc_info()` mirror as the source,
+and the early return when `last_exc_box` is already set, neither of which
+`_prepare_exception_resumption` has.  That combination is unexercised by
+`bench/synth` — the probe paired 23 for 23, so every exception-guard bridge in
+the corpus took the single-frame leg — which is why the gate was never validated
+and is why it is retired rather than flipped.  If the slice is built, its seed
+must come from `BH_LAST_EXC_VALUE`, the `grab_exc_value` source, not from
+`current_exc_value`.
+
+The other pre-flip delta is **withdrawn as miscited**: it compared an
+intermediate value to pyre's final one.  `prepare_resume_from_failure` calls
+`execute_ll_raised` with the default `constant=False`, then
+`handle_possible_exception` three lines later (pyjitpl.py:3169), which ends
+`self.class_of_last_exc_is_const = True` (pyjitpl.py:3416).  Upstream's
+post-resumption steady state is `True`, the same as pyre's.
 
 ## §1e — The grabbed guard exception is rooted for the whole handoff (2026-07-27)
 
 `bridge_guard_exc` was booked as a pre-flip gap for `PYRE_CARRIER_EXC_RESUME`.
 It is **not gate-specific**: the same grabbed pointer drives the default
-blackhole resume, so the gate never bounded the exposure.
+blackhole resume, so the gate never bounded the exposure.  (That gate is retired
+— §1b — and the `TraceCtx::bridge_guard_exc` carrier it was threaded through went
+with it.  This rooting did not: its three parking sites are on the blackhole and
+guard-failure paths, none of them the deleted one.)
 
 `grab_exc_value` (`llmodel.py:240`) reads `jf_guard_exc` off the deadframe and
 drops the jitframe, which was the collector's only handle on the exception
@@ -153,9 +194,14 @@ Instrumenting `handle_fail` counted **732,660** guard failures:
 | **NON-NULL** | **true** | **true** | **170** |
 
 So the window is entered with a live exception **34,790** times, and the 170 in
-the last row are exactly the `bridge_guard_exc` read this section is about — the
-`PYRE_CARRIER_EXC_RESUME` seed site is **reachable**, not inert.  Seven benches
-produce them: `inline_subwalk_property_mutates` and
+the last row are the bridge-route guard failures this section is about — the
+grabbed value `call_jit.rs` publishes into `BH_LAST_EXC_VALUE`.  This read
+"reachable, not inert" for the `PYRE_CARRIER_EXC_RESUME` seed site; **that
+inference was wrong**.  The instrumentation is in `handle_fail`, one layer above
+that seed, which additionally required a null `current_exc_value` and whose write
+the walk-start seed discards.  The site was reachable AND the gate inert — see
+§1b, retired 2026-08-06.  Seven benches produce them:
+`inline_subwalk_property_mutates` and
 `inline_subwalk_mutating_residual_abort` (11,482 each),
 `type_name_surrogate_reject` (9,462), `named_reraise_sibling_hot` (1,418),
 `exc_mixed_classes_bridge_flavor` (410), `handler_reraise_second_exc` (400),
@@ -738,7 +784,7 @@ delete, do not count as gates.**
 - `PYRE_JIT_DISABLED` — a `OnceLock<bool>` cache name holding the `PYRE_JIT==0` result (`pyre-jit/src/eval.rs`); the env var is `PYRE_JIT`
 - `PYRE_STACKTOOBIG` — `pub static PyreStackTooBig` runtime symbol (`stack_check.rs`)
 
-## §3 — Dead (12): no env read site
+## §3 — Dead (13): no env read site
 
 No source reads these. Comment-only or absent. **Historical measurement notes
 are preserved in place per N7** (they record why code was deemed dead / what a
@@ -758,6 +804,7 @@ census verified); they are not live gates and cost nothing.
 | PYRE_FULL_BODY_WALK | retired switch; the full-body walk is the sole tracer, so the OFF path (the deleted trait leg) is gone (#344) |
 | `_MULTIFRAME` | retired switch; reader and OFF path deleted once `walker_ec_enter` / `walker_ec_leave` closed the escaping-`sys._getframe` identity answer (§1d). Flipped default-ON and retired 2026-07-30; `_MULTIFRAME_DEPTH` is a separate live depth bound and is not this gate |
 | `_BLACKHOLE_RESUME` | retired switch; reader and OFF path deleted after #754 closed, with the multi-frame twin's retirement unblocking removal; it was flipped default-ON on 2026-07-25 |
+| `PYRE_CARRIER_EXC_RESUME` | retired experiment; reader (`carrier_exc_resume_enabled`), the `setup_bridge_sym` pre-seed it guarded, `TraceCtx::bridge_guard_exc` and the `guard_exc` parameter of `start_bridge_tracing` all deleted 2026-08-06. The ON path measured inert — structurally redundant with the ungated walk-start `seed_standing_exception_for_walk` on the single-frame leg, and never exercised on the multi-frame carrier leg it was written for. §1b keeps the seed-site probe and both corpus runs |
 
 ## §4 — Live default-ON gates KEPT (retire when the epic closes)
 
@@ -790,12 +837,13 @@ Kept as-is; listed for completeness.
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
-- **Default-OFF experiments (2 remaining)** — triaged in §1b/§1c (4 retired
-  in the 2026-07-05 pass, 8 retired since then; `PYRE_P2_DRAIN` retired with
+- **Default-OFF experiments (1 remaining)** — triaged in §1b/§1c (4 retired
+  in the 2026-07-05 pass, 9 retired since then; `PYRE_P2_DRAIN` retired with
   the framestack-walk deletion; `_VABLE_SCALAR_CA` retired 2026-07-25, see
-  §1d).  Kept: `_CALLEE_VSTACK` (callee-local operand-stack mirror) and
-  `PYRE_CARRIER_EXC_RESUME`.  For these the *ON* path is the unattested one, so
-  they are adoption targets rather than retirement targets.
+  §1d; `PYRE_CARRIER_EXC_RESUME` retired 2026-08-06 with its ON path deleted,
+  see §1b).  Kept: `_CALLEE_VSTACK` (callee-local operand-stack mirror).  Its
+  *ON* path is the unattested one, so it is an adoption target rather than a
+  retirement target.
   The single-frame resume-past-escape switch graduated out of this bucket on
   2026-07-25 when it flipped default-ON. It is now retired alongside the
   multi-frame switch, with both readers and OFF paths deleted after
