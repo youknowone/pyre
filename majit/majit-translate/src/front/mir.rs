@@ -10939,8 +10939,11 @@ impl<'a> Lowering<'a> {
     /// exact derivation — a `Str`/`Float`/`Ref`/nested-enum payload keys the
     /// suffixed root identically on both sides.  The one deviation is
     /// [`crate::front::checked_arith_uint`], which mints a BARE `Option` root
-    /// for its `Int`/`Unsigned` payload; an integer-payload `Option` therefore
-    /// stays bare here to match it.  A niche `Option<NonNull>` has no aggregate
+    /// for its `Option<usize>`; an UNSIGNED-payload `Option` therefore stays
+    /// bare here to match it.  A SIGNED one must not: the bare root carries a
+    /// single `__pos_0`, so a signed producer joining it unions `int` with
+    /// `r_uint`, which cannot be proved to share a signedness.  A niche
+    /// `Option<NonNull>` has no aggregate
     /// `__discriminant` / `__pos_0` (the arms use a pointer null-test and an
     /// identity payload), so its owners are never read — keep them bare, which
     /// also mirrors [`Self::resolve_bool_then_option_dest`]'s own aggregate
@@ -10950,9 +10953,7 @@ impl<'a> Lowering<'a> {
         recv_ty: &TyRef,
     ) -> Option<(String, String, ValueType)> {
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
-        if matches!(payload_ty, ValueType::Int | ValueType::Unsigned)
-            || self.tyref_is_niche_option_ptr(recv_ty)
-        {
+        if matches!(payload_ty, ValueType::Unsigned) || self.tyref_is_niche_option_ptr(recv_ty) {
             let def_id = self.tyref_adt_def_id(recv_ty)?;
             let td = self.llbc.type_by_id(def_id)?;
             let option_owner = td.item_meta.name_path();
@@ -11453,11 +11454,31 @@ impl<'a> Lowering<'a> {
             | ClosureCombinator::IsSomeAnd => tyref_to_value_type(dest_ty, self.llbc),
         };
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        // `map`/`and_then` BUILD their result `Option<U>`; the other combinators
+        // build none.  `U` is the dest payload, not the receiver's `T`, so the
+        // built variant must key the dest's own classdef — otherwise two `map`s
+        // over the same receiver type with different closure results share one
+        // `__pos_0` slot, the collision `recognize_from_size_align_ok_site`
+        // documents at its own site.  `resolve_option_consumer_owners` is the
+        // derivation every downstream reader of the built value (`unwrap_or`,
+        // `?`, `expect`) uses, so producing anything else payload-erases the
+        // read; a dest that is not a resolvable `Option` declines the whole
+        // rewrite and leaves the residual call.
+        let (result_option_owner, result_some_owner, result_niche) = match kind {
+            ClosureCombinator::Map | ClosureCombinator::AndThen => {
+                let (owner, some, _payload) = self.resolve_option_consumer_owners(dest_ty)?;
+                (owner, some, self.tyref_is_niche_option_ptr(dest_ty))
+            }
+            _ => (option_owner.clone(), some_owner.clone(), niche),
+        };
         Some(crate::front::option_closure_select::ClosureSelectSite {
             kind,
             result_var: result_var.clone(),
             option_owner,
             some_owner,
+            result_option_owner,
+            result_some_owner,
+            result_niche,
             call_once_owner,
             payload_ty,
             call_result_ty,

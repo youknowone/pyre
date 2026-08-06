@@ -71,12 +71,24 @@ pub(crate) struct ClosureSelectSite {
     pub kind: ClosureCombinator,
     /// The combinator call result — locates block A.
     pub result_var: Variable,
-    /// The `Option` enum root `name_path` — the `__discriminant` field owner
-    /// (both the receiver read and any built `Some`/`None`).
+    /// The receiver `Option` enum root `name_path` — the `__discriminant` field
+    /// owner for the receiver read.
     pub option_owner: String,
-    /// The `Option::Some` variant `name_path` — the `__pos_0` payload field
-    /// owner (the receiver read and any built `Some`).
+    /// The receiver `Option::Some` variant `name_path` — the `__pos_0` payload
+    /// field owner for the receiver read.
     pub some_owner: String,
+    /// The `Option` enum root `name_path` of the result the rewrite BUILDS —
+    /// `map`'s `Some(U)` and `map`/`and_then`'s `None`.  `map`'s result is
+    /// `Option<U>` for a closure `T -> U`, so it keys a different classdef than
+    /// the receiver's `Option<T>`: sharing one would put two closures' results
+    /// in one `__pos_0` slot.
+    pub result_option_owner: String,
+    /// The `Option::Some` variant `name_path` of the built result — the
+    /// `__pos_0` payload field owner of `map`'s `Some(U)`.
+    pub result_some_owner: String,
+    /// True when the BUILT result is a niche `Option` — `Some(x)` is then `x`
+    /// itself and `None` is null, the produce-side mirror of `niche`.
+    pub result_niche: bool,
     /// The closure env ADT `name_path` — the `call_once` inherent-method owner.
     pub call_once_owner: String,
     /// The receiver `Option`'s payload `T` projected to a [`ValueType`] — the
@@ -253,14 +265,26 @@ fn rewire_one_closure_select_site(
                 &site.args_tuple_suffix,
             );
             match site.kind {
-                // `map` wraps the closure result back into `Some(U)`.
-                ClosureCombinator::Map => emit_option_variant(
-                    graph,
-                    then_bb,
-                    &site.option_owner,
-                    1,
-                    Some((&site.some_owner, call_result, site.call_result_ty.clone())),
-                ),
+                // `map` wraps the closure result back into `Some(U)` — except
+                // that a niche `Option` is a one-word pointer with no aggregate
+                // `__discriminant` / `__pos_0`, where `Some(x)` is `x` itself.
+                ClosureCombinator::Map => {
+                    if site.result_niche {
+                        call_result
+                    } else {
+                        emit_option_variant(
+                            graph,
+                            then_bb,
+                            &site.result_option_owner,
+                            1,
+                            Some((
+                                &site.result_some_owner,
+                                call_result,
+                                site.call_result_ty.clone(),
+                            )),
+                        )
+                    }
+                }
                 // `and_then`'s closure already returns `Option<U>`;
                 // `is_some_and`'s already returns the `bool`.
                 _ => call_result,
@@ -282,7 +306,13 @@ fn rewire_one_closure_select_site(
     let else_value = match site.kind {
         // `map`/`and_then` build a fresh `None`.
         ClosureCombinator::Map | ClosureCombinator::AndThen => {
-            emit_option_variant(graph, else_bb, &site.option_owner, 0, None)
+            // A niche `Option` is a one-word pointer with no aggregate
+            // `__discriminant` / `__pos_0`: `None` is null.
+            if site.result_niche {
+                graph.push_null_mut_ptr(else_bb)
+            } else {
+                emit_option_variant(graph, else_bb, &site.result_option_owner, 0, None)
+            }
         }
         // `is_some_and` yields the constant `false` — no closure, no `Option`.
         ClosureCombinator::IsSomeAnd => {
@@ -467,6 +497,9 @@ mod tests {
             call_result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
+            result_option_owner: "core::option::Option".into(),
+            result_some_owner: "core::option::Option::Some".into(),
+            result_niche: false,
         }
     }
 
