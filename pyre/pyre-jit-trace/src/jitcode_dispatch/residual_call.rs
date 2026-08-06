@@ -3353,12 +3353,41 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // The inline abort-forward-flush gate snapshots this at the CALL and refuses
     // the forward flush if a callee sub-walk moved it — re-executing the CALL
     // would double the effect.
+    // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
+    // alone would count it.  The slot it writes exists only to keep a
+    // propagating exception rooted for the collector — nothing reads it back as
+    // a value — and `push_exc_info` performs the same clear at the same point.
+    // An uncommitted walk therefore has nothing to undo and the region it
+    // hands back is not irreversible, which is the `is_idempotent_gc_barrier`
+    // category one line up.
+    let writes_gc_liveness_root_only =
+        helper == majit_ir::PyreHelperKind::ClearInFlightException;
     if !provably_side_effect_free
         && !is_idempotent_gc_barrier
+        && !writes_gc_liveness_root_only
         && (writes_live_heap
             || heap_write_odometer_before
                 .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before))
     {
+        // `committed=false effects>0` is the double-apply signature, but the
+        // odometer alone does not say WHICH residual made the region
+        // irreversible.  Name the bumping call the way the escape diagnostic
+        // names a forcing one.
+        if fbw_debug_abort_enabled() {
+            let name = pyre_interpreter::jit_trace_fnaddrs()
+                .iter()
+                .find(|(_, a)| *a == func_ptr as i64)
+                .map(|(n, _)| *n);
+            eprintln!(
+                "[fbw-effect] pc={op_pc} helper={helper:?} rtype={:?} writes_live={writes_live_heap} \
+                 entered_frame={} fn={:?}/{:#x}",
+                call_descr.result_type(),
+                heap_write_odometer_before
+                    .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before),
+                name,
+                func_ptr as usize,
+            );
+        }
         fbw_bump_executed_effect();
     }
     match exec_result {

@@ -933,6 +933,12 @@ pub enum PyreHelperKind {
     /// inside a loop virtualizes away instead of allocating a `Function` per
     /// iteration through an opaque residual.
     MakeFunction,
+    /// `bh_clear_in_flight_exception()` — the `[] -> void` residual emitted by
+    /// PUSH_EXC_INFO to complete the caught-exception ownership transfer.  The
+    /// full-body walker recognises this tag to keep the executed-effect
+    /// odometer off it: the written slot is a GC-liveness root with no value
+    /// reader, so a non-committing walk has nothing to undo.
+    ClearInFlightException,
 }
 
 impl EffectInfo {

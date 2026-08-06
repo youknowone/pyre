@@ -9921,7 +9921,7 @@ impl CodeWriter {
                             let _ = residual_call!(
                                 clear_in_flight_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
-                                majit_ir::PyreHelperKind::None,
+                                majit_ir::PyreHelperKind::ClearInFlightException,
                                 vec![],
                                 vec![],
                                 vec![],
