@@ -201,13 +201,18 @@ FLOOR_GATE_MIN_BASELINE_S = 10 * EXEC_TIME_FLOOR_S
 PERF_GATE_FLOOR_RATIO = 1.0
 # Below a ceiling of this many times parity, a floor AT parity would sit inside
 # the band the ceiling itself allows, so the floor drops proportionally instead.
-# The divisor has to clear the span one fixture reads across the CI runners --
-# the ceiling is an allowance set from the slowest of them, and the fastest can
-# read several times lower.  Of the fixtures whose baseline is large enough to
-# arm the floor at all, the widest gap between a ceiling and a ratio a runner
-# reported for it is 6x; those are the fixtures whose pypy time is real work,
-# which is also what earns them a closely fitted ceiling.
-PERF_GATE_FLOOR_DIVISOR = 25
+#
+# The divisor is what lets ONE number bound a fixture at both ends, so it has to
+# clear the span that fixture reads across the runners TWICE OVER: a ceiling is
+# set at twice the slowest runner's ratio, and the derived floor still has to
+# land under the fastest runner's.  Measured over the runner logs, a fixture's
+# own ratio spans as much as 17.8x end to end (`defaults_reassigned_midloop`
+# reads 1.0x and 17.8x), and `class_attrs_methods` and
+# `foriter_inplace_immutable` are barely narrower -- so a ceiling honestly
+# fitted to the slow end sits ~36x above the fast end's reading.  A divisor
+# under that turns raising a ceiling into a floor failure on the fast runner,
+# which is the one way this pair of bounds can fight itself.
+PERF_GATE_FLOOR_DIVISOR = 40
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
 # quantized (see WIN_TIMER_QUANTUM_S above).
