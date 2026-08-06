@@ -68,7 +68,7 @@ pub mod sys {
         O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, R_OK, RTLD_GLOBAL,
         RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW, RUSAGE_SELF, S_IFDIR, S_IFMT,
         S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED,
-        WNOHANG, WUNTRACED, X_OK,
+        WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED, X_OK,
     };
     // `posix`'s `<sched.h>` and `<dlfcn.h>` names, which carry the same gates
     // there as the table that publishes them: the Apple targets declare the

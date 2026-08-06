@@ -957,8 +957,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("O_SYNC", libc::O_SYNC as i64),
         #[cfg(not(any(unix, windows)))]
         ("O_SYNC", 0i64),
-        // SEEK_SET/CUR/END are os.py's own (`SEEK_SET = 0`, os.py:204) on every
-        // platform, and neither `posix` nor `nt` carries them.
+        // SEEK_SET/SEEK_CUR/SEEK_END are os.py's own (`SEEK_SET = 0`,
+        // os.py:203-206) on every platform, named in its own `__all__`, so a
+        // binding here is counted a second time through the star-import.
+        // Neither `posix` nor `nt` carries them; the other SEEK_* values are
+        // the module's to publish.
     ] {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
     }
@@ -1245,15 +1248,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     install_noop_stubs(
         ns,
         &[
-            "fstatat",
+            // "fstatat"/"faccessat"/"futimens"/"futimes"/"fdopendir" — the `*at`
+            // and `f*` C entry points the module calls to serve `dir_fd` and a
+            // descriptor path. They are how the calls above are made, not calls
+            // of their own, and `moduledef.py` publishes none of them.
             "statvfs",
             "fstatvfs",
             "fchdir",
             "fchown",
-            "faccessat",
-            "futimens",
-            "futimes",
-            "fdopendir",
             "fork",
             "forkpty",
             "wait",
@@ -1271,8 +1273,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "setpgrp",
             "getpgid",
             "nice",
-            "pipe2",
-            "dup3",
+            // "pipe2"/"dup3" — the flag-taking forms, which Linux adds and the
+            // other hosts do not have. Neither is served here on any of them.
             "fdatasync",
             "mkfifo",
             "getloadavg",
@@ -1281,36 +1283,41 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "setpriority",
             "sched_get_priority_max",
             "sched_get_priority_min",
-            "sched_getparam",
-            "sched_setparam",
-            "sched_getscheduler",
-            "sched_setscheduler",
+            // "sched_getparam"/"sched_setparam"/"sched_getscheduler"/
+            // "sched_setscheduler" — the policy calls, which are Linux's and
+            // which hand a `sched_param` back and forth; there is no such type
+            // here.
             "sched_yield",
             "confstr",
             "confstr_names",
             "sysconf",
             "sysconf_names",
-            "setenv",
+            // "setenv" — the entry point is spelled `putenv`, and there is no
+            // second name for it.
             "ttyname",
             "openpty",
             "login_tty",
             "tcgetpgrp",
             "tcsetpgrp",
             "ctermid",
-            "get_exec_path",
+            // "get_exec_path" — `os.py:565` writes it in Python and lists it in
+            // its own `__all__`, so a name bound here is not overwritten by that
+            // definition; it is counted a second time, through the star-import.
             "WIFEXITED",
             "WEXITSTATUS",
             "WIFSIGNALED",
             "WTERMSIG",
             "WIFSTOPPED",
             "WSTOPSIG",
-            "WEXITED",
-            "WNOWAIT",
-            "WSTOPPED",
+            // "WEXITED"/"WNOWAIT"/"WSTOPPED" — `waitid`'s option flags, which
+            // are numbers rather than calls; bound with the other wait options
+            // below.
             "_cpu_count",
             // "spawnvp"/"spawnvpe" — the same os.py:881 branch defines these,
             // for the same reason the two above are not bound.
-            "popen",
+            // "popen" — `os.py:1020-1067` writes it over `subprocess` and
+            // appends it to its own `__all__`, with no guard on this name being
+            // free.
         ],
     );
 
@@ -4266,45 +4273,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // os.environ lookups from setenv / unsetenv / putenv / getenv — mutate
-    // posix.environ (the dict) rather than calling libc; os.py writes back
-    // into that dict in its _Environ wrapper. `getenv` is the module's on POSIX
-    // alone: os.py defines its own off `environ` for every platform, and `nt`
-    // has none.
-    #[cfg(not(windows))]
-    crate::module_ns_store(
-        ns,
-        "getenv",
-        crate::make_builtin_function("getenv", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_none());
-            }
-            let key = unsafe {
-                if pyre_object::is_str(args[0]) {
-                    crate::baseobjspace::str_utf8_w(args[0])?.to_string()
-                } else {
-                    return Ok(pyre_object::w_none());
-                }
-            };
-            #[cfg(feature = "sandbox")]
-            {
-                if let Ok(Some(value)) = crate::host_seam::ops::getenv(key.as_bytes()) {
-                    return Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&value)));
-                }
-            }
-            #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-            {
-                if let Ok(value) = host_os::var(&key) {
-                    return Ok(pyre_object::w_str_new(&value));
-                }
-            }
-            if args.len() >= 2 {
-                Ok(args[1])
-            } else {
-                Ok(pyre_object::w_none())
-            }
-        }),
-    );
+    // `getenv` is not bound here. `os.py:818-825` writes it against `environ`
+    // — the dict this module publishes and that os.py's `_Environ` wrapper
+    // writes back into — and names it in its own `__all__`, so a binding is
+    // both shadowed and counted twice through the star-import.
     // ── host_env::posix-backed real implementations (override the noop
     //    placeholders registered above) ───────────────────────────────
     #[cfg(all(unix, feature = "host_env"))]
@@ -4905,6 +4877,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "WCONTINUED",
             pyre_object::w_int_new(libc::WCONTINUED as i64),
         );
+        // The states `waitid` is asked to report on. They were registered above
+        // as calls answering `None`, which is neither the number nor a name a
+        // caller can tell apart from one.
+        for (name, val) in [
+            ("WEXITED", libc::WEXITED as i64),
+            ("WSTOPPED", libc::WSTOPPED as i64),
+            ("WNOWAIT", libc::WNOWAIT as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
 
         // os.dup(fd) -> new_fd
         #[cfg(not(feature = "sandbox"))]
@@ -7857,15 +7839,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "fork",
             "forkpty",
             "system",
-            "popen",
             "execv",
             "execve",
             "execvp",
             "execvpe",
-            // The spawn family is not an external here: os.py:881 writes it in
-            // Python over fork+exec+waitpid, which the stubs above already
-            // refuse. Binding a name would only stop os.py from defining the
-            // family — and with it P_WAIT and P_NOWAIT.
+            // Neither the spawn family nor `popen` is an external here: os.py
+            // writes both in Python, over fork+exec+waitpid (:881) and over
+            // `subprocess` (:1020), and the stubs above already refuse what
+            // they reach for. Binding those names would only stop os.py from
+            // defining them — and with the spawn family, P_WAIT and P_NOWAIT.
             "posix_spawn",
             "posix_spawnp",
             "abort",
