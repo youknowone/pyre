@@ -1274,6 +1274,48 @@ pub unsafe fn py_str_display(obj: PyObjectRef) -> String {
     }
 }
 
+/// `ntpath.splitdrive`'s prefix length: a whole `\\server\share` UNC root, or
+/// a two-character `X:` drive.
+fn nt_drive_len(path: &[u8]) -> usize {
+    let is_sep = |b: u8| b == b'/' || b == b'\\';
+    if path.len() >= 2 && is_sep(path[0]) && is_sep(path[1]) {
+        // The root runs through the share, so it ends at the second separator
+        // after the two leading ones — or at the end of a path with fewer.
+        let mut seen = 0;
+        for (i, &b) in path.iter().enumerate().skip(2) {
+            if is_sep(b) {
+                seen += 1;
+                if seen == 2 {
+                    return i;
+                }
+            }
+        }
+        return path.len();
+    }
+    if path.len() >= 2 && path[1] == b':' {
+        return 2;
+    }
+    0
+}
+
+/// Where `os.path.basename` starts its result.
+///
+/// `interp_exceptions.py:875` calls `os.path.basename`, so the split is the
+/// platform's. `ntpath` peels a drive off first and takes what follows the
+/// last `\` or `/` in the remainder — which is empty for a bare UNC root;
+/// `posixpath` takes what follows the last `/`, with no drive.
+///
+/// Separators and the drive colon are ASCII, and no UTF-8 continuation byte
+/// can collide with them, so the scan is safe over encoded bytes.
+fn basename_start(path: &[u8]) -> usize {
+    let windows = cfg!(windows);
+    let drive = if windows { nt_drive_len(path) } else { 0 };
+    path[drive..]
+        .iter()
+        .rposition(|&b| b == b'/' || (windows && b == b'\\'))
+        .map_or(drive, |i| drive + i + 1)
+}
+
 /// The WTF-8 carrying subset of `W_BaseException.descr_str`: a base
 /// exception whose `args_w` is a single `str` stringifies to that str
 /// verbatim (`interp_exceptions.py:131 space.str(self.args_w[0])`).
@@ -1348,19 +1390,7 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
             let w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
             if pyre_object::pyobject::is_exact_type(w_filename, &STR_TYPE) {
                 let fbuf = pyre_object::w_str_get_wtf8(w_filename).to_wtf8_buf();
-                // `os.path.basename` is the platform's: `ntpath` splits on
-                // `\` as well as `/` and drops the drive `splitdrive` peeled
-                // off first, `posixpath` splits on `/` alone.
-                let windows = cfg!(windows);
-                let mut start = fbuf
-                    .as_bytes()
-                    .iter()
-                    .rposition(|&b| b == b'/' || (windows && b == b'\\'))
-                    .map_or(0, |i| i + 1);
-                if windows && start == 0 && fbuf.as_bytes().get(1) == Some(&b':') {
-                    start = 2;
-                }
-                let mut inner = fbuf[start..].to_wtf8_buf();
+                let mut inner = fbuf[basename_start(fbuf.as_bytes())..].to_wtf8_buf();
                 if let Some(l) = lineno_str {
                     inner.push_str(", ");
                     inner.push_wtf8(&l);
@@ -1775,5 +1805,31 @@ impl fmt::Display for PyDisplay {
                 unsafe { py_str(self.0) }.unwrap_or_else(|_| "<exception in __str__>".to_string());
             write!(f, "{s}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nt_drive_len;
+
+    #[test]
+    fn nt_drive_len_matches_ntpath_splitdrive() {
+        // `X:` drives, absolute and drive-relative.
+        assert_eq!(nt_drive_len(b"C:\\dir\\enc.py"), 2);
+        assert_eq!(nt_drive_len(b"C:enc.py"), 2);
+        // A UNC root is the whole `\\server\share`, so a bare one basenames to
+        // the empty string rather than to the share.
+        assert_eq!(nt_drive_len(b"\\\\server\\share"), 14);
+        assert_eq!(nt_drive_len(b"\\\\server\\share\\enc.py"), 14);
+        // Fewer components than a share: the root is the whole path.
+        assert_eq!(nt_drive_len(b"\\\\server"), 8);
+        assert_eq!(nt_drive_len(b"\\\\server\\"), 9);
+        assert_eq!(nt_drive_len(b"\\\\"), 2);
+        // Forward slashes spell the same roots.
+        assert_eq!(nt_drive_len(b"//server/share/enc.py"), 14);
+        // No drive at all.
+        assert_eq!(nt_drive_len(b"\\dir\\enc.py"), 0);
+        assert_eq!(nt_drive_len(b"enc.py"), 0);
+        assert_eq!(nt_drive_len(b""), 0);
     }
 }
