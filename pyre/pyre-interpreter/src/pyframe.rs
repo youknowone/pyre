@@ -3182,18 +3182,18 @@ impl PyFrame {
     /// nohidden walker itself) returns the raw `f_backref` link.
     #[inline]
     pub fn fget_f_back(&self) -> *mut PyFrame {
-        // `f_back` is read from app code, which goes on to read frame fields;
-        // the walk itself no longer forces, so force both ends here.  `self`
-        // matters as much as the result: an inline-published callee frame is
-        // materialised only by a force, and `f_backref` off an unforced one
-        // names the wrong caller.
+        // pyframe.py:767-768 `fget_f_back` → `get_f_back` →
+        // `ExecutionContext.getnextframe_nohidden`, with no force of either
+        // end.  Upstream needs none: `f_backref` is a `jit.virtual_ref`
+        // (executioncontext.py:88-89), so the read at :80 `frame.f_backref()`
+        // IS the force, and it is the foldable vref one rather than an
+        // unconditional materialisation —
+        // executioncontext.py:323-331 `force_all_frames` says so outright
+        // ("We get this effect simply by reading the f_back field of all
+        // frames").  Forcing both ends concretely here instead escapes the
+        // virtualizable during tracing and loses the loop.
         let this = self as *const PyFrame as *mut PyFrame;
-        crate::executioncontext::force_frame(this);
-        let back = crate::executioncontext::ExecutionContext::getnextframe_nohidden(this);
-        if !back.is_null() {
-            crate::executioncontext::force_frame(back);
-        }
-        back
+        crate::executioncontext::ExecutionContext::getnextframe_nohidden(this)
     }
 
     /// pyframe.py:641-642 fget_code → self.getcode().  Returns the `PyCode`
