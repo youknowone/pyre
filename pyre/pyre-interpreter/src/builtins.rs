@@ -4925,14 +4925,15 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             return type_descr_new_with_metaclass(&pos[i..], w_metaclass, kwargs);
         }
     }
-    if pos.len() == 1 && unsafe { pyre_object::is_type(pos[0]) } {
-        // `type.__new__(metatype)` — no name, bases or namespace follows.
+    if pos.len() == 1 {
+        // `type.__new__(metatype)` — no name, bases or namespace follows, so
+        // `arguments_w` is empty and the count is neither one nor three.  The
+        // arity is decided before `_precheck_for_new`, which is why a
+        // non-metatype is named here rather than refused as one.
         return Err(crate::PyError::type_error(new_arity_message(pos[0])));
     }
-    if pos.len() == 1 {
-        return type_descr_new_without_metaclass(pos, kwargs);
-    }
     if pos.len() == 2 {
+        precheck_for_new(pos[0])?;
         // typeobject.py:901-908 — the one-argument form belongs to `type`
         // alone: `type(x)` reports the type of `x`, while `Metaclass(x)` is a
         // class statement missing its bases and its namespace.
@@ -4963,8 +4964,37 @@ fn new_arity_message(w_metatype: PyObjectRef) -> String {
     if unsafe { std::ptr::eq(w_metatype, crate::typedef::w_type()) } {
         return "type.__new__() takes 1 or 3 arguments".to_string();
     }
-    let name = unsafe { pyre_object::w_type_get_name(w_metatype) };
+    let name = type_new_getname(w_metatype);
     format!("{name}.__new__() takes exactly 3 arguments (1 given)")
+}
+
+/// typeobject.py:1001-1003 `_precheck_for_new` — the metatype must be a type
+/// before anything reads it as one.  It runs after the arity decision and
+/// before the one-argument form is resolved.
+fn precheck_for_new(w_type: PyObjectRef) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::is_type(w_type) } {
+        Ok(())
+    } else {
+        let type_name = crate::baseobjspace::object_functionstr_type_name(w_type);
+        Err(crate::PyError::type_error(format!(
+            "X is not a type object ({type_name})"
+        )))
+    }
+}
+
+/// `W_Root.getname` (baseobjspace.py:90-94), the `%N` operand spelling: a type
+/// reports its own name, any other object reports its `__name__` attribute,
+/// and a failed lookup reports `?`.  The arity message reaches this with an
+/// unvalidated metatype, so it must not read one through the type layout.
+fn type_new_getname(w_obj: PyObjectRef) -> String {
+    if unsafe { pyre_object::is_type(w_obj) } {
+        return unsafe { pyre_object::w_type_get_name(w_obj) }.to_string();
+    }
+    match crate::baseobjspace::getattr_str(w_obj, "__name__").and_then(crate::baseobjspace::utf8_w)
+    {
+        Ok(name) => name.to_string(),
+        Err(_) => "?".to_string(),
+    }
 }
 
 fn type_descr_new_without_metaclass(
@@ -6912,7 +6942,7 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
         // first arg is `self`; the count reported excludes it.
         return Err(crate::PyError::type_error(format!(
             "function takes exactly 4 arguments ({} given)",
-            args.len() - 1
+            args.len().saturating_sub(1)
         )));
     }
     let w_self = args[0];
@@ -6964,7 +6994,7 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     if args.len() != 6 {
         return Err(crate::PyError::type_error(format!(
             "function takes exactly 5 arguments ({} given)",
-            args.len() - 1
+            args.len().saturating_sub(1)
         )));
     }
     let w_self = args[0];
@@ -7057,7 +7087,7 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     if args.len() != 6 {
         return Err(crate::PyError::type_error(format!(
             "function takes exactly 5 arguments ({} given)",
-            args.len() - 1
+            args.len().saturating_sub(1)
         )));
     }
     let w_self = args[0];
