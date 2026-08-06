@@ -70,9 +70,7 @@ check(failure(os.mkdir, missing_deep), FileNotFoundError, 2, 3, missing_deep)
 check(failure(os.rmdir, missing), FileNotFoundError, 2, 2, missing)
 check(failure(os.remove, missing), FileNotFoundError, 2, 2, missing)
 check(failure(os.unlink, missing), FileNotFoundError, 2, 2, missing)
-# `os_utime_impl` is the one path call whose POSIX arm leaves the name out of
-# the error it raises; the Windows arm names the file like the rest of them.
-check(failure(os.utime, missing), FileNotFoundError, 2, 2, missing if WIN32 else None)
+check(failure(os.utime, missing), FileNotFoundError, 2, 2, missing)
 
 check(failure(os.mkdir, a_dir), FileExistsError, 17, 183, a_dir)
 check(failure(os.listdir, a_file), NotADirectoryError, 20, 267, a_file)

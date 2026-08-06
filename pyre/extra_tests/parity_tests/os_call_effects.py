@@ -31,9 +31,12 @@ a_file = os.path.join(base, "f")
 with open(a_file, "w") as fp:
     fp.write("hello")
 
-# os.chdir
+# os.chdir.  `base` is the spelling `getcwd` answers with, which on Windows may
+# be the 8.3 one the environment named the directory by, so the names built on
+# it are the ones to compare against — `realpath` would expand them and
+# `getcwd` does not.
 os.chdir(a_dir)
-assert os.getcwd() == os.path.realpath(a_dir), os.getcwd()
+assert os.getcwd() == a_dir, os.getcwd()
 os.chdir(base)
 assert os.getcwd() == base, os.getcwd()
 

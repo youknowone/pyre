@@ -1980,9 +1980,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 modified,
                 follow_symlinks,
             )
-            // The name stays out of this one error: `os_utime_impl` raises it
-            // through `posix_error()` rather than `path_error(path)`.
-            .map_err(|e| io_err(e, ""))?;
+            .map_err(|e| io_err_with_filename(e, path.w_path()))?;
             return Ok(pyre_object::w_none());
         }
         #[allow(unreachable_code)]
