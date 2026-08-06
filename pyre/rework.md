@@ -14,6 +14,24 @@ the anti-roadmap (§3.5) items have been rebuilt. The structural defects are
 concentrated in four places, all inside trace/resume/translate/GC-roots —
 exactly the Phase A territory the charter says outranks everything.
 
+## Audit refresh — 2026-08-06 (`ec-wiring`, base `58fcd373e05`)
+
+The findings below were written against `pc-map` on 2026-07-05. Re-measured a
+month later, **the priority order has inverted**: F1 and F2, the two the program
+called critical path, are substantially done; F3, filed as the least urgent of
+the four, has quietly moved to one slot from a hard failure.
+
+| finding | 2026-07-05 | 2026-08-06 |
+|---|---|---|
+| F1 resume coordinates | two systems + lossy `pc_map` | **largely resolved** — gh#366/367/368/369 all closed, both named artifacts gone from the tree; residue is comment rot and a `py_pc` that is still stored rather than derived |
+| F2 three executors | trait twin alive | **done, verified** — `is_full_body_walk`, `PYRE_FULL_BODY_WALK`, `OpcodeHandler for MIFrame`: 0 hits each |
+| F3 root-walker registry | 14 of 16 slots | **regressed — 15 of 16**; the 16th registration is a startup `panic!` |
+| F4 translate coverage | ~124-graph gap | gh#346 and gh#373 closed, work still landing (#1065); `abort_permanent` unchanged in scale |
+| F5 gate debt | 119 `PYRE_*` matches | 245 distinct `PYRE_*` identifiers; `gate-triage.md` refreshed 2026-08-02 |
+
+Of the fifteen issues this document tracks, **thirteen are closed**. Only gh#376
+(Phase C decision document) and gh#126 (fib_recursive residual) remain open.
+
 ---
 
 ## 1. Findings
@@ -56,6 +74,38 @@ Artifact 3), gh#367 (bank-aware pcdep color-slot map, Artifact 2 /
 slot-vs-color); groundwork gh#73 + PR#365 (closed, M3 milestone). Related:
 gh#343 (multi-frame virtual-PyFrame rematerialization on deopt),
 gh#371 (compile-time walker coalescing residual).
+
+**Status (2026-08-06) — largely resolved.** gh#366, gh#367, gh#368, gh#369 and
+gh#343 are all closed; `3ebf2f9280c` deleted the py_pc↔JitCode resume
+translation and `4e53480018d` cleaned up the `pc_map` dead names. Measured on
+the tree: `metadata.pc_map` and `resume_jitcode_pc_for` have **zero** hits, and
+`resume::SnapshotFrame` now carries `jitcode_index` plus a `pc` documented and
+written as the JitCode byte offset (`resume.py:250` parity). The ~56 surviving
+`pc_map` matches are an unrelated compile-time `Vec<usize>` in
+`jit/codewriter.rs` and `jit/flatten.rs` that drives exit-recovery construction;
+it is not the resume translation table and is not F1.
+
+Three pieces of residue remain, none of them the original defect:
+
+1. **Comment rot.** `majit-metainterp/src/recorder.rs`'s `SnapshotFrame::pc`
+   still documents "Pyre's tracer populates this slot with the Python bytecode
+   PC because pyre traces Python bytecode rather than JitCode … the runtime
+   translates `py_pc` through `pc_map` at resume time until pyre's
+   walker-as-tracer epic lands." All three claims are now false — the tracer
+   interprets JitCode, the translation is deleted, and the epic landed. Its
+   writers (`pyjitpl/dispatch.rs build_state_field_snapshot`,
+   `history.rs`) stamp the JitCode offset.
+2. **`py_pc` is stored, not derived.** WS1 increment 2 called for the
+   Python-level PC to be derived the way PyPy derives it. It is instead
+   forward-carried in every snapshot frame and serialized into
+   `rd_numb`/`numb_state`, then read back as a Python coordinate by
+   `pyre-jit/src/eval.rs` for frame and traceback reconstruction. That is the
+   §4 falsifier "keep derived, not stored" outcome — it should be recorded as
+   the deliberate adaptation it now is, or finished.
+3. **Unproven: a coordinate mixed at one writer.** `build_state_field_snapshot`
+   stamps `py_pc: frame.pc`, i.e. the same JitCode offset it writes to `pc`,
+   into the field whose readers treat it as a Python pc. The corpus is green,
+   so if this is wrong it is latent; it needs a repro before it is a finding.
 
 ### F2 — Trace time has a hand-written interpreter twin (three executors)
 
@@ -125,6 +175,23 @@ retirement (taxonomy of the 14 walkers, prebuilt-protocol absorption of the
 immortal populations, shrinking `MAX_EXTRA_ROOT_WALKERS` as the progress
 metric) is now recorded there as a scope supplement (2026-07-05 comment).
 
+**Status (2026-08-06) — REGRESSED, and now the live risk.** gh#355 is closed,
+but the registry retirement it was supplemented with did not happen. The
+registry grew instead: **15 registrations against `MAX_EXTRA_ROOT_WALKERS = 16`**
+(`shadow_stack.rs`), so exactly one slot is left and the 16th caller dies on
+`panic!("register_extra_root_walker: capacity exceeded")` — at startup, on every
+platform, for whoever adds the next walker. The current population is 11 from
+`pyre-jit/src/eval.rs` (jit/bh/guard exc values, rbigint parts cache, immortal
+exception singletons, last CA exception, sre patterns, w_globals-stamped code,
+mapdict method cache, …), 3 from `pyre-interpreter/src/eval.rs` (global
+prebuilt roots, thread roots, …) and 1 from `majit-gc/src/gcreftracer.rs`.
+
+This inverts the program's sequencing: F3 is no longer the low-urgency
+workstream. Raising the constant is the accretion the finding condemns, so the
+next walker to be added should instead be the trigger for the class-(a)/(b)
+absorption in WS3 — with the caveat that the shrinking constant can no longer
+serve as the progress metric until it first stops growing.
+
 ### F4 — majit-translate coverage is sustained by per-case seams
 
 **What exists.** Rust idioms still lack systematic lowering: the #346
@@ -152,6 +219,16 @@ successor of the closed gh#131) with per-gap instance issues gh#336
 NewWithVtable), gh#181 (box_value Void), gh#176 (phi threading), gh#180
 (gctransform), gh#139 (EffectInfo). The cliff symptom is gh#373.
 
+**Status (2026-08-06) — epic closed, work continuing under it.** gh#346 and
+gh#373 are both closed, and coverage is still landing against the #346 line
+(most recently #1065, the `ll_alloc_and_set` list-allocation family and the
+full `newlist_clear` compound jitcode opcode). `abort_permanent` has not
+shrunk in scale — ~214 matches, concentrated in `jit/codewriter.rs`,
+`pyre-jit-trace/src/trace.rs` and `jit/flatten.rs` — but the exit criterion was
+never "few matches", it was "zero UNLISTED sources", which the census answers
+and a raw match count does not. Re-run the census before treating this
+finding as open or closed.
+
 ### F5 — Deficiencies (right design, unfinished) — the debt list
 
 - **Compilation cliffs**: unported opcode classes (CallIntrinsic2, GetLen,
@@ -161,7 +238,12 @@ NewWithVtable), gh#181 (box_value Void), gh#176 (phi threading), gh#180
   gh#343; the closed gh#215 was the umbrella).
 - **Gate debt**: **119 distinct `PYRE_*` env gates** in the tree (28 in the
   FBW family alone). Charter §3.6: a gate is a staging area, not a home.
-  No triage table exists. *No tracking issue.*
+  No triage table exists. *No tracking issue.* **2026-08-06: the table now
+  exists (`gate-triage.md`, refreshed 2026-08-02), but the population kept
+  growing — 245 distinct `PYRE_*` identifiers in the tree against the 119
+  matches this audit counted. The triage is a snapshot, not a brake; nothing
+  makes a new gate enter the table at birth, which is what WS4 item 1 asked
+  for.**
 - **Documentation rot (N7)**: `majit/README.md` documented the deleted
   majit-analyze era (crates majit-opt/meta/codegen/runtime/analyze vs the
   actual majit-translate/metainterp/backend-* tree). **Resolved 2026-07-05:
@@ -305,6 +387,15 @@ should become deletable — that is the real exit test).
 
 Priority under contention (charter §5 order): **WS1 > WS2 > WS3 > WS4**,
 with the qualifications:
+
+> **Amended 2026-08-06.** This ordering was written when WS1 held the shipped
+> miscompile class. It no longer does: WS1's increments 1–3 landed and its
+> increment 4 is done pyre-side, while WS3's registry moved to 15 of 16 slots
+> with a startup panic behind the last one. Under contention today the order is
+> **WS3 > WS2 > WS1-residue > WS4** — WS3 because the next walker registration
+> is an immediate hard failure, WS1-residue last because what remains of it is
+> comment rot plus one policy decision (store-vs-derive `py_pc`), not a
+> correctness risk.
 
 - WS1 increments 1–3 are the critical path — they root out the shipped
   miscompile class. Increment 4 (W4) is the largest single piece; its
