@@ -8942,8 +8942,14 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // `descr_decode` reads an omitted encoding as utf-8
         // (stringmethods.py:200-201).  This positional shape cannot skip the
         // slot when `errors` follows it, so spell the default out: `decode`
-        // refuses a literal `None` there like any other non-str.
-        let mut decode_args = vec![src, w_encoding.unwrap_or_else(|| w_str_new("utf-8"))];
+        // refuses a literal `None` there like any other non-str.  The default
+        // is a prebuilt: `w_str_new` is immortal, so wrapping it per call
+        // would leak one string for every `str(b, errors=...)`.
+        static DEFAULT_ENCODING: crate::warn::PrebuiltText = crate::warn::PrebuiltText::new();
+        let mut decode_args = vec![
+            src,
+            w_encoding.unwrap_or_else(|| DEFAULT_ENCODING.get("utf-8")),
+        ];
         if let Some(e) = w_errors {
             decode_args.push(e);
         }
