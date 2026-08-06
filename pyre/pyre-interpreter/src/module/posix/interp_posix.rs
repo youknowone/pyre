@@ -3491,18 +3491,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "getcwd",
             |_| {
+                // interp_posix.py:906 `space.fsdecode(getcwdb(space))`. A
+                // lossy decode would answer U+FFFD for a byte the surrogate
+                // escape represents, and the name would no longer name the
+                // directory it came from.
                 #[cfg(feature = "sandbox")]
                 {
                     let cwd = crate::host_seam::ops::getcwd()
                         .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                    Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&cwd)))
+                    Ok(crate::gateway::fsdecode_filename_bytes(&cwd))
                 }
                 #[cfg(not(feature = "sandbox"))]
                 {
                     #[cfg(feature = "host_env")]
                     {
                         if let Ok(cwd) = host_os::current_dir() {
-                            return Ok(pyre_object::w_str_new(&cwd.to_string_lossy()));
+                            return Ok(crate::gateway::fsdecode_os_str(cwd.as_os_str()));
                         }
                     }
                     Ok(pyre_object::w_str_new(""))
