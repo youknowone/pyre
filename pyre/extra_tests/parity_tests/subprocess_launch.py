@@ -10,6 +10,7 @@ what is asserted here.
 The child is this interpreter, so the same program answers on either host.
 """
 
+import collections.abc
 import os
 import subprocess
 import sys
@@ -90,6 +91,52 @@ done = subprocess.run(
 )
 assert done.stdout == "value None\n", repr(done.stdout)
 
+# `env` is read as a mapping, which is what `os.environ` is and what the
+# documentation asks for — not a `dict`, whose contents it does not have.
+os.environ["PYRE_PROBE"] = "inherited"
+try:
+    done = subprocess.run(
+        child("import os; print(os.environ['PYRE_PROBE'])"),
+        capture_output=True,
+        text=True,
+        env=os.environ,
+    )
+finally:
+    del os.environ["PYRE_PROBE"]
+assert done.stdout.strip() == "inherited", repr(done.stdout)
+
+
+class Environ(collections.abc.Mapping):
+    """The mapping protocol and nothing else — no dict behind it."""
+
+    contents = {**UTF8, "PYRE_PROBE": "mapped"}
+
+    def __getitem__(self, key):
+        return self.contents[key]
+
+    def __iter__(self):
+        return iter(self.contents)
+
+    def __len__(self):
+        return len(self.contents)
+
+
+done = subprocess.run(
+    child("import os; print(os.environ['PYRE_PROBE'])"),
+    capture_output=True,
+    text=True,
+    env=Environ(),
+)
+assert done.stdout.strip() == "mapped", repr(done.stdout)
+
+# What is not a mapping is refused rather than launched without an environment.
+try:
+    subprocess.run(child("pass"), env=object())
+except (TypeError, AttributeError):
+    pass
+else:
+    raise AssertionError("a non-mapping env must fail")
+
 # Arguments and environment values are text, and reach the child as the same
 # text on a platform whose process arguments are bytes and on one whose are
 # wide characters.
@@ -163,9 +210,10 @@ for _ in range(8):
 # `os.popen` is the same launch behind a file object, whose `close` reports
 # the exit status the way `wait` does — and `None` for the zero that is not
 # worth reporting.
-with os.popen("%s -c \"print('popened')\"" % PY) as pipe:
+QUOTED = '"%s"' % PY  # the interpreter's own directory may hold a space
+with os.popen("%s -c \"print('popened')\"" % QUOTED) as pipe:
     assert pipe.read().strip() == "popened"
-assert os.popen("%s -c pass" % PY).close() is None
-assert os.popen("%s -c \"raise SystemExit(2)\"" % PY, "w").close() != 0
+assert os.popen("%s -c pass" % QUOTED).close() is None
+assert os.popen("%s -c \"raise SystemExit(2)\"" % QUOTED, "w").close() != 0
 
 print("OK")

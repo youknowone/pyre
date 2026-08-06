@@ -147,17 +147,49 @@ mod process {
     /// The environment block `CreateProcess` takes: every `KEY=value` in
     /// order, each terminated, the whole thing terminated again
     /// (`getenvironment`).
+    ///
+    /// Read through the mapping protocol, which is what `getenvironment`
+    /// takes: `subprocess` hands `os.environ` straight on, and that is a
+    /// `MutableMapping` rather than a dict.  `keys()` names the variables and
+    /// each one is subscripted for its value, so a mapping that computes its
+    /// values gets to.
     fn environment_block(w_env: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
-        if !unsafe { pyre_object::is_dict(w_env) } {
+        // What a subscript cannot be taken from is no mapping.
+        if unsafe { crate::baseobjspace::lookup(w_env, "__getitem__") }.is_none() {
             return Err(crate::PyError::type_error(
-                "environment must be a mapping object",
+                "environment must be dictionary or None",
             ));
         }
-        let mut entries = Vec::new();
-        for (w_key, w_value) in unsafe { pyre_object::w_dict_items(w_env) } {
-            let key = crate::baseobjspace::text_w(w_key)?;
-            let value = crate::baseobjspace::text_w(w_value)?;
-            entries.push((key.to_string(), value.to_string()));
+        let w_keys = crate::baseobjspace::call_method(w_env, "keys", &[]);
+        if w_keys.is_null() {
+            return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                crate::PyError::type_error("environment must be dictionary or None")
+            }));
+        }
+        let keys = crate::baseobjspace::unpackiterable(w_keys, -1)?;
+        // `getitem` runs the mapping's own `__getitem__`, which allocates, so
+        // the mapping and every key are published and read back per iteration
+        // rather than kept in plain locals.
+        let _env_roots = pyre_object::gc_roots::push_roots();
+        let env_slot = pyre_object::gc_roots::pin_roots(&[w_env]);
+        let keys_base = pyre_object::gc_roots::pin_roots(&keys);
+        let mut entries = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let _entry_roots = pyre_object::gc_roots::push_roots();
+            let w_value = crate::baseobjspace::getitem(
+                pyre_object::gc_roots::shadow_stack_get(env_slot),
+                pyre_object::gc_roots::shadow_stack_get(keys_base + i),
+            )?;
+            let value_slot = pyre_object::gc_roots::pin_roots(&[w_value]);
+            let key = crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(
+                keys_base + i,
+            ))?
+            .to_string();
+            let value = crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(
+                value_slot,
+            ))?
+            .to_string();
+            entries.push((key, value));
         }
         host_winapi::build_environment_block(entries).map_err(|e| {
             crate::PyError::value_error(match e {
@@ -188,7 +220,7 @@ mod process {
     /// starts out with exactly that empty list.
     fn handle_list(w_info: PyObjectRef) -> Result<Option<Vec<usize>>, crate::PyError> {
         let w_attrs = crate::baseobjspace::getattr_str(w_info, "lpAttributeList")?;
-        if unsafe { pyre_object::is_none(w_attrs) } || w_attrs.is_null() {
+        if w_attrs.is_null() || !unsafe { pyre_object::is_dict(w_attrs) } {
             return Ok(None);
         }
         let Some(w_handles) = (unsafe { pyre_object::w_dict_getitem_str(w_attrs, "handle_list") })
