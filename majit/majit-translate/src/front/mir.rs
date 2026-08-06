@@ -11491,7 +11491,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>`,
-    /// `Option<&mut T>`, or `Option<&T>` with a thin (Sized) ADT pointee.
+    /// `Option<fn(..)>`, `Option<&mut T>`, or `Option<&T>` with a thin
+    /// (Sized) ADT pointee.
     /// Rust encodes each in ONE pointer
     /// word (`None` = null, `Some(p)` = the non-null pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
@@ -11551,6 +11552,12 @@ impl<'a> Lowering<'a> {
             return false;
         };
         if type_node_is_mut_ref(payload, self.llbc) {
+            return true;
+        }
+        // A function pointer is one word, and `Option<fn(..)>` represents
+        // `None` as the null pointer.  The payload therefore aliases the
+        // base pointer directly and carries no metadata word.
+        if type_node_is_fn_ptr(payload, self.llbc) {
             return true;
         }
         // A shared reference `&T` is equally a one-word null-pointer niche
@@ -15622,6 +15629,33 @@ fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> 
             .and_then(|arr| arr.get(2))
             .and_then(serde_json::Value::as_str)
             .is_some_and(|kind| kind.to_ascii_lowercase().contains("mut"));
+    }
+    false
+}
+
+/// Whether a Charon type node's top-level constructor is a function pointer,
+/// after following serialization indirections.
+fn type_node_is_fn_ptr<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
+    for _ in 0..24 {
+        let Some(obj) = node.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            let Some(body) = llbc.dedup_body(id) else {
+                return false;
+            };
+            node = body;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return obj.get("FnPtr").is_some();
     }
     false
 }

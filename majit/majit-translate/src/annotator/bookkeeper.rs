@@ -2524,7 +2524,11 @@ impl Bookkeeper {
             // still has RPython's one-GC-reference shape.  Match the
             // `BigInt.from` builtin analyzer and foreign-method cutover:
             // retain a classdef-less `SomeInstance`, never lattice bottom.
-            "BigInt" => {
+            // A function pointer is a one-word code pointer, so it shares
+            // that shell: an optional function pointer then joins with None
+            // as a nullable pointer instead of collapsing to `SomeNone`,
+            // which blocks every read on the field.
+            "BigInt" | "fn" => {
                 return SomeValue::Instance(super::model::SomeInstance::new(
                     None,
                     false,
