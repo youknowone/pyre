@@ -244,6 +244,16 @@ try:
         else:
             raise AssertionError("stat of a vanished entry did not raise")
 
+    # A descriptor that is not a directory is refused, and since the descriptor
+    # is what named the directory, it is what names the failure.
+    for name in sorted(names & set(NULLABLE_ARGS)):
+        try:
+            getattr(os, name)(fd)
+        except NotADirectoryError as e:
+            check(e.filename == fd, f"{name}(non-directory fd) filename: {e.filename!r}")
+        else:
+            raise AssertionError(f"{name}(non-directory fd) did not raise")
+
     # ── an argument that is neither a path nor a descriptor ──────────────
     # path_or_fd names its caller and widens the allowed-type list with the
     # descriptor form, so the message itself reports the capability. Only the

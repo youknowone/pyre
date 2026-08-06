@@ -2299,7 +2299,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // (`interp_posix.py:1112-1121`).
             #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
             if resolved.as_fd != -1 {
-                let names = fdlistdir(resolved.as_fd).map_err(|errno| errno_err(errno, ""))?;
+                // The descriptor is what named the directory, so it is what
+                // names the failure.
+                let names = fdlistdir(resolved.as_fd)
+                    .map_err(|errno| errno_err_with_filename(errno, resolved.w_path()))?;
                 let items = names.iter().map(|n| fs_name_obj(false, n)).collect();
                 return Ok(pyre_object::w_list_new(items));
             }
@@ -3212,18 +3215,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     const S_IFREG: u32 = 0o100_000;
     const S_IFLNK: u32 = 0o120_000;
 
-    /// The file type an entry's name resolves to, or `None` where nothing
-    /// answers — `is_dir`/`is_file`/`is_symlink` all report `False` for a name
-    /// that has gone away rather than raising.
+    /// The file type an entry's name resolves to, or `None` for a name that has
+    /// gone away — `check_mode` (`interp_scandir.py:319-330`) answers "no, not
+    /// this type" for `ENOENT` alone, on the reasoning that a vanished entry is
+    /// better reported as not being of the asked-for kind than as an error.
+    /// Every other failure is the caller's to see, named by the entry.
     fn dir_entry_kind(args: &[PyObjectRef], follow: bool) -> Result<Option<u32>, crate::PyError> {
-        let (_, path) = dir_entry_path(args[0])?;
+        let (w_path, path) = dir_entry_path(args[0])?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             let dir_fd = dir_entry_dir_fd(args[0])?;
             if dir_fd != -1 {
-                return Ok(dir_entry_stat_at(&path, dir_fd, follow)
-                    .ok()
-                    .map(|st| st.st_mode as u32 & S_IFMT));
+                return match dir_entry_stat_at(&path, dir_fd, follow) {
+                    Ok(st) => Ok(Some(st.st_mode as u32 & S_IFMT)),
+                    Err(errno) if errno == libc::ENOENT => Ok(None),
+                    Err(errno) => Err(errno_err_with_filename(errno, w_path)),
+                };
             }
         }
         let meta = if follow {
@@ -3231,18 +3238,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         } else {
             host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
         };
-        Ok(meta.ok().map(|m| {
-            let ft = m.file_type();
-            if ft.is_dir() {
-                S_IFDIR
-            } else if ft.is_symlink() {
-                S_IFLNK
-            } else if ft.is_file() {
-                S_IFREG
-            } else {
-                0
+        match meta {
+            Ok(m) => {
+                let ft = m.file_type();
+                Ok(Some(if ft.is_dir() {
+                    S_IFDIR
+                } else if ft.is_symlink() {
+                    S_IFLNK
+                } else if ft.is_file() {
+                    S_IFREG
+                } else {
+                    0
+                }))
             }
-        }))
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(fs_err_with_filename(e, w_path)),
+        }
     }
     fn dir_entry_is_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let follow = dir_entry_follow(args)?;
@@ -3494,7 +3505,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         if let Some(fd) = from_fd {
             entry_dir_fd = fd;
             #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-            for name in fdlistdir(fd).map_err(|errno| errno_err(errno, ""))? {
+            for name in
+                fdlistdir(fd).map_err(|errno| errno_err_with_filename(errno, w_path()))?
+            {
                 // `interp_scandir.py:50` leaves the path prefix empty for a
                 // descriptor — there is no directory name to join — so an
                 // entry's `path` is its bare name, and a descriptor is not
@@ -5180,10 +5193,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) }
             };
             if ret < 0 {
-                return Err(io_err_with_filename(
-                    std::io::Error::last_os_error(),
-                    path.w_path(),
-                ));
+                let err = std::io::Error::last_os_error();
+                // A host can accept `AT_SYMLINK_NOFOLLOW` and not implement it,
+                // reporting so by refusing the call rather than by lacking
+                // `fchmodat` — which is why `HAVE_LCHMOD` is a narrower bit than
+                // `HAVE_FCHMODAT`. `interp_posix.py:1247-1251` reads that refusal
+                // as the modifier being unavailable rather than as an OS error.
+                if !follow_symlinks {
+                    let errno = crate::builtins::io_error_posix_errno(&err, 0);
+                    if errno == libc::ENOTSUP || errno == libc::EOPNOTSUPP {
+                        return Err(crate::PyError::not_implemented(format!(
+                            "{name}: follow_symlinks unavailable on this platform"
+                        )));
+                    }
+                }
+                return Err(io_err_with_filename(err, path.w_path()));
             }
             Ok(pyre_object::w_none())
         }
