@@ -296,12 +296,15 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             }
         }
         "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false),
-        // `interp_time.py:926` gates `thread_time` on HAS_THREAD_TIME; expose it
-        // only where the platform carries CLOCK_THREAD_CPUTIME_ID (the same
-        // clocks mod.rs registers the constant for), otherwise it falls through
-        // to the "unknown clock" ValueError.
+        // `interp_time.py:926` gates `thread_time` on HAS_THREAD_TIME; describe
+        // it only where the platform carries CLOCK_THREAD_CPUTIME_ID and the
+        // host clock is wired (the exact gate under which mod.rs registers the
+        // `thread_time` function), so the report never names a clock whose
+        // function is absent; otherwise fall through to the "unknown clock"
+        // ValueError.
         #[cfg(all(
             unix,
+            feature = "host_env",
             not(any(
                 target_os = "illumos",
                 target_os = "netbsd",
@@ -373,6 +376,77 @@ pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
     Ok(w_int_new(process_time_nanos()? as i64))
+}
+
+/// Thread CPU time (kernel + user) for the calling thread as nanoseconds.
+///
+/// `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` is the sole source, matching
+/// `_thread_time_impl`.  Unlike [`process_time_nanos`] there is no
+/// `getrusage`/`times` fallback: those report process-wide CPU time, not the
+/// calling thread's, so deriving thread time from them would be wrong.  An
+/// unreadable clock raises OSError rather than reporting a bogus value.
+///
+/// This reads the clock directly rather than through the `clock()` seam op
+/// (which is the process-CPU `ll_time_clock` analog): `_thread_time_impl` reads
+/// `c_clock_gettime` directly, `time.clock_gettime` already does the same, and
+/// `clock_gettime` is on the sandbox seccomp allowlist, so a sandbox build
+/// reads its own thread clock without a controller round-trip.
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(any(
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+))]
+fn thread_time_nanos() -> Result<i128, crate::PyError> {
+    host_time::clock_gettime(host_time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+        .map(|d| d.as_nanos() as i128)
+        .map_err(|e| {
+            crate::PyError::os_error_with_errno(
+                e.raw_os_error().unwrap_or(0),
+                format!("clock_gettime: {e}"),
+            )
+        })
+}
+
+/// time.thread_time() → float
+///
+/// Thread time for profiling: sum of the kernel and user-space CPU time.
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(any(
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+))]
+pub fn thread_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(floatobject::w_float_new(thread_time_nanos()? as f64 * 1e-9))
+}
+
+/// time.thread_time_ns() → int
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(any(
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+))]
+pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(w_int_new(thread_time_nanos()? as i64))
 }
 
 /// time.clock_gettime(clk_id) → float seconds

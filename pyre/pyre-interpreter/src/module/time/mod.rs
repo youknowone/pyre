@@ -88,8 +88,17 @@ crate::py_module! {
                 target_os = "openbsd",
                 target_os = "redox",
             )))]
-            crate::module_ns_store(ns, "CLOCK_THREAD_CPUTIME_ID",
-                pyre_object::w_int_new(libc::CLOCK_THREAD_CPUTIME_ID as i64));
+            {
+                crate::module_ns_store(ns, "CLOCK_THREAD_CPUTIME_ID",
+                    pyre_object::w_int_new(libc::CLOCK_THREAD_CPUTIME_ID as i64));
+                // thread_time reads CLOCK_THREAD_CPUTIME_ID, so it is exposed on
+                // exactly the platforms that carry the constant — the same gate
+                // `_get_time_info` uses for its "thread_time" arm.
+                crate::module_ns_store(ns, "thread_time",
+                    crate::make_builtin_function_with_arity("thread_time", t::thread_time, 0));
+                crate::module_ns_store(ns, "thread_time_ns",
+                    crate::make_builtin_function_with_arity("thread_time_ns", t::thread_time_ns, 0));
+            }
         }
         // `Module.startup` calls `_init_timezone`, and exposes `tzset` on
         // every POSIX build.  Both read host timezone state ($TZ,
