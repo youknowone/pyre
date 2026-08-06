@@ -4949,9 +4949,10 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // hand that unambiguous `[metatype, name, bases, dict]` shape on so the
     // name gets reported rather than the arity.
     if pos.len() == 4 {
-        if unsafe { pyre_object::is_type(pos[0]) } {
-            w_metaclass = pos[0];
-        }
+        // Three arguments, so the count is settled and `_precheck_for_new`
+        // (typeobject.py:899) runs before either of them is read.
+        precheck_for_new(pos[0])?;
+        w_metaclass = pos[0];
         return type_descr_new_with_metaclass(&pos[1..], w_metaclass, kwargs);
     }
     Err(crate::PyError::type_error("type() takes 1 or 3 arguments"))
