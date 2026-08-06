@@ -1120,6 +1120,41 @@ def synth_skip_backends(path):
     return ()
 
 
+def synth_skip_cpython(path):
+    """Read an optional per-fixture cpython opt-out from its header:
+        # pyre-check: skip-cpython
+
+    For a fixture sized past what cpython can usefully run. The ratio gate is
+    pypy's; cpython is only a reference, and once the workload is big enough
+    for pypy's execution time to be a measurement rather than a clock tick,
+    cpython can be minutes behind. `SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S`
+    already drops it in that case, but only after spending that timeout on
+    every run — this says so up front.
+
+    What it gives up is the cpython/pypy output cross-check, which is the one
+    thing that catches a fixture whose two baselines disagree. So the header
+    line must be followed by a comment saying why the size is what it is,
+    the way `skip-backends` does, and a fixture cpython can still run has no
+    business carrying it.
+
+    Not honored below the 20-line window, which is the safe direction: the
+    fixture simply runs cpython too.
+    """
+    marker = "# pyre-check: skip-cpython"
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if line.strip() == marker:
+                return True
+            if line.startswith(marker):
+                raise ValueError(
+                    f"synthetic cpython opt-out takes no value in {path}: {line.strip()}"
+                )
+    return False
+
+
 def default_binary(backend):
     name = CARGO_CONFIG[backend]["bin"]
     return f"./target/release/{name}{EXE}"
@@ -1226,6 +1261,7 @@ class Check:
         # Synthetic fixtures whose cpython reference run exceeded its budget,
         # so pypy alone was the baseline for them.
         self.cpython_reference_skips = []
+        self.cpython_declared_skips = []
         # Per-backend bookkeeping, keyed by backend name so any backend
         # (dynasm / cranelift / wasm / a single `--pyre-path` binary) is tracked
         # uniformly.
@@ -2208,6 +2244,7 @@ class Check:
             max_pypy_ratio = synth_perf_gate(path)
             max_rss_mb = synth_rss_gate(path)
             skip_backends = synth_skip_backends(path)
+            skip_cpython = synth_skip_cpython(path)
         except ValueError as e:
             print(f"{red('ERROR')}: {e}")
             sys.exit(1)
@@ -2216,30 +2253,39 @@ class Check:
 
         sys.stdout.write(f"    {'cpython':<10s}")
         sys.stdout.flush()
-        cpython_output, cpython_time, cpython_code, _ = run_timed(
-            [PYTHON3, path], timeout_s=SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S,
-        )
-        if cpython_code == 124:
-            # Not a crash: the fixture is sized for the JITs and cpython is
-            # only the reference. Drop it and let pypy be the baseline the
-            # backends are compared against, rather than spend the fixture's
-            # whole timeout on an interpreter nothing is gated on.
+        if skip_cpython:
+            # `# pyre-check: skip-cpython` — the fixture is sized past what
+            # cpython can usefully run, so running it would spend the whole
+            # reference timeout to arrive at the same drop.
             cpython_output = None
-            t_cpython = f"skip (>{SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S:g}s)"
+            # As wide as the timeout spelling below, so the comparison table's
+            # cpython column lines up the same way for either kind of skip.
+            t_cpython = "skip (opt)"
             print(dim(t_cpython))
-            self.cpython_reference_skips.append(name)
-        elif cpython_code != 0:
-            print(f"{red('CRASH')} (exit {cpython_code})")
-            cpython_output = None
-            t_cpython = "-"
-            for backend in ALL_BACKENDS:
-                if self.enabled(backend):
-                    self._record(backend, False, name, "cpython crash")
-                    self._append_comparison(backend, name, "-", "-", "FAIL")
-            return
+            self.cpython_declared_skips.append(name)
         else:
-            t_cpython = cpython_time
-            print(f"{dim('done')}  {t_cpython:.2f}s")
+            cpython_output, cpython_time, cpython_code, _ = run_timed(
+                [PYTHON3, path], timeout_s=SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S,
+            )
+            if cpython_code == 124:
+                # Not a crash: the fixture is sized for the JITs and cpython is
+                # only the reference. Drop it and let pypy be the baseline the
+                # backends are compared against, rather than spend the fixture's
+                # whole timeout on an interpreter nothing is gated on.
+                cpython_output = None
+                t_cpython = f"skip (>{SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S:g}s)"
+                print(dim(t_cpython))
+                self.cpython_reference_skips.append(name)
+            elif cpython_code != 0:
+                print(f"{red('CRASH')} (exit {cpython_code})")
+                for backend in ALL_BACKENDS:
+                    if self.enabled(backend):
+                        self._record(backend, False, name, "cpython crash")
+                        self._append_comparison(backend, name, "-", "-", "FAIL")
+                return
+            else:
+                t_cpython = cpython_time
+                print(f"{dim('done')}  {t_cpython:.2f}s")
 
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
@@ -2316,6 +2362,17 @@ class Check:
                 dim(
                     f"cpython reference skipped (>{SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S:g}s) "
                     f"for {len(self.cpython_reference_skips)}: {names}"
+                )
+            )
+        # The same weaker baseline, asked for rather than discovered. Listed
+        # apart so the two are not read as one number: this one only grows when
+        # someone writes the header line.
+        if self.cpython_declared_skips:
+            names = ", ".join(self.cpython_declared_skips)
+            print(
+                dim(
+                    f"cpython reference skipped (skip-cpython) "
+                    f"for {len(self.cpython_declared_skips)}: {names}"
                 )
             )
 
