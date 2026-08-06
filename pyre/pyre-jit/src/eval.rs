@@ -7450,15 +7450,16 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     if !cached_for_iter_bodies_all_jit_safe(code) && !frame_has_traceable_escaping_range_loop(code)
     {
         const DENIAL: &str = "FrameGate::ForIter/NoJitSafeLoopRegion";
-        let first_decline = pyre_jit_trace::jitcode_dispatch::census_record_for_iter_gate_decline(
-            code as *const _ as usize,
-            DENIAL,
-        );
         static FOR_ITER_GATE_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if first_decline
-            && *FOR_ITER_GATE_DIAG
-                .get_or_init(|| std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some())
-        {
+        let opcode_diag = *FOR_ITER_GATE_DIAG
+            .get_or_init(|| std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some());
+        let census_diag = std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some();
+        let first_decline = (opcode_diag || census_diag)
+            && pyre_jit_trace::jitcode_dispatch::census_record_for_iter_gate_decline(
+                code as *const _ as usize,
+                DENIAL,
+            );
+        if first_decline && opcode_diag {
             eprintln!(
                 "[for-iter-gate-decline] code={} source={} predicate={DENIAL}",
                 code.qualname, code.source_path
