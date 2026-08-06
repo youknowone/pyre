@@ -2042,6 +2042,9 @@ class Check:
 
         ratio = _ratio(elapsed, t_pypy) if elapsed > 0 else "-"
 
+        # Ratio and memory failures do not invalidate the run's counters, so
+        # keep comparing or recording the jit-stats baseline after they fail.
+        failures = []
         retry_note = ""
         if vs_cpython and t_cpython not in (None, "-"):
             passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
@@ -2053,15 +2056,16 @@ class Check:
                     backend, "cpython", checked_elapsed, checked_baseline,
                     vs_cpython, bound,
                 )
-                self._record(backend, False, name, detail)
                 suffix = f" ({retry_note})" if retry_note else ""
-                print(f"{red('SLOWER')}  pyre {detail}{suffix}")
-                self._append_comparison(
-                    backend, name, t_cpython, t_pypy,
-                    fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
+                failures.append(
+                    (
+                        f"{red('SLOWER')}  pyre {detail}{suffix}",
+                        detail,
+                        fmt_time(f"{elapsed:.2f}"),
+                        f"({ratio} vs pypy)",
+                    )
                 )
-                return
-            if retry_note:
+            if passed and retry_note:
                 elapsed = checked_elapsed
                 ratio = _ratio(elapsed, t_pypy)
 
@@ -2076,52 +2080,75 @@ class Check:
                     backend, "pypy", checked_elapsed, checked_baseline,
                     vs_pypy, bound, minimum,
                 )
-                self._record(backend, False, name, detail)
                 suffix = f" ({retry_note})" if retry_note else ""
                 label = "FASTER" if bound == "floor" else "SLOWER"
-                print(f"{red(label)}  pyre {detail}{suffix}")
-                self._append_comparison(
-                    backend, name, t_cpython, t_pypy,
-                    fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
+                failures.append(
+                    (
+                        f"{red(label)}  pyre {detail}{suffix}",
+                        detail,
+                        fmt_time(f"{elapsed:.2f}"),
+                        f"({ratio} vs pypy)",
+                    )
                 )
-                return
-            if retry_note:
+            if passed and retry_note:
                 elapsed = checked_elapsed
                 t_pypy = checked_baseline
                 ratio = _ratio(elapsed, t_pypy)
 
         # `# pyre-check: max-rss-mb=` — the axis the ratio gates cannot see.
         # Checked after them so a fixture that is both slow and fat reports the
-        # slowness first, matching the existing gate order.
+        # slowness first, while still reporting both failures.
         if max_rss_mb is not None and peak_rss_mb is not None and peak_rss_mb > max_rss_mb:
             detail = f"peak RSS {peak_rss_mb:.0f}MB > {max_rss_mb:.0f}MB"
-            self._record(backend, False, name, detail)
-            print(f"{red('FATTER')}  pyre {detail}")
-            self._append_comparison(
-                backend, name, t_cpython, t_pypy,
-                fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
+            failures.append(
+                (
+                    f"{red('FATTER')}  pyre {detail}",
+                    detail,
+                    fmt_time(f"{elapsed:.2f}"),
+                    f"({ratio} vs pypy)",
+                )
             )
-            return
 
         snap_status, snap_reason = self._apply_snapshot_gate(
             backend, name, script, output, stderr, elapsed, timeout,
         )
-        if snap_status == "unstable":
-            # Warned, not failed: the counter did not reproduce itself in this
-            # invocation, so there is nothing to gate on.
-            self._record(backend, True, name, f"{elapsed:.2f}s")
-            print(f"{yellow('UNSTABLE')}  {snap_reason}")
-            self._append_comparison(backend, name, t_cpython, t_pypy, "UNSTABLE")
+        if snap_status != "ok":
+            if snap_status == "unstable":
+                # Warned, not failed: the counter did not reproduce itself in
+                # this invocation, so there is nothing to gate on.
+                unstable_line = f"{yellow('UNSTABLE')}  {snap_reason}"
+            else:
+                # `improved` is still a failure; the label only tells the
+                # reader whether to investigate or just re-record.
+                label = "IMPROVED" if snap_status == "improved" else "SNAPDIFF"
+                paint = yellow if snap_status == "improved" else red
+                failures.append(
+                    (f"{paint(label)}  {snap_reason}", snap_reason, label, None)
+                )
+                unstable_line = None
+        else:
+            unstable_line = None
+
+        if failures:
+            self._record(
+                backend, False, name,
+                "; ".join(detail for _, detail, _, _ in failures),
+            )
+            for index, (line, _, _, _) in enumerate(failures):
+                print(f"{' ' * 14 if index else ''}{line}")
+            if unstable_line is not None:
+                print(f"{' ' * 14}{unstable_line}")
+            _, _, comparison_cell, comparison_note = failures[0]
+            self._append_comparison(
+                backend, name, t_cpython, t_pypy,
+                comparison_cell, comparison_note,
+            )
             return
 
-        if snap_status != "ok":
-            # `improved` is still a failure; the label only tells the reader
-            # whether to investigate or just re-record.
-            label = "IMPROVED" if snap_status == "improved" else "SNAPDIFF"
-            paint = yellow if snap_status == "improved" else red
-            self._record(backend, False, name, snap_reason)
-            print(f"{paint(label)}  {snap_reason}")
-            self._append_comparison(backend, name, t_cpython, t_pypy, label)
+        if unstable_line is not None:
+            self._record(backend, True, name, f"{elapsed:.2f}s")
+            print(unstable_line)
+            self._append_comparison(backend, name, t_cpython, t_pypy, "UNSTABLE")
             return
 
         self._record(backend, True, name, f"{elapsed:.2f}s")
