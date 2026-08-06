@@ -1708,6 +1708,21 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
     // the allocating `build_list_storage` so the acquire cannot deadlock behind
     // a collection, and reload `obj` behind it because a contended acquire
     // blocks through `before_external_block`.
+    // The Object items block needs the same bracket as `obj`, and for the same
+    // reason: `build_list_storage` hands it back young, with no shadow-stack
+    // slot (`alloc_list_items_block_gc`'s `push_roots` scope ends at its
+    // return) and no heap edge until the store below, so a collection that runs
+    // while this thread sits in `before_external_block` sees it as garbage.
+    // `reload_typed_blocks` covers only the typed blocks -- `ListStorage` keeps
+    // a root slot for those two alone.  Same pin/reload
+    // `w_list_new_with_strategy` puts around its header allocation.
+    let block_root: Option<usize> = if storage.block.is_null() {
+        None
+    } else {
+        let s = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(storage.block as PyObjectRef);
+        Some(s)
+    };
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
@@ -1716,6 +1731,9 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
     // bracket only once it is behind them (`IntArray::install`).
     list.drop_object_items();
     storage.reload_typed_blocks();
+    if let Some(s) = block_root {
+        storage.block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
+    }
     list.length = storage.length;
     list.items = storage.block;
     list.strategy = strategy;
