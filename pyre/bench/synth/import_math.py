@@ -1,4 +1,9 @@
 # pyre-check: max-pypy-ratio=8
+# pyre-check: skip-cpython
+# 56372764 puts pypy at 142ms; a count cpython could finish inside its
+# reference timeout leaves pypy back on the floor, so cpython is dropped
+# deliberately rather than by spending the whole timeout to discover the same
+# drop.
 # The 291 this replaces was never fitted to an observation: pypy's execution
 # sat on the startup-subtraction floor, so the ratio it bounded was pyre's time
 # divided by a constant. With pypy's side now a measurement the loop reads
