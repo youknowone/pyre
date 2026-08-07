@@ -7,6 +7,7 @@
 //! mirror that once implemented them here is retired.
 
 use crate::state::*;
+use pyre_interpreter::locals_w;
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
@@ -3211,7 +3212,7 @@ impl MIFrame {
         let physical_array_len = ctx
             .virtualizable_array_lengths()
             .and_then(|lengths| lengths.first().copied())
-            .or_else(|| concrete_frame.map(|f| f.locals_w().len()))
+            .or_else(|| concrete_frame.map(|f| locals_w!(f).len()))
             .unwrap_or_else(|| {
                 if !sym.jitcode.is_null() {
                     let code = unsafe { &*(*sym.jitcode).raw_code() };

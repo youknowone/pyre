@@ -13,6 +13,7 @@ use crate::{
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_forward,
     ensure_range_iter, execute_opcode_step, stack_underflow_error, unpack_sequence_exact,
 };
+use crate::{locals_w, locals_w_mut};
 use pyre_object::*;
 
 use crate::call::call_callable;
@@ -2341,11 +2342,11 @@ impl SharedOpcodeHandler for PyFrame {
 
 impl LocalOpcodeHandler for PyFrame {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
-        Ok(self.locals_w()[idx])
+        Ok(locals_w!(self)[idx])
     }
 
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
-        let value = self.locals_w()[idx];
+        let value = locals_w!(self)[idx];
         if value.is_null() {
             return Err(PyError::unbound_local_error(format!(
                 "cannot access local variable '{name}' where it is not associated with a value"
@@ -2571,7 +2572,7 @@ impl StackOpcodeHandler for PyFrame {
         // `<[T]>::swap` method call (the localsplus list carries no class row).
         let top_idx = self.valuestackdepth - 1;
         let other_idx = self.valuestackdepth - depth;
-        self.locals_w_mut().swap(top_idx, other_idx);
+        locals_w_mut!(self).swap(top_idx, other_idx);
         Ok(())
     }
 }
@@ -3018,7 +3019,7 @@ impl ControlFlowOpcodeHandler for PyFrame {
                     "?"
                 };
                 let arg0_intval = {
-                    let lw = self.locals_w();
+                    let lw = locals_w!(self);
                     if lw.len() > 0 {
                         let v = lw[0];
                         if !v.is_null() && pyre_object::pyobject::is_int(v) {
@@ -3392,9 +3393,9 @@ impl OpcodeStepExecutor for PyFrame {
                 "WITH_EXCEPT_START requires five stack values",
             ));
         }
-        let val = self.locals_w()[depth - 1];
-        let exit_self = self.locals_w()[depth - 4];
-        let exit_func = self.locals_w()[depth - 5];
+        let val = locals_w!(self)[depth - 1];
+        let exit_self = locals_w!(self)[depth - 4];
+        let exit_func = locals_w!(self)[depth - 5];
         let res = with_except_start_values(exit_func, exit_self, val);
         if res.is_null() {
             return Err(crate::call::take_call_error()
@@ -3447,7 +3448,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// PyPy: pyopcode.py LOAD_DEREF → cell.get()
     /// If the slot holds a cell object, dereference it to get the value.
     fn load_deref(&mut self, idx: usize) -> Result<(), PyError> {
-        let slot = self.locals_w()[idx];
+        let slot = locals_w!(self)[idx];
         let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_get(slot) }
         } else {
@@ -3473,7 +3474,7 @@ impl OpcodeStepExecutor for PyFrame {
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
             return self.store_name_value("__class__", 0, value);
         }
-        let slot = self.locals_w()[idx];
+        let slot = locals_w!(self)[idx];
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_set(slot, value) };
         } else {
@@ -3486,7 +3487,7 @@ impl OpcodeStepExecutor for PyFrame {
     ///
     /// PyPy: pyopcode.py LOAD_CLOSURE → push cell for closure capture.
     fn load_closure(&mut self, idx: usize) -> Result<(), PyError> {
-        let cell = self.locals_w()[idx];
+        let cell = locals_w!(self)[idx];
         self.push(cell);
         Ok(())
     }
@@ -3506,7 +3507,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// cell-wrapping-a-cell, and `fast2locals` / closure reads would
     /// surface the inner cell instead of the value.
     fn make_cell(&mut self, idx: usize) -> Result<(), PyError> {
-        let current = self.locals_w()[idx];
+        let current = locals_w!(self)[idx];
         if current.is_null() || !unsafe { pyre_object::is_cell(current) } {
             let cell = pyre_object::w_cell_new(current);
             self.set_locals_w(idx, cell);
@@ -3521,8 +3522,8 @@ impl OpcodeStepExecutor for PyFrame {
         // `pyopcode.py:580 DELETE_DEREF`: fetch the cell, raise if empty, then
         // `cell.set(None)` — clear the cell *contents* (PY_NULL is the empty
         // marker), not the slot pointer that holds the cell.  The cell lives at
-        // `locals_w()[idx]`, the same slot `load_deref`/`store_deref` use.
-        let slot = self.locals_w()[idx];
+        // `locals_w!(self)[idx]`, the same slot `load_deref`/`store_deref` use.
+        let slot = locals_w!(self)[idx];
         let is_cell = !slot.is_null() && unsafe { pyre_object::is_cell(slot) };
         let contents = if is_cell {
             unsafe { pyre_object::w_cell_get(slot) }
@@ -3771,7 +3772,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── DeleteFast ──
 
     fn delete_fast(&mut self, idx: usize) -> Result<(), PyError> {
-        if self.locals_w()[idx].is_null() {
+        if locals_w!(self)[idx].is_null() {
             let code = unsafe { &*crate::pyframe_get_pycode(self) };
             let name = if idx < code.varnames.len() {
                 code.varnames[idx].as_str()
@@ -4094,7 +4095,7 @@ impl OpcodeStepExecutor for PyFrame {
         } else {
             idx
         };
-        let slot = self.locals_w()[deref_idx];
+        let slot = locals_w!(self)[deref_idx];
         let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_get(slot) }
         } else {
@@ -4151,7 +4152,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── LoadFastAndClear (comprehension scope) ──
     fn load_fast_and_clear(&mut self, idx: usize) -> Result<(), PyError> {
-        let val = self.locals_w()[idx];
+        let val = locals_w!(self)[idx];
         self.push(val);
         self.set_locals_w(idx, PY_NULL);
         Ok(())

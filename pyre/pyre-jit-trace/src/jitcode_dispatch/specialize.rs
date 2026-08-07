@@ -7364,7 +7364,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         let Some((slot_op, entry_value)) = ctx.trace_ctx.virtualizable_entry_at(flat) else {
             return Ok(None);
         };
-        // The value comes from the SHADOW, never from `frame.locals_w()`.  An
+        // The value comes from the SHADOW, never from `locals_w!(frame)`.  An
         // unsynchronized virtualizable's heap array holds whatever the frame
         // last wrote out — measured one FOR_ITER iteration behind on the loop
         // variable — which is exactly the staleness the read barrier's

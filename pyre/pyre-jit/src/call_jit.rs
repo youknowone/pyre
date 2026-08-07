@@ -3,6 +3,7 @@
 //!
 //! Separated from pyre-interpreter/src/call.rs so pyre-interpreter stays JIT-free.
 
+use pyre_interpreter::{locals_w, locals_w_mut};
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::sync::Once;
@@ -358,7 +359,7 @@ fn unroot_callee_frame(ptr: *mut PyFrame) {
 /// `frame` must point at a fully-initialized live `PyFrame`.
 unsafe fn visit_callee_frame_roots(frame: *mut PyFrame, visitor: &mut dyn FnMut(&mut GcRef)) {
     let frame = unsafe { &mut *frame };
-    for slot in frame.locals_w_mut().as_mut_slice() {
+    for slot in locals_w_mut!(frame).as_mut_slice() {
         visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut GcRef) });
     }
     visitor(unsafe { &mut *(&mut frame.f_generator_nowref as *mut PyObjectRef as *mut GcRef) });
@@ -1342,11 +1343,11 @@ pub extern "C" fn jit_force_recursive_call_1(
     // result_type=REF: no RawInt unbox needed — arg is already boxed Ref
     if majit_metainterp::majit_log_enabled() {
         let caller = unsafe { &*(caller_frame as *const PyFrame) };
-        let caller_arg0 = if caller.locals_w().len() > 0
-            && !caller.locals_w()[0].is_null()
-            && unsafe { is_int(caller.locals_w()[0]) }
+        let caller_arg0 = if locals_w!(caller).len() > 0
+            && !locals_w!(caller)[0].is_null()
+            && unsafe { is_int(locals_w!(caller)[0]) }
         {
-            Some(unsafe { w_int_get_value(caller.locals_w()[0]) })
+            Some(unsafe { w_int_get_value(locals_w!(caller)[0]) })
         } else {
             None
         };
@@ -1366,11 +1367,11 @@ pub extern "C" fn jit_force_recursive_call_1(
     jit_drop_callee_frame(frame_ptr);
     if majit_metainterp::majit_log_enabled() {
         let caller = unsafe { &*(caller_frame as *const PyFrame) };
-        let caller_arg0 = if caller.locals_w().len() > 0
-            && !caller.locals_w()[0].is_null()
-            && unsafe { is_int(caller.locals_w()[0]) }
+        let caller_arg0 = if locals_w!(caller).len() > 0
+            && !locals_w!(caller)[0].is_null()
+            && unsafe { is_int(locals_w!(caller)[0]) }
         {
-            Some(unsafe { w_int_get_value(caller.locals_w()[0]) })
+            Some(unsafe { w_int_get_value(locals_w!(caller)[0]) })
         } else {
             None
         };
@@ -4458,7 +4459,7 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
         eprintln!(
             "[jit][ca-frame-raw] ptr={frame_ptr:p} locals=0x{:x} local0=0x{:x} vsd={} raw_arg={}",
             f.locals_cells_stack_w as usize,
-            f.locals_w()[0] as usize,
+            locals_w!(f)[0] as usize,
             f.valuestackdepth,
             raw_int_arg,
         );
@@ -4573,7 +4574,7 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_frame_set_slot_ref(frame_ptr: i64, idx: i64, value: i64) {
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    frame.locals_w_mut()[idx as usize] = value as PyObjectRef;
+    locals_w_mut!(frame)[idx as usize] = value as PyObjectRef;
 }
 
 /// `jit_frame_set_slot_ref` for a raw int value — boxes via `w_int_new`.
@@ -4581,7 +4582,7 @@ pub extern "C" fn jit_frame_set_slot_ref(frame_ptr: i64, idx: i64, value: i64) {
 pub extern "C" fn jit_frame_set_slot_int(frame_ptr: i64, idx: i64, raw: i64) {
     let boxed = pyre_object::intobject::w_int_new(raw);
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    frame.locals_w_mut()[idx as usize] = boxed;
+    locals_w_mut!(frame)[idx as usize] = boxed;
 }
 
 /// `jit_frame_set_slot_ref` for a raw float value — boxes via `w_float_new`.
@@ -4589,7 +4590,7 @@ pub extern "C" fn jit_frame_set_slot_int(frame_ptr: i64, idx: i64, raw: i64) {
 pub extern "C" fn jit_frame_set_slot_float(frame_ptr: i64, idx: i64, raw: f64) {
     let boxed = pyre_object::floatobject::w_float_new(raw);
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    frame.locals_w_mut()[idx as usize] = boxed;
+    locals_w_mut!(frame)[idx as usize] = boxed;
 }
 
 // ===========================================================================
@@ -5011,7 +5012,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
                 // A NULL here with a live fastlocal is an unbound blackhole
                 // register (the resume never seeded the slot); a NULL fastlocal
                 // means the frame itself lost the binding.
-                let locals_w = frame.locals_w();
+                let locals_w = locals_w!(frame);
                 let shown = locals_w.len().min(8);
                 let locals: Vec<Option<usize>> = (0..shown)
                     .map(|i| {

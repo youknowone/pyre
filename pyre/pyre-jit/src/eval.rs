@@ -16,6 +16,7 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
     PyError, PyResult, StepResult, decode_instruction_forward, execute_opcode_step,
 };
+use pyre_interpreter::{locals_w, locals_w_mut};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -7506,10 +7507,10 @@ fn deliver_exit_frame_exception(
 // dont_look_inside: JIT debug/driver helper.
 #[majit_macros::dont_look_inside]
 fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
-    if frame.locals_w().len() == 0 {
+    if locals_w!(frame).len() == 0 {
         return None;
     }
-    let value = frame.locals_w()[0];
+    let value = locals_w!(frame)[0];
     if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
         return None;
     }
@@ -8611,7 +8612,7 @@ fn untag_tagged_frame_locals(frame: &mut PyFrame) {
         return;
     }
     let nlocals = frame.nlocals();
-    let locals = frame.locals_w_mut();
+    let locals = locals_w_mut!(frame);
     let n = nlocals.min(locals.len());
     for i in 0..n {
         let slot = locals[i];
@@ -8647,9 +8648,9 @@ fn execute_assembler(
     untag_tagged_frame_locals(frame);
 
     if majit_metainterp::majit_log_enabled() {
-        let locals: Vec<(usize, Option<i64>)> = (0..frame_root.frame().locals_w().len().min(5))
+        let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame_root.frame()).len().min(5))
             .map(|i| {
-                let value = frame_root.frame().locals_w()[i];
+                let value = locals_w!(frame_root.frame())[i];
                 let decoded = if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) }
                 {
                     None
@@ -9131,9 +9132,9 @@ fn bound_reached(
 ) -> Option<LoopResult> {
     let mut frame_root = FrameRoot::new(frame);
     if majit_metainterp::majit_log_enabled() {
-        let locals: Vec<(usize, Option<i64>)> = (0..frame_root.frame().locals_w().len().min(5))
+        let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame_root.frame()).len().min(5))
             .map(|i| {
-                let value = frame_root.frame().locals_w()[i];
+                let value = locals_w!(frame_root.frame())[i];
                 let decoded = if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) }
                 {
                     None
@@ -11475,7 +11476,7 @@ fn build_resumed_frames(
                     f.w_globals,
                     f.debugdata,
                     f.vable_token,
-                    f.locals_w().len(),
+                    locals_w!(f).len(),
                 );
             }
         }
@@ -13091,10 +13092,10 @@ mod tests {
         let code = function_code_from_module(&module, "f");
 
         let mut frame = PyFrame::new(code.clone());
-        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
-        frame.locals_w_mut()[1] = w_int_new(7);
-        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
-        frame.locals_w_mut()[3] = w_int_new(5);
+        locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
+        locals_w_mut!(frame)[1] = w_int_new(7);
+        locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
+        locals_w_mut!(frame)[3] = w_int_new(5);
         frame.valuestackdepth = 4;
         let _ = frame.getorcreatedebug(123);
         frame.append_block(FrameBlock {
@@ -13192,10 +13193,10 @@ mod tests {
         let code = function_code_from_module(&module, "f");
 
         let mut frame = PyFrame::new(code.clone());
-        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
-        frame.locals_w_mut()[1] = w_int_new(7);
-        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
-        frame.locals_w_mut()[3] = w_int_new(5);
+        locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
+        locals_w_mut!(frame)[1] = w_int_new(7);
+        locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
+        locals_w_mut!(frame)[3] = w_int_new(5);
         frame.valuestackdepth = 4;
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
@@ -13299,10 +13300,10 @@ mod tests {
         let code = function_code_from_module(&module, "f");
 
         let mut frame = PyFrame::new(code.clone());
-        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
-        frame.locals_w_mut()[1] = w_int_new(7);
-        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
-        frame.locals_w_mut()[3] = w_int_new(5);
+        locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
+        locals_w_mut!(frame)[1] = w_int_new(7);
+        locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
+        locals_w_mut!(frame)[3] = w_int_new(5);
         frame.valuestackdepth = 4;
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
@@ -13364,10 +13365,10 @@ mod tests {
         let code = function_code_from_module(&module, "f");
 
         let mut frame = PyFrame::new(code.clone());
-        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
-        frame.locals_w_mut()[1] = w_int_new(7);
-        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
-        frame.locals_w_mut()[3] = w_int_new(5);
+        locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
+        locals_w_mut!(frame)[1] = w_int_new(7);
+        locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
+        locals_w_mut!(frame)[3] = w_int_new(5);
         frame.valuestackdepth = 4;
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
@@ -13472,9 +13473,9 @@ mod tests {
         let code = function_code_from_module(&module, "f");
 
         let mut frame = PyFrame::new(code.clone());
-        frame.locals_w_mut()[0] = w_int_new(11);
-        frame.locals_w_mut()[1] = w_int_new(7);
-        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
+        locals_w_mut!(frame)[0] = w_int_new(11);
+        locals_w_mut!(frame)[1] = w_int_new(7);
+        locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
         frame.valuestackdepth = 7;
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
@@ -13623,9 +13624,9 @@ mod tests {
         let code = function_code_from_module(&module, "f");
 
         let mut frame = PyFrame::new(code.clone());
-        frame.locals_w_mut()[0] = w_int_new(11);
-        frame.locals_w_mut()[1] = w_int_new(7);
-        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
+        locals_w_mut!(frame)[0] = w_int_new(11);
+        locals_w_mut!(frame)[1] = w_int_new(7);
+        locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
         frame.valuestackdepth = 7;
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
@@ -13747,7 +13748,7 @@ mod tests {
             "f",
             2,
             |frame| {
-                frame.locals_w_mut()[0] = w_int_new(7);
+                locals_w_mut!(frame)[0] = w_int_new(7);
             },
         );
         // `live_args_shape_at` and

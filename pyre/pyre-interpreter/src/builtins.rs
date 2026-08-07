@@ -1,3 +1,4 @@
+use crate::locals_w;
 use num_traits::ToPrimitive;
 use pyre_object::rbigint::RBigInt as BigInt;
 
@@ -10287,7 +10288,7 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         // CPython 3.11+ localsplus lets an argument cellvar share slot zero;
         // this is PyPy's `_get_self_location` / `_getcell(self_cell)` branch
         // expressed in the unified slot layout.
-        let self_slot = frame.locals_w()[0];
+        let self_slot = locals_w!(frame)[0];
         let first_arg_is_cellvar = code
             .varnames
             .first()
@@ -10310,8 +10311,7 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             .position(|name| name == "__class__")
             .ok_or_else(|| crate::PyError::runtime_error("super(): __class__ cell not found"))?;
         let class_slot = code.varnames.len() + crate::pyframe::npure_cellvars(code) + class_freevar;
-        let class_cell = frame
-            .locals_w()
+        let class_cell = locals_w!(frame)
             .as_slice()
             .get(class_slot)
             .copied()

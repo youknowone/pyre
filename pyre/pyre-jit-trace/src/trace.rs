@@ -9,6 +9,7 @@
 
 use majit_metainterp::{MetaInterp, TraceAction, TraceCtx};
 use pyre_interpreter::CodeObject;
+use pyre_interpreter::{locals_w, locals_w_mut};
 
 use crate::state::{PyreMeta, PyreSym, WalkSym};
 
@@ -822,7 +823,7 @@ fn try_commit_midbody_abort_inner(
             if !exception_delivery_stack_is_sourceable(
                 depth,
                 below.len(),
-                outer.locals_w().as_slice().len(),
+                locals_w!(outer).as_slice().len(),
                 outer_stack_base,
             ) {
                 return Err(MidBodyDecline::BeforeRun(
@@ -871,14 +872,14 @@ fn try_commit_midbody_abort_inner(
             "live_locals length does not match varnames",
         ));
     }
-    for slot in &mut frame.locals_w_mut().as_mut_slice()[..code.varnames.len()] {
+    for slot in &mut locals_w_mut!(frame).as_mut_slice()[..code.varnames.len()] {
         *slot = pyre_object::PY_NULL;
     }
     // `_copy_data_from_miframe` restores Ref registers before any scalar
     // boxing allocation; once installed, the rooted frame array owns them.
     for (slot, value) in current.live_locals.iter().enumerate() {
         if let Some(crate::state::ConcreteValue::Ref(value)) = value {
-            frame.locals_w_mut().as_mut_slice()[slot] = *value;
+            locals_w_mut!(frame).as_mut_slice()[slot] = *value;
         }
     }
     let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
@@ -886,7 +887,7 @@ fn try_commit_midbody_abort_inner(
         let crate::state::ConcreteValue::Ref(value) = value else {
             return Err(MidBodyDecline::BeforeRun("live stack slot is not a Ref"));
         };
-        frame.locals_w_mut().as_mut_slice()[stack_base + rel] = *value;
+        locals_w_mut!(frame).as_mut_slice()[stack_base + rel] = *value;
     }
     // The array is old-gen from birth (`FrameLocalsArrayAllocation::OldGenGc`)
     // and `FrameLocalsRoot` only forwards the field slot, not the items: the
@@ -895,14 +896,14 @@ fn try_commit_midbody_abort_inner(
     // every batch that follows a possible collection.
     crate::state::frame_array_write_barrier(
         frame.as_mut_ptr() as *mut u8,
-        frame.locals_w_mut() as *mut _,
+        locals_w_mut!(frame) as *mut _,
     );
     for (slot, value) in current.live_locals.iter().enumerate() {
         crate::state::frame_array_write_barrier(
             frame.as_mut_ptr() as *mut u8,
-            frame.locals_w_mut() as *mut _,
+            locals_w_mut!(frame) as *mut _,
         );
-        frame.locals_w_mut().as_mut_slice()[slot] = match value {
+        locals_w_mut!(frame).as_mut_slice()[slot] = match value {
             None => pyre_object::PY_NULL,
             Some(crate::state::ConcreteValue::Ref(value)) => *value,
             Some(crate::state::ConcreteValue::Int(value)) => pyre_object::w_int_new(*value),
@@ -916,7 +917,7 @@ fn try_commit_midbody_abort_inner(
     }
     crate::state::frame_array_write_barrier(
         frame.as_mut_ptr() as *mut u8,
-        frame.locals_w_mut() as *mut _,
+        locals_w_mut!(frame) as *mut _,
     );
     frame.valuestackdepth = stack_base + current.live_stack.len();
     frame.last_instr = words.callee_py_pc as isize - 1;
@@ -1000,8 +1001,8 @@ fn try_commit_midbody_abort_inner(
             let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
             // The handler unwinds from the operand level the CALL raised at,
             // which for an expression-position call is not the empty one.
-            let arr_ptr = outer.locals_w_mut() as *mut _;
-            outer.locals_w_mut().as_mut_slice()
+            let arr_ptr = locals_w_mut!(outer) as *mut _;
+            locals_w_mut!(outer).as_mut_slice()
                 [outer_stack_base..outer_stack_base + below_now.len()]
                 .copy_from_slice(below_now);
             crate::state::frame_array_write_barrier(cf_addr as *mut u8, arr_ptr);
@@ -3544,7 +3545,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                     if cf_addr != 0 {
                         let frame =
                             unsafe { &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame) };
-                        if let Some(&value) = frame.locals_w().as_slice().get(slot as usize)
+                        if let Some(&value) = locals_w!(frame).as_slice().get(slot as usize)
                             && !value.is_null()
                         {
                             ctx.set_opref_concrete(
@@ -5317,7 +5318,7 @@ fn loop_inlines_abort_permanent_callee(
         // resolve it directly from the loop-body-referenced slots in the
         // frame's initialised locals/cells region.  Stop at `stack_base()` —
         // operand-stack slots beyond it are uninitialised.
-        let slots = cf.locals_w().as_slice();
+        let slots = locals_w!(cf).as_slice();
         let bound = cf.stack_base().min(slots.len());
         for (slot_idx, &slot) in slots[..bound].iter().enumerate() {
             if !loop_body_local_slots.contains(&slot_idx) {

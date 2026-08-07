@@ -16,6 +16,7 @@
 //! arms themselves stay in `handle` (mod.rs) and call into these.
 
 use super::*;
+use pyre_interpreter::{locals_w, locals_w_mut};
 
 /// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
 /// pc.  They differ in exactly the way the walk-end commit contract cares
@@ -1422,7 +1423,7 @@ fn capture_escape_flush_undo(frame: usize) {
             frame,
             last_instr,
             valuestackdepth: pf.valuestackdepth,
-            slots: pf.locals_w().as_slice().to_vec(),
+            slots: locals_w!(pf).as_slice().to_vec(),
         });
     });
 }
@@ -1439,7 +1440,7 @@ pub(crate) fn restore_escape_flush_undo() {
         };
         unsafe {
             let pf = &mut *(undo.frame as *mut pyre_interpreter::PyFrame);
-            let dst = pf.locals_w_mut();
+            let dst = locals_w_mut!(pf);
             let n = undo.slots.len().min(dst.as_slice().len());
             for (i, &v) in undo.slots.iter().take(n).enumerate() {
                 dst[i] = v;

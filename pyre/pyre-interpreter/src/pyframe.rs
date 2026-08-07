@@ -19,6 +19,35 @@ const _: () = assert!(
         == std::mem::size_of::<Rc<PyExecutionContext>>()
 );
 
+/// Borrow a frame's `locals_cells_stack_w` array.
+///
+/// A macro and not an accessor method on purpose.  The codewriter only
+/// lowers an array access through the virtualizable protocol —
+/// `getarrayitem_vable_r` / `setarrayitem_vable_r` — when the `getfield` of
+/// the virtualizable array and the array access itself sit in the same basic
+/// block (`rpython/jit/codewriter/jtransform.py`).  A method that returns the
+/// array reference puts the `getfield` in its own graph, so every access
+/// through it falls back to a plain `getarrayitem_gc`.  Expanding the field
+/// read at the call site is what keeps the pair together, which is also why
+/// `pyframe.py` writes `self.locals_cells_stack_w[i]` inline at every use
+/// instead of going through an accessor.
+///
+/// Accepts anything that derefs to a `PyFrame`, so `FrameBox` works too.
+#[macro_export]
+macro_rules! locals_w {
+    ($frame:expr) => {
+        (unsafe { &*$frame.locals_cells_stack_w })
+    };
+}
+
+/// Mutably borrow a frame's `locals_cells_stack_w` array. See [`locals_w!`].
+#[macro_export]
+macro_rules! locals_w_mut {
+    ($frame:expr) => {
+        (unsafe { &mut *$frame.locals_cells_stack_w })
+    };
+}
+
 /// `types.FrameType` — the PyType every `PyFrame`'s `ob_header` points at.
 /// pyframe.py `class PyFrame(W_Root)` with `typedef.py:736 PyFrame.typedef
 /// = TypeDef("frame", ...)`. The descriptors (`f_back`, `f_locals`, …) are
@@ -563,6 +592,18 @@ pub struct FrameBox {
     /// the frame on the ExecutionContext chain.
     owner_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
 }
+
+/// `FrameBox::new` takes the frame **by value**, and the codewriter depends on
+/// it: a virtualizable-field projection whose base is a non-dereferenced local
+/// aggregate is not treated as reaching a live virtualizable, which is what
+/// keeps the twelve frame-construction projections in `new` off the
+/// `getfield_vable_*` / `setfield_vable_*` path.  Allocating first and
+/// initialising through a pointer turns every one of them into a deref and
+/// withdraws that suppression silently — nothing fails where the edit is made.
+///
+/// Changing this signature is therefore a decision, not a refactor.
+/// `pyre/scripts/vable-projection-census.py` is the corpus-level check.
+const _: fn(PyFrame) -> FrameBox = FrameBox::new;
 
 impl FrameBox {
     /// Move `frame` onto the heap behind a GC header.
@@ -1206,18 +1247,6 @@ impl PyFrame {
         }
     }
 
-    /// Access locals_cells_stack_w (deref the pointer).
-    #[inline]
-    pub fn locals_w(&self) -> &FixedObjectArray {
-        unsafe { &*self.locals_cells_stack_w }
-    }
-
-    /// Mutably access locals_cells_stack_w.
-    #[inline]
-    pub fn locals_w_mut(&mut self) -> &mut FixedObjectArray {
-        unsafe { &mut *self.locals_cells_stack_w }
-    }
-
     #[inline]
     pub fn set_locals_w(&mut self, index: usize, value: PyObjectRef) {
         unsafe { &mut *self.locals_cells_stack_w }.set_ref(index, value);
@@ -1248,8 +1277,8 @@ impl PyFrame {
     pub fn restore_resume_state_from(&mut self, src: &PyFrame) {
         self.last_instr = src.last_instr;
         self.valuestackdepth = src.valuestackdepth;
-        let src_vals = src.locals_w().as_slice().to_vec();
-        let dst = self.locals_w_mut();
+        let src_vals = locals_w!(src).as_slice().to_vec();
+        let dst = locals_w_mut!(self);
         let n = src_vals.len().min(dst.as_slice().len());
         for (i, &v) in src_vals.iter().take(n).enumerate() {
             dst[i] = v;
@@ -2285,7 +2314,7 @@ impl PyFrame {
     /// PyPy-compatible `_getcell`.
     #[inline]
     pub fn _getcell(&self, varindex: usize) -> PyObjectRef {
-        self.locals_w()
+        locals_w!(self)
             .as_slice()
             .get(self.nlocals() + varindex)
             .copied()
@@ -2567,7 +2596,7 @@ impl PyFrame {
             execution_context: self.execution_context,
             pycode: self.pycode,
             locals_cells_stack_w: unsafe {
-                let values = self.locals_w().to_vec();
+                let values = locals_w!(self).to_vec();
                 let array = alloc_frame_locals_array(values.len(), PY_NULL, allocation);
                 for (i, value) in values.into_iter().enumerate() {
                     (*array).items_mut_ptr().add(i).write(value);
@@ -2655,7 +2684,7 @@ impl PyFrame {
             report_stack_underflow(self);
         }
         let depth = self.valuestackdepth - 1;
-        let value = self.locals_w()[depth];
+        let value = locals_w!(self)[depth];
         self.set_locals_w(depth, PY_NULL);
         self.valuestackdepth = depth;
         value
@@ -2663,13 +2692,13 @@ impl PyFrame {
 
     #[inline]
     pub fn peek(&self) -> PyObjectRef {
-        self.locals_w()[self.valuestackdepth - 1]
+        locals_w!(self)[self.valuestackdepth - 1]
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn peek_at(&self, depth: usize) -> PyObjectRef {
-        self.locals_w()[self.valuestackdepth - 1 - depth]
+        locals_w!(self)[self.valuestackdepth - 1 - depth]
     }
 
     /// Null the locals_cells_stack slots at and above `depth`, the
@@ -2678,7 +2707,7 @@ impl PyFrame {
     /// scan before the next push does not observe a stale operand pointer
     /// above the live depth.
     pub fn clear_stack_above(&mut self, depth: usize) {
-        let arr = self.locals_w_mut().as_mut_slice();
+        let arr = locals_w_mut!(self).as_mut_slice();
         for slot in arr.iter_mut().skip(depth) {
             *slot = PY_NULL;
         }
@@ -2694,7 +2723,7 @@ impl PyFrame {
     #[inline]
     pub fn pushvalue_none(&mut self) {
         let depth = self.valuestackdepth;
-        debug_assert!(self.locals_w()[depth].is_null());
+        debug_assert!(locals_w!(self)[depth].is_null());
         self.valuestackdepth = depth + 1;
     }
 
@@ -2717,7 +2746,7 @@ impl PyFrame {
     /// rather than as silent malloc corruption later.
     #[inline]
     pub fn _check_stack_index(&self, index: usize) -> bool {
-        index >= self.stack_base() && index < self.locals_w().len()
+        index >= self.stack_base() && index < locals_w!(self).len()
     }
 
     /// pyframe.py:313-314 popvalue
@@ -2733,7 +2762,7 @@ impl PyFrame {
     pub fn popvalue_maybe_none(&mut self) -> PyObjectRef {
         let depth = self.valuestackdepth - 1;
         self.assert_stack_index(depth);
-        let w_object = self.locals_w()[depth];
+        let w_object = locals_w!(self)[depth];
         self.set_locals_w(depth, PY_NULL);
         self.valuestackdepth = depth;
         w_object
@@ -2781,7 +2810,7 @@ impl PyFrame {
         let mut idx = n;
         while idx > 0 {
             idx -= 1;
-            values_w[idx] = self.locals_w()[base + idx];
+            values_w[idx] = locals_w!(self)[base + idx];
         }
         values_w
     }
@@ -2835,7 +2864,7 @@ impl PyFrame {
         if index == usize::MAX || index < self.stack_base() {
             return PY_NULL;
         }
-        self.locals_w()[index]
+        locals_w!(self)[index]
     }
 
     /// PyPy-compatible `settopvalue()`.
@@ -3281,9 +3310,9 @@ impl PyFrame {
         // Clear locals, cell/free vars, and the stack.  A cell slot is
         // rebound to a fresh empty cell (not mutated in place, since it may
         // still be shared by an inner/outer function).
-        let len = self.locals_w().len();
+        let len = locals_w!(self).len();
         for i in 0..len {
-            let w_oldvalue = self.locals_w()[i];
+            let w_oldvalue = locals_w!(self)[i];
             let w_newvalue = if !w_oldvalue.is_null() && unsafe { pyre_object::is_cell(w_oldvalue) }
             {
                 pyre_object::w_cell_new(pyre_object::PY_NULL)
@@ -3605,7 +3634,7 @@ impl PyFrame {
             // CO_FAST_HIDDEN slots are not reflected in the locals mapping —
             // preserve the current fast value instead of clearing it.
             if hidden_local(code, i) {
-                new_fastlocals_w[i] = self.locals_w()[i];
+                new_fastlocals_w[i] = locals_w!(self)[i];
                 continue;
             }
             let name = &code.varnames[i];
@@ -3640,9 +3669,9 @@ impl PyFrame {
                 code.freevars[i - npure].as_ref()
             };
             let idx = numlocals + i;
-            if idx < self.locals_w().len() {
+            if idx < locals_w!(self).len() {
                 let w_value = finditem_str_object(w_locals, name)?.unwrap_or(PY_NULL);
-                let slot = self.locals_w()[idx];
+                let slot = locals_w!(self)[idx];
                 if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
                     unsafe { pyre_object::w_cell_set(slot, w_value) };
                 } else {
@@ -3688,7 +3717,7 @@ impl PyFrame {
                 continue;
             }
             let name = &varnames[i];
-            let w_value = self.locals_w()[i];
+            let w_value = locals_w!(self)[i];
             if !w_value.is_null() {
                 setitem_str_object(w_locals, name, w_value)?;
             } else {
@@ -3721,8 +3750,8 @@ impl PyFrame {
                 code.freevars[i - npure].as_ref()
             };
             let idx = numlocals + i;
-            if idx < self.locals_w().len() {
-                let slot = self.locals_w()[idx];
+            if idx < locals_w!(self).len() {
+                let slot = locals_w!(self)[idx];
                 let w_value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
                     unsafe { pyre_object::w_cell_get(slot) }
                 } else {

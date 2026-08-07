@@ -11,6 +11,7 @@ use majit_metainterp::{
     BridgeInlineCarrier, BridgeVirtualCache, JitDriverStaticData, JitState, ReconstructRecipe,
     TraceAction, TraceCtx, decode_fieldnum, materialize_bridge_virtual,
 };
+use pyre_interpreter::{locals_w, locals_w_mut};
 
 use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
 use pyre_interpreter::pyframe::PyFrame;
@@ -11294,7 +11295,7 @@ mod tests {
         let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
         let values = [w_int_new(11), pyre_object::w_none(), w_int_new(33)];
         for (index, value) in values.iter().copied().enumerate() {
-            frame.locals_w_mut()[index] = value;
+            locals_w_mut!(frame)[index] = value;
         }
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
@@ -11349,7 +11350,7 @@ mod tests {
         let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
         let values = [w_int_new(11), w_int_new(22)];
         for (index, value) in values.iter().copied().enumerate() {
-            frame.locals_w_mut()[index] = value;
+            locals_w_mut!(frame)[index] = value;
         }
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
@@ -11396,7 +11397,7 @@ mod tests {
         let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
         let values = [w_int_new(11), w_int_new(22), w_int_new(33)];
         for (index, value) in values.iter().copied().enumerate() {
-            frame.locals_w_mut()[index] = value;
+            locals_w_mut!(frame)[index] = value;
         }
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
@@ -12033,10 +12034,10 @@ mod tests {
         assert!(publish_captured_frame_stack(live_addr, &captured));
         assert_eq!(live.valuestackdepth, stack_base + 2);
         assert_eq!(live.last_instr, 37);
-        assert_eq!(live.locals_w()[stack_base], forwarded_iterator);
-        assert_eq!(live.locals_w()[stack_base + 1], forwarded_item);
-        assert_eq!(snapshot.locals_w()[stack_base], iterator);
-        assert_eq!(snapshot.locals_w()[stack_base + 1], item);
+        assert_eq!(locals_w!(live)[stack_base], forwarded_iterator);
+        assert_eq!(locals_w!(live)[stack_base + 1], forwarded_item);
+        assert_eq!(locals_w!(snapshot)[stack_base], iterator);
+        assert_eq!(locals_w!(snapshot)[stack_base + 1], item);
     }
 
     fn contains_instruction(code: &CodeObject, predicate: impl Fn(Instruction) -> bool) -> bool {
@@ -12946,7 +12947,7 @@ mod tests {
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = PyFrame::new(code);
         frame.fix_array_ptrs();
-        let full_len = frame.locals_w().len();
+        let full_len = locals_w!(frame).len();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut state = empty_state();
@@ -13410,8 +13411,8 @@ mod tests {
         ensure_test_callbacks();
         let code = compile_exec("len(x)").expect("test code should compile");
         let mut frame = PyFrame::new(code);
-        frame.locals_w_mut()[0] = w_int_new(41);
-        frame.locals_w_mut()[1] = w_int_new(7);
+        locals_w_mut!(frame)[0] = w_int_new(41);
+        locals_w_mut!(frame)[1] = w_int_new(7);
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let array_len =
