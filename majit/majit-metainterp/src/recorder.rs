@@ -72,16 +72,21 @@ pub struct Snapshot {
 pub struct SnapshotFrame {
     /// Index of the jitcode (or 0 for the root portal).
     pub jitcode_index: u32,
-    /// Program counter within the jitcode.  In RPython, the MIFrame's
-    /// `pc` field IS the JitCode byte offset (`pyjitpl.py:185
-    /// setposition`).  Pyre's tracer populates this slot with the Python
-    /// bytecode PC because pyre traces Python bytecode rather than JitCode
-    /// — see `[[project-issue73-phase5-design]]` for the broader deviation
-    /// context; the runtime translates `py_pc` through `pc_map` at resume
-    /// time until pyre's walker-as-tracer epic lands.
+    /// Program counter within the jitcode: the JitCode byte offset, as the
+    /// MIFrame's `pc` field is upstream (`pyjitpl.py:185 setposition`). Both
+    /// writers stamp a JitCode offset — `build_state_field_snapshot` reads
+    /// `MIFrame::pc` directly, and `capture_snapshot_for_last_guard_multi_frame`
+    /// takes it from the walker's own `build_framestack_snapshot`. There is no
+    /// longer a second, Python-keyed coordinate here and no translation table
+    /// between the two.
     pub pc: u32,
     /// Forward-carried Python instruction PC for this JitCode position.
     /// `u32::MAX` is the no-snapshot sentinel paired with `pc == -1`.
+    ///
+    /// Upstream derives the Python-level position where it needs one; this
+    /// carries it, because the resume decoder that reads it back for
+    /// `f_lasti` and traceback reconstruction holds no jitcode metadata and
+    /// so has no jitcode→Python inverse available at that point.
     pub py_pc: u32,
     /// Tagged references to the live boxes in this frame.
     pub boxes: Vec<SnapshotTagged>,
