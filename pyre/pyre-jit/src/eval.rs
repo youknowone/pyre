@@ -6795,11 +6795,14 @@ fn loop_region_contains_escaping_range_append(
             {
                 state = State::AwaitRange;
             }
-            I::LoadGlobal { namei }
-                if matches!(state, State::AwaitRange)
-                    && code.names[(namei.get(op_arg) as usize) >> 1].as_str() == "range" =>
-            {
-                state = State::AwaitRangeCall;
+            I::LoadGlobal { namei } => {
+                state = if matches!(state, State::AwaitRange)
+                    && code.names[(namei.get(op_arg) as usize) >> 1].as_str() == "range"
+                {
+                    State::AwaitRangeCall
+                } else {
+                    State::Searching
+                };
             }
             I::Call { .. } | I::CallKw { .. } => {
                 state = match state {
@@ -6808,6 +6811,8 @@ fn loop_region_contains_escaping_range_append(
                     _ => State::Searching,
                 };
             }
+            I::ExtendedArg | I::Cache => {}
+            _ if matches!(state, State::AwaitAppendCall) => state = State::Searching,
             _ => {}
         }
     }
@@ -12729,6 +12734,40 @@ mod tests {
         assert!(!for_iter_body_is_jit_safe_at(
             &code,
             final_for_iter.expect("fixture must contain the final comprehension")
+        ));
+    }
+
+    #[test]
+    fn range_consumed_by_len_is_not_an_escaping_append() {
+        use pyre_interpreter::{Instruction as I, compile_exec};
+        let module = compile_exec(
+            "def run(n):\n    escaped = []\n    i = 0\n    while i < n:\n        escaped.append(len(range(i)))\n        i += 1\n    return escaped\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "run");
+
+        let mut loop_header = usize::MAX;
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        for (pc, unit) in code.instructions.iter().copied().enumerate() {
+            let (instr, op_arg) = arg_state.get(unit);
+            let target = match instr {
+                I::JumpBackward { delta } => {
+                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                I::JumpBackwardNoInterrupt { delta } => {
+                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                loop_header = loop_header.min(target);
+            }
+        }
+
+        assert_ne!(loop_header, usize::MAX);
+        assert!(!loop_region_contains_escaping_range_append(
+            &code,
+            loop_header
         ));
     }
 
