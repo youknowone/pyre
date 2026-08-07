@@ -1,8 +1,11 @@
-# pyre-check: max-pypy-ratio=90
-# pypy's exec time is pinned to the startup-subtraction floor here, so the
-# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
-# runners observe (44.3x), rounded up.
-N = 2000000
+# pyre-check: max-pypy-ratio=5
+# The trip count puts pypy's execution above the startup-subtraction floor, so
+# this ratio is a measurement. It collapses from the clamped reading rather
+# than rising: at the old trip count the numerator was mostly pyre's fixed
+# warmup, which the longer loop amortises, so the same code reads 2.1x where
+# it read ~44x against the floor. The ceiling is twice the slowest of the
+# three backends observed (2.1x on wasm); the previous 90 gated nothing.
+N = 110000000
 
 
 def main():

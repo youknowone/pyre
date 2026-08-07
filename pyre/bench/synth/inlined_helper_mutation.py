@@ -1,4 +1,8 @@
-# pyre-check: max-pypy-ratio=45
+# pyre-check: max-pypy-ratio=145
+# The trip count now puts pypy above the startup-subtraction floor, so this
+# ratio is a measurement rather than pyre divided by the floor constant. The
+# ceiling is twice the slowest of the three backends observed unclamped
+# (71.1x on wasm); the previous 45 was fitted against the clamp and fails.
 # Inlined-callee shared-heap mutation parity, in both helper orderings.
 #
 # A tiny helper mutates a caller-owned list/instance inside a hot while-loop,
@@ -14,7 +18,7 @@
 # the append abort and the interpreter restarts the iteration from the
 # unadvanced frame, re-running bump.  A recording attempt that aborts after
 # the committed store must not leave a doubled side effect.
-N = 100000
+N = 2900000
 
 
 def push(a, v):

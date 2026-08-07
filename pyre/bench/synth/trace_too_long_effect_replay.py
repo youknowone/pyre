@@ -21,7 +21,7 @@ def set_trace_limit(n):
         pypyjit.set_param("trace_limit=%d,threshold=1,function_threshold=1" % n)
 
 
-N = 200
+N = 13000
 
 # Phase A — an effect-free body under a limit small enough to trip it. The
 # committed `.jitstats` baseline records the resulting abort, so the length

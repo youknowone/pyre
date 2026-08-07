@@ -10,7 +10,7 @@
 # Regression guard for the kept_boxed_int flat-map migration: a wrong/stale
 # color would either miss the boxed-int hazard (miscompile) or recover the
 # wrong slot.  Pure arithmetic -> deterministic checksum.
-N = 400000
+N = 23000000
 
 
 def main():

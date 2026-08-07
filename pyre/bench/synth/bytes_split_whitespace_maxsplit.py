@@ -2,7 +2,7 @@
 # bytes/bytearray split/rsplit on whitespace (sep=None) with a positive
 # maxsplit keeps the surrounding whitespace of the final remainder field,
 # matching str. Output verified against CPython/PyPy.
-N = 20000
+N = 470000
 
 
 def main():

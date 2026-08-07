@@ -4,7 +4,7 @@
 # and the temporary W_FloatObject results can virtualize.
 from math import cos, log, sin
 
-N = 200000
+N = 6600000
 
 
 def run():

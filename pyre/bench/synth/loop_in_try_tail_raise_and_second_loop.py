@@ -15,7 +15,7 @@
 #
 # The ratio gate is loose for the same reason as the sibling fixtures: it is
 # sizing a decline, not a code generator.
-N = 40000
+N = 1100000
 R = 20
 
 
