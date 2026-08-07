@@ -6699,33 +6699,52 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     true
 }
 
+/// Return the end of the natural loop region whose header is `loop_header_pc`.
+/// Out-of-line exception handlers can rejoin the loop through a backward jump
+/// to the middle of the body, so grow the region until every such rejoining
+/// handler is included.
+fn loop_region_end(code: &pyre_interpreter::CodeObject, loop_header_pc: usize) -> Option<usize> {
+    use pyre_interpreter::Instruction as I;
+    let mut region_end = None;
+    loop {
+        let previous_end = region_end;
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        for (pc, unit) in code.instructions.iter().copied().enumerate() {
+            let (instr, op_arg) = arg_state.get(unit);
+            let target = match instr {
+                I::JumpBackward { delta } => {
+                    Some(skip_caches(code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                I::JumpBackwardNoInterrupt { delta } => {
+                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                _ => None,
+            };
+            let extends_region = match (target, region_end) {
+                (Some(target), _) if target == loop_header_pc => true,
+                (Some(target), Some(end)) => pc > end && (loop_header_pc..=end).contains(&target),
+                _ => false,
+            };
+            if extends_region {
+                region_end = Some(region_end.map_or(pc, |end: usize| end.max(pc)));
+            }
+        }
+        if region_end == previous_end {
+            return region_end;
+        }
+    }
+}
+
 /// Apply the FOR_ITER safety gate only to loops inside the natural loop region
-/// whose backedge is being considered.  `interp_jit.py:118-120` invokes
-/// `can_enter_jit` for that backedge; a later, disjoint loop in the same frame
-/// cannot execute in the trace starting there and must not blacklist it.
+/// whose backedge is being considered. `interp_jit.py:118-120` invokes
+/// `can_enter_jit` for that backedge. Later disjoint loops remain outside the
+/// region, while out-of-line handlers that rejoin this loop are included.
 fn loop_region_for_iter_bodies_all_jit_safe(
     code: &pyre_interpreter::CodeObject,
     loop_header_pc: usize,
 ) -> bool {
     use pyre_interpreter::Instruction as I;
-    let mut region_end = None;
-    let mut arg_state = pyre_interpreter::OpArgState::default();
-    for (pc, unit) in code.instructions.iter().copied().enumerate() {
-        let (instr, op_arg) = arg_state.get(unit);
-        let target = match instr {
-            I::JumpBackward { delta } => {
-                Some(skip_caches(code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            I::JumpBackwardNoInterrupt { delta } => {
-                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            _ => None,
-        };
-        if target == Some(loop_header_pc) {
-            region_end = Some(region_end.map_or(pc, |end: usize| end.max(pc)));
-        }
-    }
-    let Some(region_end) = region_end else {
+    let Some(region_end) = loop_region_end(code, loop_header_pc) else {
         return true;
     };
     let mut scan_state = pyre_interpreter::OpArgState::default();
@@ -6756,24 +6775,7 @@ fn loop_region_contains_escaping_range_append(
         AwaitAppendCall,
     }
 
-    let mut region_end = None;
-    let mut arg_state = pyre_interpreter::OpArgState::default();
-    for (pc, unit) in code.instructions.iter().copied().enumerate() {
-        let (instr, op_arg) = arg_state.get(unit);
-        let target = match instr {
-            I::JumpBackward { delta } => {
-                Some(skip_caches(code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            I::JumpBackwardNoInterrupt { delta } => {
-                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            _ => None,
-        };
-        if target == Some(loop_header_pc) {
-            region_end = Some(region_end.map_or(pc, |end: usize| end.max(pc)));
-        }
-    }
-    let Some(region_end) = region_end else {
+    let Some(region_end) = loop_region_end(code, loop_header_pc) else {
         return false;
     };
 
@@ -12727,6 +12729,46 @@ mod tests {
         assert!(!for_iter_body_is_jit_safe_at(
             &code,
             final_for_iter.expect("fixture must contain the final comprehension")
+        ));
+    }
+
+    #[test]
+    fn loop_region_includes_out_of_line_handler_rejoining_mid_body() {
+        use pyre_interpreter::{Instruction as I, compile_exec};
+        let module = compile_exec(
+            "def run(items, k):\n    out = []\n    seen = []\n    for x in items:\n        try:\n            items[x + 100]\n        except IndexError:\n            out.extend([str(y) for y in range(k)])\n        seen.append(len(range(x)))\n        out.append(x)\n    return out, seen\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "run");
+
+        let mut outer_header = usize::MAX;
+        let mut direct_end = None;
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        for (pc, unit) in code.instructions.iter().copied().enumerate() {
+            let (instr, op_arg) = arg_state.get(unit);
+            let target = match instr {
+                I::JumpBackward { delta } => {
+                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                I::JumpBackwardNoInterrupt { delta } => {
+                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                outer_header = outer_header.min(target);
+                if target == outer_header {
+                    direct_end = Some(direct_end.map_or(pc, |end: usize| end.max(pc)));
+                }
+            }
+        }
+
+        let direct_end = direct_end.expect("fixture must contain the outer backedge");
+        let region_end = loop_region_end(&code, outer_header).expect("loop must have a region");
+        assert!(region_end > direct_end);
+        assert!(!loop_region_for_iter_bodies_all_jit_safe(
+            &code,
+            outer_header
         ));
     }
 
