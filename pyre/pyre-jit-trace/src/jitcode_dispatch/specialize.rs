@@ -2808,6 +2808,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
+    use pyre_interpreter::pyframe::PyFrame;
+
     if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
@@ -3047,6 +3049,21 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         } else {
             false
         };
+        let traceback_frame = if slot
+            == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Traceback
+        {
+            let frame = unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(stored) };
+            // `mark_traceback_escaped` leaves a torn-down traceback alone.
+            // Decline before recording the receiver guards when the
+            // authoritative read sees that shape; compiled replays guard
+            // the frame load below and side-exit to the same residual path.
+            if frame.is_null() {
+                return Ok(None);
+            }
+            Some(frame)
+        } else {
+            None
+        };
         walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
         let raw_value = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -3061,15 +3078,39 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Traceback {
             // The fold replaces `descr_gettraceback`, whose read marks the
             // traceback's frame escaped so `ExecutionContext::leave` forces
-            // its vref.  The walk is the authoritative execution path, so
-            // mark now as well as on every compiled re-execution.
-            unsafe { pyre_interpreter::pytraceback::mark_traceback_escaped(stored) };
-            ctx.trace_ctx.call_void_typed_with_effect(
-                pyre_interpreter::pytraceback::jit_mark_traceback_escaped as *const (),
-                &[raw_value],
-                &[majit_ir::Type::Ref],
-                majit_metainterp::cannot_raise_effect_info(),
+            // its vref.  `descr_settraceback` admits only None or PyTraceback,
+            // so the non-null slot is already type-safe without a class guard.
+            // Read the node's frame, require the non-null case handled by the
+            // traced path, and mirror `PyFrame.mark_as_escaped` directly.
+            let frame_ref = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                raw_value,
+                crate::descr::pytraceback_frame_descr(),
             );
+            walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[frame_ref])?;
+            let concrete_frame = traceback_frame.expect("traceback fold has no frame");
+            ctx.trace_ctx.set_opref_concrete(
+                frame_ref,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame as usize)),
+            );
+            let flags_descr = crate::descr::pyframe_flags_descr();
+            let live_flags =
+                crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame_ref, flags_descr.clone());
+            let escaped_bit = ctx.trace_ctx.const_int(i64::from(PyFrame::FLAG_ESCAPED));
+            let new_flags = ctx
+                .trace_ctx
+                .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
+            ctx.trace_ctx.record_op_with_descr(
+                OpCode::SetfieldGc,
+                &[frame_ref, new_flags],
+                flags_descr.clone(),
+            );
+            ctx.trace_ctx
+                .heapcache_setfield_cached(frame_ref, flags_descr.index(), new_flags);
+
+            // The walk is the authoritative execution path, so mark its
+            // concrete frame now as well as on every compiled re-execution.
+            unsafe { pyre_interpreter::pytraceback::mark_traceback_escaped(stored) };
         }
         let value = if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
             let list = unsafe { &*(stored as *const pyre_object::listobject::W_ListObject) };
