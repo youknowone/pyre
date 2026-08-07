@@ -2642,6 +2642,67 @@ pub fn census_record_for_iter_gate_decline(code_ptr: usize, kind: &'static str) 
     first
 }
 
+#[derive(Clone, Copy, Default)]
+struct ForiterInflightCensusCounts {
+    delivered: usize,
+    refused: usize,
+}
+
+thread_local! {
+    /// In-flight FOR_ITER delivery outcomes, keyed by the frame's stable raw
+    /// `CodeObject` identity and the Python body pc. The map is touched only
+    /// when its diagnostic is enabled, so ordinary execution does not
+    /// allocate or count on the abort path.
+    static FORITER_INFLIGHT_CENSUS: std::cell::RefCell<
+        std::collections::BTreeMap<(usize, usize), ForiterInflightCensusCounts>
+    > = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Record one legacy in-flight FOR_ITER delivery decision. Like
+/// [`census_record_for_iter_gate_decline`], the collection gate precedes the
+/// thread-local lookup, so the census costs nothing when diagnostics are off.
+fn census_record_foriter_inflight(code_ptr: usize, body_pc: usize, delivered: bool) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("PYRE_FORITER_INFLIGHT_CENSUS").is_some()
+            || std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some()
+    }) {
+        return;
+    }
+    FORITER_INFLIGHT_CENSUS.with(|c| {
+        let mut map = c.borrow_mut();
+        let counts = map.entry((code_ptr, body_pc)).or_default();
+        if delivered {
+            counts.delivered += 1;
+        } else {
+            counts.refused += 1;
+        }
+    });
+    census_dump_foriter_inflight();
+}
+
+/// Print the accumulated in-flight delivery table after each observation, so
+/// the last block in a process log is its final tally without an exit hook.
+fn census_dump_foriter_inflight() {
+    FORITER_INFLIGHT_CENSUS.with(|c| {
+        for (&(code_ptr, body_pc), counts) in c.borrow().iter() {
+            let (name, source) = if code_ptr == 0 {
+                ("<unknown>", "<unknown>")
+            } else {
+                // The code object is owned by the live frame/JitCode for the
+                // duration of the process; the census only reads its labels.
+                let code = unsafe { &*(code_ptr as *const pyre_interpreter::CodeObject) };
+                (code.qualname.as_str(), code.source_path.as_str())
+            };
+            eprintln!(
+                "[fbw-foriter-census] code=0x{code_ptr:x} name={name:?} source={source:?} \
+                 body_pc={body_pc} DELIVERED={} REFUSED={}",
+                counts.delivered, counts.refused
+            );
+        }
+    });
+}
+
 /// The accumulated decline census as `(variant name, count)` pairs, sorted by
 /// name — the same content [`census_dump`] prints, for a reader that has no
 /// stderr to print it to.  A wasm guest is exactly that: `eprintln!` goes

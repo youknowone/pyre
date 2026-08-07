@@ -866,7 +866,9 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 /// or that replay starts at the next iteration and drops this one.
 /// `for_mutate` aborts BEFORE the append's effect, so both signal classes are
 /// clear at the abort point — the clean continuation case.
-pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> {
+pub fn fbw_foriter_inflight_take(
+    fallback_code_ptr: usize,
+) -> Option<(pyre_object::PyObjectRef, usize)> {
     // Take the MOST-RECENT (top) entry and drop the rest, matching the
     // single-slot behaviour: one take delivers the innermost in-flight item
     // and leaves nothing for a subsequent deliver call.  (S2 will instead
@@ -882,11 +884,24 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
     let Some(body_pc) = inflight_foriter_body_pc(stash.body) else {
         return None;
     };
+    // The live frame passed by the legacy delivery site is the portal frame,
+    // but an inline sub-walk's consumed item belongs to its own JitCode. Keep
+    // that per-frame code identity for the census; only legacy Python-pc
+    // entries lack a JitCode and fall back to the live frame's code.
+    let code_ptr = match stash.body {
+        InflightForiterBody::Jit {
+            outer_jitcode_index,
+            ..
+        } => crate::state::raw_code_for_jitcode_index(outer_jitcode_index as i32)
+            .map_or(fallback_code_ptr, |code| code as usize),
+        InflightForiterBody::Py(_) => fallback_code_ptr,
+    };
     let store_len = fbw_store_journal_len();
     let append_len = FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len());
     let cell_store_len = FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len());
     let unjournaled = fbw_has_unjournaled_effect();
     if body_effect || store_len != 0 || append_len != 0 || cell_store_len != 0 {
+        census_record_foriter_inflight(code_ptr, body_pc, false);
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-foriter] deliver REFUSED (body effect committed since consume) body_pc={} \
@@ -898,6 +913,7 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
         }
         return None;
     }
+    census_record_foriter_inflight(code_ptr, body_pc, true);
     if fbw_debug_abort_enabled() {
         eprintln!(
             "[fbw-foriter] deliver item=0x{:x} body_pc={} store_journal_len={store_len} \
@@ -920,7 +936,7 @@ mod foriter_delivery_tests {
         fbw_mark_unjournaled_effect(ResidualDecline::Symbolic);
 
         assert!(!fbw_foriter_any_body_effect_signal());
-        assert_eq!(fbw_foriter_inflight_take(), Some((item, 34)));
+        assert_eq!(fbw_foriter_inflight_take(0), Some((item, 34)));
 
         fbw_store_journal_reset();
     }
@@ -933,7 +949,7 @@ mod foriter_delivery_tests {
         fbw_mark_foriter_body_effect_since_consume();
 
         assert!(fbw_foriter_any_body_effect_signal());
-        assert_eq!(fbw_foriter_inflight_take(), None);
+        assert_eq!(fbw_foriter_inflight_take(0), None);
 
         fbw_store_journal_reset();
     }

@@ -8172,7 +8172,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 /// informational (the debug log distinguishes the two `false` cases).  The R1
 /// double-apply guard lives in `fbw_foriter_inflight_take`.
 fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
-    let Some((item, body_pc)) = pyre_jit_trace::jitcode_dispatch::fbw_foriter_inflight_take()
+    let code_ptr = unsafe { pyre_interpreter::pyframe_get_pycode(frame) } as usize;
+    let Some((item, body_pc)) =
+        pyre_jit_trace::jitcode_dispatch::fbw_foriter_inflight_take(code_ptr)
     else {
         return false;
     };
