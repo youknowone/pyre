@@ -5013,6 +5013,12 @@ fn min_max_multiple_args(
 /// metatype and `pos[1..]` is `arguments_w`.  A bound `__new__` does not prepend
 /// its `__self__`, on the direct path or through `super()`, so the split is the
 /// same however the call arrives.
+///
+/// Nothing may key the `(name, bases, dict)` triple off argument *types* —
+/// scanning for the first `str`, say — because that lets a non-type metatype
+/// slip past `precheck_for_new` and build a class, and it is why `_ast`'s
+/// `register_module` has to name `type` explicitly rather than rely on a scan
+/// to default it.
 pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // The class-definition keywords arrive as a trailing `__pyre_kw__`
     // dict (the builtin kwargs ABI); strip it before the arity check and
@@ -5041,10 +5047,10 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         // typeobject.py:901-908 — the one-argument form belongs to `type`
         // alone: `type(x)` reports the type of `x`, while `Metaclass(x)` is a
         // class statement missing its bases and its namespace.
-        if !unsafe { std::ptr::eq(w_typetype, crate::typedef::w_type()) } {
-            return Err(crate::PyError::type_error(new_arity_message(w_typetype)));
+        if unsafe { std::ptr::eq(w_typetype, crate::typedef::w_type()) } {
+            return type_descr_new_without_metaclass(arguments_w, kwargs);
         }
-        return type_descr_new_without_metaclass(arguments_w, kwargs);
+        return Err(crate::PyError::type_error(new_arity_message(w_typetype)));
     }
 
     type_descr_new_with_metaclass(arguments_w, w_typetype, kwargs)

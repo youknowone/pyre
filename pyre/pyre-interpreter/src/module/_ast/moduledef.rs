@@ -170,6 +170,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             field_types,
         )
         .expect("set _field_types on _ast type namespace");
+        // `type_descr_new` reads the metatype off the first argument, the way
+        // `descr__new__` takes it as a parameter beside `arguments_w`.  Every
+        // other caller reaches it through an attribute lookup that supplies
+        // one; this one builds the argument list by hand, so it names `type`.
         let args = [
             crate::typedef::w_type(),
             pyre_object::w_str_new(name),

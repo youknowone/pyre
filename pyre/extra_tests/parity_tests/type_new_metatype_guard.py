@@ -7,6 +7,10 @@ carrying none reports the arity under the `%N` operand spelling —
 `W_Root.getname` (baseobjspace.py:90-94), which answers `?` when the
 object has no `__name__`.
 
+The precheck is unconditional, so the three-argument form is covered too:
+the metatype is a parameter beside `__args__.arguments_w` rather than one of
+them, which fixes its position at every arity.
+
 cpython words all of these differently, so only the outcome kind is
 compared for the rows where it does; the messages are asserted per
 runtime.
@@ -113,5 +117,55 @@ class WithMeta(metaclass=Meta):
 
 expect_value("class_plain", lambda: Plain.__name__, "Plain")
 expect_value("class_metaclass", lambda: type(WithMeta), Meta)
+
+# The three-argument form runs the same precheck.  `descr__new__` takes the
+# metatype as a parameter beside `__args__.arguments_w`, so it is `pos[0]`
+# whatever the arity; keying the (name, bases, dict) triple off argument
+# *types* instead lets these three build a class.
+expect_type_error(
+    "int_metatype_three_args",
+    lambda: type.__new__(42, "A", (), {}),
+    "X is not a type object (int)",
+    "type.__new__(X): X is not a type object (int)",
+)
+expect_type_error(
+    "none_metatype_three_args",
+    lambda: type.__new__(None, "A", (), {}),
+    "X is not a type object (NoneType)",
+    "type.__new__(X): X is not a type object (NoneType)",
+)
+expect_type_error(
+    "str_metatype_three_args",
+    lambda: type.__new__("s", "A", (), {}),
+    "X is not a type object (str)",
+    "type.__new__(X): X is not a type object (str)",
+)
+
+
+class SuperMeta(type):
+    def __new__(mcls, name, bases, ns):
+        return super().__new__(mcls, name, bases, ns)
+
+
+class ViaSuper(metaclass=SuperMeta):
+    marker = 17
+
+
+# `super().__new__` resolves to the very same carrier as `type.__new__` and
+# prepends no receiver, so its metatype is `pos[0]` too.
+expect_value("super_new_is_type_new", lambda: SuperMeta.__mro__[1].__new__, type.__new__)
+expect_value("super_new_metaclass", lambda: type(ViaSuper), SuperMeta)
+expect_value("super_new_body", lambda: ViaSuper.marker, 17)
+
+# The `_ast` heap types are built by an in-tree caller that hands
+# `type.__new__` its arguments directly, so they are the one construction path
+# where the metatype is not supplied by an attribute lookup.
+import ast
+
+expect_value("ast_root_metatype", lambda: type(ast.AST), type)
+expect_value("ast_node_metatype", lambda: type(ast.Module), type)
+expect_value("ast_node_name", lambda: ast.Module.__name__, "Module")
+expect_value("ast_node_base", lambda: issubclass(ast.Module, ast.AST), True)
+expect_value("ast_parse_result", lambda: isinstance(ast.parse("x = 1"), ast.Module), True)
 
 print("OK")
