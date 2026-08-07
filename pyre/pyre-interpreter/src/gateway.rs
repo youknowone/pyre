@@ -1603,6 +1603,52 @@ pub fn fsdecode_os_str_wtf8(name: &std::ffi::OsStr) -> rustpython_wtf8::Wtf8Buf 
     }
 }
 
+/// The filesystem bytes behind a host `OsStr` — [`fsdecode_os_str_wtf8`]'s
+/// inverse, for a caller that has to retain the name as bytes rather than as
+/// text: `co_filename`'s stored spelling, which `pycode.py:431
+/// filename='fsencode'` names in the same units the syscall took.
+///
+/// Total, unlike [`fsencode`]: the host handed us this name, so it is already
+/// in the filesystem's own units and there is nothing left to reject.
+pub fn fsencode_os_str(name: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let units: Vec<u16> = name.encode_wide().collect();
+        // `FS_ERRORS` is `surrogatepass` here, so a string's own WTF-8
+        // spelling is its filesystem encoding.
+        rustpython_wtf8::Wtf8Buf::from_wide(&units)
+            .as_bytes()
+            .to_vec()
+    }
+    #[cfg(not(windows))]
+    {
+        name.as_encoded_bytes().to_vec()
+    }
+}
+
+/// [`fsencode_os_str`]'s other direction: the host name filesystem bytes
+/// spell, for a caller that has to hand them to an API taking an `OsStr`.
+pub fn os_string_from_fs_bytes(data: &[u8]) -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let units: Vec<u16> = fsdecode_filename_wtf8(data).encode_wide().collect();
+        std::ffi::OsString::from_wide(&units)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(data.to_vec())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No byte spelling on this platform, so the name can only be carried
+        // as the best text representation of these bytes.
+        std::ffi::OsString::from(String::from_utf8_lossy(data).into_owned())
+    }
+}
+
 /// `interp_posix.py:140-152 Path`: the syscall spelling and the resolved path
 /// object travel together. For `os.PathLike`, `w_path` is the result of the
 /// single `__fspath__` call, not the wrapper that supplied it.

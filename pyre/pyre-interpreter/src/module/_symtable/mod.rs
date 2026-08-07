@@ -190,7 +190,7 @@ fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {
         } else if pyre_object::is_bytes(arg) {
             crate::compile::decode_source_bytes(
                 pyre_object::bytesobject::bytes_like_data(arg),
-                &filename,
+                pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(filename_slot)),
                 false,
             )?
         } else {

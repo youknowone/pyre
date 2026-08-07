@@ -1621,7 +1621,7 @@ fn spawn_thread(
             if has_handle {
                 let h = W_ThreadHandle::from_obj(handle_addr as PyObjectRef).unwrap();
                 if let Err(e) = h.start(ident) {
-                    bootstrap.fail(e.message);
+                    bootstrap.fail(e.message_text());
                     thread_is_stopping(&mut ec);
                     crate::call::set_last_exec_ctx(std::ptr::null());
                     drop(worker_roots);
@@ -1656,11 +1656,17 @@ fn spawn_thread(
             // driver owner is made interpreter-global.
             let _plain_worker = crate::call::force_plain_eval();
             if let Err(mut error) = call_thread_target(callable, &args, kwargs, ec_ptr) {
-                let callable_repr =
-                    unsafe { crate::py_repr(callable).unwrap_or_else(|_| "<unknown>".to_string()) };
+                let callable_repr = unsafe {
+                    crate::display::py_repr_wtf8(callable).unwrap_or_else(|_| {
+                        rustpython_wtf8::Wtf8Buf::from_string("<unknown>".to_string())
+                    })
+                };
                 error.write_unraisable(
                     w_none(),
-                    &format!("Exception ignored in thread started by {callable_repr}"),
+                    &crate::display::wtf8_format!(
+                        "Exception ignored in thread started by ",
+                        callable_repr
+                    ),
                     w_none(),
                 );
             }

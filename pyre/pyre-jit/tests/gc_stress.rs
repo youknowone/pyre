@@ -50,7 +50,7 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    importing::init_sys_path(&cwd, &cwd.to_string_lossy());
+    importing::init_sys_path(&cwd, cwd.as_os_str());
     // This harness never imports `site`, so perform the post-site `sys.path[0]`
     // insert directly.
     importing::add_sys_path_0();

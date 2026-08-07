@@ -363,15 +363,21 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
         // `getitem` above ran a lookup that can collect, so the key has to be
         // reread from its slot rather than reused from before the call.
         let key = pyre_object::gc_roots::shadow_stack_get(keys_sp + i);
-        parts.push(format!(
-            "{}={}",
-            unsafe { crate::display::py_str(key)? },
-            unsafe {
-                crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(value_sp))?
-            }
+        parts.push(crate::display::wtf8_format!(
+            unsafe { crate::display::py_str_wtf8(key)? },
+            "=",
+            unsafe { crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(value_sp))? }
         ));
     }
-    Ok(w_str_new(&format!("{name}({})", parts.join(", "))))
+    let mut text = rustpython_wtf8::Wtf8Buf::from_string(format!("{name}("));
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_wtf8(part);
+    }
+    text.push_str(")");
+    Ok(pyre_object::w_str_from_wtf8(text))
 }
 
 /// `_structseq.py:185 SimpleNamespace.__eq__` — structural over `__dict__`
@@ -994,11 +1000,11 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     let w_tb = crate::baseobjspace::getattr_str(w_hookargs, "exc_traceback")?;
     let w_err_msg = crate::baseobjspace::getattr_str(w_hookargs, "err_msg")?;
     let err_msg = if unsafe { pyre_object::is_none(w_err_msg) } {
-        String::new()
+        rustpython_wtf8::Wtf8Buf::new()
     } else if unsafe { pyre_object::is_str(w_err_msg) } {
-        unsafe { pyre_object::w_str_get_value(w_err_msg) }.to_string()
+        unsafe { pyre_object::w_str_get_wtf8(w_err_msg) }.to_wtf8_buf()
     } else {
-        unsafe { crate::display::py_str(w_err_msg)? }
+        unsafe { crate::display::py_str_wtf8(w_err_msg)? }
     };
     let w_object = crate::baseobjspace::getattr_str(w_hookargs, "object")?;
     crate::PyError::write_unraisable_default(

@@ -55,6 +55,7 @@ majit-metainterp = { workspace = true }
 majit-gc = { workspace = true }
 lexopt = { workspace = true }
 rustpython-compiler = { workspace = true }
+rustpython-wtf8 = { workspace = true }
 dirs = { workspace = true }
 rustyline = { workspace = true }
 libc = { workspace = true }

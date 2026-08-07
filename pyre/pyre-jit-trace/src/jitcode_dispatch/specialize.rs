@@ -10531,7 +10531,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     // and rooted by the compiled loop's gcref table thereafter.
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(exc);
-    let msg = pyre_object::w_str_new(&err.message);
+    let msg = pyre_object::w_str_from_wtf8(err.message.clone());
     let msg_const = ctx.trace_ctx.const_ref(msg as i64);
     let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &[msg_const]);
     // Stamp the canonical list class exactly as `w_list_new` does (the

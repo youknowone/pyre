@@ -1,5 +1,7 @@
 use pyre_object::PyObjectRef;
-use pyre_object::interp_exceptions::{ExcKind, exc_kind_name, w_exception_new};
+use pyre_object::interp_exceptions::{
+    ExcKind, exc_kind_name, w_exception_new, w_exception_new_wtf8,
+};
 use ruff_text_size::Ranged;
 use rustpython_compiler::{ast, parser};
 use rustpython_wtf8::Wtf8Buf;
@@ -243,16 +245,20 @@ impl OperationError {
 /// A direct `raise non_exception`, which never calls a constructor, keeps
 /// the ordinary "exceptions must derive from BaseException" wording.
 pub fn exception_from_call_type_error(w_constructor: PyObjectRef, w_inst: PyObjectRef) -> PyError {
-    let constructor = unsafe { crate::display::py_repr(w_constructor) }
-        .unwrap_or_else(|_| "<exception class>".to_string());
+    let constructor = unsafe { crate::display::py_repr_wtf8(w_constructor) }
+        .unwrap_or_else(|_| Wtf8Buf::from_string("<exception class>".to_string()));
     let w_type = crate::baseobjspace::exception_getclass(w_inst);
+    let unknown = || Wtf8Buf::from_string("<unknown type>".to_string());
     let returned_type = if w_type.is_null() {
-        "<unknown type>".to_string()
+        unknown()
     } else {
-        unsafe { crate::display::py_repr(w_type) }.unwrap_or_else(|_| "<unknown type>".to_string())
+        unsafe { crate::display::py_repr_wtf8(w_type) }.unwrap_or_else(|_| unknown())
     };
-    PyError::type_error(format!(
-        "calling {constructor} should have returned an instance of BaseException, not {returned_type}"
+    PyError::type_error(crate::display::wtf8_format!(
+        "calling ",
+        constructor,
+        " should have returned an instance of BaseException, not ",
+        returned_type
     ))
 }
 
@@ -334,9 +340,9 @@ pub fn chain_context(exc: PyObjectRef, active: PyObjectRef) {
 impl From<OperationError> for PyError {
     fn from(value: OperationError) -> Self {
         let message = if value.w_value.is_null() {
-            String::new()
+            Wtf8Buf::new()
         } else {
-            "operation error".to_string()
+            Wtf8Buf::from_string("operation error".to_string())
         };
         PyError {
             kind: PyErrorKind::RuntimeError,
@@ -363,7 +369,7 @@ pub type PyResult = Result<PyObjectRef, PyError>;
 #[derive(Debug, Clone)]
 pub struct PyError {
     pub kind: PyErrorKind,
-    pub message: String,
+    pub message: Wtf8Buf,
     /// Cached W_BaseException pointer — reused by to_exc_object()
     /// to avoid re-allocating an exception object that already exists.
     pub exc_object: PyObjectRef,
@@ -532,7 +538,7 @@ pub enum PyErrorKind {
 }
 
 impl PyError {
-    pub fn new(kind: PyErrorKind, message: impl Into<String>) -> Self {
+    pub fn new(kind: PyErrorKind, message: impl Into<Wtf8Buf>) -> Self {
         PyError {
             kind,
             message: message.into(),
@@ -544,11 +550,11 @@ impl PyError {
         }
     }
 
-    pub fn type_error(msg: impl Into<String>) -> Self {
+    pub fn type_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::TypeError, msg)
     }
 
-    pub fn attribute_error(msg: impl Into<String>) -> Self {
+    pub fn attribute_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::AttributeError, msg)
     }
 
@@ -557,7 +563,7 @@ impl PyError {
     /// and the `obj` it was looked up on so `e.name` / `e.obj` read back
     /// once the instance is materialised (Python 3.10+).
     pub fn attribute_error_with_context(
-        msg: impl Into<String>,
+        msg: impl Into<Wtf8Buf>,
         w_obj: PyObjectRef,
         name: &str,
     ) -> Self {
@@ -567,7 +573,7 @@ impl PyError {
         err
     }
 
-    pub fn value_error(msg: impl Into<String>) -> Self {
+    pub fn value_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::ValueError, msg)
     }
 
@@ -587,7 +593,7 @@ impl PyError {
         }
     }
 
-    pub fn syntax_error(msg: impl Into<String>) -> Self {
+    pub fn syntax_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::SyntaxError, msg)
     }
 
@@ -601,8 +607,8 @@ impl PyError {
     /// offending source line (`None` → `text` reads back as `None`).
     #[allow(clippy::too_many_arguments)]
     pub fn syntax_error_located(
-        msg: impl Into<String>,
-        filename: &str,
+        msg: impl Into<Wtf8Buf>,
+        filename: &rustpython_wtf8::Wtf8,
         lineno: i64,
         offset: i64,
         end_lineno: i64,
@@ -615,7 +621,7 @@ impl PyError {
         // `w_tuple_new` / `w_list_new` run, so a collection there could sweep
         // the unrooted exception before `w_exception_set_args` writes it.
         let _roots = pyre_object::gc_roots::push_roots();
-        let exc = w_exception_new(ExcKind::SyntaxError, &message);
+        let exc = w_exception_new_wtf8(ExcKind::SyntaxError, &message);
         let exc_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(exc);
         // Build the `(filename, lineno, offset, text, end_lineno, end_offset)`
@@ -625,7 +631,7 @@ impl PyError {
         // young element (the filename or text string, or an uncached line/col
         // int), leaving its raw local pointing at the old address.
         let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_str_new(filename));
+        pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8(filename.to_wtf8_buf()));
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
         let offset_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -678,7 +684,7 @@ impl PyError {
         // becomes `args[1]`.
         let details_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(details);
-        let w_msg = pyre_object::w_str_new(&message);
+        let w_msg = pyre_object::w_str_from_wtf8(message.clone());
         let msg_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_msg);
         unsafe {
@@ -698,7 +704,7 @@ impl PyError {
             // Leave the display message empty so `message_text` derives it from
             // `exc_object` via the SyntaxError `descr_str`, which appends the
             // `(filename, line N)` suffix.
-            message: String::new(),
+            message: Wtf8Buf::new(),
             exc_object: exc,
             attach_tb: true,
             reraise_lasti: -1,
@@ -774,30 +780,30 @@ impl PyError {
         };
     }
 
-    pub fn zero_division(msg: impl Into<String>) -> Self {
+    pub fn zero_division(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::ZeroDivisionError, msg)
     }
 
-    pub fn overflow_error(msg: impl Into<String>) -> Self {
+    pub fn overflow_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::OverflowError, msg)
     }
 
-    pub fn runtime_error(msg: impl Into<String>) -> Self {
+    pub fn runtime_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::RuntimeError, msg)
     }
 
-    pub fn not_implemented(msg: impl Into<String>) -> Self {
+    pub fn not_implemented(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::NotImplementedError, msg)
     }
 
-    pub fn system_error(msg: impl Into<String>) -> Self {
+    pub fn system_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::SystemError, msg)
     }
 
     /// `_PyEval_FormatExcCheckArg` parity — a NameError carrying the
     /// undefined `name` so `e.name` reads back once the instance is
     /// materialised (Python 3.10+).
-    pub fn name_error_with_name(msg: impl Into<String>, name: &str) -> Self {
+    pub fn name_error_with_name(msg: impl Into<Wtf8Buf>, name: &str) -> Self {
         let mut err = Self::new(PyErrorKind::NameError, msg);
         err.w_name_context = pyre_object::w_str_new(name);
         err
@@ -807,7 +813,7 @@ impl PyError {
     /// rides only in the message: `format_exc_check_arg` stamps the `name`
     /// slot when the raised class is exactly `NameError`, so an
     /// `UnboundLocalError` reaches Python with `name` still `None`.
-    pub fn unbound_local_error(msg: impl Into<String>) -> Self {
+    pub fn unbound_local_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::UnboundLocalError, msg)
     }
 
@@ -816,14 +822,14 @@ impl PyError {
     /// machinery raises `ModuleNotFoundError(msg, name=fullname)`.  The
     /// `name` rides the shared `w_n` slot (ImportError / NameError /
     /// AttributeError), stamped by `to_exc_object`.
-    pub fn module_not_found_with_name(msg: impl Into<String>, name: &str) -> Self {
+    pub fn module_not_found_with_name(msg: impl Into<Wtf8Buf>, name: &str) -> Self {
         Self::module_not_found_with_name_obj(msg, pyre_object::w_str_new(name))
     }
 
     /// `module_not_found_with_name` for a name with no `&str` spelling, so the
     /// caller supplies the name object itself.
     pub fn module_not_found_with_name_obj(
-        msg: impl Into<String>,
+        msg: impl Into<Wtf8Buf>,
         w_name: pyre_object::PyObjectRef,
     ) -> Self {
         let mut err = Self::new(PyErrorKind::ModuleNotFoundError, msg);
@@ -831,13 +837,13 @@ impl PyError {
         err
     }
 
-    pub fn internal_trace_abort(reason: impl Into<String>) -> Self {
+    pub fn internal_trace_abort(reason: impl Into<Wtf8Buf>) -> Self {
         let mut err = Self::new(PyErrorKind::TraceAbort, reason);
         err.attach_tb = false;
         err
     }
 
-    pub fn key_error(msg: impl Into<String>) -> Self {
+    pub fn key_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::KeyError, msg)
     }
 
@@ -860,12 +866,12 @@ impl PyError {
             pyre_object::gc_roots::pin_root(key);
         }
         let message = if key.is_null() {
-            "<null>".to_string()
+            Wtf8Buf::from_string("<null>".to_string())
         } else {
-            unsafe { crate::display::py_repr(key) }
-                .unwrap_or_else(|_| "<unrepresentable>".to_string())
+            unsafe { crate::display::py_repr_wtf8(key) }
+                .unwrap_or_else(|_| Wtf8Buf::from_string("<unrepresentable>".to_string()))
         };
-        let exc = pyre_object::interp_exceptions::w_exception_new(ExcKind::KeyError, &message);
+        let exc = w_exception_new_wtf8(ExcKind::KeyError, &message);
         pyre_object::gc_roots::pin_root(exc);
         if !key.is_null() {
             // Reload the key after the repr / exception allocations: the pin
@@ -886,15 +892,15 @@ impl PyError {
         }
     }
 
-    pub fn index_error(msg: impl Into<String>) -> Self {
+    pub fn index_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::IndexError, msg)
     }
 
-    pub fn lookup_error(msg: impl Into<String>) -> Self {
+    pub fn lookup_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::LookupError, msg)
     }
 
-    pub fn os_error(msg: impl Into<String>) -> Self {
+    pub fn os_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::OSError, msg)
     }
 
@@ -1065,7 +1071,7 @@ impl PyError {
             // `exc_object` via `W_OSError.descr_str`, which appends the
             // `: 'filename'` suffix; the bare "[Errno N] strerror" would bypass
             // it and the uncaught-traceback header would drop the filename.
-            message: String::new(),
+            message: Wtf8Buf::new(),
             exc_object: exc,
             attach_tb: true,
             reraise_lasti: -1,
@@ -1076,7 +1082,7 @@ impl PyError {
 
     /// Raise the structured OSError for `errno` (no filename). The caller's
     /// platform message is superseded by the errno-derived strerror.
-    pub fn os_error_with_errno(errno: i32, _msg: impl Into<String>) -> Self {
+    pub fn os_error_with_errno(errno: i32, _msg: impl Into<Wtf8Buf>) -> Self {
         Self::os_error_syscall(errno, pyre_object::PY_NULL)
     }
 
@@ -1106,7 +1112,7 @@ impl PyError {
             // Leave the display message empty so `message_text` derives it
             // from `exc_object`, whose `descr_str` renders the two-element
             // `args` as a tuple repr rather than as a bare string.
-            message: String::new(),
+            message: Wtf8Buf::new(),
             exc_object: exc,
             attach_tb: true,
             reraise_lasti: -1,
@@ -1121,7 +1127,7 @@ impl PyError {
     /// `e.errno` / `e.strerror` read back the two values.  Like
     /// `OSError(errno, strerror)`, every errno in CPython's/PyPy's errno map
     /// selects its concrete subclass (EAGAIN → BlockingIOError, etc.).
-    pub fn os_error_errno_strerror(errno: i32, strerror: impl Into<String>) -> Self {
+    pub fn os_error_errno_strerror(errno: i32, strerror: impl Into<Wtf8Buf>) -> Self {
         let strerror = strerror.into();
         let subclass = crate::builtins::os_error_errno_subclass(errno as i64);
         let kind = if matches!(subclass, Some("FileNotFoundError")) {
@@ -1134,13 +1140,16 @@ impl PyError {
         } else {
             ExcKind::OSError
         };
-        let message = format!("[Errno {errno}] {strerror}");
+        // `strerror` reaches Python as `e.strerror` and as `args[1]`, so it is
+        // WTF-8 and the assembled `[Errno N] ...` line has to be too.
+        let mut message = Wtf8Buf::from_string(format!("[Errno {errno}] "));
+        message.push_wtf8(&strerror);
         // Root the fresh exception across the args allocation below: `exc`
         // lives only in this Rust local while `w_int_new` / `w_str_new` /
         // `w_list_new` run, so a collection there could sweep the unrooted
         // exception before `w_exception_set_args` writes through it.
         let _roots = pyre_object::gc_roots::push_roots();
-        let exc = w_exception_new(exc_kind, &message);
+        let exc = w_exception_new_wtf8(exc_kind, &message);
         pyre_object::gc_roots::pin_root(exc);
         if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
             unsafe {
@@ -1149,7 +1158,7 @@ impl PyError {
         }
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::w_int_new(errno as i64),
-            pyre_object::w_str_new(&strerror),
+            pyre_object::w_str_from_wtf8(strerror.clone()),
         ]);
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
@@ -1159,7 +1168,7 @@ impl PyError {
             );
             pyre_object::interp_exceptions::w_exception_set_strerror(
                 exc,
-                pyre_object::w_str_new(&strerror),
+                pyre_object::w_str_from_wtf8(strerror.clone()),
             );
         }
         PyError {
@@ -1178,7 +1187,7 @@ impl PyError {
     /// this so `.name` (the package) and `.path` (its file) are readable,
     /// which `PyError::new(ImportError, msg)` cannot carry.
     pub fn import_error_name_path(
-        msg: impl Into<String>,
+        msg: impl Into<Wtf8Buf>,
         w_name: PyObjectRef,
         w_path: PyObjectRef,
     ) -> Self {
@@ -1197,14 +1206,14 @@ impl PyError {
         if !w_path.is_null() {
             pyre_object::gc_roots::pin_root(w_path);
         }
-        let exc = w_exception_new(ExcKind::ImportError, &message);
+        let exc = w_exception_new_wtf8(ExcKind::ImportError, &message);
         pyre_object::gc_roots::pin_root(exc);
         // `ImportError.__init__` mirrors args[0] into the dedicated `msg`
         // slot; the prebuilt-instance path bypasses it, so stamp it here.
         let w_msg = if message.is_empty() {
             pyre_object::w_none()
         } else {
-            pyre_object::w_str_new(&message)
+            pyre_object::w_str_from_wtf8(message.clone())
         };
         // Reload name/path after the message allocation: the pins keep them
         // alive, but a minor collection may have relocated the young objects,
@@ -1238,11 +1247,11 @@ impl PyError {
 
     /// pypy/module/_weakref/interp__weakref.py:347 — raised by `force()`
     /// when the referent of a proxy is no longer alive.
-    pub fn reference_error(msg: impl Into<String>) -> Self {
+    pub fn reference_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::ReferenceError, msg)
     }
 
-    pub fn recursion_error(msg: impl Into<String>) -> Self {
+    pub fn recursion_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::RecursionError, msg)
     }
 
@@ -1250,7 +1259,7 @@ impl PyError {
     /// — module-level singleton instance the JIT raises through
     /// `PropagateExceptionDescr.handle_fail` when a malloc helper
     /// returns NULL.
-    pub fn memory_error(msg: impl Into<String>) -> Self {
+    pub fn memory_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::MemoryError, msg)
     }
 
@@ -1307,7 +1316,7 @@ impl PyError {
         pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
-            let msg = pyre_object::w_str_new(&self.message);
+            let msg = pyre_object::w_str_from_wtf8(self.message.clone());
             pyre_object::gc_roots::pin_root(msg);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![msg]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
@@ -1369,7 +1378,7 @@ impl PyError {
     pub fn write_unraisable(
         &mut self,
         space: PyObjectRef,
-        where_desc: &str,
+        where_desc: &rustpython_wtf8::Wtf8,
         w_object: PyObjectRef,
     ) {
         let w_value = self
@@ -1395,12 +1404,14 @@ impl PyError {
         } else {
             w_object
         };
+        // The description names an object — a thread's callable, a ctypes
+        // callback — so it may hold a lone surrogate and is carried as WTF-8.
         let mut first_line = if where_desc.is_empty() {
-            String::new()
-        } else if where_desc.starts_with("Exception ignored ") {
-            where_desc.to_string()
+            Wtf8Buf::new()
+        } else if where_desc.as_bytes().starts_with(b"Exception ignored ") {
+            where_desc.to_wtf8_buf()
         } else {
-            format!("Exception ignored in: {where_desc}")
+            crate::display::wtf8_format!("Exception ignored in: ", where_desc)
         };
         // vm.py:19-25 also carries `extra_line`; pyre's hook-args
         // structseq targets the 5-field shape, so only the default printer
@@ -1414,7 +1425,7 @@ impl PyError {
                 if first_line.is_empty() {
                     pyre_object::w_none()
                 } else {
-                    pyre_object::w_str_new(&first_line)
+                    pyre_object::w_str_from_wtf8(first_line.clone())
                 },
                 w_object,
             ],
@@ -1425,7 +1436,9 @@ impl PyError {
                     match crate::call::call_function_impl_result(w_hook, &[hook_args]) {
                         Ok(_) => return,
                         Err(mut hook_err) => {
-                            first_line = "Exception ignored in sys.unraisablehook".to_string();
+                            first_line = Wtf8Buf::from_string(
+                                "Exception ignored in sys.unraisablehook".to_string(),
+                            );
                             w_object = w_hook;
                             let hook_value = hook_err
                                 .normalize_exception(space)
@@ -1477,8 +1490,13 @@ impl PyError {
             Ok(w) if !w.is_null() && !unsafe { pyre_object::is_none(w) } => w,
             _ => return false,
         };
-        let text = String::from_utf8_lossy(buf).into_owned();
-        let w_text = pyre_object::w_str_new(&text);
+        // The buffer is assembled from text the printer already escaped, so
+        // it is well-formed; a decode failure would mean a byte no writer put
+        // there, and the lossy read is the last resort for it.
+        let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
+            Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
+            None => pyre_object::w_str_new(&String::from_utf8_lossy(buf)),
+        };
         let result = crate::baseobjspace::call_method(stderr, "write", &[w_text]);
         if result.is_null() {
             let _ = crate::call::take_call_error();
@@ -1493,20 +1511,21 @@ impl PyError {
         w_type: PyObjectRef,
         w_value: PyObjectRef,
         w_tb: PyObjectRef,
-        first_line: &str,
+        first_line: &rustpython_wtf8::Wtf8,
         w_object: PyObjectRef,
         extra_line: &str,
     ) {
         let _ = (space, w_type);
         let mut first_line = if first_line.is_empty() {
-            "Exception ignored in:".to_string()
+            Wtf8Buf::from_string("Exception ignored in:".to_string())
         } else {
-            first_line.to_string()
+            first_line.to_wtf8_buf()
         };
         if !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) } {
-            let objrepr = unsafe { crate::display::py_repr(w_object) }
-                .unwrap_or_else(|_| "<object repr() failed>".to_string());
-            first_line = format!("{first_line} {objrepr}");
+            let objrepr = unsafe { crate::display::py_repr_wtf8(w_object) }
+                .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
+            first_line.push_str(" ");
+            first_line.push_wtf8(&objrepr);
         }
         let extra_line = if extra_line.is_empty() {
             "\n".to_string()
@@ -1514,7 +1533,9 @@ impl PyError {
             format!("{extra_line}:\n")
         };
         let mut buf = Vec::new();
-        let _ = write!(&mut buf, "{first_line}");
+        // The stream takes text, and the printer spells a lone surrogate as
+        // the escape it prints elsewhere rather than folding it to U+FFFD.
+        let _ = buf.write_all(first_line.as_bytes());
         if !extra_line.is_empty() {
             let _ = write!(&mut buf, "{extra_line}");
         }
@@ -1526,7 +1547,7 @@ impl PyError {
             let _ = write_exception(&mut buf, &err, true);
         }
         if !Self::write_unraisable_to_sys_stderr(&buf) {
-            crate::host_seam::emit_stderr(&buf);
+            emit_report_to_host_stderr(&buf);
         }
     }
 
@@ -1591,7 +1612,7 @@ impl PyError {
             // display time.
             PyError {
                 kind: Self::kind_from_exc(kind),
-                message: String::new(),
+                message: Wtf8Buf::new(),
                 exc_object: obj,
                 attach_tb: true,
                 reraise_lasti: -1,
@@ -1657,7 +1678,11 @@ impl PyError {
     /// `__str__` runs at display time, not at raise time.
     pub fn message_text(&self) -> String {
         if !self.message.is_empty() || self.exc_object.is_null() {
-            return self.message.clone();
+            // Display-side only: `message` is WTF-8 and may hold a lone
+            // surrogate, so spend the escape the stream would spend rather
+            // than folding it to U+FFFD.  A caller that needs the value
+            // itself wants [`message_wtf8`].
+            return crate::display::wtf8_display_string(self.message.clone(), "<unprintable>");
         }
         // Infallible Display-side context: a raising `__str__` degrades to
         // the placeholder rather than propagating, and a lone surrogate is
@@ -1665,15 +1690,33 @@ impl PyError {
         unsafe { crate::display::py_str_display(self.exc_object) }
     }
 
+    /// [`message_text`] without the display encode — the text as a value.
+    ///
+    /// The exception's own `args[0]` is minted from this, so an unpaired
+    /// surrogate in a message that names a user string has to survive here;
+    /// `message_text` is for the diagnostic streams only.
+    pub fn message_wtf8(&self) -> Wtf8Buf {
+        if !self.message.is_empty() || self.exc_object.is_null() {
+            return self.message.clone();
+        }
+        unsafe { crate::display::py_str_wtf8(self.exc_object) }
+            .unwrap_or_else(|_| Wtf8Buf::from_string("<unprintable>".to_string()))
+    }
+
     pub fn render_exception(&self) -> String {
+        crate::display::wtf8_display_string(self.render_exception_wtf8(), "<unprintable>")
+    }
+
+    /// [`render_exception`](Self::render_exception) as the report's own WTF-8,
+    /// for a writer assembling a buffer whose sink spends the encode.
+    pub(crate) fn render_exception_wtf8(&self) -> Wtf8Buf {
         let name = exc_object_class_name(self.exc_object)
             .unwrap_or_else(|| exc_kind_name(self.to_exc_kind()).to_string());
-        let message = self.message_text();
+        let message = self.message_wtf8();
         if message.is_empty() {
-            name
-        } else {
-            format!("{name}: {message}")
+            return Wtf8Buf::from_string(name);
         }
+        crate::display::wtf8_format!(name, ": ", message)
     }
 }
 
@@ -1748,7 +1791,8 @@ pub fn write_exception<W: Write>(
     include_traceback: bool,
 ) -> std::io::Result<()> {
     if !include_traceback {
-        return writeln!(writer, "{}", err.render_exception());
+        writer.write_all(err.render_exception_wtf8().as_bytes())?;
+        return writer.write_all(b"\n");
     }
     if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) } {
         // The instance carries the whole report: the cause/context chain, the
@@ -1766,7 +1810,8 @@ pub fn write_exception<W: Write>(
     // no group and no frame list — only the header.
     writeln!(writer, "Traceback (most recent call last):")?;
     write_traceback_chain(writer, err)?;
-    writeln!(writer, "{}", err.render_exception())
+    writer.write_all(err.render_exception_wtf8().as_bytes())?;
+    writer.write_all(b"\n")
 }
 
 /// CPython 3.14 `_PyErr_Display(file, exc_type, exc_value, exc_tb)` shape used
@@ -1831,7 +1876,8 @@ pub fn write_exception_from_parts<W: Write>(
 pub fn write_syntax_error<W: Write>(writer: &mut W, err: &PyError) -> std::io::Result<()> {
     let exc = err.exc_object;
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
-        return writeln!(writer, "{}", err.render_exception());
+        writer.write_all(err.render_exception_wtf8().as_bytes())?;
+        return writer.write_all(b"\n");
     }
     write_syntax_error_object(writer, exc)
 }
@@ -1845,31 +1891,31 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
         crate::baseobjspace::syntax_error_attr(exc, name)
     };
     // `filename` is the compiled file's own name, so it carries whatever
-    // surrogate escapes the filesystem encoding produced, and `text` is a line
-    // of that file. Printing a traceback must not abort for want of a UTF-8
-    // view: escape what has no spelling, the way stderr already does.
+    // surrogate escapes the filesystem encoding produced, and `msg` may quote
+    // it.  Both go out as the report's own WTF-8; the sink spends the
+    // `backslashreplace` encode.
+    let wtf8_of = |w: PyObjectRef| -> Option<Wtf8Buf> {
+        (!w.is_null() && unsafe { pyre_object::is_str(w) })
+            .then(|| unsafe { pyre_object::w_str_get_wtf8(w) }.to_owned())
+    };
+    // `text` is a line of source, which the compiler only accepted as UTF-8, so
+    // the caret arithmetic below can work on a `str`.
     let str_of = |w: PyObjectRef| -> Option<String> {
-        (!w.is_null() && unsafe { pyre_object::is_str(w) }).then(|| {
-            let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w) };
-            match wtf8.as_str() {
-                Ok(s) => s.to_owned(),
-                Err(_) => {
-                    let s_obj = pyre_object::w_str_from_wtf8(wtf8.to_owned());
-                    crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
-                        .map(|b| String::from_utf8_lossy(&b).into_owned())
-                        .unwrap_or_else(|_| "<unprintable>".to_string())
-                }
-            }
+        wtf8_of(w).map(|wtf8| match wtf8.as_str() {
+            Ok(s) => s.to_owned(),
+            Err(_) => "<unprintable>".to_string(),
         })
     };
     let int_of = |w: PyObjectRef| -> Option<i64> {
         (!w.is_null() && unsafe { pyre_object::is_int(w) })
             .then(|| unsafe { pyre_object::intobject::w_int_get_value(w) })
     };
-    let filename = str_of(attr("filename"));
+    let filename = wtf8_of(attr("filename"));
     let lineno = int_of(attr("lineno"));
     if let (Some(fname), Some(lineno)) = (filename.as_ref(), lineno) {
-        writeln!(writer, "  File \"{fname}\", line {lineno}")?;
+        writer.write_all(b"  File \"")?;
+        writer.write_all(fname.as_bytes())?;
+        writeln!(writer, "\", line {lineno}")?;
     }
     if let Some(text) = str_of(attr("text")) {
         let raw = text.trim_end_matches(['\n', '\r']);
@@ -1898,8 +1944,12 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
     }
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let name = exc_object_class_name(exc).unwrap_or_else(|| "SyntaxError".to_string());
-    match str_of(attr("msg")) {
-        Some(msg) if !msg.is_empty() => writeln!(writer, "{name}: {msg}"),
+    match wtf8_of(attr("msg")) {
+        Some(msg) if !msg.is_empty() => {
+            write!(writer, "{name}: ")?;
+            writer.write_all(msg.as_bytes())?;
+            writer.write_all(b"\n")
+        }
         _ => writeln!(writer, "{name}"),
     }
 }
@@ -1909,7 +1959,7 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
 pub fn eprint_syntax_error(err: &PyError) {
     let mut buf: Vec<u8> = Vec::new();
     let _ = write_syntax_error(&mut buf, err);
-    crate::host_seam::emit_stderr(&buf);
+    emit_report_to_host_stderr(&buf);
 }
 
 /// `lib-python/3/traceback.py:980-1000 _ExceptionPrintContext` and
@@ -2029,8 +2079,7 @@ fn write_plain_exception_object<W: Write>(
     {
         write_syntax_error_object(&mut rendered, exc)?;
     } else {
-        let header = render_rooted_exc_object_display(exc_slot);
-        rendered.write_all(header.as_bytes())?;
+        rendered.write_all(render_rooted_exc_object_wtf8(exc_slot).as_bytes())?;
         rendered.write_all(b"\n")?;
     }
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
@@ -2096,8 +2145,7 @@ fn write_exception_group<W: Write>(
     }
 
     let mut header = Vec::new();
-    let group_header = render_rooted_exc_object_display(exc_slot);
-    header.write_all(group_header.as_bytes())?;
+    header.write_all(render_rooted_exc_object_wtf8(exc_slot).as_bytes())?;
     header.write_all(b"\n")?;
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     write_exception_notes(&mut header, exc)?;
@@ -2240,8 +2288,8 @@ fn write_chained_context_inner<W: Write>(
 fn write_single_exception<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
     writeln!(writer, "Traceback (most recent call last):")?;
     write_traceback_chain_from_exc(writer, exc)?;
-    let render = render_exc_object(exc);
-    writeln!(writer, "{}", render)?;
+    writer.write_all(render_exc_object_wtf8(exc).as_bytes())?;
+    writer.write_all(b"\n")?;
     write_exception_notes(writer, exc)
 }
 
@@ -2270,9 +2318,11 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
             let err_obj = pyre_object::gc_roots::shadow_stack_get(
                 pyre_object::gc_roots::shadow_stack_len() - 1,
             );
-            let rendered = unsafe { crate::display::py_repr(err_obj) }
-                .unwrap_or_else(|_| "<exception repr() failed>".to_string());
-            return writeln!(writer, "Ignored error getting __notes__: {rendered}");
+            let rendered = unsafe { crate::display::py_repr_wtf8(err_obj) }
+                .unwrap_or_else(|_| Wtf8Buf::from_string("<exception repr() failed>".to_string()));
+            writer.write_all(b"Ignored error getting __notes__: ")?;
+            writer.write_all(rendered.as_bytes())?;
+            return writer.write_all(b"\n");
         }
     };
     let notes_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2333,9 +2383,10 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
         return Ok(());
     }
     let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
-    let rendered = unsafe { crate::display::py_repr(notes) }
-        .unwrap_or_else(|_| "<exception repr() failed>".to_string());
-    writeln!(writer, "{rendered}")
+    let rendered = unsafe { crate::display::py_repr_wtf8(notes) }
+        .unwrap_or_else(|_| Wtf8Buf::from_string("<exception repr() failed>".to_string()));
+    writer.write_all(rendered.as_bytes())?;
+    writer.write_all(b"\n")
 }
 
 fn notes_is_abc_sequence(notes_slot: usize) -> bool {
@@ -2361,25 +2412,6 @@ fn notes_is_abc_sequence(notes_slot: usize) -> bool {
     let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
     let sequence = pyre_object::gc_roots::shadow_stack_get(sequence_slot);
     crate::baseobjspace::isinstance(notes, sequence).unwrap_or(false)
-}
-
-/// Compose the `ExcName: msg` header for a W_BaseException —
-/// equivalent to `traceback.format_exception_only`'s last line.
-fn render_exc_object(exc: PyObjectRef) -> String {
-    crate::display::wtf8_display_string(render_exc_object_wtf8(exc), "<exception str() failed>")
-}
-
-/// [`render_rooted_exc_object_wtf8`] as the bytes stderr should receive.
-///
-/// The callers that assemble the report into a byte buffer have to spend the
-/// `backslashreplace` encode themselves; writing the `Wtf8Buf` straight out
-/// puts the raw surrogate bytes on the stream, which is not what
-/// `errors='backslashreplace'` produces and is not valid UTF-8.
-fn render_rooted_exc_object_display(exc_slot: usize) -> String {
-    crate::display::wtf8_display_string(
-        render_rooted_exc_object_wtf8(exc_slot),
-        "<exception str() failed>",
-    )
 }
 
 fn render_rooted_exc_object_wtf8(exc_slot: usize) -> Wtf8Buf {
@@ -3072,9 +3104,12 @@ fn read_source_line(filename: &[u8], lineno: i64) -> Option<String> {
         // for a file declaring anything else.  The name reaches the decode only
         // to report a failure this caller discards, so the lossy spelling of a
         // path with no UTF-8 form is enough there.
-        let content =
-            crate::compile::decode_source_bytes(&bytes, &String::from_utf8_lossy(filename), false)
-                .ok()?;
+        let content = crate::compile::decode_source_bytes(
+            &bytes,
+            &crate::gateway::fsdecode_filename_wtf8(filename),
+            false,
+        )
+        .ok()?;
         content
             .lines()
             .nth((lineno - 1) as usize)
@@ -3092,13 +3127,31 @@ fn read_source_line(filename: &[u8], lineno: i64) -> Option<String> {
     }
 }
 
+/// Write a rendered report to the host's stderr, spending the encode the
+/// stream object would have.
+///
+/// A report is assembled as WTF-8 throughout, which is what `sys.stderr.write`
+/// takes: a lone surrogate reaches the stream as itself and its
+/// `errors='backslashreplace'` decides how it is spelled, exactly as
+/// `PyErr_Display` leaves that to the stream.  A raw fd has no codec behind it,
+/// so a caller writing to one owes that encode itself -- putting the WTF-8
+/// bytes straight on the stream would emit a sequence that is not valid UTF-8.
+pub(crate) fn emit_report_to_host_stderr(buf: &[u8]) {
+    let text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
+        Some(report) => crate::display::wtf8_display_string(report.to_wtf8_buf(), "<unprintable>"),
+        // A byte no writer put there; the lossy read is the last resort for it.
+        None => String::from_utf8_lossy(buf).into_owned(),
+    };
+    crate::host_seam::emit_stderr(text.as_bytes());
+}
+
 pub fn eprint_exception(err: &PyError, include_traceback: bool) {
     // Buffer then emit through the host_seam so the traceback rides the same
     // mediated stderr as sys.stderr under sandbox (raw fd 2 would bypass the
     // controller / corrupt nothing but escape the seam).
     let mut buf: Vec<u8> = Vec::new();
     let _ = write_exception(&mut buf, err, include_traceback);
-    crate::host_seam::emit_stderr(&buf);
+    emit_report_to_host_stderr(&buf);
 }
 
 /// `app_main.py:114-129 handle_sys_exit` — `exitcode = e.code`; `None` exits
@@ -3133,8 +3186,9 @@ pub fn system_exit_code(err: &PyError) -> i32 {
         // and `SystemExit(-1)` both exit 255.
         return crate::baseobjspace::int_w(code).unwrap_or(-1) as i32;
     }
-    let text =
-        unsafe { crate::display::py_str(code) }.unwrap_or_else(|_| "<unprintable>".to_string());
+    // Straight to the host's stderr, which has no codec behind it, so the
+    // text spends the `backslashreplace` encode here.
+    let text = unsafe { crate::display::py_str_display(code) };
     crate::host_seam::emit_stderr(format!("{text}\n").as_bytes());
     1
 }

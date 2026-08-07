@@ -4260,8 +4260,8 @@ impl OpcodeStepExecutor for PyFrame {
         }
         // No `sys` yet (early bootstrap) — native repr print.
         if !unsafe { pyre_object::is_none(val) } {
-            let s = unsafe { crate::py_repr(val)? };
-            crate::host_seam::emit_stdout(format!("{s}\n").as_bytes());
+            let s = unsafe { crate::display::py_repr_wtf8(val)? };
+            crate::host_seam::emit_stdout(crate::display::wtf8_format!(s, "\n").as_bytes());
         }
         Ok(())
     }
@@ -5007,7 +5007,10 @@ mod tests {
         let (result, _frame) = run_exec_frame("raise int");
         let err = result.expect_err("raise int should fail");
         assert_eq!(err.kind, PyErrorKind::TypeError);
-        assert_eq!(err.message, "exceptions must derive from BaseException");
+        assert_eq!(
+            err.message_text(),
+            "exceptions must derive from BaseException"
+        );
     }
 
     #[test]
@@ -5046,7 +5049,7 @@ mod tests {
         let err = result.expect_err("invalid cause should fail");
         assert_eq!(err.kind, PyErrorKind::TypeError);
         assert_eq!(
-            err.message,
+            err.message_text(),
             "exception causes must derive from BaseException"
         );
     }
@@ -5238,7 +5241,7 @@ r = acc",
             .execute_frame(None, None)
             .expect_err("expected bytecode corruption");
         assert_eq!(err.kind, PyErrorKind::BytecodeCorruption);
-        assert_eq!(err.message, "bytecode corruption");
+        assert_eq!(err.message_text(), "bytecode corruption");
     }
 
     #[test]
@@ -6814,7 +6817,7 @@ except (ValueError, 42):
                 matches!(e.kind, crate::PyErrorKind::TypeError),
                 "expected TypeError, got {:?}: {}",
                 e.kind,
-                e.message,
+                e.message_text(),
             ),
             Ok(_) => panic!("expected TypeError for `except (ValueError, 42):`"),
         }

@@ -2734,7 +2734,9 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// precedence shared by CPython 3.14.
 fn module_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
-    Ok(pyre_object::w_str_new_managed(&module_repr_string(module)?))
+    Ok(pyre_object::w_str_from_wtf8_managed(module_repr_string(
+        module,
+    )?))
 }
 
 fn module_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
@@ -2746,13 +2748,14 @@ fn module_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::Py
     Ok(obj)
 }
 
-pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<String, crate::PyError> {
+pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+    use crate::display::wtf8_format;
     let importlib = crate::importing::get_sys_module("_frozen_importlib")
         .or_else(|| crate::importing::get_sys_module("importlib._bootstrap"));
     if let Some(importlib) = importlib {
         let repr_fn = crate::baseobjspace::getattr_str(importlib, "_module_repr")?;
         let result = crate::call::call_function_impl_result(repr_fn, &[module])?;
-        return Ok(crate::baseobjspace::text_w(result)?.to_string());
+        return Ok(unsafe { pyre_object::w_str_get_wtf8(result) }.to_wtf8_buf());
     }
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let loader = crate::baseobjspace::finditem_str(w_dict, "__loader__")?;
@@ -2768,48 +2771,45 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<String, crate::P
             let origin = crate::baseobjspace::getattr_str(spec, "origin")?;
             if unsafe { pyre_object::is_none(origin) } {
                 let spec_loader = crate::baseobjspace::getattr_str(spec, "loader")?;
+                let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
                 if unsafe { pyre_object::is_none(spec_loader) } {
-                    return Ok(format!("<module {}>", unsafe {
-                        crate::display::py_repr(name)?
-                    }));
+                    return Ok(wtf8_format!("<module ", name_repr, ">"));
                 }
-                return Ok(format!(
-                    "<module {} ({})>",
-                    unsafe { crate::display::py_repr(name)? },
-                    unsafe { crate::display::py_repr(spec_loader)? }
-                ));
+                let loader_repr = unsafe { crate::display::py_repr_wtf8(spec_loader)? };
+                return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
             }
+            let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
             let has_location = crate::baseobjspace::getattr_str(spec, "has_location")?;
             if crate::baseobjspace::is_true(has_location)? {
-                return Ok(format!(
-                    "<module {} from {}>",
-                    unsafe { crate::display::py_repr(name)? },
-                    unsafe { crate::display::py_repr(origin)? }
+                let origin_repr = unsafe { crate::display::py_repr_wtf8(origin)? };
+                return Ok(wtf8_format!(
+                    "<module ",
+                    name_repr,
+                    " from ",
+                    origin_repr,
+                    ">"
                 ));
             }
-            return Ok(format!(
-                "<module {} ({})>",
-                unsafe { crate::display::py_repr(name)? },
-                unsafe { crate::display::py_str(origin)? }
-            ));
+            let origin_str = unsafe { crate::display::py_str_wtf8(origin)? };
+            return Ok(wtf8_format!("<module ", name_repr, " (", origin_str, ")>"));
         }
     }
     let name = crate::baseobjspace::finditem_str(w_dict, "__name__")?
         .unwrap_or_else(|| pyre_object::w_str_new("?"));
-    let name_repr = unsafe { crate::display::py_repr(name)? };
+    let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
     if let Some(filename) = crate::baseobjspace::finditem_str(w_dict, "__file__")? {
-        return Ok(format!("<module {name_repr} from {}>", unsafe {
-            crate::display::py_repr(filename)?
-        }));
+        let file_repr = unsafe { crate::display::py_repr_wtf8(filename)? };
+        return Ok(wtf8_format!(
+            "<module ", name_repr, " from ", file_repr, ">"
+        ));
     }
     if let Some(loader) = loader {
         if !loader.is_null() && !unsafe { pyre_object::is_none(loader) } {
-            return Ok(format!("<module {name_repr} ({})>", unsafe {
-                crate::display::py_repr(loader)?
-            }));
+            let loader_repr = unsafe { crate::display::py_repr_wtf8(loader)? };
+            return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
         }
     }
-    Ok(format!("<module {name_repr}>"))
+    Ok(wtf8_format!("<module ", name_repr, ">"))
 }
 
 /// module.py:130-160 `Module.descr_getattribute`. The object-space module
@@ -2842,9 +2842,9 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 crate::baseobjspace::isinstance_w(w_dict, dict_type.as_ptr())
             }))
     {
-        return Err(crate::PyError::type_error(format!(
-            "{}.__dict__ is not a dictionary",
-            unsafe { crate::display::py_repr(module)? }
+        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            unsafe { crate::display::py_repr_wtf8(module)? },
+            ".__dict__ is not a dictionary"
         )));
     }
     if let Some(w_dir) = crate::baseobjspace::finditem_str(w_dict, "__dir__")? {
@@ -9070,9 +9070,10 @@ fn union_mro_entries_method(args: &[PyObjectRef]) -> crate::PyResult {
             "descriptor '__mro_entries__' requires a 'types.UnionType' object",
         ));
     }
-    let rendered = unsafe { crate::display::py_repr(self_)? };
-    Err(crate::PyError::type_error(format!(
-        "Cannot subclass {rendered}"
+    let rendered = unsafe { crate::display::py_repr_wtf8(self_)? };
+    Err(crate::PyError::type_error(crate::display::wtf8_format!(
+        "Cannot subclass ",
+        rendered
     )))
 }
 
@@ -9329,12 +9330,13 @@ fn init_union_type(ns: PyObjectRef) {
                 |args| {
                     let self_ = args.first().copied().unwrap_or(PY_NULL);
                     let rendered = if self_.is_null() {
-                        "typing.Union".to_string()
+                        Wtf8Buf::from_string("typing.Union".to_string())
                     } else {
-                        unsafe { crate::py_repr(self_) }?
+                        unsafe { crate::display::py_repr_wtf8(self_) }?
                     };
-                    Err(crate::PyError::type_error(format!(
-                        "Cannot subclass {rendered}"
+                    Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                        "Cannot subclass ",
+                        rendered
                     )))
                 },
                 2,
@@ -12650,10 +12652,12 @@ fn init_function_type(ns: PyObjectRef) {
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         "__repr__",
                     )?;
-                    let qualname = unsafe { crate::function::function_get_qualname(function) };
-                    Ok(pyre_object::w_str_new(&format!(
-                        "<function {qualname} at {function:p}>"
-                    )))
+                    // `format!` renders the WTF-8 qualname through `Display`,
+                    // which substitutes U+FFFD for a lone surrogate.
+                    let mut repr = Wtf8Buf::from_string("<function ".to_string());
+                    repr.push_wtf8(&unsafe { crate::function::function_get_qualname(function) });
+                    repr.push_str(&format!(" at {function:p}>"));
+                    Ok(pyre_object::w_str_from_wtf8(repr))
                 },
                 1,
             ),
@@ -12911,23 +12915,29 @@ fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
         // (`stamp_method_owners`), which is also what `bool.from_bytes`
         // reporting `int.from_bytes` requires.
         if unsafe { pyre_object::is_type(instance) } {
-            return Ok(pyre_object::w_str_new(&unsafe {
+            return Ok(pyre_object::w_str_from_wtf8(unsafe {
                 crate::function::function_get_qualname(descr)
             }));
         }
         let actual_type =
             crate::typedef::r#type(instance).map_or(pyre_object::PY_NULL, |tp| tp.as_ptr());
         let type_qualname = crate::baseobjspace::getattr_str(actual_type, "__qualname__")?;
-        let Some(type_qualname) = (unsafe { pyre_object::w_str_get_value_opt(type_qualname) })
-        else {
+        if !unsafe { pyre_object::is_str(type_qualname) } {
             return Err(crate::PyError::type_error(
                 "<method>.__class__.__qualname__ is not a unicode object",
             ));
-        };
+        }
+        // A class named through `type()` may carry a lone surrogate in its
+        // qualname, which is a `str` the read has to keep rather than reject.
+        let type_qualname = unsafe { pyre_object::w_str_get_wtf8(type_qualname) };
         let name = unsafe { crate::function::function_get_name(descr) };
-        Ok(pyre_object::w_str_new(&format!("{type_qualname}.{name}")))
+        Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
+            type_qualname,
+            ".",
+            name,
+        )))
     } else {
-        Ok(pyre_object::w_str_new(&unsafe {
+        Ok(pyre_object::w_str_from_wtf8(unsafe {
             crate::function::function_get_qualname(obj)
         }))
     }
@@ -15293,11 +15303,15 @@ fn staticmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let sm = staticmethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
     let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
     let repr = if function.is_null() {
-        "<NULL>".to_string()
+        Wtf8Buf::from_string("<NULL>".to_string())
     } else {
-        unsafe { crate::display::py_repr(function)? }
+        unsafe { crate::display::py_repr_wtf8(function)? }
     };
-    Ok(w_str_new_managed(&format!("<staticmethod({repr})>")))
+    Ok(w_str_from_wtf8_managed(crate::display::wtf8_format!(
+        "<staticmethod(",
+        repr,
+        ")>"
+    )))
 }
 
 /// function.py:708-709 `StaticMethod.descr_reduce_ex`.
@@ -15570,11 +15584,15 @@ fn classmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let cm = classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
     let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
     let repr = if function.is_null() {
-        "<NULL>".to_string()
+        Wtf8Buf::from_string("<NULL>".to_string())
     } else {
-        unsafe { crate::display::py_repr(function)? }
+        unsafe { crate::display::py_repr_wtf8(function)? }
     };
-    Ok(w_str_new_managed(&format!("<classmethod({repr})>")))
+    Ok(w_str_from_wtf8_managed(crate::display::wtf8_format!(
+        "<classmethod(",
+        repr,
+        ")>"
+    )))
 }
 
 /// function.py:763-764 `ClassMethod.descr_reduce_ex`.
@@ -19105,7 +19123,7 @@ fn bytearray_descr_init_value(
     // pos[0] is the class; `bytearray(source, encoding, errors)` accepts at
     // most three further positional arguments.
     if pos.len() > 4 {
-        return Err(crate::PyError::type_error(&format!(
+        return Err(crate::PyError::type_error(format!(
             "bytearray() takes at most 3 arguments ({} given)",
             pos.len() - 1
         )));
@@ -21648,6 +21666,30 @@ fn unicode_encode_error_msg(
     }
 }
 
+/// `str.encode('utf-8')` under the default error handler, for a consumer that
+/// can only hold a Rust `str` — the compiler's source text, the tokenizer's
+/// input line.
+///
+/// `pyparse.py:9-15 recode_to_utf8` takes this same encode, and it is strict:
+/// a lone surrogate has no UTF-8 spelling, so the text is reported rather than
+/// silently rewritten with U+FFFD.
+pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
+    if let Ok(s) = text.as_str() {
+        return Ok(s.to_owned());
+    }
+    let position = text
+        .code_points()
+        .position(|c| c.to_char().is_none())
+        .unwrap_or(0);
+    Err(unicode_encode_error(
+        "utf-8",
+        pyre_object::w_str_from_wtf8(text),
+        position,
+        position + 1,
+        "surrogates not allowed",
+    ))
+}
+
 /// unicodehelper.py encode_error_handler — raises a structured
 /// UnicodeEncodeError, mirroring `OperationError(space.w_UnicodeEncodeError,
 /// space.newtuple([encoding, w_obj, start, end, msg]))`.  Populates the
@@ -22306,7 +22348,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // pos[0] is the class; `bytes(source, encoding, errors)` accepts at most
     // three further positional arguments.
     if pos.len() > 4 {
-        return Err(crate::PyError::type_error(&format!(
+        return Err(crate::PyError::type_error(format!(
             "bytes() takes at most 3 arguments ({} given)",
             pos.len() - 1
         )));
@@ -26429,14 +26471,14 @@ fn count_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let cls_name = full_name.rsplit('.').next().unwrap_or(full_name);
     let w_c = unsafe { pyre_object::interp_itertools::w_count_get_c(obj) };
     let w_step = unsafe { pyre_object::interp_itertools::w_count_get_step(obj) };
-    let c = unsafe { crate::display::py_repr(w_c)? };
+    let c = unsafe { crate::display::py_repr_wtf8(w_c)? };
     let text = if count_single_argument(w_step)? {
-        format!("{cls_name}({c})")
+        crate::display::wtf8_format!(cls_name, "(", c, ")")
     } else {
-        let step = unsafe { crate::display::py_repr(w_step)? };
-        format!("{cls_name}({c}, {step})")
+        let step = unsafe { crate::display::py_repr_wtf8(w_step)? };
+        crate::display::wtf8_format!(cls_name, "(", c, ", ", step, ")")
     };
-    Ok(w_str_new(&text))
+    Ok(w_str_from_wtf8(text))
 }
 
 fn init_count_type(ns: PyObjectRef) {
@@ -26505,14 +26547,14 @@ fn repeat_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let full_name = unsafe { pyre_object::w_type_get_name(cls) };
     let cls_name = full_name.rsplit('.').next().unwrap_or(full_name);
     let w_obj = unsafe { pyre_object::interp_itertools::w_repeat_get_obj(obj) };
-    let objrepr = unsafe { crate::display::py_repr(w_obj)? };
+    let objrepr = unsafe { crate::display::py_repr_wtf8(w_obj)? };
     let text = if unsafe { pyre_object::interp_itertools::w_repeat_get_counting(obj) } {
         let count = unsafe { pyre_object::interp_itertools::w_repeat_get_count(obj) };
-        format!("{cls_name}({objrepr}, {count})")
+        crate::display::wtf8_format!(cls_name, "(", objrepr, format!(", {count})"))
     } else {
-        format!("{cls_name}({objrepr})")
+        crate::display::wtf8_format!(cls_name, "(", objrepr, ")")
     };
-    Ok(w_str_new(&text))
+    Ok(w_str_from_wtf8(text))
 }
 
 fn init_repeat_type(ns: PyObjectRef) {
@@ -28666,6 +28708,6 @@ mod tests {
         assert!(repr.contains(": int object at 0x"));
         let err = crate::builtins::try_hash_value(one).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert_eq!(err.message, "unhashable type: 'cell'");
+        assert_eq!(err.message_text(), "unhashable type: 'cell'");
     }
 }

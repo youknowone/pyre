@@ -63,12 +63,20 @@ fn type_name_of(w_obj: PyObjectRef) -> String {
 /// TypeError and propagates as the actual exception PyPy raises.
 /// Pyre mirrors this by returning the async `PyError` verbatim
 /// instead of building the TypeError prefix.
-pub fn raise_type_error(w_function: PyObjectRef, msg: String) -> crate::PyError {
+pub fn raise_type_error(
+    w_function: PyObjectRef,
+    msg: impl Into<rustpython_wtf8::Wtf8Buf>,
+) -> crate::PyError {
+    let msg = msg.into();
     if w_function.is_null() {
         return crate::PyError::type_error(msg);
     }
     match crate::baseobjspace::object_functionstr(w_function) {
-        Ok(prefix) => crate::PyError::type_error(format!("{prefix} {msg}")),
+        Ok(mut prefix) => {
+            prefix.push_str(" ");
+            prefix.push_wtf8(&msg);
+            crate::PyError::type_error(prefix)
+        }
         // Async findattr propagates as the actual raise (matches
         // PyPy `oefmt`'s argument-evaluation order: side effects of
         // `%s` formatting fire before the TypeError is constructed).
@@ -154,14 +162,18 @@ pub fn check_not_duplicate_kwargs(
         if contains_w_names(w_key, existingkeywords_w) {
             let key_repr = unsafe {
                 if pyre_object::is_str(w_key) {
-                    pyre_object::w_str_get_wtf8(w_key).to_string()
+                    pyre_object::w_str_get_wtf8(w_key).to_owned()
                 } else {
-                    crate::display::py_str(w_key)?
+                    crate::display::py_str_wtf8(w_key)?
                 }
             };
             return Err(raise_type_error(
                 w_function,
-                format!("got multiple values for keyword argument '{key_repr}'"),
+                crate::display::wtf8_format!(
+                    "got multiple values for keyword argument '",
+                    key_repr,
+                    "'"
+                ),
             ));
         }
     }
@@ -1727,7 +1739,7 @@ mod tests {
     fn raise_type_error_no_function() {
         let err = raise_type_error(pyre_object::PY_NULL, "boom".to_string());
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert_eq!(err.message, "boom");
+        assert_eq!(err.message_text(), "boom");
     }
 
     /// pypy/interpreter/argument.py:16-17 — function-prefixed arm.
@@ -1744,7 +1756,7 @@ mod tests {
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         // object_functionstr scalar fallback returns the str() of the
         // value, here "7"; raise_type_error joins it with the message.
-        assert_eq!(err.message, "7 needs an iterable");
+        assert_eq!(err.message_text(), "7 needs an iterable");
     }
 
     /// pypy/interpreter/argument.py:534-552 single-missing positional case.
@@ -1917,7 +1929,7 @@ mod tests {
         let err = check_not_duplicate_kwargs(&existing, &new, &values, pyre_object::PY_NULL)
             .expect_err("should raise TypeError on duplicate");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert!(err.message.contains("got multiple values"));
+        assert!(err.message_text().contains("got multiple values"));
     }
 
     /// pypy/interpreter/argument.py:410-417 `_check_not_duplicate_kwargs` —
@@ -1930,8 +1942,8 @@ mod tests {
         let err = check_not_duplicate_kwargs(&existing, &new, &values, pyre_object::PY_NULL)
             .expect_err("should raise TypeError on duplicate");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert!(err.message.contains("got multiple values"));
-        assert!(err.message.contains("'a'"));
+        assert!(err.message_text().contains("got multiple values"));
+        assert!(err.message_text().contains("'a'"));
     }
 
     /// `check_not_duplicate_kwargs` accepts disjoint name sets.
@@ -1970,7 +1982,10 @@ mod tests {
         let err = combine_starargs_wrapped(&mut args, stararg, pyre_object::PY_NULL)
             .expect_err("int star arg should raise TypeError");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert!(err.message.contains("argument after * must be an iterable"));
+        assert!(
+            err.message_text()
+                .contains("argument after * must be an iterable")
+        );
     }
 
     /// pypy/interpreter/argument.py:172-338 `match_signature` happy
@@ -2187,7 +2202,10 @@ mod tests {
             Ok(_) => panic!("non-iterable star arg should fail"),
             Err(err) => {
                 assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-                assert!(err.message.contains("argument after * must be an iterable"));
+                assert!(
+                    err.message_text()
+                        .contains("argument after * must be an iterable")
+                );
             }
         }
     }
@@ -2280,7 +2298,7 @@ mod tests {
                 assert_eq!(err.kind, crate::PyErrorKind::TypeError);
                 // baseobjspace.py:313-315 `_typed_unwrap_error`:
                 // `expected str, got <T> object`.
-                assert!(err.message.contains("expected str"));
+                assert!(err.message_text().contains("expected str"));
             }
         }
     }
@@ -2352,7 +2370,7 @@ mod tests {
             )
             .expect_err("unknown kwarg should TypeError");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert_eq!(err.message, "myfn() takes no keyword arguments");
+        assert_eq!(err.message_text(), "myfn() takes no keyword arguments");
     }
 
     /// pypy/interpreter/argument.py:385-389 `frompacked` builds

@@ -933,6 +933,10 @@ fn wrap_value_expr(
                 "f64" => return Ok(quote! { ::pyre_object::w_float_new(#value) }),
                 "bool" => return Ok(quote! { ::pyre_object::w_bool_from(#value) }),
                 "String" => return Ok(quote! { ::pyre_object::w_str_new(&#value) }),
+                // A method whose text may hold a lone surrogate — a `__repr__`
+                // naming a filename, say — returns the WTF-8 buffer itself
+                // rather than a `String` it cannot spell.
+                "Wtf8Buf" => return Ok(quote! { ::pyre_object::w_str_from_wtf8(#value) }),
                 _ => {}
             }
             // `Vec<T>` — bytes / list-of-X.

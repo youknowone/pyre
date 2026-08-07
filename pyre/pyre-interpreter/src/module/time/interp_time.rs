@@ -109,9 +109,12 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     const SECS_TO_NS: i64 = 1_000_000_000;
     let timeout_ns: i64 = unsafe {
         let overflow = || {
-            crate::PyError::overflow_error(format!(
-                "timestamp {} too large to convert to C _PyTime_t",
-                crate::py_repr(args[0]).unwrap_or_else(|_| "<unprintable>".to_string())
+            crate::PyError::overflow_error(crate::display::wtf8_format!(
+                "timestamp ",
+                crate::display::py_repr_wtf8(args[0]).unwrap_or_else(|_| {
+                    rustpython_wtf8::Wtf8Buf::from_string("<unprintable>".to_string())
+                }),
+                " too large to convert to C _PyTime_t"
             ))
         };
         if is_float(args[0]) {
@@ -1401,15 +1404,16 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     &msvc_tm,
                 );
                 if n != 0 {
-                    return Ok(w_str_from_wtf8(
-                        rustpython_wtf8::Wtf8Buf::from_bytes(buf[..n].to_vec()).unwrap_or_else(
-                            |b| {
-                                rustpython_wtf8::Wtf8Buf::from_string(
-                                    String::from_utf8_lossy(&b).into_owned(),
-                                )
-                            },
-                        ),
-                    ));
+                    // The same recovery as the unix arm above: unrecognised
+                    // directive bytes are echoed verbatim, so a format that is
+                    // a lone surrogate's WTF-8 encoding comes back unchanged,
+                    // and genuinely undecodable locale output takes
+                    // surrogateescape rather than raising.
+                    let rendered = buf[..n].to_vec();
+                    return Ok(match rustpython_wtf8::Wtf8Buf::from_bytes(rendered) {
+                        Ok(wtf8) => w_str_from_wtf8(wtf8),
+                        Err(bytes) => crate::typedef::charp2uni(&bytes),
+                    });
                 }
                 if buf.len() > 16384 {
                     return Ok(w_str_new(""));

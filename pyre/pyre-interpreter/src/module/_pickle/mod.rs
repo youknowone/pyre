@@ -175,10 +175,10 @@ pub(crate) fn call_meth(
 /// Build a `PyError` whose raised object is an instance of the named exception
 /// class, with `msg` as the single argument. Falls back to a generic ValueError
 /// carrying the same text if the class is somehow unavailable.
-fn pickle_exc(class_name: &str, msg: String) -> PyError {
+fn pickle_exc(class_name: &str, msg: rustpython_wtf8::Wtf8Buf) -> PyError {
     let mut err = PyError::value_error(msg.clone());
     if let Some(cls) = crate::builtins::lookup_exc_class(class_name) {
-        let args = [cls, pyre_object::w_str_new(&msg)];
+        let args = [cls, pyre_object::w_str_from_wtf8(msg)];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }
@@ -187,15 +187,15 @@ fn pickle_exc(class_name: &str, msg: String) -> PyError {
 }
 
 pub(crate) fn unpickling_error(msg: &str) -> PyError {
-    pickle_exc("_pickle.UnpicklingError", msg.to_string())
+    pickle_exc("_pickle.UnpicklingError", msg.into())
 }
 
-pub(crate) fn pickling_error(msg: impl Into<String>) -> PyError {
+pub(crate) fn pickling_error(msg: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
     pickle_exc("_pickle.PicklingError", msg.into())
 }
 
 pub(crate) fn eof_error(msg: &str) -> PyError {
-    pickle_exc("EOFError", msg.to_string())
+    pickle_exc("EOFError", msg.into())
 }
 
 // ── import / dotted attribute resolution (save_global / find_class) ───
@@ -469,11 +469,13 @@ pub(crate) fn getattribute_dotted_obj(
             .unwrap()
         };
         if unsafe { pyre_object::w_str_get_wtf8(w_part) }.as_bytes() == b"<locals>" {
-            let qualname_repr =
-                unsafe { crate::py_repr(pyre_object::gc_roots::shadow_stack_get(qualname_slot)) }
-                    .unwrap_or_else(|_| "<qualname>".to_string());
-            return Err(PyError::attribute_error(format!(
-                "Can't get local attribute {qualname_repr}"
+            let qualname_repr = unsafe {
+                crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(qualname_slot))
+            }
+            .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<qualname>".to_string()));
+            return Err(PyError::attribute_error(crate::display::wtf8_format!(
+                "Can't get local attribute ",
+                qualname_repr
             )));
         }
         parent_slot = cur_slot;

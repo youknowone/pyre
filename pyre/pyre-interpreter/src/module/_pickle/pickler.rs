@@ -182,7 +182,11 @@ fn pickle_type_name(w_obj: PyObjectRef) -> Result<String, PyError> {
 /// original exception object. `PyError` is a Rust carrier which the precise
 /// collector does not scan, so materialise and pin the exception before any
 /// type-name lookup or `add_note` call can collect.
-fn add_pickle_object_note(mut err: PyError, w_obj: PyObjectRef, role: &str) -> PyError {
+fn add_pickle_object_note(
+    mut err: PyError,
+    w_obj: PyObjectRef,
+    role: &rustpython_wtf8::Wtf8,
+) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
     let w_exc = err.to_exc_object();
     pyre_object::gc_roots::pin_root(w_exc);
@@ -191,7 +195,10 @@ fn add_pickle_object_note(mut err: PyError, w_obj: PyObjectRef, role: &str) -> P
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     if let Ok(type_name) = pickle_type_name(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
-        let w_note = pyre_object::w_str_new(&format!("when serializing {type_name} {role}"));
+        let w_note = pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
+            format!("when serializing {type_name} "),
+            role
+        ));
         pyre_object::gc_roots::pin_root(w_note);
         let note_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if let Ok(w_add_note) = crate::baseobjspace::getattr_str(
@@ -213,7 +220,11 @@ fn add_pickle_object_note(mut err: PyError, w_obj: PyObjectRef, role: &str) -> P
     err
 }
 
-fn add_reduce_note(err: PyError, w_obj_slot: Option<usize>, role: &str) -> PyError {
+fn add_reduce_note(
+    err: PyError,
+    w_obj_slot: Option<usize>,
+    role: &rustpython_wtf8::Wtf8,
+) -> PyError {
     match w_obj_slot {
         Some(slot) => {
             add_pickle_object_note(err, pyre_object::gc_roots::shadow_stack_get(slot), role)
@@ -1459,7 +1470,7 @@ fn save_reduce_value(
         add_pickle_object_note(
             err,
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            "object",
+            rustpython_wtf8::Wtf8::new("object"),
         )
     })
 }
@@ -1750,7 +1761,7 @@ fn save_tuple(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
                 return Err(add_pickle_object_note(
                     err,
                     pyre_object::gc_roots::shadow_stack_get(slot),
-                    &format!("item {i}"),
+                    rustpython_wtf8::Wtf8::new(format!("item {i}").as_str()),
                 ));
             }
         }
@@ -1774,7 +1785,7 @@ fn save_tuple(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
             return Err(add_pickle_object_note(
                 err,
                 pyre_object::gc_roots::shadow_stack_get(slot),
-                &format!("item {i}"),
+                rustpython_wtf8::Wtf8::new(format!("item {i}").as_str()),
             ));
         }
     }
@@ -1894,7 +1905,7 @@ fn save_set_items(
         return Err(add_pickle_object_note(
             err,
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            "element",
+            rustpython_wtf8::Wtf8::new("element"),
         ));
     }
     let mut i = 1;
@@ -1907,7 +1918,7 @@ fn save_set_items(
             return Err(add_pickle_object_note(
                 err,
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                "element",
+                rustpython_wtf8::Wtf8::new("element"),
             ));
         }
         i += 1;
@@ -1917,7 +1928,7 @@ fn save_set_items(
             return Err(add_pickle_object_note(
                 err,
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                "element",
+                rustpython_wtf8::Wtf8::new("element"),
             ));
         }
     }
@@ -1959,7 +1970,7 @@ fn save_frozenset(
             return Err(add_pickle_object_note(
                 err,
                 pyre_object::gc_roots::shadow_stack_get(fs_slot),
-                "element",
+                rustpython_wtf8::Wtf8::new("element"),
             ));
         }
     }
@@ -2206,7 +2217,11 @@ fn batch_appends(
         let n = pinned_len(snapshot_slot);
         for i in 0..n {
             if let Err(err) = save(ctx, buf, pinned_get(snapshot_slot, i)) {
-                return Err(add_reduce_note(err, obj_slot, &format!("item {i}")));
+                return Err(add_reduce_note(
+                    err,
+                    obj_slot,
+                    rustpython_wtf8::Wtf8::new(format!("item {i}").as_str()),
+                ));
             }
             buf.push(op::APPEND);
         }
@@ -2234,7 +2249,11 @@ fn batch_appends(
                     buf,
                     pyre_object::gc_roots::shadow_stack_get(first_slot),
                 ) {
-                    return Err(add_reduce_note(err, obj_slot, &format!("item {index}")));
+                    return Err(add_reduce_note(
+                        err,
+                        obj_slot,
+                        rustpython_wtf8::Wtf8::new(format!("item {index}").as_str()),
+                    ));
                 }
                 buf.push(op::APPEND);
                 return Ok(());
@@ -2247,13 +2266,21 @@ fn batch_appends(
             buf,
             pyre_object::gc_roots::shadow_stack_get(first_slot),
         ) {
-            return Err(add_reduce_note(err, obj_slot, &format!("item {index}")));
+            return Err(add_reduce_note(
+                err,
+                obj_slot,
+                rustpython_wtf8::Wtf8::new(format!("item {index}").as_str()),
+            ));
         }
         index += 1;
         let mut count = 1;
         loop {
             if let Err(err) = save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(item_slot)) {
-                return Err(add_reduce_note(err, obj_slot, &format!("item {index}")));
+                return Err(add_reduce_note(
+                    err,
+                    obj_slot,
+                    rustpython_wtf8::Wtf8::new(format!("item {index}").as_str()),
+                ));
             }
             index += 1;
             count += 1;
@@ -2313,8 +2340,12 @@ fn save_pair(
             // pickle.py only invokes the key's arbitrary __repr__ while
             // annotating a value-save failure. Successful dictionary saves
             // must not gain an observable repr call.
-            let key_repr = unsafe { crate::display::py_repr(pinned_get(pair_slot, 0))? };
-            Err(add_reduce_note(err, obj_slot, &format!("item {key_repr}")))
+            let key_repr = unsafe { crate::display::py_repr_wtf8(pinned_get(pair_slot, 0))? };
+            Err(add_reduce_note(
+                err,
+                obj_slot,
+                &crate::display::wtf8_format!("item ", key_repr),
+            ))
         }
     }
 }
@@ -2433,7 +2464,10 @@ fn memoize(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
 /// Build a PicklingError while preserving the intercepted import/attribute
 /// exception as `__context__`, matching the native pickler's exception
 /// chaining rather than flattening it to text.
-fn pickling_error_with_context(message: String, mut context: PyError) -> PyError {
+fn pickling_error_with_context(
+    message: impl Into<rustpython_wtf8::Wtf8Buf>,
+    mut context: PyError,
+) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
     let w_context = context.to_exc_object();
     pyre_object::gc_roots::pin_root(w_context);
@@ -2469,10 +2503,12 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
     pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if name.split('.').any(|s| s == "<locals>") {
-        let obj_repr =
-            unsafe { crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(obj_slot))? };
-        return Err(pickling_error(format!(
-            "Can't pickle local object {obj_repr}"
+        let obj_repr = unsafe {
+            crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(obj_slot))?
+        };
+        return Err(pickling_error(crate::display::wtf8_format!(
+            "Can't pickle local object ",
+            obj_repr
         )));
     }
     // `interp_pickle.py:1738-1742 whichmodule` returns any non-None
@@ -2597,11 +2633,11 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
             ) =>
         {
             let obj_repr = unsafe {
-                crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(obj_slot))?
+                crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(obj_slot))?
             };
-            let detail = error.message_text();
+            let detail = error.message_wtf8();
             return Err(pickling_error_with_context(
-                format!("Can't pickle {obj_repr}: {detail}"),
+                crate::display::wtf8_format!("Can't pickle ", obj_repr, ": ", detail),
                 error,
             ));
         }
@@ -2614,10 +2650,14 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
         Ok((value, _)) => value,
         Err(error) if matches!(error.kind, crate::PyErrorKind::AttributeError) => {
             let obj_repr = unsafe {
-                crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(obj_slot))?
+                crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(obj_slot))?
             };
             return Err(pickling_error_with_context(
-                format!("Can't pickle {obj_repr}: it's not found as {module_name}.{name}"),
+                crate::display::wtf8_format!(
+                    "Can't pickle ",
+                    obj_repr,
+                    format!(": it's not found as {module_name}.{name}")
+                ),
                 error,
             ));
         }
@@ -2626,10 +2666,13 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
     if crate::baseobjspace::is_w(resolved, pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
         Ok(ModuleName::Utf8(module_name))
     } else {
-        let obj_repr =
-            unsafe { crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(obj_slot))? };
-        Err(pickling_error(format!(
-            "Can't pickle {obj_repr}: it's not the same object as {module_name}.{name}"
+        let obj_repr = unsafe {
+            crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(obj_slot))?
+        };
+        Err(pickling_error(crate::display::wtf8_format!(
+            "Can't pickle ",
+            obj_repr,
+            format!(": it's not the same object as {module_name}.{name}")
         )))
     }
 }
@@ -2866,11 +2909,14 @@ fn identifier_encoding_error(
     let context_obj = context.to_exc_object();
     pyre_object::gc_roots::pin_root(context_obj);
     let context_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let identifier_repr =
-        unsafe { crate::py_repr(pyre_object::gc_roots::shadow_stack_get(identifier_slot)) }
-            .unwrap_or_else(|_| "<identifier>".to_string());
-    let mut error = pickling_error(format!(
-        "can't pickle {kind} identifier {identifier_repr} using pickle protocol {proto}"
+    let identifier_repr = unsafe {
+        crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(identifier_slot))
+    }
+    .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<identifier>".to_string()));
+    let mut error = pickling_error(crate::display::wtf8_format!(
+        format!("can't pickle {kind} identifier "),
+        identifier_repr,
+        format!(" using pickle protocol {proto}")
     ));
     let exc = error.to_exc_object();
     pyre_object::gc_roots::pin_root(exc);
@@ -3091,12 +3137,17 @@ fn save_reduce(
             if !crate::baseobjspace::is_w(args_get(0), w_class) {
                 pyre_object::gc_roots::pin_root(w_class);
                 let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let cls_repr = unsafe { crate::display::py_repr(args_get(0))? };
+                let cls_repr = unsafe { crate::display::py_repr_wtf8(args_get(0))? };
                 let obj_class_repr = unsafe {
-                    crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(class_slot))?
+                    crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                        class_slot,
+                    ))?
                 };
-                return Err(pickling_error(format!(
-                    "first argument to __newobj_ex__() must be {obj_class_repr}, not {cls_repr}"
+                return Err(pickling_error(crate::display::wtf8_format!(
+                    "first argument to __newobj_ex__() must be ",
+                    obj_class_repr,
+                    ", not ",
+                    cls_repr
                 )));
             }
         }
@@ -3114,13 +3165,25 @@ fn save_reduce(
         }
         if ctx.proto >= 4 {
             if let Err(err) = save(ctx, buf, args_get(0)) {
-                return Err(add_reduce_note(err, w_obj_slot, "class"));
+                return Err(add_reduce_note(
+                    err,
+                    w_obj_slot,
+                    rustpython_wtf8::Wtf8::new("class"),
+                ));
             }
             if let Err(err) = save(ctx, buf, args_get(1)) {
-                return Err(add_reduce_note(err, w_obj_slot, "__new__ arguments"));
+                return Err(add_reduce_note(
+                    err,
+                    w_obj_slot,
+                    rustpython_wtf8::Wtf8::new("__new__ arguments"),
+                ));
             }
             if let Err(err) = save(ctx, buf, args_get(2)) {
-                return Err(add_reduce_note(err, w_obj_slot, "__new__ arguments"));
+                return Err(add_reduce_note(
+                    err,
+                    w_obj_slot,
+                    rustpython_wtf8::Wtf8::new("__new__ arguments"),
+                ));
             }
             buf.push(op::NEWOBJ_EX);
         } else {
@@ -3169,7 +3232,11 @@ fn save_reduce(
             pyre_object::gc_roots::pin_root(w_func);
             let func_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             if let Err(err) = save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(func_slot)) {
-                return Err(add_reduce_note(err, w_obj_slot, "reconstructor"));
+                return Err(add_reduce_note(
+                    err,
+                    w_obj_slot,
+                    rustpython_wtf8::Wtf8::new("reconstructor"),
+                ));
             }
             let w_empty_args = pyre_object::tupleobject::w_tuple_new(Vec::new());
             save(ctx, buf, w_empty_args)?;
@@ -3194,12 +3261,17 @@ fn save_reduce(
             if !crate::baseobjspace::is_w(args_get(0), w_class) {
                 pyre_object::gc_roots::pin_root(w_class);
                 let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let cls_repr = unsafe { crate::display::py_repr(args_get(0))? };
+                let cls_repr = unsafe { crate::display::py_repr_wtf8(args_get(0))? };
                 let obj_class_repr = unsafe {
-                    crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(class_slot))?
+                    crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                        class_slot,
+                    ))?
                 };
-                return Err(pickling_error(format!(
-                    "first argument to __newobj__() must be {obj_class_repr}, not {cls_repr}"
+                return Err(pickling_error(crate::display::wtf8_format!(
+                    "first argument to __newobj__() must be ",
+                    obj_class_repr,
+                    ", not ",
+                    cls_repr
                 )));
             }
         }
@@ -3208,22 +3280,38 @@ fn save_reduce(
         pyre_object::gc_roots::pin_root(w_newargs);
         let newargs_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if let Err(err) = save(ctx, buf, args_get(0)) {
-            return Err(add_reduce_note(err, w_obj_slot, "class"));
+            return Err(add_reduce_note(
+                err,
+                w_obj_slot,
+                rustpython_wtf8::Wtf8::new("class"),
+            ));
         }
         if let Err(err) = save(
             ctx,
             buf,
             pyre_object::gc_roots::shadow_stack_get(newargs_slot),
         ) {
-            return Err(add_reduce_note(err, w_obj_slot, "__new__ arguments"));
+            return Err(add_reduce_note(
+                err,
+                w_obj_slot,
+                rustpython_wtf8::Wtf8::new("__new__ arguments"),
+            ));
         }
         buf.push(op::NEWOBJ);
     } else {
         if let Err(err) = save(ctx, buf, rv_get(0)) {
-            return Err(add_reduce_note(err, w_obj_slot, "reconstructor"));
+            return Err(add_reduce_note(
+                err,
+                w_obj_slot,
+                rustpython_wtf8::Wtf8::new("reconstructor"),
+            ));
         }
         if let Err(err) = save(ctx, buf, rv_get(1)) {
-            return Err(add_reduce_note(err, w_obj_slot, "reconstructor arguments"));
+            return Err(add_reduce_note(
+                err,
+                w_obj_slot,
+                rustpython_wtf8::Wtf8::new("reconstructor arguments"),
+            ));
         }
         buf.push(op::REDUCE);
     }
@@ -3251,21 +3339,33 @@ fn save_reduce(
     if has_state {
         if has_state_setter {
             if let Err(err) = save(ctx, buf, rv_get(5)) {
-                return Err(add_reduce_note(err, w_obj_slot, "state setter"));
+                return Err(add_reduce_note(
+                    err,
+                    w_obj_slot,
+                    rustpython_wtf8::Wtf8::new("state setter"),
+                ));
             }
             let state_obj = w_obj_slot
                 .map(pyre_object::gc_roots::shadow_stack_get)
                 .unwrap_or_else(pyre_object::w_none);
             save(ctx, buf, state_obj)?;
             if let Err(err) = save(ctx, buf, rv_get(2)) {
-                return Err(add_reduce_note(err, w_obj_slot, "state"));
+                return Err(add_reduce_note(
+                    err,
+                    w_obj_slot,
+                    rustpython_wtf8::Wtf8::new("state"),
+                ));
             }
             buf.push(op::TUPLE2);
             buf.push(op::REDUCE);
             buf.push(op::POP);
         } else {
             if let Err(err) = save(ctx, buf, rv_get(2)) {
-                return Err(add_reduce_note(err, w_obj_slot, "state"));
+                return Err(add_reduce_note(
+                    err,
+                    w_obj_slot,
+                    rustpython_wtf8::Wtf8::new("state"),
+                ));
             }
             buf.push(op::BUILD);
         }

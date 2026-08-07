@@ -2777,7 +2777,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 && !p.alt_form
                 && !matches!(p.sign, Some('+') | Some(' '))
             {
-                let body = Wtf8Buf::from_string(crate::py_str(val)?);
+                let body = unsafe { crate::display::py_str_wtf8(val)? };
                 return pad_wtf8(&body, p.fill, align, p.width);
             }
             // CPython _PyComplex_FormatAdvancedWriter: component flags
@@ -2855,13 +2855,18 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
         // Reached only for the rare builtin type whose `__format__` is the
         // inherited default yet still routes here with a non-empty spec;
         // format its `str()` through the shared string formatter.
-        let s = crate::py_str(val)?;
-        let parsed = FormatSpec::parse(spec)
-            .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
-        let out = parsed
-            .format_string(&CharLenStr(&s, s.chars().count()))
-            .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
-        Ok(Wtf8Buf::from_string(out))
+        let full = unsafe { crate::display::py_str_wtf8(val)? };
+        if let Ok(s) = full.as_str() {
+            let parsed = FormatSpec::parse(spec)
+                .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
+            let out = parsed
+                .format_string(&CharLenStr(s, s.chars().count()))
+                .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
+            return Ok(Wtf8Buf::from_string(out));
+        }
+        // A body carrying a lone surrogate has no `&str` view for the shared
+        // formatter, so pad it by code point.
+        format_surrogate_str(&full, spec)
     }
 }
 
@@ -6492,7 +6497,7 @@ mod dict_method_tests {
         let err = result.expect_err("operation should reject unhashable dict key");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         assert_eq!(
-            err.message,
+            err.message_text(),
             "cannot use 'list' as a dict key (unhashable type: 'list')"
         );
     }

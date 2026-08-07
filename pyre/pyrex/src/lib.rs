@@ -576,7 +576,7 @@ fn real_main(binary_name: &str) {
             // cwd is still the anchor the shadowing check compares module
             // origins against.
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd, "");
+            importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
             let mut argv = vec![std::ffi::OsString::from("-c")];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -589,7 +589,7 @@ fn real_main(binary_name: &str) {
             // `-m`: sys.path[0] is the cwd (runpy resets argv[0] to the
             // module's resolved origin via `_run_module_as_main`).
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd, &cwd.to_string_lossy());
+            importing::init_sys_path(&cwd, cwd.as_os_str());
             let mut argv = vec![std::ffi::OsString::from(&module)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -604,7 +604,11 @@ fn real_main(binary_name: &str) {
             // the same channel module imports use.  The bytes then go through
             // the tokenizer's BOM / PEP 263 decoding in every build.
             let source = match importing::read_source_bytes(Path::new(&path)) {
-                Ok(bytes) => match pyre_interpreter::decode_source_bytes(&bytes, &path, false) {
+                Ok(bytes) => match pyre_interpreter::decode_source_bytes(
+                    &bytes,
+                    rustpython_wtf8::Wtf8::new(path.as_str()),
+                    false,
+                ) {
                     Ok(source) => source,
                     Err(error) => {
                         pyre_interpreter::eprint_exception(&error, false);
@@ -639,7 +643,7 @@ fn real_main(binary_name: &str) {
                 };
                 parent.canonicalize().unwrap_or_else(|_| sys_path_cwd())
             };
-            importing::init_sys_path(&script_dir, &script_dir.to_string_lossy());
+            importing::init_sys_path(&script_dir, script_dir.as_os_str());
             // sys.argv[0] is the script path; remaining values go to argv[1:].
             let mut argv = vec![std::ffi::OsString::from(&path)];
             argv.extend(args);
@@ -664,7 +668,7 @@ fn real_main(binary_name: &str) {
             // (`_PyPathConfig_ComputeSysPath0` on an argv[0] of "" / "-"); the
             // cwd stays the shadowing-check anchor.
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd, "");
+            importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
             // `sys.argv` is `['']` with no script argument and `['-', …]` for
             // an explicit dash.
             let mut argv = vec![std::ffi::OsString::from(argv0)];
@@ -1095,7 +1099,7 @@ fn run_atexit_callbacks(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyEx
     if let Err(mut error) = result {
         error.write_unraisable(
             pyre_object::w_none(),
-            "_run_exitfuncs",
+            rustpython_wtf8::Wtf8::new("_run_exitfuncs"),
             pyre_object::w_none(),
         );
     }

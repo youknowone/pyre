@@ -648,10 +648,10 @@ pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate
         }));
     }
     let s = match conv {
-        2 => crate::builtins::py_ascii(value)?,
-        _ => unsafe { crate::py_str(value)? },
+        2 => rustpython_wtf8::Wtf8Buf::from_string(crate::builtins::py_ascii(value)?),
+        _ => unsafe { crate::py_str_wtf8(value)? },
     };
-    Ok(pyre_object::w_str_new_managed(&s))
+    Ok(pyre_object::w_str_from_wtf8_managed(s))
 }
 
 /// FORMAT_SIMPLE / FORMAT_WITH_SPEC evaluation, shared by the interpreter
@@ -1720,7 +1720,7 @@ mod tests {
         let err = classify_callable(w_int_new(3)).expect_err("non-callable dispatch should fail");
 
         assert!(matches!(err.kind, PyErrorKind::TypeError));
-        assert!(err.message.contains("not callable"));
+        assert!(err.message_text().contains("not callable"));
     }
 
     #[test]

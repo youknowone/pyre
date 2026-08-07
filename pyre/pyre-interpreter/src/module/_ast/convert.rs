@@ -159,16 +159,16 @@ impl ObjectConverter {
     }
 
     /// How `%R` names the value an error rejected.
-    fn repr(&self, object: PyObjectRef) -> AstResult<String> {
-        unsafe { crate::display::py_repr(object) }
+    fn repr(&self, object: PyObjectRef) -> AstResult<rustpython_wtf8::Wtf8Buf> {
+        unsafe { crate::display::py_repr_wtf8(object) }
     }
 
     /// `obj_to_int` (ast.py:36) — an integer field takes an `int`, or an
     /// instance of a subclass of one.  Nothing else is asked for `__index__`.
     fn obj_to_int(&self, value: PyObjectRef) -> AstResult<i64> {
         if !unsafe { crate::baseobjspace::isinstance_int_w(value) } {
-            return Err(crate::PyError::value_error(format!(
-                "invalid integer value: {}",
+            return Err(crate::PyError::value_error(crate::display::wtf8_format!(
+                "invalid integer value: ",
                 self.repr(value)?
             )));
         }
@@ -212,8 +212,8 @@ impl ObjectConverter {
             if unsafe { pyre_object::is_none(item) } || self.is_node(item, "TypeIgnore")? {
                 continue;
             }
-            return Err(crate::PyError::type_error(format!(
-                "expected some sort of type_ignore, but got {}",
+            return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                "expected some sort of type_ignore, but got ",
                 self.repr(item)?
             )));
         }
@@ -234,8 +234,8 @@ impl ObjectConverter {
                 body: Box::new(self.recurse(|this| this.expr(body))?),
             }));
         } else {
-            return Err(crate::PyError::type_error(format!(
-                "expected some sort of mod, but got {}",
+            return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                "expected some sort of mod, but got ",
                 self.repr(object)?
             )));
         };
@@ -608,8 +608,8 @@ impl ObjectConverter {
                 cases,
             }))
         } else {
-            Err(crate::PyError::type_error(format!(
-                "expected some sort of stmt, but got {}",
+            Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                "expected some sort of stmt, but got ",
                 self.repr(object)?
             )))
         }
@@ -728,8 +728,8 @@ impl ObjectConverter {
     fn handler(&mut self, object: PyObjectRef) -> AstResult<ast::ExceptHandler> {
         self.location(object, "excepthandler")?;
         if !self.is_node(object, "ExceptHandler")? {
-            return Err(crate::PyError::type_error(format!(
-                "expected some sort of excepthandler, but got {}",
+            return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                "expected some sort of excepthandler, but got ",
                 self.repr(object)?
             )));
         }
@@ -862,8 +862,8 @@ impl ObjectConverter {
                 default: self.opt_expr(object, "default_value")?,
             }))
         } else {
-            Err(crate::PyError::type_error(format!(
-                "expected some sort of type_param, but got {}",
+            Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                "expected some sort of type_param, but got ",
                 self.repr(object)?
             )))
         }
@@ -1002,8 +1002,8 @@ impl ObjectConverter {
                 runtime_patterns: None,
             }))
         } else {
-            Err(crate::PyError::type_error(format!(
-                "expected some sort of pattern, but got {}",
+            Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                "expected some sort of pattern, but got ",
                 self.repr(object)?
             )))
         }
@@ -1411,8 +1411,8 @@ impl ObjectConverter {
             let element = self.interpolation(object)?;
             Ok(fstring(vec![element], None))
         } else {
-            Err(crate::PyError::type_error(format!(
-                "expected some sort of expr, but got {}",
+            Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                "expected some sort of expr, but got ",
                 self.repr(object)?
             )))
         }
@@ -1463,8 +1463,8 @@ impl ObjectConverter {
                 return Ok(op);
             }
         }
-        Err(crate::PyError::type_error(format!(
-            "expected some sort of boolop, but got {}",
+        Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "expected some sort of boolop, but got ",
             self.repr(object)?
         )))
     }
@@ -1486,8 +1486,8 @@ impl ObjectConverter {
                 return Ok(op);
             }
         }
-        Err(crate::PyError::type_error(format!(
-            "expected some sort of cmpop, but got {}",
+        Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "expected some sort of cmpop, but got ",
             self.repr(object)?
         )))
     }
@@ -1619,8 +1619,8 @@ impl ObjectConverter {
                 return Ok(ctx);
             }
         }
-        Err(crate::PyError::type_error(format!(
-            "expected some sort of expr_context, but got {}",
+        Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "expected some sort of expr_context, but got ",
             self.repr(object)?
         )))
     }
@@ -1636,8 +1636,8 @@ impl ObjectConverter {
                 return Ok(op);
             }
         }
-        Err(crate::PyError::type_error(format!(
-            "expected some sort of unaryop, but got {}",
+        Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "expected some sort of unaryop, but got ",
             self.repr(object)?
         )))
     }
@@ -1662,8 +1662,8 @@ impl ObjectConverter {
                 return Ok(op);
             }
         }
-        Err(crate::PyError::type_error(format!(
-            "expected some sort of operator, but got {}",
+        Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "expected some sort of operator, but got ",
             self.repr(object)?
         )))
     }

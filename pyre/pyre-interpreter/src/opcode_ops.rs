@@ -281,9 +281,11 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     let mut all_match = true;
     for key in key_items {
         if crate::baseobjspace::contains(w_seen, key)? {
-            let key_repr = unsafe { crate::py_repr(key)? };
-            return Err(PyError::value_error(format!(
-                "mapping pattern checks duplicate key ({key_repr})"
+            let key_repr = unsafe { crate::display::py_repr_wtf8(key)? };
+            return Err(PyError::value_error(crate::display::wtf8_format!(
+                "mapping pattern checks duplicate key (",
+                key_repr,
+                ")"
             )));
         }
         unsafe { pyre_object::w_set_add(w_seen, key) };
@@ -787,10 +789,14 @@ pub fn dict_merge_value(
     for key in keys {
         let val = crate::baseobjspace::getitem(source, key)?;
         if crate::baseobjspace::contains(dict, key)? {
-            let key_str = unsafe { crate::display::py_str(key) }?;
+            let key_str = unsafe { crate::display::py_str_wtf8(key) }?;
             return Err(crate::argument::raise_type_error(
                 w_callable,
-                format!("got multiple values for keyword argument '{key_str}'"),
+                crate::display::wtf8_format!(
+                    "got multiple values for keyword argument '",
+                    key_str,
+                    "'"
+                ),
             ));
         }
         unsafe { pyre_object::w_dict_store(dict, key, val) };

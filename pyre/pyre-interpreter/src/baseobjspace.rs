@@ -157,7 +157,7 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
     PyError::type_error(format!(
         "cannot use '{}' as a dict key ({})",
         object_functionstr_type_name(key),
-        err.message,
+        err.message_text(),
     ))
 }
 
@@ -176,7 +176,7 @@ pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
     PyError::type_error(format!(
         "cannot use '{}' as a set element ({})",
         object_functionstr_type_name(item),
-        err.message,
+        err.message_text(),
     ))
 }
 
@@ -2159,9 +2159,9 @@ pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
             if pyre_object::w_range_contains_bigint(obj, &item) {
                 return Ok(pyre_object::w_range_index_of(obj, &item));
             }
-            return Err(PyError::value_error(format!(
-                "{} is not in range",
-                crate::display::py_repr(needle)?
+            return Err(PyError::value_error(crate::display::wtf8_format!(
+                crate::display::py_repr_wtf8(needle)?,
+                " is not in range"
             )));
         }
     }
@@ -6640,32 +6640,44 @@ unsafe fn module_getattr_hook_or_err(
         let (origin, is_shadowing, is_shadowing_stdlib) =
             crate::importing::module_shadow_info(w_spec, w_name)?;
         let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+        // The origin is a filename and may hold a surrogate escape, so each
+        // message that names it is assembled as WTF-8; `format!` would render
+        // it through `Display` and substitute U+FFFD.
+        let with_origin = |head: String, tail: String| {
+            let mut msg = Wtf8Buf::from_string(head);
+            msg.push_wtf8(origin.as_deref().unwrap_or(Wtf8::new("")));
+            msg.push_str(&tail);
+            msg
+        };
         if is_shadowing_stdlib {
-            let origin = origin.as_deref().unwrap_or("");
-            format!(
-                "module '{nm}' has no attribute '{name}' (consider renaming \
-                 '{origin}' since it has the same name as the standard library \
-                 module named '{nm}' and prevents importing that standard \
-                 library module)"
+            with_origin(
+                format!("module '{nm}' has no attribute '{name}' (consider renaming '"),
+                format!(
+                    "' since it has the same name as the standard library module \
+                     named '{nm}' and prevents importing that standard library \
+                     module)"
+                ),
             )
         } else if crate::importing::is_spec_initializing(w_spec)? {
             if is_shadowing {
-                let origin = origin.as_deref().unwrap_or("");
-                format!(
-                    "module '{nm}' has no attribute '{name}' (consider renaming \
-                     '{origin}' if it has the same name as a library you \
-                     intended to import)"
+                with_origin(
+                    format!("module '{nm}' has no attribute '{name}' (consider renaming '"),
+                    "' if it has the same name as a library you intended to import)".to_string(),
                 )
-            } else if let Some(origin) = origin.as_deref() {
-                format!(
-                    "partially initialized module '{nm}' from '{origin}' has no \
-                     attribute '{name}' (most likely due to a circular import)"
+            } else if origin.is_some() {
+                with_origin(
+                    format!("partially initialized module '{nm}' from '"),
+                    format!(
+                        "' has no attribute '{name}' (most likely due to a \
+                         circular import)"
+                    ),
                 )
             } else {
                 format!(
                     "partially initialized module '{nm}' has no attribute \
                      '{name}' (most likely due to a circular import)"
                 )
+                .into()
             }
         } else {
             let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
@@ -6674,12 +6686,13 @@ unsafe fn module_getattr_hook_or_err(
                     "cannot access submodule '{name}' of module '{nm}' \
                      (most likely due to a circular import)"
                 )
+                .into()
             } else {
-                format!("module '{nm}' has no attribute '{name}'")
+                format!("module '{nm}' has no attribute '{name}'").into()
             }
         }
     } else {
-        format!("module '{nm}' has no attribute '{name}'")
+        Wtf8Buf::from_string(format!("module '{nm}' has no attribute '{name}'"))
     };
     Err(PyError::new(PyErrorKind::AttributeError, msg))
 }
@@ -8630,7 +8643,7 @@ impl SimpleBufferBytes {
         if let Err(mut error) = crate::builtins::memoryview_release(&[view]) {
             error.write_unraisable(
                 pyre_object::w_none(),
-                "Exception ignored in __release_buffer__:",
+                Wtf8::new("Exception ignored in __release_buffer__:"),
                 view,
             );
         }
@@ -13667,7 +13680,7 @@ pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<
 /// functions.  Pyre's `Function` does not carry the field directly;
 /// `crate::function::function_get_qualname` reproduces the same
 /// precedence (set-attr override → `code.qualname` → `function.name`).
-pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyError> {
+pub fn object_functionstr(w_function: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // baseobjspace.py:2108-2120 — Function fast path (also covers
     // `FunctionWithFixedCode` and `BuiltinFunction`, both subclasses
     // of `Function` per function.py:783,786).  Pyre's `is_function`
@@ -13676,15 +13689,22 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
         // function.py:2108 `qualname = w_function.qualname` — match
         // PyPy's stored `qualname` field via the helper that walks
         // the stored `qualname` → `code.qualname` → `name`.
+        // The qualname is WTF-8 and this text becomes a TypeError's
+        // `args[0]` prefix, so `format!` (which would render it through
+        // `Display` and substitute U+FFFD) is not usable here.
         let qualname = unsafe { crate::function::function_get_qualname(w_function) };
+        let mut out = Wtf8Buf::new();
         let w_module = unsafe { crate::function::fget___module__(w_function) };
         if !is_w(w_module, w_none()) && unsafe { pyre_object::is_str(w_module) } {
-            let module = unsafe { pyre_object::w_str_get_value(w_module) };
-            if !module.is_empty() && module != "builtins" {
-                return Ok(format!("{module}.{qualname}()"));
+            let module = unsafe { pyre_object::w_str_get_wtf8(w_module) };
+            if !module.is_empty() && module.as_str() != Ok("builtins") {
+                out.push_wtf8(module);
+                out.push_str(".");
             }
         }
-        return Ok(format!("{qualname}()"));
+        out.push_wtf8(&qualname);
+        out.push_str("()");
+        return Ok(out);
     }
     // baseobjspace.py:2121-2122 — `_Method` recursive fast path:
     // unwrap to `w_function.w_function` and recurse.
@@ -13716,10 +13736,17 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
             // try/except OperationError: pass — async findattr suppressed too.
             Err(_) => break 'qualname,
         };
+        // The dotted prefix is optional; the qualname and the trailing `()`
+        // are not, so build the one and prepend the other.
+        let bare = |qualname: &Wtf8Buf| {
+            let mut out = qualname.clone();
+            out.push_str("()");
+            out
+        };
         match w_module {
             // No `__module__` or `__module__ is None`: bare `qualname()`.
-            None => return Ok(format!("{qualname}()")),
-            Some(w_module) if is_w(w_module, w_none()) => return Ok(format!("{qualname}()")),
+            None => return Ok(bare(&qualname)),
+            Some(w_module) if is_w(w_module, w_none()) => return Ok(bare(&qualname)),
             Some(w_module) => {
                 // text_w(w_module) — non-string raises in PyPy → except →
                 // fall through (do NOT return `qualname()` here, which
@@ -13727,11 +13754,15 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
                 let Ok(module) = object_functionstr_text_w(w_module) else {
                     break 'qualname;
                 };
-                if !module.is_empty() && module != "builtins" {
-                    return Ok(format!("{module}.{qualname}()"));
+                if !module.is_empty() && module.as_str() != Ok("builtins") {
+                    let mut out = module;
+                    out.push_str(".");
+                    out.push_wtf8(&qualname);
+                    out.push_str("()");
+                    return Ok(out);
                 }
                 // module empty or 'builtins': bare qualname().
-                return Ok(format!("{qualname}()"));
+                return Ok(bare(&qualname));
             }
         }
     }
@@ -13748,12 +13779,14 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
     if let Ok(w_s) = object_functionstr_str(w_function)
         && unsafe { pyre_object::is_str(w_s) }
     {
-        return Ok(unsafe { pyre_object::w_str_get_value(w_s).to_string() });
+        // `str(w_function)`'s own text: another `w_str_get_value` that would
+        // panic on a lone surrogate rather than answer.
+        return Ok(unsafe { pyre_object::w_str_get_wtf8(w_s).to_wtf8_buf() });
     }
-    Ok(format!(
+    Ok(Wtf8Buf::from_string(format!(
         "{} object",
         object_functionstr_type_name(w_function)
-    ))
+    )))
 }
 
 /// `space.str(w_obj)` — `__str__`-only fast path for
@@ -13821,10 +13854,13 @@ fn object_functionstr_findattr(
 }
 
 /// `space.text_w(w_obj)` for the `object_functionstr` try blocks.
-fn object_functionstr_text_w(w_obj: PyObjectRef) -> Result<String, crate::PyError> {
+fn object_functionstr_text_w(w_obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         if pyre_object::is_str(w_obj) {
-            Ok(pyre_object::w_str_get_value(w_obj).to_string())
+            // `text_w` is the surrogate-preserving spelling upstream, and
+            // `w_str_get_value` would panic outright on a `__qualname__`
+            // carrying a lone surrogate rather than return its text.
+            Ok(pyre_object::w_str_get_wtf8(w_obj).to_wtf8_buf())
         } else {
             Err(crate::PyError::type_error(format!(
                 "expected str, got {} object",
@@ -16675,10 +16711,15 @@ unsafe fn property_no_accessor(
         }
     }
     let msg = if !w_name.is_null() {
-        let name_repr = crate::display::py_repr(w_name).unwrap_or_else(|_| "<name>".to_string());
-        format!("property {name_repr} of '{qualname}' object has no {kind}")
+        let name_repr = crate::display::py_repr_wtf8(w_name)
+            .unwrap_or_else(|_| Wtf8Buf::from_string("<name>".to_string()));
+        crate::display::wtf8_format!(
+            "property ",
+            name_repr,
+            format!(" of '{qualname}' object has no {kind}")
+        )
     } else {
-        format!("property of '{qualname}' object has no {kind}")
+        Wtf8Buf::from_string(format!("property of '{qualname}' object has no {kind}"))
     };
     Ok(crate::PyError::attribute_error(msg))
 }
@@ -18004,7 +18045,11 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
                     return match crate::call::call_function_impl_result(finalizer, &[gen_obj]) {
                         Ok(_) => Ok(w_none()),
                         Err(mut err) => {
-                            err.write_unraisable(w_none(), "async generator finalizer", gen_obj);
+                            err.write_unraisable(
+                                w_none(),
+                                Wtf8::new("async generator finalizer"),
+                                gen_obj,
+                            );
                             Ok(w_none())
                         }
                     };
@@ -18265,7 +18310,7 @@ mod tests {
         crate::typedef::init_typeobjects();
         let err = super::isinstance(w_int_new(5), w_int_new(6)).unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::TypeError));
-        assert!(err.message.contains("isinstance() arg 2"));
+        assert!(err.message_text().contains("isinstance() arg 2"));
     }
 
     /// abstractinst.py:108-114 + 53-72 — when one tuple element is not a
@@ -18287,7 +18332,7 @@ mod tests {
         let int_type = crate::typedef::r#type(w_int_new(0)).unwrap().as_ptr();
         let err = super::issubclass(w_int_new(5), int_type).unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::TypeError));
-        assert!(err.message.contains("issubclass() arg 1"));
+        assert!(err.message_text().contains("issubclass() arg 1"));
     }
 
     /// abstractinst.py:150-169 — `issubclass(int, 6)` must raise
@@ -18298,7 +18343,7 @@ mod tests {
         let int_type = crate::typedef::r#type(w_int_new(0)).unwrap().as_ptr();
         let err = super::issubclass(int_type, w_int_new(6)).unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::TypeError));
-        assert!(err.message.contains("issubclass() arg 2"));
+        assert!(err.message_text().contains("issubclass() arg 2"));
     }
 
     /// abstractinst.py:127-147 — `p_abstract_issubclass_w` must walk
@@ -18352,7 +18397,7 @@ mod tests {
         let lst = w_list_new(vec![w_int_new(1)]);
         let err = unpackiterable(lst, 3).expect_err("expected ValueError");
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
-        assert!(err.message.contains("not enough values"));
+        assert!(err.message_text().contains("not enough values"));
     }
 
     /// pypy/interpreter/baseobjspace.py:1043-1046 — `too many values
@@ -18363,7 +18408,7 @@ mod tests {
         let lst = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3), w_int_new(4)]);
         let err = unpackiterable(lst, 3).expect_err("expected ValueError");
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
-        assert!(err.message.contains("too many values"));
+        assert!(err.message_text().contains("too many values"));
     }
 
     /// pypy/interpreter/baseobjspace.py:983-994 — expected_length=-1
@@ -18453,7 +18498,7 @@ mod tests {
     fn object_functionstr_scalar_fallback() {
         crate::typedef::init_typeobjects();
         let s = object_functionstr(w_int_new(42)).expect("scalar fallback never propagates async");
-        assert_eq!(s, "42");
+        assert_eq!(s.as_str(), Ok("42"));
     }
 }
 

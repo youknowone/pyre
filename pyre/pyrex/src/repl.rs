@@ -240,7 +240,7 @@ fn read_prompt(sys_module: pyre_object::PyObjectRef, name: &str) -> Option<Strin
     if prompt.is_null() || unsafe { pyre_object::is_none(prompt) } {
         return None;
     }
-    unsafe { pyre_interpreter::py_str(prompt) }.ok()
+    Some(unsafe { pyre_interpreter::display::py_str_display(prompt) })
 }
 
 /// Register a compiled interactive tree with `linecache._interactive_cache`.

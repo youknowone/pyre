@@ -161,14 +161,16 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
     }
     host_ctypes::lookup_function_symbol_addr(handle, &name_bytes).map_err(|e| {
         use host_ctypes::LookupSymbolError as L;
-        let sym = String::from_utf8_lossy(&name_bytes);
-        match e {
-            L::LibraryNotFound => crate::PyError::value_error("library not found"),
-            L::LibraryClosed => {
-                crate::PyError::attribute_error(format!("function '{sym}' not found"))
-            }
-            L::Load(_) => crate::PyError::attribute_error(format!("function '{sym}' not found")),
+        if matches!(e, L::LibraryNotFound) {
+            return crate::PyError::value_error("library not found");
         }
+        // A symbol name arrives as bytes, so it is decoded the way a name the
+        // host handed us is: `format!` would fold a byte with no UTF-8
+        // spelling to U+FFFD and report a symbol nobody asked for.
+        let mut msg = rustpython_wtf8::Wtf8Buf::from_string("function '".to_string());
+        msg.push_wtf8(&crate::gateway::fsdecode_filename_wtf8(&name_bytes));
+        msg.push_str("' not found");
+        crate::PyError::attribute_error(msg)
     })
 }
 
@@ -388,15 +390,18 @@ fn callback_result(
         Ok(value) => value,
         Err(mut error) => {
             let callable = instance_get(obj, CALLABLE_KEY).unwrap_or(pyre_object::PY_NULL);
+            let unknown = || rustpython_wtf8::Wtf8Buf::from_string("<unknown>".to_string());
             let rendered = if callable.is_null() {
-                "<unknown>".to_string()
+                unknown()
             } else {
-                unsafe { crate::display::py_repr(callable) }
-                    .unwrap_or_else(|_| "<unknown>".to_string())
+                unsafe { crate::display::py_repr_wtf8(callable) }.unwrap_or_else(|_| unknown())
             };
             error.write_unraisable(
                 pyre_object::w_none(),
-                &format!("Exception ignored while calling ctypes callback function {rendered}"),
+                &crate::display::wtf8_format!(
+                    "Exception ignored while calling ctypes callback function ",
+                    rendered
+                ),
                 pyre_object::PY_NULL,
             );
             pyre_object::w_int_new(0)

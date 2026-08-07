@@ -2330,7 +2330,12 @@ impl UserDelAction {
                 return;
             }
             if let Err(error) = crate::baseobjspace::generator_finalize(current()) {
-                report_error(self.base.space, &error, "", current());
+                report_error(
+                    self.base.space,
+                    &error,
+                    rustpython_wtf8::Wtf8::new(""),
+                    current(),
+                );
             }
             return;
         }
@@ -2356,7 +2361,12 @@ impl UserDelAction {
         if let Err(error) = unsafe {
             crate::baseobjspace::get_and_call_function(del(), current(), w_type.as_ptr(), &[])
         } {
-            report_error(self.base.space, &error, "", del());
+            report_error(
+                self.base.space,
+                &error,
+                rustpython_wtf8::Wtf8::new(""),
+                del(),
+            );
         }
     }
 }
@@ -2386,7 +2396,7 @@ impl AsyncActionOps for UserDelAction {
 pub fn report_error(
     space: PyObjectRef,
     error: &crate::PyError,
-    where_desc: &str,
+    where_desc: &rustpython_wtf8::Wtf8,
     w_obj: PyObjectRef,
 ) {
     let mut error = error.clone();

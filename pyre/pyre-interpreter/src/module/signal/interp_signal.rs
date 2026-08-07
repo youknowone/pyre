@@ -72,7 +72,7 @@ fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
     ];
     let exc = crate::builtins::exc_os_error_new(&args)
         .expect("exc_os_error_new is infallible for int/str args");
-    let mut err = crate::PyError::os_error(&strerror);
+    let mut err = crate::PyError::os_error(strerror);
     err.exc_object = exc;
     err
 }
