@@ -5669,10 +5669,11 @@ fn register_quasi_immutable_deps(_green_key: u64) {
         pyre_jit_trace::descr::plain_attribute_ever_mutated_descr().index();
     let holder_attr = pyre_jit_trace::descr::holder_attr_descr().index();
     let holder_typ = pyre_jit_trace::descr::holder_typ_descr().index();
+    let audit_holder_hooks = pyre_jit_trace::descr::audit_holder_hooks_descr().index();
     // Hoisted because each accessor clones a `LazyLock` descr; the index also
     // decides which type `dep_ptr` is cast to, so the chain below ends in a
     // fail-loud default rather than reinterpreting a headerless map node as a
-    // `W_TypeObject`.  These six are every quasi-immutable descr this binary
+    // `W_TypeObject`.  These seven are every quasi-immutable descr this binary
     // mints — see the same reasoning on `state.rs install_quasiimmut_field`.
     for (dep_ptr, field_index) in deps {
         unsafe {
@@ -5703,6 +5704,11 @@ fn register_quasi_immutable_deps(_green_key: u64) {
                 );
             } else if field_index == holder_typ {
                 pyre_interpreter::objspace::std::mapdict::holder_register_typ_watcher(
+                    dep_ptr as *const _,
+                    &flag,
+                );
+            } else if field_index == audit_holder_hooks {
+                pyre_interpreter::module::sys::vm::audit_holder_register_hooks_watcher(
                     dep_ptr as *const _,
                     &flag,
                 );

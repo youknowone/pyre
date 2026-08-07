@@ -4562,8 +4562,8 @@ fn install_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
     // The index decides which type `struct_ptr` is cast to, so an unrecognised
     // one must fail loudly rather than reinterpret a headerless map-node
     // allocation as a `W_TypeObject`.  Dropping the old implicit `W_TypeObject`
-    // fallback is safe: the six arms below are every quasi-immutable descr this
-    // binary can mint.  The two `opimpl_getfield_gc_*` callers gate on
+    // fallback is safe: the seven arms below are every quasi-immutable descr
+    // this binary can mint.  The two `opimpl_getfield_gc_*` callers gate on
     // `descr.is_quasi_immutable()` and see only analyzer-derived descrs, whose
     // rank comes from a `#[jit_immutable_fields]` entry carrying the
     // `_immutable_fields_` `?` suffix — no declaration in the tree has one.
@@ -4592,6 +4592,10 @@ fn install_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
             );
         } else if index == crate::descr::holder_typ_descr().index() {
             pyre_interpreter::objspace::std::mapdict::holder_install_typ_watcher(
+                struct_ptr as *const _,
+            );
+        } else if index == crate::descr::audit_holder_hooks_descr().index() {
+            pyre_interpreter::module::sys::vm::audit_holder_install_hooks_watcher(
                 struct_ptr as *const _,
             );
         } else {

@@ -8113,6 +8113,35 @@ fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
+/// Pin `vm.py:439 AuditHolder._immutable_fields_ = ['hooks_w?[:]']`, the read
+/// `vm.py:481`'s `holder.hooks_w is None` early-out makes before `audit`
+/// returns without calling anything.
+///
+/// A fold that elides an audit event has to depend on that read, or a later
+/// `addaudithook` would silently stop being able to observe the event.  On a
+/// quasi-immutable field the dependency costs a marker plus one
+/// `GUARD_NOT_INVALIDATED` per trace, and `addaudithook` revokes the loop.
+///
+/// The caller passes the holder it has already resolved: there is none before
+/// `sys` is registered, and a fold that cannot pin this field must decline
+/// rather than elide an event nothing watches.
+fn walker_pin_audit_hooks<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    holder: *const pyre_interpreter::module::sys::vm::AuditHolder,
+) -> Result<(), DispatchError> {
+    if holder.is_null() {
+        return Ok(());
+    }
+    let owner = ctx.trace_ctx.const_ref(holder as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::audit_holder_hooks_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
 fn walker_pin_holder_attr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

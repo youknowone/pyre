@@ -670,6 +670,12 @@ pub fn getframe(depth: i64) -> crate::PyResult {
     }
     unsafe { (*current).mark_as_escaped() };
     crate::executioncontext::force_frame(current);
+    // `vm.py:51 audit(space, "sys._getframe", [f])`.  Ordered after the force
+    // because a hook is app code that reads the frame it is handed, and the
+    // force is what makes those reads see the JIT's live virtualizable fields —
+    // upstream gets that ordering from the `hook_access_field` injection at
+    // each field read, which pyre has relocated to this one call site.
+    audit("sys._getframe", &[current as PyObjectRef])?;
     Ok(current as PyObjectRef)
 }
 
@@ -2441,6 +2447,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "addaudithook",
         make_builtin_function_with_arity("addaudithook", sys_addaudithook, 1),
     );
+    // `space.fromcache(AuditHolder)` — see [`audit_holder`] for why the holder
+    // is built here rather than on the first `addaudithook`.
+    audit_holder();
 }
 
 /// `pypy/module/sys/vm.py:438 AuditHolder`, which upstream reaches through
@@ -2450,11 +2459,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 /// a process-global — the shape `_codecs`' `CodecState` already uses for a
 /// registry that belongs to the interpreter rather than to one mutator.  Its
 /// Python objects are handed to the collector by [`walk_audit_hooks_gc`].
-struct AuditHolder {
-    /// `_immutable_fields_ = ['hooks_w?[:]']`.  A null [`AUDIT_HOOKS`] is
-    /// upstream's `hooks_w is None`, and that null test is the whole reason
-    /// [`audit`] can be called unconditionally from a hot caller.
-    ///
+pub struct AuditHolder {
+    /// `vm.py:442 self.hooks_w = None` projected onto a byte at a fixed offset:
+    /// false while upstream's list is None, which is exactly the `vm.py:481`
+    /// early-out.  The projection exists because the JIT reads this field
+    /// through a descriptor, and `Box<[T]>` has no target-stable null spelling
+    /// — a wasm32 fat pointer is two 4-byte halves, not one 8-byte word.
+    pub hooks_armed: std::cell::Cell<bool>,
+    /// The hidden watcher field implementing `vm.py:439 _immutable_fields_ =
+    /// ['hooks_w?[:]']`.  The owner is a `Box::into_raw` leak that is never
+    /// freed, so [`pyre_object::quasiimmut::QuasiImmutField`]'s `Drop` is
+    /// unreachable and its inner box is reclaimed only through `invalidate`.
+    pub hooks_watchers: pyre_object::quasiimmut::QuasiImmutField,
     /// A boxed slice rather than a `Vec` because `vm.py:502
     /// debug.make_sure_not_resized` is the other half of that declaration:
     /// [`sys_addaudithook`] replaces the list, never grows it in place.
@@ -2463,6 +2479,71 @@ struct AuditHolder {
 
 static AUDIT_HOOKS: std::sync::atomic::AtomicPtr<AuditHolder> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// `space.fromcache(AuditHolder)`.
+///
+/// Created eagerly, from [`register_module`], rather than on the first
+/// `addaudithook`: a trace recorded while no hook exists pins `hooks_w?` on
+/// this object, so the object has to exist before it does.  `fromcache` gives
+/// upstream the same guarantee for free.
+fn audit_holder() -> *mut AuditHolder {
+    loop {
+        let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
+        if !holder.is_null() {
+            return holder;
+        }
+        let created = Box::into_raw(Box::new(AuditHolder {
+            hooks_armed: std::cell::Cell::new(false),
+            hooks_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
+            hooks_w: Box::new([]),
+        }));
+        if AUDIT_HOOKS
+            .compare_exchange(
+                std::ptr::null_mut(),
+                created,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return created;
+        }
+        // Another thread published one first; drop ours and take theirs.
+        drop(unsafe { Box::from_raw(created) });
+    }
+}
+
+/// The holder a `QUASIIMMUT_FIELD` on `hooks_w?` hangs off, or null before
+/// `sys` is registered — the compiler declines the fold rather than pinning a
+/// field on nothing.
+pub fn audit_holder_ptr() -> *const AuditHolder {
+    AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Register a loop against the holder's `hooks_w?` field.
+///
+/// # Safety
+/// `holder` must be null or a live [`AuditHolder`].
+pub unsafe fn audit_holder_register_hooks_watcher(
+    holder: *const AuditHolder,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).hooks_watchers.register_loop_token(flag) };
+}
+
+/// Install the holder's `hooks_w?` watcher without registering a loop.
+///
+/// # Safety
+/// `holder` must be null or a live [`AuditHolder`].
+pub unsafe fn audit_holder_install_hooks_watcher(holder: *const AuditHolder) {
+    if holder.is_null() {
+        return;
+    }
+    unsafe { (*holder).hooks_watchers.ensure_installed() };
+}
 
 /// Forward the installed hooks.  Upstream reaches them through the space's
 /// object graph; pyre holds them off-heap, so the collector has to be handed
@@ -2486,6 +2567,11 @@ fn trigger_audit_events(
 ) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_event);
+    // Before the tuple is built, not after: its allocation can collect, and the
+    // caller's arguments are reachable only through the borrowed slice.
+    for &w_arg in args_w {
+        pyre_object::gc_roots::pin_root(w_arg);
+    }
     let w_args = pyre_object::tupleobject::w_tuple_new(args_w.to_vec());
     pyre_object::gc_roots::pin_root(w_args);
     // A hook may install another hook, and upstream's list is replaced rather
@@ -2539,10 +2625,10 @@ pub fn audit_w(
     w_event: pyre_object::PyObjectRef,
     args_w: &[pyre_object::PyObjectRef],
 ) -> Result<(), crate::PyError> {
-    let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
-    if holder.is_null() {
+    if !audit_hooks_armed() {
         return Ok(());
     }
+    let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
     trigger_audit_events(unsafe { &*holder }, w_event, args_w)
 }
 
@@ -2550,22 +2636,18 @@ pub fn audit_w(
 /// emitters.  Free when no hook is installed, which is what lets a caller on a
 /// hot path emit unconditionally.
 pub fn audit(event: &str, args_w: &[pyre_object::PyObjectRef]) -> Result<(), crate::PyError> {
-    if AUDIT_HOOKS
-        .load(std::sync::atomic::Ordering::Acquire)
-        .is_null()
-    {
+    if !audit_hooks_armed() {
         return Ok(());
     }
     audit_w(w_str_new(event), args_w)
 }
 
-/// Whether any hook is installed.  A JIT fold that answers a call without
-/// running the body it would have traced through needs this to decide whether
-/// the event it is eliding could be observed.
+/// `vm.py:481 holder.hooks_w is None`, negated.  A JIT fold that answers a call
+/// without running the body it would have traced through needs this to decide
+/// whether the event it is eliding could be observed.
 pub fn audit_hooks_armed() -> bool {
-    !AUDIT_HOOKS
-        .load(std::sync::atomic::Ordering::Acquire)
-        .is_null()
+    let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
+    !holder.is_null() && unsafe { (*holder).hooks_armed.get() }
 }
 
 fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
@@ -2601,39 +2683,26 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_hook);
-    loop {
-        let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
-        if !holder.is_null() {
-            // `holder.hooks_w = holder.hooks_w + [w_hook]` — a fresh list, so a
-            // `trigger_audit_events` already iterating the old one keeps the set
-            // it started with.
-            let old = unsafe { &(*holder).hooks_w };
-            let mut next = Vec::with_capacity(old.len() + 1);
-            next.extend_from_slice(old);
-            next.push(w_hook);
-            unsafe { (*holder).hooks_w = next.into_boxed_slice() };
-            return Ok(w_none());
+    let holder = audit_holder();
+    unsafe {
+        // `holder.hooks_w = holder.hooks_w + [w_hook]` — a fresh list, so a
+        // `trigger_audit_events` already iterating the old one keeps the set it
+        // started with.
+        let old = &(*holder).hooks_w;
+        let mut next = Vec::with_capacity(old.len() + 1);
+        next.extend_from_slice(old);
+        next.push(w_hook);
+        // Notification precedes the store, as `rclass.py:1010-1012
+        // hook_setfield` emits `jit_force_quasi_immutable` before `setfield`.
+        // The `is_installed()` fast path is `quasiimmut.py:38-41 invalidation`'s
+        // null test, so an unwatched install stays lock-free.
+        if (*holder).hooks_watchers.is_installed() {
+            pyre_object::quasiimmut::sweep_quasi_immut_field(&(*holder).hooks_watchers);
         }
-        // `holder.hooks_w = [w_hook]`.  Filled before it is published:
-        // `walk_audit_hooks_gc` reads the slot without a lock, so it must never
-        // observe a holder whose list is still being built.
-        let created = Box::into_raw(Box::new(AuditHolder {
-            hooks_w: Box::new([w_hook]),
-        }));
-        if AUDIT_HOOKS
-            .compare_exchange(
-                std::ptr::null_mut(),
-                created,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            return Ok(w_none());
-        }
-        // Another thread published one first; retry against it.
-        drop(unsafe { Box::from_raw(created) });
+        (*holder).hooks_w = next.into_boxed_slice();
+        (*holder).hooks_armed.set(true);
     }
+    Ok(w_none())
 }
 
 /// `e.match(space, space.w_RuntimeError)` for a `PyError` that may carry either

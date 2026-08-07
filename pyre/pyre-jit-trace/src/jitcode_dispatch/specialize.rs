@@ -7775,6 +7775,17 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     if ctx.fbw_mode.inline_subwalk || current_inline_concrete_frame() != 0 {
         return Ok(None);
     }
+    // `vm.py:51 audit(space, "sys._getframe", [f])`.  With no hook installed
+    // `audit` takes its `holder.hooks_w is None` early-out (`vm.py:481`) and the
+    // event costs nothing; the emission below pins that read so a later
+    // `addaudithook` revokes this loop instead of silently missing the event.
+    // With a hook already installed the event reaches `trigger_audit_events`,
+    // which is `@objectmodel.dont_inline` — a residual call this arm has no
+    // channel for — so it declines and the generic residual `getframe` emits.
+    let audit_holder = pyre_interpreter::module::sys::vm::audit_holder_ptr();
+    if audit_holder.is_null() || pyre_interpreter::module::sys::vm::audit_hooks_armed() {
+        return Ok(None);
+    }
     let (Some(vable_op), Some(vable_ptr)) = (
         ctx.trace_ctx.standard_virtualizable_box(),
         ctx.trace_ctx.standard_virtualizable_ptr(),
@@ -7889,6 +7900,11 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // The walk IS the interpreter running, so the recorded store has to take
     // effect here too — the residual would have applied it before returning.
     unsafe { (*frame).mark_as_escaped() };
+
+    // `audit(space, "sys._getframe", [f])` — vm.py:51.  The gate above resolved
+    // it to the no-hook early-out, so all that is emitted is the marker for the
+    // read that reached that conclusion.
+    walker_pin_audit_hooks(ctx, op.pc, audit_holder)?;
 
     // `return f` — `_do_jit_force_virtual` hands back `standard_box` itself.
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', vable_op)?;
