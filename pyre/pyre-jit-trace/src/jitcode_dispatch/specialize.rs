@@ -3288,6 +3288,16 @@ pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
     else {
         return Ok(None);
     };
+    // The metaclass guard below reads the raw `w_class` slot, while the fast
+    // path answers through `typedef::type`, which falls back to
+    // `gettypefor(ob_type)` when that slot is null.  A receiver reached through
+    // that fallback would be guarded against a value its field never holds, and
+    // nothing writes the slot afterwards, so the guard would fail on every
+    // execution forever — one bridge per `trace_eagerness` bucket, without ever
+    // converging.  Fold only what the guard can discharge.
+    if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, metatype) {
+        return Ok(None);
+    }
 
     // guard_class(obj, ob_type): the `W_TypeObject` layout both field reads
     // below index into.  `is_type` is this check.
