@@ -64,6 +64,13 @@ const X86_FLOAT_REGS: [crate::regloc::RegLoc; 8] = [
     crate::regloc::RegLoc::new(7, true),
 ];
 
+/// A LABEL publishes an in-buffer offset and only becomes an absolute address
+/// in `fixup_target_tokens`; 0 means its target was never compiled.  The first
+/// page is never mapped, so any value below it is one of those two and can only
+/// be a wild branch.  Dynasm bakes the immediate at codegen, so it cannot be
+/// repaired later.
+const MIN_RELOCATED_JUMP_TARGET: usize = 4096;
+
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
 enum ResolvedArg {
     /// Frame-pointer-relative byte offset: [rbp + offset] on x64, [x29, #offset] on aarch64.
@@ -800,6 +807,9 @@ pub struct Assembler386<'a> {
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
     target_tokens_currently_compiling: IndexMap<usize, DynamicLabel>,
     compiled_target_tokens: Vec<majit_ir::DescrRef>,
+    /// First cross-buffer JUMP whose target still points into an assembler
+    /// buffer instead of executable memory.
+    unrelocated_jump_target: Option<(usize, usize)>,
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
     vtable_offset: Option<usize>,
@@ -1024,6 +1034,7 @@ impl<'a> Assembler386<'a> {
             guard_success_cc: None,
             target_tokens_currently_compiling: IndexMap::new(),
             compiled_target_tokens: Vec::new(),
+            unrelocated_jump_target: None,
             vtable_offset,
             classptr_to_typeid,
             guard_gc_type_info,
@@ -2504,6 +2515,49 @@ impl<'a> Assembler386<'a> {
         gcmap
     }
 
+    /// `x86/assembler.py:990 fixup_target_tokens`.
+    /// A LABEL assembled inside a bridge is a jump target for later traces exactly like a loop's.
+    fn fixup_target_tokens(tokens: Vec<majit_ir::DescrRef>, frame_depth: usize, rawstart: usize) {
+        for descr in tokens {
+            if let Some(loop_descr) = descr.as_loop_target_descr() {
+                // assembler.py:1003-1008 reads the target loop's
+                // `frame_info.jfi_frame_depth` at a cross-loop JUMP; publish
+                // this loop's full frame depth so a later trace's JUMP can
+                // size its frame for this target.  Carries the depth grown by
+                // `_assemble` for this loop's own onward JUMP.
+                //
+                // Store the companion `target_frame_depth` BEFORE the
+                // `ll_loop_code` gate (both Release stores): a reader
+                // Acquire-loads `ll_loop_code` and only reads
+                // `target_frame_depth` once the gate is non-zero, so the depth
+                // must become visible first — otherwise the reader pairs the
+                // new code pointer with a stale 0 depth and bypasses the
+                // frame-capacity check (descr.rs set_dispatch_target ordering
+                // contract).  Dynasm ignores `label_block_id` (descr.rs:1236 —
+                // it bakes the LABEL address straight into `ll_loop_code`), so
+                // that companion is not published here.
+                let old = loop_descr.ll_loop_code();
+                let new = old + rawstart;
+                loop_descr.set_target_frame_depth(frame_depth);
+                loop_descr.set_ll_loop_code(new);
+                if majit_ir::debug::have_debug_prints() {
+                    majit_ir::debug::debug_print(&format!(
+                        "[dynasm] fixup_target_tokens: ll_loop_code {old} -> {new:#x}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn check_unrelocated_jump_target(&self) -> Result<(), BackendError> {
+        let Some((target, descr)) = self.unrelocated_jump_target else {
+            return Ok(());
+        };
+        Err(BackendError::CompilationFailed(format!(
+            "cross-buffer JUMP target {target:#x} for descr {descr:#x} is not a relocated executable address"
+        )))
+    }
+
     // ----------------------------------------------------------------
     // assembler.py:501 assemble_loop
     // ----------------------------------------------------------------
@@ -2525,6 +2579,7 @@ impl<'a> Assembler386<'a> {
         self.self_entry_label = Some(entry_label);
         let entry = self.mc.offset();
         self._assemble(true)?;
+        self.check_unrelocated_jump_target()?;
 
         // regalloc sets fail_arg_locs in append_guard_token_with_faillocs.
         // No allocate_unmapped_fail_arg_slots needed.
@@ -2533,6 +2588,8 @@ impl<'a> Assembler386<'a> {
         let stub_offsets = self.write_pending_failure_recoveries();
 
         // assembler.py:556 materialize_loop — finalize to executable memory
+        let tokens = std::mem::take(&mut self.compiled_target_tokens);
+        let frame_depth = self.frame_depth;
         let buffer = self
             .mc
             .finalize()
@@ -2553,28 +2610,7 @@ impl<'a> Assembler386<'a> {
         // trampoline. The JIT code loads from this pointer at runtime.
         unsafe { *self.self_entry_addr_ptr = rawstart + entry.0 };
 
-        for descr in &self.compiled_target_tokens {
-            if let Some(loop_descr) = descr.as_loop_target_descr() {
-                // assembler.py:1003-1008 reads the target loop's
-                // `frame_info.jfi_frame_depth` at a cross-loop JUMP; publish
-                // this loop's full frame depth so a later trace's JUMP can
-                // size its frame for this target.  Carries the depth grown by
-                // `_assemble` for this loop's own onward JUMP.
-                //
-                // Store the companion `target_frame_depth` BEFORE the
-                // `ll_loop_code` gate (both Release stores): a reader
-                // Acquire-loads `ll_loop_code` and only reads
-                // `target_frame_depth` once the gate is non-zero, so the depth
-                // must become visible first — otherwise the reader pairs the
-                // new code pointer with a stale 0 depth and bypasses the
-                // frame-capacity check (descr.rs set_dispatch_target ordering
-                // contract).  Dynasm ignores `label_block_id` (descr.rs:1236 —
-                // it bakes the LABEL address straight into `ll_loop_code`), so
-                // that companion is not published here.
-                loop_descr.set_target_frame_depth(self.frame_depth);
-                loop_descr.set_ll_loop_code(loop_descr.ll_loop_code() + rawstart);
-            }
-        }
+        Self::fixup_target_tokens(tokens, frame_depth, rawstart);
 
         // Position is the canonical fail_index identity (matching
         // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
@@ -2684,8 +2720,11 @@ impl<'a> Assembler386<'a> {
         // assembler.py:641 prepare_bridge
         let entry = self.mc.offset();
         self._assemble(false)?;
+        self.check_unrelocated_jump_target()?;
         let stub_offsets = self.write_pending_failure_recoveries();
 
+        let tokens = std::mem::take(&mut self.compiled_target_tokens);
+        let frame_depth = self.frame_depth;
         let buffer = self
             .mc
             .finalize()
@@ -2700,6 +2739,7 @@ impl<'a> Assembler386<'a> {
         // patch rewrites the placeholder `0xffffff` immediate(s) so the
         // CMP at bridge entry reflects the bridge's true requirement.
         Self::patch_stack_checks(self.frame_depth, rawstart, &self.frame_depth_to_patch);
+        Self::fixup_target_tokens(tokens, frame_depth, rawstart);
 
         if crate::majit_dump_enabled() {
             let code = unsafe { std::slice::from_raw_parts(rawstart as *const u8, buffer.len()) };
@@ -2754,6 +2794,7 @@ impl<'a> Assembler386<'a> {
     fn _assemble(&mut self, emit_prologue: bool) -> Result<(), BackendError> {
         let inputargs: &'a [InputArg] = self.inputargs;
         let ops: &'a [Op] = self.operations;
+        self.unrelocated_jump_target = None;
         if emit_prologue {
             self._call_header(inputargs);
         } else {
@@ -4126,7 +4167,8 @@ impl<'a> Assembler386<'a> {
                     .and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
                 {
                     dynasm!(self.mc ; .arch x64 ; jmp =>label);
-                } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
+                } else if let (Some(descr_ref), Some(descr)) = (descr_arc.as_ref(), jump_descr) {
+                    let target = descr.ll_loop_code();
                     // External JUMP: direct JMP to target loop code.
                     // assembler.py:2461 mc.JMP(imm(target)) — PyPy's
                     // `LocationCodeBuilder._addr_as_reg_offset` (regloc.py:204)
@@ -4141,16 +4183,19 @@ impl<'a> Assembler386<'a> {
                     // expecting a class pointer.
                     // assembler.py:1003-1008 `_assemble`: record the target
                     // loop's frame depth so this trace's frame grows to fit it.
-                    if let Some(descr) = jump_descr {
+                    if target < MIN_RELOCATED_JUMP_TARGET {
+                        self.unrelocated_jump_target =
+                            Some((target, majit_ir::descr_identity(descr_ref)));
+                    } else {
                         self.jump_target_frame_depth =
                             self.jump_target_frame_depth.max(descr.target_frame_depth());
+                        let addr = target as i64;
+                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                        dynasm!(self.mc ; .arch x64
+                            ; mov Rq(scratch), QWORD addr
+                            ; jmp Rq(scratch)
+                        );
                     }
-                    let addr = target as i64;
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    dynasm!(self.mc ; .arch x64
-                        ; mov Rq(scratch), QWORD addr
-                        ; jmp Rq(scratch)
-                    );
                 }
             }
             OpCode::Finish => {
