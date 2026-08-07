@@ -4148,9 +4148,11 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// FBW virtualization of the array-backed BUILD_TUPLE, at arity 1 and 3 up.
-/// Sibling of [`try_walker_specialize_newlist`] and
-/// [`try_walker_specialize_newtuple`], which takes the arity-2 plain-int shape.
+/// FBW virtualization of the array-backed BUILD_TUPLE — the arities
+/// `makespecialisedtuple2` does not claim.  Sibling of
+/// [`try_walker_specialize_newtuple`] (arity-2 plain-int `spec_ii`) and
+/// [`try_walker_specialize_newlist`], reached only after the `spec_ii` fold
+/// declines, so that path stays byte-identical.
 ///
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear` +
 /// per-index `setarrayitem_gc` + a `newtuple_from_array` residual.  Re-emit the
@@ -4161,16 +4163,19 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 /// and one that does escape materializes from the same fields the residual
 /// would have written.
 ///
-/// Arity 2 is declined: `makespecialisedtuple2`
-/// (`specialisedtupleobject.py:169-179`) is what the runtime calls there, so a
-/// canonical virtual would be the one shape the interpreter never builds.  The
-/// trace alone stays self-consistent, but a side exit hands a real `Cls_ii` /
-/// `Cls_ff` / `Cls_oo` — inline `value0` / `value1`, no `wrappeditems` block —
-/// to a consumer the trace picked for the canonical layout, and
+/// Arity 2 is `makespecialisedtuple2` territory (`Cls_ii` / `Cls_ff` /
+/// `Cls_oo`, `specialisedtupleobject.py`): the runtime never builds an
+/// array-backed tuple there, so emitting one would diverge from what the
+/// blackhole rebuilds on deopt.  Declined here — the `spec_ii` fold owns the
+/// int-int case and the residual owns the rest.  The empty tuple is declined
+/// too (no element to recover a length from).
+///
+/// Lifting that decline is not a trace-local question: the trace stays
+/// self-consistent, but a side exit hands a real pair — inline `value0` /
+/// `value1`, no `wrappeditems` block — to whatever consumer the trace picked
+/// for the canonical layout, and
 /// [`try_walker_specialize_subscr_specialised_pair`] then reads a field that is
-/// not there.  [`try_walker_specialize_newtuple`] takes the pair shapes it can
-/// build faithfully.  The empty tuple is declined too (no element to recover a
-/// length from).
+/// not there.
 ///
 /// Returns `Ok(Some(()))` when folded; `Ok(None)` falls through to the opaque
 /// residual, which stays correct for any shape — a non-const array length or
@@ -4226,9 +4231,8 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
         concretes.push(obj);
     }
 
-    // Concrete shadow: a fresh array-backed tuple from the element shadows,
-    // built by the same constructor the emit reproduces so the walk's own value
-    // and the traced object agree at every arity.  A new allocation with no
+    // Concrete shadow: a fresh array-backed tuple from the element shadows
+    // (`w_tuple_new` parity for every arity but 2). A new allocation with no
     // heap mutation, safe during the walk like `wrapint`.  Built before the
     // emit so a failure leaves no orphan ops in the trace.
     let result_concrete = pyre_object::w_tuple_new_array_backed(concretes);
@@ -4256,12 +4260,6 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
 /// build keeps no consumer and DCEs.  The partner
 /// [`try_walker_specialize_unpack`] then folds the `value0` / `value1`
 /// reads off the virtual tuple, collapsing build→unpack to a pure-int loop.
-///
-/// Runs only after [`try_walker_specialize_newtuple_object`] declines, which it
-/// does for a pair whose backing-array length never reached the heap-cache as a
-/// constant; the element probing below recovers the arity without it.  UNPACK
-/// is the one consumer that folds off this shape, so the canonical arm is the
-/// preferred one wherever it applies.
 ///
 /// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
 /// `Ok(None)` to fall through to the opaque residual, which stays correct
