@@ -2370,11 +2370,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // sys.audit — no-op
+    // `vm.py:473 audit` — `@unwrap_spec(event="text")`, so the event name is
+    // required and must be a str; everything after it is the argument tuple.
     module_ns_store(
         ns,
         "audit",
-        crate::make_builtin_function("audit", |_| Ok(w_none())),
+        crate::make_builtin_function("audit", sys_audit),
     );
     // sys._clear_type_descriptors(cls) — remove the descriptors owned by the
     // original class before `dataclasses._add_slots` copies its namespace into
@@ -2434,12 +2435,223 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `importlib._bootstrap_external.cache_from_source` reads it to compute the
     // bytecode path before `dont_write_bytecode` is consulted.
     module_ns_store(ns, "pycache_prefix", w_none());
-    // sys.addaudithook
+    // `vm.py:485 addaudithook`
     module_ns_store(
         ns,
         "addaudithook",
-        make_builtin_function_with_arity("addaudithook", |_| Ok(w_none()), 1),
+        make_builtin_function_with_arity("addaudithook", sys_addaudithook, 1),
     );
+}
+
+/// `pypy/module/sys/vm.py:438 AuditHolder`, which upstream reaches through
+/// `space.fromcache(AuditHolder)`.
+///
+/// pyre has no space object graph to hang a cache object off, so the holder is
+/// a process-global — the shape `_codecs`' `CodecState` already uses for a
+/// registry that belongs to the interpreter rather than to one mutator.  Its
+/// Python objects are handed to the collector by [`walk_audit_hooks_gc`].
+struct AuditHolder {
+    /// `_immutable_fields_ = ['hooks_w?[:]']`.  A null [`AUDIT_HOOKS`] is
+    /// upstream's `hooks_w is None`, and that null test is the whole reason
+    /// [`audit`] can be called unconditionally from a hot caller.
+    ///
+    /// A boxed slice rather than a `Vec` because `vm.py:502
+    /// debug.make_sure_not_resized` is the other half of that declaration:
+    /// [`sys_addaudithook`] replaces the list, never grows it in place.
+    hooks_w: Box<[pyre_object::PyObjectRef]>,
+}
+
+static AUDIT_HOOKS: std::sync::atomic::AtomicPtr<AuditHolder> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Forward the installed hooks.  Upstream reaches them through the space's
+/// object graph; pyre holds them off-heap, so the collector has to be handed
+/// them — and unconditionally, not behind the prebuilt-roots bit: a hook is
+/// installed by running app code, so its callable is young when it lands.
+pub(crate) fn walk_audit_hooks_gc(visitor: &mut dyn FnMut(&mut pyre_object::PyObjectRef)) {
+    let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
+    if holder.is_null() {
+        return;
+    }
+    for slot in unsafe { (*holder).hooks_w.iter_mut() } {
+        visitor(slot);
+    }
+}
+
+/// `vm.py:447 AuditHolder.trigger_audit_events`.
+fn trigger_audit_events(
+    holder: &AuditHolder,
+    w_event: pyre_object::PyObjectRef,
+    args_w: &[pyre_object::PyObjectRef],
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_event);
+    let w_args = pyre_object::tupleobject::w_tuple_new(args_w.to_vec());
+    pyre_object::gc_roots::pin_root(w_args);
+    // A hook may install another hook, and upstream's list is replaced rather
+    // than appended to, so an in-flight trigger keeps iterating the set it
+    // started with.  Snapshotting into pinned roots reproduces that and keeps
+    // every callable forwarded across the calls below.
+    let hooks_w = holder.hooks_w.clone();
+    for &w_hook in &hooks_w {
+        pyre_object::gc_roots::pin_root(w_hook);
+    }
+
+    let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
+    // don't trace audithooks by default
+    if !ec.is_null() {
+        unsafe { (*ec).is_tracing += 1 };
+    }
+    let mut result = Ok(());
+    for &w_hook in &hooks_w {
+        let cantrace = match crate::baseobjspace::findattr(w_hook, "__cantrace__") {
+            None => false,
+            Some(w_cantrace) => match crate::baseobjspace::is_true(w_cantrace) {
+                Ok(cantrace) => cantrace,
+                Err(err) => {
+                    result = Err(err);
+                    break;
+                }
+            },
+        };
+        if cantrace && !ec.is_null() {
+            unsafe { (*ec).is_tracing -= 1 };
+        }
+        let w_result = crate::baseobjspace::call_function(w_hook, &[w_event, w_args]);
+        if cantrace && !ec.is_null() {
+            unsafe { (*ec).is_tracing += 1 };
+        }
+        if w_result.is_null() {
+            result = Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::runtime_error("audit hook call failed")));
+            break;
+        }
+    }
+    if !ec.is_null() {
+        unsafe { (*ec).is_tracing -= 1 };
+    }
+    result
+}
+
+/// `vm.py:474 audit` with the event already wrapped, for callers that hold a
+/// `str` object rather than a Rust `&str`.
+pub fn audit_w(
+    w_event: pyre_object::PyObjectRef,
+    args_w: &[pyre_object::PyObjectRef],
+) -> Result<(), crate::PyError> {
+    let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
+    if holder.is_null() {
+        return Ok(());
+    }
+    trigger_audit_events(unsafe { &*holder }, w_event, args_w)
+}
+
+/// `vm.py:474 audit` — `space.audit(event, args_w)` for interpreter-level
+/// emitters.  Free when no hook is installed, which is what lets a caller on a
+/// hot path emit unconditionally.
+pub fn audit(event: &str, args_w: &[pyre_object::PyObjectRef]) -> Result<(), crate::PyError> {
+    if AUDIT_HOOKS
+        .load(std::sync::atomic::Ordering::Acquire)
+        .is_null()
+    {
+        return Ok(());
+    }
+    audit_w(w_str_new(event), args_w)
+}
+
+/// Whether any hook is installed.  A JIT fold that answers a call without
+/// running the body it would have traced through needs this to decide whether
+/// the event it is eliding could be observed.
+pub fn audit_hooks_armed() -> bool {
+    !AUDIT_HOOKS
+        .load(std::sync::atomic::Ordering::Acquire)
+        .is_null()
+}
+
+fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let Some(&w_event) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "audit() missing 1 required positional argument: 'event'",
+        ));
+    };
+    // `@unwrap_spec(event="text")`
+    if !unsafe { pyre_object::is_str(w_event) } {
+        return Err(crate::PyError::type_error(
+            "audit() argument 1 must be str, not other",
+        ));
+    }
+    audit_w(w_event, &args[1..])?;
+    Ok(w_none())
+}
+
+/// `vm.py:485 addaudithook`.  The hooks already installed get a say: a
+/// `RuntimeError` out of the `sys.addaudithook` event means the set refused the
+/// new hook, and it is dropped rather than added.  Anything else propagates.
+fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let Some(&w_hook) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "addaudithook() missing 1 required positional argument",
+        ));
+    };
+    if let Err(err) = audit("sys.addaudithook", &[]) {
+        if !error_is_runtime_error(&err) {
+            return Err(err);
+        }
+        return Ok(w_none());
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_hook);
+    loop {
+        let holder = AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire);
+        if !holder.is_null() {
+            // `holder.hooks_w = holder.hooks_w + [w_hook]` — a fresh list, so a
+            // `trigger_audit_events` already iterating the old one keeps the set
+            // it started with.
+            let old = unsafe { &(*holder).hooks_w };
+            let mut next = Vec::with_capacity(old.len() + 1);
+            next.extend_from_slice(old);
+            next.push(w_hook);
+            unsafe { (*holder).hooks_w = next.into_boxed_slice() };
+            return Ok(w_none());
+        }
+        // `holder.hooks_w = [w_hook]`.  Filled before it is published:
+        // `walk_audit_hooks_gc` reads the slot without a lock, so it must never
+        // observe a holder whose list is still being built.
+        let created = Box::into_raw(Box::new(AuditHolder {
+            hooks_w: Box::new([w_hook]),
+        }));
+        if AUDIT_HOOKS
+            .compare_exchange(
+                std::ptr::null_mut(),
+                created,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Ok(w_none());
+        }
+        // Another thread published one first; retry against it.
+        drop(unsafe { Box::from_raw(created) });
+    }
+}
+
+/// `e.match(space, space.w_RuntimeError)` for a `PyError` that may carry either
+/// an interpreter-level kind or a materialised exception object.
+fn error_is_runtime_error(err: &crate::PyError) -> bool {
+    // A hook may raise a RuntimeError SUBCLASS, so the interpreter-level kind
+    // alone is not the test; it is the fallback for an error that never
+    // materialised an exception object.
+    let w_runtime_error = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+        pyre_object::interp_exceptions::ExcKind::RuntimeError,
+    );
+    if !err.exc_object.is_null() && !w_runtime_error.is_null() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(err.exc_object);
+        pyre_object::gc_roots::pin_root(w_runtime_error);
+        return crate::baseobjspace::isinstance(err.exc_object, w_runtime_error).unwrap_or(false);
+    }
+    matches!(err.kind, crate::PyErrorKind::RuntimeError)
 }
 
 /// `sysmodule.c sys._clear_type_descriptors`: remove the instance-dict and weakref

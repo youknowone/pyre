@@ -1280,6 +1280,10 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
         };
         crate::module::_pickle::walk_pickle_state_gc(&mut fwd);
+        // `space.fromcache(AuditHolder)`'s hooks are installed by running app
+        // code, so a hook callable is young when it lands and cannot wait for
+        // the prebuilt-roots scan below.
+        crate::module::sys::vm::walk_audit_hooks_gc(&mut fwd);
     }
     // `space.fromcache(MethodCache)` is a live interpreter-global GC root,
     // not a write-once prebuilt object, and one cache serves every mutator.
