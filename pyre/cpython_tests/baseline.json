@@ -169,7 +169,7 @@
       "reason": "implementation detail"
     },
     "test.test_code_module": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codeccallbacks": {
       "dynasm": "IMPORTERROR"

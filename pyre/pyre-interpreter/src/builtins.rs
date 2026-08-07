@@ -10484,6 +10484,25 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             ParseErrorType::DuplicateKeywordArgumentError(name) => {
                 format!("keyword argument repeated: {name}")
             }
+            // The parser spells every unlexable character the same way. Split
+            // it the way `pytokenizer.py:130-140` does — non-printable
+            // characters name only their code point, printable ones are quoted
+            // — with the hex uppercase and padded to at least four digits, so
+            // an astral character widens instead of truncating.
+            //
+            // A printable ASCII character reports plain `invalid syntax`:
+            // `test_syntax.py:1459` asserts that for `1 $ 2`, and keeps
+            // `invalid character` for the non-ASCII case (`:2238`).
+            ParseErrorType::Lexical(LexicalErrorType::UnrecognizedToken { tok }) => {
+                let code = *tok as u32;
+                if !rustpython_unicode::classify::is_printable(*tok) {
+                    format!("invalid non-printable character U+{code:04X}")
+                } else if tok.is_ascii() {
+                    "invalid syntax".to_string()
+                } else {
+                    format!("invalid character '{tok}' (U+{code:04X})")
+                }
+            }
             _ => e.to_string(),
         }
     } else {
