@@ -5179,36 +5179,46 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// pins that in either of two wordings; the arm below is the one pypy prints,
 /// down to `None` rendering unquoted where a type name is quoted.
 ///
-/// The decode itself is not imported — `ljust`/`rjust` refuse a
-/// bytearray/memoryview/array fill that upstream turns into a fill char, as
-/// they already did before this function grew a per-method message. So the
-/// three arms below reproduce upstream's message for every operand upstream
-/// also refuses, and a buffer operand takes the last arm as the one place the
-/// missing decode still shows.
+/// The decode is strict, so an operand that exports bytes which are not valid
+/// UTF-8 raises from the decode rather than being refused by type.
 ///
-/// A str of the wrong length is a separate refusal, and the one upstream
-/// words per method.
+/// A fill of the wrong length is a separate refusal, and the one upstream words
+/// per method; it applies to the decoded operand, so a multi-byte buffer is
+/// rejected by its code-point count and not by its byte count.
 fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::PyError> {
     if args.len() <= 2 {
         return Ok(CodePoint::from_char(' '));
     }
-    if !unsafe { pyre_object::is_str(args[2]) } {
+    let decoded;
+    let raw = if unsafe { pyre_object::is_str(args[2]) } {
+        unsafe { w_str_get_wtf8(args[2]) }
+    } else {
         let type_name = arg_type_name(args[2]);
-        let message = if method == "center" {
-            format!("expected str, got {type_name} object")
+        if method == "center" {
+            return Err(crate::PyError::type_error(format!(
+                "expected str, got {type_name} object"
+            )));
         } else if unsafe { pyre_object::is_bytes(args[2]) } {
-            format!("Can't convert '{type_name}' object to str implicitly")
+            return Err(crate::PyError::type_error(format!(
+                "Can't convert '{type_name}' object to str implicitly"
+            )));
         } else {
-            let operand = if unsafe { pyre_object::is_none(args[2]) } {
-                "None".to_string()
-            } else {
-                format!("'{type_name}'")
+            let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(args[2])? else {
+                let operand = if unsafe { pyre_object::is_none(args[2]) } {
+                    "None".to_string()
+                } else {
+                    format!("'{type_name}'")
+                };
+                return Err(crate::PyError::type_error(format!(
+                    "decoding to str: a bytes-like object is required, not {operand}"
+                )));
             };
-            format!("decoding to str: a bytes-like object is required, not {operand}")
-        };
-        return Err(crate::PyError::type_error(message));
-    }
-    let raw = unsafe { w_str_get_wtf8(args[2]) };
+            let result = crate::typedef::decode_bytes_to_wtf8(buffer.as_bytes(), "utf-8", "strict");
+            buffer.release();
+            decoded = result?;
+            decoded.as_ref()
+        }
+    };
     let mut iter = raw.code_points();
     let first = iter.next();
     if first.is_none() || iter.next().is_some() {
