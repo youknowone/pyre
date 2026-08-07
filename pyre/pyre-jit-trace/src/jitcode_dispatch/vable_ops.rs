@@ -631,13 +631,61 @@ fn folded_store_is_observable_local<Sym: WalkSym>(
     if !shadow.frame_materialized {
         return false;
     }
+    let Some(nlocals) = active_frame_nlocals(ctx) else {
+        return false;
+    };
+    slot >= 0 && slot < nlocals
+}
+
+/// `CodeObject` of the frame a vable op names — the callee's inside an inline
+/// sub-walk, the outer portal frame's otherwise.
+fn active_frame_code<'a, Sym: WalkSym>(
+    ctx: &'a WalkContext<'_, '_, Sym>,
+) -> Option<&'a pyre_interpreter::CodeObject> {
+    let code_ptr = if ctx.fbw_mode.inline_subwalk {
+        ctx.callee_shadow.as_ref()?.code_ptr
+    } else {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if sym.is_null() {
+            return None;
+        }
+        // SAFETY: sym and its jitcode are live for the full-body walk; read-only.
+        unsafe {
+            let jitcode = (*sym).jitcode();
+            if jitcode.is_null() {
+                return None;
+            }
+            let jitcode = &*jitcode;
+            jitcode.payload.code_ptr
+        }
+    };
+    // SAFETY: the code object outlives the walk that resolved it; read-only.
+    unsafe { code_ptr.as_ref() }
+}
+
+/// Local-region size of the frame a `getarrayitem_vable_*` /
+/// `setarrayitem_vable_*` slot indexes.
+///
+/// The op names its own frame, so the split between the
+/// `locals_cells_stack_w` prefix and the operand-stack region is that frame's
+/// own count.  `fbw_mode.snapshot_sym` describes the outermost portal frame;
+/// reading the count off it inside a sub-walk misreads every callee slot at or
+/// above the CALLER's count as operand stack.  For `_find_ti(self, dt, i)`
+/// (6 slots) inlined into `utcoffset(self, dt)` (2), that folded away the
+/// `STORE_FAST` of every local from slot 2 up, and a guard resuming inside the
+/// callee then read them back as NULL from the reconstructed frame — the next
+/// call in the callee arrived one positional argument short.
+fn active_frame_nlocals<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<i64> {
+    if ctx.fbw_mode.inline_subwalk {
+        return active_frame_code(ctx)
+            .map(|code| crate::state::callee_layout_for_call_assembler(code).0 as i64);
+    }
     let sym = ctx.fbw_mode.snapshot_sym;
     if sym.is_null() {
-        return false;
+        return None;
     }
     // SAFETY: pointer live for the full-body walk; read-only.
-    let nlocals = unsafe { (*sym).nlocals() } as i64;
-    slot >= 0 && slot < nlocals
+    Some(unsafe { (*sym).nlocals() } as i64)
 }
 
 /// RPython parity: `pyjitpl.py _opimpl_setarrayitem_vable`.
@@ -732,19 +780,16 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // (`GuardSnapshotVableUntyped`).  Gate on a live mirror + a Ref store into
     // the local region so a genuine null / non-mirrored slot keeps the legacy
     // read.
-    if value.is_none() && value_bank == 'r' && ctx.vstack_valid {
-        let full_body_sym = ctx.fbw_mode.snapshot_sym;
-        if !full_body_sym.is_null() {
-            // SAFETY: pointer live for the full-body walk; read-only.
-            let nlocals = unsafe { (*full_body_sym).nlocals() as i64 };
-            if index_value >= 0 && index_value < nlocals {
-                if let Some(&tos) = ctx.vstack_boxes.last() {
-                    if !tos.is_none() {
-                        value = tos;
-                    }
-                }
-            }
-        }
+    if value.is_none()
+        && value_bank == 'r'
+        && ctx.vstack_valid
+        && let Some(nlocals) = active_frame_nlocals(ctx)
+        && index_value >= 0
+        && index_value < nlocals
+        && let Some(&tos) = ctx.vstack_boxes.last()
+        && !tos.is_none()
+    {
+        value = tos;
     }
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
     let concrete =
@@ -791,43 +836,28 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // general boundary model remains authoritative for other push/pop shapes.
     // Local/cell stores remain excluded by the `index >= nlocals` gate.
     if value_bank == 'r' && ctx.vstack_valid {
-        let full_body_sym = ctx.fbw_mode.snapshot_sym;
-        if !full_body_sym.is_null() {
-            // SAFETY: pointer live for the full-body walk; read-only.
-            let nlocals = unsafe { (*full_body_sym).nlocals() } as i64;
-            if index_value >= nlocals {
-                let method_load = unsafe {
-                    let jitcode = (*full_body_sym).jitcode();
-                    if jitcode.is_null() {
-                        false
-                    } else {
-                        let jitcode = &*jitcode;
-                        if jitcode.payload.code_ptr.is_null() {
-                            false
-                        } else {
-                            pyre_interpreter::decode_instruction_at(
-                                &*jitcode.payload.code_ptr,
-                                ctx.vstack_cur_pypc as usize,
-                            )
-                            .is_some_and(|(instr, op_arg)| match instr
-                            {
-                                pyre_interpreter::Instruction::LoadAttr { namei } => {
-                                    namei.get(op_arg).is_method()
-                                }
-                                _ => false,
-                            })
+        if let Some(nlocals) = active_frame_nlocals(ctx)
+            && index_value >= nlocals
+        {
+            // `vstack_cur_pypc` is a pc in the frame the op names, so it must
+            // be decoded against that frame's own bytecode.
+            let method_load = active_frame_code(ctx).is_some_and(|code| {
+                pyre_interpreter::decode_instruction_at(code, ctx.vstack_cur_pypc as usize)
+                    .is_some_and(|(instr, op_arg)| match instr {
+                        pyre_interpreter::Instruction::LoadAttr { namei } => {
+                            namei.get(op_arg).is_method()
                         }
-                    }
-                };
-                if method_load {
-                    let stack_slot = (index_value - nlocals) as usize;
-                    if ctx.vstack_boxes.len() <= stack_slot {
-                        ctx.vstack_boxes.resize(stack_slot + 1, OpRef::NONE);
-                    }
-                    ctx.vstack_boxes[stack_slot] = value;
+                        _ => false,
+                    })
+            });
+            if method_load {
+                let stack_slot = (index_value - nlocals) as usize;
+                if ctx.vstack_boxes.len() <= stack_slot {
+                    ctx.vstack_boxes.resize(stack_slot + 1, OpRef::NONE);
                 }
-                ctx.vstack_last_ref = value;
+                ctx.vstack_boxes[stack_slot] = value;
             }
+            ctx.vstack_last_ref = value;
         }
     }
     Ok((DispatchOutcome::Continue, op.next_pc))

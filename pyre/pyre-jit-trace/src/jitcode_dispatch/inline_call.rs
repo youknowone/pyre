@@ -4212,7 +4212,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     };
     let (callee_outcome, callee_class_of_last_exc_is_const) = {
         let mut sub_wc = WalkContext {
-            callee_shadow: Some(Default::default()),
+            callee_shadow: Some(super::CalleeLocalsShadow {
+                code_ptr: raw_callee_code,
+                ..Default::default()
+            }),
             // Path-1: resolve scalar static-field reads off this callee's own
             // unseeded portal frame to its compile-time constants.
             inline_callee_consts: Some(inline_consts),

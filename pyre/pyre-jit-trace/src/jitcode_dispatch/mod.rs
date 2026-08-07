@@ -413,6 +413,14 @@ pub struct CalleeLocalsShadow {
     /// `f_locals` or `sys._getframe` — and must not be folded away; the operand
     /// -stack region above `nlocals` is not reachable that way and still folds.
     pub frame_materialized: bool,
+    /// `CodeObject` of THIS inline level's frame.
+    ///
+    /// A `getarrayitem_vable_*` / `setarrayitem_vable_*` slot indexes the frame
+    /// the op names, and a Python pc reached inside a sub-walk indexes that
+    /// frame's bytecode — both are the callee's, not the outer portal frame the
+    /// `fbw_mode.snapshot_sym` describes.  Null when the level did not resolve
+    /// a callee code object.
+    pub code_ptr: *const pyre_interpreter::CodeObject,
 }
 
 impl Default for CalleeLocalsShadow {
@@ -424,6 +432,7 @@ impl Default for CalleeLocalsShadow {
             concrete_frame: 0,
             frame_box: OpRef::NONE,
             frame_materialized: false,
+            code_ptr: std::ptr::null(),
         }
     }
 }

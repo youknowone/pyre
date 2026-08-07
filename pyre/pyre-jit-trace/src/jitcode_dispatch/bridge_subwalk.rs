@@ -1223,7 +1223,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
 
     let outcome = {
         let mut sub_wc = WalkContext {
-            callee_shadow: Some(Default::default()),
+            callee_shadow: Some(super::CalleeLocalsShadow {
+                code_ptr: callee_pjc.code_ptr,
+                ..Default::default()
+            }),
             inline_callee_consts: Some(consts),
             fbw_mode: FbwWalkMode {
                 snapshot_sym: root_sym_ptr,
