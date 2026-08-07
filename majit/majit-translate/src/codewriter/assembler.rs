@@ -3335,6 +3335,63 @@ fn bh_field_name(owner: &str, field_name: &str) -> String {
     }
 }
 
+enum BhFieldLookup {
+    Parent(crate::jitcode::BhFieldSpec),
+    Layout(crate::codewriter::call::StructFieldLayout),
+    Missing,
+}
+
+fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> BhFieldLookup {
+    let Some(owner) = field.owner_root.as_deref() else {
+        return BhFieldLookup::Missing;
+    };
+    if let Some(parent_spec) = bh_size_spec_from_callcontrol(cc, owner) {
+        let full_name = bh_field_name(owner, &field.name);
+        // `all_fielddescrs` is flattened depth-first, so a nested
+        // `Outer.inner.x` precedes the `Outer.x` the caller named. A
+        // single `find` over the disjunction would let that nested row
+        // win on the dotted-suffix arm alone; run the exact spellings to
+        // exhaustion first and keep the suffix match as the fallback.
+        let dotted_suffix = format!(".{}", field.name);
+        let matched = parent_spec
+            .all_fielddescrs
+            .iter()
+            .find(|spec| spec.name == full_name || spec.field_key() == field.name)
+            .or_else(|| {
+                parent_spec
+                    .all_fielddescrs
+                    .iter()
+                    .find(|spec| spec.name.ends_with(&dotted_suffix))
+            });
+        if let Some(spec) = matched {
+            return BhFieldLookup::Parent(spec.clone());
+        }
+    }
+    cc.struct_layout_for(owner)
+        .and_then(|layout| layout.fields.iter().find(|row| row.name == field.name))
+        .cloned()
+        .map(BhFieldLookup::Layout)
+        .unwrap_or(BhFieldLookup::Missing)
+}
+
+/// Return the byte offset of a by-value substructure that has no flattened
+/// field descriptor of its own.
+///
+/// This deliberately shares `fielddescrof`'s lookup: an exact parent
+/// `all_fielddescrs` match wins, and only a layout-row fallback carrying the
+/// struct flag denotes the `getsubstruct` shape.
+pub(crate) fn inline_substruct_field_offset(
+    cc: &crate::codewriter::call::CallControl,
+    field: &crate::model::FieldDescriptor,
+) -> Option<usize> {
+    match bh_field_lookup(cc, field) {
+        BhFieldLookup::Layout(row) if row.flag == majit_ir::descr::ArrayFlag::Struct => {
+            Some(row.offset)
+        }
+        BhFieldLookup::Parent(_) | BhFieldLookup::Layout(_) | BhFieldLookup::Missing => None,
+    }
+}
+
 fn bh_field_spec_from_parts(
     index: u32,
     owner: &str,
@@ -3784,26 +3841,10 @@ fn fielddescrof(
         {
             parent_spec.type_id = owner_id.as_u64();
         }
-        let mut found_parent_field = false;
-        if let Some(parent_spec) = parent.as_ref() {
-            let full_name = bh_field_name(owner, &field.name);
-            // `all_fielddescrs` is flattened depth-first, so a nested
-            // `Outer.inner.x` precedes the `Outer.x` the caller named. A
-            // single `find` over the disjunction would let that nested row
-            // win on the dotted-suffix arm alone; run the exact spellings to
-            // exhaustion first and keep the suffix match as the fallback.
-            let dotted_suffix = format!(".{}", field.name);
-            let matched = parent_spec
-                .all_fielddescrs
-                .iter()
-                .find(|spec| spec.name == full_name || spec.field_key() == field.name)
-                .or_else(|| {
-                    parent_spec
-                        .all_fielddescrs
-                        .iter()
-                        .find(|spec| spec.name.ends_with(&dotted_suffix))
-                });
-            if let Some(spec) = matched {
+        let field_lookup = bh_field_lookup(cc, field);
+        let found_parent_field = matches!(field_lookup, BhFieldLookup::Parent(_));
+        match field_lookup {
+            BhFieldLookup::Parent(spec) => {
                 offset = spec.offset;
                 field_size = spec.field_size;
                 field_type = spec.field_type;
@@ -3812,35 +3853,32 @@ fn fielddescrof(
                 is_immutable = spec.is_immutable;
                 is_quasi_immutable = spec.is_quasi_immutable;
                 index_in_parent = spec.index_in_parent;
-                found_parent_field = true;
             }
-        }
-        if !found_parent_field
-            && let Some(layout_field) = cc
-                .struct_layout_for(owner)
-                .and_then(|layout| layout.fields.iter().find(|fl| fl.name == field.name))
-        {
-            offset = layout_field.offset;
-            field_size = layout_field.size;
-            field_type = layout_field.field_type;
-            field_flag = layout_field.flag;
-            is_field_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
-            is_immutable = layout_field.is_immutable();
-            is_quasi_immutable = layout_field.is_quasi_immutable();
-        } else if !found_parent_field
-            && let Some((
-                computed_offset,
-                computed_size,
-                computed_type,
-                computed_flag,
-                computed_signed,
-            )) = heuristic_field_layout(cc, owner, &field.name)
-        {
-            offset = computed_offset;
-            field_size = computed_size;
-            field_type = computed_type;
-            field_flag = computed_flag;
-            is_field_signed = computed_signed;
+            BhFieldLookup::Layout(layout_field) => {
+                offset = layout_field.offset;
+                field_size = layout_field.size;
+                field_type = layout_field.field_type;
+                field_flag = layout_field.flag;
+                is_field_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
+                is_immutable = layout_field.is_immutable();
+                is_quasi_immutable = layout_field.is_quasi_immutable();
+            }
+            BhFieldLookup::Missing => {
+                if let Some((
+                    computed_offset,
+                    computed_size,
+                    computed_type,
+                    computed_flag,
+                    computed_signed,
+                )) = heuristic_field_layout(cc, owner, &field.name)
+                {
+                    offset = computed_offset;
+                    field_size = computed_size;
+                    field_type = computed_type;
+                    field_flag = computed_flag;
+                    is_field_signed = computed_signed;
+                }
+            }
         }
 
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
