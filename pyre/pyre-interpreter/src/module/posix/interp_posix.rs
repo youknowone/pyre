@@ -2545,26 +2545,65 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
         #[cfg(all(windows, feature = "host_env"))]
         {
+            use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::Storage::FileSystem::{
+                CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
+                SetFileTime,
+            };
             if dir_fd.is_some() || !follow_symlinks {
                 return Err(crate::PyError::not_implemented(
                     "utime: dir_fd and follow_symlinks=False are unavailable on this platform",
                 ));
             }
-            // The host call here counts from the epoch upwards and has no
-            // second below it, so a pre-epoch time is turned away rather than
-            // written as the wrong one. The descriptor form above and every
-            // POSIX host write it.
-            let since_epoch = |t: UTime| {
-                u64::try_from(t.sec)
-                    .map(|sec| std::time::Duration::new(sec, t.nsec as u32))
-                    .map_err(|_| crate::PyError::value_error("utime: timestamp out of range"))
+            // A FILETIME counts 100-ns intervals from 1601-01-01, so a
+            // pre-epoch time is an ordinary positive count rather than one with
+            // no representation; utimensat and every POSIX host write it, and
+            // 3.14 writes it through `SetFileTime` (rposix.win32_utime). The
+            // sub-100ns of a nanosecond is not a tick the filesystem holds and
+            // is floored, as the call floors it.
+            const EPOCH_DIFF: i64 = 11_644_473_600;
+            let to_filetime = |t: UTime| -> Result<FILETIME, crate::PyError> {
+                let ticks = t
+                    .sec
+                    .checked_add(EPOCH_DIFF)
+                    .filter(|s| *s >= 0)
+                    .and_then(|s| s.checked_mul(10_000_000))
+                    .and_then(|s| s.checked_add(t.nsec / 100))
+                    .ok_or_else(|| crate::PyError::value_error("utime: timestamp out of range"))?
+                    as u64;
+                Ok(FILETIME {
+                    dwLowDateTime: ticks as u32,
+                    dwHighDateTime: (ticks >> 32) as u32,
+                })
             };
-            host_os::set_file_times(
-                path_from_bytes(&path.as_bytes).as_ref(),
-                since_epoch(access)?,
-                since_epoch(modified)?,
-            )
-            .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
+            let atime = to_filetime(access)?;
+            let mtime = to_filetime(modified)?;
+            let wide = wide_path(&path.as_bytes)?;
+            // FILE_WRITE_ATTRIBUTES is the access `SetFileTime` takes;
+            // FILE_FLAG_BACKUP_SEMANTICS lets the name open a directory too.
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    FILE_WRITE_ATTRIBUTES,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(fs_err_with_filename(
+                    std::io::Error::last_os_error(),
+                    path.w_path(),
+                ));
+            }
+            let wrote = unsafe { SetFileTime(handle, std::ptr::null(), &atime, &mtime) };
+            let error = (wrote == 0).then(std::io::Error::last_os_error);
+            unsafe { CloseHandle(handle) };
+            if let Some(error) = error {
+                return Err(fs_err_with_filename(error, path.w_path()));
+            }
             return Ok(pyre_object::w_none());
         }
         #[cfg(all(unix, not(feature = "sandbox")))]
