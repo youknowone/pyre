@@ -1389,14 +1389,34 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
       * artefact and stamp mtimes are printed, never gated. `extract` writes
         both in one pass, and the source digest already answers the question a
         timestamp only approximates.
-      * NOT COVERED, as opposed to deliberately ungated: the `excluded_deps`
-        exclusion. `extract` re-reads the artefact and refuses if a package
-        dropped from the fingerprint is referenced by it, but that guard lives
-        in `extract` alone, so an artefact only ever `--check`ed never has its
-        exclusion re-validated. The guard's oracle does discriminate — the same
-        symbol is present in `pyre-jit.ullbc`, which excludes nothing, and
-        absent from the two artefacts that exclude it — so this is a coverage
-        gap in WHERE it runs, not a defect in WHAT it asks.
+      * the `excluded_deps` exclusion is not re-asked here, and MOSTLY DOES NOT
+        NEED TO BE — do not add a second checker without reading this first.
+        `extract` re-reads the artefact and refuses if a package dropped from
+        the fingerprint is referenced by it; `stamp_path.write_text` is the
+        stamp's ONLY writer and sits immediately after that guard, so a
+        violation raises before any stamp exists. A matching stamp is therefore
+        the guard's certificate: it could only have been written by an
+        extraction the guard passed. The skip path inherits this — it fires on
+        `stamp == recorded`, and that recorded stamp had the same provenance.
+        The oracle discriminates rather than being vacuous: the same symbol is
+        present in `pyre-jit.ullbc`, which excludes nothing, and absent from
+        the two artefacts that exclude it.
+
+        Two narrow things the certificate does NOT carry:
+
+          - it does not distinguish "the guard passed" from "the guard was
+            vacuous". A spec with empty `excluded_deps` runs an empty loop and
+            writes an indistinguishable stamp.
+          - `--force` re-extracts with the skip bypassed, and an excluded
+            package's sources changing is BY CONSTRUCTION invisible to
+            `source=`. So a forced run can write a violating artefact, raise at
+            the guard, and leave the previous stamp in place still matching the
+            tree — after which this function passes. It fails loud once, at the
+            forced extraction, and is silent on every check after. (Read from
+            the code path, not reproduced: reproducing it needs a real
+            extraction. The half that IS demonstrated is that `check` never
+            looks at artefact content — a stamp-matching fixture holding
+            arbitrary bytes passes.)
 
     Nothing here re-extracts. Re-extraction runs a whole-crate Charon build and
     writes into the working tree, so it stays a human's scheduling decision and
