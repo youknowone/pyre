@@ -8,6 +8,8 @@ import argparse
 import difflib
 import math
 import os
+import platform
+import re
 import shutil
 import statistics
 import struct
@@ -143,6 +145,17 @@ WIN_NATIVE_TIMEOUT_SCALE = 2.0
 
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
+CPYTHON_SUITE_BASELINE = "pyre/cpython_tests/baseline.json"
+# The baseline holds one verdict per module per backend, and dynasm emits
+# arch-specific code, so a verdict only compares against the host it was
+# observed on. `.github/workflows/pyre-ci.yml` pins its CPython suite job to
+# `macos-latest` for the same reason.
+CPYTHON_SUITE_BASELINE_HOST = ("darwin", "arm64")
+# Per module, matching the CI job. `test.test_asyncio` alone needs ~2m47s of
+# wall time, so a smaller per-module limit turns a slow module into a fake
+# regression.
+CPYTHON_SUITE_MODULE_TIMEOUT_S = 300
+CPYTHON_SUITE_TIMEOUT_S = 2400
 SNAP_DIR = "pyre/check.snap"
 BENCH_COMPARE_BUFFER_S = 0.005
 # Windows process CPU accounting advances in scheduler ticks (normally 1/64 s).
@@ -2374,6 +2387,79 @@ class Check:
             print(f"{green('PASS')}  {elapsed:.2f}s")
             self._append_comparison(backend, name, "-", "-", f"{elapsed:.2f}s")
 
+    # ── vendored CPython suite ──
+
+    def run_cpython_suite(self):
+        """Gate the vendored CPython test suite against its recorded baseline.
+
+        Every other stage in this file runs code we wrote, so it can only
+        catch a defect in a shape somebody already thought of.  This one runs
+        CPython's own tests, and it is the stage that reports a JIT miscompile
+        nobody wrote a fixture for: `test.test_datetime` failed on a
+        specialised-pair subscript fold while the whole synthetic corpus and
+        every parity fixture stayed green.
+
+        The baseline records one verdict per module per backend, observed on
+        darwin-arm64, and dynasm's codegen is arch-specific -- so the
+        comparison only means anything there, which is also why the CI job
+        pins `runs-on: macos-latest`.  On any other host the stage reports
+        that it did not run instead of counting as a pass.
+        """
+        name = "cpython-suite"
+        backend = "dynasm"
+        print(f"  {name}")
+        if not self.enabled(backend):
+            sys.stdout.write(f"    {backend:<10s}")
+            print(dim("skip (backend not enabled)"))
+            self._append_comparison(backend, name, "-", "-", "skip")
+            return
+        host = (sys.platform, platform.machine())
+        if host != CPYTHON_SUITE_BASELINE_HOST:
+            sys.stdout.write(f"    {backend:<10s}")
+            print(dim(
+                f"skip (baseline observed on {'-'.join(CPYTHON_SUITE_BASELINE_HOST)}, "
+                f"host is {'-'.join(host)})"
+            ))
+            self._append_comparison(backend, name, "-", "-", "skip")
+            return
+        sys.stdout.write(f"    {backend:<10s}")
+        sys.stdout.flush()
+        output, elapsed, code, stderr = run_timed(
+            [
+                PYTHON3, str(Path(__file__).parent / "cpython_tests" / "run.py"),
+                "--binary", str(self._pyre(backend)),
+                "--baseline", str(CPYTHON_SUITE_BASELINE),
+                "--jobs", str(max(1, (os.cpu_count() or 4) - 1)),
+                "--timeout", str(CPYTHON_SUITE_MODULE_TIMEOUT_S),
+            ],
+            timeout_s=CPYTHON_SUITE_TIMEOUT_S,
+            env=pyre_env(),
+        )
+        # `N to run,` rather than the runner's own "no regressions": a
+        # selection that came out empty prints every counter as zero and
+        # still exits 0, which reads as a pass and tests nothing.
+        selected = re.search(r"^(\d+) to run,", output, re.M)
+        if code == 124:
+            detail = f"timeout (>{CPYTHON_SUITE_TIMEOUT_S}s)"
+        elif selected is None:
+            detail = "runner printed no selection line"
+        elif selected.group(1) == "0":
+            detail = "selected 0 modules"
+        elif code != 0:
+            regressions = re.findall(r"^  - (\S+): (.*)$", output, re.M)
+            detail = "; ".join(f"{m} {d}" for m, d in regressions) or f"exit {code}"
+        else:
+            detail = ""
+        if detail:
+            self._record(backend, False, name, detail)
+            print(f"{red('FAIL')}  {detail}")
+            _dump_failed_run(output, stderr)
+            self._append_comparison(backend, name, "-", "-", "FAIL")
+            return
+        self._record(backend, True, name, "")
+        print(f"{green('PASS')}  {selected.group(1)} modules, {elapsed:.0f}s")
+        self._append_comparison(backend, name, "-", "-", f"{elapsed:.0f}s")
+
     # ── synthetic parity suite ──
 
     def run_synthetic_bench(self, path, timeout):
@@ -2707,6 +2793,11 @@ def parse_args():
         help="skip pyre/bench/synth feature-parity benchmarks",
     )
     parser.add_argument(
+        "--no-cpython-suite",
+        action="store_true",
+        help="skip the vendored CPython suite gate (pyre/cpython_tests)",
+    )
+    parser.add_argument(
         "--synthetic-only",
         action="store_true",
         help="run only pyre/bench/synth feature-parity benchmarks",
@@ -2888,6 +2979,11 @@ def main():
     if not args.no_synthetic:
         print()
         chk.run_synthetic_suite()
+
+    if not args.no_cpython_suite and not args.synthetic_only:
+        print()
+        print(bold("vendored CPython suite"))
+        chk.run_cpython_suite()
 
     rc = chk.print_summary()
     sys.exit(rc)
