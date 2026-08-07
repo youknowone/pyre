@@ -1030,10 +1030,9 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     Some(module)
 }
 
-/// The builtin-module half of `load_part`: build the module, bind it in
-/// `sys.modules`, then run its `startup` hook. `_imp.create_builtin` performs
-/// the same three steps a native `import` does, so the two entry points leave
-/// a builtin module in the same state.
+/// Build a builtin module for `_imp.create_builtin`, then run its `startup`
+/// hook. App-level `module_from_spec` stamps import metadata afterwards
+/// (`_bootstrap.py:822`), so this entry point must not pre-fill it.
 pub(crate) fn create_builtin_module(
     name: &str,
     execution_context: *const PyExecutionContext,
@@ -1044,11 +1043,11 @@ pub(crate) fn create_builtin_module(
     // exception hierarchy, and overwrote the name→class registry. The
     // process-global get-or-mint registry now prevents that identity
     // clobbering even on another fresh-dictionary path, while this guard still
-    // preserves the builtins Module identity. `load_part` routes the name this
-    // way; the `_imp.create_builtin` entry point must too.
+    // preserves the builtins Module identity.
     if name == "builtins" && !execution_context.is_null() {
         let module = unsafe { (*execution_context).get_builtin() };
         set_sys_module(name, module);
+        seed_create_builtin_attrs(module);
         return Ok(Some(module));
     }
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1059,8 +1058,17 @@ pub(crate) fn create_builtin_module(
     pyre_object::gc_roots::pin_root(module);
     set_sys_module(name, pyre_object::gc_roots::shadow_stack_get(module_slot));
     let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
-    startup_builtin_module(name, module, execution_context)?;
+    startup_builtin_module_impl(name, module, execution_context, false)?;
+    seed_create_builtin_attrs(pyre_object::gc_roots::shadow_stack_get(module_slot));
     Ok(Some(pyre_object::gc_roots::shadow_stack_get(module_slot)))
+}
+
+fn seed_create_builtin_attrs(module: PyObjectRef) {
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    if !w_dict.is_null() {
+        crate::module_ns_store(w_dict, "__loader__", pyre_object::w_none());
+        crate::module_ns_store(w_dict, "__spec__", pyre_object::w_none());
+    }
 }
 
 /// Set a builtin module's `__spec__`/`__loader__`/`__package__` from the
@@ -1214,6 +1222,15 @@ fn startup_builtin_module(
     module: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<(), crate::PyError> {
+    startup_builtin_module_impl(name, module, execution_context, true)
+}
+
+fn startup_builtin_module_impl(
+    name: &str,
+    module: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+    stamp_spec: bool,
+) -> Result<(), crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
     let _roots = push_roots();
@@ -1228,7 +1245,9 @@ fn startup_builtin_module(
     if let Some(startup) = startup {
         startup(shadow_stack_get(mod_slot), execution_context)?;
     }
-    set_builtin_module_spec(name, shadow_stack_get(mod_slot))?;
+    if stamp_spec {
+        set_builtin_module_spec(name, shadow_stack_get(mod_slot))?;
+    }
     Ok(())
 }
 
