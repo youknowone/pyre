@@ -1498,10 +1498,21 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
         recorded = parse_stamp(text)
         missing = [key for key in STAMP_KEYS if key not in recorded]
         if missing:
+            # Order matters: the LIKELIEST cause is listed first, and it is the
+            # one the two original guesses both excluded. Adding a key to
+            # STAMP_KEYS makes EVERY stamp already on disk land here at once,
+            # so right after such a change this arm fires for a reason that is
+            # neither "a foreign tool wrote it" nor "it was truncated" — the
+            # stamp is this engine's own output from before the field existed.
+            # Saying only those two sends a reader hunting a corruption that is
+            # not there. Measured after `external=` was added: all five live
+            # pyre stamps refuse through here, none of them damaged.
             stale.append(
                 f"{crate}: fingerprint stamp {stamp_path} has no "
-                f"{', '.join(missing)} field — it was not written by this "
-                f"engine, or was truncated"
+                f"{', '.join(missing)} field — written before this engine "
+                f"recorded that field, or by another tool, or truncated. "
+                f"Re-extract either way; the artefact predates what the stamp "
+                f"is now required to cover, so it cannot be compared"
             )
             continue
 
