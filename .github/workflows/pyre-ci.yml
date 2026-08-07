@@ -11,6 +11,9 @@ on:
       - "lib-python/**"
       - "scripts/install-charon.py"
       - "scripts/extract-llbc.py"
+      # The engine `extract-llbc.py` imports; most of the extraction logic
+      # lives here, so a change to it alone must still trigger this workflow.
+      - "scripts/llbc_extract.py"
       - ".github/workflows/pyre-ci.yml"
   pull_request:
     branches: [ "main", "py3.[0-9]+" ]
@@ -22,6 +25,7 @@ on:
       - "lib-python/**"
       - "scripts/install-charon.py"
       - "scripts/extract-llbc.py"
+      - "scripts/llbc_extract.py"
       - ".github/workflows/pyre-ci.yml"
   workflow_dispatch:
 
@@ -374,6 +378,28 @@ jobs:
         test -s build/llbc/pyre-object.ullbc
         test -s build/llbc/pyre-interpreter.ullbc
         test -s build/llbc/pyre-jit.ullbc
+    - name: Only frame construction accesses PyFrame virtualizable fields without a pointer (Linux only)
+      # A red here means a virtualizable field of `PyFrame` is now reached off
+      # a non-dereferenced local aggregate somewhere the census does not expect
+      # — or that frame construction stopped doing so. The codewriter treats
+      # that shape as not reaching a live virtualizable and keeps it off the
+      # `getfield_vable_*` / `setfield_vable_*` path, so the set of places with
+      # that shape is a soundness-relevant invariant rather than a style rule.
+      # `FrameBox::new` taking its frame by value is what puts its twelve
+      # projections there; `pyframe.rs` carries a compile-time guard on that
+      # signature, and this is the corpus-level half.
+      #
+      # Reads the extracted LLBC that the steps above already downloaded — no
+      # corpus build.
+      #
+      # The Linux gate is required, not an optimization. This step sits in
+      # `&pyre-check-steps`, which the macOS and Windows legs alias, so it is
+      # copied into all three jobs; the census resolves charon per platform and
+      # has no Windows mapping, and would hard-fail that leg ungated. Running
+      # once is also sufficient — the property is platform-independent.
+      if: runner.os == 'Linux'
+      shell: bash
+      run: python3 pyre/scripts/vable-projection-census.py build/llbc/pyre-object.ullbc build/llbc/pyre-interpreter.ullbc build/llbc/pyre-jit.ullbc
     - name: Add wasm32 target (Linux only)
       # check.py adds wasm to its default backends when this target is
       # installed, so this is what makes the Linux leg build and run the wasm
