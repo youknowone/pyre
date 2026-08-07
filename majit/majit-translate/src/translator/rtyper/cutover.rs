@@ -5069,9 +5069,7 @@ mod tests {
             .flat_map(|block| block.borrow().operations.clone())
             .map(|op| format!("{op:?}"))
             .collect::<Vec<_>>();
-        eprintln!(
-            "[cutover_repeat_runs_transform_allocate_before_rtype] after={rtyped_output:?}"
-        );
+        eprintln!("[cutover_repeat_runs_transform_allocate_before_rtype] after={rtyped_output:?}");
         assert!(
             rtyped_output.iter().any(|op| op.contains("alloc_and_set")),
             "rtyped repeat output must retain alloc_and_set identity: {rtyped_output:?}"
