@@ -8153,8 +8153,8 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let repr_slot = if is_list_or_tuple {
         None
     } else {
-        let rendered = pyre_object::w_str_new(&unsafe {
-            crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(base + 2))?
+        let rendered = pyre_object::w_str_from_wtf8(unsafe {
+            crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 2))?
         });
         pyre_object::gc_roots::pin_root(rendered);
         Some(pyre_object::gc_roots::shadow_stack_len() - 1)
@@ -8650,11 +8650,16 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let (message, exceptions) = exception_group_fields(w_self)?;
     let cls = crate::typedef::r#type(w_self).unwrap();
     let name = unsafe { pyre_object::w_type_get_name(cls.as_ptr()) };
-    let message_repr = unsafe { crate::display::py_repr(message)? };
+    let message_repr = unsafe { crate::display::py_repr_wtf8(message)? };
     let saved =
         unsafe { pyre_object::interp_exceptions::w_exception_get_group_exceptions_repr(w_self) };
+    // `app_group.py:92-93` interpolates the two `!r` results into the result
+    // verbatim, so a `__repr__` that answers a lone surrogate carries it
+    // through.  Every piece here is WTF-8 for that reason: `w_str_get_value`
+    // on the saved spelling would panic outright on such a surrogate, and the
+    // `py_repr` spelling of the fallbacks would fold it to U+FFFD.
     let exceptions_repr = if !saved.is_null() {
-        unsafe { pyre_object::w_str_get_value(saved) }.to_string()
+        unsafe { pyre_object::w_str_get_wtf8(saved) }.to_wtf8_buf()
     } else {
         // Fallback for a group whose constructor never recorded the spelling:
         // render the immutable internal tuple, but as a list when `args` shows
@@ -8671,14 +8676,20 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         };
         if original_was_list {
             let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
-            unsafe { crate::display::py_repr(pyre_object::w_list_new(items))? }
+            unsafe { crate::display::py_repr_wtf8(pyre_object::w_list_new(items))? }
         } else {
-            unsafe { crate::display::py_repr(exceptions)? }
+            unsafe { crate::display::py_repr_wtf8(exceptions)? }
         }
     };
-    Ok(pyre_object::w_str_new(&format!(
-        "{name}({message_repr}, {exceptions_repr})"
-    )))
+    let mut rendered =
+        Wtf8Buf::with_capacity(name.len() + message_repr.len() + exceptions_repr.len() + 4);
+    rendered.push_str(name);
+    rendered.push_str("(");
+    rendered.push_wtf8(&message_repr);
+    rendered.push_str(", ");
+    rendered.push_wtf8(&exceptions_repr);
+    rendered.push_str(")");
+    Ok(pyre_object::w_str_from_wtf8(rendered))
 }
 
 fn make_exception_group_type(

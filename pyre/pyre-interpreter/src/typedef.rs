@@ -7963,9 +7963,9 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     return Ok(pyre_object::w_str_new(""));
                 }
                 unsafe {
-                    Ok(pyre_object::w_str_new_managed(&crate::display::py_str(
-                        args[0],
-                    )?))
+                    Ok(pyre_object::w_str_from_wtf8_managed(
+                        crate::display::py_str_wtf8(args[0])?,
+                    ))
                 }
             }),
         )
@@ -18748,8 +18748,8 @@ fn init_object_type(ns: PyObjectRef) {
                             crate::type_methods::arg_type_name(args[0])
                         )));
                     }
-                    Ok(pyre_object::w_str_new_managed(&unsafe {
-                        crate::py_str(args[0])?
+                    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+                        crate::display::py_str_wtf8(args[0])?
                     }))
                 },
                 2,

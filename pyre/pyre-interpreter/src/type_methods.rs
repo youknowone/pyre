@@ -2672,15 +2672,13 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::STR_TYPE) } {
             return Ok(args[0]);
         }
-        // `str(self)` — a str self passes through as WTF-8. Dynamic result:
+        // `str(self)` — passes through as WTF-8 whatever the receiver is.
+        // `py_str` is `py_str_wtf8` plus a lossy UTF-8 encode, so taking it
+        // for a non-`str` receiver only folded that receiver's `__str__`
+        // result to U+FFFD on the way back into a `str`.  Dynamic result:
         // collectable.
-        if unsafe { pyre_object::is_str(args[0]) } {
-            return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
-                crate::display::py_str_wtf8(args[0])?
-            }));
-        }
-        return Ok(pyre_object::w_str_new_managed(&unsafe {
-            crate::py_str(args[0])?
+        return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+            crate::display::py_str_wtf8(args[0])?
         }));
     }
     Ok(pyre_object::w_str_from_wtf8_managed(
