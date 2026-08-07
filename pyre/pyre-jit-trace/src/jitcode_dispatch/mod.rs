@@ -3947,6 +3947,44 @@ fn concrete_from_recorded_opref<Sym: WalkSym>(
     }
 }
 
+/// The `operand_offset` of this op's Ref var-list (`R`), for a reader that
+/// holds only the decoded op and must find that list itself.
+///
+/// A dispatcher that decoded the whole op passes the offset it already
+/// computed; anything reached later — an abort leg, a specializer entered
+/// after resolution — has no such value and must not guess one.  `R` sits at
+/// offset 1 for the Ref-only residual shape (`iRd>r`) but NOT for the mixed
+/// one (`iIRd>r`, `riIRd>r`, `iiIRd>r`), whose leading Int list is itself
+/// variable-width: reading offset 1 there lands on the Int list's length byte
+/// and takes its register indices into the Ref bank, yielding unrelated
+/// objects with a plausible length.
+///
+/// Walks the argcode widths of `blackhole.py:112-157`, the same walk
+/// [`decode_op_at`] performs.  `None` — an op declaring no Ref list, or one
+/// whose earlier operands cannot be width-counted — leaves the caller to
+/// decline.
+///
+/// [`decode_op_at`]: crate::jitcode_runtime::decode_op_at
+fn ref_var_list_operand_offset(code: &[u8], op: &DecodedOp) -> Option<usize> {
+    let first_operand_pc = op.pc + 1;
+    let mut cursor = first_operand_pc;
+    let mut chars = op.argcodes.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            'R' => return Some(cursor - first_operand_pc),
+            'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'L' | 'd' | 'j' => cursor += 2,
+            'I' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
+            '>' => {
+                chars.next()?;
+                cursor += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Read concrete shadow values for a Ref-bank variadic operand list.
 /// Parallels [`read_ref_var_list`] — reads the
 /// same byte indices but resolves through `ctx.concrete_registers_r`.

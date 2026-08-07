@@ -12276,3 +12276,50 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
         "a committed walk keeps its nodes"
     );
 }
+
+#[test]
+fn ref_var_list_offset_follows_the_argcodes_not_a_fixed_byte() {
+    // The Ref-only residual shape puts its `R` list right after the funcptr
+    // register, so offset 1 answers it; the mixed shape does not, because the
+    // Int list between them is variable-width.  A reader that assumes 1 for
+    // both takes the Int list's length byte as the Ref list's, and its
+    // register indices into the Ref bank — a list of unrelated objects whose
+    // LENGTH still looks plausible, which is what let the wrong operand stack
+    // through the abort flush's depth check.
+    let ref_only = *insns_opname_to_byte()
+        .get("residual_call_r_r/iRd>r")
+        .expect("residual_call_r_r/iRd>r must be in insns table");
+    // opcode, i=funcptr, R: len=2 + 2 regs, d=0x0001, >r dst
+    let code = [ref_only, 0x07, 0x02, 0x04, 0x05, 0x01, 0x00, 0x09];
+    let op = crate::jitcode_runtime::decode_op_at(&code, 0).expect("must decode");
+    assert_eq!(op.argcodes, "iRd>r");
+    assert_eq!(ref_var_list_operand_offset(&code, &op), Some(1));
+
+    let mixed = *insns_opname_to_byte()
+        .get("residual_call_ir_r/iIRd>r")
+        .expect("residual_call_ir_r/iIRd>r must be in insns table");
+    // opcode, i=funcptr, I: len=3 + 3 regs, R: len=2 + 2 regs, d, >r dst
+    let code = [
+        mixed, 0x07, //  i
+        0x03, 0x00, 0x01, 0x02, // I: len=3
+        0x02, 0x04, 0x05, // R: len=2
+        0x01, 0x00, // d
+        0x09, // >r
+    ];
+    let op = crate::jitcode_runtime::decode_op_at(&code, 0).expect("must decode");
+    assert_eq!(op.argcodes, "iIRd>r");
+    assert_eq!(
+        ref_var_list_operand_offset(&code, &op),
+        Some(5),
+        "the R list starts past the 4-byte I list, not at offset 1",
+    );
+
+    // An op with no Ref list at all has no offset to answer with, and the
+    // caller must decline rather than read whatever sits at a guessed one.
+    let int_only = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("int_add/ii>i must be in insns table");
+    let code = [int_only, 0x01, 0x02, 0x03];
+    let op = crate::jitcode_runtime::decode_op_at(&code, 0).expect("must decode");
+    assert_eq!(ref_var_list_operand_offset(&code, &op), None);
+}

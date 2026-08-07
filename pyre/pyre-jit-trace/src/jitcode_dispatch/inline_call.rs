@@ -1300,7 +1300,14 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     op: &DecodedOp,
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<Vec<pyre_object::PyObjectRef>> {
-    let fresh = read_ref_var_list_concrete(code, op, 1, ctx);
+    // The Ref list is NOT at a fixed offset: the method-form `CALL` helpers
+    // this leg latches for lower through the mixed `iIRd>r` shape, whose
+    // leading Int list shifts it (`dispatch_residual_call_iIRd_kind` reads it
+    // at `1 + i_width`).  Reading offset 1 there takes the Int list's register
+    // indices into the Ref bank — refs unrelated to the call, of a length that
+    // still passes the flush's depth check.
+    let ref_operand_offset = ref_var_list_operand_offset(code, op)?;
+    let fresh = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
     if fresh.is_empty() {
         return None;
     }
