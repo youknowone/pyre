@@ -2865,13 +2865,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // body sub-walk reaches its own recursive CALL as a nested residual, which
     // `fbw_abort_nested_unjournaled_residual` declines on the self-recursive
     // hazard arm — an abort storm that folds the whole guard bridge back to
-    // residual.  The native `CALL_ASSEMBLER` self-recursion fold already exempts
-    // that decline via `SELFREC_CA_FOLD_ACTIVE`; the same exemption applies to
-    // this admitted inline, whose recursive residual runs concretely at the
-    // pre-execute site (executed, so no replay double-apply).  Native only: the
-    // wasm always-portal path type-confuses the self-recursive inline
-    // (`setintbound: got Ref`), so it keeps the correct residual-fallback
-    // decline.
+    // residual.  The `CALL_ASSEMBLER` self-recursion fold already exempts that
+    // decline via `SELFREC_CA_FOLD_ACTIVE`; the same exemption applies to this
+    // admitted inline, whose recursive residual runs concretely at the
+    // pre-execute site (executed, so no replay double-apply).
     let mut bridge_rec_root_selfrec = false;
     if ctx.trace_ctx.is_bridge_trace
         && args_all_builtin_integer
@@ -2911,12 +2908,11 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         if !safe_root_bridge {
             return Ok(None);
         }
-        bridge_rec_root_selfrec = cfg!(not(target_arch = "wasm32"))
-            && unsafe {
-                let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject;
-                !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
-            };
+        bridge_rec_root_selfrec = unsafe {
+            let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject;
+            !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
+        };
     }
     // A callee `fbw_abort_nested_unjournaled_residual` already named on its
     // hazard arm residualizes from here on.  The hazard is a static property of
