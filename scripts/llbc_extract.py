@@ -604,7 +604,29 @@ def _collect_inputs(
                     external.append(package_dir / "Cargo.toml")
                 for target in package["targets"]:
                     kinds = set(target["kind"])
-                    if not ({"lib", "bin", "custom-build"} & kinds):
+                    # ⭐ A DENY-list, and the direction is the whole point. This
+                    # was `{"lib","bin","custom-build"} & kinds` — an allow-list
+                    # written from a remembered vocabulary rather than a
+                    # measured one, and it silently dropped THREE path-dep
+                    # packages in this tree: `majit-macros` and `pyre-macros`
+                    # (`proc-macro`) and `pyre-wasm` (`cdylib`). A proc macro is
+                    # the WORST possible omission — its expansion is inlined
+                    # into the consuming crate, so its sources are more coupled
+                    # to the artefact's item bodies than an ordinary `lib`'s
+                    # are. An allow-list that omits exactly that is the inverse
+                    # of the risk ordering.
+                    #
+                    # The package loop above appends `Cargo.toml` BEFORE this
+                    # loop runs, which is what made the omission invisible: the
+                    # dropped crate still showed up in `--list-inputs`, so it
+                    # read as covered while none of its sources were hashed.
+                    #
+                    # Naming what is NOT compiled into the artefact is a short,
+                    # closed list; naming what IS grows silently with every
+                    # crate type cargo adds. Getting this wrong now costs a
+                    # re-extraction, never a wrong answer — the same direction
+                    # the untracked-file leg below is deliberately biased in.
+                    if kinds & {"example", "test", "bench"}:
                         continue
                     src_path = Path(target["src_path"]).resolve()
                     if src_path.is_relative_to(root):
