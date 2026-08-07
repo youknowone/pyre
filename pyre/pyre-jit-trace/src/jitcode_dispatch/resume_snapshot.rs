@@ -1403,7 +1403,37 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         jitcode_index as i32,
         i32::try_from(call.next_pc).ok()?,
     );
-    let mut int_values = Vec::with_capacity(live.int.len());
+    // `_copy_data_from_miframe` (`blackhole.py:1711-1730`) copies the WHOLE
+    // bank — `range(num_regs_i/r/f())` — filtering only on "the MIFrame has a
+    // box here", never on liveness.  Each bank below therefore runs twice: the
+    // liveness pass, which still DEMANDS a concrete for every color live at
+    // `resume_pc`, and then a sweep that seeds every remaining color the walk
+    // happens to have a concrete for.
+    //
+    // Seeding only the live subset is unsound the moment the drive leaves the
+    // straight line: the blackhole runs on to a `jit_merge_point` whose own
+    // live set is generally LARGER (a loop-carried value defined in the
+    // prologue and not rewritten in the body is dead at a mid-body pc but live
+    // at the header).  Those colors read back NULL, and a NULL in a live
+    // operand-stack slot faults the interpreter.  The innermost frame already
+    // gets this treatment; a caller frame is no different.
+    //
+    // The sweep cannot introduce a stale value: a color the drive rewrites is
+    // overwritten before any read, and one it does not rewrite still holds what
+    // the walk observed here, which is what a merge reached without an
+    // intervening definition expects.  Colors with no concrete stay unset,
+    // exactly as an absent upstream box does.  Nor can a swept color turn a
+    // usable image into a declined one: `num_regs_*()` is upstream's own bound
+    // and never exceeds the `num_regs_and_consts_*()` bank the replay indexes,
+    // so the replay's out-of-range refusal stays out of reach.
+    // How many colors each sweep adds beyond the live set is the one number
+    // that says whether the caller banks were actually sparse here.  Report-only,
+    // gated on `fbw_debug_abort_enabled` like the rest of the walk's build
+    // reporting, so a build without the flag pays three counter bumps and one
+    // predictable branch.
+    let mut swept = [0usize; 3];
+    let mut int_values = Vec::with_capacity(pjc.jitcode.num_regs_i());
+    let mut int_seeded = vec![false; pjc.jitcode.num_regs_i()];
     for &color in &live.int {
         let color = color as usize;
         if result_bank == 'i' && result_color == Some(color) {
@@ -1413,9 +1443,22 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
             return None;
         };
         int_values.push((color, value));
+        if let Some(seeded) = int_seeded.get_mut(color) {
+            *seeded = true;
+        }
+    }
+    for color in 0..pjc.jitcode.num_regs_i() {
+        if int_seeded[color] || (result_bank == 'i' && result_color == Some(color)) {
+            continue;
+        }
+        if let Some(ConcreteValue::Int(value)) = ctx.concrete_registers_i.get(color).copied() {
+            int_values.push((color, value));
+            swept[0] += 1;
+        }
     }
 
-    let mut ref_values = Vec::with_capacity(live.ref_.len());
+    let mut ref_values = Vec::with_capacity(pjc.jitcode.num_regs_r());
+    let mut ref_seeded = vec![false; pjc.jitcode.num_regs_r()];
     for &color in &live.ref_ {
         let color = color as usize;
         if result_bank == 'r' && result_color == Some(color) {
@@ -1434,9 +1477,24 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
             return None;
         };
         ref_values.push((color, value));
+        if let Some(seeded) = ref_seeded.get_mut(color) {
+            *seeded = true;
+        }
+    }
+    for color in 0..pjc.jitcode.num_regs_r() {
+        if ref_seeded[color] || (result_bank == 'r' && result_color == Some(color)) {
+            continue;
+        }
+        // `ConcreteValue::Null` is the walker's "unknown" sentinel rather than a
+        // proven Python null, so it seeds nothing.
+        if let Some(ConcreteValue::Ref(value)) = ctx.concrete_registers_r.get(color).copied() {
+            ref_values.push((color, value));
+            swept[1] += 1;
+        }
     }
 
-    let mut float_values = Vec::with_capacity(live.float.len());
+    let mut float_values = Vec::with_capacity(pjc.jitcode.num_regs_f());
+    let mut float_seeded = vec![false; pjc.jitcode.num_regs_f()];
     for &color in &live.float {
         let color = color as usize;
         if result_bank == 'f' && result_color == Some(color) {
@@ -1447,6 +1505,46 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
             return None;
         }
         float_values.push((color, opref));
+        if let Some(seeded) = float_seeded.get_mut(color) {
+            *seeded = true;
+        }
+    }
+    // Floats keep their OpRefs and resolve at force time, and the consumer
+    // DECLINES the whole image on one that is not a stamped Float — so unlike
+    // the two concrete banks, the sweep resolves here and carries only the
+    // colors that already have a Float.  A swept color is opportunistic; it
+    // must not be able to turn a usable image into a declined one.
+    for color in 0..pjc.jitcode.num_regs_f() {
+        if float_seeded[color] || (result_bank == 'f' && result_color == Some(color)) {
+            continue;
+        }
+        let Some(opref) = ctx.registers_f.get(color).copied() else {
+            continue;
+        };
+        if opref == OpRef::NONE {
+            continue;
+        }
+        if matches!(
+            ctx.trace_ctx.concrete_of_opref(opref),
+            Some(majit_ir::Value::Float(_))
+        ) {
+            float_values.push((color, opref));
+            swept[2] += 1;
+        }
+    }
+
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-blackhole] caller image jitcode_index={jitcode_index} \
+             resume_pc={} banks={}/{}/{} swept={}/{}/{}",
+            call.next_pc,
+            int_values.len(),
+            ref_values.len(),
+            float_values.len(),
+            swept[0],
+            swept[1],
+            swept[2],
+        );
     }
 
     Some(InlineParentBlackhole {
