@@ -29,12 +29,28 @@ def raises(call, exc):
 
 check(not hasattr(os, "dup3"), "os grew a dup3")
 
-# The flag `pipe2` exists for. Every Unix has it; `nt` spells the same intent
-# O_NOINHERIT and publishes no O_CLOEXEC at all.
+# ── the <fcntl.h> flag set ───────────────────────────────────────────────
+# The values are the host header's own, so what is checked is which names
+# exist and that each is an int. The split is the hosts' own: seven on every
+# Unix, then one group per platform. `nt` has none of them.
+FLAGS = {
+    "": ("O_ACCMODE", "O_ASYNC", "O_CLOEXEC", "O_DIRECTORY", "O_FSYNC", "O_NOCTTY",
+         "O_NOFOLLOW"),
+    "linux": ("O_DIRECT", "O_LARGEFILE", "O_NOATIME", "O_PATH", "O_RSYNC", "O_TMPFILE"),
+    "darwin": ("O_EVTONLY", "O_EXEC", "O_EXLOCK", "O_NOFOLLOW_ANY", "O_SEARCH", "O_SHLOCK",
+               "O_SYMLINK"),
+}
 if sys.platform != "win32":
-    check(hasattr(os, "O_CLOEXEC"), "os has no O_CLOEXEC")
-    check(isinstance(os.O_CLOEXEC, int) and os.O_CLOEXEC != 0,
-          f"O_CLOEXEC is {getattr(os, 'O_CLOEXEC', None)!r}")
+    expected = FLAGS[""]
+    for key, names in FLAGS.items():
+        if key and sys.platform.startswith(key):
+            expected += names
+    for name in expected:
+        check(hasattr(os, name), f"os has no {name}")
+        check(isinstance(getattr(os, name), int), f"{name} is not an int")
+    # O_CLOEXEC is the flag `pipe2` exists for, and a zero there would be a flag
+    # that silently leaves the descriptor inheritable.
+    check(os.O_CLOEXEC != 0, "O_CLOEXEC is 0")
 
 # ── pipe2 ────────────────────────────────────────────────────────────────
 if hasattr(os, "pipe2"):
@@ -65,6 +81,48 @@ if hasattr(os, "pipe2"):
     raises(lambda: os.pipe2(-1), OSError)
 elif sys.platform.startswith(("linux", "freebsd", "netbsd", "openbsd", "dragonfly")):
     raise AssertionError("this host has pipe2 and os does not publish it")
+
+# ── the CPU affinity mask ────────────────────────────────────────────────
+if hasattr(os, "sched_getaffinity"):
+    cpus = os.sched_getaffinity(0)
+    check(isinstance(cpus, set), f"sched_getaffinity answered a {type(cpus).__name__}")
+    check(cpus, "this process is affine to no CPU at all")
+    check(all(isinstance(c, int) for c in cpus), "a CPU number is not an int")
+    check(all(c >= 0 for c in cpus), "a CPU number is negative")
+
+    raises(lambda: os.sched_getaffinity(), TypeError)
+    raises(lambda: os.sched_getaffinity("x"), TypeError)
+    # A pid nobody runs under. ProcessLookupError is an OSError.
+    raises(lambda: os.sched_getaffinity(-1), OSError)
+
+    try:
+        # The mask this process already has, spelled three ways: a set, a list
+        # and a bare iterator are all accepted, and all answer None.
+        check(os.sched_setaffinity(0, cpus) is None, "sched_setaffinity answered a value")
+        check(os.sched_setaffinity(0, list(cpus)) is None, "a list mask was refused")
+        check(os.sched_setaffinity(0, iter(cpus)) is None, "an iterator mask was refused")
+        check(os.sched_getaffinity(0) == cpus, "the mask changed under a no-op write")
+    except PermissionError:
+        # A host that refuses a scheduler write refuses it here too.
+        pass
+
+    # An empty mask leaves nothing to run on, and the kernel says so.
+    raises(lambda: os.sched_setaffinity(0, []), OSError)
+    # A CPU that cannot be one: negative, wider than the mask, wider than a C int.
+    raises(lambda: os.sched_setaffinity(0, [-1]), ValueError)
+    raises(lambda: os.sched_setaffinity(0, [99999]), OSError)
+    raises(lambda: os.sched_setaffinity(0, [2**40]), OverflowError)
+    # Not a CPU number at all, and not an iterable at all.
+    raises(lambda: os.sched_setaffinity(0, ["x"]), TypeError)
+    raises(lambda: os.sched_setaffinity(0, 5), TypeError)
+    raises(lambda: os.sched_setaffinity(0), TypeError)
+    raises(lambda: os.sched_setaffinity(-1, cpus), OSError)
+
+    try:
+        os.sched_setaffinity(0, cpus)
+    except PermissionError:
+        pass
+    check(os.sched_getaffinity(0) == cpus, "the mask did not survive the refusals")
 
 # ── sched_param and the policy calls ─────────────────────────────────────
 if not hasattr(os, "sched_getparam"):

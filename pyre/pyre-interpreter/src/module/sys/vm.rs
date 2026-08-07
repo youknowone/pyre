@@ -1433,6 +1433,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    // sys._get_cpu_count_config() — the cpu count the interpreter was
+    // configured with, or -1 where none was. `os.py:1180` asks before it
+    // decides whether `process_cpu_count` counts the affinity mask or aliases
+    // `cpu_count`, so a `posix` that publishes `sched_getaffinity` and a `sys`
+    // that does not answer this makes `import os` raise.
+    //
+    // -1 is the answer here rather than a placeholder: the value is set by
+    // `-X cpu_count` and `PYTHON_CPU_COUNT`, and this interpreter reads
+    // neither, so there is no configured count to report.
+    module_ns_store(
+        ns,
+        "_get_cpu_count_config",
+        make_builtin_function_with_arity("_get_cpu_count_config", |_| Ok(w_int_new(-1)), 0),
+    );
     // sys.getrecursionlimit / setrecursionlimit — pypy/module/sys/vm.py:45.
     // The runtime stack budget lives in `crate::stack_check`; both
     // helpers route through it so the interpreter, JIT prologue probe,

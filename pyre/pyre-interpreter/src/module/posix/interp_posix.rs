@@ -1091,6 +1091,51 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // silently leaves the descriptor inheritable.
         #[cfg(unix)]
         ("O_CLOEXEC", libc::O_CLOEXEC as i64),
+        // The rest of the `<fcntl.h>` set. Each value is the host header's own,
+        // and the split below is the hosts' own too: these six are on every
+        // Unix, the next two groups are one platform's each. `nt` has none of
+        // them and is left with the flags it does have.
+        #[cfg(unix)]
+        ("O_ACCMODE", libc::O_ACCMODE as i64),
+        #[cfg(unix)]
+        ("O_ASYNC", libc::O_ASYNC as i64),
+        #[cfg(unix)]
+        ("O_DIRECTORY", libc::O_DIRECTORY as i64),
+        #[cfg(unix)]
+        ("O_FSYNC", libc::O_FSYNC as i64),
+        #[cfg(unix)]
+        ("O_NOCTTY", libc::O_NOCTTY as i64),
+        #[cfg(unix)]
+        ("O_NOFOLLOW", libc::O_NOFOLLOW as i64),
+        // Linux's own. O_LARGEFILE is 0 on the targets that are already 64-bit,
+        // which is the header answering that there is nothing to widen.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        ("O_DIRECT", libc::O_DIRECT as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        ("O_LARGEFILE", libc::O_LARGEFILE as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        ("O_NOATIME", libc::O_NOATIME as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        ("O_PATH", libc::O_PATH as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        ("O_RSYNC", libc::O_RSYNC as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        ("O_TMPFILE", libc::O_TMPFILE as i64),
+        // The Apple targets' own.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        ("O_EVTONLY", libc::O_EVTONLY as i64),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        ("O_EXEC", libc::O_EXEC as i64),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        ("O_EXLOCK", libc::O_EXLOCK as i64),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        ("O_NOFOLLOW_ANY", libc::O_NOFOLLOW_ANY as i64),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        ("O_SEARCH", libc::O_SEARCH as i64),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        ("O_SHLOCK", libc::O_SHLOCK as i64),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        ("O_SYMLINK", libc::O_SYMLINK as i64),
         #[cfg(unix)]
         ("O_DSYNC", libc::O_DSYNC as i64),
         #[cfg(not(any(unix, windows)))]
@@ -5517,6 +5562,118 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
         }
 
+        // os.sched_getaffinity(pid) / os.sched_setaffinity(pid, mask) — the CPU
+        // mask, which `moduledef.py` does not publish and `rposix` does not
+        // wrap, so both are written against the host header rather than ported.
+        //
+        // The mask is the fixed `cpu_set_t`, `CPU_SETSIZE` CPUs wide: the libc
+        // crate exposes no `CPU_ALLOC`. A CPU number at or past that width is
+        // refused with the EINVAL the kernel would answer for it, and a host
+        // with more CPUs than that gets the kernel's own EINVAL out of
+        // `sched_getaffinity` rather than a silently truncated mask.
+        //
+        // Both name libc directly, so neither is compiled into a sandbox build;
+        // `host_seam::sys` re-exports no syscall and the stubs at the end of
+        // this module serve the names there.
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(target_os = "linux", target_os = "android")
+        ))]
+        {
+            crate::module_ns_store(
+                ns,
+                "sched_getaffinity",
+                crate::make_builtin_function_with_arity(
+                    "sched_getaffinity",
+                    |args| {
+                        if args.is_empty() {
+                            return Err(crate::PyError::type_error(
+                                "sched_getaffinity() requires 1 argument",
+                            ));
+                        }
+                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let mut mask: libc::cpu_set_t =
+                            unsafe { core::mem::zeroed::<libc::cpu_set_t>() };
+                        unsafe { libc::CPU_ZERO(&mut mask) };
+                        let res = unsafe {
+                            libc::sched_getaffinity(
+                                pid,
+                                core::mem::size_of::<libc::cpu_set_t>(),
+                                &mut mask,
+                            )
+                        };
+                        if res == -1 {
+                            return Err(io_err(std::io::Error::last_os_error(), ""));
+                        }
+                        let items: Vec<_> = (0..libc::CPU_SETSIZE as usize)
+                            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &mask) })
+                            .map(|cpu| pyre_object::w_int_new(cpu as i64))
+                            .collect();
+                        Ok(pyre_object::w_set_from_items(&items))
+                    },
+                    1,
+                ),
+            );
+
+            crate::module_ns_store(
+                ns,
+                "sched_setaffinity",
+                crate::make_builtin_function_with_arity(
+                    "sched_setaffinity",
+                    |args| {
+                        if args.len() < 2 {
+                            return Err(crate::PyError::type_error(
+                                "sched_setaffinity() requires 2 arguments",
+                            ));
+                        }
+                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let items = crate::builtins::collect_iterable(args[1])?;
+                        let int_type =
+                            crate::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE);
+                        let mut mask: libc::cpu_set_t =
+                            unsafe { core::mem::zeroed::<libc::cpu_set_t>() };
+                        unsafe { libc::CPU_ZERO(&mut mask) };
+                        for item in items {
+                            if !crate::baseobjspace::isinstance(item, int_type)? {
+                                return Err(crate::PyError::type_error(format!(
+                                    "expected an iterator of ints, but iterator yielded <class '{}'>",
+                                    crate::type_methods::arg_type_name(item)
+                                )));
+                            }
+                            let cpu = crate::baseobjspace::int_w(item)?;
+                            if cpu < 0 {
+                                return Err(crate::PyError::value_error("negative CPU number"));
+                            }
+                            if cpu > libc::c_int::MAX as i64 {
+                                return Err(crate::PyError::overflow_error(
+                                    "CPU number too large",
+                                ));
+                            }
+                            if cpu >= libc::CPU_SETSIZE as i64 {
+                                return Err(io_err(
+                                    std::io::Error::from_raw_os_error(libc::EINVAL),
+                                    "",
+                                ));
+                            }
+                            unsafe { libc::CPU_SET(cpu as usize, &mut mask) };
+                        }
+                        let res = unsafe {
+                            libc::sched_setaffinity(
+                                pid,
+                                core::mem::size_of::<libc::cpu_set_t>(),
+                                &mask,
+                            )
+                        };
+                        if res == -1 {
+                            return Err(io_err(std::io::Error::last_os_error(), ""));
+                        }
+                        Ok(pyre_object::w_none())
+                    },
+                    2,
+                ),
+            );
+        }
+
         // os.sync()
         #[cfg(not(any(target_os = "redox", target_os = "android")))]
         crate::module_ns_store(
@@ -9322,6 +9479,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "sched_getparam",
             "sched_rr_get_interval",
         ] {
+            crate::module_ns_store(
+                ns,
+                name,
+                crate::make_builtin_function(name, sandbox_unavailable),
+            );
+        }
+        // The affinity mask is the same kind of host-process leak, and carries
+        // the narrower gate the pair is published under.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        for name in ["sched_getaffinity", "sched_setaffinity"] {
             crate::module_ns_store(
                 ns,
                 name,

@@ -74,12 +74,19 @@ pub mod sys {
     // Constants (added as sandbox-reachable modules need them).
     pub use ::libc::{
         AT_FDCWD, CODESET, EBADF, EINTR, EINVAL, F_OK, LC_ALL, LC_COLLATE, LC_CTYPE, LC_MESSAGES,
-        LC_MONETARY, LC_NUMERIC, LC_TIME, O_APPEND, O_CLOEXEC, O_CREAT, O_DSYNC, O_EXCL,
-        O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS,
-        PRIO_USER, R_OK, RTLD_GLOBAL, RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW,
-        RUSAGE_SELF, S_IFDIR, S_IFMT, S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY,
-        TIOCGWINSZ, W_OK, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED, X_OK,
+        LC_MONETARY, LC_NUMERIC, LC_TIME, O_ACCMODE, O_APPEND, O_ASYNC, O_CLOEXEC, O_CREAT,
+        O_DIRECTORY, O_DSYNC, O_EXCL, O_FSYNC, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR,
+        O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, R_OK, RTLD_GLOBAL,
+        RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW, RUSAGE_SELF, S_IFDIR, S_IFMT,
+        S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED,
+        WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED, X_OK,
     };
+    // The `<fcntl.h>` flags only one platform declares, carrying the same gates
+    // as the table that publishes them.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub use ::libc::{O_DIRECT, O_LARGEFILE, O_NOATIME, O_PATH, O_RSYNC, O_TMPFILE};
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub use ::libc::{O_EVTONLY, O_EXEC, O_EXLOCK, O_NOFOLLOW_ANY, O_SEARCH, O_SHLOCK, O_SYMLINK};
     // `lockf`'s commands and `waitid`'s two vocabularies — which process it is
     // asked about, and what it reports happened. All are numbers the module
     // publishes; the calls themselves are refused under sandbox.
