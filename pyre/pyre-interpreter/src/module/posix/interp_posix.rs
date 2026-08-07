@@ -1021,93 +1021,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ],
     );
 
-    // The four families below are `nt`'s absentees on the same reading — none
-    // of `<sysexits.h>`, `<sys/statvfs.h>`, `<dlfcn.h>` and `<sched.h>` is a
-    // header Windows carries.
-    #[cfg(unix)]
-    {
-        // `<sysexits.h>`. The header is a verbatim descendant of the 4.3BSD one
-        // wherever it is carried, so the values are the same on every host that
-        // has it and the `libc` crate binds none of them.
-        for (name, val) in [
-            ("EX_OK", 0i64),
-            ("EX_USAGE", 64),
-            ("EX_DATAERR", 65),
-            ("EX_NOINPUT", 66),
-            ("EX_NOUSER", 67),
-            ("EX_NOHOST", 68),
-            ("EX_UNAVAILABLE", 69),
-            ("EX_SOFTWARE", 70),
-            ("EX_OSERR", 71),
-            ("EX_OSFILE", 72),
-            ("EX_CANTCREAT", 73),
-            ("EX_IOERR", 74),
-            ("EX_TEMPFAIL", 75),
-            ("EX_PROTOCOL", 76),
-            ("EX_NOPERM", 77),
-            ("EX_CONFIG", 78),
-        ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
-        }
-        // The `f_flag` bits `statvfs` answers with, which is the only reader
-        // there is for them.
-        for (name, val) in [
-            ("ST_RDONLY", libc::ST_RDONLY as i64),
-            ("ST_NOSUID", libc::ST_NOSUID as i64),
-        ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
-        }
-        // `<dlfcn.h>` — `rdynload.py:50-82` reads the same set, and
-        // `sys.setdlopenflags` and `ctypes` hand them straight back to
-        // `dlopen`, where a zero would ask for `RTLD_LOCAL | RTLD_LAZY`
-        // whatever was named.
-        for (name, val) in [
-            ("RTLD_LAZY", libc::RTLD_LAZY as i64),
-            ("RTLD_NOW", libc::RTLD_NOW as i64),
-            ("RTLD_GLOBAL", libc::RTLD_GLOBAL as i64),
-            ("RTLD_LOCAL", libc::RTLD_LOCAL as i64),
-            ("RTLD_NODELETE", libc::RTLD_NODELETE as i64),
-            ("RTLD_NOLOAD", libc::RTLD_NOLOAD as i64),
-            // A glibc extension, absent from the header anywhere else.
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            ("RTLD_DEEPBIND", libc::RTLD_DEEPBIND as i64),
-        ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
-        }
-        // `<sched.h>`, read as `rposix.py:296-300` reads it: present where the
-        // header defines it, and with the host's own numbering rather than a
-        // shared one — the three disagree between Linux, the BSDs and Darwin.
-        // The Apple targets declare them in `<pthread/pthread_impl.h>`, which
-        // the `libc` crate does not mirror.
-        for (name, val) in [
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            ("SCHED_OTHER", libc::SCHED_OTHER as i64),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            ("SCHED_OTHER", 1i64),
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            ("SCHED_FIFO", libc::SCHED_FIFO as i64),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            ("SCHED_FIFO", 4i64),
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            ("SCHED_RR", libc::SCHED_RR as i64),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            ("SCHED_RR", 2i64),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            ("SCHED_BATCH", libc::SCHED_BATCH as i64),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            ("SCHED_IDLE", libc::SCHED_IDLE as i64),
-        ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
-        }
-    }
-
     // `nt`'s own constants. The spawn modes are the C runtime's `_P_*`
     // (process.h) and carry its values: registering the set at zero made
     // `P_NOWAIT` mean `P_WAIT`. On POSIX these are os.py's, not the module's —
     // it defines `P_WAIT = 0` and `P_NOWAIT = P_NOWAITO = 1` for itself in the
-    // branch that has `fork`.
+    // branch that has `fork`, which is why `P_NOWAITO` is 3 here and 1 there.
+    //
+    // `EX_OK` is the one member of the `<sysexits.h>` family Windows answers to
+    // as well, and it carries the same 0 there.
     #[cfg(windows)]
     for (name, val) in [
+        ("EX_OK", 0i64),
         ("P_WAIT", 0i64),
         ("P_NOWAIT", 1),
         ("P_OVERLAY", 2),
@@ -1280,10 +1204,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // "spawnv"/"spawnve" — os.py:881 builds the spawn family out of
             // fork+exec+waitpid, but only `if not _exists("spawnv")`, so a name
             // bound here is not a placeholder waiting to be overwritten: it is
-            // what stops the real implementation from ever being defined.
+            // what stops the real implementation from ever being defined. That
+            // reading is the POSIX one: `nt` carries `_spawnv` itself and the
+            // os.py block is behind `_exists("fork")`, so on Windows the name
+            // is the module's or it is nowhere, and it is registered below.
             "system",
         ],
     );
+
+    // The spawn entry points `nt` has of its own. There is no fork on Windows
+    // for os.py:881 to write them over, so unbinding them here would not hand
+    // the definition back to os.py — it would delete the name.
+    #[cfg(windows)]
+    install_noop_stubs(ns, &["spawnv", "spawnve"]);
 
     // The calls `nt` has not got. Each is probed for presence rather than
     // called blind — `os.py` gates `supports_fd` on `_exists`, `shutil` picks

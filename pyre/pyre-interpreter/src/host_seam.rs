@@ -81,12 +81,12 @@ pub mod sys {
     // there as the table that publishes them: the Apple targets declare the
     // scheduling policies outside the `libc` crate, `SCHED_BATCH`/`SCHED_IDLE`
     // are Linux's own, and `RTLD_DEEPBIND` is glibc's.
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    pub use ::libc::{SCHED_FIFO, SCHED_OTHER, SCHED_RR};
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub use ::libc::{SCHED_BATCH, SCHED_IDLE};
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     pub use ::libc::RTLD_DEEPBIND;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub use ::libc::{SCHED_BATCH, SCHED_IDLE};
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub use ::libc::{SCHED_FIFO, SCHED_OTHER, SCHED_RR};
     // `SEEK_HOLE`/`SEEK_DATA` carry the same host list as the table that
     // publishes them: they exist only where the header answers the question.
     #[cfg(any(
