@@ -1,5 +1,6 @@
-//! Every `PYRE_*` environment gate read from a workspace member's Rust source
-//! must have a live entry in `pyre/gate-triage.md`.
+//! Every `PYRE_*` environment gate this project reads — from a workspace
+//! member's Rust or from its own Python — must have a live entry in
+//! `pyre/gate-triage.md`.
 //!
 //! The charter (§3.6) says a gate is a staging area, not a home, and
 //! `gate-triage.md` is the standing list of what to retire and when. That list
@@ -10,11 +11,17 @@
 //! Adding a gate therefore costs one row. The row is cheap; the alternative is
 //! another hand audit that goes stale the week after it lands.
 //!
-//! **Scope: Rust only.** `PYRE_CHECK_PYPY3`, `PYRE_CHECK_PYTHON3`,
-//! `PYRE_SHARED_BUILD` and `PYRE_SYNTH_PYPY` are live gates read from `check.py`,
-//! `check_synthetic.py`, the CI workflows and `scripts/llbc_extract.py`, and
-//! nothing here sees them. A Python- or YAML-only gate can still enter
-//! undocumented; whether to widen this scan is tracked as F5 in `rework.md`.
+//! **Scope.** Rust sources in workspace member crates, and this project's own
+//! Python under `pyre/` and `scripts/`. The harness reads six gates that no Rust
+//! file reads — `check.py`, `check_synthetic.py`, the `extra_tests` runners and
+//! `scripts/llbc_extract.py` — and two of them, `PYRE_SYNTH_PYRE` and
+//! `PYRE_SYNTH_PYTHON`, were undocumented until this scan reached them.
+//!
+//! Shell and YAML are not scanned. Every `PYRE_*` in them is *set* for a child
+//! process whose reader is Rust or Python, so the read side is already covered
+//! here; the one remaining `PYRE_*` name outside both languages,
+//! `PYRE_CLASS_DESCRIPTORS`, is a linkme distributed slice and not an env var at
+//! all (`gate-triage.md` §2).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -60,7 +67,16 @@ fn workspace_member_dirs(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Where this project's own Python lives.
+///
+/// An allow-list rather than a tree walk, for two reasons the Rust side does not
+/// have. The repository vendors the CPython and PyPy sources — `lib-python/`,
+/// `pypy/`, `rpython/`, `lib_pypy/`, some 4600 `.py` files that are upstream's
+/// and not ours — and untracked scratch directories sit at the repository root.
+/// Neither is under these two.
+const PYTHON_ROOTS: [&str; 2] = ["pyre", "scripts"];
+
+fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -69,9 +85,9 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
         if path.is_dir() {
             // A member crate's own `target/` from a standalone build.
             if entry.file_name() != "target" {
-                collect_rs(&path, out);
+                collect_sources(&path, ext, out);
             }
-        } else if path.extension().is_some_and(|e| e == "rs") {
+        } else if path.extension().is_some_and(|e| e == ext) {
             out.push(path);
         }
     }
@@ -86,7 +102,16 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 /// visible to a `std::env` search only because unrelated `env::var` readers
 /// exist in `pyre-wasm-runner`. A wasm- or sandbox-only gate would have no such
 /// cover and would bypass the brake entirely.
-const READ_FORMS: [&str; 3] = ["env::var", "host_os::var", "getenv"];
+///
+/// `environ.get` and `getenv` are the Python side. Only these two, because they
+/// read unambiguously: the harness also writes gates into a child's environment
+/// (`env["PYRE_PROBE"] = …`, `env.pop(…)`), and a subscript form cannot be told
+/// from a read without parsing. Writing a gate for a child is not owning it —
+/// the child's read is what this file asks about, and that read is in Rust.
+///
+/// A form belonging to the other language costs nothing: `env::var(` cannot
+/// occur in Python, nor `environ.get(` in Rust.
+const READ_FORMS: [&str; 4] = ["env::var", "host_os::var", "getenv", "environ.get"];
 
 /// Gate names this text reads from the environment.
 ///
@@ -129,6 +154,10 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
         );
         host_os::var("PYRE_D").ok();
         crate::host_seam::ops::getenv(b"PYRE_E");
+        os.environ.get("PYRE_F")
+        os.getenv("PYRE_G")
+        # a gate written into a child's environment is not a read of ours
+        env["PYRE_NOT_A_READ_EITHER"] = "1"
         // PYRE_MENTIONED_IN_A_COMMENT
         const PYRE_CONST: &str = "PYRE_NOT_A_READ";
         other::var("PYRE_NOT_ENV");
@@ -137,7 +166,12 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
     let mut got = gates_read_by(sample);
     // Sorted: the scan groups by read form, so the order carries no meaning.
     got.sort_unstable();
-    assert_eq!(got, vec!["PYRE_A", "PYRE_B", "PYRE_C", "PYRE_D", "PYRE_E"]);
+    assert_eq!(
+        got,
+        vec![
+            "PYRE_A", "PYRE_B", "PYRE_C", "PYRE_D", "PYRE_E", "PYRE_F", "PYRE_G"
+        ]
+    );
 }
 
 /// Does this `##` heading introduce a section that records history?
@@ -160,8 +194,9 @@ fn is_history_heading(heading: &str) -> bool {
 /// Tokenized rather than substring-searched: `contains("PYRE_A")` is satisfied
 /// by a documented `PYRE_ANCHOR_STRICT`, so a new gate whose name is a prefix of
 /// a listed one would slip through the brake unnoticed. Scoped to the live
-/// sections for the reason in `is_history_heading`. `###` subsections inherit
-/// their `##` parent, which is what keeps §6a–§6c live under §6.
+/// sections for the reason in `is_history_heading`, and within them to the rows
+/// that are not themselves retirement records. `###` subsections inherit their
+/// `##` parent, which is what keeps §6a–§6c live under §6.
 fn gates_documented_in(triage: &str) -> BTreeSet<&str> {
     let mut found = BTreeSet::new();
     let mut live = true;
@@ -170,6 +205,15 @@ fn gates_documented_in(triage: &str) -> BTreeSet<&str> {
             live = !is_history_heading(heading);
         }
         if !live {
+            continue;
+        }
+        // A row inside a live section can still be a retirement record. §1d's
+        // heading says "Parity verdicts", so the section is live, yet its table
+        // marks `PYRE_FBW_VABLE_SCALAR_CA` **RETIRED** — section granularity
+        // cannot express a mixed section. A row that says "retired" documents
+        // nothing either. "retired", not "retire": §4's live gates are the ones
+        // that "retire when the epic closes".
+        if line.to_ascii_lowercase().contains("retired") {
             continue;
         }
         for (at, _) in line.match_indices("PYRE_") {
@@ -208,6 +252,11 @@ fn every_live_pyre_gate_has_a_gate_triage_entry() {
          matches gate-triage.md's headings"
     );
     assert!(
+        !documented.contains("PYRE_FBW_VABLE_SCALAR_CA"),
+        "PYRE_FBW_VABLE_SCALAR_CA is marked RETIRED inside §1d, a section whose \
+         heading reads live — the per-row retirement check is no longer catching it"
+    );
+    assert!(
         documented.contains("PYRE_JD1"),
         "PYRE_JD1 is listed live in §6a but did not count as documented — \
          is_history_heading is excluding a live section"
@@ -215,13 +264,30 @@ fn every_live_pyre_gate_has_a_gate_triage_entry() {
 
     let mut sources = Vec::new();
     for member in workspace_member_dirs(&root) {
-        collect_rs(&member, &mut sources);
+        collect_sources(&member, "rs", &mut sources);
     }
     assert!(
         sources.len() > 100,
         "found only {} .rs files across the workspace members — the walk is not \
          reaching the tree",
         sources.len()
+    );
+
+    let rust_files = sources.len();
+    for py_root in PYTHON_ROOTS {
+        let dir = root.join(py_root);
+        assert!(
+            dir.is_dir(),
+            "PYTHON_ROOTS names {py_root}, which is not a directory under {}",
+            root.display()
+        );
+        collect_sources(&dir, "py", &mut sources);
+    }
+    assert!(
+        sources.len() - rust_files > 100,
+        "found only {} .py files under {PYTHON_ROOTS:?} — the walk is not \
+         reaching the harness",
+        sources.len() - rust_files
     );
     // This file's own fixture spells out `env::var("PYRE_A")` and friends, which
     // are test data rather than gates.

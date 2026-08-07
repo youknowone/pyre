@@ -114,43 +114,52 @@ nowhere to go belongs inside an existing kind, not in a new slot.
 runs), and the regrtest harness under moving collection. The real exit test is
 that the oldgen-nonmoving concession becomes deletable.
 
-### F5 — three documented gates have no reader left, and the brake is Rust-only
+### F5 — one gate is still listed live with no reader left
 
-The 66 undocumented gates and the missing brake are both closed: `gate-triage.md`
-§6 lists all 66, and `pyre/pyrex/tests/gate_triage_complete.rs` fails the build
-when a `PYRE_*` read in a workspace member has no entry in a **live** section of
-that file. **Measured 2026-08-07**, re-measured once §6 landed:
+The 66 undocumented gates, the missing brake, and the brake's Rust-only reach are
+all closed. `gate-triage.md` §6 lists the 66, and
+`pyre/pyrex/tests/gate_triage_complete.rs` fails the build when a `PYRE_*` read —
+from a workspace member's Rust, or from the harness Python under `pyre/` and
+`scripts/` — has no entry in a **live** section of that file.
 
 | count | value | what it is |
 |---|---|---|
-| distinct names read from `*.rs` | **105** | the population the brake sees |
-| (file, name) read pairs | 128 | read *sites*, not gates |
-| named in `gate-triage.md`'s live sections | 113 | tokens; one is the `PYRE_FBW_*` fragment in §1d's heading |
-| named in its retirement sections | 47 | already swept |
-| **live-named with no reader anywhere** | **3** | the debt |
+| distinct names read | **111** | 105 from `*.rs`, 6 only from the harness |
+| (file, name) read pairs | 137 | read *sites*, not gates |
+| documented live in `gate-triage.md` | 113 | tokens, excluding retirement rows |
+| named only in a retirement section or row | 45 | already swept |
+| **read but undocumented** | **0** | where the brake holds it |
+| **listed live with no reader anywhere** | **1** | the debt; plus the `PYRE_FBW_*` fragment in §1d's heading, which is not a name |
 
 ```sh
-git ls-files '*.rs' | xargs rg --no-filename -o \
-  '(env::var[_a-z]*|host_os::var|getenv)\(b?"(PYRE_[A-Z0-9_]+)"' -r '$2' | sort -u
+{ git ls-files '*.rs'; git ls-files 'pyre/**/*.py' 'scripts/*.py'; } \
+  | xargs rg --no-filename -o \
+      '(env::var[_a-z]*|host_os::var|getenv|environ\.get)\(b?"(PYRE_[A-Z0-9_]+)"' \
+      -r '$2' | sort -u
 ```
 
 Say which of these a number is. Earlier revisions reported 119 and then 126
 "distinct names"; both were the (file, name) pair count, because the command as
 written then kept rg's filename prefix and `sort -u` counted sites.
 
-**Violates.** Charter §3.6: a gate is a staging area, not a home. Three names are
+Widening to the harness reported exactly two names missing, and both turned out
+to be documented already — `gate-triage.md` had them in its `_PYRE`, `_PYTHON`
+run-on shorthand, which a whole-token match cannot resolve. They are spelled out
+now, and §6 says to spell every name in full at least once. A census can only
+find what the document is willing to say.
+
+Two of the three names previously counted as debt turned out to be the reverse
+problem: `PYRE_FBW_VABLE_SCALAR_CA` and `PYRE_P2_DRAIN` are recorded as retired
+in prose, inside sections whose headings read live. Those rows now document
+nothing — a retired gate whose reader came back has to earn a fresh entry rather
+than pass on its own obituary.
+
+**Violates.** Charter §3.6: a gate is a staging area, not a home. One name is
 staged in a file nobody swept.
 
-**What is left.**
-
-1. Retire `PYRE_FBW_REC_UNROLL`, `PYRE_FBW_VABLE_SCALAR_CA` and `PYRE_P2_DRAIN`
-   — named in §5/§1d, read from nothing in the tree.
-2. Decide whether the brake scans beyond Rust. Four live gates
-   (`PYRE_CHECK_PYPY3`, `PYRE_CHECK_PYTHON3`, `PYRE_SHARED_BUILD`,
-   `PYRE_SYNTH_PYPY`) are read only by `check.py`, `check_synthetic.py`, the CI
-   workflows and `scripts/llbc_extract.py`. A `*.rs` census reads them as retire
-   targets and they are not; conversely a Python- or YAML-only gate added
-   tomorrow enters undocumented, which is the hole §6 was written to close.
+**What is left.** Retire `PYRE_FBW_REC_UNROLL` — listed live among §5's config
+switches, read from nothing in the tree. The brake does not cover this direction:
+it fails on an undocumented read, not on a documented name with no reader.
 
 ### Smaller open items
 
