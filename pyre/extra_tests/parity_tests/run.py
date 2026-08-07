@@ -48,6 +48,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent.parent
@@ -111,7 +112,30 @@ def _script_env(script: Path) -> dict[str, str]:
     return {m.group(1): m.group(2) for m in _ENV_DIRECTIVE.finditer(text)}
 
 
-def _run(cmd: list[str], script: Path, env: dict[str, str] | None) -> tuple[bool, str]:
+TIMEOUT = 30
+
+
+class Failure(NamedTuple):
+    """One (script, runner) pair that did not pass, and the evidence."""
+
+    script: str
+    backend: str
+    # What the runner concluded, in one line — fits beside the table row.
+    reason: str
+    # The child's stderr, verbatim. A traceback is the answer to "why", and it
+    # only reads as one when its own line breaks survive.
+    stderr: str
+
+
+def _run(
+    cmd: list[str], script: Path, env: dict[str, str] | None
+) -> tuple[bool, str, str]:
+    """Whether the script passed, why it did not, and the child's stderr.
+
+    The reason is kept apart from the stderr rather than formatted into it: a
+    `repr` of a whole traceback is one unreadable line, and the run wants the
+    short verdict beside the row and the traceback in the report at the end.
+    """
     try:
         proc = subprocess.run(
             cmd + [str(script)],
@@ -119,27 +143,25 @@ def _run(cmd: list[str], script: Path, env: dict[str, str] | None) -> tuple[bool
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=30,
+            timeout=TIMEOUT,
             env=None if env is None else {**os.environ, **env},
         )
-    except subprocess.TimeoutExpired:
-        return False, "timeout"
-    out = proc.stdout
-    err = proc.stderr
-    lines = [line for line in out.splitlines() if line.strip()]
+    except subprocess.TimeoutExpired as expired:
+        partial = expired.stderr or ""
+        return False, f"timed out after {TIMEOUT}s", partial
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
     last = lines[-1] if lines else ""
-    ok = proc.returncode == 0 and last == "OK"
-    if ok:
-        detail = ""
-    elif proc.returncode == 0:
+    if proc.returncode == 0 and last == "OK":
+        return True, "", ""
+    if proc.returncode == 0:
         # The script ran to completion and never announced itself. Reporting
         # this as `rc=0 last=''` reads like an interpreter that produced
         # nothing, and it is reported once per runner, so three of them make a
         # sound fixture that forgot its last line look like a pyre failure.
-        detail = f"exited 0 without a final 'OK' line (last non-empty line {last!r})"
+        reason = f"exited 0 without a final 'OK' line (last non-empty line {last!r})"
     else:
-        detail = f"rc={proc.returncode} last={last!r} stderr={err.strip()!r}"
-    return ok, detail
+        reason = f"exited {proc.returncode} (last non-empty stdout line {last!r})"
+    return False, reason, proc.stderr
 
 
 PROBE = "import sys; print(sys.version_info[0], sys.version_info[1]); print(sys.executable)"
@@ -206,6 +228,45 @@ def _cpython() -> str:
     )
 
 
+def _report(failures: list[Failure]) -> None:
+    """The evidence for every failure, printed last and on stdout.
+
+    Last because a CI log is read from its end, and the table above it is two
+    hundred rows: a reader who has to scroll up for the reason reruns the job
+    instead. On stdout because the table is — these lines used to go to stderr,
+    which is unbuffered where a piped stdout is not, so the whole report
+    arrived in the log *above* the run's own header and the last thing before
+    the runner's non-zero exit was a passing row.
+    """
+    print("=" * 72)
+    print(f"{len(failures)} failure(s)")
+    for failure in failures:
+        print()
+        print(f"  {failure.script} [{failure.backend}]: {failure.reason}")
+        for line in failure.stderr.strip().splitlines():
+            print(f"      {line}")
+    print("=" * 72)
+
+
+def _annotate(failures: list[Failure]) -> None:
+    """One GitHub Actions error annotation per failure.
+
+    An annotation shows on the pull request and the job summary, so the
+    reason survives even for a reader who never opens the log. The message is
+    a single line by the format's own rule, so it carries the verdict and the
+    exception line rather than the whole traceback.
+    """
+    for failure in failures:
+        spoken = [line.strip() for line in failure.stderr.splitlines() if line.strip()]
+        tail = spoken[-1] if spoken else ""
+        message = f"{failure.backend}: {failure.reason}"
+        if tail:
+            message += f" | {tail}"
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        path = (HERE / failure.script).relative_to(ROOT).as_posix()
+        print(f"::error file={path},title=parity::{escaped}")
+
+
 def _runners(
     only_dynasm: bool, only_cranelift: bool, gc_poison: bool
 ) -> list[tuple[str, list[str], dict[str, str] | None]]:
@@ -228,6 +289,15 @@ def main() -> int:
     parser.add_argument("--gc-poison", action="store_true")
     args = parser.parse_args()
 
+    # A piped stdout is block-buffered, so without line buffering the rows
+    # arrive in the log in one burst at the end and a run that dies mid-way
+    # names none of the scripts it got through. The encoding is pinned because
+    # the report echoes a child's stderr, and several of these scripts are
+    # about names no console codepage can spell — printing one of those on a
+    # non-UTF-8 console used to kill the runner with a `UnicodeEncodeError`
+    # instead of reporting the failure it was in the middle of explaining.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
     runners = _runners(args.dynasm_only, args.cranelift_only, args.gc_poison)
     scripts, skipped = _scripts()
     if not scripts:
@@ -240,27 +310,31 @@ def main() -> int:
         print(f"skipped ({sys.platform} not in its platforms): {script.name}")
     print()
 
-    fail = 0
+    failures: list[Failure] = []
     for script in scripts:
         name = script.name
         pinned = _script_env(script)
         row: list[str] = [f"  {name:<36s}"]
+        reasons: list[str] = []
         for backend, cmd, env in runners:
             merged = {**(env or {}), **pinned}
-            ok, detail = _run(cmd, script, merged or None)
-            mark = "OK" if ok else "FAIL"
-            row.append(f"{backend}={mark}")
+            ok, reason, err = _run(cmd, script, merged or None)
+            row.append(f"{backend}={'OK' if ok else 'FAIL'}")
             if not ok:
-                fail += 1
-                print(f"    {backend} {name}: {detail}", file=sys.stderr)
+                failures.append(Failure(name, backend, reason, err))
+                reasons.append(f"      {backend}: {reason}")
         print(" ".join(row))
+        for line in reasons:
+            print(line)
 
     print()
-    if fail:
-        print(f"{fail} failure(s)", file=sys.stderr)
-        return 1
-    print("all parity tests pass")
-    return 0
+    if not failures:
+        print("all parity tests pass")
+        return 0
+    _report(failures)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        _annotate(failures)
+    return 1
 
 
 if __name__ == "__main__":
