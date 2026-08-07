@@ -1239,6 +1239,35 @@ fn finalize_system_exit(
     std::process::exit(code);
 }
 
+/// Die by SIGINT for an uncaught KeyboardInterrupt after shutdown has run
+/// (`app_main.py:1133-1153`).
+fn terminate_by_sigint() -> ! {
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        #[cfg(windows)]
+        let signaled = libc::raise(libc::SIGINT);
+        #[cfg(not(windows))]
+        let signaled = libc::kill(libc::getpid(), libc::SIGINT);
+        if signaled != 0 {
+            std::process::exit(1);
+        }
+    }
+    std::process::abort();
+}
+
+fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {
+    let exc = error.exc_object;
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return false;
+    }
+    let Some(raised_type) = pyre_interpreter::typedef::r#type(exc) else {
+        return false;
+    };
+    pyre_interpreter::builtins::lookup_exc_class("KeyboardInterrupt").is_some_and(|target| unsafe {
+        pyre_interpreter::baseobjspace::exception_issubclass_w(raised_type.as_ptr(), target)
+    })
+}
+
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
 /// the `-m` entry point. `vm.run_module` analog.
 fn run_module(module: &str, no_site: bool) {
@@ -1283,6 +1312,7 @@ fn run_module(module: &str, no_site: bool) {
         if e.kind == PyErrorKind::SystemExit {
             finalize_system_exit(e, canonical, ec_ptr);
         }
+        let is_keyboard_interrupt = is_keyboard_interrupt(&e);
         // targetpypystandalone.py:88 `finally: space.finish()` — finalize on
         // every exit path, not only on SystemExit.  Print first: the raw
         // `PyObjectRef` fields of `e` are not GC-visible and `finalize_runtime`
@@ -1290,6 +1320,9 @@ fn run_module(module: &str, no_site: bool) {
         pyre_interpreter::eprint_exception(&e, true);
         finalize_runtime(canonical, ec_ptr);
         maybe_print_jit_stats();
+        if is_keyboard_interrupt {
+            terminate_by_sigint();
+        }
         std::process::exit(1);
     }
     finalize_runtime(canonical, ec_ptr);
@@ -1450,6 +1483,7 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
             if e.kind == PyErrorKind::SystemExit {
                 finalize_system_exit(e, canonical, ec_ptr);
             }
+            let is_keyboard_interrupt = is_keyboard_interrupt(&e);
             // targetpypystandalone.py:88 `finally: space.finish()` — finalize
             // on every exit path, not only on SystemExit.  Print first: the raw
             // `PyObjectRef` fields of `e` are not GC-visible and
@@ -1457,6 +1491,9 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
             pyre_interpreter::eprint_exception(&e, true);
             finalize_runtime(canonical, ec_ptr);
             maybe_print_jit_stats();
+            if is_keyboard_interrupt {
+                terminate_by_sigint();
+            }
             std::process::exit(1);
         }
     }
