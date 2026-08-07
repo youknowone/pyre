@@ -2755,7 +2755,7 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
     if let Some(importlib) = importlib {
         let repr_fn = crate::baseobjspace::getattr_str(importlib, "_module_repr")?;
         let result = crate::call::call_function_impl_result(repr_fn, &[module])?;
-        return Ok(unsafe { pyre_object::w_str_get_wtf8(result) }.to_wtf8_buf());
+        return Ok(crate::baseobjspace::text_wtf8_w(result)?.to_wtf8_buf());
     }
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let loader = crate::baseobjspace::finditem_str(w_dict, "__loader__")?;
