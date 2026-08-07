@@ -24,17 +24,22 @@ struct ApplevelForkCallbacks {
 }
 
 /// `posix.DirEntry` — native layout `[PyObject | w_name | w_path | w_stat |
-/// w_lstat | dir_fd | enum_ino]`, matching `interp_scandir.py W_DirEntry`: the
-/// name and full path plus the cached `stat` (`follow_symlinks=True`) and
-/// `lstat` (`follow_symlinks=False`) results.  `w_stat`/`w_lstat` are `PY_NULL`
-/// until first requested, so `entry.stat()` re-fetches once and then returns
-/// the same object, and `is_dir`/`is_file` share the same on-demand stat.
-/// `dir_fd` is the descriptor a `scandir(fd)` handed the entry (`-1` for a
-/// name), which its own stat resolves the bare `name` against — the native
-/// counterpart of `self.scandir_iterator.orig_fd`.  `enum_ino` is the inode
-/// `readdir` reported at enumeration (`descr_inode`'s `self.inode`), so
-/// `inode()` answers from it without a stat; it is `-1` when unavailable (the
-/// `scandir(fd)` path and non-unix hosts), which falls back to a stat.
+/// w_lstat | dir_fd | enum_ino | enum_type]`, matching `interp_scandir.py
+/// W_DirEntry`: the name and full path plus the cached `stat`
+/// (`follow_symlinks=True`) and `lstat` (`follow_symlinks=False`) results.
+/// `w_stat`/`w_lstat` are `PY_NULL` until first requested, so `entry.stat()`
+/// re-fetches once and then returns the same object, and `is_dir`/`is_file`
+/// share the same on-demand stat.  `dir_fd` is the descriptor a `scandir(fd)`
+/// handed the entry (`-1` for a name), which its own stat resolves the bare
+/// `name` against — the native counterpart of
+/// `self.scandir_iterator.orig_fd`.  `enum_ino` is the inode `readdir` reported
+/// at enumeration (`descr_inode`'s `self.inode`), so `inode()` answers from it
+/// without a stat; it is `-1` when unavailable (non-unix hosts), which falls
+/// back to a stat.  `enum_type` is the `d_type` `readdir` reported (the
+/// `known_type` half of `self.flags`), so `is_dir`/`is_file`/`is_symlink`
+/// answer from it without a stat when it is not `DT_UNKNOWN`; it defaults to
+/// `DT_UNKNOWN` (`0`) — the value for a host or filesystem that reports no
+/// type — which falls through to the stat.
 /// The layout carries no instance dict; `name`/`path` are read-only getset
 /// descriptors, so the type is not instantiable and not acceptable as a base.
 #[crate::pyre_class("posix.DirEntry")]
@@ -46,6 +51,7 @@ pub struct W_DirEntry {
     pub w_lstat: PyObjectRef,
     pub dir_fd: i32,
     pub enum_ino: i64,
+    pub enum_type: i32,
 }
 
 static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
@@ -2670,14 +2676,44 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
     }
 
-    /// The names a directory descriptor holds, `.` and `..` left out
+    /// Drive an open `DIR*` to its end, handing each real entry (`.` and `..`
+    /// left out) to `f` as `(name, d_ino, d_type)` — the `get_name_bytes`,
+    /// `get_inode`, and `get_known_type` a `nextentry` yields
+    /// (`interp_scandir.py:148-153`).  Returns the errno at the end: `0` for a
+    /// clean end, or the failure `readdir` reported.  Does not close `dirp`.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    fn readdir_collect(dirp: *mut libc::DIR, mut f: impl FnMut(&[u8], i64, u8)) -> i32 {
+        loop {
+            // `readdir` reports the end of the directory and a failure the
+            // same way — a null return — so errno is cleared before the call
+            // and read back after it (`rposix.py:797` RFFI_FULL_ERRNO_ZERO).
+            rustpython_host_env::os::set_errno(0);
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
+                return crate::builtins::crt_errno();
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let name = name.to_bytes();
+            if name != b"." && name != b".." {
+                let ino = unsafe { (*entry).d_ino } as i64;
+                let d_type = unsafe { (*entry).d_type };
+                f(name, ino, d_type);
+            }
+        }
+    }
+
+    /// Read a directory descriptor's entries through `f`
     /// (`rposix.py:810-845` `_listdir`/`fdlistdir`).
     ///
     /// `fdopendir` takes the descriptor over and `closedir` closes it, so the
     /// caller's own is duplicated first — `interp_posix.py:1118` spells that
-    /// `rposix.dup(fd, inheritable=False)`, which is `F_DUPFD_CLOEXEC`.
+    /// `rposix.dup(fd, inheritable=False)`, which is `F_DUPFD_CLOEXEC`.  The
+    /// duplicate shares its file description — and so its directory offset —
+    /// with the caller's descriptor, which would be left at the end of the
+    /// directory and read as empty next time; `_listdir`'s `rewind=True`
+    /// (`rposix.py:844`) puts it back before the close.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    fn fdlistdir(fd: i32) -> Result<Vec<Vec<u8>>, i32> {
+    fn fd_readdir(fd: i32, f: impl FnMut(&[u8], i64, u8)) -> Result<(), i32> {
         let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
         if dup < 0 {
             return Err(crate::builtins::crt_errno());
@@ -2688,32 +2724,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             unsafe { libc::close(dup) };
             return Err(errno);
         }
-        let mut names = Vec::new();
-        let errno = loop {
-            // `readdir` reports the end of the directory and a failure the
-            // same way — a null return — so errno is cleared before the call
-            // and read back after it (`rposix.py:797` RFFI_FULL_ERRNO_ZERO).
-            rustpython_host_env::os::set_errno(0);
-            let entry = unsafe { libc::readdir(dirp) };
-            if entry.is_null() {
-                break crate::builtins::crt_errno();
-            }
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-            let name = name.to_bytes();
-            if name != b"." && name != b".." {
-                names.push(name.to_vec());
-            }
-        };
-        // The duplicate shares its file description — and so its directory
-        // offset — with the caller's descriptor, which would be left at the end
-        // of the directory and read as empty next time. `_listdir`'s
-        // `rewind=True` (`rposix.py:844`) puts it back before the close.
+        let errno = readdir_collect(dirp, f);
         unsafe { libc::rewinddir(dirp) };
         // `closedir` closes the duplicate, so nothing here outlives the call.
         unsafe { libc::closedir(dirp) };
         if errno != 0 {
             return Err(errno);
         }
+        Ok(())
+    }
+
+    /// The names a directory descriptor holds, `.` and `..` left out.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    fn fdlistdir(fd: i32) -> Result<Vec<Vec<u8>>, i32> {
+        let mut names = Vec::new();
+        fd_readdir(fd, |name, _ino, _d_type| names.push(name.to_vec()))?;
         Ok(names)
     }
 
@@ -3752,6 +3777,38 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     const S_IFREG: u32 = 0o100_000;
     const S_IFLNK: u32 = 0o120_000;
 
+    /// The `d_type` byte `readdir` reports — the `known_type` half of
+    /// `interp_scandir.py`'s `flags`.  `DT_UNKNOWN` (`0`) is the `W_DirEntry`
+    /// default, so an entry whose type the host did not report (a non-unix
+    /// host, or a filesystem that answers `DT_UNKNOWN`) falls through to the
+    /// stat `dir_entry_kind` runs.  Only the three types the tests read need a
+    /// name.
+    const DT_UNKNOWN: u8 = 0;
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    const DT_LNK: u8 = 10;
+
+    fn dir_entry_known_type(self_obj: PyObjectRef) -> u8 {
+        W_DirEntry::from_obj(self_obj).map_or(DT_UNKNOWN, |de| de.enum_type as u8)
+    }
+
+    /// Answer `is_dir`/`is_file`/`is_symlink` from the enumeration `d_type`
+    /// when it decides the question, else `None` to fall through to a stat
+    /// (`interp_scandir.py:399-426`).  `target` is the `DT_*` the query wants.
+    /// An unknown type never decides.  A symlink decides every query but a
+    /// followed `is_dir`/`is_file`, which need the target's type instead.
+    fn dir_entry_kind_from_type(known: u8, target: u8, follow: bool) -> Option<bool> {
+        if known == DT_UNKNOWN {
+            None
+        } else if known == target {
+            Some(true)
+        } else if follow && known == DT_LNK {
+            None
+        } else {
+            Some(false)
+        }
+    }
+
     /// The file type an entry's name resolves to, or `None` for a name that has
     /// gone away — `check_mode` (`interp_scandir.py:319-330`) answers "no, not
     /// this type" for `ENOENT` alone, on the reasoning that a vanished entry is
@@ -3794,20 +3851,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
     fn dir_entry_is_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let follow = dir_entry_follow(args)?;
-        Ok(pyre_object::w_bool_from(
-            dir_entry_kind(args, follow)? == Some(S_IFDIR),
-        ))
+        let ans = match dir_entry_kind_from_type(dir_entry_known_type(args[0]), DT_DIR, follow) {
+            Some(b) => b,
+            None => dir_entry_kind(args, follow)? == Some(S_IFDIR),
+        };
+        Ok(pyre_object::w_bool_from(ans))
     }
     fn dir_entry_is_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let follow = dir_entry_follow(args)?;
-        Ok(pyre_object::w_bool_from(
-            dir_entry_kind(args, follow)? == Some(S_IFREG),
-        ))
+        let ans = match dir_entry_kind_from_type(dir_entry_known_type(args[0]), DT_REG, follow) {
+            Some(b) => b,
+            None => dir_entry_kind(args, follow)? == Some(S_IFREG),
+        };
+        Ok(pyre_object::w_bool_from(ans))
     }
     fn dir_entry_is_symlink(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        Ok(pyre_object::w_bool_from(
-            dir_entry_kind(args, false)? == Some(S_IFLNK),
-        ))
+        // `is_symlink` never follows, so a known non-`DT_LNK` type answers `false`
+        // and `DT_LNK` answers `true`; only `DT_UNKNOWN` needs the lstat.
+        let ans = match dir_entry_kind_from_type(dir_entry_known_type(args[0]), DT_LNK, false) {
+            Some(b) => b,
+            None => dir_entry_kind(args, false)? == Some(S_IFLNK),
+        };
+        Ok(pyre_object::w_bool_from(ans))
     }
     fn dir_entry_is_junction(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // POSIX has no junction points.
@@ -3815,8 +3880,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
     fn dir_entry_inode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // `descr_inode` returns the inode `readdir` reported at enumeration when
-        // the entry carries one (the name-based `scandir` path on unix), with no
-        // stat; `-1` means it has none and the stat paths below answer instead.
+        // the entry carries one (every unix `scandir` path, name or descriptor),
+        // with no stat; `-1` means it has none and the stat paths below answer
+        // instead.
         if let Some(de) = W_DirEntry::from_obj(args[0]) {
             if de.enum_ino != -1 {
                 return Ok(pyre_object::w_int_new(de.enum_ino));
@@ -4133,6 +4199,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// is stable but its young strings join the remembered set.  `dir_fd` is the
     /// descriptor the entry resolves its own `name` against, or `-1`.  `enum_ino`
     /// is the `readdir` inode (or `-1` when the enumeration did not carry one).
+    /// Join a `scandir` path prefix to an entry name the way
+    /// `interp_scandir.py:65-67` builds `w_path_prefix`: a separator goes
+    /// between them unless the prefix is empty or already ends in one.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    fn join_dir_name(prefix: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut full = Vec::with_capacity(prefix.len() + 1 + name.len());
+        full.extend_from_slice(prefix);
+        if !prefix.is_empty() && full.last() != Some(&b'/') {
+            full.push(b'/');
+        }
+        full.extend_from_slice(name);
+        full
+    }
     fn scandir_push_entry(
         list_slot: usize,
         bytes_mode: bool,
@@ -4140,6 +4219,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         full: &[u8],
         dir_fd: i32,
         enum_ino: i64,
+        enum_type: u8,
     ) {
         let _entry_scope = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::shadow_stack_len();
@@ -4152,6 +4232,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         de.w_path = pyre_object::gc_roots::shadow_stack_get(base + 1);
         de.dir_fd = dir_fd;
         de.enum_ino = enum_ino;
+        de.enum_type = enum_type as i32;
         unsafe { pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8) };
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         unsafe { pyre_object::w_list_append(list, obj) };
@@ -4189,15 +4270,39 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `interp_scandir.py:50` leaves the path prefix empty for a
                 // descriptor — there is no directory to join — so an entry's
                 // `path` is its bare `name`, and a descriptor is not `bytes`,
-                // so both come back as `str`.
-                for name in
-                    fdlistdir(fd).map_err(|errno| errno_err_with_filename(errno, w_path()))?
-                {
-                    // `fdlistdir` yields names only, so the descriptor entries
-                    // carry no enumeration inode yet and `inode()` stats them.
-                    scandir_push_entry(list_slot, false, &name, &name, fd, -1);
+                // so both come back as `str`. Every entry records the
+                // descriptor so its own stat resolves the bare name against it.
+                fd_readdir(fd, |name, ino, d_type| {
+                    scandir_push_entry(list_slot, false, name, name, fd, ino, d_type);
+                })
+                .map_err(|errno| errno_err_with_filename(errno, w_path()))?;
+            }
+            // A name is enumerated through `opendir`/`readdir` so each entry
+            // carries the `d_ino` and `d_type` the dirent reports
+            // (`interp_scandir.py:148-153`): `inode()` answers from `d_ino`
+            // and `is_dir`/`is_file`/`is_symlink` from `d_type`, both without
+            // a stat.
+            #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+            _ => {
+                let c_path = std::ffi::CString::new(path)
+                    .map_err(|_| crate::PyError::value_error("embedded null byte"))?;
+                let dirp = unsafe { libc::opendir(c_path.as_ptr()) };
+                if dirp.is_null() {
+                    return Err(errno_err_with_filename(crate::builtins::crt_errno(), w_path()));
+                }
+                let errno = readdir_collect(dirp, |name, ino, d_type| {
+                    let full = join_dir_name(path, name);
+                    scandir_push_entry(list_slot, bytes_mode, name, &full, -1, ino, d_type);
+                });
+                unsafe { libc::closedir(dirp) };
+                if errno != 0 {
+                    return Err(errno_err_with_filename(errno, w_path()));
                 }
             }
+            // No raw `readdir` to read the dirent from (wasm, the sandbox seam,
+            // or a build without `host_env`), so `d_type` is unknown and
+            // `is_dir` stats; the inode is still free from the dirent on unix.
+            #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
             _ => {
                 let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
                     .map_err(|e| fs_err_with_filename(e, w_path()))?;
@@ -4205,9 +4310,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let entry = entry.map_err(|e| fs_err_with_filename(e, w_path()))?;
                     let name = entry.file_name();
                     let full = entry.path().into_os_string();
-                    // The inode `readdir` reported is what `descr_inode`
-                    // returns; `d_ino` comes straight from the dirent, so
-                    // capturing it here lets `inode()` answer without a stat.
                     #[cfg(unix)]
                     let enum_ino = {
                         use std::os::unix::fs::DirEntryExt;
@@ -4222,6 +4324,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         full.as_encoded_bytes(),
                         -1,
                         enum_ino,
+                        DT_UNKNOWN,
                     );
                 }
             }
