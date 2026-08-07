@@ -288,40 +288,96 @@ pub fn jit_call_area_addr() -> usize {
     &JIT_CALL_AREA as *const _ as usize
 }
 
-thread_local! {
-    /// llmodel.py self.gc_ll_descr — owned by the active wasm
-    /// backend on this thread. Stored as a thread-local so the
-    /// backend-agnostic `majit_gc::ActiveGcGuardHooks` shims can
-    /// reach the live allocator without taking a wasm dependency.
-    /// Mirrors `cranelift::compiler::CRANELIFT_ACTIVE_GC` and
-    /// `dynasm::runner::DYNASM_ACTIVE_GC` — RPython's
-    /// `cpu.gc_ll_descr` parity, single-slot per thread.
-    static WASM_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> = const { RefCell::new(None) };
-    /// Raw mirror of the boxed allocator, read by `wasm_gc_owns_object`'s
-    /// reentrant fallback: the interpreter-safepoint major holds the
-    /// `WASM_ACTIVE_GC` mutable borrow while extra-root walkers ask whether a
-    /// slot is GC-managed, so that query routes through the raw pointer instead
-    /// of a second borrow. Mirrors `dynasm::runner::DYNASM_ACTIVE_GC_RAW`.
-    static WASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn GcAllocator>> =
-        const { std::cell::Cell::new(None) };
+/// The per-thread GC box, and the accessors every trampoline reaches it through.
+///
+/// `gc.py:30` `GcLLDescription.__init__` holds `self.gcdescr` as a plain field
+/// on the backend descriptor — there is no per-thread allocator upstream — so
+/// this cell is scaffolding, not a ported structure. Only `install_gc_box`
+/// fills it and only tests reach that; the production build goes through
+/// `install_gc_standalone` and allocates from the `gc_sync` singleton.
+///
+/// Every accessor opens with `majit_gc::gc_box_installed()`, which without
+/// `majit-gc/gc_box` is a constant `false` — so in a production build each one
+/// folds to `None`, the thread-local becomes unreachable, and the trampolines
+/// call `gc_sync` directly. The gate lives in `majit-gc` because a Cargo
+/// feature is per-crate: this crate cannot `#[cfg]` on a feature of its
+/// dependency, so the box is eliminated by the optimizer rather than by
+/// conditional compilation. Mirrors `majit-backend-dynasm/src/runner.rs`'s
+/// `gc_box`.
+mod gc_box {
+    use super::{GcAllocator, RefCell};
+
+    thread_local! {
+        /// llmodel.py self.gc_ll_descr — owned by the active wasm backend on
+        /// this thread. Stored as a thread-local so the backend-agnostic
+        /// `majit_gc::ActiveGcGuardHooks` shims can reach the live allocator
+        /// without taking a wasm dependency. RPython's `cpu.gc_ll_descr`
+        /// parity, single-slot per thread.
+        static WASM_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> =
+            const { RefCell::new(None) };
+        /// Read-only mirror of the box address: the interpreter-safepoint major
+        /// holds the mutable borrow while extra-root walkers ask whether a slot
+        /// is GC-managed, so that query routes through the raw pointer instead
+        /// of taking a second borrow.
+        static WASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn GcAllocator>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// `&mut` access to this thread's GC box, for allocation, write barriers
+    /// and collection. `None` means there is no box, and the caller runs its
+    /// `gc_sync` path instead.
+    pub(super) fn with_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
+        if !majit_gc::gc_box_installed() {
+            return None;
+        }
+        WASM_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
+            // SAFETY: `guard` holds the borrow for the whole `f` call and
+            // these are non-reentrant top-level trampolines, so the reborrow
+            // is exclusive and outlives `f`.
+            Some(f(unsafe { &mut *raw }))
+        })
+    }
+
+    /// Read-only access that tolerates being reached from inside a collection:
+    /// when an in-progress mutation already holds the mutable borrow, read the
+    /// same allocator through the raw mirror rather than taking a second one.
+    pub(super) fn with_reentrant_ref<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
+        if !majit_gc::gc_box_installed() {
+            return None;
+        }
+        WASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
+            Ok(guard) => guard.as_deref().map(f),
+            // SAFETY: the mirror is published and cleared under the same
+            // borrow as the box itself, so a non-null value points at the
+            // live allocator, and this query only reads it.
+            Err(_) => WASM_ACTIVE_GC_RAW.with(|raw| raw.get().map(|p| f(unsafe { &*p }))),
+        })
+    }
+
+    /// Whether this thread holds a box at all.
+    pub(super) fn present() -> bool {
+        majit_gc::gc_box_installed() && WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some())
+    }
+
+    /// Store `gc` as this thread's box, publishing the raw mirror with it.
+    pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) {
+        WASM_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            *guard = Some(gc);
+            let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+            WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+        });
+    }
 }
 
+/// Read-only GC query for the guard hooks and codegen helpers. The box arm is
+/// reentrancy-tolerant because these can fire during a collection's extra-root
+/// walk, which is also why the singleton arm is the reentrant read.
 fn with_wasm_active_gc<R>(f: impl Fn(&dyn GcAllocator) -> R) -> Option<R> {
-    if !majit_gc::gc_box_installed() {
-        return majit_gc::gc_sync::is_initialized()
-            .then(|| majit_gc::gc_sync::gc_query_reentrant(|gc| f(gc)));
-    }
-    match WASM_ACTIVE_GC.with(|cell| cell.try_borrow().map(|g| g.as_deref().map(|gc| f(gc)))) {
-        Ok(Some(r)) => return Some(r),
-        Ok(None) => {}
-        Err(_) => {
-            if let Some(ptr) = WASM_ACTIVE_GC_RAW.with(|raw| raw.get()) {
-                // SAFETY: the raw mirror points at the same live test box whose
-                // mutable borrow is held by the in-progress mutation. This is a
-                // read-only reentrant query, so it does not create a second &mut.
-                return Some(f(unsafe { &*ptr }));
-            }
-        }
+    if let Some(r) = gc_box::with_reentrant_ref(&f) {
+        return Some(r);
     }
     if majit_gc::gc_sync::is_initialized() {
         return Some(majit_gc::gc_sync::gc_query_reentrant(|gc| f(gc)));
@@ -335,15 +391,8 @@ fn with_wasm_active_gc<R>(f: impl Fn(&dyn GcAllocator) -> R) -> Option<R> {
 /// `None` so callers keep their non-GC fallback. Top-level mutator/
 /// blackhole trampolines, never inside a collection, so `gc_op` is correct.
 fn with_wasm_active_gc_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
-    if majit_gc::gc_box_installed() && WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
-        return WASM_ACTIVE_GC.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
-            // SAFETY: `guard` holds the borrow for the whole `f` call and
-            // these are non-reentrant top-level trampolines, so the
-            // reborrow is exclusive and outlives `f`.
-            Some(f(unsafe { &mut *raw }))
-        });
+    if gc_box::present() {
+        return gc_box::with_mut(f);
     }
     if majit_gc::gc_sync::is_initialized() {
         return Some(majit_gc::gc_sync::gc_op(|gc| f(gc)));
@@ -409,12 +458,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     majit_gc::disarm_published_nursery();
     majit_gc::note_gc_box_installed();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
-    WASM_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        *guard = Some(gc);
-        let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
-        WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
-    });
+    gc_box::store(gc);
     register_active_hooks(supports_guard_gc_type);
 }
 
@@ -1015,43 +1059,15 @@ fn wasm_active_gc_write_barrier(obj: GcRef) {
 
 /// Host-side `is_managed_heap_object` trampoline.
 ///
-/// This read-only ownership query can fire reentrantly from an extra-root
-/// walker mid-collection (the interpreter-safepoint major holds the
-/// `WASM_ACTIVE_GC` mutable borrow while asking whether a slot is
-/// GC-managed), so:
-///   - `Ok(Some)`: a test box is present and free-borrowable → use it.
-///   - `Ok(None)`: no box (production) → route to `gc_sync` reentrantly.
-///   - `Err`: the test box's mutable borrow is held by an in-progress
-///     mutation → reach it through the raw mirror (read-only), or fall
-///     back to `gc_sync` if there is no box at all.
+/// This query can fire reentrantly from an extra-root walker mid-collection
+/// (the interpreter-safepoint major holds the box's mutable borrow while
+/// asking whether a slot is GC-managed), so both arms are read-only.
 fn wasm_gc_owns_object(addr: usize) -> bool {
-    if !majit_gc::gc_box_installed() {
-        return majit_gc::gc_sync::is_initialized()
-            && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr));
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.is_managed_heap_object(addr)) {
+        return r;
     }
-    match WASM_ACTIVE_GC.with(|cell| {
-        cell.try_borrow()
-            .map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr)))
-    }) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            if majit_gc::gc_sync::is_initialized() {
-                majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
-            } else {
-                false
-            }
-        }
-        Err(_) => WASM_ACTIVE_GC_RAW.with(|raw| match raw.get() {
-            Some(ptr) => unsafe { (*ptr).is_managed_heap_object(addr) },
-            None => {
-                if majit_gc::gc_sync::is_initialized() {
-                    majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
-                } else {
-                    false
-                }
-            }
-        }),
-    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
 }
 
 pub struct WasmBackend {
