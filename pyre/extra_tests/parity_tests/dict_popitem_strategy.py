@@ -1,3 +1,6 @@
+import types
+
+
 def assert_empty_popitem(d):
     try:
         d.popitem()
@@ -67,5 +70,25 @@ sub = DictSubclass()
 sub["x"] = 1
 sub["y"] = 2
 assert_lifo("subclass", sub, [("y", 2), ("x", 1)])
+
+# A non-str key moves a module dict off cell storage; popitem has a separate
+# arm for that storage half, and a reader of a popped global must stop seeing it.
+switched = types.ModuleType("popitem_strategy_switched")
+exec("def read_g():\n    return g\n", switched.__dict__)
+read_g = switched.read_g
+switched.__dict__[42] = "not a str key"
+switched.__dict__["g"] = "before"
+assert read_g() == "before"
+assert switched.__dict__.popitem() == ("g", "before")
+try:
+    read_g()
+except NameError:
+    pass
+else:
+    raise AssertionError("read_g must not see the popped global")
+switched.__dict__["g"] = "after"
+assert read_g() == "after"
+assert switched.__dict__.popitem() == ("g", "after")
+assert switched.__dict__.popitem() == (42, "not a str key")
 
 print("OK")

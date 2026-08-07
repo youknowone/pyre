@@ -4586,8 +4586,9 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let w_obj = mapdict_strategy_unerase(w_dict);
         let _instance_guard = instance_lock(w_obj);
         ensure_mapdict_initialized(w_obj);
-        let inst = &*(w_obj as *const pyre_object::W_ObjectObject);
-        let curr = node_search(inst._get_mapdict_map(), DICT)?;
+        let inst = &mut *(w_obj as *mut pyre_object::W_ObjectObject);
+        let map = inst._get_mapdict_map();
+        let curr = node_search(map, DICT)?;
         let key = &(*curr).as_plain().name;
         // mapdict.py:1231 reads the value with `getitem_str(w_dict, key)`, but
         // the trait's `getitem_str` takes a `&str` and a node name is WTF-8:
@@ -4595,8 +4596,17 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         // is a node here and has no `&str` form. The `node_search` hit makes
         // the value-present arm explicit: `node_read` would return
         // `Some(plain_direct_read(curr, inst))` (mapdict.py:55-66).
-        let w_value = plain_direct_read(curr, inst);
+        //
+        // Box the key before the read's conversion tail runs: `key` borrows the
+        // map node, and the migration below replaces the instance's map.
         let w_key = pyre_object::unicodeobject::box_str_constant(key);
+        let w_value = plain_direct_read(curr, &*inst);
+        // `plain_direct_read` is only `_prim_direct_read` (mapdict.py:600-601).
+        // The read still owes `_direct_read`'s tail (mapdict.py:592-598): an
+        // unboxed attribute whose terminator has stopped allowing unboxing
+        // converts the whole instance to boxed storage. `getdictvalue` pairs
+        // the two the same way.
+        maybe_migrate_to_boxed(map, inst, key, DICT);
         self.delitem(w_dict, w_key);
         Some((w_key, w_value))
     }

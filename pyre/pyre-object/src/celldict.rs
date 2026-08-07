@@ -1197,13 +1197,18 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// `celldict.py:166-173 popitem` — pop the most recently inserted
     /// (key, cell) from the IndexMap, mutated(), unwrap the cell, and
     /// return (`_wrapkey(space, key)`, `unwrap_cell(space, cell)`).
-    /// O(1) via `IndexMap::pop`; falls back to the trait default
-    /// after a `switch_to_object_strategy` (entries live in
-    /// `object_storage`).
+    /// O(1) via `IndexMap::pop`; after a `switch_to_object_strategy` the
+    /// entries live in `object_storage` and are popped already unwrapped.
     unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage_mut_opt(w_dict)
         {
             let (k, v) = entries.pop()?;
+            // `mutated()` on this half too: the object storage is still reached
+            // through this strategy, so a compiled trace that pinned a global
+            // stays valid until `version` is reassigned. `delitem` pairs the
+            // two calls the same way on the object-storage arm.
+            let module = &mut *(w_dict as *mut crate::dictmultiobject::W_ModuleDictObject);
+            (*module.mstrategy).mutated();
             crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
             return Some((k.obj, v));
         }
