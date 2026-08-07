@@ -14091,7 +14091,7 @@ while i < 40:
     }
 
     /// rclass.py:1133-1137 `ll_issubclass(subcls, cls)` parity. After
-    /// `set_gc_allocator` runs `freeze_types`, the materialized
+    /// `install_gc_standalone` runs `freeze_types`, the materialized
     /// `(subclassrange_min, subclassrange_max)` for each registered
     /// PyType must satisfy `int_between(cls.min, subcls.min, cls.max)`
     /// for every (cls, subcls) pair where `subcls` Python-inherits from
@@ -14105,7 +14105,7 @@ while i < 40:
     ///      `LIST_TYPE`) are disjoint.
     #[test]
     fn test_subclass_range_preorder_bounds() {
-        // Force JIT_DRIVER initialization so set_gc_allocator runs and
+        // Force JIT_DRIVER initialization so init_gc_subsystem runs and
         // installs the active subclass_range hook.
         let _ = driver_pair();
 
