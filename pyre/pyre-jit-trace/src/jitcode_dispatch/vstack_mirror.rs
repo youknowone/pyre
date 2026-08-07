@@ -493,11 +493,13 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // LOAD_ATTR source segment, so the floor lookup reports the earlier py_pc,
     // and the return boundary reports the CALL's again at the same depth.  No
     // Python opcode retired in between — the stack the walk left is the stack
-    // it resumes with — so replay the saved boxes rather than reseeding.  The
-    // reseed cannot serve this shape: the operands the in-flight opcode
-    // already popped read NULL in the virtualizable shadow, so
-    // `reseed_vstack_from_shadow` rejects them and the callable slides down
-    // into the `self_or_null` slot with the TOS left a hole.
+    // it resumes with — so the saved boxes, not a reseed, are this boundary's
+    // reconcile.  The reseed cannot serve this shape: the operands the
+    // in-flight opcode already popped read NULL in the virtualizable shadow,
+    // so `reseed_vstack_from_shadow` rejects them and the callable slides down
+    // into the `self_or_null` slot with the TOS left a hole.  The restore
+    // replaces only the reconcile; the shadow-backed hole-fill below still
+    // runs over the result.
     //
     // The excursion itself is an artifact of walking a flattened jitcode:
     // `pyopcode.py:1037` `LOAD_ATTR` pops and pushes the live value stack in
@@ -507,17 +509,14 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
         &ctx.vstack_reorder_saved,
         Some((pc, depth, _)) if *pc == new_pypc && *depth == new_depth
     );
-    if in_reorder_region && returned_to_arm_point {
+    let restored = in_reorder_region && returned_to_arm_point;
+    if restored {
         let (_, _, boxes) = ctx
             .vstack_reorder_saved
             .take()
             .expect("checked by returned_to_arm_point");
         ctx.vstack_boxes = boxes;
         ctx.vstack_reorder_ceiling = u32::MAX;
-        ctx.vstack_cur_pypc = new_pypc;
-        ctx.vstack_depth = new_depth;
-        ctx.vstack_last_ref = OpRef::NONE;
-        return;
     }
 
     // PER-OP RECONCILE.  In the SEQUENTIAL case the previous opcode's stack
@@ -529,12 +528,19 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // in the walk register bank, never written through to the portal array).
     // Inside the out-of-order permutation region the per-op replay is invalid;
     // reseed from the shadow (same shape as `ShadowReseed`).
-    let effective_class = if in_reorder_region {
+    let effective_class = if in_reorder_region && !restored {
         VstackOpClass::ShadowReseed
     } else {
         class
     };
     match effective_class {
+        // The saved boxes ARE the reconcile for this boundary; the previous
+        // opcode's effect belongs to the excursion, not to the arm point.  The
+        // shadow-backed hole-fill below still runs: a slot the arm point
+        // already carried as a hole is no more recoverable from the saved
+        // boxes than from a reseed, and skipping the fill left the operand
+        // `LOAD_GLOBAL` pushed unsourced in the resume image.
+        _ if restored => {}
         // A layout-only boundary (the observed depth matches neither real
         // successor of the previous opcode) means the per-op effect cannot
         // explain this transition; preserve the surviving slots instead of
