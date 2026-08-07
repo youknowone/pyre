@@ -2721,9 +2721,7 @@ pub fn call_with_kwargs_in_ctx(
                         if !result[pi].is_null() {
                             let mut msg = Wtf8Buf::new();
                             msg.push_wtf8(&fname);
-                            msg.push_str(&format!(
-                                "() got multiple values for argument '{key}'"
-                            ));
+                            msg.push_str(&format!("() got multiple values for argument '{key}'"));
                             return Err(crate::PyError::type_error(msg));
                         }
                         result[pi] = value;
