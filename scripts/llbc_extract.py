@@ -1370,7 +1370,10 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
     wrong" is what makes a gate decorative — a harness reads the exit status,
     not the output.
 
-    Two things are deliberately not gated:
+    Two things are deliberately not gated, and one is simply not covered here
+    — the list is written out because an incomplete "what this does not check"
+    reads as a complete one, which is the same shape as an allow-list that
+    silently omits a member:
 
       * `features=` is replayed out of the stamp rather than compared. The
         stamp records the configuration the artefact was built under, and the
@@ -1386,6 +1389,14 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
       * artefact and stamp mtimes are printed, never gated. `extract` writes
         both in one pass, and the source digest already answers the question a
         timestamp only approximates.
+      * NOT COVERED, as opposed to deliberately ungated: the `excluded_deps`
+        exclusion. `extract` re-reads the artefact and refuses if a package
+        dropped from the fingerprint is referenced by it, but that guard lives
+        in `extract` alone, so an artefact only ever `--check`ed never has its
+        exclusion re-validated. The guard's oracle does discriminate — the same
+        symbol is present in `pyre-jit.ullbc`, which excludes nothing, and
+        absent from the two artefacts that exclude it — so this is a coverage
+        gap in WHERE it runs, not a defect in WHAT it asks.
 
     Nothing here re-extracts. Re-extraction runs a whole-crate Charon build and
     writes into the working tree, so it stays a human's scheduling decision and
