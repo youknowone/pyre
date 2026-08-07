@@ -13181,8 +13181,143 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // Catch-all: unknown instruction.
-                        _other => {
+                        // No catch-all.  The match is exhaustive over `Instruction`, so a
+                        // variant added upstream fails to compile here instead of
+                        // declining the loop with no record of which opcode it was.  The
+                        // three groups below are the opcodes this compiler cannot emit;
+                        // each still declines, and each now says which one it was.
+
+                        // ---- Adaptive specializations ----
+                        // A specializing interpreter rewrites the generic opcode in place
+                        // in the code object; the compiler never emits one.  pyre's eval
+                        // loop does not quicken, so the walk cannot meet one.
+                        // `deoptimize()` is deliberately not called on them: a stream
+                        // carrying a specialization this interpreter never wrote is
+                        // corrupt, not something to fold back.  A walk is no place to
+                        // raise, so the answer is the same permanent decline the unported
+                        // opcodes take.
+                        Instruction::BinaryOpAddFloat
+                        | Instruction::BinaryOpAddInt
+                        | Instruction::BinaryOpAddUnicode
+                        | Instruction::BinaryOpExtend
+                        | Instruction::BinaryOpInplaceAddUnicode
+                        | Instruction::BinaryOpMultiplyFloat
+                        | Instruction::BinaryOpMultiplyInt
+                        | Instruction::BinaryOpSubscrDict
+                        | Instruction::BinaryOpSubscrGetitem
+                        | Instruction::BinaryOpSubscrListInt
+                        | Instruction::BinaryOpSubscrListSlice
+                        | Instruction::BinaryOpSubscrStrInt
+                        | Instruction::BinaryOpSubscrTupleInt
+                        | Instruction::BinaryOpSubtractFloat
+                        | Instruction::BinaryOpSubtractInt
+                        | Instruction::CallAllocAndEnterInit
+                        | Instruction::CallBoundMethodExactArgs
+                        | Instruction::CallBoundMethodGeneral
+                        | Instruction::CallBuiltinClass
+                        | Instruction::CallBuiltinFast
+                        | Instruction::CallBuiltinFastWithKeywords
+                        | Instruction::CallBuiltinO
+                        | Instruction::CallIsinstance
+                        | Instruction::CallKwBoundMethod
+                        | Instruction::CallKwNonPy
+                        | Instruction::CallKwPy
+                        | Instruction::CallLen
+                        | Instruction::CallListAppend
+                        | Instruction::CallMethodDescriptorFast
+                        | Instruction::CallMethodDescriptorFastWithKeywords
+                        | Instruction::CallMethodDescriptorNoargs
+                        | Instruction::CallMethodDescriptorO
+                        | Instruction::CallNonPyGeneral
+                        | Instruction::CallPyExactArgs
+                        | Instruction::CallPyGeneral
+                        | Instruction::CallStr1
+                        | Instruction::CallTuple1
+                        | Instruction::CallType1
+                        | Instruction::CompareOpFloat
+                        | Instruction::CompareOpInt
+                        | Instruction::CompareOpStr
+                        | Instruction::ContainsOpDict
+                        | Instruction::ContainsOpSet
+                        | Instruction::ForIterGen
+                        | Instruction::ForIterList
+                        | Instruction::ForIterRange
+                        | Instruction::ForIterTuple
+                        | Instruction::LoadAttrClass
+                        | Instruction::LoadAttrClassWithMetaclassCheck
+                        | Instruction::LoadAttrGetattributeOverridden
+                        | Instruction::LoadAttrInstanceValue
+                        | Instruction::LoadAttrMethodLazyDict
+                        | Instruction::LoadAttrMethodNoDict
+                        | Instruction::LoadAttrMethodWithValues
+                        | Instruction::LoadAttrModule
+                        | Instruction::LoadAttrNondescriptorNoDict
+                        | Instruction::LoadAttrNondescriptorWithValues
+                        | Instruction::LoadAttrProperty
+                        | Instruction::LoadAttrSlot
+                        | Instruction::LoadAttrWithHint
+                        | Instruction::LoadConstImmortal
+                        | Instruction::LoadConstMortal
+                        | Instruction::LoadGlobalBuiltin
+                        | Instruction::LoadGlobalModule
+                        | Instruction::LoadSuperAttrAttr
+                        | Instruction::LoadSuperAttrMethod
+                        | Instruction::ResumeCheck
+                        | Instruction::SendGen
+                        | Instruction::StoreAttrInstanceValue
+                        | Instruction::StoreAttrSlot
+                        | Instruction::StoreAttrWithHint
+                        | Instruction::StoreSubscrDict
+                        | Instruction::StoreSubscrListInt
+                        | Instruction::ToBoolAlwaysTrue
+                        | Instruction::ToBoolBool
+                        | Instruction::ToBoolInt
+                        | Instruction::ToBoolList
+                        | Instruction::ToBoolNone
+                        | Instruction::ToBoolStr
+                        | Instruction::UnpackSequenceList
+                        | Instruction::UnpackSequenceTuple
+                        | Instruction::UnpackSequenceTwoTuple => {
+                            emit_abort_permanent!(py_pc);
+                        }
+
+                        // ---- sys.monitoring instrumentation ----
+                        // Substituted at runtime while a monitoring tool is attached, and
+                        // never produced by the static compiler.  Nothing in the tree
+                        // writes one.
+                        Instruction::InstrumentedCall
+                        | Instruction::InstrumentedCallFunctionEx
+                        | Instruction::InstrumentedCallKw
+                        | Instruction::InstrumentedEndAsyncFor
+                        | Instruction::InstrumentedEndFor
+                        | Instruction::InstrumentedEndSend
+                        | Instruction::InstrumentedForIter
+                        | Instruction::InstrumentedInstruction
+                        | Instruction::InstrumentedJumpBackward
+                        | Instruction::InstrumentedJumpForward
+                        | Instruction::InstrumentedLine
+                        | Instruction::InstrumentedLoadSuperAttr
+                        | Instruction::InstrumentedNotTaken
+                        | Instruction::InstrumentedPopIter
+                        | Instruction::InstrumentedPopJumpIfFalse
+                        | Instruction::InstrumentedPopJumpIfNone
+                        | Instruction::InstrumentedPopJumpIfNotNone
+                        | Instruction::InstrumentedPopJumpIfTrue
+                        | Instruction::InstrumentedResume
+                        | Instruction::InstrumentedReturnValue
+                        | Instruction::InstrumentedYieldValue => {
+                            emit_abort_permanent!(py_pc);
+                        }
+
+                        // ---- Interpreter- and JIT-internal ----
+                        // `EnterExecutor`, `InterpreterExit` and the two `JumpBackward`
+                        // forms belong to a tier-2 executor this interpreter does not
+                        // have; `Reserved` is a hole in the opcode table.
+                        Instruction::EnterExecutor
+                        | Instruction::InterpreterExit
+                        | Instruction::JumpBackwardJit
+                        | Instruction::JumpBackwardNoJit
+                        | Instruction::Reserved => {
                             emit_abort_permanent!(py_pc);
                         }
                     }
