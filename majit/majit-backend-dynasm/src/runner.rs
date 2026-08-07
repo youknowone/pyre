@@ -103,6 +103,15 @@ thread_local! {
     /// backend on this thread. Stored as a thread-local so the
     /// backend-agnostic `majit_gc::ActiveGcGuardHooks` shims can
     /// reach the live allocator without taking a dynasm dependency.
+    ///
+    /// `gc.py:30` `GcLLDescription.__init__` holds `self.gcdescr` as a plain
+    /// field on the backend descriptor — there is no per-thread allocator
+    /// upstream — so this cell is scaffolding, not a ported structure. Only
+    /// `install_gc_box` fills it and only tests reach that; the production
+    /// build goes through `install_gc_standalone` and routes to the `gc_sync`
+    /// singleton. Every read of it is therefore guarded by
+    /// `majit_gc::gc_box_installed()`, so the path the cell does not serve
+    /// does not pay for it.
     pub static DYNASM_ACTIVE_GC: RefCell<Option<Box<dyn majit_gc::GcAllocator>>> =
         const { RefCell::new(None) };
     static DYNASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn majit_gc::GcAllocator>> =

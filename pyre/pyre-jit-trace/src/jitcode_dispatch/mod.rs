@@ -1663,6 +1663,11 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// — the shadow reseed cannot reconstruct them, because mid-expression the
     /// virtualizable's stack region holds the NULLs the in-flight opcode's
     /// `popvalue_maybe_none` wrote.  `None` outside a region.
+    ///
+    /// There is nothing to snapshot upstream: `pyjitpl.py:1892`
+    /// `MIFrame.run_one_step` steps a live frame whose `registers_r` survive
+    /// the step.  This mirror is instead reconstructed from source pcs, and
+    /// that reconstruction is exactly what an excursion can lose.
     pub vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>)>,
     /// The py_pc the walk's floor lookup reports while it is inside an
     /// out-of-line exception LANDING block — the unwind bookkeeping the

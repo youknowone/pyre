@@ -498,6 +498,11 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // already popped read NULL in the virtualizable shadow, so
     // `reseed_vstack_from_shadow` rejects them and the callable slides down
     // into the `self_or_null` slot with the TOS left a hole.
+    //
+    // The excursion itself is an artifact of walking a flattened jitcode:
+    // `pyopcode.py:1037` `LOAD_ATTR` pops and pushes the live value stack in
+    // place, so the interpreter has no walk position to leave and return to,
+    // and nothing here to mirror.
     let returned_to_arm_point = matches!(
         &ctx.vstack_reorder_saved,
         Some((pc, depth, _)) if *pc == new_pypc && *depth == new_depth
