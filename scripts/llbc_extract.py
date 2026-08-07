@@ -425,6 +425,16 @@ def refuse_inert_pathspecs(eng: Engine) -> None:
     question about git. An `is_file()` test on a module about to be imported is
     a genuine filesystem question and stays correct.)
 
+    ⭐ The contrasting sibling now lives in ANOTHER REPO, so neither file shows
+    both halves of the rule on its own. A driver that declares
+    `external_inputs` may legitimately use `exists()` as a VERDICT on those,
+    and cel-jit's `refuse_absent_external_inputs` does: they are hashed by
+    reading their bytes, never through git, so the filesystem is the correct
+    oracle and the only one. Read alone, that function looks like the mistake
+    this one refuses; read alone, this one looks like a blanket ban on
+    `exists()`. Neither reading is right — the oracle has to match the channel
+    the input is carried on, and the two guards are on different channels.
+
     `ls-files ∪ ls-files --others --exclude-standard` is the definition of
     git-reachable used here, matching `_collect_inputs` exactly. `ls-files
     --error-unmatch` alone is TRACKED-only, and would call a brand-new unadded
@@ -505,10 +515,25 @@ def _collect_inputs(
     in-tree workspace member and a `[patch]` redirect into a sibling checkout —
     so a patched dependency was discovered, found to be out-of-root, and
     discarded with no diagnostic. cel-jit patches `majit-{ir,macros,metainterp}`
-    to `../majit/*`, which pulls the rest of that workspace by path: 10 of the
-    11 closure members landed here, `majit-macros` among them. That one is a
-    proc macro, so its expansion IS the extracted crate's bodies, and editing it
-    changed the artefact's content without moving its fingerprint.
+    to `../majit/*`, which pulls the rest of that workspace in by path, and
+    most of what that pulls landed here, `majit-macros` among them.
+
+    ⛔ NO NUMBER IS QUOTED FOR THAT CLOSURE, deliberately. Two careful
+    measurements of it disagree (11 members / 1 kept, and 10 packages / 9
+    out-of-root) and the disagreement is UNEXPLAINED — a `CARGO_FEATURES`
+    difference was proposed and then refuted, because swapping one backend
+    crate for another changes membership without changing the count. The
+    closure is not a stable set, and a figure written down here would be
+    quoted back as if it were. This is the empirical case for a driver
+    declaring a whole directory in `external_inputs` rather than a per-crate
+    list the walk derived.
+
+    `majit-macros` is a proc macro, so its expansion IS the extracted crate's
+    item bodies. It was dropped by TWO independent gates, and finding the
+    first hid the second: this out-of-root discard, and the target-kind filter
+    below, which admitted neither `proc-macro` nor `cdylib` until it was
+    inverted into a deny-list. Both are fixed; do not read that as the class
+    being closed, since each was found only after the previous one was.
     """
     root = eng.root
     target_names: list[str] = []
