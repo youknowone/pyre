@@ -313,36 +313,34 @@ fn rewire_one_slice_index_site(
                 .map(|oi| (bi, oi))
         })
         .ok_or_else(|| format!("{name}: slice::index op vanished before rewrite"))?;
-    if let SliceIndexBounds::MinusOne { .. } = bounds {
-        graph.blocks[rb].operations[ri] = SpaceOperation {
-            result: Some(index_result),
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec!["__getslice_minusone".to_string()],
+    match bounds {
+        SliceIndexBounds::MinusOne { .. } => {
+            graph.blocks[rb].operations[ri] = SpaceOperation {
+                result: Some(index_result),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__getslice_minusone".to_string()],
+                    },
+                    args: vec![slice],
+                    result_ty: index_result_ty,
                 },
-                args: vec![slice],
-                result_ty: index_result_ty,
-            },
-        };
-    } else {
-        match bounds {
-            SliceIndexBounds::RangeFrom { start } => {
-                let synthetic_bound = graph.alloc_value_var();
-                graph.blocks[rb].operations[ri] = SpaceOperation {
-                    result: Some(index_result),
-                    kind: OpKind::GetSlice {
-                        args: vec![slice, start.clone(), synthetic_bound.clone()],
-                    },
-                };
-                graph.blocks[rb].operations.insert(
-                    ri,
-                    SpaceOperation {
-                        result: Some(synthetic_bound),
-                        kind: OpKind::ConstNone,
-                    },
-                );
-            }
-            SliceIndexBounds::MinusOne { .. } => unreachable!(),
+            };
+        }
+        SliceIndexBounds::RangeFrom { start } => {
+            let synthetic_bound = graph.alloc_value_var();
+            graph.blocks[rb].operations[ri] = SpaceOperation {
+                result: Some(index_result),
+                kind: OpKind::GetSlice {
+                    args: vec![slice, start.clone(), synthetic_bound.clone()],
+                },
+            };
+            graph.blocks[rb].operations.insert(
+                ri,
+                SpaceOperation {
+                    result: Some(synthetic_bound),
+                    kind: OpKind::ConstNone,
+                },
+            );
         }
     }
     Ok(())

@@ -23888,12 +23888,14 @@ mod tests {
         );
     }
 
-    /// Array slicing keeps the residual RangeTo path because the general stop
-    /// has no length proof; mutable indexing is likewise residual because it
-    /// writes through a view.
+    /// Array slicing keeps the residual RangeTo path because a general stop has
+    /// no proof that `end <= slice.len()`.  Both halves are asserted — the
+    /// residual call is present AND no `__getslice_rangeto` marker was planted
+    /// — so a lowering change that drops the call for an unrelated reason is a
+    /// failure rather than a pass.
     #[test]
     #[ignore]
-    fn call_function_impl_result_has_no_residual_array_index() {
+    fn call_function_impl_result_keeps_residual_array_index() {
         use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -23902,19 +23904,31 @@ mod tests {
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "call_function_impl_result")
             .expect("lower call_function_impl_result");
+        let calls_path = |want: &[&str]| -> usize {
+            let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: crate::model::CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &want
+                    )
+                })
+                .count()
+        };
         assert!(
-            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath { segments },
-                        ..
-                    } if segments
-                        == &["core", "array", "<Impl>", "index"]
-                            .map(str::to_string)
-                )
-            }),
+            calls_path(&["core", "array", "<Impl>", "index"]) >= 1,
             "general RangeTo array index remains residual"
+        );
+        assert_eq!(
+            calls_path(&["__getslice_rangeto"]),
+            0,
+            "no general RangeTo site is rewritten — the fold is declined"
         );
     }
 }
