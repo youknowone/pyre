@@ -2282,6 +2282,7 @@ fn build_shell(
                     owner_root: Some(owner),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value: crate::model::LinkArg::Value(payload),
                 ty: payload_ty,

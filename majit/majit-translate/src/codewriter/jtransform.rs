@@ -832,15 +832,19 @@ impl<'a> Transformer<'a> {
         // it is never a renaming *key*; the post-renaming list can only
         // gain occurrences of it, never lose one.
         //
-        // UNWIRED — see [`Transformer::check_no_vable_array`].  The two
-        // calls that belong here are:
-        //     self.check_no_vable_array(args.iter(), graph_name,
-        //                               "fused exitswitch operand");
-        //     self.check_no_vable_array(
-        //         link.args.iter().filter_map(LinkArg::as_variable),
-        //         graph_name, "link argument");
-        // over `block.exitswitch`'s `ExitSwitch::Fused` args and every
-        // `block.exits` link.
+        {
+            let block = &graph.blocks[block_idx];
+            if let Some(crate::model::ExitSwitch::Fused { args, .. }) = &block.exitswitch {
+                self.check_no_vable_array(args.iter(), graph_name, "fused exitswitch operand");
+            }
+            for link in &block.exits {
+                self.check_no_vable_array(
+                    link.args.iter().filter_map(LinkArg::as_variable),
+                    graph_name,
+                    "link argument",
+                );
+            }
+        }
 
         // Upstream `rpython/translator/backendopt/canraise.py:25-47
         // analyze_exceptblock_in_graph` identifies raising blocks by the
@@ -924,48 +928,48 @@ impl<'a> Transformer<'a> {
     /// `setfield` — would carry the raw array pointer out of reach of
     /// the lowering, so the graph is rejected instead.
     ///
-    /// # NOT WIRED — deliberately, and not an oversight
+    /// # What the check needed before it could be wired
     ///
-    /// The four call sites this belongs at are marked `UNWIRED` with the
-    /// exact call they should carry: the fused-exitswitch and link-args
-    /// pair in `optimize_block` (`jtransform.py:124-127`),
+    /// The four call sites are the fused-exitswitch and link-args pair in
+    /// `optimize_block` (`jtransform.py:124-127`),
     /// `rewrite_call_three_lists` (`jtransform.py:421`), and
-    /// `rewrite_op_setfield` (`jtransform.py:912`).  **Do not wire them
-    /// back up on their own.**  The check is correct; what it rejects is
-    /// not.
+    /// `rewrite_op_setfield` (`jtransform.py:912`).  All four stood
+    /// commented out for a while, because the check was correct and what
+    /// it rejected was not.
     ///
-    /// pyre's MIR front gives a single-predecessor block inputargs that
-    /// are the *same* `Variable` identities as the predecessor's exit
-    /// args, rather than fresh phis — measured at **92.6% of 153,927
-    /// single-predecessor blocks** across the interpreter corpus.  That
-    /// defeats `transform_dead_op_vars`' positional liveness
-    /// (`simplify.py:512-524`): a value read anywhere in the predecessor
-    /// is in `read_vars`, so the dead link arg naming it is never
-    /// dropped, and the array leaves its block on a link upstream would
-    /// have pruned away.
+    /// pyre's MIR front used to give a block its first predecessor's exit
+    /// framestate verbatim, so its inputargs were the *same* `Variable`
+    /// identities as the link args feeding them — measured at 142598 of
+    /// 153927 blocks.  That defeats `transform_dead_op_vars`' positional
+    /// liveness (`simplify.py:512-524`): a value read anywhere in the
+    /// predecessor is in `read_vars`, so the dead link arg naming it is
+    /// never dropped, and the array leaves its block on a link upstream
+    /// would have pruned away.
     ///
-    /// The witnessed case is `pyre_interpreter::pyframe::<Impl>::_check_stack_index`
+    /// The witnessed case was `pyre_interpreter::pyframe::<Impl>::_check_stack_index`
     /// (`index >= self.stack_base() && index < locals_w!(self).len()`).
     /// Its array read and the `ArrayLen` consuming it sit in the same
-    /// block, exactly as the protocol requires — and the array still
-    /// rides that block's outgoing link **twice**, into a block whose
-    /// only operation is the `int_lt` and which never touches it.
+    /// block, exactly as the protocol requires — and the array still rode
+    /// that block's outgoing link **twice**, into a block whose only
+    /// operation is the `int_lt` and which never touches it.  Eliminating
+    /// empty blocks does not reach that: the block it escapes into is not
+    /// empty.
     ///
-    /// So enabling this check requires the front-end fix first: mint
-    /// fresh inputargs for single-predecessor blocks, restoring the
-    /// distinct-phi invariant `transform_dead_op_vars` assumes.  That is
-    /// its own piece of work, not a follow-up to be picked up casually.
-    /// Eliminating empty blocks does not reach it — the block the array
-    /// escapes into is not empty.
+    /// Two things fixed it, and each is load-bearing on its own —
+    /// reverting either one puts the array back on the link.
+    /// `lower_framestate` now copies the entry framestate
+    /// (`flowcontext.py:466 newstate = state.copy()`), and
+    /// `simplify_lowered_graph` runs `prune_dead_phis` unconditionally, as
+    /// `all_passes` does (simplify.py:1067).
     ///
-    /// The test that the wiring needs, and that should land with it: for
-    /// every variable in `vable_array_vars`, assert that every consumer
-    /// sits in the block that read it **and** that it appears in no
-    /// link's args anywhere in the graph.  Enumerating individual escape
-    /// routes is what let `_check_stack_index` pass a green test while
-    /// escaping by the one route that test did not look at.
+    /// `tests/test_vable_array_len.rs` holds the regression: not just
+    /// "the `len` lowered to `ArrayLen`", but that the array appears in no
+    /// link's args and is no block's inputarg anywhere in the graph.
+    /// Enumerating individual escape routes is what let `_check_stack_index`
+    /// pass a green test while escaping by the one route that test did not
+    /// look at.
     ///
-    /// `route` names which of those four the escape took.  Upstream's
+    /// `route` names which of the four the escape took.  Upstream's
     /// message does not carry it, and the extra line is a deliberate pyre
     /// addition: the four call sites below share one panic body, this
     /// function is small enough to be inlined into all of them in an
@@ -980,7 +984,6 @@ impl<'a> Transformer<'a> {
     /// `"setfield operand"` (`jtransform.py:912`, the base or the stored
     /// value of a `setfield`; there is no `setarrayitem` site, because
     /// that one is the array access the protocol exists to allow).
-    #[allow(dead_code, reason = "ported but not wired — see the doc above")]
     fn check_no_vable_array<'v>(
         &self,
         list: impl IntoIterator<Item = &'v crate::flowspace::model::Variable>,
@@ -1032,11 +1035,7 @@ impl<'a> Transformer<'a> {
         Vec<crate::flowspace::model::Variable>,
         Vec<crate::flowspace::model::Variable>,
     ) {
-        // UNWIRED — see [`Transformer::check_no_vable_array`].  The call
-        // that belongs here is
-        //     self.check_no_vable_array(args.iter(), graph_name,
-        //                               "call argument");
-        let _ = graph_name;
+        self.check_no_vable_array(args.iter(), graph_name, "call argument");
         self.make_three_lists_from_vars(args)
     }
 
@@ -2866,11 +2865,14 @@ impl<'a> Transformer<'a> {
             OpKind::FieldRead { base, .. } => self.is_fresh_virtualizable(base),
             _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
         };
-        // Same suppression, reached structurally: a container that was
-        // not dereferenced is a value in this frame, so the access cannot
-        // be to a live virtualizable.  This is what covers the frame
-        // constructor, where the hint upstream relies on cannot land.
-        let fresh_virtualizable = fresh_virtualizable || field.base_is_local_aggregate();
+        // Two more suppressions, both reached structurally.  A container
+        // that was not dereferenced is a value in this frame, so the
+        // access cannot be to a live virtualizable — that is what covers
+        // the frame constructor, where the hint upstream relies on cannot
+        // land.  And a projection whose *address* was taken is not a read
+        // of the field at all; tracking it would drop the op and leave the
+        // address's consumer with an undefined operand.
+        let fresh_virtualizable = fresh_virtualizable || field.suppresses_virtualizable();
         // Track virtualizable array field reads
         if let Some(array_field) = self
             .config
@@ -3051,12 +3053,13 @@ impl<'a> Transformer<'a> {
         // field name rides in a descriptor here, leaving the base and the
         // stored value as the operands.
         //
-        // UNWIRED — see [`Transformer::check_no_vable_array`].  The call
-        // that belongs here is
-        //     self.check_no_vable_array(
-        //         std::iter::once(base).chain(value.as_variable()),
-        //         graph_name, "setfield operand");
-        // guarded by `if let OpKind::FieldWrite { base, .. } = &op.kind`.
+        if let OpKind::FieldWrite { base, .. } = &op.kind {
+            self.check_no_vable_array(
+                std::iter::once(base).chain(value.as_variable()),
+                graph_name,
+                "setfield operand",
+            );
+        }
         let typed_ty = value
             .as_variable()
             .and_then(|v| self.get_value_type(v))
@@ -7820,11 +7823,12 @@ mod tests {
     /// along a link argument; the block that would consume it has no
     /// `vable_array_vars` entry for it, so no lowering could ever happen.
     ///
-    /// Calls the check **directly** rather than through `transform_graph`,
-    /// because it is not wired into the transform on this branch — see
-    /// [`Transformer::check_no_vable_array`] for why, and for what has to
-    /// land before it can be.  This keeps the port covered; it is
-    /// deliberately not evidence that the transform enforces it.
+    /// Drives the whole `transform_graph`, so it is evidence that the
+    /// transform enforces the rule and not only that the predicate is
+    /// correct.  This is the same graph as
+    /// `fresh_virtualizable_suppresses_vable_array_tracking` minus the
+    /// hint: there the array never becomes a virtualizable array and the
+    /// link is fine, here it does and the link is not.
     ///
     /// The expectation names the escape route, not just the upstream
     /// header: all four call sites share one panic body, so without the
@@ -7832,6 +7836,37 @@ mod tests {
     #[test]
     #[should_panic(expected = "Escaped via: link argument")]
     fn vable_array_escaping_the_block_on_a_link_arg_is_rejected() {
+        use crate::model::Link;
+
+        let mut graph = FunctionGraph::new("vable_array_escape");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: frame_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+
+        // The consumer block receives the array as a link argument instead
+        // of reading it itself, so its `vable_array_vars` — rebuilt per
+        // block — has no entry to lower the access against.
+        let consumer = graph.create_block();
+        let phi = graph.alloc_value_var();
+        graph.push_inputarg_var(consumer, phi.clone());
+        graph.set_return(consumer, Some(phi));
+        let link = Link::from_variables(&graph, vec![array_var], consumer, None);
+        graph.set_control_flow_metadata(graph.startblock, None, vec![link]);
+
         let config = GraphTransformConfig {
             vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
                 "locals_stack_w",
@@ -7842,24 +7877,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let mut transformer = Transformer::new(&config);
-
-        // The array a virtualizable field read produced, as
-        // `rewrite_op_getfield` would have recorded it.
-        let mut graph = FunctionGraph::new("vable_array_escape");
-        let base_var = graph.alloc_value_var();
-        let array_var = graph.alloc_value_var();
-        transformer
-            .vable_array_vars
-            .insert(array_var.clone(), (base_var, 0, 8, true));
-
-        // The consumer block receives it as a link argument instead of
-        // reading it itself.
-        transformer.check_no_vable_array(
-            std::iter::once(&array_var),
-            "vable_array_escape",
-            "link argument",
-        );
+        transform_graph(&graph, &config);
     }
 
     /// `jtransform.py:990-993` — a virtualizable the graph just allocated
@@ -7939,6 +7957,74 @@ mod tests {
             ops.iter()
                 .any(|op| matches!(op.kind, OpKind::FieldRead { .. })),
             "the array field read must stay an ordinary getfield, got {ops:?}"
+        );
+    }
+
+    /// Taking the **address** of a virtualizable array field is not a read
+    /// of it, so it must not enter `vable_array_vars`.
+    ///
+    /// The front models a reference as an alias of its referent, so
+    /// `&raw mut (*frame).locals_cells_stack_w` arrives here as a
+    /// `FieldRead`.  Tracking it would drop the op — the array is only
+    /// materialised at an array access — and leave the consumer that
+    /// wanted the address with an undefined operand.
+    /// `pyframe::FrameLocalsRoot::new` is the shape: it hands the slot
+    /// address to `try_gc_add_root`.
+    #[test]
+    fn address_of_a_vable_array_field_is_not_tracked() {
+        use crate::model::Link;
+
+        let mut graph = FunctionGraph::new("vable_array_addr_of");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        let slot_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: frame_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    )
+                    .with_base_is_deref(true)
+                    .with_taken_by_address(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+
+        // The address leaves the block, exactly as it does on the way to
+        // `try_gc_add_root`.  Were the array tracked, this link would trip
+        // `_check_no_vable_array`.
+        let consumer = graph.create_block();
+        let phi = graph.alloc_value_var();
+        graph.push_inputarg_var(consumer, phi.clone());
+        graph.set_return(consumer, Some(phi));
+        let link = Link::from_variables(&graph, vec![slot_var], consumer, None);
+        graph.set_control_flow_metadata(graph.startblock, None, vec![link]);
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
+        assert_eq!(
+            result.vable_rewrites, 0,
+            "an address-of must produce no virtualizable rewrite"
+        );
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::FieldRead { .. })),
+            "the projection must stay an ordinary getfield, got {ops:?}"
         );
     }
 

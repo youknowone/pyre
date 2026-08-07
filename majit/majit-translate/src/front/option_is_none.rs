@@ -90,6 +90,7 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
                     owner_root: Some(site.option_owner.clone()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 ty: ValueType::Int,
                 pure: true,

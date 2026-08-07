@@ -2586,7 +2586,7 @@ fn simplify_lowered_graph(
     // to a native `NewWithVtable` + payload store before the dead-aggregate
     // sweep, which then reclaims the orphaned construct-on-stack ctor and
     // header field writes.
-    let mut dirty = crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
+    crate::model::fuse_boxing_alloc(graph, struct_field_attrs);
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
     // liveness (`transform_dead_op_vars`, simplify.py:425-479) with the
@@ -2597,14 +2597,14 @@ fn simplify_lowered_graph(
     // graph has `fused == 0`, and the pass is conservative (fresh-alloc
     // producers + scoped store exemption) so it is a no-op on graphs with no
     // such remnants.  A removal leaves dangling threaded inputargs / link args
-    // the `prune_dead_phis` below reclaims, so fold its count into `dirty`.
-    dirty |= crate::model::prune_dead_boxing_remnants(graph) > 0;
+    // the `prune_dead_phis` below reclaims.
+    crate::model::prune_dead_boxing_remnants(graph);
     // Drop dead aggregate constructions (malloc + field stores whose
     // result is never read) before the dead-op sweep — `prune_dead_phis`
     // keeps them because a `FieldWrite` is side-effecting, so its `base`
     // pins the aggregate (`remove_simple_mallocs`, malloc.py).
-    dirty |= crate::model::remove_dead_aggregates(graph) > 0;
-    dirty |= crate::model::remove_assertion_errors(graph) > 0;
+    crate::model::remove_dead_aggregates(graph);
+    crate::model::remove_assertion_errors(graph);
     // Constant-condition arms (`if WITHPREBUILTINT { … }` with the
     // config const folded by `const_eval_global`) collapse to the
     // taken link and the dead arm is emptied — the registry lift
@@ -2614,11 +2614,21 @@ fn simplify_lowered_graph(
     // folding (backendopt/constfold.py).
     if crate::model::fold_constant_exitswitch(graph) > 0 {
         crate::model::clear_unreachable_blocks(graph);
-        dirty = true;
     }
-    if dirty {
-        crate::model::prune_dead_phis(graph);
-    }
+    // `transform_dead_op_vars` is the first entry in `all_passes`
+    // (simplify.py:1067) and `simplify_graph` (:1080-1086) applies every
+    // pass to every graph — there is no "only if something was removed"
+    // condition upstream.  The gate that used to stand here was written
+    // when the front made a single-predecessor block's inputargs the
+    // predecessor's own Variables, which left the sweep unable to tell a
+    // read in the predecessor from a read in the target; it removed
+    // little, so running it only after another pass had already changed
+    // something looked free.  Now that the entry framestate is copied
+    // (`flowcontext.py:466`) the sweep does real work on graphs no other
+    // pass touches — `_check_stack_index` threads the virtualizable array
+    // into a successor that never reads it, and nothing else in this
+    // sequence reports a removal for that graph.
+    crate::model::prune_dead_phis(graph);
     // Collapse again, now that every dead-code sweep above has run.
     //
     // Upstream orders `all_passes` (simplify.py:1065-1078, applied in list
@@ -2657,9 +2667,6 @@ fn simplify_lowered_graph(
     // blocks split by the `get_instantiate` / `gc_interp::enabled` calls).
     crate::model::thread_undefined_op_operands(graph);
 }
-
-
-
 
 /// Order in which [`Lowering::lower`] walks the MIR basic blocks.
 #[derive(Clone, Copy)]
@@ -3610,7 +3617,27 @@ impl<'a> Lowering<'a> {
                     .as_ref()
                     .map(PackedFrameState::unpack)
                 {
-                    None => ex.clone(),
+                    // First edge to reach `tmir` — `flowcontext.py:464-471
+                    // make_next_block`, whose whole body is `newstate =
+                    // state.copy()` before `SpamBlock(newstate)`.
+                    // `FrameState.copy` is "make a copy of this state in
+                    // which all Variables are fresh" (framestate.py:42), and
+                    // the freshness is what the flowspace shape rests on: a
+                    // block's inputargs are Variables *distinct* from the
+                    // link args feeding them, so per-Variable liveness can
+                    // tell "read in the predecessor" apart from "read in the
+                    // target".  Carrying `ex` through unchanged instead made
+                    // the target's inputargs literally the predecessor's
+                    // Variables — measured at 142598 of 153927 blocks — and
+                    // `prune_dead_phis` (`transform_dead_op_vars`) then kept
+                    // every link arg whose Variable happened to be read
+                    // anywhere in the predecessor, however dead it was in the
+                    // target.  Each slot is copied independently, so two
+                    // slots holding one Variable become two distinct
+                    // inputargs; `remove_duplicate_inputargs`
+                    // (`remove_identical_vars_SSA`) recombines the ones that
+                    // really are one phi column.
+                    None => ex.copy(&mut self.graph),
                     Some(prev) => prev.union(&ex, &mut self.graph).ok_or_else(|| {
                         LowerError::Unsupported(format!(
                             "framestate: union of predecessors failed at bb{tmir}"
@@ -4519,7 +4546,10 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, .. } => {
+                let projection = matches!(&place.kind, PlaceKind::Projection(..));
+                let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
+                self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
             }
             // `RawPtr { place, ... }` — `&raw const x` / `&raw mut x`.
@@ -4527,7 +4557,10 @@ impl<'a> Lowering<'a> {
             // and references identically at the IR level (lifetime
             // tracking lives outside the JIT).
             Rvalue::RawPtr { place, .. } => {
+                let projection = matches!(&place.kind, PlaceKind::Projection(..));
+                let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
+                self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
             }
             // `Repeat(elem, ty, count)` — `[v; N]` literal. The decodable
@@ -4840,6 +4873,7 @@ impl<'a> Lowering<'a> {
                                 owner_root: Some(result_ty_owner.clone()),
                                 owner_id: None,
                                 base_is_deref: None,
+                                taken_by_address: false,
                             },
                             value: crate::model::LinkArg::Value(value),
                             ty: ValueType::Ref(None),
@@ -4996,6 +5030,7 @@ impl<'a> Lowering<'a> {
                             owner_root,
                             owner_id,
                             base_is_deref: None,
+                            taken_by_address: false,
                         },
                         ty: ValueType::Int,
                         pure: true,
@@ -5185,6 +5220,62 @@ impl<'a> Lowering<'a> {
             kind: op,
         });
         Ok(var)
+    }
+
+    /// Record that the `Variable` just resolved for a place is the
+    /// **address** of a field, not its value.
+    ///
+    /// The `Ref` / `RawPtr` arms alias the reference to its referent, so
+    /// `&raw mut (*p).f` leaves an ordinary `FieldRead` behind.  A
+    /// virtualizable field read is not kept as a value — the codewriter
+    /// records the array in `vable_array_vars` and drops the op — so the
+    /// address's consumer would be handed an undefined operand.  Flagging
+    /// the descriptor lets the codewriter decline the virtualizable path
+    /// for exactly this projection.
+    ///
+    /// Only the **outermost** projection is marked: it is the one whose
+    /// result is the Variable the address stands for.  An inner step of
+    /// `&(*p).a.b` is a genuine value read of `a` and keeps its lowering,
+    /// so a nested read of a virtualizable field is not collaterally
+    /// suppressed.
+    ///
+    /// Both guards are load-bearing, because a local's Variable *is* the
+    /// Variable of whatever op produced it:
+    ///
+    /// - `projection` — `&mut x` on a bare local resolves to that local's
+    ///   Variable with nothing emitted.  Matching on the last op's result
+    ///   alone would then mark the op that produced `x`, which may be an
+    ///   unrelated earlier field read.  Autoref makes this the common
+    ///   case, not a corner: `self.method()` on `&mut self` is a
+    ///   `Rvalue::Ref` over a local at every call site.
+    /// - `before` — a projection that emits nothing (a bare `Deref`, or a
+    ///   field the front resolves without a read) leaves the preceding op
+    ///   as `last`, with the same false-marking risk.
+    ///
+    /// A false mark here is not inert: on a virtualizable field it would
+    /// silently disable the protocol for a genuine access, which is the
+    /// failure the `Option` default on `base_is_deref` exists to prevent.
+    fn mark_place_address_of(
+        &mut self,
+        mir_bb: usize,
+        projection: bool,
+        before: usize,
+        v: &Variable,
+    ) {
+        if !projection {
+            return;
+        }
+        let bb_id = self.block_id[mir_bb];
+        let block = self.graph.block_mut(bb_id);
+        if block.operations.len() <= before {
+            return;
+        }
+        if let Some(op) = block.operations.last_mut()
+            && op.result.as_ref() == Some(v)
+            && let OpKind::FieldRead { field, .. } = &mut op.kind
+        {
+            field.taken_by_address = true;
+        }
     }
 
     fn resolve_place(&mut self, mir_bb: usize, place: Place) -> Result<Variable, LowerError> {
@@ -7969,6 +8060,7 @@ impl<'a> Lowering<'a> {
                                 owner_root,
                                 owner_id,
                                 base_is_deref: None,
+                                taken_by_address: false,
                             },
                             ty: ValueType::Int,
                             pure: true,
@@ -12930,6 +13022,7 @@ impl<'a> Lowering<'a> {
                         owner_root: Some(field_owner.to_string()),
                         owner_id: None,
                         base_is_deref: None,
+                        taken_by_address: false,
                     },
                     value: LinkArg::Value(value),
                     ty: ValueType::Int,
@@ -20197,8 +20290,7 @@ mod tests {
 
         let entry_exit = &graph.block(entry).exits[0];
         assert_eq!(
-            entry_exit.target,
-            graph.returnblock,
+            entry_exit.target, graph.returnblock,
             "the emptied forwarding block must be rewired past"
         );
         assert!(

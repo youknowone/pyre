@@ -1,55 +1,84 @@
-//! `FixedObjectArray::len` on the virtualizable array must lower to
-//! `OpKind::ArrayLen`, not to a `__len` call.
+//! What the virtualizable array may and may not do, checked against the
+//! shipped interpreter LLBC rather than a hand-built graph.
 //!
 //! The codewriter's virtualizable protocol requires the array to be
-//! consumed by an array operation in its defining block.  A call passes it
-//! as an argument instead, which reaches `jtransform`'s
-//! `handle_residual_call` and aborts the build with "a virtualizable array
-//! is passed around".
+//! consumed by an array operation in its defining block: `vable_array_vars`
+//! is rebuilt per block, so anything that carries the array elsewhere —
+//! a call argument, a link argument — reaches `_check_no_vable_array` and
+//! aborts the build with "a virtualizable array is passed around".
 
 use majit_charon_reader::Llbc;
+use majit_translate::flowspace::model::Variable;
 use majit_translate::front::mir::lower_fun_decl;
-use majit_translate::model::{CallTarget, OpKind};
+use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
 
 const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-interpreter.ullbc"
 );
 
-/// `PyFrame::_check_stack_index` is `index >= self.stack_base() && index <
-/// locals_w!(self).len()` — a read of the virtualizable array whose only
-/// consumer is `len`.
-#[test]
-fn vable_array_len_lowers_to_arraylen_not_a_call() {
+/// Lower `pyframe::<Impl>::<leaf>` out of the shipped interpreter LLBC.
+/// Returns `None` when the artefact is absent so the tests degrade to a
+/// skip rather than a failure on a tree that has not run the extraction.
+fn lower_pyframe_method(leaf: &str) -> Option<FunctionGraph> {
     if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
         eprintln!(
             "skipping: {INTERPRETER_LLBC} is missing; run \
              `python3 scripts/extract-llbc.py pyre-interpreter`"
         );
-        return;
+        return None;
     }
-
     let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let suffix = format!("::{leaf}");
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path().ends_with("::_check_stack_index"))
-        .expect("_check_stack_index present in the shipped LLBC");
-    let graph = lower_fun_decl(&llbc, fd).expect("lower _check_stack_index");
+        .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
+        .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"));
+    Some(lower_fun_decl(&llbc, fd).unwrap_or_else(|e| panic!("lower {leaf}: {e:?}")))
+}
 
-    let mut array_var = None;
-    let mut defining_block = None;
+/// Every graph in the LLBC whose name path ends with `::<leaf>`.  Five
+/// distinct functions in `pyframe` render as `pyframe::<Impl>::new`, so a
+/// test that wants one of them has to pick it out by shape.
+fn lower_all_named(leaf: &str) -> Option<Vec<FunctionGraph>> {
+    if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
+        eprintln!("skipping: {INTERPRETER_LLBC} is missing");
+        return None;
+    }
+    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let suffix = format!("::{leaf}");
+    Some(
+        llbc.iter_local_fns()
+            .filter(|fd| fd.item_meta.name_path().ends_with(&suffix))
+            .filter_map(|fd| lower_fun_decl(&llbc, fd).ok())
+            .collect(),
+    )
+}
+
+/// The `locals_cells_stack_w` read and the block it happens in.
+fn virtualizable_array_read(graph: &FunctionGraph) -> (Variable, usize) {
+    let mut found = None;
     for (index, block) in graph.blocks.iter().enumerate() {
         for op in &block.operations {
             if let OpKind::FieldRead { field, .. } = &op.kind
                 && field.name == "locals_cells_stack_w"
             {
-                array_var = op.result.clone();
-                defining_block = Some(index);
+                found = Some((op.result.clone().expect("the read binds a result"), index));
             }
         }
     }
-    let array_var = array_var.expect("a read of the virtualizable array");
-    let defining_block = defining_block.expect("the array's defining block");
+    found.expect("a read of the virtualizable array")
+}
+
+/// `PyFrame::_check_stack_index` is `index >= self.stack_base() && index <
+/// locals_w!(self).len()` — a read of the virtualizable array whose only
+/// consumer is `len`.
+#[test]
+fn vable_array_len_lowers_to_arraylen_not_a_call() {
+    let Some(graph) = lower_pyframe_method("_check_stack_index") else {
+        return;
+    };
+    let (array_var, defining_block) = virtualizable_array_read(&graph);
 
     let mut len_block = None;
     for (index, block) in graph.blocks.iter().enumerate() {
@@ -79,5 +108,132 @@ fn vable_array_len_lowers_to_arraylen_not_a_call() {
         len_block,
         Some(defining_block),
         "`ArrayLen` must consume the array in the block that reads it"
+    );
+}
+
+/// The array must not leave the block that reads it.
+///
+/// `_check_no_vable_array` (jtransform.py:124-127) rejects a graph whose
+/// `Link.args` carry a virtualizable array, because the target block's
+/// `vable_array_vars` is rebuilt per block and cannot follow the array
+/// across the edge.  Lowering the `len` to `ArrayLen` is not on its own
+/// enough: the array can still ride a **dead** link arg out of its
+/// defining block, and it did — `_check_stack_index` threaded it twice
+/// into a successor whose only operation never touches it.
+///
+/// `prune_dead_phis` (`transform_dead_op_vars`) is what removes such a
+/// link arg, and it can only do so when the target's inputargs are
+/// Variables distinct from the link args feeding them
+/// (`flowcontext.py:466 newstate = state.copy()`).  This asserts the
+/// outcome rather than the mechanism, so it stays meaningful if the
+/// freshening moves.
+#[test]
+fn vable_array_never_rides_a_link_out_of_its_defining_block() {
+    let Some(graph) = lower_pyframe_method("_check_stack_index") else {
+        return;
+    };
+    let (array_var, defining_block) = virtualizable_array_read(&graph);
+
+    for (index, block) in graph.blocks.iter().enumerate() {
+        for (exit_index, link) in block.exits.iter().enumerate() {
+            let position = link
+                .args
+                .iter()
+                .position(|arg| matches!(arg, LinkArg::Value(v) if *v == array_var));
+            assert!(
+                position.is_none(),
+                "the virtualizable array escapes block {index} on exit {exit_index} \
+                 (arg {}) to block {:?}; `_check_no_vable_array` rejects that link",
+                position.unwrap(),
+                link.target,
+            );
+        }
+    }
+
+    for (index, block) in graph.blocks.iter().enumerate() {
+        assert!(
+            !block.inputargs.iter().any(|v| *v == array_var),
+            "the virtualizable array is an inputarg of block {index}, so it was \
+             threaded in from elsewhere rather than read in block {defining_block}",
+        );
+    }
+}
+
+/// `FrameLocalsRoot::new` registers the frame's array **slot** as a GC
+/// root:
+///
+/// ```ignore
+/// let slot = addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8;
+/// let registered = try_gc_add_root(slot);
+/// ```
+///
+/// The front models a reference as an alias of its referent, so that
+/// `&raw mut` arrives as a `FieldRead` of the virtualizable array field
+/// and the address is handed to a call.  It must be marked
+/// `taken_by_address` — otherwise the codewriter records the array in
+/// `vable_array_vars`, **drops** the read, and `try_gc_add_root` is left
+/// with an undefined operand (with `_check_no_vable_array` wired, it
+/// aborts the build instead, which is how this was found).
+///
+/// Marking it does not make the aliasing right: the getfield still yields
+/// the array's value where the source asked for the slot's address, the
+/// same as every other place-address in the corpus.  It stops the
+/// virtualizable path from turning that into a dropped operand.
+#[test]
+fn address_of_the_vable_array_slot_is_marked_not_a_read() {
+    let Some(graphs) = lower_all_named("new") else {
+        return;
+    };
+
+    let mut checked = 0;
+    for graph in &graphs {
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let OpKind::FieldRead { field, .. } = &op.kind else {
+                    continue;
+                };
+                if field.name != "locals_cells_stack_w" {
+                    continue;
+                }
+                let Some(result) = op.result.as_ref() else {
+                    continue;
+                };
+                // Only the read whose consumer is the root registration.
+                let feeds_add_root = graph.blocks.iter().any(|b| {
+                    b.operations.iter().any(|o| {
+                        matches!(
+                            &o.kind,
+                            OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
+                                if segments.last().is_some_and(|s| s == "try_gc_add_root")
+                                    && args.contains(result)
+                        )
+                    })
+                });
+                if !feeds_add_root {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    field.taken_by_address,
+                    "the `addr_of_mut!` projection feeding `try_gc_add_root` in {:?} \
+                     is recorded as a plain read of the virtualizable array",
+                    graph.name,
+                );
+                assert!(
+                    field.suppresses_virtualizable(),
+                    "an address-of projection must suppress the virtualizable lowering",
+                );
+            }
+        }
+    }
+    // Without this the loop above passes vacuously on a corpus that no
+    // longer has the shape, and the test would go quietly inert.  The
+    // count is not pinned: `FrameLocalsRoot::new` is not the only `::new`
+    // that roots the slot, and adding another is not a regression.
+    assert!(
+        checked > 0,
+        "no `addr_of_mut!(locals_cells_stack_w)` feeding `try_gc_add_root` \
+         was found in the shipped LLBC — the test is no longer exercising \
+         anything"
     );
 }

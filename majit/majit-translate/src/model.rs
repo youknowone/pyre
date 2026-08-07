@@ -518,6 +518,36 @@ pub struct FieldDescriptor {
     /// `Some(false)` the correct reading and `Some(true)` merely
     /// conservative.
     pub base_is_deref: Option<bool>,
+    /// The projection this descriptor was built for had its **address**
+    /// taken (`&p.f`, `&raw mut (*p).f`) rather than its value read.
+    ///
+    /// The front models a reference as an alias of its referent
+    /// (`Rvalue::Ref` / `RawPtr` both resolve to the referent's Variable,
+    /// see the module header), so `&raw mut (*p).f` reaches the codewriter
+    /// as an ordinary `FieldRead` of `f`.  For most consumers that
+    /// imprecision is the long-standing model.  For a **virtualizable**
+    /// field it is not survivable: the read is not kept as a value at all
+    /// — an array field read is recorded in `vable_array_vars` and the op
+    /// is dropped, so the operand the address was wanted for is left
+    /// undefined.  `pyframe::FrameLocalsRoot::new` is the witnessed case;
+    /// it registers `addr_of_mut!((*frame).locals_cells_stack_w)` as a GC
+    /// root, and the only consumer is `try_gc_add_root`.
+    ///
+    /// So this suppresses the virtualizable lowering, the same way
+    /// `base_is_local_aggregate` does.  `false` is "not recorded, or not
+    /// an address-of" and keeps the existing lowering, so the conservative
+    /// default is the one a producer gets by saying nothing — the opposite
+    /// polarity to `base_is_deref`, where the *suppressing* value is
+    /// `Some(false)` and an unknowing producer must say `None`.
+    ///
+    /// This does **not** repair the aliasing itself.  An address-of still
+    /// yields the field's value, here as everywhere else; what it stops is
+    /// the virtualizable path turning that into a dropped operand.  A real
+    /// fix needs a distinct place-address op and its consumers.
+    ///
+    /// Excluded from `PartialEq` / `Hash` for the same reason as
+    /// `owner_id` and `base_is_deref`.
+    pub taken_by_address: bool,
 }
 
 impl PartialEq for FieldDescriptor {
@@ -542,6 +572,7 @@ impl FieldDescriptor {
             owner_root,
             owner_id: None,
             base_is_deref: None,
+            taken_by_address: false,
         }
     }
 
@@ -562,6 +593,20 @@ impl FieldDescriptor {
     /// so this access cannot be reaching a live virtualizable.
     pub fn base_is_local_aggregate(&self) -> bool {
         self.base_is_deref == Some(false)
+    }
+
+    /// Builder-style setter for [`Self::taken_by_address`].
+    pub fn with_taken_by_address(mut self, taken_by_address: bool) -> Self {
+        self.taken_by_address = taken_by_address;
+        self
+    }
+
+    /// This access must not lower through the virtualizable protocol:
+    /// either the container is a local aggregate rather than a live
+    /// virtualizable, or what was taken is the field's address rather
+    /// than its value.
+    pub fn suppresses_virtualizable(&self) -> bool {
+        self.base_is_local_aggregate() || self.taken_by_address
     }
 }
 
@@ -6418,6 +6463,7 @@ mod tests {
                         owner_root: Some("Tuple".into()),
                         owner_id: None,
                         base_is_deref: None,
+                        taken_by_address: false,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -6474,6 +6520,7 @@ mod tests {
                     owner_root: Some("Tuple".into()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value: LinkArg::Value(b0),
                 ty: ValueType::Ref(None),
@@ -6582,6 +6629,7 @@ mod tests {
                     owner_root: Some("PyObject".into()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value: LinkArg::Value(ty_addr),
                 ty: ValueType::Ref(None),
@@ -6608,6 +6656,7 @@ mod tests {
                     owner_root: Some("W_FloatObject".into()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -6623,6 +6672,7 @@ mod tests {
                     owner_root: Some("W_FloatObject".into()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value: LinkArg::Value(v.clone()),
                 ty: ValueType::Ref(None),
@@ -6756,6 +6806,7 @@ mod tests {
                     owner_root: Some("PyObject".into()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value: LinkArg::Value(ty_addr),
                 ty: ValueType::Ref(None),
@@ -6782,6 +6833,7 @@ mod tests {
                     owner_root: Some("W_ComplexObject".into()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -6798,6 +6850,7 @@ mod tests {
                         owner_root: Some("W_ComplexObject".into()),
                         owner_id: None,
                         base_is_deref: None,
+                        taken_by_address: false,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -6931,6 +6984,7 @@ mod tests {
                 owner_root: Some(owner.into()),
                 owner_id: None,
                 base_is_deref: None,
+                taken_by_address: false,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -7112,6 +7166,7 @@ mod tests {
                     owner_root: Some("PyObject".into()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value: LinkArg::Value(ty_addr),
                 ty: ValueType::Ref(None),
@@ -7137,6 +7192,7 @@ mod tests {
                     owner_root: Some("W_SetObject".into()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value,
                 ty,
@@ -7263,6 +7319,7 @@ mod tests {
                 owner_root: None,
                 owner_id: None,
                 base_is_deref: None,
+                taken_by_address: false,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -7352,6 +7409,7 @@ mod tests {
                 owner_root: Some("PyObject".into()),
                 owner_id: None,
                 base_is_deref: None,
+                taken_by_address: false,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -7541,6 +7599,7 @@ mod tests {
                 owner_root: None,
                 owner_id: None,
                 base_is_deref: None,
+                taken_by_address: false,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -8344,6 +8403,7 @@ mod tests {
                     owner_root: Some("Box".into()),
                     owner_id: None,
                     base_is_deref: None,
+                    taken_by_address: false,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Float,
