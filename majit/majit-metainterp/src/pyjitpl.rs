@@ -21,6 +21,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use crate::jitprof::Instant;
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
 use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
 #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
@@ -6061,6 +6062,7 @@ impl<M: Clone> MetaInterp<M> {
             Vec<majit_ir::OpRc>,
             crate::optimizeopt::unroll::ExportedState,
         )> = None;
+        let optimize_start = Instant::now();
         let optimize_result = if no_unroll {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -6263,6 +6265,7 @@ impl<M: Clone> MetaInterp<M> {
                 optimized_ops
             }
         };
+        let opt_time = Instant::now().saturating_duration_since(optimize_start);
         let num_ops_after = optimized_ops.len();
         if crate::majit_log_enabled() {
             eprintln!(
@@ -6625,12 +6628,14 @@ impl<M: Clone> MetaInterp<M> {
                 compiled_ops.len()
             );
         }
+        let compile_start = Instant::now();
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_loop(&inputargs, &compiled_ops, &token)
             }))
         };
+        let compile_time = Instant::now().saturating_duration_since(compile_start);
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(e) => {
@@ -6808,8 +6813,8 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     num_ops_before,
                     num_ops_after,
-                    std::time::Duration::ZERO,
-                    std::time::Duration::ZERO,
+                    opt_time,
+                    compile_time,
                 );
                 // warmstate.py:339-348 attach the same compiled token object.
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
@@ -7614,6 +7619,7 @@ impl<M: Clone> MetaInterp<M> {
         // the pre-peel arg set for slots the loop label rebinds.
         unroll_opt.emit_start_label = false;
 
+        let optimize_start = Instant::now();
         let optimize_result = unroll_opt.optimize_trace_with_constants_and_inputs_vable(
             &trace_ops,
             &mut constants,
@@ -7634,6 +7640,7 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             }
         };
+        let opt_time = Instant::now().saturating_duration_since(optimize_start);
         // compile.py:384-390: merge loop_info deps first, then deps carried
         // from the exported start_state.
         let mut quasi_immutable_deps = std::mem::take(&mut unroll_opt.quasi_immutable_deps);
@@ -7809,6 +7816,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let compile_start = Instant::now();
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7820,6 +7828,7 @@ impl<M: Clone> MetaInterp<M> {
                 )
             }))
         };
+        let compile_time = Instant::now().saturating_duration_since(compile_start);
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(payload) => {
@@ -7974,8 +7983,8 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     num_ops_before,
                     num_combined_ops,
-                    std::time::Duration::ZERO,
-                    std::time::Duration::ZERO,
+                    opt_time,
+                    compile_time,
                 );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;

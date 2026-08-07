@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
+pub use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
-use wasm_clock::Instant;
+pub use wasm_clock::Instant;
 
 /// Monotonic substitute for `std::time::Instant` on wasm32-unknown-unknown,
 /// which has no clock (`Instant::now()` there panics). The profiler only needs
@@ -33,7 +33,7 @@ use wasm_clock::Instant;
 /// `Instant::now()` / `saturating_duration_since` surface the timer uses, so
 /// the timing code below is platform-agnostic.
 #[cfg(target_arch = "wasm32")]
-mod wasm_clock {
+pub mod wasm_clock {
     use core::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
