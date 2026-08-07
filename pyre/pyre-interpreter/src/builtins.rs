@@ -5024,12 +5024,14 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // dict (the builtin kwargs ABI); strip it before the arity check and
     // hand it to __init_subclass__ via `type_descr_new_with_metaclass`.
     let (pos, kwargs) = split_builtin_kwargs(args);
-    // The gateway supplies `w_typetype` from a declared parameter, so upstream
-    // never sees this shape; pyre reads it out of the same slice and has to
-    // refuse it here, in `tp_new_wrapper`'s words.
+    // The gateway supplies `w_typetype` from a declared parameter, so this
+    // shape is refused by the argument parser and never reaches
+    // `descr__new__`.  pyre reads the metatype out of the same flat slice and
+    // has to word that refusal itself — in the parser's words, which is the
+    // one message here that is not `descr__new__`'s own.
     if pos.is_empty() {
         return Err(crate::PyError::type_error(
-            "type.__new__(): not enough arguments",
+            "type.__new__() missing 1 required positional argument: 'typetype'",
         ));
     }
 
@@ -5468,7 +5470,9 @@ fn type_descr_new_with_metaclass(
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         type_new_wrap_special_methods(class_ns);
 
-        // Default bases to (object,) if empty
+        // typeobject.py:954 — `W_TypeObject.__init__` is the site that reads
+        // the bases as `bases_w or [space.w_object]`, so the `(object,)`
+        // default belongs to construction and to nothing that runs before it.
         let w_effective_bases =
             if bases.is_null() || !unsafe { is_tuple(bases) } || unsafe { w_tuple_len(bases) } == 0
             {
@@ -5521,18 +5525,18 @@ fn type_descr_new_with_metaclass(
             }
         }
         let w_metaclass = w_winner;
+
         // `_create_new_type` reaches the instance through
-        // `space.allocate_instance(W_TypeObject, w_typetype)`, and that runs
+        // `space.allocate_instance(W_TypeObject, w_typetype)`, which runs
         // `W_TypeObject.check_user_subclass` (typeobject.py:555-567) on the way
-        // in: the winning metatype has to be a subtype of `type` before a type
-        // is laid out for it.
-        if !unsafe { crate::baseobjspace::issubtype_w(w_metaclass, crate::typedef::w_type()) } {
-            let self_name = type_new_getname(crate::typedef::w_type());
-            let subtype_name = type_new_getname(w_metaclass);
-            return Err(crate::PyError::type_error(format!(
-                "{self_name}.__new__({subtype_name}): {subtype_name} is not a subtype of {self_name}"
-            )));
-        }
+        // in.  That is the only place a metatype which *is* a type but is not a
+        // subtype of `type` gets refused — `precheck_for_new` above settles
+        // only that it is a type at all — so without it
+        // `type.__new__(int, 'A', (), {})` would build a class whose metatype
+        // is `int`.  Call the function rather than inline one of its three
+        // checks: the layout arm is what refuses a metatype whose instances are
+        // not laid out as type objects.
+        crate::typedef::check_user_subclass(crate::typedef::w_type(), w_metaclass)?;
 
         // This is type.__new__'s own construction path. A different winning
         // metaclass above received the original bases without a C3 pre-check.

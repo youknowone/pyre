@@ -24,6 +24,24 @@ use std::sync::OnceLock;
 
 type PyResult = Result<PyObjectRef, crate::PyError>;
 
+/// A ctypes metaclass derived from `type`, whose *instances* are therefore
+/// type objects.
+///
+/// `make_builtin_type_with_base` would name the general instance layout
+/// instead, which is the record `check_user_subclass` reads to decide whether
+/// `type.__new__(mcls, …)` may allocate — and `type` itself is set up with
+/// `TYPE_TYPE` for exactly that reason.  Upstream never faces the question:
+/// its ctypes metaclasses are app-level (`class _CDataMeta(type)`,
+/// basics.py:48) and inherit `type`'s instance layout from their base.
+fn make_ctypes_metatype(name: &str, init: impl FnOnce(PyObjectRef)) -> PyObjectRef {
+    crate::typedef::make_builtin_type_with_layout(
+        name,
+        init,
+        crate::typedef::w_type(),
+        &pyre_object::pyobject::TYPE_TYPE as *const pyre_object::PyType,
+    )
+}
+
 // ── cached type objects ────────────────────────────────────────────────
 
 macro_rules! cached_type {
@@ -36,43 +54,31 @@ macro_rules! cached_type {
 }
 
 cached_type!(PYCSIMPLETYPE, pycsimpletype_type, || {
-    crate::typedef::make_builtin_type_with_base(
-        "PyCSimpleType",
-        |ns| {
-            install_new(ns, csimpletype_new);
-            install_init(ns, csimpletype_init);
-            install_shared_meta(ns);
-        },
-        crate::typedef::w_type(),
-    )
+    make_ctypes_metatype("PyCSimpleType", |ns| {
+        install_new(ns, csimpletype_new);
+        install_init(ns, csimpletype_init);
+        install_shared_meta(ns);
+    })
 });
 
 cached_type!(PYCSTRUCTTYPE, pycstructtype_type, || {
-    crate::typedef::make_builtin_type_with_base(
-        "PyCStructType",
-        |ns| {
-            install_new(ns, cstructtype_new);
-            install_init(ns, cstructtype_init);
-            install_shared_meta(ns);
-            install_fields_getset(ns);
-        },
-        crate::typedef::w_type(),
-    )
+    make_ctypes_metatype("PyCStructType", |ns| {
+        install_new(ns, cstructtype_new);
+        install_init(ns, cstructtype_init);
+        install_shared_meta(ns);
+        install_fields_getset(ns);
+    })
 });
 
 cached_type!(PYCUNIONTYPE, pycuniontype_type, || {
     // The union metaclass's Python-visible name is `UnionType` (matching
     // `_ctypes.UnionType`), though its Rust identifier is PyCUnionType.
-    crate::typedef::make_builtin_type_with_base(
-        "UnionType",
-        |ns| {
-            install_new(ns, cuniontype_new);
-            install_init(ns, cuniontype_init);
-            install_shared_meta(ns);
-            install_fields_getset(ns);
-        },
-        crate::typedef::w_type(),
-    )
+    make_ctypes_metatype("UnionType", |ns| {
+        install_new(ns, cuniontype_new);
+        install_init(ns, cuniontype_init);
+        install_shared_meta(ns);
+        install_fields_getset(ns);
+    })
 });
 
 cached_type!(STRUCTURE, structure_type, || {
@@ -139,27 +145,19 @@ cached_type!(CFIELD, cfield_type, || {
 });
 
 cached_type!(PYCARRAYTYPE, pycarraytype_type, || {
-    crate::typedef::make_builtin_type_with_base(
-        "PyCArrayType",
-        |ns| {
-            install_new(ns, carraytype_new);
-            install_init(ns, carraytype_init);
-            install_shared_meta(ns);
-        },
-        crate::typedef::w_type(),
-    )
+    make_ctypes_metatype("PyCArrayType", |ns| {
+        install_new(ns, carraytype_new);
+        install_init(ns, carraytype_init);
+        install_shared_meta(ns);
+    })
 });
 
 cached_type!(PYCPOINTERTYPE, pycpointertype_type, || {
-    crate::typedef::make_builtin_type_with_base(
-        "PyCPointerType",
-        |ns| {
-            install_new(ns, cpointertype_new);
-            install_init(ns, cpointertype_init);
-            install_shared_meta(ns);
-        },
-        crate::typedef::w_type(),
-    )
+    make_ctypes_metatype("PyCPointerType", |ns| {
+        install_new(ns, cpointertype_new);
+        install_init(ns, cpointertype_init);
+        install_shared_meta(ns);
+    })
 });
 
 cached_type!(ARRAY, array_type, || {

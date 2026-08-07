@@ -11,6 +11,13 @@ The precheck is unconditional, so the three-argument form is covered too:
 the metatype is a parameter beside `__args__.arguments_w` rather than one of
 them, which fixes its position at every arity.
 
+The precheck settles only that the metatype is a type.  A metatype that is a
+type without being a subtype of `type` is refused later, by the
+`check_user_subclass` that `space.allocate_instance` runs — after the winning
+metaclass has been calculated over the bases *as written*, and before the
+`(object,)` default is applied to them.  cpython orders those two the other
+way round, which is what the empty-bases and one-base rows below separate.
+
 cpython words all of these differently, so only the outcome kind is
 compared for the rows where it does; the messages are asserted per
 runtime.
@@ -167,5 +174,68 @@ expect_value("ast_node_metatype", lambda: type(ast.Module), type)
 expect_value("ast_node_name", lambda: ast.Module.__name__, "Module")
 expect_value("ast_node_base", lambda: issubclass(ast.Module, ast.AST), True)
 expect_value("ast_parse_result", lambda: isinstance(ast.parse("x = 1"), ast.Module), True)
+
+# `descr__new__` declares the metatype as a parameter, so a call supplying
+# nothing at all is refused by the argument parser and never reaches the arity
+# switch.  cpython's `tp_new_wrapper` words the same refusal its own way.
+expect_type_error(
+    "no_arguments",
+    lambda: type.__new__(),
+    "type.__new__() missing 1 required positional argument: 'typetype'",
+    "type.__new__(): not enough arguments",
+)
+
+# `int`, `str` and `bool` are types, so they pass the precheck; what refuses
+# them is the `check_user_subclass` inside `space.allocate_instance`, which
+# demands the metatype be a subtype of `type`.  Both runtimes word it alike.
+MSG_NOT_SUBTYPE = "type.__new__(%s): %s is not a subtype of type"
+for label, metatype in (("int", int), ("str", str), ("bool", bool)):
+    message = MSG_NOT_SUBTYPE % (label, label)
+    expect_type_error(
+        "%s_metatype_not_subtype" % label,
+        lambda metatype=metatype: type.__new__(metatype, "A", (), {}),
+        message,
+        message,
+    )
+
+# The same metatype with a base written out answers differently, and that pair
+# is what pins the ordering: the winning metaclass is calculated over the bases
+# as given, so the empty tuple leaves `int` unopposed and the allocation check
+# names it, while `(object,)` weighs it against `type(object)` and conflicts
+# first.  Substituting the default before the winner would collapse both rows
+# onto the conflict.  cpython reaches its subtype check before the winner and
+# therefore answers the same on both.
+expect_type_error(
+    "int_metatype_with_base",
+    lambda: type.__new__(int, "A", (object,), {}),
+    "metaclass conflict: the metaclass of a derived class must be a "
+    "(non-strict) subclass of the metaclasses of all its bases",
+    MSG_NOT_SUBTYPE % ("int", "int"),
+)
+
+# The default itself still reaches construction, and a metatype that is a
+# subtype of `type` still builds through the allocation check.
+expect_value("empty_bases_default", lambda: type.__new__(type, "A", (), {}).__bases__, (object,))
+expect_value("meta_metatype", lambda: type(type.__new__(Meta, "A", (), {})), Meta)
+expect_value("meta_empty_bases", lambda: type.__new__(Meta, "A", (), {}).__bases__, (object,))
+
+# The allocation check reads the metatype's recorded instance layout, so a
+# metaclass an extension module defines has to record that its instances are
+# type objects.  Importing `ctypes` alone exercises it — `class
+# py_object(_SimpleCData)` is a `type.__new__` under one of those metaclasses —
+# and the rows below name the metatype rather than assert its spelling, which
+# the runtimes disagree on.
+import ctypes
+
+CTYPES_META = type(ctypes.py_object)
+
+expect_value("ctypes_metatype_is_a_type", lambda: isinstance(CTYPES_META, type), True)
+expect_value("ctypes_metatype_subtypes_type", lambda: issubclass(CTYPES_META, type), True)
+expect_value("ctypes_subclass_name", lambda: type("P", (ctypes.py_object,), {}).__name__, "P")
+expect_value(
+    "ctypes_subclass_metatype",
+    lambda: type(type("P", (ctypes.py_object,), {})),
+    CTYPES_META,
+)
 
 print("OK")
