@@ -240,7 +240,10 @@ fn read_prompt(sys_module: pyre_object::PyObjectRef, name: &str) -> Option<Strin
     if prompt.is_null() || unsafe { pyre_object::is_none(prompt) } {
         return None;
     }
-    Some(unsafe { pyre_interpreter::display::py_str_display(prompt) })
+    // A `sys.ps1` whose `__str__` raises leaves the prompt unread, so
+    // `load_prompt`'s own default stands in; a placeholder would become the
+    // prompt itself.
+    unsafe { pyre_interpreter::display::py_str_display_result(prompt) }.ok()
 }
 
 /// Register a compiled interactive tree with `linecache._interactive_cache`.

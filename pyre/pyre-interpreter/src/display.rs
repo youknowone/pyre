@@ -1362,6 +1362,20 @@ pub unsafe fn py_str_display(obj: PyObjectRef) -> String {
     }
 }
 
+/// `str(obj)` rendered for a terminal, like [`py_str_display`], but a raising
+/// `__str__` is reported to the caller instead of degrading to a placeholder.
+///
+/// For text that is a value the user supplied rather than a diagnostic about
+/// one -- a prompt, say -- `"<unprintable>"` is the wrong answer: the caller
+/// has its own fallback and needs to know the read failed to reach it.
+///
+/// # Safety
+/// `obj` must be a valid object.
+pub unsafe fn py_str_display_result(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    let rendered = unsafe { py_str_wtf8(obj) }?;
+    Ok(wtf8_display_string(rendered, "<unprintable>"))
+}
+
 /// The text a WTF-8 diagnostic becomes on the way to stderr.
 ///
 /// `sys.stderr` carries `errors='backslashreplace'`, so an unpaired surrogate
