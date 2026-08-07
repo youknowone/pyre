@@ -815,6 +815,24 @@ fn is_vec_ctor_segments(segments: &[String]) -> bool {
         && (segments[2] == "with_capacity" || segments[2] == "new")
 }
 
+/// `alloc::vec::from_elem(elem, count)` (Rust MIR `vec![elem; count]`) —
+/// the repeated resizable-list constructor.  Routed in [`translate_op`] to
+/// `newlist(elem)` + `mul(list, count)`, the same `[a] * b` shape that
+/// `transform_allocate` (`transform.py:36-50`) collapses to
+/// `alloc_and_set` and `rtype_alloc_and_set` (`rlist.py:346-351`) lowers
+/// through `ll_alloc_and_set` (`rlist.py:487`).
+///
+/// Charon emits this call as `alloc::vec::from_elem`, while the constructor
+/// recognizer above omits the foreign crate prefix. Match the trailing
+/// `vec::from_elem` spelling defensively, but require the exact two-argument
+/// `(elem, count)` shape.
+fn is_vec_from_elem_segments(segments: &[String], arg_count: usize) -> bool {
+    segments.len() >= 2
+        && segments[segments.len() - 2] == "vec"
+        && segments[segments.len() - 1] == "from_elem"
+        && arg_count == 2
+}
+
 /// `Vec::push(l, item)` (Rust MIR `vec::Vec::push`) — the resizable-list
 /// append. Routed to the resized `ListRepr.rtype_method("append")`
 /// (`rlist.py:185`) via the `getattr(recv, "append") + simple_call` method
@@ -934,8 +952,11 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // Matched before the general `Call` arm.
         OpKind::Call {
             target: crate::model::CallTarget::FunctionPath { segments },
+            args,
             ..
-        } if is_vec_ctor_segments(segments) => false,
+        } if is_vec_ctor_segments(segments) || is_vec_from_elem_segments(segments, args.len()) => {
+            false
+        }
         // `[__iter_next]` (`front::iter_next`) lowers to the raising
         // flowspace `next` op (`operation.rs` `OpKind::Next.can_only_throw
         // = [StopIteration, RuntimeError]`).  Matched before the general
@@ -1898,6 +1919,22 @@ pub fn translate_op(
                     // dropped — see [`is_vec_ctor_segments`].
                     if is_vec_ctor_segments(segments) {
                         return Ok(vec![FlowspaceOp::new("newlist", vec![], result)]);
+                    }
+                    // `vec![elem; count]` lowers (in Rust MIR) to a call to
+                    // `alloc::vec::from_elem(elem, count)`. Emit the same
+                    // `newlist(elem)` + `mul(list, count)` shape as the
+                    // `__array_repeat` synthetic above; see
+                    // [`is_vec_from_elem_segments`] for the upstream
+                    // `transform_allocate` / `rtype_alloc_and_set` path.
+                    if is_vec_from_elem_segments(segments, arg_hls.len()) {
+                        let mut iter = arg_hls.into_iter();
+                        let fill = iter.next().expect("from_elem fill arg");
+                        let count = iter.next().expect("from_elem count arg");
+                        let list = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new("newlist", vec![fill], list.clone()),
+                            FlowspaceOp::new("mul", vec![list, count], result),
+                        ]);
                     }
                     // `Vec::push(recv, item)` lowers (in Rust MIR) to a call
                     // to `vec::Vec::push`. Emit the *method* shape
@@ -4730,6 +4767,62 @@ mod tests {
         assert_eq!(translated[1].args[0], translated[0].result);
         assert_eq!(translated[1].args[1], count);
         assert_eq!(translated[1].result, result);
+    }
+
+    /// The frontend cannot see the adapter's expansion: `lower_function`
+    /// still contains the raw `alloc::vec::from_elem` call, while the
+    /// flowspace graph must carry `newlist` + `mul` instead.  This real-LLBC
+    /// anchor therefore runs both stages and checks the adapter output.
+    #[test]
+    #[ignore]
+    fn bind_kwargs_to_signature_has_no_residual_vec_from_elem_after_adaptation() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = majit_charon_reader::Llbc::load(path).expect("load real LLBC");
+        let legacy = crate::front::mir::lower_function(&llbc, "bind_kwargs_to_signature")
+            .expect("lower bind_kwargs_to_signature");
+        let raw_from_elem = legacy
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath { segments },
+                        ..
+                    } if is_vec_from_elem_segments(segments, 2)
+                )
+            })
+            .count();
+        assert!(raw_from_elem > 0, "fixture must contain vec::from_elem");
+
+        let var_map = build_value_to_variable_map(&legacy);
+        let value_map = build_value_to_hlvalue_map(&legacy, &var_map);
+        let registry = empty_call_registry();
+        let expansions = legacy
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath { segments },
+                        ..
+                    } if is_vec_from_elem_segments(segments, 2)
+                )
+            })
+            .map(|op| translate_op(op, &value_map, &registry).expect("adapt from_elem"))
+            .collect::<Vec<_>>();
+        assert!(!expansions.is_empty());
+        for translated in expansions {
+            assert_eq!(translated.len(), 2);
+            assert_eq!(translated[0].opname, "newlist");
+            assert_eq!(translated[1].opname, "mul");
+        }
     }
 
     #[test]
