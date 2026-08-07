@@ -859,10 +859,11 @@ fn maybe_print_jit_stats() {
     );
     let stats = pyre_jit::eval::driver_pair().0.get_stats();
     eprintln!(
-        "[jit-stats] loops_compiled={} bridges_compiled={} loops_aborted={} \
+        "[jit-stats] loops_compiled={} bridges_compiled={} retraces_compiled={} loops_aborted={} \
          guard_failures={} internal_compile_panics={}",
         stats.loops_compiled,
         stats.bridges_compiled,
+        stats.retraces_compiled,
         stats.loops_aborted,
         stats.guard_failures,
         stats.internal_compile_panics,

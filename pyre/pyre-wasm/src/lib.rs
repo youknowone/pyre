@@ -435,6 +435,15 @@ pub extern "C" fn pyre_jit_loops_compiled() -> u64 {
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 #[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_retraces_compiled() -> u64 {
+    pyre_jit::eval::driver_pair()
+        .0
+        .get_stats()
+        .retraces_compiled as u64
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
 pub extern "C" fn pyre_jit_bridges_compiled() -> u64 {
     pyre_jit::eval::driver_pair().0.get_stats().bridges_compiled as u64
 }

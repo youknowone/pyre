@@ -899,6 +899,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         };
         let loops_compiled = counter("pyre_jit_loops_compiled", &mut missing);
         let bridges_compiled = counter("pyre_jit_bridges_compiled", &mut missing);
+        let retraces_compiled = counter("pyre_jit_retraces_compiled", &mut missing);
         let loops_aborted = counter("pyre_jit_loops_aborted", &mut missing);
         let guard_failures = counter("pyre_jit_guard_failures", &mut missing);
         let internal_compile_panics = counter("pyre_jit_internal_compile_panics", &mut missing);
@@ -955,6 +956,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         eprintln!(
             "[jit-stats] loops_compiled={loops_compiled} \
              bridges_compiled={bridges_compiled} \
+             retraces_compiled={retraces_compiled} \
              loops_aborted={loops_aborted} \
              guard_failures={guard_failures} \
              internal_compile_panics={internal_compile_panics} \

@@ -831,7 +831,7 @@ JITSTATS_BADNESS_FIELDS = (
     "fbw_store_journal_rollback_failed",
 )
 
-# The three count-valued counters, and what a move in either direction means:
+# The count-valued counters, and what a move in either direction means:
 #
 # * `guard_failures` counts every guard failure that re-enters the metainterp,
 #   so it is what moves when a compiled loop's guards start failing more often —
@@ -853,6 +853,10 @@ JITSTATS_BADNESS_FIELDS = (
 #   under ordinary tuning", which made a bridge collapse (27 -> 0) invisible for
 #   as long as `guard_failures` stayed inside its band — the whole dead-bridge
 #   class this suite exists to catch.
+# * `retraces_compiled` records that a requested retrace was assembled and
+#   attached. A fall means the retrace path stopped producing an artifact;
+#   without this positive signal, `loops_aborted` can hold at zero and the
+#   accompanying fall in `guard_failures` looks like an improvement.
 # * `fbw_blackhole_adopted_single_frame` and
 #   `fbw_blackhole_adopted_multi_frame` count successful full-body-walk
 #   blackhole adoptions: the walk handed the interpreter a resumable image
@@ -887,6 +891,7 @@ JITSTATS_BADNESS_FIELDS = (
 JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
     "loops_compiled",
     "bridges_compiled",
+    "retraces_compiled",
     "guard_failures",
     "fbw_blackhole_adopted_single_frame",
     "fbw_blackhole_adopted_multi_frame",
@@ -903,11 +908,14 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # `loops_compiled` is inverted against the badness fields: it is the counter
 # that falls when the tracer stops admitting a frame at all, which aborts
 # nothing and *lowers* `guard_failures`, so a fall is the regression and a rise
-# is the gain. The blackhole adoption counters are inverted the same way: a
-# fall means the interpreter stopped receiving an image and went back to replay.
+# is the gain. `retraces_compiled` has the same polarity: a fall means an
+# assembled retrace stopped being attached. The blackhole adoption counters are
+# inverted the same way: a fall means the interpreter stopped receiving an
+# image and went back to replay.
 JITSTATS_REGRESSION_ON_RISE = JITSTATS_BADNESS_FIELDS + ("guard_failures",)
 JITSTATS_REGRESSION_ON_FALL = (
     "loops_compiled",
+    "retraces_compiled",
     "fbw_blackhole_adopted_single_frame",
     "fbw_blackhole_adopted_multi_frame",
 )

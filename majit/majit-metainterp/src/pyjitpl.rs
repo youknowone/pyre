@@ -1561,8 +1561,8 @@ pub struct MetaInterp<M: Clone> {
 /// Internal mutable counters for JIT compilation statistics.
 ///
 /// Holds only the pyre-specific lifetime counters (`loops_compiled`,
-/// `loops_aborted`, `bridges_compiled`, `guard_failures`) that have no
-/// `Counters.*` slot upstream.  Every counter that maps to a
+/// `retraces_compiled`, `loops_aborted`, `bridges_compiled`, `guard_failures`)
+/// that have no `Counters.*` slot upstream.  Every counter that maps to a
 /// `Counters.*` id (OPS / HEAPCACHED_OPS / RECORDED_OPS / GUARDS /
 /// OPT_OPS / OPT_GUARDS / OPT_GUARDS_SHARED / NV* / ABORT_* /
 /// FORCE_VIRTUALIZABLES / OPT_VECTORIZE_*) lives on
@@ -1571,6 +1571,7 @@ pub struct MetaInterp<M: Clone> {
 #[derive(Default, Clone, Debug)]
 pub(crate) struct JitStatsCounters {
     loops_compiled: usize,
+    retraces_compiled: usize,
     loops_aborted: usize,
     bridges_compiled: usize,
     guard_failures: usize,
@@ -1580,6 +1581,7 @@ pub(crate) struct JitStatsCounters {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JitStats {
     pub loops_compiled: usize,
+    pub retraces_compiled: usize,
     pub loops_aborted: usize,
     pub bridges_compiled: usize,
     pub guard_failures: usize,
@@ -4083,6 +4085,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn get_stats(&self) -> JitStats {
         JitStats {
             loops_compiled: self.stats.loops_compiled,
+            retraces_compiled: self.stats.retraces_compiled,
             loops_aborted: self.stats.loops_aborted,
             bridges_compiled: self.stats.bridges_compiled,
             guard_failures: self.stats.guard_failures,
@@ -8194,6 +8197,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `ResumeDescr.rd_loop_token` inherits the source identity.
                 let mut combined_ops = combined_ops;
                 self.record_loop_or_bridge(&source_jct, &mut combined_ops, bridge_trace_id);
+                self.stats.retraces_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] attached retrace to guard at key={green_key}, guard={fail_index}, \
