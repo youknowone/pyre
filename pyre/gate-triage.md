@@ -237,7 +237,7 @@ program point is not a safepoint, and the same bench is clean under the real
 allocation-driven stress.  Force collections through the GC's own stress hook,
 never at a hand-picked instruction.
 
-## §1c — Retired since the 2026-07-05 audit (10): reader already deleted by a closed epic
+## §1c — Retired since the 2026-07-05 audit (11): reader already deleted by a closed epic
 
 Book-keeping only: these OFF-paths were deleted in source by the cited epics
 after the 2026-07-05 audit; this pass removes their stale registry rows. The
@@ -255,6 +255,7 @@ after the 2026-07-05 audit; this pass removes their stale registry rows. The
 | PYRE_P2_FS_COMPILE | PR#374 (`9a97c47f6e9`) | stale §5 deferred entry removed |
 | PYRE_P2_AUTHORITATIVE | reader gone; attribution #374 per re-audit | stale §5 deferred entry removed |
 | PYRE_SAME_GREENKEY | PR#390 (`802b79ff8db`); follow-up `111bdb4eeb8` dropped the gate | stale §1b deferred mention and §5 list entry removed |
+| PYRE_FBW_REC_UNROLL | PR#374 (`9a97c47f6e9`) deleted `fbw_unroll_bound()` | stale §5 config-switch entry removed 2026-08-08. The successor knob `PYRE_FBW_REC_UNROLL_DEPTH` was never listed here and its reader `fbw_max_rec_unroll_depth()` is gone too (PR#887, `e5546b2ed36`) — both names read from nothing |
 
 ## §1d — Parity verdicts for the default-OFF `PYRE_FBW_*` seams (2026-07-25)
 
@@ -878,8 +879,8 @@ Kept as-is; listed for completeness.
   the mirror is seeded and then read by nobody.  Definition of done before
   re-evaluating: make the maintenance sites read the ACTIVE callee jitcode
   metadata (what the gate doc already asks for), then land a consumer.
-- **Config / value / master switches (~18)** — tuning, paths, modes; keep:
-  `PYRE_FBW_REC_UNROLL`, `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
+- **Config / value / master switches (~17)** — tuning, paths, modes; keep:
+  `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
   `PYRE_GC_INTERP`, `PYRE_JIT`, `PYRE_NO_JIT`, `PYRE_STDLIB`,
   `PYRE_CHECK_PYPY3`, `PYRE_CHECK_PYTHON3`, `PYRE_SANDBOX_NO_SECCOMP`,
@@ -901,7 +902,7 @@ with no entry here fails `cargo test`. The counts to quote, distinguished:
 | — read only from the harness Python | 6 |
 | (file, name) read pairs | 137 |
 | **live gates that were absent from this file** | **66** |
-| names still listed live with no read site left (retire) | 1 |
+| names still listed live with no read site left (retire) | 0 |
 
 ```sh
 { git ls-files '*.rs'; git ls-files 'pyre/**/*.py' 'scripts/*.py'; } \
@@ -997,11 +998,11 @@ already-ON criterion. They are listed so they cannot be missed again.
 
 | bucket | count |
 |---|---|
-| retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 10 + 1 |
-| not gates (identifiers) | 11 |
+| retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 11 + 1 |
+| not gates (identifiers) | 12 |
 | dead (no read site) | 10 |
 | live default-ON, kept until epic closes | 9 (+ `PYRE_GC_INTERP`, wasm32-only) |
 | diagnostics (OFF) | ~34 |
 | default-OFF experiments (all keep — adoption targets) | 3 |
-| config / value / master | ~18 |
+| config / value / master | ~17 |
 | test harness | 1 |

@@ -1,6 +1,6 @@
-//! Every `PYRE_*` environment gate this project reads — from a workspace
-//! member's Rust or from its own Python — must have a live entry in
-//! `pyre/gate-triage.md`.
+//! `pyre/gate-triage.md` and the tree's `PYRE_*` environment gates must name the
+//! same set — every gate read from a workspace member's Rust or from this
+//! project's own Python has a live entry, and every live entry has a reader.
 //!
 //! The charter (§3.6) says a gate is a staging area, not a home, and
 //! `gate-triage.md` is the standing list of what to retire and when. That list
@@ -10,6 +10,13 @@
 //!
 //! Adding a gate therefore costs one row. The row is cheap; the alternative is
 //! another hand audit that goes stale the week after it lands.
+//!
+//! Both directions, because they rot differently and only one of them is loud. A
+//! gate with no row is a gate nobody will retire. A row with no reader is the
+//! quieter half: it survives the deletion of the code it describes, and the next
+//! sweep spends its time re-deriving that the name is already gone —
+//! `PYRE_FBW_REC_UNROLL` sat in the config-switch list from 2026-07-06, when
+//! PR#374 deleted `fbw_unroll_bound()`, until this test went looking.
 //!
 //! **Scope.** Rust sources in workspace member crates, and this project's own
 //! Python under `pyre/` and `scripts/`. The harness reads six gates that no Rust
@@ -234,6 +241,68 @@ fn gates_documented_in(triage: &str) -> BTreeSet<&str> {
     found
 }
 
+/// A documented token that is a wildcard's stem rather than a gate.
+///
+/// This file writes `PYRE_*` and `PYRE_FBW_*` when it means a family, and the
+/// token scan stops at the `*`, leaving a name ending in `_`. No gate is named
+/// that way, so the trailing underscore is the whole test.
+fn is_wildcard_stem(name: &str) -> bool {
+    name.ends_with('_')
+}
+
+/// Every source file a gate can be read from.
+fn source_files(root: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    for member in workspace_member_dirs(root) {
+        collect_sources(&member, "rs", &mut sources);
+    }
+    assert!(
+        sources.len() > 100,
+        "found only {} .rs files across the workspace members — the walk is not \
+         reaching the tree",
+        sources.len()
+    );
+
+    let rust_files = sources.len();
+    for py_root in PYTHON_ROOTS {
+        let dir = root.join(py_root);
+        assert!(
+            dir.is_dir(),
+            "PYTHON_ROOTS names {py_root}, which is not a directory under {}",
+            root.display()
+        );
+        collect_sources(&dir, "py", &mut sources);
+    }
+    assert!(
+        sources.len() - rust_files > 100,
+        "found only {} .py files under {PYTHON_ROOTS:?} — the walk is not \
+         reaching the harness",
+        sources.len() - rust_files
+    );
+    sources
+}
+
+/// `(gate name, repo-relative file)` for every environment read in the tree.
+fn read_sites(root: &Path) -> BTreeSet<(String, String)> {
+    // This file's own fixture spells out `env::var("PYRE_A")` and friends, which
+    // are test data rather than gates.
+    let self_path = root.join(file!());
+    let mut sites = BTreeSet::new();
+    for path in source_files(root) {
+        if path == self_path {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for name in gates_read_by(&text) {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            sites.insert((name.to_string(), rel.display().to_string()));
+        }
+    }
+    sites
+}
+
 #[test]
 fn every_live_pyre_gate_has_a_gate_triage_entry() {
     let root = repo_root();
@@ -262,52 +331,10 @@ fn every_live_pyre_gate_has_a_gate_triage_entry() {
          is_history_heading is excluding a live section"
     );
 
-    let mut sources = Vec::new();
-    for member in workspace_member_dirs(&root) {
-        collect_sources(&member, "rs", &mut sources);
-    }
-    assert!(
-        sources.len() > 100,
-        "found only {} .rs files across the workspace members — the walk is not \
-         reaching the tree",
-        sources.len()
-    );
-
-    let rust_files = sources.len();
-    for py_root in PYTHON_ROOTS {
-        let dir = root.join(py_root);
-        assert!(
-            dir.is_dir(),
-            "PYTHON_ROOTS names {py_root}, which is not a directory under {}",
-            root.display()
-        );
-        collect_sources(&dir, "py", &mut sources);
-    }
-    assert!(
-        sources.len() - rust_files > 100,
-        "found only {} .py files under {PYTHON_ROOTS:?} — the walk is not \
-         reaching the harness",
-        sources.len() - rust_files
-    );
-    // This file's own fixture spells out `env::var("PYRE_A")` and friends, which
-    // are test data rather than gates.
-    let self_path = root.join(file!());
-
-    let mut missing: BTreeSet<(String, String)> = BTreeSet::new();
-    for path in &sources {
-        if *path == self_path {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        for name in gates_read_by(&text) {
-            if !documented.contains(name) {
-                let rel = path.strip_prefix(&root).unwrap_or(path);
-                missing.insert((name.to_string(), rel.display().to_string()));
-            }
-        }
-    }
+    let missing: BTreeSet<(String, String)> = read_sites(&root)
+        .into_iter()
+        .filter(|(name, _)| !documented.contains(name.as_str()))
+        .collect();
 
     if !missing.is_empty() {
         let listed = missing
@@ -323,4 +350,36 @@ fn every_live_pyre_gate_has_a_gate_triage_entry() {
             missing.len()
         );
     }
+}
+
+#[test]
+fn every_live_gate_triage_entry_still_has_a_reader() {
+    let root = repo_root();
+    let triage_path = root.join("pyre/gate-triage.md");
+    let triage = std::fs::read_to_string(&triage_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", triage_path.display()));
+
+    let read: BTreeSet<String> = read_sites(&root)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let stale: Vec<&str> = gates_documented_in(&triage)
+        .into_iter()
+        .filter(|name| !is_wildcard_stem(name) && !read.contains(*name))
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "{} name(s) are listed live in pyre/gate-triage.md but nothing in the tree \
+         reads them:\n{}\n\n\
+         Deleting the row loses why the gate existed. Move each to a retirement \
+         section (§1c) naming the change that removed its reader — that is what \
+         stops the next reader of this name from passing on an obituary.",
+        stale.len(),
+        stale
+            .iter()
+            .map(|name| format!("  {name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
