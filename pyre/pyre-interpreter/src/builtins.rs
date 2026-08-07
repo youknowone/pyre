@@ -8634,10 +8634,15 @@ fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let message = unsafe { pyre_object::w_str_get_wtf8(message) };
     let count = unsafe { pyre_object::w_tuple_len(exceptions) };
     let suffix = if count == 1 { "" } else { "s" };
-    Ok(pyre_object::w_str_new(&format!(
-        "{} ({count} sub-exception{suffix})",
-        message.to_string_lossy()
-    )))
+    // `app_group.py:88-90` interpolates `self.message` into the result, and a
+    // `str` carrying an unpaired surrogate interpolates as itself.  Building
+    // the result through `to_string_lossy` instead turned that surrogate into
+    // U+FFFD, so `str(group)` answered a different string than `group.message`
+    // held -- a loss visible from Python, not only on the way to stderr.
+    let mut rendered = Wtf8Buf::with_capacity(message.len() + 32);
+    rendered.push_wtf8(message);
+    rendered.push_str(&format!(" ({count} sub-exception{suffix})"));
+    Ok(pyre_object::w_str_from_wtf8(rendered))
 }
 
 fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

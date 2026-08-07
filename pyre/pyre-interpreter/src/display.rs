@@ -1306,15 +1306,27 @@ pub unsafe fn py_str_display(obj: PyObjectRef) -> String {
             Ok(w) => w,
             Err(_) => return "<unprintable>".to_string(),
         };
-        if let Ok(s) = w.as_str() {
-            return s.to_owned();
-        }
-        let s_obj = pyre_object::w_str_from_wtf8(w);
-        crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_else(|| "<unprintable>".to_string())
+        wtf8_display_string(w, "<unprintable>")
     }
+}
+
+/// The text a WTF-8 diagnostic becomes on the way to stderr.
+///
+/// `sys.stderr` carries `errors='backslashreplace'`, so an unpaired surrogate
+/// leaves as the six characters `\udcXX` rather than as the three WTF-8 bytes
+/// behind it — which are not valid UTF-8 and would reach a consumer as
+/// replacement characters.  Every diagnostic assembled as a `Wtf8Buf` owes that
+/// encode before it is written; `fallback` names the caller's placeholder for
+/// the encode itself failing.
+pub(crate) fn wtf8_display_string(rendered: Wtf8Buf, fallback: &str) -> String {
+    if let Ok(s) = rendered.as_str() {
+        return s.to_owned();
+    }
+    let s_obj = pyre_object::w_str_from_wtf8(rendered);
+    crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 /// The encoded length of the character a WTF-8 lead byte opens.

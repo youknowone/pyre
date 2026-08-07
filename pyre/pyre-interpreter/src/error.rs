@@ -2029,7 +2029,7 @@ fn write_plain_exception_object<W: Write>(
     {
         write_syntax_error_object(&mut rendered, exc)?;
     } else {
-        let header = render_rooted_exc_object_wtf8(exc_slot);
+        let header = render_rooted_exc_object_display(exc_slot);
         rendered.write_all(header.as_bytes())?;
         rendered.write_all(b"\n")?;
     }
@@ -2096,7 +2096,7 @@ fn write_exception_group<W: Write>(
     }
 
     let mut header = Vec::new();
-    let group_header = render_rooted_exc_object_wtf8(exc_slot);
+    let group_header = render_rooted_exc_object_display(exc_slot);
     header.write_all(group_header.as_bytes())?;
     header.write_all(b"\n")?;
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
@@ -2366,15 +2366,20 @@ fn notes_is_abc_sequence(notes_slot: usize) -> bool {
 /// Compose the `ExcName: msg` header for a W_BaseException —
 /// equivalent to `traceback.format_exception_only`'s last line.
 fn render_exc_object(exc: PyObjectRef) -> String {
-    let rendered = render_exc_object_wtf8(exc);
-    if let Ok(s) = rendered.as_str() {
-        return s.to_owned();
-    }
-    let s_obj = pyre_object::w_str_from_wtf8(rendered);
-    crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
-        .ok()
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| "<exception str() failed>".to_string())
+    crate::display::wtf8_display_string(render_exc_object_wtf8(exc), "<exception str() failed>")
+}
+
+/// [`render_rooted_exc_object_wtf8`] as the bytes stderr should receive.
+///
+/// The callers that assemble the report into a byte buffer have to spend the
+/// `backslashreplace` encode themselves; writing the `Wtf8Buf` straight out
+/// puts the raw surrogate bytes on the stream, which is not what
+/// `errors='backslashreplace'` produces and is not valid UTF-8.
+fn render_rooted_exc_object_display(exc_slot: usize) -> String {
+    crate::display::wtf8_display_string(
+        render_rooted_exc_object_wtf8(exc_slot),
+        "<exception str() failed>",
+    )
 }
 
 fn render_rooted_exc_object_wtf8(exc_slot: usize) -> Wtf8Buf {
