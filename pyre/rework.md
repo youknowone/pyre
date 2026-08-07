@@ -3,8 +3,9 @@
 **Status**: living record, companion to `design.md` (the charter). Where the
 charter states what pyre must be, this states where today's code violates it and
 what is left to do about it. **Findings are deleted as they close** — the history
-of what was once wrong belongs in git, not here. Keep this document small enough
-that it is worth re-reading.
+of what was once wrong belongs in git, not here. The one exception is *Settled*
+below: a closed finding leaves a one-line verdict there only where re-deriving it
+is the live risk. Keep this document small enough that it is worth re-reading.
 
 Original audit: branch `pc-map`, 2026-07-05, against the charter's axioms A1–A7
 and norms N1–N7. Re-measured 2026-08-07 on `ec-wiring`.
@@ -113,41 +114,43 @@ nowhere to go belongs inside an existing kind, not in a new slot.
 runs), and the regrtest harness under moving collection. The real exit test is
 that the oldgen-nonmoving concession becomes deletable.
 
-### F5 — 66 of the 105 live `PYRE_*` gates are undocumented, and nothing stops a 67th
+### F5 — three documented gates have no reader left, and the brake is Rust-only
 
-**Measured 2026-08-07**, distinguishing the counts this has been confused between
-before:
+The 66 undocumented gates and the missing brake are both closed: `gate-triage.md`
+§6 lists all 66, and `pyre/pyrex/tests/gate_triage_complete.rs` fails the build
+when a `PYRE_*` read in a workspace member has no entry in a **live** section of
+that file. **Measured 2026-08-07**, re-measured once §6 landed:
 
 | count | value | what it is |
 |---|---|---|
-| distinct names read from the environment | **105** | the gate population |
-| (file, name) read pairs | 127 | read *sites*, not gates |
-| names mentioned in `gate-triage.md` | 90 | of which only 39 are still read |
-| **live gates absent from `gate-triage.md`** | **66** | the debt |
+| distinct names read from `*.rs` | **105** | the population the brake sees |
+| (file, name) read pairs | 128 | read *sites*, not gates |
+| named in `gate-triage.md`'s live sections | 113 | tokens; one is the `PYRE_FBW_*` fragment in §1d's heading |
+| named in its retirement sections | 47 | already swept |
+| **live-named with no reader anywhere** | **3** | the debt |
 
+```sh
+git ls-files '*.rs' | xargs rg --no-filename -o \
+  '(env::var[_a-z]*|host_os::var|getenv)\(b?"(PYRE_[A-Z0-9_]+)"' -r '$2' | sort -u
 ```
-git ls-files '*.rs' | xargs rg --no-filename -o 'env::var[_a-z]*\("(PYRE_[A-Z0-9_]+)"' -r '$1' | sort -u
-```
 
-Earlier revisions of this document reported 119 and then 126 "distinct names".
-Both were the (file, name) pair count: the command as previously written kept
-rg's filename prefix, so `sort -u` counted sites. `--no-filename` is what makes it
-a gate count. Say which of the four a number is.
+Say which of these a number is. Earlier revisions reported 119 and then 126
+"distinct names"; both were the (file, name) pair count, because the command as
+written then kept rg's filename prefix and `sort -u` counted sites.
 
-**Violates.** Charter §3.6: a gate is a staging area, not a home. The triage
-table is a snapshot that is 63% empty, and nothing makes a new gate enter it at
-birth — which is what the hygiene workstream asked for and never got.
+**Violates.** Charter §3.6: a gate is a staging area, not a home. Three names are
+staged in a file nobody swept.
 
 **What is left.**
 
-1. **List the 66.** Most are default-OFF diagnostics (`*_DIAG`, `*_AUDIT`,
-   `*_CENSUS`, `*_PROBE`), which `gate-triage.md`'s own polarity rule classifies
-   mechanically from the read expression. The default-ON ones are the removal
-   targets; the rest are book-keeping.
-2. **Add the brake**: a check that fails when a `PYRE_*` env read has no entry in
-   `gate-triage.md`. Without it the table re-rots the moment it is filled, which
-   is how it got to 63% empty.
-3. Retire the 51 documented names that no longer have a read site.
+1. Retire `PYRE_FBW_REC_UNROLL`, `PYRE_FBW_VABLE_SCALAR_CA` and `PYRE_P2_DRAIN`
+   — named in §5/§1d, read from nothing in the tree.
+2. Decide whether the brake scans beyond Rust. Four live gates
+   (`PYRE_CHECK_PYPY3`, `PYRE_CHECK_PYTHON3`, `PYRE_SHARED_BUILD`,
+   `PYRE_SYNTH_PYPY`) are read only by `check.py`, `check_synthetic.py`, the CI
+   workflows and `scripts/llbc_extract.py`. A `*.rs` census reads them as retire
+   targets and they are not; conversely a Python- or YAML-only gate added
+   tomorrow enters undocumented, which is the hole §6 was written to close.
 
 ### Smaller open items
 
@@ -189,7 +192,10 @@ registration away, and that is gone.
 - **F5 out of order whenever convenient** — it is cheap, it is the only item that
   gets *worse* while ignored, and its brake is what keeps it closed.
 
-F4 and F3 are parallel-safe: different crates, no shared surface.
+F4 and F3 are parallel-safe, though not for the reason an earlier revision gave:
+both touch `pyre-jit`, so "different crates" was wrong. They share no file and no
+symbol — F4 is confined to `jit/codewriter.rs`, F3 to the root-walker
+registration in `eval.rs` / `call_jit.rs` and `majit-gc/shadow_stack.rs`.
 
 Each item closes by the charter's instruments: N4 gates for every landing, N5
 evidence for every default flip, N7 written rationale for every mechanism deleted
@@ -232,8 +238,9 @@ or replaced. **And then its section here is deleted.**
 
 ## What falsifies this
 
-- If the F4 census, once built, shows the unlisted set is already empty, F4
-  closes on the spot and only the tracked residue remains.
+- The F4 census is built, and the unlisted set is not empty: it is the one
+  `_other` catch-all. If naming that arm's opcode shows it never fires on the
+  corpus, F4 closes on the spot and only the tracked residue remains.
 - If F3's class-(b) absorption measurably regresses minor-collection pause
   (prebuilt scanning cost), the registry survives *for that class only*,
   documented as the deliberate adaptation it currently is not.

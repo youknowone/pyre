@@ -369,7 +369,7 @@ call, and two nested inlined levels (depth 3).  Instrumented 2026-07-26, both
 report the same cause — a ref color that is **live at the caller's post-call
 coordinate holds `ConcreteValue::Null`**:
 
-```
+```text
 try/except caller: ref color=11 not concrete: Null  result_color=Some(5) nlocals=3 depth=3 live_ref=[0,1,2,5,11]
 depth 3:           ref color=2  not concrete: Null  result_color=Some(0) nlocals=1 depth=1 live_ref=[0,1,2]
 ```
@@ -393,7 +393,7 @@ still named the CALLER while an inlined callee body ran.  A `sys._getframe`
 that is *itself* the escaping residual therefore read the wrong frame at walk
 time, and the adopt committed that answer where legacy escape/replay discards it:
 
-```
+```text
 _gf().f_code.co_name   -> "main",     not "leaf"
 _gf(1).f_code.co_name  -> "<module>", not "main"     # one level too far up
 _gf(1).f_locals["k"]   -> KeyError                   # same cause, seen through the argument
@@ -846,13 +846,21 @@ with no entry here fails `cargo test`. The counts to quote, distinguished:
 | count | value |
 |---|---|
 | distinct names read from the environment | **105** |
-| (file, name) read pairs | 127 |
+| (file, name) read pairs | 128 |
 | **live gates that were absent from this file** | **66** |
 | names here with no read site left (retire) | 51 |
 
+```sh
+git ls-files '*.rs' | xargs rg --no-filename -o \
+  '(env::var[_a-z]*|host_os::var|getenv)\(b?"(PYRE_[A-Z0-9_]+)"' -r '$2' | sort -u
 ```
-git ls-files '*.rs' | xargs rg --no-filename -o 'env::var[_a-z]*\("(PYRE_[A-Z0-9_]+)"' -r '$1' | sort -u
-```
+
+`--no-filename` is what makes this count gates: without it rg prefixes each hit
+and `sort -u` counts (file, name) pairs instead. The two seam forms matter for
+the same reason — `host_os::var` and `host_seam::ops::getenv` (a *byte* string)
+are how `importing.rs` reads `PYRE_STDLIB`, and a `std::env` search alone would
+miss a sandbox- or wasm-only gate entirely. Neither seam form adds a name here;
+both are `PYRE_STDLIB`, already read through `env::var` in `pyre-wasm-runner`.
 
 Polarity below follows this file's rule, with one correction it needed: an
 `is_none()` whose value *is* the enable flag means default **ON**, but an
