@@ -3137,12 +3137,20 @@ fn read_source_line(filename: &[u8], lineno: i64) -> Option<String> {
 /// so a caller writing to one owes that encode itself -- putting the WTF-8
 /// bytes straight on the stream would emit a sequence that is not valid UTF-8.
 pub(crate) fn emit_report_to_host_stderr(buf: &[u8]) {
-    let text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
-        Some(report) => crate::display::wtf8_display_string(report.to_wtf8_buf(), "<unprintable>"),
-        // A byte no writer put there; the lossy read is the last resort for it.
-        None => String::from_utf8_lossy(buf).into_owned(),
-    };
-    crate::host_seam::emit_stderr(text.as_bytes());
+    match rustpython_wtf8::Wtf8::from_bytes(buf) {
+        Some(report) => {
+            let text = crate::display::wtf8_display_string(report.to_wtf8_buf(), "<unprintable>");
+            crate::host_seam::emit_stderr(text.as_bytes());
+        }
+        // A frame's `co_filename` goes out as the filesystem bytes it was read
+        // as, so a path byte with no UTF-8 spelling leaves the report a mix of
+        // those bytes and the WTF-8 around them, which is not a WTF-8 buffer
+        // and has no encode to spend. Pass it through: the byte form is what
+        // still names the file to whatever reads the stream, and re-reading it
+        // as UTF-8 would substitute U+FFFD for the one byte that carries the
+        // name.
+        None => crate::host_seam::emit_stderr(buf),
+    }
 }
 
 pub fn eprint_exception(err: &PyError, include_traceback: bool) {
