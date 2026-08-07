@@ -44,8 +44,12 @@ SCHED = ["SCHED_OTHER", "SCHED_FIFO", "SCHED_RR"]
 FAMILIES = [name for name, _ in SYSEXITS] + DLOPEN + STATVFS + SCHED
 
 if sys.platform == "win32":
-    # None of the four headers is one Windows carries.
-    for name in FAMILIES + ["SCHED_BATCH", "SCHED_IDLE", "RTLD_DEEPBIND"]:
+    # None of the four headers is one Windows carries, so the families are not
+    # there — except EX_OK, which is documented as available on Windows too and
+    # carries the same 0.
+    check(os.EX_OK == 0, f"os.EX_OK is {os.EX_OK!r}")
+    absent = [n for n in FAMILIES if n != "EX_OK"]
+    for name in absent + ["SCHED_BATCH", "SCHED_IDLE", "RTLD_DEEPBIND"]:
         check(not hasattr(os, name), f"windows grew an os.{name}")
     print("OK")
     raise SystemExit

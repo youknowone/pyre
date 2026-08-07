@@ -15,6 +15,7 @@ import array
 import atexit
 import os
 import shutil
+import sys
 import tempfile
 
 
@@ -53,9 +54,13 @@ BUFFERS = [
 # and do not here — see the follow-up task on the unnamed path-only message.)
 PINNED = {
     "stat": ((), "stat: path should be string, bytes, os.PathLike or integer, not {}"),
+    # listdir names `integer` only where it can open a directory descriptor;
+    # the Windows build has no fdopendir and leaves that word out.
     "listdir": (
         (),
-        "listdir: path should be string, bytes, os.PathLike, integer or None, not {}",
+        "listdir: path should be string, bytes, os.PathLike, integer or None, not {}"
+        if sys.platform != "win32"
+        else "listdir: path should be string, bytes, os.PathLike or None, not {}",
     ),
     "lchown": ((-1, -1), "lchown: path should be string, bytes or os.PathLike, not {}"),
 }

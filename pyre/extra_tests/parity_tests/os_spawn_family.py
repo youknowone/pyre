@@ -18,15 +18,19 @@ def check(cond, what):
 
 check(hasattr(os, "spawnv"), "no os.spawnv")
 check(os.P_WAIT != os.P_NOWAIT, f"P_WAIT and P_NOWAIT are both {os.P_WAIT}")
-check(os.P_NOWAIT == os.P_NOWAITO, "P_NOWAIT and P_NOWAITO disagree")
 check(os.__all__.count("P_WAIT") == 1, "P_WAIT is in __all__ twice")
 check(os.__all__.count("spawnv") == 1, "spawnv is in __all__ twice")
 
 if sys.platform == "win32" or not hasattr(os, "fork"):
-    # Windows spawns through `_spawnv` rather than fork+exec; os_supports_fd.py
-    # covers what that build does carry.
+    # Windows spawns through `_spawnv` rather than fork+exec, and takes the C
+    # runtime's own `_P_*` numbering, where `P_NOWAITO` is 3 rather than the 1
+    # os.py gives it. os_supports_fd.py covers what that build does carry.
     print("OK")
     raise SystemExit
+
+# os.py defines `P_NOWAIT = P_NOWAITO = 1` in the branch that has fork, so the
+# two are one value there and a module that bound them apart would say so.
+check(os.P_NOWAIT == os.P_NOWAITO, "P_NOWAIT and P_NOWAITO disagree")
 
 exe = sys.executable
 check(bool(exe), "no sys.executable to spawn")

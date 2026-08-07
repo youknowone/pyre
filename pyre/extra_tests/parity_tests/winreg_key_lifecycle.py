@@ -108,6 +108,7 @@ finally:
 # leaves a file. Both are answers; being absent or silently doing nothing is
 # not.
 import os
+import shutil
 import tempfile
 
 hive = os.path.join(tempfile.mkdtemp(prefix="pyre_hive_"), "saved")
@@ -117,8 +118,10 @@ except OSError as exc:
     assert exc.winerror is not None, exc
 else:
     assert os.path.exists(hive), hive
-    os.remove(hive)
-os.rmdir(os.path.dirname(hive))
+# A saved hive is not one file: the registry writes its transaction log beside
+# it under names of its own choosing, so the directory is emptied rather than
+# the one name removed.
+shutil.rmtree(os.path.dirname(hive), ignore_errors=True)
 
 # Both take strings, and neither takes a key that is not one.
 for call, args in (
