@@ -16,6 +16,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -89,11 +90,20 @@ class Engine:
     metadata_feature_crates: tuple[str, ...] = ()
     layout_targets: tuple[str, ...] = ()
     layout_target_rustflags: str = ""
-    # Files/directories outside `root` that a driver declares by hand, for
-    # inputs the dependency walk cannot find: the engine module itself, and
-    # any build-determining file `git ls-files` refuses to list (an ignored
-    # `.cargo/config.toml`, a lockfile a repo does not commit). Patched path
-    # deps need no declaration — `_collect_inputs` discovers those.
+    # Files/directories a driver declares by hand because the git channel
+    # cannot carry them. Two kinds, and BOTH are hashed by content:
+    #
+    #   * outside `root` — the engine module itself, a sibling checkout. `git
+    #     ls-files` refuses a pathspec that leaves the repository.
+    #   * inside `root` but IGNORED — an uncommitted `.cargo/config.toml`, a
+    #     lockfile a repo gitignores. `_collect_inputs` resolves pathspecs
+    #     through `ls-files ∪ ls-files --others --exclude-standard`, and an
+    #     ignored file is in neither, so declaring it as a pathspec is inert.
+    #     `refuse_inert_pathspecs` names this field as the remedy, so keep it
+    #     accepting in-root paths: labels come from `os.path.relpath`, which
+    #     spells an in-root path without any `..`.
+    #
+    # Patched path deps need no declaration — `_collect_inputs` discovers those.
     external_inputs: tuple[Path, ...] = ()
 
     def spec(self, crate: str) -> CrateSpec:
@@ -377,6 +387,103 @@ def _reject_unresolvable_include(where: str, tail: str) -> None:
     )
 
 
+def refuse_inert_pathspecs(eng: Engine) -> None:
+    """Refuse a declared fingerprint input that cannot contribute anything.
+
+    A pathspec is an input only if git will list a file under it, because
+    `_collect_inputs` resolves the in-root channel through `git ls-files` and
+    nothing else. A pathspec matching zero files is therefore a silent no-op —
+    and a no-op that READS as coverage everywhere a human looks: in the
+    driver's list, in the comments that cite it, and in the design decisions
+    that rest on it. A driver carried `Cargo.lock` in exactly that state while
+    a comment eight lines above called it a declared input and used it to
+    justify skipping the more expensive `cargo metadata` walk, so the cheaper
+    option was resting on coverage that did not exist.
+
+    This lives in the ENGINE rather than in one driver because every consumer
+    of the engine has the same hole: the check was first written against one
+    driver's `BASE_PATHSPECS`, and each other driver kept the defect until it
+    grew its own copy. Refusing here catches the whole class at the one place
+    that resolves pathspecs, and it would have fired the day either known
+    offender was added.
+
+    Scope is the DECLARED pathspecs — `base_pathspecs`, and each spec's
+    `fingerprint_pathspecs`. The ones `_collect_inputs` discovers from `cargo
+    metadata` are facts about the build rather than a human's claim of
+    coverage, and refusing on those would fail a driver over a dependency's
+    layout it does not control. Every spec is checked, not only the crates
+    requested on this run: a pathspec that rots in a spec nobody asked for
+    today is then found on the next run, rather than the next time that one
+    crate happens to be extracted.
+
+    ⛔ The DECISION is git's, and only git's. `Path.exists()` below feeds the
+    MESSAGE and nothing else — do not "simplify" this to an existence test. An
+    ignored file EXISTS on disk and is invisible to `git ls-files`, which is
+    the entire defect. Filesystem-reachable and git-reachable are different
+    predicates, and a check that conflates them answers a question nobody
+    asked. (The defect is not `exists()`; it is using `exists()` to answer a
+    question about git. An `is_file()` test on a module about to be imported is
+    a genuine filesystem question and stays correct.)
+
+    `ls-files ∪ ls-files --others --exclude-standard` is the definition of
+    git-reachable used here, matching `_collect_inputs` exactly. `ls-files
+    --error-unmatch` alone is TRACKED-only, and would call a brand-new unadded
+    file inert when the engine does hash it.
+
+    The two failure modes need different remedies, so they are reported apart:
+    a path that EXISTS but is ignored is a coverage hole, a path that does not
+    exist is a typo or a file that moved.
+    """
+
+    def git_lists(*args: str) -> bool:
+        result = subprocess.run(
+            ["git", "-C", str(eng.root), *args],
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        return bool(result.stdout.strip())
+
+    declared: list[tuple[str, list[str]]] = [("base_pathspecs", eng.base_pathspecs)]
+    for name, spec in eng.specs.items():
+        if spec.fingerprint_pathspecs is not None:
+            declared.append(
+                (f"specs[{name!r}].fingerprint_pathspecs", spec.fingerprint_pathspecs)
+            )
+
+    inert: list[tuple[str, str, bool]] = []
+    for label, pathspecs in declared:
+        for pathspec in pathspecs:
+            # `--others` only when the tracked query came back empty: the live
+            # case is one subprocess per pathspec instead of two, and this runs
+            # on every invocation including the `--check` a build script makes.
+            if git_lists("ls-files", "--", pathspec):
+                continue
+            if git_lists("ls-files", "--others", "--exclude-standard", "--", pathspec):
+                continue
+            inert.append((label, pathspec, (eng.root / pathspec).exists()))
+    if not inert:
+        return
+
+    lines = ["extract-llbc.py: declared fingerprint pathspecs that match no file:"]
+    for label, pathspec, on_disk in inert:
+        if on_disk:
+            lines.append(
+                f"  {label}: {pathspec!r} — EXISTS on disk but git will not list"
+                f" it (ignored?), so it contributes nothing to the fingerprint."
+                f" Either stop declaring it or cover it another way — an"
+                f" out-of-root or ignored file goes in `external_inputs=`,"
+                f" which is hashed by content; do not leave it here reading as"
+                f" coverage."
+            )
+        else:
+            lines.append(
+                f"  {label}: {pathspec!r} — does not exist. Renamed, moved, or a"
+                f" typo: whatever it was meant to fingerprint is now"
+                f" unfingerprinted."
+            )
+    raise SystemExit("\n".join(lines))
+
+
 def _collect_inputs(
     eng: Engine, crates: list[str], cargo_features: str
 ) -> tuple[list[str], list[Path]]:
@@ -387,9 +494,11 @@ def _collect_inputs(
     * `pathspecs` — repo-relative, resolved through `git ls-files` below, so
       the working tree (including untracked-not-ignored files) is what gets
       hashed.
-    * `external` — absolute paths OUTSIDE `eng.root`, which `git ls-files`
-      cannot name at all: it refuses a pathspec that leaves the repository.
-      These are hashed by content instead, by `external_fingerprint`.
+    * `external` — absolute paths the git channel cannot carry: anything
+      outside `eng.root`, which `git ls-files` refuses to name at all, plus
+      whatever a driver declares in `external_inputs` (which is also how an
+      in-root but IGNORED file gets covered). Hashed by content instead, by
+      `external_fingerprint`.
 
     The second list used to be dropped on the floor. The dependency walk below
     admits path deps by `source is None`, which is how cargo spells BOTH an
@@ -554,69 +663,166 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
     return _collect_inputs(eng, crates, cargo_features)[0]
 
 
-def external_input_entries(
+def external_input_groups(
     eng: Engine, crates: list[str], cargo_features: str
-) -> list[tuple[str, Path]]:
-    """Out-of-root inputs hashed into `external=`, as `(label, absolute path)`.
+) -> list[tuple[str, list[tuple[str, Path]]]]:
+    """Out-of-root inputs GROUPED by the root that declared or discovered them.
+
+    `[(root label, [(file label, absolute path), …]), …]`, sorted by root label
+    and, within a root, by file label.
 
     Deliberately NOT named `external_inputs`: that is the driver-facing keyword
     of `run_cli`, and a parameter of that name shadows the module-level
     function for the whole body.
 
+    ⭐ The GROUP, not the file and not the whole set, is the unit `external=`
+    records a digest for, and that choice is the only reason `check` can name a
+    mover. One digest over every out-of-root file fires identically whether a
+    doc comment moved in a crate the artefact barely references or
+    `majit-macros` did — a proc macro whose expansion IS the extracted crate's
+    item bodies, so its movement voids every measurement already read out of
+    the artefact. Same remedy (`--force`), very different consequence, and a
+    single digest cannot tell them apart. Per FILE is the other extreme and no
+    better: cel's declared closure is hundreds of files, and a report naming
+    hundreds of movers carries the same zero bits spelled longer.
+
+    Roots are deduped by label — the metadata walk runs once per layout
+    platform and rediscovers the same packages — but files are NOT deduped
+    across roots. `<crate>/src/lib.rs` and `<crate>/src/` are both roots the
+    walk emits, so an edit to `lib.rs` moves both, and that pair of movers is
+    the narrowing a reader wants rather than noise.
+
     The label — not the absolute path — is what enters the digest, so two
-    checkouts of the same layout in different directories agree. Directories
-    are expanded here rather than at collection time so the walk sees the
-    working tree at hashing time, matching `source=`'s
+    checkouts of the same layout in different directories agree. Labels are
+    relative to the artefact root, so a stamp survives relocating the whole
+    cohabitation (`<super>/{pyre,cel-jit,majit}`) as a unit; it does not
+    survive rearranging those repos RELATIVE to each other, which is the
+    correct sensitivity, because that changes which sources are compiled.
+
+    Directories are expanded here rather than at collection time so the walk
+    sees the working tree at hashing time, matching `source=`'s
     save-not-commit behaviour for the in-root half.
     """
     _, roots = _collect_inputs(eng, crates, cargo_features)
 
     def label_for(path: Path) -> str:
-        # Relative to the artefact root, so the stamp survives relocating the
-        # whole cohabitation (`<super>/{pyre,cel-jit,majit}`) as a unit. It
-        # does not survive rearranging the repos RELATIVE to each other, which
-        # is the correct sensitivity: that changes which sources are compiled.
         return Path(os.path.relpath(path, eng.root)).as_posix()
 
-    found: dict[str, Path] = {}
+    groups: dict[str, list[tuple[str, Path]]] = {}
     for entry in roots:
-        if entry.is_file():
-            found[label_for(entry)] = entry
+        root_label = label_for(entry)
+        if root_label in groups:
             continue
-        if not entry.is_dir():
-            # A declared input that does not exist still has to move the
-            # digest, exactly as a deleted tracked file does in `source=`.
-            found.setdefault(label_for(entry), entry)
-            continue
-        for sub in entry.rglob("*"):
-            # `target/` is build output and dot-dirs are VCS/tooling state;
-            # neither is a compiler input, and `target/` alone is tens of GB.
-            parts = set(sub.relative_to(entry).parts[:-1])
-            if "target" in parts or any(p.startswith(".") for p in parts):
-                continue
-            if sub.is_file():
-                found[label_for(sub)] = sub
-    return sorted(found.items())
+        if entry.is_dir():
+            found: dict[str, Path] = {}
+            for sub in entry.rglob("*"):
+                # `target/` is build output and dot-dirs are VCS/tooling state;
+                # neither is a compiler input, and `target/` alone is tens of GB.
+                parts = set(sub.relative_to(entry).parts[:-1])
+                if "target" in parts or any(p.startswith(".") for p in parts):
+                    continue
+                if sub.is_file():
+                    found[label_for(sub)] = sub
+            groups[root_label] = sorted(found.items())
+        else:
+            # A file, or a declared root that does not exist. The absent case
+            # still gets a group, so it moves the digest when it appears —
+            # exactly as a deleted tracked file does in `source=`.
+            groups[root_label] = [(root_label, entry)]
+    return sorted(groups.items())
 
 
-def external_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
-    """Digest of the out-of-root inputs, or `""` when there are none.
+def external_group_digest(root_label: str, files: list[tuple[str, Path]]) -> str:
+    """Digest of one out-of-root group.
 
-    Empty is the common case (a consumer whose whole dependency closure lives
-    inside its own repo, which is every pyre crate today) and it is spelled as
-    an empty value rather than a digest-of-nothing so the stamp says plainly
-    that nothing outside the repo was folded in.
+    The root label is folded in first so an EMPTY group (a declared directory
+    holding no file the filter admits) still gets a digest of its own rather
+    than colliding with every other empty group.
     """
-    entries = external_input_entries(eng, crates, cargo_features)
-    if not entries:
-        return ""
     digest = hashlib.sha256()
-    for label, path in entries:
+    digest.update(root_label.encode("utf-8"))
+    digest.update(b"\0")
+    for label, path in files:
         digest.update(label.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes() if path.is_file() else b"<absent>")
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def external_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
+    """`external=`'s stamp value: one `<root label>=<digest>` per group.
+
+    Empty is the common case (a consumer whose whole dependency closure lives
+    inside its own repo, which is every pyre crate today) and it is spelled as
+    an empty value rather than a digest-of-nothing, so the stamp says plainly
+    that nothing outside the repo was folded in.
+
+    `shlex.quote` per entry, space-separated: a root label is a filesystem path
+    and may hold a space or a quote, and the value has to survive as ONE line
+    of a line-oriented stamp. `parse_external` is the inverse.
+
+    One stamp KEY, not one key per root. `STAMP_KEYS` is a fixed schema and
+    `check` refuses a stamp missing any member of it; deriving the key set from
+    the very declaration whose movement is under test would mean a dropped
+    input takes its own coverage assertion with it, and "the field is gone"
+    would read the same as "there was never such a field".
+    """
+    groups = external_input_groups(eng, crates, cargo_features)
+    return " ".join(
+        shlex.quote(f"{root_label}={external_group_digest(root_label, files)}")
+        for root_label, files in groups
+    )
+
+
+def parse_external(value: str) -> dict[str, str]:
+    """Split an `external=` stamp value into `{root label: digest}`.
+
+    Inverse of `external_fingerprint`'s encoding. `rpartition`, not `partition`:
+    a label may contain `=`, and the hex digest that follows never does.
+    """
+    entries: dict[str, str] = {}
+    for token in shlex.split(value):
+        label, sep, digest = token.rpartition("=")
+        if sep:
+            entries[label] = digest
+    return entries
+
+
+def external_diff(crate: str, recorded: str, expected: str) -> list[str]:
+    """Name WHICH out-of-root input moved, rather than printing two digests.
+
+    `external=` carries one digest per root precisely so this can be written.
+    With a single digest there is nothing to say here beyond "something outside
+    the repo changed" — a guard that fires without informing, which is the
+    shape this field is structured to avoid.
+    """
+    was = parse_external(recorded)
+    now = parse_external(expected)
+    lines: list[str] = []
+    for label in sorted(set(was) | set(now)):
+        if label not in now:
+            lines.append(
+                f"{crate}: external: {label!r} is no longer a declared input, "
+                f"but the artefact was built with it folded in"
+            )
+        elif label not in was:
+            lines.append(
+                f"{crate}: external: {label!r} is an input the artefact never "
+                f"covered"
+            )
+        elif was[label] != now[label]:
+            lines.append(f"{crate}: external: {label!r} changed")
+    if not lines:
+        # The packed values differ while every root agrees: an encoding this
+        # engine did not write, or a reordering. Reporting nothing here would
+        # turn a mismatch into a silent pass.
+        lines.append(
+            f"{crate}: external: {recorded!r} does not match {expected!r} "
+            f"although every root agrees — the value was not written by this "
+            f"engine"
+        )
+    return lines
 
 
 def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
@@ -1125,8 +1331,11 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
         configuration; comparing it against this process's `CARGO_FEATURES`
         would refuse a byte-correct artefact whenever the caller left the
         default in place. Replaying keeps `flags=`, `charon_flags=`,
-        `layout_flags=` and `source=` real comparisons — all four are
-        recomputed from the replayed value.
+        `layout_flags=`, `source=` and `external=` real comparisons — all
+        five are recomputed from the replayed value. (`external=` belongs on
+        that list because the dependency walk it feeds off is itself run
+        per feature set, so a feature that pulls in a patched path dep
+        changes which out-of-root inputs exist.)
       * artefact and stamp mtimes are printed, never gated. `extract` writes
         both in one pass, and the source digest already answers the question a
         timestamp only approximates.
@@ -1250,6 +1459,13 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
             )
             continue
         for key in differing:
+            if key == "external":
+                # Two packed per-root lists, not two hashes: printing them as
+                # opaque values would hand the reader kilobytes and no answer.
+                stale.extend(
+                    external_diff(crate, recorded[key], want.get(key, ""))
+                )
+                continue
             stale.append(
                 f"{crate}: {key}: artefact says {recorded[key]!r}, "
                 f"tree says {want.get(key)!r}"
@@ -1415,6 +1631,11 @@ def run_cli(
         layout_target_rustflags=layout_target_rustflags,
         external_inputs=tuple(external_inputs),
     )
+    # Before ANY subcommand, including the read-only instruments: an inert
+    # pathspec makes `--list-inputs` and `--fingerprint` report a coverage the
+    # stamp does not have, and those are the two outputs a reader trusts when
+    # deciding whether the guard is working.
+    refuse_inert_pathspecs(eng)
 
     crates = args.crates or default_crates
     if args.list_inputs:
@@ -1422,9 +1643,16 @@ def run_cli(
             print(path.as_posix())
         # Marked, because the two channels are hashed into different stamp
         # fields and an unmarked union would read as one list of repo-relative
-        # paths — which is what made the out-of-root inputs easy to miss.
-        for label, _ in external_input_entries(eng, crates, cargo_features):
-            print(f"external:{label}")
+        # paths — which is what made the out-of-root inputs easy to miss. The
+        # root is named on every line because it, not the file, is the unit
+        # `external=` records a digest for and `check` reports a move against.
+        for root_label, files in external_input_groups(eng, crates, cargo_features):
+            if not files:
+                # A declared root the filter emptied. It still holds a digest,
+                # so listing nothing for it would under-report the coverage.
+                print(f"external[{root_label}]: (no files)")
+            for label, _ in files:
+                print(f"external[{root_label}]:{label}")
         return
     if args.fingerprint:
         # BOTH fields. Printing only `source=` here previously cost a session:
