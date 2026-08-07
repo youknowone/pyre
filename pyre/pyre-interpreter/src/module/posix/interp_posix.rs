@@ -2448,10 +2448,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
     /// `interp_posix.py:1901-1904` answers a descriptor with `futimens`, which
     /// is the call HAVE_FUTIMENS names.
-    fn utime_fd(fd: i32, access: UTime, modified: UTime) -> Result<PyObjectRef, crate::PyError> {
+    fn utime_fd(
+        fd: i32,
+        now: bool,
+        access: UTime,
+        modified: UTime,
+    ) -> Result<PyObjectRef, crate::PyError> {
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            let times = [timespec_of(access), timespec_of(modified)];
+            let times = [timespec_of(access, now), timespec_of(modified, now)];
             if unsafe { libc::futimens(fd, times.as_ptr()) } < 0 {
                 return Err(io_err(std::io::Error::last_os_error(), ""));
             }
@@ -2459,18 +2464,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
         #[allow(unreachable_code)]
         {
-            let _ = (fd, access, modified);
+            let _ = (fd, now, access, modified);
             Err(crate::PyError::not_implemented(
                 "utime: fd is unavailable on this platform",
             ))
         }
     }
 
+    /// `do_utimens` (`interp_posix.py:1948-1953`) writes `UTIME_NOW` over both
+    /// nanosecond fields when the caller named no time, rather than reading a
+    /// time off its own clock and asking for that one. The two are different
+    /// requests: `UTIME_NOW` on both stamps is granted to anyone the file is
+    /// writable to, while naming a timestamp asks for ownership, so a writable
+    /// descriptor onto someone else's file answers `utime(fd)` and refuses
+    /// `utime(fd, ns=(now, now))` with EPERM.
     #[cfg(all(unix, not(feature = "sandbox")))]
-    fn timespec_of(t: UTime) -> libc::timespec {
+    fn timespec_of(t: UTime, now: bool) -> libc::timespec {
         libc::timespec {
             tv_sec: t.sec as libc::time_t,
-            tv_nsec: t.nsec as _,
+            tv_nsec: if now { libc::UTIME_NOW as _ } else { t.nsec as _ },
         }
     }
 
@@ -2644,7 +2656,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             })
         };
 
-        let (access, modified) = match (times, ns) {
+        // `parse_utime_args` (`interp_posix.py:1918-1946`) answers a "now" flag
+        // beside the pair and leaves the pair itself at zero when it is set;
+        // each of the calls below is what turns that flag into its own spelling
+        // of "now".
+        let (now, access, modified) = match (times, ns) {
             (Some(_), Some(_)) => {
                 return Err(crate::PyError::value_error(
                     "utime: you may specify either 'times' or 'ns' but not both",
@@ -2652,22 +2668,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             (Some(t), None) => {
                 let (a, m) = unpack_two(t, "times")?;
-                (time_from_secs(a)?, time_from_secs(m)?)
+                (false, time_from_secs(a)?, time_from_secs(m)?)
             }
             (None, Some(n)) => {
                 let (a, m) = unpack_two(n, "ns")?;
-                (time_from_ns(a)?, time_from_ns(m)?)
+                (false, time_from_ns(a)?, time_from_ns(m)?)
             }
-            (None, None) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or(std::time::Duration::ZERO);
-                let now = UTime {
-                    sec: now.as_secs() as i64,
-                    nsec: now.subsec_nanos() as i64,
-                };
-                (now, now)
-            }
+            (None, None) => (true, UTime { sec: 0, nsec: 0 }, UTime { sec: 0, nsec: 0 }),
         };
 
         if path.as_fd != -1 {
@@ -2686,7 +2693,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "utime: cannot use fd and follow_symlinks together",
                 ));
             }
-            return utime_fd(path.as_fd, access, modified);
+            return utime_fd(path.as_fd, now, access, modified);
         }
 
         #[cfg(all(windows, feature = "host_env"))]
@@ -2724,6 +2731,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     dwLowDateTime: ticks as u32,
                     dwHighDateTime: (ticks >> 32) as u32,
                 }
+            };
+            // `rposix.py:1568-1576` reads a clock here when the caller named no
+            // time — `GetSystemTime` into both stamps — and reaches
+            // `time_t_to_FILE_TIME` only for a named pair. `SetFileTime` has no
+            // word for "now", which is what the `utimensat` arm below spells
+            // `UTIME_NOW`; the pair arrives at zero while the flag carries the
+            // meaning, so reading it here is what keeps `os.utime(path)` off
+            // 1970.
+            let (access, modified) = if now {
+                let d = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or(std::time::Duration::ZERO);
+                let t = UTime {
+                    sec: d.as_secs() as i64,
+                    nsec: d.subsec_nanos() as i64,
+                };
+                (t, t)
+            } else {
+                (access, modified)
             };
             let atime = to_filetime(access);
             let mtime = to_filetime(modified);
@@ -2768,7 +2794,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             } else {
                 libc::AT_SYMLINK_NOFOLLOW
             };
-            let times = [timespec_of(access), timespec_of(modified)];
+            let times = [timespec_of(access, now), timespec_of(modified, now)];
             let error = unsafe {
                 libc::utimensat(
                     dir_fd.unwrap_or(libc::AT_FDCWD),
@@ -2787,7 +2813,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
         #[allow(unreachable_code)]
         {
-            let _ = (access, modified, dir_fd, follow_symlinks, &path, pos);
+            let _ = (now, access, modified, dir_fd, follow_symlinks, &path, pos);
             Err(crate::PyError::not_implemented(
                 "utime is unavailable on this platform",
             ))
@@ -5833,20 +5859,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
 
         // interp_posix.py:407-412: retry EINTR, propagate every other OSError.
+        // The retry is `eintr_retry=True`, which runs the pending Python signal
+        // handlers before going back to the call — a handler that raises ends
+        // the loop there, and one that disarms the timer stops the interruption
+        // recurring. Retrying on the bare errno would spin without ever giving
+        // that handler a turn.
+        //
         // Which filename the caller then reports is its own: `os.ftruncate` was
         // given no name to report, while `os.truncate` names the one it opened.
-        // The call runs through the call gate so a signal handler gets its turn
-        // between the retries.
         #[cfg(all(unix, not(feature = "sandbox")))]
-        fn ftruncate_retry(fd: libc::c_int, length: libc::off_t) -> Result<(), i32> {
+        fn ftruncate_retry(
+            fd: libc::c_int,
+            length: libc::off_t,
+            wrap: impl Fn(i32) -> crate::PyError,
+        ) -> Result<(), crate::PyError> {
             loop {
                 if crate::builtins::crt_call!(libc::ftruncate(fd, length)) == 0 {
                     return Ok(());
                 }
                 let errno = crate::builtins::crt_errno();
-                if errno != libc::EINTR {
-                    return Err(errno);
-                }
+                crate::builtins::eintr_retry_with(
+                    std::io::Error::from_raw_os_error(errno),
+                    |e| wrap(e.raw_os_error().unwrap_or(0)),
+                )?;
             }
         }
 
@@ -5877,7 +5912,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     )?;
                     let length = truncate_length_w(args[1])?;
                     if path.as_fd != -1 {
-                        ftruncate_retry(path.as_fd, length).map_err(|e| errno_err(e, ""))?;
+                        ftruncate_retry(path.as_fd, length, |e| errno_err(e, ""))?;
                         return Ok(pyre_object::w_none());
                     }
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
@@ -5901,7 +5936,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             |e| errno_err_with_filename(e.raw_os_error().unwrap_or(0), path.w_path()),
                         )?;
                     };
-                    let truncated = ftruncate_retry(fd, length);
+                    let truncated =
+                        ftruncate_retry(fd, length, |e| errno_err_with_filename(e, path.w_path()));
                     // `interp_posix.py:429-431` closes the descriptor it opened
                     // in a `finally`, through the module's own `close` — so a
                     // writeback error the close is the first to see is the
@@ -5910,7 +5946,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // both fail, which is the order the `finally` gives them.
                     let closed = unsafe { libc::close(fd) };
                     let close_errno = (closed < 0).then(crate::builtins::crt_errno);
-                    truncated.map_err(|e| errno_err_with_filename(e, path.w_path()))?;
+                    truncated?;
                     if let Some(errno) = close_errno {
                         return Err(errno_err_with_filename(errno, path.w_path()));
                     }
@@ -5955,7 +5991,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         crate::PyError::overflow_error("Python int too large to convert to C int")
                     })?;
                     let length = truncate_length_w(args[1])?;
-                    ftruncate_retry(fd, length).map_err(|e| errno_err(e, ""))?;
+                    ftruncate_retry(fd, length, |e| errno_err(e, ""))?;
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -6987,10 +7023,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         //     wrapper (macos).
         //   * Returns bytes-sent as int (PyPy: space.newint(res)).
         //
-        // EINTR retry loop intentionally omitted — pyre's other os-syscall
-        // wrappers don't do manual retry (relies on PEP 475 OS-level retry),
-        // matching pyre-wide convention rather than introducing a single
-        // outlier.
+        // Both arms of `interp_posix.py:2958-2974` retry under
+        // `wrap_oserror(..., eintr_retry=True)` and this one does not, so an
+        // interrupted transfer surfaces as `InterruptedError` here where
+        // upstream runs the signal handlers and resumes. The reason recorded
+        // for the omission — that a retry would be the module's only one — no
+        // longer holds: `ftruncate`, `truncate`'s `open` and `lockf` all retry
+        // through `builtins::eintr_retry_with`. What the BSD arm should do with
+        // a partial `sbytes` on EINTR is the open question, so it is left to
+        // its own change.
         #[cfg(all(
             any(target_os = "linux", target_os = "macos"),
             not(feature = "sandbox")
