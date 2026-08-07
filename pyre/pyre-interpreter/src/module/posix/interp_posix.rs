@@ -424,6 +424,49 @@ fn waitid_result_seq_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// `posix.sched_param` structseq — the single field `app_posix.py:140-147`
+/// declares.  Its `__new__` takes the priority itself rather than a sequence,
+/// which is what `_structseq.py:102-107` already gives every 1-field structseq.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd"
+    )
+))]
+fn sched_param_seq_type() -> PyObjectRef {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        crate::_structseq::make_struct_seq("posix.sched_param", &["sched_priority"]) as usize
+    }) as PyObjectRef
+}
+
+/// The `w_param` argument `sched_setparam` and `sched_setscheduler` share.
+/// `interp_posix.py:3086-3092` refuses anything that is not a `sched_param`,
+/// reads field 0 through the sequence protocol, and refuses a priority the C
+/// `int` cannot hold.
+#[cfg(all(
+    unix,
+    not(target_env = "musl"),
+    any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd"
+    )
+))]
+fn sched_priority_w(w_param: PyObjectRef) -> Result<i32, crate::PyError> {
+    if !crate::baseobjspace::isinstance(w_param, sched_param_seq_type())? {
+        return Err(crate::PyError::type_error("must have a sched_param object"));
+    }
+    let w_priority = crate::baseobjspace::getitem(w_param, pyre_object::w_int_new(0))?;
+    let priority = crate::baseobjspace::int_w(w_priority)?;
+    i32::try_from(priority)
+        .map_err(|_| crate::PyError::overflow_error("sched_priority out of range"))
+}
+
 /// `os.times_result` structseq — `(user, system, children_user,
 /// children_system, elapsed)`; repr renders "posix.times_result(...)", or
 /// "nt.times_result(...)" on the host whose module is spelled that way.  The
@@ -1042,6 +1085,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("O_NDELAY", libc::O_NONBLOCK as i64),
         #[cfg(not(any(unix, windows)))]
         ("O_NDELAY", 0i64),
+        // `moduledef.py:264-266` publishes O_CLOEXEC by name wherever the host
+        // has it, which is every Unix. `nt` has no such flag -- it spells the
+        // same intent O_NOINHERIT -- so a zero there would be a flag that
+        // silently leaves the descriptor inheritable.
+        #[cfg(unix)]
+        ("O_CLOEXEC", libc::O_CLOEXEC as i64),
         #[cfg(unix)]
         ("O_DSYNC", libc::O_DSYNC as i64),
         #[cfg(not(any(unix, windows)))]
@@ -1330,8 +1379,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "setgroups",
             "setpgrp",
             "nice",
-            // "pipe2"/"dup3" — the flag-taking forms, which Linux adds and the
-            // other hosts do not have. Neither is served here on any of them.
+            // "pipe2" — the flag-taking form of `pipe`, published below on the
+            // hosts whose libc declares it. "dup3" is not a name `moduledef.py`
+            // defines, nor one `os` publishes on any host, so there is nothing
+            // here for it to stand in for.
             "fdatasync",
             "mkfifo",
             "getloadavg",
@@ -1341,9 +1392,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "sched_get_priority_max",
             "sched_get_priority_min",
             // "sched_getparam"/"sched_setparam"/"sched_getscheduler"/
-            // "sched_setscheduler" — the policy calls, which are Linux's and
-            // which hand a `sched_param` back and forth; there is no such type
-            // here.
+            // "sched_setscheduler" — the policy calls, published below together
+            // with the `sched_param` type they hand back and forth.
+            // `moduledef.py:168-174` gates the five as one group.
             "sched_yield",
             // "confstr"/"confstr_names" — the host's string-valued configuration
             // table, published below where the host defines one. A build with no
@@ -5138,6 +5189,45 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
+        // os.pipe2(flags) -> (r_fd, w_fd)
+        //
+        // `interp_posix.py:1188-1195`, which — unlike `pipe` two blocks up —
+        // forces no inheritance on the pair afterwards: the flags argument is
+        // the whole of the caller's control over it.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        crate::module_ns_store(
+            ns,
+            "pipe2",
+            crate::make_builtin_function_with_arity(
+                "pipe2",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("pipe2() requires 1 argument"));
+                    }
+                    // interp_posix.py:1187 `@unwrap_spec(flags=c_int)`.
+                    let flags = crate::baseobjspace::c_int_w(args[0])?;
+                    match host_posix::pipe2(flags) {
+                        Ok((rfd, wfd)) => {
+                            use std::os::fd::IntoRawFd;
+                            Ok(pyre_object::w_tuple_new(vec![
+                                pyre_object::w_int_new(rfd.into_raw_fd() as i64),
+                                pyre_object::w_int_new(wfd.into_raw_fd() as i64),
+                            ]))
+                        }
+                        Err(e) => Err(io_err(e, "")),
+                    }
+                },
+                1,
+            ),
+        );
+
         // os.sched_yield()
         crate::module_ns_store(
             ns,
@@ -5270,6 +5360,162 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 1,
             ),
         );
+
+        // The scheduling-policy group `moduledef.py:168-174` publishes as one —
+        // the two getters, the two setters and the `sched_param` type they
+        // exchange — plus `sched_rr_get_interval`, which `moduledef.py:166-167`
+        // gates on its own but which the same libcs carry. The setters are left
+        // out where the libc is musl, which declares neither.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "netbsd"
+        ))]
+        {
+            crate::module_ns_store(ns, "sched_param", sched_param_seq_type());
+
+            // os.sched_rr_get_interval(pid) -> seconds
+            //
+            // host_env wraps none of this one, so the call is made here — which
+            // is why it is absent from a sandbox build: `host_seam::sys`
+            // re-exports no syscall function, and the name is served there by
+            // the raising stub registered at the end of this module instead.
+            #[cfg(not(feature = "sandbox"))]
+            crate::module_ns_store(
+                ns,
+                "sched_rr_get_interval",
+                crate::make_builtin_function_with_arity(
+                    "sched_rr_get_interval",
+                    |args| {
+                        if args.is_empty() {
+                            return Err(crate::PyError::type_error(
+                                "sched_rr_get_interval() requires 1 argument",
+                            ));
+                        }
+                        // interp_posix.py:3061 `@unwrap_spec(pid=int)`; the
+                        // timespec the call fills is answered as one float
+                        // (`rposix.py:2525`).
+                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let mut interval: libc::timespec =
+                            unsafe { core::mem::zeroed::<libc::timespec>() };
+                        if unsafe { libc::sched_rr_get_interval(pid, &mut interval) } == -1 {
+                            return Err(io_err(std::io::Error::last_os_error(), ""));
+                        }
+                        Ok(pyre_object::w_float_new(
+                            interval.tv_sec as f64 + 1e-9 * interval.tv_nsec as f64,
+                        ))
+                    },
+                    1,
+                ),
+            );
+
+            // os.sched_getscheduler(pid) -> policy
+            crate::module_ns_store(
+                ns,
+                "sched_getscheduler",
+                crate::make_builtin_function_with_arity(
+                    "sched_getscheduler",
+                    |args| {
+                        if args.is_empty() {
+                            return Err(crate::PyError::type_error(
+                                "sched_getscheduler() requires 1 argument",
+                            ));
+                        }
+                        // interp_posix.py:3073 `@unwrap_spec(pid=int)`.
+                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let policy =
+                            host_posix::sched_getscheduler(pid).map_err(|e| io_err(e, ""))?;
+                        Ok(pyre_object::w_int_new(policy as i64))
+                    },
+                    1,
+                ),
+            );
+
+            // os.sched_getparam(pid) -> sched_param
+            crate::module_ns_store(
+                ns,
+                "sched_getparam",
+                crate::make_builtin_function_with_arity(
+                    "sched_getparam",
+                    |args| {
+                        if args.is_empty() {
+                            return Err(crate::PyError::type_error(
+                                "sched_getparam() requires 1 argument",
+                            ));
+                        }
+                        // interp_posix.py:3103 `@unwrap_spec(pid=int)`; the
+                        // priority the call fills in is handed back wrapped in
+                        // the type, not bare (`interp_posix.py:3113`).
+                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let param = host_posix::sched_getparam(pid).map_err(|e| io_err(e, ""))?;
+                        Ok(crate::_structseq::new_instance(
+                            sched_param_seq_type(),
+                            vec![pyre_object::w_int_new(param.sched_priority as i64)],
+                        ))
+                    },
+                    1,
+                ),
+            );
+
+            // Both setters answer None. `interp_posix.py:3097`/`:3131` hand
+            // back the raw `handle_posix_error` result instead, which is 0 on
+            // every success and which `os.sched_setparam` does not publish.
+            #[cfg(not(target_env = "musl"))]
+            {
+                // os.sched_setscheduler(pid, policy, param)
+                crate::module_ns_store(
+                    ns,
+                    "sched_setscheduler",
+                    crate::make_builtin_function_with_arity(
+                        "sched_setscheduler",
+                        |args| {
+                            if args.len() < 3 {
+                                return Err(crate::PyError::type_error(
+                                    "sched_setscheduler() requires 3 arguments",
+                                ));
+                            }
+                            // interp_posix.py:3085 `@unwrap_spec(pid=int, policy=int)`.
+                            let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                            let policy = crate::baseobjspace::int_w(args[1])? as libc::c_int;
+                            let priority = sched_priority_w(args[2])?;
+                            let mut param: libc::sched_param =
+                                unsafe { core::mem::zeroed::<libc::sched_param>() };
+                            param.sched_priority = priority;
+                            host_posix::sched_setscheduler(pid, policy, &param)
+                                .map_err(|e| io_err(e, ""))?;
+                            Ok(pyre_object::w_none())
+                        },
+                        3,
+                    ),
+                );
+
+                // os.sched_setparam(pid, param)
+                crate::module_ns_store(
+                    ns,
+                    "sched_setparam",
+                    crate::make_builtin_function_with_arity(
+                        "sched_setparam",
+                        |args| {
+                            if args.len() < 2 {
+                                return Err(crate::PyError::type_error(
+                                    "sched_setparam() requires 2 arguments",
+                                ));
+                            }
+                            // interp_posix.py:3117 `@unwrap_spec(pid=int)`.
+                            let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                            let priority = sched_priority_w(args[1])?;
+                            let mut param: libc::sched_param =
+                                unsafe { core::mem::zeroed::<libc::sched_param>() };
+                            param.sched_priority = priority;
+                            host_posix::sched_setparam(pid, &param).map_err(|e| io_err(e, ""))?;
+                            Ok(pyre_object::w_none())
+                        },
+                        2,
+                    ),
+                );
+            }
+        }
 
         // os.sync()
         #[cfg(not(any(target_os = "redox", target_os = "android")))]
@@ -8948,9 +9194,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // inheritance control (set_inheritable would mutate a real fd).
             "dup",
             "dup2",
-            "dup3",
             "pipe",
-            "pipe2",
             "openpty",
             "login_tty",
             "sendfile",
@@ -9040,6 +9284,60 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "ttyname",
             "ctermid",
         ] {
+            crate::module_ns_store(
+                ns,
+                name,
+                crate::make_builtin_function(name, sandbox_unavailable),
+            );
+        }
+
+        // The same, for the names only some hosts have. Listing them above
+        // would not neutralise anything on a host that never registered them —
+        // `module_ns_store` writes rather than overwrites, so it would publish
+        // a `posix.pipe2` where there is no `pipe2` to refuse.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        crate::module_ns_store(
+            ns,
+            "pipe2",
+            crate::make_builtin_function("pipe2", sandbox_unavailable),
+        );
+        // The policy calls reach the host scheduler; only the setters mutate,
+        // but a policy read is a host-process leak in the same way `getpriority`
+        // above is. `sched_param` is left alone — it carries no host access.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "netbsd"
+        ))]
+        for name in [
+            "sched_getscheduler",
+            "sched_getparam",
+            "sched_rr_get_interval",
+        ] {
+            crate::module_ns_store(
+                ns,
+                name,
+                crate::make_builtin_function(name, sandbox_unavailable),
+            );
+        }
+        #[cfg(all(
+            not(target_env = "musl"),
+            any(
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "linux",
+                target_os = "netbsd"
+            )
+        ))]
+        for name in ["sched_setscheduler", "sched_setparam"] {
             crate::module_ns_store(
                 ns,
                 name,

@@ -49,6 +49,16 @@ pub mod sys {
         c_char, c_int, c_long, c_uint, c_void, clockid_t, gid_t, mode_t, off_t, pid_t, rusage,
         size_t, time_t, timespec, timeval, tm, uid_t,
     };
+    // The struct `sched_setparam`/`sched_setscheduler` fill in before handing it
+    // to host_env. Naming it allocates nothing and calls nothing; the calls
+    // themselves are overwritten by the sandbox stubs in interp_posix.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd"
+    ))]
+    pub use ::libc::sched_param;
     // Calendar/formatting on a caller-supplied value: `gmtime_r` reads only glibc's
     // timezone cache — which the seccomp backstop primes before lockdown
     // (see `pyre_sandbox::seccomp`), so at runtime it doesn't open a host file.
@@ -64,11 +74,11 @@ pub mod sys {
     // Constants (added as sandbox-reachable modules need them).
     pub use ::libc::{
         AT_FDCWD, CODESET, EBADF, EINTR, EINVAL, F_OK, LC_ALL, LC_COLLATE, LC_CTYPE, LC_MESSAGES,
-        LC_MONETARY, LC_NUMERIC, LC_TIME, O_APPEND, O_CREAT, O_DSYNC, O_EXCL, O_NONBLOCK, O_RDONLY,
-        O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, R_OK, RTLD_GLOBAL,
-        RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW, RUSAGE_SELF, S_IFDIR, S_IFMT,
-        S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED,
-        WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED, X_OK,
+        LC_MONETARY, LC_NUMERIC, LC_TIME, O_APPEND, O_CLOEXEC, O_CREAT, O_DSYNC, O_EXCL,
+        O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS,
+        PRIO_USER, R_OK, RTLD_GLOBAL, RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW,
+        RUSAGE_SELF, S_IFDIR, S_IFMT, S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY,
+        TIOCGWINSZ, W_OK, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED, X_OK,
     };
     // `lockf`'s commands and `waitid`'s two vocabularies — which process it is
     // asked about, and what it reports happened. All are numbers the module
