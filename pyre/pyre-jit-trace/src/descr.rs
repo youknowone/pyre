@@ -2664,6 +2664,34 @@ pub fn type_version_tag_descr() -> DescrRef {
     TYPE_VERSION_TAG_FIELD_DESCR.clone()
 }
 
+/// `typeobject.py:213 W_TypeObject.w_name` — the app-level `type.__name__`
+/// object, which the `Cls.__name__` fold reads instead of the opaque `getattr`
+/// residual.
+///
+/// Mutable, unlike the version tag beside it: `descr_set__name__`
+/// (typeobject.py:1046) replaces the slot without calling `mutated()`, so a
+/// rename moves this field and nothing else.  Reading it live is what makes
+/// the fold survive one.
+///
+/// One object per run for the identity reason [`W_CLASS_FIELD_DESCR`]
+/// documents — `heap.rs` keys its field cache on the `Arc` pointer, so a
+/// per-call descriptor would miss its own cache on every read.  The size
+/// follows the same descriptor's: 8 for a `PyObjectRef` on every target, not
+/// the 4 bytes a wasm32 pointer occupies.  `synth/type_name_attr_fold` reads
+/// the same name under wasm as under both native backends.
+static TYPE_NAME_OBJ_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    make_field_descr(
+        core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, w_name),
+        8,
+        Type::Ref,
+        false,
+    )
+});
+
+pub fn type_name_obj_descr() -> DescrRef {
+    TYPE_NAME_OBJ_FIELD_DESCR.clone()
+}
+
 /// `celldict.py:32 ModuleDictStrategy.version` — the module-namespace version
 /// tag (`u64`, 8 bytes, unsigned) on the strategy box.
 ///

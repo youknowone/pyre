@@ -305,8 +305,6 @@ pub(crate) struct InlineBodyFacts {
     /// [`PyJitCodePayload::has_abort`], which the codewriter keeps narrowly
     /// scoped to `abort()` emissions.
     pub(crate) has_abort_permanent: bool,
-    /// Body shape the method-form inline route supports.
-    pub(crate) method_form_supported: bool,
     /// Straight-line body, the exception-override / property routes' entry test.
     pub(crate) exc_override_straight_line: bool,
     /// Effect-free enough to speculatively sample before emitting IR.

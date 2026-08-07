@@ -1371,6 +1371,17 @@ pub unsafe fn w_type_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
     t.w_name
 }
 
+/// The `type.__name__` slot as it stands, without the lazy materialisation
+/// [`w_type_get_name_obj`] performs — `PY_NULL` until the first read of the
+/// name has been served.
+///
+/// The tracer reads it this way: materialising here would allocate a string
+/// while the walker holds raw pointers into the heap, and a class whose name
+/// has never been asked for is not one a hot loop is reading it from.
+pub unsafe fn w_type_peek_name_obj(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const W_TypeObject)).w_name
+}
+
 /// Replace the class name (`descr_set__name__`, typeobject.py:1058
 /// `w_type.name = name`).  `name` is an owned `String` behind a raw
 /// pointer (`malloc_raw` = boxed); assigning through it drops the old

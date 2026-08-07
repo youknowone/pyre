@@ -3235,6 +3235,97 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `Cls.__name__` `LOAD_ATTR` fold, on the safety oracle
+/// [`pyre_interpreter::baseobjspace::type_name_obj_fast_path`]: a class whose
+/// metaclass is exactly `type` resolves `__name__` through the metatype data
+/// descriptor `type.__name__`, whose getter returns the class's `w_name` slot.
+/// The fold is that slot read, under the guards that prove the receiver is
+/// such a class:
+///
+///   guard_class(obj, W_TypeObject layout)      — `is_type`
+///   guard_value(getfield(obj, w_class), type)  — the metaclass is `type`
+///   getfield(obj, w_name) + guard_nonnull      — what the getter returns
+///
+/// The class itself is NOT pinned, unlike the classmethod fold beside this
+/// one: nothing here depends on which class arrived, so a loop reading
+/// `cls.__name__` over several classes keeps one trace.  Nor is the version
+/// tag pinned — it is not what a rename moves (`descr_set__name__` skips
+/// `mutated()`), and the live slot read already reports one.
+///
+/// `w_name` is filled in on first read and never cleared, so the null the
+/// guard covers is a class this trace has not served before; its side exit
+/// runs the residual, which materialises the slot, and re-entry folds.
+///
+/// Attempted inside an inlined callee sub-walk as well, on the same terms as
+/// [`try_walker_specialize_load_attr`]: the guards prove the read, so the fold
+/// cannot raise where the residual would not, and `cls.__name__` in a method
+/// body is precisely where the opaque residual costs the most — it is what
+/// makes the enclosing `FOR_ITER` decline to inline the callee at all.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    if name != "__name__" {
+        return Ok(None);
+    }
+    let Some((metatype, w_name)) =
+        (unsafe { pyre_interpreter::baseobjspace::type_name_obj_fast_path(concrete_obj) })
+    else {
+        return Ok(None);
+    };
+
+    // guard_class(obj, ob_type): the `W_TypeObject` layout both field reads
+    // below index into.  `is_type` is this check.
+    let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(phys_type);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, phys_type);
+    }
+
+    // The metaclass, pinned to `type`: only then is `type.__name__` the
+    // descriptor `descr_getattribute` selects, and only then is it fixed —
+    // `type` is immutable, a user metaclass is not.
+    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
+    let metatype_const = ctx.trace_ctx.const_ref(metatype as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[w_class_op, metatype_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(w_class_op, metatype_const);
+
+    let name_op =
+        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::type_name_obj_descr());
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[name_op])?;
+    ctx.trace_ctx.set_opref_concrete(
+        name_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(w_name as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, name_op)?;
+    Ok(Some(()))
+}
+
 /// Fold the `LOAD_ATTR`-method `getattr` residual for a receiver whose name
 /// resolves to a plain builtin-code function on its type — the `lst.append`
 /// shape [`try_walker_specialize_load_method_attr`] declines because upstream

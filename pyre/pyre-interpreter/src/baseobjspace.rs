@@ -9573,6 +9573,40 @@ pub unsafe fn classmethod_on_type_fast_path(
     Some((w_type, version_tag, w_func))
 }
 
+/// `Cls.__name__` read fast path: when `w_obj` is a class whose metaclass is
+/// exactly `type`, return that metaclass and the class's name object.
+///
+/// `__name__` is a `GetSetProperty` on `type`, so it is a DATA descriptor on
+/// the metatype, and `descr_getattribute` (typeobject.py:814-819) hands the
+/// read to it before consulting the class's own MRO — no `__name__` entry in
+/// any base's dict can shadow it, and the MRO does not have to be walked at
+/// all.  Pinning the metatype to `type` itself is therefore the whole
+/// precondition: `type` is immutable, so the getter cannot be replaced, and
+/// what it returns is the `w_name` slot.
+///
+/// The slot is reported rather than its contents because the walker must read
+/// it live: `descr_set__name__` (typeobject.py:1046) replaces the name without
+/// going through `mutated()`, so the version tag does not move when a class is
+/// renamed and a baked name would outlive the rename.  A slot that has not
+/// been materialised yet (`PY_NULL`) declines rather than filling it in, since
+/// filling it in means allocating.
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
+pub unsafe fn type_name_obj_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
+    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+        return None;
+    }
+    // `is_type` answers for the physical layout, which every type object
+    // shares; the metaclass is the `w_class` header read `getclass()` performs.
+    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    if !std::ptr::eq(metatype, crate::typedef::w_type()) {
+        return None;
+    }
+    let w_name = pyre_object::typeobject::w_type_peek_name_obj(w_obj);
+    (!w_name.is_null()).then_some((metatype, w_name))
+}
+
 /// `callmethod.py`'s `w_obj.getdictvalue(space, name)` shadowing check,
 /// restricted to a probe that neither allocates nor runs Python.
 ///

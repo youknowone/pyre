@@ -6007,6 +6007,22 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
+                // The plain-slot fold wants a mapdict instance and declines a
+                // class; `Cls.__name__` reads the slot the metatype getset
+                // returns instead.
+                if try_walker_specialize_load_type_name_attr(
+                    ctx,
+                    op.pc,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
                 // The plain-slot fold declines a `property` (data descriptor);
                 // inline its Python getter instead of the opaque residual.
                 if let Some(inlined) = try_walker_inline_property_get(

@@ -466,32 +466,6 @@ pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "jit_merge_point")
 }
 
-/// Whether a method-form callee body is free of `LoadAttr` residuals.
-///
-/// A `self.attr` read in the body is what makes it answer `false`, and that is
-/// the common shape (`def at(self, i): return self.v + i`).  No entry declines
-/// on it any more; it names the bodies that reach the inline only through the
-/// widened surface, which the two declines in
-/// `try_walker_inline_resolved_user_call` are scoped to.
-pub(crate) fn method_form_callee_body_supported(
-    body_code: &[u8],
-    callee_descr_refs: &[DescrRef],
-) -> bool {
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            return false;
-        };
-        if residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs)
-            == Some(majit_ir::PyreHelperKind::LoadAttr)
-        {
-            return false;
-        }
-        pc = d.next_pc;
-    }
-    true
-}
-
 /// Whether sampling an exception string override before recording can have no
 /// app-visible effect. Portal-frame vable traffic and constant/int boxing are
 /// local; branches, other calls, and live-heap writes decline the sample.
@@ -1603,7 +1577,6 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
                 contains_raise: callee_body_contains_raise(body.code),
                 has_abort_permanent: crate::jitcode_runtime::decoded_ops(body.code)
                     .any(|op| op.opname == "abort_permanent"),
-                method_form_supported: method_form_callee_body_supported(body.code, descr_refs),
                 exc_override_straight_line: exception_string_override_straight_line(body.code),
                 exc_override_sample_safe: exception_string_override_sample_safe(
                     body.code, descr_refs,
@@ -2960,20 +2933,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return Ok(None);
     }
-    // An unbound method-form callee whose body reads `self.attr`.  FOR_ITER
-    // admits this widened surface only when the receiver is known not to be a
-    // type object: type-attribute reads can run through metatype descriptor
-    // dispatch and still reach the deferred abort path below.
-    let widened_method_form =
-        method_form && bound_method.is_none() && !body_facts.method_form_supported;
-    let widened_method_foriter_admissible = !widened_method_form
-        || callee_arg_concretes.first().is_some_and(|concrete| {
-            matches!(
-                concrete,
-                ConcreteValue::Ref(receiver)
-                    if !receiver.is_null() && !unsafe { pyre_object::is_type(*receiver) }
-            )
-        });
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
     // Replaying a live-heap mutation would double it, so a Dirty body stays on
@@ -3012,13 +2971,19 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // body is still admitted from there — it has nothing that can
                 // abort.
                 //
-                // A widened method-form body is admitted only after proving the
-                // receiver is not a type object.  The type receiver shape
-                // (`cls.__name__` through `type.__getattribute__`) reaches the
-                // deferred abort path, and that first abort retires the
-                // enclosing loop before the deny helps the next attempt.
-                // Declining it here reaches the same residual call with the
-                // loop intact.
+                // The widened method-form surface — an unbound callee whose
+                // body reads `self.attr` — was admitted here only once the
+                // receiver was proven not to be a type object, because a type
+                // receiver's read went through `type.__getattribute__` and
+                // reached the deferred abort path.  That read folds now
+                // ([`try_walker_specialize_load_type_name_attr`]), so a type
+                // receiver reaches no residual to abort on either and the proof
+                // is no longer what admits it: a classmethod body reading
+                // `cls.__name__` measured 1082 ns/iter on the decline against
+                // 1.6 once admitted.  A body whose attribute read does NOT fold
+                // — any metaclass other than `type` — still aborts once and is
+                // denied, which is what this arm's promise has always rested
+                // on.
                 //
                 // A callee with its own exception handler has protected-region
                 // state that must be restored at the callee's precise resume
@@ -3028,7 +2993,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // bodies on the residual path unless this scan proves them
                 // clean.
                 foriter_deferred_admit = arg_class_guard.is_none()
-                    && widened_method_foriter_admissible
                     && !body_facts.owns_loop_header
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !body_facts.has_exception_table
