@@ -24,14 +24,17 @@ struct ApplevelForkCallbacks {
 }
 
 /// `posix.DirEntry` — native layout `[PyObject | w_name | w_path | w_stat |
-/// w_lstat | dir_fd]`, matching `interp_scandir.py W_DirEntry`: the name and
-/// full path plus the cached `stat` (`follow_symlinks=True`) and `lstat`
-/// (`follow_symlinks=False`) results.  `w_stat`/`w_lstat` are `PY_NULL` until
-/// first requested, so `entry.stat()` re-fetches once and then returns the
-/// same object, and `is_dir`/`is_file`/`inode` share the same on-demand stat.
+/// w_lstat | dir_fd | enum_ino]`, matching `interp_scandir.py W_DirEntry`: the
+/// name and full path plus the cached `stat` (`follow_symlinks=True`) and
+/// `lstat` (`follow_symlinks=False`) results.  `w_stat`/`w_lstat` are `PY_NULL`
+/// until first requested, so `entry.stat()` re-fetches once and then returns
+/// the same object, and `is_dir`/`is_file` share the same on-demand stat.
 /// `dir_fd` is the descriptor a `scandir(fd)` handed the entry (`-1` for a
 /// name), which its own stat resolves the bare `name` against — the native
-/// counterpart of `self.scandir_iterator.orig_fd`.
+/// counterpart of `self.scandir_iterator.orig_fd`.  `enum_ino` is the inode
+/// `readdir` reported at enumeration (`descr_inode`'s `self.inode`), so
+/// `inode()` answers from it without a stat; it is `-1` when unavailable (the
+/// `scandir(fd)` path and non-unix hosts), which falls back to a stat.
 /// The layout carries no instance dict; `name`/`path` are read-only getset
 /// descriptors, so the type is not instantiable and not acceptable as a base.
 #[crate::pyre_class("posix.DirEntry")]
@@ -42,6 +45,7 @@ pub struct W_DirEntry {
     pub w_stat: PyObjectRef,
     pub w_lstat: PyObjectRef,
     pub dir_fd: i32,
+    pub enum_ino: i64,
 }
 
 static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
@@ -3810,6 +3814,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         Ok(pyre_object::w_bool_from(false))
     }
     fn dir_entry_inode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        // `descr_inode` returns the inode `readdir` reported at enumeration when
+        // the entry carries one (the name-based `scandir` path on unix), with no
+        // stat; `-1` means it has none and the stat paths below answer instead.
+        if let Some(de) = W_DirEntry::from_obj(args[0]) {
+            if de.enum_ino != -1 {
+                return Ok(pyre_object::w_int_new(de.enum_ino));
+            }
+        }
         let (w_path, path) = dir_entry_path(args[0])?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
@@ -4119,13 +4131,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// on the shadow stack).  Each string is pinned before the next allocation
     /// so a moving collection during `allocate_stable` forwards it; the entry
     /// is stable but its young strings join the remembered set.  `dir_fd` is the
-    /// descriptor the entry resolves its own `name` against, or `-1`.
+    /// descriptor the entry resolves its own `name` against, or `-1`.  `enum_ino`
+    /// is the `readdir` inode (or `-1` when the enumeration did not carry one).
     fn scandir_push_entry(
         list_slot: usize,
         bytes_mode: bool,
         name: &[u8],
         full: &[u8],
         dir_fd: i32,
+        enum_ino: i64,
     ) {
         let _entry_scope = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::shadow_stack_len();
@@ -4137,6 +4151,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         de.w_name = pyre_object::gc_roots::shadow_stack_get(base);
         de.w_path = pyre_object::gc_roots::shadow_stack_get(base + 1);
         de.dir_fd = dir_fd;
+        de.enum_ino = enum_ino;
         unsafe { pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8) };
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         unsafe { pyre_object::w_list_append(list, obj) };
@@ -4178,7 +4193,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 for name in
                     fdlistdir(fd).map_err(|errno| errno_err_with_filename(errno, w_path()))?
                 {
-                    scandir_push_entry(list_slot, false, &name, &name, fd);
+                    // `fdlistdir` yields names only, so the descriptor entries
+                    // carry no enumeration inode yet and `inode()` stats them.
+                    scandir_push_entry(list_slot, false, &name, &name, fd, -1);
                 }
             }
             _ => {
@@ -4188,12 +4205,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let entry = entry.map_err(|e| fs_err_with_filename(e, w_path()))?;
                     let name = entry.file_name();
                     let full = entry.path().into_os_string();
+                    // The inode `readdir` reported is what `descr_inode`
+                    // returns; `d_ino` comes straight from the dirent, so
+                    // capturing it here lets `inode()` answer without a stat.
+                    #[cfg(unix)]
+                    let enum_ino = {
+                        use std::os::unix::fs::DirEntryExt;
+                        entry.ino() as i64
+                    };
+                    #[cfg(not(unix))]
+                    let enum_ino = -1i64;
                     scandir_push_entry(
                         list_slot,
                         bytes_mode,
                         name.as_encoded_bytes(),
                         full.as_encoded_bytes(),
                         -1,
+                        enum_ino,
                     );
                 }
             }
