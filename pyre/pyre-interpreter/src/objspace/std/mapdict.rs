@@ -4599,16 +4599,32 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         //
         // Box the key before the read's conversion tail runs: `key` borrows the
         // map node, and the migration below replaces the instance's map.
-        let w_key = pyre_object::unicodeobject::box_str_constant(key);
-        let w_value = plain_direct_read(curr, &*inst);
+        //
+        // Boxing, the read and the migration all allocate, so each is a point
+        // where a minor collection can forward a nursery address out from under
+        // a Rust local. Pin the carrier and the two results and read them back
+        // from the shadow stack after every such call. `map`, `curr` and `key`
+        // need no pin: map nodes are not GC-allocated.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj]);
+        let key_slot =
+            pyre_object::gc_roots::pin_roots(&[pyre_object::unicodeobject::box_str_constant(key)]);
+        let inst = &mut *(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+            as *mut pyre_object::W_ObjectObject);
+        let value_slot = pyre_object::gc_roots::pin_roots(&[plain_direct_read(curr, &*inst)]);
         // `plain_direct_read` is only `_prim_direct_read` (mapdict.py:600-601).
         // The read still owes `_direct_read`'s tail (mapdict.py:592-598): an
         // unboxed attribute whose terminator has stopped allowing unboxing
         // converts the whole instance to boxed storage. `getdictvalue` pairs
         // the two the same way.
+        let inst = &mut *(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+            as *mut pyre_object::W_ObjectObject);
         maybe_migrate_to_boxed(map, inst, key, DICT);
-        self.delitem(w_dict, w_key);
-        Some((w_key, w_value))
+        self.delitem(w_dict, pyre_object::gc_roots::shadow_stack_get(key_slot));
+        Some((
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        ))
     }
 
     /// mapdict.py:1237-1253 `copy`.

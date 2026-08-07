@@ -4159,14 +4159,13 @@ pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> 
 /// `dictmultiobject.py:257` `W_DictMultiObject.descr_popitem` delegates to
 /// `W_DictMultiObject.popitem`, which dispatches through the live strategy.
 ///
-/// Residualise this mutating strategy call (`rlib/jit.py:139`): concrete
-/// strategies pop from `IndexMap` or mapdict storage, neither of which the
-/// tracer can model as inline heap mutation.
+/// Traced like the other strategy dispatchers: `w_dict_delitem` and
+/// `w_dict_clear` mutate the same `IndexMap` and mapdict storages with no
+/// barrier, and `dictmultiobject.py` carries no `@dont_look_inside` here.
 ///
 /// # Safety
 /// `obj` must be a valid PyObjectRef pointing at a `W_DictObject` or
 /// `W_ModuleDictObject`.
-#[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_popitem(obj: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
     w_dict_get_strategy(obj).popitem(obj)

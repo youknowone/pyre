@@ -45,6 +45,9 @@ assert_empty_popitem(reused)
 
 assert_lifo("int", {1: "a", 2: "b", 3: "c"}, [(3, "c"), (2, "b"), (1, "a")])
 assert_lifo("str", {"a": 1, "b": 2, "c": 3}, [("c", 3), ("b", 2), ("a", 1)])
+# A bytes-only dict reaches its own strategy arm, which rebuilds the key from
+# the stored bytes rather than handing back a stored object.
+assert_lifo("bytes", {b"a": 1, b"b": 2, b"c": 3}, [(b"c", 3), (b"b", 2), (b"a", 1)])
 assert_lifo("object", {1: "a", "b": 2, (3,): "c"}, [((3,), "c"), ("b", 2), (1, "a")])
 
 kw = make_kwargs(a=1, b=2, c=3)

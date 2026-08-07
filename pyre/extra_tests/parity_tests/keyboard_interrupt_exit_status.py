@@ -5,12 +5,16 @@
 — so a shell sees the interrupt rather than an ordinary error exit. The child is
 spawned because the fixture itself has to exit 0.
 
-The other three cases pin the exit paths this must not have moved.
+`-c` and `-m` reach that ending through separate call sites, so both are
+asserted; the remaining cases pin the exit paths this must not have moved.
 """
 
+import os
+import pathlib
 import signal
 import subprocess
 import sys
+import tempfile
 
 
 def run_child(source):
@@ -53,7 +57,30 @@ child = run_child(
 assert child.returncode == 0, child.returncode
 assert child.stdout.strip() == "caught", child.stdout
 
-# The same exit path through `-m`, which is a separate call site.
+# `-m` runs the module through a separate call site, so it needs the same two
+# statuses of its own: a module that raises the interrupt, and one that fails to
+# import at all.
+with tempfile.TemporaryDirectory() as module_dir:
+    pathlib.Path(module_dir, "kbd_interrupt_module.py").write_text(
+        "raise KeyboardInterrupt\n", encoding="utf-8"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = module_dir + os.pathsep + env.get("PYTHONPATH", "")
+    child = subprocess.run(
+        [sys.executable, "-m", "kbd_interrupt_module"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+if sys.platform == "win32":
+    assert child.returncode == 0xC000013A, child.returncode
+else:
+    assert child.returncode == -signal.SIGINT, child.returncode
+assert "Traceback" in child.stderr, child.stderr
+assert "KeyboardInterrupt" in child.stderr, child.stderr
+
 child = subprocess.run(
     [sys.executable, "-m", "this_module_does_not_exist_zzz"],
     capture_output=True,

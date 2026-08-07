@@ -51,8 +51,8 @@ class L(list):
         return super().__getattribute__(name)
 
 
-l = L([1, 2, 3])
-assert l.marker is SENTINEL
+list_subclass = L([1, 2, 3])
+assert list_subclass.marker is SENTINEL
 assert L.calls == 1
 
 try:
