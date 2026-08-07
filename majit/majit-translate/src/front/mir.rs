@@ -2112,7 +2112,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
-            simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, false);
         }
         let mut tail_forwarded_returns = 0usize;
         if !lo.slice_index_rangeto_sites.is_empty() {
@@ -2414,7 +2414,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
-        simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
+        simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
         // `format!`-chain expansion (#131): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
@@ -2459,7 +2459,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // so untouched graphs keep their single end-of-lowering simplify.
         if collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
-            simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
         }
         Ok(())
     };
@@ -2552,11 +2552,26 @@ fn lower_unstructured_with_static_addrs_and_attrs(
 ///   (`removeassert.py:35-37` "now melt away the (hopefully) dead
 ///   operation that compute the condition").  Upstream leaves this to
 ///   the later backendopt sweep (`backendopt/all.py`); the model
-///   layer has no later sweep, so it runs here, gated on an actual
-///   removal to keep untouched graphs byte-identical.
+///   layer has no later sweep, so it runs here — see `sweep_dead_vars`
+///   below for when.
+///
+/// `sweep_dead_vars` selects which of the two call sites this is.  The
+/// end-of-lowering call passes `true` and runs `prune_dead_phis`
+/// unconditionally, as `all_passes` does.  The result-exc pre-pass passes
+/// `false`: `rewire_result_exc_call_sites` walks the `Result` diamond by
+/// following one `Variable` identity from link args into the target's
+/// inputargs, and a `Result` that is dead downstream is exactly what the
+/// sweep removes — the walk then fails the whole graph with "block N's exit
+/// does not carry the tracked value".  Measured: three `_io` `__init__`
+/// graphs stopped lowering, taking the `reader_reset_buf` /
+/// `writer_reset_buf` callees they queue with them.  The pre-pass is
+/// pyre-only and exists so the diamond matcher sees a pruned discriminant
+/// switch; keeping the sweep out of it leaves one sweep per graph, which is
+/// what upstream has.
 fn simplify_lowered_graph(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    sweep_dead_vars: bool,
 ) {
     // Collapse the operation-less blocks the MIR lowering leaves behind.
     // This is not the no-op `eliminate_empty_blocks`' own doc describes —
@@ -2586,7 +2601,7 @@ fn simplify_lowered_graph(
     // to a native `NewWithVtable` + payload store before the dead-aggregate
     // sweep, which then reclaims the orphaned construct-on-stack ctor and
     // header field writes.
-    crate::model::fuse_boxing_alloc(graph, struct_field_attrs);
+    let mut dirty = crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
     // liveness (`transform_dead_op_vars`, simplify.py:425-479) with the
@@ -2598,13 +2613,13 @@ fn simplify_lowered_graph(
     // producers + scoped store exemption) so it is a no-op on graphs with no
     // such remnants.  A removal leaves dangling threaded inputargs / link args
     // the `prune_dead_phis` below reclaims.
-    crate::model::prune_dead_boxing_remnants(graph);
+    dirty |= crate::model::prune_dead_boxing_remnants(graph) > 0;
     // Drop dead aggregate constructions (malloc + field stores whose
     // result is never read) before the dead-op sweep — `prune_dead_phis`
     // keeps them because a `FieldWrite` is side-effecting, so its `base`
     // pins the aggregate (`remove_simple_mallocs`, malloc.py).
-    crate::model::remove_dead_aggregates(graph);
-    crate::model::remove_assertion_errors(graph);
+    dirty |= crate::model::remove_dead_aggregates(graph) > 0;
+    dirty |= crate::model::remove_assertion_errors(graph) > 0;
     // Constant-condition arms (`if WITHPREBUILTINT { … }` with the
     // config const folded by `const_eval_global`) collapse to the
     // taken link and the dead arm is emptied — the registry lift
@@ -2614,6 +2629,7 @@ fn simplify_lowered_graph(
     // folding (backendopt/constfold.py).
     if crate::model::fold_constant_exitswitch(graph) > 0 {
         crate::model::clear_unreachable_blocks(graph);
+        dirty = true;
     }
     // `transform_dead_op_vars` is the first entry in `all_passes`
     // (simplify.py:1067) and `simplify_graph` (:1080-1086) applies every
@@ -2628,7 +2644,9 @@ fn simplify_lowered_graph(
     // pass touches — `_check_stack_index` threads the virtualizable array
     // into a successor that never reads it, and nothing else in this
     // sequence reports a removal for that graph.
-    crate::model::prune_dead_phis(graph);
+    if sweep_dead_vars || dirty {
+        crate::model::prune_dead_phis(graph);
+    }
     // Collapse again, now that every dead-code sweep above has run.
     //
     // Upstream orders `all_passes` (simplify.py:1065-1078, applied in list
@@ -20286,7 +20304,7 @@ mod tests {
         graph.set_goto(entry, forwarding, vec![array.clone()]);
         graph.set_return(forwarding, None);
 
-        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new());
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
 
         let entry_exit = &graph.block(entry).exits[0];
         assert_eq!(
