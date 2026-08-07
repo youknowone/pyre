@@ -1309,3 +1309,25 @@ def run_cli(
         check(eng, args)
         return
     extract(eng, args)
+
+
+# This module is the shared extraction ENGINE. Every consumer imports it — the
+# per-repo wrappers call `run_cli` with their own `SPECS` — and nothing has ever
+# invoked it as a program.
+#
+# Without this block, running it directly defined `main()` and fell off the end:
+# zero output, **exit 0**, for every argument including `--check`, `--fingerprint`
+# and `--help`. A freshness check aimed here reported success without executing,
+# which is worse than the staleness it was run to detect.
+#
+# The body refuses instead of dispatching. Adding a `main()` call would make
+# direct invocation *work* and mint a second, under-specified entry point: the
+# engine alone cannot know which crates to extract or where their sources live —
+# that is exactly what a wrapper's `CrateSpec` and `PYRE_ROOT` resolution supply.
+if __name__ == "__main__":
+    raise SystemExit(
+        "llbc_extract.py is the shared extraction ENGINE, not an entry point.\n"
+        "  pyre crates:  python3 scripts/extract-llbc.py ...\n"
+        "  cel crates:   python3 cel-jit/scripts/extract-llbc.py ...\n"
+        "Those wrappers supply the CrateSpec table this module needs."
+    )
