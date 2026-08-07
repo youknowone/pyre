@@ -4336,7 +4336,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // `EBADF`.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
-            use std::os::windows::io::{AsRawHandle, FromRawHandle};
             let invalid_handle = || {
                 crate::PyError::os_error_win32_syscall2(
                     windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32,
@@ -4345,13 +4344,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 )
             };
             let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
-            let handle =
-                rustpython_host_env::crt_fd::as_handle(borrowed).map_err(|_| invalid_handle())?;
-            let file = unsafe { std::fs::File::from_raw_handle(handle.as_raw_handle()) };
-            let meta = file.metadata();
-            let _ = std::mem::ManuallyDrop::new(file); // don't close
-            match meta {
-                Ok(m) => Ok(make_stat_result(&m, 0)),
+            // Same `StatStruct` the path forms take, for the reason
+            // [`win_stat_fields`] states: `std::fs::Metadata` carries no file
+            // index or volume serial, so answering from it would report a
+            // different identity for the very file `os.stat(path)` just named.
+            // It also answers a character device or pipe with the format bits
+            // `GetFileType` reports rather than a disk file's.
+            match rustpython_host_env::fileutils::fstat(borrowed) {
+                Ok(st) => Ok(stat_result_from_fields(
+                    &stat_fields_from_statstruct(&st),
+                    0,
+                )),
                 Err(e) => Err(match e.raw_os_error() {
                     Some(winerror) => crate::PyError::os_error_win32_syscall2(
                         winerror,
