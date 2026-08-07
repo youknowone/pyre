@@ -6676,6 +6676,13 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
 /// is admitted because a mid-body abort from its method call follows the same
 /// exact-resume path rather than dropping the remainder of the iteration.
 ///
+/// `LIST_EXTEND` has the same contract. `pyopcode.py:1497 LIST_EXTEND` calls
+/// `space.call_method(v, 'extend', w)` and only translates the non-iterable
+/// error. An iterable may mutate the list before it raises, so replay is not
+/// sound; a mid-body abort therefore keeps that partial or complete mutation
+/// and resumes forward through `try_commit_midbody_abort` or exception
+/// delivery. CALL-forward remains limited to the before-run case. The extend
+/// is consequently applied exactly once and no iteration tail is dropped.
 /// `SET_ADD` and `MAP_ADD` — the set/dict comprehension accumulators — are
 /// admitted on the same footing, because upstream spells them as operations this
 /// body scan already admits and gives them no accumulator status of their own:
@@ -6915,6 +6922,7 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
                             | I::LoadName { .. }
                             // `call_method(set, 'add', v)` / `setitem(d, k, v)`
                             // spelled as one opcode; void residuals, not folds.
+                            | I::ListExtend { .. }
                             | I::SetAdd { .. }
                             | I::MapAdd { .. }
             )
