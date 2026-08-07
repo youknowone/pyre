@@ -4028,12 +4028,6 @@ pub fn pyframe_debugdata_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 5)
 }
 
-/// rewrite.py:665-695 handle_call_assembler scalar field read for the
-/// `lastblock` slot of the virtualizable expansion (Phase D-1 prereq).
-pub fn pyframe_lastblock_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
-}
-
 /// PyFrame.execution_context FieldDescr.
 /// inline PyFrame 생성 시 caller 의 ec 를 새 frame 으로 SetfieldGc 하기 위해.
 /// 호출 사이트는 `helpers.rs::emit_new_pyframe_inline*`.

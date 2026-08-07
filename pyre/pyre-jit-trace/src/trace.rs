@@ -658,8 +658,8 @@ fn try_commit_entry_carrier_call(
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                 call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
-                 lastblock) — legacy replay kept"
+                 call_py_pc={call_py_pc} (depth mismatch / unresolved local) — \
+                 legacy replay kept"
             );
         }
         return None;
@@ -1132,8 +1132,8 @@ pub fn trace_bytecode<Sym: WalkSym>(
     }
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
     // The snapshot stands in for concrete stepping only; vable-statics
-    // capture must read pointer-valued fields (`debugdata` / `lastblock`)
-    // from the live frame the compiled loop will run on.  See the
+    // capture must read the pointer-valued `debugdata` field from the live
+    // frame the compiled loop will run on. See the
     // `live_vable_frame_addr` field doc (state.rs).  Set before the
     // full-body-walk leg below so the production tracer sees it.
     //
@@ -3847,8 +3847,8 @@ fn run_perfn_walk<Sym: WalkSym>(
     // produces RPython-style reds (`jump_args = [frame, ec]`, len 2 for the
     // portal jitdriver), but pyre's runtime closes loops against the
     // EXPLICIT scalar inputarg vector
-    // `[frame, ec, next_instr, code, valuestackdepth, debugdata, lastblock,
-    //  namespace, locals..., stack...]` (len >= NUM_SCALAR_INPUTARGS).
+    // `[frame, ec, next_instr, code, valuestackdepth, debugdata, namespace,
+    //  locals..., stack...]` (len >= NUM_SCALAR_INPUTARGS).
     // `validate_close_with_jump_args` (state.rs) rejects the reds shape, so
     // rebuild the explicit vector via `close_loop_args_at`, matching
     // `reached_loop_header` (trace_opcode.rs close path). The
@@ -3954,7 +3954,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-end-flush] declined at header_pc={header_pc} (shadow slot \
-                         without concrete / depth / lastblock) — legacy replay kept"
+                         without concrete / depth) — legacy replay kept"
                     );
                 }
             }
@@ -4289,7 +4289,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                     (shadow slot without concrete / depth) — legacy replay kept"
                             );
                         }
                     }
@@ -4404,7 +4404,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                     (shadow slot without concrete / depth) — legacy replay kept"
                             );
                         }
                     }
@@ -4491,7 +4491,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
-                         (operand slot without concrete / depth / lastblock) — legacy replay kept"
+                         (operand slot without concrete / depth) — legacy replay kept"
                     );
                 }
             } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -4623,7 +4623,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-branch-flush] declined at resume_py_pc={resume_py_pc} \
-                             (shadow slot without concrete / depth / lastblock) — legacy drop kept"
+                             (shadow slot without concrete / depth) — legacy drop kept"
                     );
                 }
             }

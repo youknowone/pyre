@@ -5,9 +5,9 @@
 //! builder, field/array spec constants, and virtualizable hook helpers.
 
 use crate::frame_layout::{
-    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LAST_INSTR_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
-    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_PYCODE_OFFSET, PYFRAME_VABLE_TOKEN_OFFSET,
-    PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
+    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LAST_INSTR_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+    PYFRAME_PYCODE_OFFSET, PYFRAME_VABLE_TOKEN_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET,
+    PYFRAME_W_GLOBALS_OFFSET,
 };
 use crate::state::PyreJitState;
 use pyre_object::FIXED_OBJECT_ARRAY_TOKEN;
@@ -31,9 +31,9 @@ majit_macros::virtualizable! {
     },
 
     // Layout: [frame:Ref, ec:Ref, last_instr:Int, pycode:Ref,
-    //          valuestackdepth:Int, debugdata:Ref, lastblock:Ref,
-    //          w_globals:Ref, array...]
-    // Mirrors `pypy/module/pypyjit/interp_jit.py:25-31`'s
+    //          valuestackdepth:Int, debugdata:Ref, w_globals:Ref,
+    //          array...]
+    // Mirrors `pypy/module/pypyjit/interp_jit.py:25-30`'s
     // `_virtualizable_` declaration line by line; `ec` is from
     // `interp_jit.py:67 reds = ['frame', 'ec']` (extra_reds above).
     inputargs = {
@@ -41,7 +41,6 @@ majit_macros::virtualizable! {
         pycode: Ref,
         valuestackdepth: Int,
         debugdata: Ref,
-        lastblock: Ref,
         w_globals: Ref,
     },
 
@@ -49,13 +48,12 @@ majit_macros::virtualizable! {
     array_item_type = Ref,
 
     // VirtualizableInfo field layout (byte offsets).
-    // interp_jit.py:25-31 order — line-by-line PyPy parity.
+    // interp_jit.py:25-30 order — line-by-line PyPy parity.
     fields = {
         last_instr: int @ PYFRAME_LAST_INSTR_OFFSET,
         pycode: ref @ PYFRAME_PYCODE_OFFSET,
         valuestackdepth: int @ PYFRAME_VALUESTACKDEPTH_OFFSET,
         debugdata: ref @ PYFRAME_DEBUGDATA_OFFSET,
-        lastblock: ref @ PYFRAME_LASTBLOCK_OFFSET,
         w_globals: ref @ PYFRAME_W_GLOBALS_OFFSET,
     },
 

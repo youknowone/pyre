@@ -4431,8 +4431,8 @@ impl<M: Clone> MetaInterp<M> {
             return input_types;
         };
         // `extract_live_values()` still emits the expanded
-        // `[frame, last_instr, pycode, valuestackdepth, debugdata, lastblock,
-        //  w_globals, locals..., stack...]` shape, so the trace's inputarg
+        // `[frame, last_instr, pycode, valuestackdepth, debugdata, w_globals,
+        //  locals..., stack...]` shape, so the trace's inputarg
         // types do NOT carry the reds in the leading `num_reds` slots —
         // truncating to `num_reds` here would register a bogus
         // `[Ref(frame), Int(last_instr)]` ABI when reds is `[frame, ec]`.

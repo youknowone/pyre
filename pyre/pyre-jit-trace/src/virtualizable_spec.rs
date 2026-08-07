@@ -7,33 +7,23 @@ pub const PYFRAME_VABLE_OWNER_ROOT: &str = "PyFrame";
 
 /// Virtualizable scalar fields.
 ///
-/// `pypy/module/pypyjit/interp_jit.py:25-30` declares
-/// `['last_instr', 'pycode', 'valuestackdepth', 'locals_cells_stack_w[*]',
-/// 'debugdata', 'w_globals']` — five scalars and one array. Pyre carries a
-/// SIXTH scalar, `lastblock`, which upstream does not list; the ordering
-/// below is otherwise upstream's, so `w_globals` sits one slot later here
-/// than it would there.
-///
-/// Note on `lastblock` semantics: PyPy's bytecode emits
-/// `SETUP_FINALLY` / `SETUP_EXCEPT` / `POP_BLOCK` (`pyopcode.py:1268`)
-/// which mutate `frame.lastblock` on the hot path and the JIT must
-/// track those mutations via `_opimpl_setfield_vable`.  CPython 3.14's
-/// compiler emits no such opcodes — try/except/finally goes through
-/// the zero-cost `co_exceptiontable` side table consulted only on
-/// raise.  Under pyre's 3.14 bytecode the slot is therefore JIT-scope
-/// invariant, but the layout slot is preserved for line-by-line PyPy
-/// parity (the legacy SETUP_*/POP_BLOCK interpreter path at
-/// `pyre-interpreter/src/eval.rs:306-308` still mutates the heap
-/// field, and any future port of those opcode handlers must emit
-/// `setfield_vable_r` per RPython
-/// `pyjitpl.py:1188 _opimpl_setfield_vable`).
+/// This table is the scalar subset of
+/// `pypy/module/pypyjit/interp_jit.py:25-30`'s `_virtualizable_` list,
+/// in declaration order. `PyFrame.lastblock` is deliberately absent:
+/// the frame model tracked by this tree has no block stack. Unwind uses
+/// the `co_exceptiontable` lookup at
+/// `pypy/interpreter/pyopcode.py:152 lookup_exceptiontable`, and pyre's
+/// 3.14 bytecode emits no `SETUP_*` / `POP_BLOCK`, so nothing mutates
+/// the field inside a trace. It remains an ordinary heap field with a
+/// plain `FieldDescr` and a GC root slot. If block opcodes are ever
+/// reintroduced, re-add it here and emit `_opimpl_setfield_vable` from
+/// their handlers; a layout slot with no setfield is not tracking.
 pub const PYFRAME_VABLE_FIELDS: &[(&str, usize)] = &[
     ("last_instr", 0),      // interp_jit.py:25 last_instr
     ("pycode", 1),          // interp_jit.py:25 pycode
     ("valuestackdepth", 2), // interp_jit.py:26 valuestackdepth
     ("debugdata", 3),       // interp_jit.py:28 debugdata
-    ("lastblock", 4),       // no `_virtualizable_` entry — see above
-    ("w_globals", 5),       // interp_jit.py:29 w_globals
+    ("w_globals", 4),       // interp_jit.py:29 w_globals
 ];
 
 /// Virtualizable array fields in canonical index order.

@@ -5709,14 +5709,14 @@ impl CodeWriter {
         // the codewriter call site. RPython looks up the index dynamically
         // through `VABLEINFO.static_field_descrs` since each backend may
         // reorder fields. Pyre's `_virtualizable_` order matches PyPy
-        // `interp_jit.py:25-31` line by line:
-        // [last_instr, pycode, valuestackdepth, debugdata, lastblock,
-        // w_globals], so the literals match
+        // `interp_jit.py:25-30` line by line:
+        // [last_instr, pycode, valuestackdepth, debugdata, w_globals],
+        // so the literals match
         // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`.
         const VABLE_LAST_INSTR_FIELD_IDX: u16 = 0;
         const VABLE_CODE_FIELD_IDX: u16 = 1;
         const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
-        const VABLE_NAMESPACE_FIELD_IDX: u16 = 5;
+        const VABLE_NAMESPACE_FIELD_IDX: u16 = 4;
 
         // regalloc.py: compile-time stack depth counter — tracks which
         // stack register (stack_base + depth) is the current TOS.

@@ -1249,7 +1249,7 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
 /// Compile-time-constant frame fields of an inlined callee.
 #[derive(Clone, Copy)]
 pub struct InlineCalleeConsts {
-    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 5): the
+    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 4): the
     /// callee function's `__globals__` as a `PyObjectRef`.
     w_globals: usize,
     /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
@@ -3801,8 +3801,8 @@ fn write_ref_reg<Sym: WalkSym>(
 /// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
 ///
 /// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
-/// `valuestackdepth(2)`, `debugdata(3)`, `lastblock(4)`, and `w_globals(5)`
-/// (`virtualizable_gen.rs`, `NUM_VABLE_SCALARS = 6`).  They are frame
+/// `valuestackdepth(2)`, `debugdata(3)`, and `w_globals(4)`
+/// (`virtualizable_gen.rs`, `NUM_VABLE_SCALARS = 5`). They are frame
 /// bookkeeping; the Python operand stack lives in the separate
 /// `locals_cells_stack_w` array (`virtualizable_gen.rs`,
 /// `pyre-interpreter/src/pyframe.rs`).  PyPy's `interp_jit.py`
