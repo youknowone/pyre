@@ -599,7 +599,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 58;
+pub const MC_DIAG_SLOTS: usize = 60;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -678,11 +678,20 @@ pub const MC_DIAG_SLOTS: usize = 58;
 /// have landed a body JUMP on a preamble LABEL of a different arity
 /// (`compile.py:334`). Non-zero means a retrace was built and discarded; see
 /// the preamble-arity item.
+///
+/// 58/59 = the FBW walker's inline sub-walk decided to open (58) / close (59) a
+/// `portal_trace_positions` entry.  They count the DECISIONS, not the appends:
+/// an abort retires the log mid-sub-walk, so an append tally would read 58 far
+/// above 59 for a reason that says nothing about the pairing.  As decisions,
+/// `58 != 59` at process exit means exactly one thing — a sub-walk exit path
+/// skipped its close, and `find_biggest_function` mis-sizes every frame after
+/// it.  A `debug_assert!` cannot see that; the imbalance is only visible across
+/// a whole run.
 pub static MC_DIAG: [std::sync::atomic::AtomicU64; MC_DIAG_SLOTS] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [
         Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
     ]
 };
 
@@ -747,6 +756,8 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     "retrace_mp_untyped",
     "close_hdr_fallback",
     "retrace_arity_giveup",
+    "ptp_push",
+    "ptp_pop",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

@@ -4374,6 +4374,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // two-frame specialization of `run_blackhole_interp_to_cancel_tracing`:
         // `_copy_data_from_miframe` preserves the callee's own position and
         // live registers instead of collapsing it onto the caller frame.
+        // `newframe(jitcode, greenkey)` (pyjitpl.py:2443-2445) — the callee this
+        // walk is about to inline is what upstream logs there.  The pair
+        // brackets the `walk` call and nothing else: every decline is already
+        // behind us and every exit below reads `result`, so the sequence
+        // `find_biggest_function` pairs off cannot go out of step.  The green
+        // key is the callee's function-entry key, the one
+        // `disable_noninlinable_function` is applied to.
+        let subwalk_jd_no = crate::state::note_inline_subwalk_start(
+            crate::driver::make_green_key(raw_callee_code as *const (), 0),
+            sub_wc.trace_ctx.get_trace_position(),
+        );
         let result = {
             // #704 root-bridge self-recursive inline: exempt this callee body
             // sub-walk's nested recursive residual from the self-recursive
@@ -4382,6 +4393,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             let _bridge_rec_selfrec_guard = bridge_rec_root_selfrec.then(SelfRecCaFoldGuard::enter);
             walk(body.code, 0, &mut sub_wc)
         };
+        if let Some(jd_no) = subwalk_jd_no {
+            crate::state::note_inline_subwalk_end(jd_no, sub_wc.trace_ctx.get_trace_position());
+        }
         let midbody_abort = match &result {
             Err(DispatchError::AbortPermanentMarkerReached { pc }) => {
                 Some((*pc, MidBodyAbortKind::Marker))

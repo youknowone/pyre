@@ -790,6 +790,8 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 "retrace_mp_untyped",
                 "close_hdr_fallback",
                 "retrace_arity_giveup",
+                "ptp_push",
+                "ptp_pop",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

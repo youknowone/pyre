@@ -14305,6 +14305,46 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// The driver [`Self::is_main_jitcode`] would answer `true` for, named
+    /// without a jitcode.
+    ///
+    /// `newframe` reaches the log through a `JitCode`, which every caller
+    /// building an `MIFrame` has.  A tracer that inlines a callee WITHOUT
+    /// building one — pyre's FBW walker walks the callee body directly — has
+    /// the same question to answer and no jitcode to answer it with, so the
+    /// predicate is offered here in its jitcode-free form: the index of the
+    /// recursive portal driver. `None` when none is registered, which is the
+    /// `is_main_jitcode` = false case and must equally leave the log alone.
+    pub fn main_jitdriver_index(&self) -> Option<usize> {
+        self.staticdata
+            .jitdrivers_sd
+            .iter()
+            .position(|jd| jd.is_recursive)
+    }
+
+    /// Append one `portal_trace_positions` entry, `newframe`'s
+    /// (pyjitpl.py:2443-2445) and `popframe`'s (pyjitpl.py:2470-2472) shared
+    /// tail, for a caller that reached the decision without an `MIFrame`.
+    ///
+    /// `green_key` is `Some` for the opening entry and `None` for the closing
+    /// one; [`Self::find_biggest_function`] pairs them off a stack, so an
+    /// unbalanced sequence mis-sizes every frame after the imbalance.
+    ///
+    /// A retired log (`blackhole_if_trace_too_long` sets it to `None`) drops
+    /// both kinds alike, which keeps what remains internally consistent — the
+    /// closing entry of a frame whose opening entry was dropped would not be.
+    pub fn push_portal_trace_position(
+        &mut self,
+        jd_no: usize,
+        green_key: Option<u64>,
+        pos: crate::recorder::TracePosition,
+    ) {
+        let Some(positions) = self.portal_trace_positions.as_mut() else {
+            return;
+        };
+        positions.push((jd_no, green_key, pos));
+    }
+
     /// pyjitpl.py:2432-2452 `MetaInterp.newframe(jitcode, greenkey)`.
     ///
     /// ```python
@@ -20243,6 +20283,64 @@ mod metainterp_static_data_tests {
         let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
         jc.replace_jitdriver_sd(Some(idx));
         assert!(meta.is_main_jitcode(&jc));
+    }
+
+    #[test]
+    fn main_jitdriver_index_answers_is_main_jitcode_without_a_jitcode() {
+        // The walker inlines a callee without building an `MIFrame`, so it asks
+        // the `is_main_jitcode` question through this accessor instead. The two
+        // must agree, or the walker would log frames upstream would not (or
+        // skip ones it would).
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        assert_eq!(meta.main_jitdriver_index(), None);
+
+        // A non-recursive driver is not the main one, exactly as
+        // `is_main_jitcode` reads it.
+        let mut plain = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        plain.is_recursive = false;
+        let mut recursive = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        recursive.is_recursive = true;
+        let (plain_idx, recursive_idx) = {
+            let MetaInterp {
+                staticdata,
+                backend,
+                ..
+            } = &mut meta;
+            let sd = std::sync::Arc::get_mut(staticdata).unwrap();
+            let plain_idx = sd.register_jitdriver_sd(plain, backend);
+            let recursive_idx = sd.register_jitdriver_sd(recursive, backend);
+            (plain_idx, recursive_idx)
+        };
+        assert_ne!(plain_idx, recursive_idx);
+        assert_eq!(meta.main_jitdriver_index(), Some(recursive_idx));
+
+        let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
+        jc.replace_jitdriver_sd(Some(plain_idx));
+        assert!(!meta.is_main_jitcode(&jc));
+        jc.replace_jitdriver_sd(Some(recursive_idx));
+        assert!(meta.is_main_jitcode(&jc));
+    }
+
+    #[test]
+    fn push_portal_trace_position_pairs_are_sized_by_find_biggest_function() {
+        // The walker's two calls land as one balanced start/end pair, which is
+        // the shape `find_biggest_function` walks. A retired log drops both.
+        let (mut meta, _jc) = meta_with_recursive_portal();
+        start_tracing(&mut meta);
+        let jd_no = meta.main_jitdriver_index().expect("recursive portal");
+        let start = meta.trace_ctx().expect("tracing").get_trace_position();
+        meta.push_portal_trace_position(jd_no, Some(0xBEEF), start);
+        record_ops(&mut meta, 5);
+        let end = meta.trace_ctx().expect("tracing").get_trace_position();
+        meta.push_portal_trace_position(jd_no, None, end);
+        assert_eq!(meta.find_biggest_function(), Some((jd_no, 0xBEEF)));
+
+        // pyjitpl.py:2823 `self.portal_trace_positions = None` — after the
+        // abort boundary nothing is logged and nothing is found.
+        meta.portal_trace_positions = None;
+        meta.push_portal_trace_position(jd_no, Some(0xF00D), end);
+        assert_eq!(meta.find_biggest_function(), None);
     }
 
     #[test]

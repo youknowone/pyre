@@ -3154,15 +3154,26 @@ pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     boxed
 }
 
-/// The warm-state half of `prepare_trace_segmenting` (pyjitpl.py:2833),
+/// `blackhole_if_trace_too_long`'s warm-state bookkeeping (pyjitpl.py:2817-2831),
 /// callable from the walker, which holds `&mut TraceCtx` and so cannot take
-/// `MetaInterp` to run the method itself.  The two arms are independent and
-/// upstream applies each on its own condition, so both arguments are read
-/// straight off the walk's `TraceCtx`:
+/// `MetaInterp` to run the method itself.
 ///
-/// * `merge_key` — `if self.current_merge_points:` (pyjitpl.py:2839). A loop's
-///   outermost green key; `None` while tracing a bridge, which has no merge
-///   point to boost.
+/// The two arms upstream keeps apart:
+///
+/// * `find_biggest_function()` named an inlined callee — the trace is long
+///   because of THAT function, so it alone is disabled and the root is merely
+///   asked to retrace (pyjitpl.py:2822-2831).  The root is NOT force-finished
+///   and NOT marked dont-trace-here, and no bridge segmenting is enabled: the
+///   next attempt is expected to fit once the callee stops being inlined.
+/// * no callee named — `prepare_trace_segmenting` (pyjitpl.py:2833-2858): the
+///   root itself is too big, so it gets all three warm-state marks and, for a
+///   bridge, the source token gets `FORCE_BRIDGE_SEGMENTING`.
+///
+/// Both arguments are read straight off the walk's `TraceCtx`:
+///
+/// * `merge_key` — `if self.current_merge_points:` (pyjitpl.py:2827, 2839). A
+///   loop's outermost green key; `None` while tracing a bridge, which has no
+///   merge point to boost.
 /// * `source_token` — `if not isinstance(self.resumekey, ResumeFromInterpDescr):`
 ///   (pyjitpl.py:2849). A bridge has no room in its `ResumeGuardDescr` for the
 ///   segmenting bit, so upstream sets it on the source `JitCellToken` instead,
@@ -3173,31 +3184,99 @@ pub(crate) fn note_root_trace_too_long(
     merge_key: Option<u64>,
     source_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
 ) {
-    if let Some(merge_key) = merge_key {
-        let (driver, _) = crate::driver::driver_pair();
-        let warm_state = driver.meta_interp_mut().warm_state_mut();
-        // pyjitpl.py:2843-2844.
-        warm_state.trace_next_iteration(merge_key);
-        warm_state.mark_force_finish_tracing(merge_key);
-        // pyjitpl.py:2846 `warmstate.dont_trace_here(greenkey)`, the third call
-        // of the same arm.  Without it the two above ask for the loop to be
-        // re-traced and force-finished while its callers may still inline it,
-        // so the next attempt can rebuild the very trace that overflowed.
-        warm_state.disable_noninlinable_function(merge_key);
-    }
-    if let Some(source_jct) = source_token.as_ref() {
-        // pyjitpl.py:2857 `loop_token.retraced_count |= FORCE_BRIDGE_SEGMENTING`.
-        let cur = source_jct.retraced_count.get();
-        source_jct
-            .retraced_count
-            .set(cur | majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING);
+    let (driver, _) = crate::driver::driver_pair();
+    let meta = driver.meta_interp_mut();
+    // pyjitpl.py:2821 `jd_sd, greenkey_of_huge_function = self.find_biggest_function()`.
+    let huge_fn = meta.find_biggest_function();
+    // pyjitpl.py:2823 `self.portal_trace_positions = None` — the log's `_pos`
+    // cursors index the recorder this abort is discarding.
+    meta.portal_trace_positions = None;
+    if let Some((jd_no, huge_key)) = huge_fn {
+        // pyjitpl.py:2825-2826.
+        meta.warm_state_mut().disable_noninlinable_function(huge_key);
+        // pyjitpl.py:2827-2828, read by `aborted_tracing`'s `on_trace_abort`.
+        meta.aborted_tracing_jitdriver = Some(jd_no);
+        meta.aborted_tracing_greenkey = Some(huge_key);
+        // pyjitpl.py:2829-2831 — the root is asked to retrace and nothing else.
+        if let Some(merge_key) = merge_key {
+            meta.warm_state_mut().trace_next_iteration(merge_key);
+        }
+    } else {
+        if let Some(merge_key) = merge_key {
+            let warm_state = meta.warm_state_mut();
+            // pyjitpl.py:2843-2844.
+            warm_state.trace_next_iteration(merge_key);
+            warm_state.mark_force_finish_tracing(merge_key);
+            // pyjitpl.py:2846 `warmstate.dont_trace_here(greenkey)`, the third
+            // call of the same arm.  Without it the two above ask for the loop
+            // to be re-traced and force-finished while its callers may still
+            // inline it, so the next attempt can rebuild the very trace that
+            // overflowed.
+            warm_state.disable_noninlinable_function(merge_key);
+        }
+        if let Some(source_jct) = source_token.as_ref() {
+            // pyjitpl.py:2857 `loop_token.retraced_count |= FORCE_BRIDGE_SEGMENTING`.
+            let cur = source_jct.retraced_count.get();
+            source_jct
+                .retraced_count
+                .set(cur | majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING);
+        }
     }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][trace-too-long] merge_key={merge_key:?} bridge_segmenting={}",
-            source_token.is_some()
+            "[jit][trace-too-long] merge_key={merge_key:?} huge_fn={huge_fn:?} \
+             bridge_segmenting={}",
+            source_token.is_some() && huge_fn.is_none()
         );
     }
+}
+
+/// pyjitpl.py:2443-2445 — open a `portal_trace_positions` entry for a callee
+/// the FBW walker is about to inline.
+///
+/// Upstream fills the log from `newframe`, reached through
+/// `_opimpl_recursive_call`'s greenkey-bearing `perform_call`.  The walker
+/// inlines a Python callee by walking its body directly and never builds an
+/// `MIFrame`, so that append never happens and `find_biggest_function` reads an
+/// empty log — it can then never name a huge inlined function, and every
+/// too-long abort takes the segmenting arm by default rather than by finding.
+/// This is the walker's counterpart of that append.
+///
+/// The trace position is read by the caller, which holds the `&mut TraceCtx`,
+/// and passed in — the driver is reached separately, exactly as
+/// [`note_root_trace_too_long`] does.
+///
+/// Returns whether an entry was appended; the caller must call
+/// [`note_inline_subwalk_end`] if and only if it did, or the start/end walk
+/// goes out of step.
+pub(crate) fn note_inline_subwalk_start(
+    green_key: u64,
+    pos: majit_metainterp::recorder::TracePosition,
+) -> Option<usize> {
+    let (driver, _) = crate::driver::try_driver_pair()?;
+    let meta = driver.meta_interp_mut();
+    // `is_main_jitcode(jitcode)` in its jitcode-free form: no recursive portal
+    // driver means upstream would not have logged this frame either.
+    let jd_no = meta.main_jitdriver_index()?;
+    meta.push_portal_trace_position(jd_no, Some(green_key), pos);
+    // Counted HERE, not where the entry is appended: an abort retires the log
+    // mid-sub-walk, so counting appends would read `push` far above `pop` for a
+    // reason that says nothing about the pairing.  Counting the decisions makes
+    // `ptp_push != ptp_pop` mean exactly one thing — a sub-walk exit that
+    // skipped its close.
+    majit_metainterp::mc_diag_bump(58);
+    Some(jd_no)
+}
+
+/// pyjitpl.py:2470-2472 — close the entry [`note_inline_subwalk_start`] opened.
+pub(crate) fn note_inline_subwalk_end(jd_no: usize, pos: majit_metainterp::recorder::TracePosition) {
+    majit_metainterp::mc_diag_bump(59);
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return;
+    };
+    driver
+        .meta_interp_mut()
+        .push_portal_trace_position(jd_no, None, pos);
 }
 
 /// Stage `reason` as the abort the walker is returning, so the single
