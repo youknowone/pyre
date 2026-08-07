@@ -473,9 +473,9 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
 /// helper's NULL result flows to the consumer — keep both states in sync.
 ///
 /// Both cells this writes — `BH_LAST_EXC_VALUE` and the backend `JIT_EXC_VALUE`
-/// (via `store_jit_exception`) — are GC-rooted by their respective extra-root
-/// walkers (`walk_bh_last_exception`, `walk_jit_exc_value`), so this writer
-/// needs no rooting of its own.
+/// (via `store_jit_exception`) — are GC-rooted by `walk_parked_exception_roots`
+/// and by the per-mutator `PyFrameRootArea`, so this writer needs no rooting of
+/// its own.
 fn publish_residual_call_exception(exc_obj: i64) {
     // Every residual raise enters the two exception channels here, so this is
     // the one place that can hold the line on what they may carry — and the

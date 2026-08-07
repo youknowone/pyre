@@ -3909,34 +3909,61 @@ fn walk_rbigint_parts_cache(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     });
 }
 
-/// Phase B: root walkers that reference interpreter state (immortal dicts,
-/// mapdict side table, etc.).  Called on first eval entry, after the
-/// interpreter is initialized.
-fn install_gc_root_walkers() {
-    pyre_interpreter::eval::register_pyframe_root_walker();
-    majit_gc::shadow_stack::register_extra_root_walker(walk_jit_exc_value);
-    majit_gc::shadow_stack::register_extra_root_walker(walk_bh_last_exc_value);
-    majit_gc::shadow_stack::register_extra_root_walker(walk_guard_exc_value);
-    majit_gc::shadow_stack::register_extra_root_walker(walk_rbigint_parts_cache);
+/// Every exception parked outside GC discipline, as one root source.
+///
+/// Each carrier below holds a `W_BaseException` in a cell the precise collector
+/// cannot reach — a backend static, a raw TLS `i64`, a `PyError` in flight, the
+/// active `PyreSym` — for the window between the store and whatever drains it.
+/// They share one registration rather than taking a registry slot apiece
+/// because they are one *kind* of root storage, which is the granularity
+/// `framework.py root_walker.walk_roots` registers at: a fixed set of sources,
+/// each enumerating its own population.
+fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    walk_jit_exc_value(visitor);
+    walk_bh_last_exc_value(visitor);
+    walk_guard_exc_value(visitor);
     // Children of the off-GC exception singletons, which no carrier and no
     // collection phase reaches on its own.
-    majit_gc::shadow_stack::register_extra_root_walker(walk_immortal_exception_singleton_roots);
+    walk_immortal_exception_singleton_roots(visitor);
     // Stored `PyError` carrier whose GC refs the precise collector cannot
     // reach through its raw TLS cell. Mirrors `walk_pending_call_error`.
-    majit_gc::shadow_stack::register_extra_root_walker(crate::call_jit::walk_last_ca_exception);
+    crate::call_jit::walk_last_ca_exception(visitor);
     // Exception parked for the next interpreter call boundary (JIT prologue
     // overflow, or a jd1 drain error handed back to the caller loop): live in
     // a raw TLS cell across the collecting code that runs before the drain.
-    majit_gc::shadow_stack::register_extra_root_walker(
-        pyre_interpreter::stack_check::walk_jit_pending_exception,
-    );
+    pyre_interpreter::stack_check::walk_jit_pending_exception(visitor);
     // Trace-time exception carriers held only in the active `PyreSym`
     // (`trace_built_exc` / `last_exc_value` / `current_exc_value`): a
     // trace-built exception is unreachable to the precise collector between its
     // construction and the RAISE_VARARGS lift-out.
-    majit_gc::shadow_stack::register_extra_root_walker(
-        pyre_jit_trace::trace::walk_active_sym_exc_roots,
-    );
+    pyre_jit_trace::trace::walk_active_sym_exc_roots(visitor);
+}
+
+/// The immortal, process-global stores whose GC-heap slots nothing else
+/// forwards, as one root source.
+///
+/// Every holder here is `malloc_typed` or a plain static, so the marker skips
+/// it and this walk is the only path to its contents. All four are
+/// process-global rather than per-mutator for the same reason: each outlives
+/// the thread that filled it. `w_globals` (`pycode.py:159-165
+/// frame_stores_global`) is first-store-wins, `_mapdict_caches[i].w_method`
+/// (mapdict.py:1418) is filled once, and a compiled `W_SRE_Pattern` outlives
+/// its compiling thread — as per-mutator areas their slots would lose their
+/// root at that thread's `unregister_mutator` while the holder stayed live.
+fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    walk_rbigint_parts_cache(visitor);
+    sre_pattern_root_walker(visitor);
+    w_globals_stamped_code_root_walker(visitor);
+    mapdict_method_cache_root_walker(visitor);
+}
+
+/// Phase B: root walkers that reference interpreter state (immortal dicts,
+/// mapdict side table, etc.).  Called on first eval entry, after the
+/// interpreter is initialized.
+fn install_gc_root_walkers() {
+    pyre_interpreter::eval::register_interpreter_global_root_walker();
+    majit_gc::shadow_stack::register_extra_root_walker(walk_parked_exception_roots);
+    majit_gc::shadow_stack::register_extra_root_walker(walk_immortal_store_roots);
     // The mapdict side tables are keyed by owner address and root their
     // values, so a major collection has to drop the entries whose owner it is
     // about to sweep.
@@ -3949,21 +3976,6 @@ fn install_gc_root_walkers() {
     // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
     // `JIT_DRIVER` rather than a global table, so it registers per mutator
     // instead — see `forced_virtuals_pruner_area`.
-
-    // GC-heap slots of the immortal, process-global `W_SRE_Pattern` store. The
-    // patterns are `malloc_typed`, so nothing traces into them; a compiled
-    // pattern outlives the thread that compiled it, so its owner is a global
-    // walker rather than a per-mutator area.
-    majit_gc::shadow_stack::register_extra_root_walker(sre_pattern_root_walker);
-
-    // Same ownership argument for the two immortal-code-object registries.
-    // `w_globals` (`pycode.py:159-165 frame_stores_global`) is first-store-wins
-    // and `_mapdict_caches[i].w_method` (mapdict.py:1418) is filled once, so
-    // both slots outlive whichever thread stamped them; as per-mutator areas
-    // they lost their root at that thread's `unregister_mutator` while the
-    // code object stayed live and callable.
-    majit_gc::shadow_stack::register_extra_root_walker(w_globals_stamped_code_root_walker);
-    majit_gc::shadow_stack::register_extra_root_walker(mapdict_method_cache_root_walker);
 }
 
 fn register_thread_root_areas() {

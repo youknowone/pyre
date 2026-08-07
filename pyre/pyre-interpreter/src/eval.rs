@@ -1164,18 +1164,29 @@ pub unsafe fn walk_pyframe_roots_area(
     }
 }
 
-/// Install the PyFrame GC root walker with the majit-gc collector.
+/// The interpreter's process-global off-GC slots, as one root source.
+///
+/// Frame roots are not here: `PyFrame.locals_cells_stack_w` and the
+/// thread-local exception carriers ride the per-mutator `PyFrameRootArea`
+/// (`walk_pyframe_root_area`), which reaches every registered thread rather
+/// than only the collecting one. What is left is genuinely process-global —
+/// app-level interphook handles, the `threading` module's own roots, and the
+/// faulthandler's — so it registers once for the process.
+fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    walk_global_prebuilt_roots(visitor);
+    crate::module::thread::walk_thread_roots(visitor);
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    crate::module::faulthandler::handler::walk_faulthandler_roots(visitor);
+}
+
+/// Install the interpreter's process-global GC root walker with the majit-gc
+/// collector.
 ///
 /// Called once at process startup from the JIT driver / pyrex main.
 /// Stored in a process-global fn-pointer cell (#396); calling again with
 /// the same fn pointer is idempotent.
-pub fn register_pyframe_root_walker() {
-    majit_gc::shadow_stack::register_extra_root_walker(walk_global_prebuilt_roots);
-    majit_gc::shadow_stack::register_extra_root_walker(crate::module::thread::walk_thread_roots);
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-    majit_gc::shadow_stack::register_extra_root_walker(
-        crate::module::faulthandler::handler::walk_faulthandler_roots,
-    );
+pub fn register_interpreter_global_root_walker() {
+    majit_gc::shadow_stack::register_extra_root_walker(walk_interpreter_global_roots);
 }
 
 thread_local! {
@@ -1230,21 +1241,6 @@ unsafe fn walk_in_flight_exception_area(
     // raw GC-managed children after forwarding the carrier itself.
     let exc = unsafe { *(slot as *const PyObjectRef) };
     unsafe { walk_raw_exception_roots(exc, visitor) };
-}
-
-/// Root the residual-call raise carried in the blackhole `BH_LAST_EXC_VALUE`
-/// cell. A residual `bh_call` that raised publishes the exception's raw pointer
-/// here (`publish_residual_call_exception`); between that write and the frame
-/// that catches it (`route_to_catch` / the eval-loop walker-skip path) the
-/// exception is held only in this raw `i64` cell, invisible to the precise
-/// collector — a safepoint major would sweep its oldgen traceback chain. Mark
-/// it (and its children) so the whole graph survives. Only `0` (no pending
-/// raise) is skipped; production never stores a non-pointer value here (the
-/// `0xDEAD` sentinel exists solely in a blackhole unit-test helper).
-fn walk_bh_last_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
-        unsafe { walk_raw_exception_cell_area(c as *const _, visitor) };
-    });
 }
 
 /// Forward one raw `i64` exception carrier cell and trace the exception's

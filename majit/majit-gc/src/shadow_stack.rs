@@ -1260,16 +1260,19 @@ pub fn extra_root_walk_kind() -> ExtraRootWalkKind {
     EXTRA_ROOT_WALK_KIND.with(|k| k.get())
 }
 
-// Walkers registered today: eval.rs registers twelve (rd_consts, partial
-// trace, active trace, compile snapshot, jitcode constants, fbw store
-// journal, fbw finish concrete, pyre interpreter side tables, signal
-// handlers, the _io autoflusher handle list, jit callee frames, and pyre
-// objects), plus gcreftracer.rs registers the per-loop gc_table walker —
-// thirteen total.
-// Leave headroom above that so a future root source does not overflow the
-// array and poison the registry lock with a "capacity exceeded" panic on
-// first use.
-const MAX_EXTRA_ROOT_WALKERS: usize = 16;
+// One registration per *kind* of root storage, as framework.py registers
+// GcRootMap sources: the interpreter's process-global off-GC slots
+// (`walk_interpreter_global_roots`), the exceptions parked outside GC
+// discipline (`walk_parked_exception_roots`), the immortal process-global
+// stores (`walk_immortal_store_roots`), and the per-loop gc_table walker
+// registered from gcreftracer.rs — four in a native build, three on wasm and
+// under `sandbox`, where the faulthandler source is compiled out.
+//
+// Anything that enumerates a population belongs inside one of those, not in a
+// slot of its own; the cap is what stops the array from drifting back into a
+// per-defect callback registry, so raising it is the wrong response to running
+// out of room.
+const MAX_EXTRA_ROOT_WALKERS: usize = 8;
 
 /// Registered root walkers. Each slot is either `None` or a function
 /// pointer. We cap the count to keep the set stack-allocatable and
