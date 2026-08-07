@@ -6966,6 +6966,10 @@ enum BuiltinLenSource {
     /// `W_ListObject.length()` → `strategy.length` (rlist.py). Carries the
     /// storage-strategy id the read is guarded on.
     ListStrategy(i64),
+    /// `EmptyListStrategy.length()` returns zero (`listobject.py:1131-1132`).
+    /// The strategy still needs a guard because a reused list may transition
+    /// to typed or object storage after tracing.
+    EmptyList,
     /// `W_UnicodeObject.len` → `bh_unicodelen`; no storage strategy.
     StrField,
     /// `tupleobject.py` carries no separate length field, so the length is
@@ -6988,8 +6992,8 @@ enum BuiltinLenSource {
 /// side-exits to the generic residual.
 ///
 /// Returns `None` (fall through to the generic residual, SAFE) for any
-/// other shape: non-list/str/tuple arg, a subclass, empty-strategy list, a
-/// bound receiver, or wrong arity.
+/// other shape: non-list/str/tuple arg, a subclass, a bound receiver, or wrong
+/// arity.
 pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -7032,20 +7036,23 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
             if !std::ptr::eq(w_class, exact) {
                 return Ok(None);
             }
-            let sid = if pyre_object::w_list_uses_int_storage(list_obj) {
-                1i64
+            let len_source = if pyre_object::w_list_uses_int_storage(list_obj) {
+                BuiltinLenSource::ListStrategy(
+                    pyre_object::listobject::ListStrategy::Integer as i64,
+                )
             } else if pyre_object::w_list_uses_float_storage(list_obj) {
-                2i64
+                BuiltinLenSource::ListStrategy(pyre_object::listobject::ListStrategy::Float as i64)
             } else if pyre_object::w_list_uses_object_storage(list_obj) {
-                0i64
+                BuiltinLenSource::ListStrategy(pyre_object::listobject::ListStrategy::Object as i64)
+            } else if pyre_object::w_list_uses_empty_storage(list_obj) {
+                BuiltinLenSource::EmptyList
             } else {
-                // Empty-strategy list: no length field to read.
                 return Ok(None);
             };
             (
                 &pyre_object::pyobject::LIST_TYPE as *const _ as i64,
                 Some(exact),
-                BuiltinLenSource::ListStrategy(sid),
+                len_source,
                 pyre_object::w_list_len(list_obj),
             )
         } else if std::ptr::eq(ob_type, &pyre_object::pyobject::STR_TYPE) {
@@ -7143,6 +7150,21 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
                 _ => crate::descr::list_float_items_len_descr(),
             };
             crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr)
+        }
+        BuiltinLenSource::EmptyList => {
+            let strategy = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::list_strategy_descr(),
+            );
+            let empty = ctx
+                .trace_ctx
+                .const_int(pyre_object::listobject::ListStrategy::Empty as i64);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardValue, &[strategy, empty], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            ctx.trace_ctx.heap_cache_mut().replace_box(strategy, empty);
+            ctx.trace_ctx.const_int(0)
         }
         BuiltinLenSource::TupleArrayLen => {
             let wrappeditems = crate::state::opimpl_getfield_gc_r(

@@ -2800,11 +2800,28 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             let operand = args[2] as pyre_object::PyObjectRef;
             !operand.is_null() && unsafe { pyre_object::is_str(operand) }
         };
+    // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
+    // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
+    // cannot mutate an object visible before the call.  Upstream records list
+    // construction directly as `opimpl_newlist` (`pyjitpl.py:779-789`) and
+    // allows residual calls at every `MIFrame` depth (`pyjitpl.py:1995-2080`);
+    // it has no nested-callee abort for these allocation helpers.  Keep this
+    // executor predicate aligned with `fbw_callee_body_replay_safety`, which
+    // already admits both helpers as replay-safe reads/fresh allocations.
+    //
+    // Disjoint from the three observed-value classes above: those name `CallFn`
+    // and `GetIter` over exact builtin scalars, this one names the two
+    // allocation helpers, and no helper kind is in both.
+    let replay_safe_fresh_allocation = matches!(
+        helper,
+        majit_ir::PyreHelperKind::NewtupleFromArray | majit_ir::PyreHelperKind::NewlistFromArray
+    );
     let provably_side_effect_free = reentrant_residual
         || helper == majit_ir::PyreHelperKind::ForIterNext
         || observed_exact_scalar_str
         || observed_exact_str_iter
-        || observed_exact_str_ord;
+        || observed_exact_str_ord
+        || replay_safe_fresh_allocation;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
         || matches!(
             helper,
