@@ -247,10 +247,7 @@ mod imp {
 
     /// The sub-key argument as a wide string; absent and `None` both mean the
     /// key itself, which the Win32 calls spell as the empty name.
-    fn sub_key_wide(
-        args: &[PyObjectRef],
-        idx: usize,
-    ) -> Result<WideCString, crate::PyError> {
+    fn sub_key_wide(args: &[PyObjectRef], idx: usize) -> Result<WideCString, crate::PyError> {
         Ok(WideCString::from_str_truncate(
             opt_str(args, idx)?.as_deref().unwrap_or(""),
         ))
