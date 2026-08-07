@@ -1543,7 +1543,16 @@ pub fn init_typeobjects() {
             .get()
             .map(|v| *v as PyObjectRef)
             .unwrap_or(PY_NULL);
-        for &w_typeobject_addr in reg.values() {
+        // `new_builtin_typeobject` stamps every type built once this loop has
+        // published `type`. The ones built before that read `PY_NULL` there
+        // and are filled here: the registry's own entries, plus
+        // `getset_descriptor`, whose factory the loop uses to build the other
+        // typedefs' descriptors and which therefore never enters `reg`.
+        for w_typeobject_addr in reg
+            .values()
+            .copied()
+            .chain(GETSET_DESCRIPTOR_TYPE.get().copied())
+        {
             let w_typeobj = w_typeobject_addr as PyObjectRef;
             unsafe {
                 if (*w_typeobj).w_class.is_null() {
@@ -2219,6 +2228,30 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
     }
 }
 
+/// Build a builtin type object with its metatype stamped.
+///
+/// `baseobjspace.py getclass()` — a type object's class is its metatype, so
+/// every builtin type object carries `w_class = type`. The `TYPEOBJECT_CACHE`
+/// sweep stamps the types it registers, but the lazily built ones never enter
+/// that registry: `getset_descriptor` (built inside the init loop as a
+/// descriptor factory for the other typedefs), every exception class,
+/// `posix.DirEntry`, and the `py_class_typed!` / `#[pyre_class]` natives.
+/// Stamping at the single construction point covers all of them.
+///
+/// The roots built before the `type` typeobject is published read `PY_NULL`
+/// here; the sweep still fills them. A type whose metatype is not `type`
+/// (`_ctypes`' metaclasses) overwrites the slot after construction.
+fn new_builtin_typeobject(
+    name: &str,
+    bases: PyObjectRef,
+    dict_ptr: *mut u8,
+    layout_pytype: *const PyType,
+) -> PyObjectRef {
+    let type_obj = w_type_new_builtin(name, bases, dict_ptr, layout_pytype);
+    unsafe { (*type_obj).w_class = w_type() };
+    type_obj
+}
+
 /// Create the root `object` type. MRO = [object].
 fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
@@ -2235,7 +2268,7 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
         unsafe { stamp_method_owners(ns, owner) };
     }
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    let type_obj = w_type_new_builtin(
+    let type_obj = new_builtin_typeobject(
         name,
         PY_NULL,
         ns as *mut u8,
@@ -2307,7 +2340,7 @@ fn new_typeobject_with_base_and_layout(
     }
     let bases = w_tuple_new(vec![base]);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    let type_obj = w_type_new_builtin(name, bases, ns as *mut u8, layout_pytype);
+    let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype);
 
     // typeobject.py:1273-1280 setup_builtin_type:
     //   parent_layout = w_bestbase.layout
@@ -2398,7 +2431,7 @@ pub fn make_builtin_type_with_bases(
     init(ns);
     let bases_tuple = w_tuple_new(bases.to_vec());
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    let type_obj = w_type_new_builtin(name, bases_tuple, ns as *mut u8, layout_pytype);
+    let type_obj = new_builtin_typeobject(name, bases_tuple, ns as *mut u8, layout_pytype);
 
     unsafe {
         let parent_layout = pyre_object::w_type_get_layout_ptr(base);
