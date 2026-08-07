@@ -16,7 +16,9 @@
 # function so the kept-stack guard resumes at depth 1 and the hot loop is the
 # whole trace (a multi-shape loop dilutes the guard and hides the miscompile).
 # Pure arithmetic -> deterministic checksum.
-N = 200000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 11325144
 
 
 def kept_and():

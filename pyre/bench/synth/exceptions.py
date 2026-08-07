@@ -1,5 +1,7 @@
 # pyre-check: max-pypy-ratio=118
-N = 250000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 41258646
 
 
 def may_fail(i):

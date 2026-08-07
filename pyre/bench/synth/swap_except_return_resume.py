@@ -8,7 +8,9 @@
 # Previously the codewriter emitted `abort_permanent` for SWAP, so the
 # resume walk failed ("call failed" / uncaught escape).  This bench pins
 # that the SWAP-bearing handler tail resumes byte-identically.
-N = 1000000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 28115472
 
 
 def raise_then_return(n):

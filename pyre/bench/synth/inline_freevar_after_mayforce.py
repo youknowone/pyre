@@ -1,4 +1,9 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=49
+# The ceiling is twice the slowest ratio observed once pypy's side became a
+# measurement. The previous 25 was fitted while pypy's execution was pinned to
+# the startup-subtraction floor, and a pinned denominator over-estimates the
+# work pypy actually did, so every ratio read against it was a lower bound --
+# this loop was always this far behind, the clamp just hid it.
 # An inlined closure keeps its freevar cells in MIFrame.registers_r across a
 # may-force call.  The `Fraction` arithmetic in `forward` is that may-force
 # call and invalidates heap-cache facts; the following LOAD_DEREF must recover
@@ -16,7 +21,9 @@
 from fractions import Fraction
 
 
-N = 10000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 32176
 
 
 def make_forwarder():

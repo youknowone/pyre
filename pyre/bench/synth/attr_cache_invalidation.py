@@ -1,5 +1,10 @@
-# pyre-check: max-pypy-ratio=28
-N = 100000
+# pyre-check: max-pypy-ratio=41
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+# The ceiling is twice the slowest ratio observed at this size. The previous 28
+# was fitted against a floored denominator, which over-estimates pypy's work
+# and so understated the ratio; the loop was always this far behind.
+N = 2043795
 
 
 class C:

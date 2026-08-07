@@ -1,5 +1,7 @@
 # pyre-check: max-pypy-ratio=80
-N = 200000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 870236
 
 
 class MyExit(SystemExit):

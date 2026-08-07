@@ -11,7 +11,9 @@
 #
 # Pure arithmetic only, so the checksum is deterministic across runtimes —
 # a parity regression target for the kept-stack branch-guard path.
-N = 200000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 11180211
 
 
 def main():

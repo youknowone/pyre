@@ -9,7 +9,9 @@
 # non-finite argument or a rebound `math.sqrt` falls through to the residual.
 import math
 
-N = 300000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 32645190
 
 
 def run():

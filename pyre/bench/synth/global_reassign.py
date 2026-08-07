@@ -12,7 +12,9 @@
 # version, so a stale const-fold would return the previous value.
 #
 # Correct output is verified against CPython/PyPy.
-N = 300000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 5886741
 
 
 def run_int():

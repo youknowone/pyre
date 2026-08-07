@@ -18,7 +18,9 @@
 # scope is unaffected (locals are never const-folded this way); the
 # module-global read path is the one under test.
 K = 5000
-N = 1000000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 10193192
 
 x = 1
 i = 0

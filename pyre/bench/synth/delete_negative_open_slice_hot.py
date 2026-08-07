@@ -2,7 +2,9 @@
 # Two-argument BUILD_SLICE must pass the Python None singleton as its implicit
 # step.  Negative bounds make a malformed null step observable during slice
 # normalization, including on guard-failure blackhole resume.
-N = 60000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 4351274
 
 
 def delete_neg3_open():
