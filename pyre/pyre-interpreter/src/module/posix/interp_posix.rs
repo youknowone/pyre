@@ -467,6 +467,63 @@ fn sched_priority_w(w_param: PyObjectRef) -> Result<i32, crate::PyError> {
         .map_err(|_| crate::PyError::overflow_error("sched_priority out of range"))
 }
 
+/// `rpy_cpu_count` — `rposix.py:2968-3006` splits the processor count three
+/// ways; these are its two Unix arms, `sysconf(_SC_NPROCESSORS_ONLN)` on linux
+/// and gnu and `sysctl(CTL_HW, HW_NCPU)` on the Apple and BSD targets. The
+/// third is Windows' and stays with the Windows registration. Anywhere else
+/// there is no answer and the count is 0, which `cpu_count` reports as None
+/// (`interp_posix.py:2910-2914` `if count <= 0`).
+///
+/// This is deliberately not the thread count. `get_number_of_os_threads` reads
+/// `/proc/self/stat`'s `num_threads` and the mach `task_threads` count, and
+/// serves `warn_if_multi_threaded` in the fork path; answering `cpu_count` with
+/// it reports how many threads happen to be alive, which moves under the
+/// caller's feet.
+#[cfg(not(feature = "sandbox"))]
+fn host_cpu_count() -> i64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let ncpu = {
+        let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        if n < 0 { 0 } else { n as i64 }
+    };
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    let ncpu = {
+        let mut ncpu: libc::c_int = 0;
+        let mut mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_NCPU];
+        let mut len = core::mem::size_of::<libc::c_int>();
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut ncpu as *mut libc::c_int).cast(),
+                &mut len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 { 0 } else { ncpu as i64 }
+    };
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    let ncpu = 0i64;
+    ncpu
+}
+
 /// `os.times_result` structseq — `(user, system, children_user,
 /// children_system, elapsed)`; repr renders "posix.times_result(...)", or
 /// "nt.times_result(...)" on the host whose module is spelled that way.  The
@@ -6766,35 +6823,40 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
-        // os.cpu_count() -> int | None
+        // os.cpu_count() -> int | None — `interp_posix.py:2910-2914`, which
+        // answers None for a count of 0 or less. Both names read the processor
+        // count through `host_cpu_count`; the syscalls it makes are the reason
+        // the pair is left to the sandbox stubs below.
+        #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
             "cpu_count",
             crate::make_builtin_function_with_arity(
                 "cpu_count",
                 |_| {
-                    let n = host_posix::get_number_of_os_threads();
+                    let n = host_cpu_count();
                     if n <= 0 {
                         Ok(pyre_object::w_none())
                     } else {
-                        Ok(pyre_object::w_int_new(n as i64))
+                        Ok(pyre_object::w_int_new(n))
                     }
                 },
                 0,
             ),
         );
         // _cpu_count alias — newer CPython exposes both.
+        #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
             "_cpu_count",
             crate::make_builtin_function_with_arity(
                 "_cpu_count",
                 |_| {
-                    let n = host_posix::get_number_of_os_threads();
+                    let n = host_cpu_count();
                     if n <= 0 {
                         Ok(pyre_object::w_none())
                     } else {
-                        Ok(pyre_object::w_int_new(n as i64))
+                        Ok(pyre_object::w_int_new(n))
                     }
                 },
                 0,
@@ -9081,6 +9143,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
 
         // os.cpu_count() -> int | None
+        //
+        // `rposix.py:2978-2986` reads `GetSystemInfo().dwNumberOfProcessors`
+        // here, which counts the processors in the caller's processor group;
+        // `available_parallelism` answers the process affinity mask instead, so
+        // the two part company on a host that has restricted one. Left as it is
+        // because no Windows oracle is reachable from this host to measure
+        // which the surface should report — see the follow-up task.
         crate::module_ns_store(
             ns,
             "cpu_count",
