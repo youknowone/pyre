@@ -3970,9 +3970,22 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// `obj` must be a valid object.
 unsafe fn range_index_bound(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let w = crate::baseobjspace::space_index(obj)?;
-    Ok(pyre_object::range_bigint_to_obj(
-        pyre_object::range_obj_to_bigint(w),
-    ))
+    // `is_int` is true for a bool, so bool has to be tested first or a `True`
+    // bound would be preserved as `True`. A plain int is already the wrapping
+    // this returns, so it passes straight through; everything else keeps the
+    // narrowing a machine-word-sized long depends on -- the stored width is
+    // what makes `iter()` pick `rangeiterator` over `longrange_iterator`.
+    if pyre_object::is_bool(w) {
+        Ok(w_int_new(pyre_object::w_bool_get_value(w) as i64))
+    } else if pyre_object::is_int(w) {
+        Ok(w)
+    } else if let Some(value) = pyre_object::range_obj_as_i64(w) {
+        Ok(w_int_new(value))
+    } else {
+        Ok(pyre_object::range_bigint_to_obj(
+            pyre_object::range_obj_to_bigint(w),
+        ))
+    }
 }
 
 /// `range(stop)` / `range(start, stop[, step])` — `functional.py
@@ -4011,7 +4024,11 @@ pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             if n == 3 {
                 w_step = range_index_bound(args[2])?;
                 pyre_object::gc_roots::pin_root(w_step);
-                if pyre_object::range_obj_to_bigint(w_step) == BigInt::from(0) {
+                let step_is_zero = match pyre_object::range_obj_as_i64(w_step) {
+                    Some(step) => step == 0,
+                    None => pyre_object::range_obj_to_bigint(w_step) == BigInt::from(0),
+                };
+                if step_is_zero {
                     return Err(crate::PyError::value_error(
                         "step argument must not be zero",
                     ));
