@@ -835,6 +835,73 @@ Kept as-is; listed for completeness.
   `PYRE_SHARED_BUILD`, `PYRE_SYNTH_PYPY`, `_PYRE`, `_PYTHON`.
 - **Test harness (1)**: `PYRE_MIR_STRESS_LLBC`.
 
+## §6 — The 66 gates the audits never listed (2026-08-07)
+
+The hand audits above enumerated what they were looking at. Measured against the
+tree instead, **66 of the 105 live gates had no entry anywhere in this file** —
+the table was 63% empty, because nothing failed when a new gate skipped it.
+`pyre/pyrex/tests/gate_triage_complete.rs` is now that failure: a `PYRE_*` read
+with no entry here fails `cargo test`. The counts to quote, distinguished:
+
+| count | value |
+|---|---|
+| distinct names read from the environment | **105** |
+| (file, name) read pairs | 127 |
+| **live gates that were absent from this file** | **66** |
+| names here with no read site left (retire) | 51 |
+
+```
+git ls-files '*.rs' | xargs rg --no-filename -o 'env::var[_a-z]*\("(PYRE_[A-Z0-9_]+)"' -r '$1' | sort -u
+```
+
+Polarity below follows this file's rule, with one correction it needed: an
+`is_none()` whose value *is* the enable flag means default **ON**, but an
+`if …is_none() { return; }` early-return guard means the thing is default
+**OFF**. Three diagnostics (`PYRE_DESCR_SPELLING_GATE`, `PYRE_GC_DIAG`,
+`PYRE_MC_DIAG`) read as ON under the unqualified rule and are OFF in fact.
+
+### §6a — Live default-ON (4): the removal targets
+
+| gate | what is ON by default | retire when |
+|---|---|---|
+| PYRE_JD1 | the jd1 compiled-loop experiment (`eval.rs jd1_experiment_enabled`); `PYRE_NO_JD1` or `PYRE_JD1=0` turns it off, and no-JIT implies off | the jd1 experiment concludes |
+| PYRE_JD1_NO_ENTER | entering the compiled jd1 loop directly rather than leaving the drain to the interpreter caller | with `PYRE_JD1` |
+| PYRE_WALKABORT_OFF | the non-carrier walk-abort leg (`trace.rs walk_abort_leg_enabled`) | kept deliberately: the leg commits irrevocably once the blackhole runs, so it is the one-binary A/B for the bug class it sits in |
+| PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
+
+### §6b — VALUE knobs (11): config, not gates
+
+`PYRE_DYN_INDIRECT`, `PYRE_FBW_MULTIFRAME_DEPTH`, `PYRE_JD1_THRESHOLD`,
+`PYRE_OPTION_RESIDUAL_NARROW`, `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
+`PYRE_TRACE_CALL_DIAG`, `PYRE_TRACE_OPS_DIAG`,
+`PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
+`PYRE_WASM_GUEST_PROFILE`, `PYRE_WASM_MODULE`.
+
+### §6c — Default-OFF diagnostics, censuses and probes (51): keep, cost nothing
+
+Each is inert unless set, so none is a removal target by this file's
+already-ON criterion. They are listed so they cannot be missed again.
+
+`PYRE_BH_NULL_ARG`, `PYRE_CALLEE_RCA`, `PYRE_DESCR_SPELLING_GATE`,
+`PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
+`PYRE_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_INLINE_DIAG`,
+`PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
+`PYRE_FBW_MF_DIAG`, `PYRE_FBW_STRICT_DIAG`, `PYRE_FIELD_IDENTITY_CENSUS`,
+`PYRE_GC_DIAG`, `PYRE_GC_FREELIST_DIAG`, `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
+`PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
+`PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,
+`PYRE_M73_LASTINSTR_AUDIT`, `PYRE_M73_MIDBODY_CARRY_AUDIT`,
+`PYRE_MAJIT_STATS_ANCESTOR`, `PYRE_MAJIT_STATS_ROOT_ONLY`, `PYRE_MC_DIAG`,
+`PYRE_MIR_FRAMESTATE_STRICT`, `PYRE_NO_JD1`, `PYRE_NO_UNROLL`,
+`PYRE_PCMAP_AFTERRESIDUAL_AUDIT`, `PYRE_PCMAP_CONTAINING_AUDIT`,
+`PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT`, `PYRE_PCMAP_RESIDUAL_CENSUS`,
+`PYRE_PORTAL_RCA`, `PYRE_PROBE_BH_STARTUP`, `PYRE_PROBE_SNAPSHOT`,
+`PYRE_PROBE_SUBSCR`, `PYRE_PROFILE_PIPELINE`, `PYRE_QMUT_MAPDICT_FORCE`,
+`PYRE_RERAISE_DIAG`, `PYRE_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
+`PYRE_WASM_DUMP_BAD_TRACE`, `PYRE_WASM_EXEC_TRACE`, `PYRE_WASM_FBW_CENSUS`,
+`PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_NO_CACHE`,
+`PYRE_WASM_STARTUP_TRACE`.
+
 ## Summary
 
 | bucket | count |
