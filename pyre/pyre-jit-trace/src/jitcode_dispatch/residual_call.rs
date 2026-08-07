@@ -5051,6 +5051,22 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `sys._getframe()` / `sys._getframe(0)` at the top walk level: publish the
+    // portal virtualizable directly, the shape upstream's
+    // `@jit.look_inside_iff(jit.isconstant(depth))` produces by tracing the
+    // constant-depth walk through.  Like the `locals()` arm this runs BEFORE
+    // `try_execute_residual_call_via_executor` arms the vable token protocol,
+    // which is the point: `getframe`'s two `force_frame` calls clear that token
+    // from inside the residual and cost the loop.  Any non-matching shape falls
+    // through to the generic residual (SAFE).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_sys_getframe(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // `math.sqrt(x)` / `float(x)` on an exact numeric argument: inline the
     // domain-guarded pure `CALL_F(sqrt_nonneg_jit)` (ll_math.rs) resp. the
     // `CastIntToFloat` / identity conversion instead of the opaque

@@ -7234,6 +7234,224 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `sys._getframe()` / `sys._getframe(0)` at the top walk level: publish the
+/// portal virtualizable itself instead of residualizing `vm.py:42-54 getframe`.
+///
+/// `getframe` is `@jit.look_inside_iff(lambda space, depth:
+/// jit.isconstant(depth))` (`pypy/module/sys/vm.py:41`), so a constant depth is
+/// traced THROUGH: `ec.gettopframe_nohidden()` is a vref read that
+/// `pyjitpl.py:2153-2172 _do_jit_force_virtual` answers with
+/// `virtualizable_boxes[-1]` under a `ptr_eq` + `implement_guard_value`, the
+/// `depth == 0` test folds away, and `mark_as_escaped` is one `setfield_gc`.
+/// No call and no virtualizable force anywhere — pypy3 reports `forcings: 0`
+/// and `abort: vable escape: 0` on the fixtures where pyre loses the loop.
+///
+/// Pyre residualizes the same walk as one opaque `bh_call_fn(_getframe,
+/// PY_NULL, depth)` `CallMayForce`, and [`pyre_interpreter::module::sys::vm::getframe`]'s
+/// two explicit `force_frame`s — the stand-in for the injection
+/// `rvirtualizable.py:49-53 hook_access_field` performs and pyre's rtyper
+/// cannot build — then clear `TOKEN_TRACING_RESCALL` inside that call, which
+/// `tracing_after_residual_call` reads as an escape
+/// (`VableEscapedDuringResidualCall`).  Removing the residual removes both
+/// forces with it, and nothing has to replace them: `last_instr` is published
+/// onto the portal frame at every may-force boundary (`LiveLastInstrGuard`),
+/// and every getset that reads a virtualizable field off the handed-out frame
+/// (`f_locals`, and `f_lasti` / `f_lineno` through their own `jit_getattr`
+/// residual) is itself such a boundary.
+///
+/// Emitted shape, following `getframe`'s body line by line:
+/// `guard_value(callable)`; `guard_class` + exact-class + `getfield_gc_i` on
+/// the depth box, whose resulting RAW int must be a trace constant — that
+/// unboxed value is what `jit.isconstant(depth)` tests upstream, where
+/// `@unwrap_spec(depth=int)` has already run OUTSIDE the looked-inside graph
+/// (the wrapped `W_IntObject` the residual receives is built in-trace by
+/// `NewWithVtable` + `SetfieldGc` and is never constant, so testing the box
+/// declines 100% of the time); `getfield_gc_r(frame, execution_context)` +
+/// `getfield_gc_r(ec, topframeref)` + `ptr_eq` + `guard_true`, the port of
+/// `_do_jit_force_virtual`'s identity check; and one non-forcing void `Call`
+/// for `mark_as_escaped`.  The result IS `standard_virtualizable_box()`,
+/// exactly as `_do_jit_force_virtual` returns `standard_box`.
+///
+/// The guard reads `topframeref` raw, without the vref force or the
+/// hidden-frame walk `gettopframe_nohidden` performs, so the gate below
+/// requires the record-time chain to need neither: `topframeref` must BE the
+/// portal pointer (not a `JitVirtualRef` naming it) and the nohidden walk must
+/// land on the same frame.  Any other chain declines, and at runtime a
+/// `topframeref` that stops matching side-exits.
+///
+/// Returns `None` (fall through to the generic residual, SAFE — exactly
+/// today's behaviour) for every other shape: a rebound `sys._getframe`, a
+/// bound receiver, a non-int / inexact / non-constant depth, any depth other
+/// than 0, an inline sub-walk, and a walk with no standard virtualizable.
+///
+/// ⛔ Depth 0 at the TOP walk level is the only level this may take. Inside an
+/// inline sub-walk depth 0 names the callee's virtual frame, whose
+/// `last_instr` is still the `-1` its constructor wrote and which nothing
+/// updates through the inlined body (`jitcode_dispatch/mod.rs` says so in the
+/// tree); depth > 0 names a frame the walk holds no OpRef for at all.  The
+/// sub-walk gate is what makes "depth 0 == the portal" true rather than
+/// assumed.
+pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // `sys._getframe()` (2) or `sys._getframe(depth)` (3).
+    if !(2..=3).contains(&r_args.len()) {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
+    // as arg0, not a plain `sys._getframe(...)` call.
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || !pyre_interpreter::module::sys::vm::is_builtin_getframe_function(concrete_callable)
+    {
+        return Ok(None);
+    }
+    // The depth has to be an exact plain int holding 0 before anything is
+    // emitted; the guards below pin both facts for the compiled loop.
+    let exact_int_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let depth_arg = if r_args.len() == 3 {
+        let ConcreteValue::Ref(depth_obj) = arg_concretes[2] else {
+            return Ok(None);
+        };
+        if depth_obj.is_null()
+            || unsafe {
+                !std::ptr::eq((*depth_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+                    || !std::ptr::eq((*depth_obj).w_class, exact_int_class)
+            }
+            || unsafe { pyre_object::w_int_get_value(depth_obj) } != 0
+        {
+            return Ok(None);
+        }
+        Some(r_args[2])
+    } else {
+        None
+    };
+    // `virtualizable_boxes` describe the PORTAL frame only.  An inline sub-walk
+    // publishes a different concrete frame, so depth 0 there names the callee —
+    // the level this arm must not take.
+    if ctx.fbw_mode.inline_subwalk || current_inline_concrete_frame() != 0 {
+        return Ok(None);
+    }
+    let (Some(vable_op), Some(vable_ptr)) = (
+        ctx.trace_ctx.standard_virtualizable_box(),
+        ctx.trace_ctx.standard_virtualizable_ptr(),
+    ) else {
+        return Ok(None);
+    };
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    if ec.is_null() {
+        return Ok(None);
+    }
+    // The emitted guard compares the RAW `topframeref` against the portal, so
+    // require the record-time chain to make that comparison equivalent to
+    // `getframe`'s own resolution: the slot holds the frame pointer itself
+    // (an inlined callee's `JitVirtualRef` would decline here, and so would a
+    // deeper portal), and the hidden-frame walk lands on that same frame.
+    if unsafe { (*ec).topframeref } as usize != vable_ptr {
+        return Ok(None);
+    }
+    let frame = unsafe { (*ec).gettopframe_nohidden() };
+    if frame.is_null() || frame as usize != vable_ptr {
+        return Ok(None);
+    }
+
+    // --- emit the specialized IR (walker-native) ---
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+
+    // `sys` is an ordinary mutable module, so nothing else keeps the name bound
+    // to this builtin across iterations.
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    // `@unwrap_spec(depth=int)` and then `jit.isconstant(depth)`: unbox first,
+    // and require the UNBOXED value to be the trace constant.  The unbox is
+    // only sound behind the class guards, so the constness decline rewinds
+    // rather than being hoisted above them.
+    if let Some(depth_op) = depth_arg {
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        walker_guard_class(ctx, op.pc, depth_op, int_type_addr)?;
+        walker_guard_exact_w_class(ctx, op.pc, depth_op, exact_int_class)?;
+        let raw = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            depth_op,
+            crate::descr::int_intval_descr(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Int(0));
+        if !raw.is_constant() {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+    }
+    // `ec = space.getexecutioncontext()` — recovered off the portal frame, the
+    // same route `walker_ec_enter` takes (`inline_call.rs`), since the outer
+    // frame's `execution_context` is always the true one.
+    let ec_op = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[vable_op],
+        crate::descr::pyframe_execution_context_descr(),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(ec_op, majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)));
+    // `f = ec.gettopframe_nohidden()` followed by `pyjitpl.py:2166-2168`'s
+    // `ptr_eq(vref_box, standard_box)` + `implement_guard_value`: the identity
+    // this arm resolved at record time, re-checked every compiled iteration.
+    let topframeref_op = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec_op],
+        crate::descr::ec_topframeref_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        topframeref_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(vable_ptr)),
+    );
+    let is_standard = ctx
+        .trace_ctx
+        .record_op(OpCode::PtrEq, &[topframeref_op, vable_op]);
+    ctx.trace_ctx
+        .set_opref_concrete(is_standard, majit_ir::Value::Int(1));
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[is_standard])?;
+    // `f.mark_as_escaped()` — vm.py:54.  `escaped` is not one of the six fields
+    // `interp_jit.py:25-30` declares, so the store cannot force; it is
+    // load-bearing at `executioncontext.py:99-106 leave`, which forces the
+    // leaving frame's own vref only for a frame that escaped.
+    ctx.trace_ctx.call_void_typed_with_effect(
+        pyre_interpreter::module::sys::vm::jit_frame_mark_as_escaped as *const (),
+        &[vable_op],
+        &[majit_ir::Type::Ref],
+        majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    // The walk IS the interpreter running, so the recorded store has to take
+    // effect here too — the residual would have applied it before returning.
+    unsafe { (*frame).mark_as_escaped() };
+
+    // `return f` — `_do_jit_force_virtual` hands back `standard_box` itself.
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', vable_op)?;
+    Ok(Some(()))
+}
+
 /// `math.sqrt(x)` on an exact int/float argument: inline the domain-guarded
 /// pure `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` → `sqrt_nonneg`,
 /// EF_ELIDABLE_CANNOT_RAISE) instead of the opaque

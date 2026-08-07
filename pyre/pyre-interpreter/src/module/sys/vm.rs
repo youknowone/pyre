@@ -588,21 +588,25 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// virtualizable fields the JIT may still be holding.
 ///
 /// The price is that each call trips `vable_after_residual_call` and aborts the
-/// trace: measured 2026-08-03, 138 of the synth corpus's 219 `loops_aborted`,
-/// against `abort: vable escape: 0` and `forcings: 0` on the same fixtures
-/// under real pypy3.
+/// trace, against `abort: vable escape: 0` and `forcings: 0` on the same
+/// fixtures under real pypy3.
 ///
-/// A constant-depth traced-through arm does NOT reclaim that. It reaches 15 of
-/// the 138; 70 sit at call sites inside an inlined callee, whose virtual frame
-/// carries `last_instr = -1` (`pyre-jit-trace/src/helpers.rs`) with nothing
-/// updating it through the body, so folding them would compile a
-/// `_getframe().f_lineno` that reports the `def` line where the abort today
-/// falls back to the interpreter and answers correctly. Part of this abort
-/// count is load-bearing. The lever that could take the 70 is instead the
-/// escalation from a *callee* frame escape to a *portal* virtualizable force in
-/// `pyre-jit/src/eval.rs`, which has no upstream counterpart —
-/// `executioncontext.py:91-107 leave` forces the leaving frame's own vref and
-/// only *marks* `f_back`.
+/// `try_walker_specialize_sys_getframe`
+/// (`pyre-jit-trace/src/jitcode_dispatch/specialize.rs`) reproduces upstream's
+/// traced-through form for the one level it can resolve — depth 0 at the top
+/// walk level, where the answer IS the portal virtualizable — so those call
+/// sites reach neither this function nor its forces. Over the `getframe_*`
+/// corpus that took `loops_aborted` 155 → 71 and `loops_compiled` 6 → 22.
+///
+/// Every other shape still arrives here, and both forces stay load-bearing for
+/// it. A call site inside an INLINED callee is the one the arm must keep
+/// declining: that frame carries `last_instr = -1`
+/// (`pyre-jit-trace/src/helpers.rs`) with nothing updating it through the body,
+/// so folding it would compile a `_getframe().f_lineno` reporting the `def`
+/// line where the residual's force answers correctly today. The `*_declined`
+/// fixtures under `pyre/bench/synth` hold each folded shape's escape at a
+/// depth the arm refuses, so the machinery behind these forces keeps its
+/// coverage.
 pub fn getframe(depth: i64) -> crate::PyResult {
     let ec = current_execution_context();
     let mut current = if ec.is_null() {
@@ -660,6 +664,26 @@ fn sys_getframe(args: &[PyObjectRef]) -> crate::PyResult {
         ));
     }
     getframe(depth)
+}
+
+/// `vm.py:54 f.mark_as_escaped()` as one non-forcing call, for the walker's
+/// constant-depth [`getframe`] arm.
+///
+/// Upstream's traced-through `getframe` emits it as `setfield_gc(p0, 1,
+/// inst_escaped)`; `escaped` is a plain field, not one of the six
+/// `interp_jit.py:25-30` declares, so writing it neither reads nor materialises
+/// the virtualizable.  The frame reaches this helper only to address the flag
+/// byte — nothing under it can call
+/// [`crate::executioncontext::force_frame`], which is what keeps the arm's
+/// whole point (no residual force) intact.
+///
+/// Emitted as a void `CallN`, matching the upstream `setfield_gc`'s lack of a
+/// result: the store is the whole point, so nothing may drop it as dead.
+pub extern "C" fn jit_frame_mark_as_escaped(frame: i64) {
+    let f = frame as *mut crate::PyFrame;
+    if !f.is_null() {
+        unsafe { (*f).mark_as_escaped() };
+    }
 }
 
 /// True iff `callable` is the canonical `sys._getframe` builtin.
