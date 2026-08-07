@@ -699,9 +699,13 @@ mod win_nt {
     /// DLL_DIRECTORY_COOKIE pointer is returned as an int instead. host_env has
     /// no AddDllDirectory wrapper, so call windows-sys directly.
     pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
         let (path, _, resolved) = arg_path(args, "_add_dll_directory")?;
-        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        // `encode_wide` re-emits the code units `arg_path` decoded the path
+        // into; going back through a `str` would have no spelling for a lone
+        // surrogate and would address a different directory.
+        let wide: Vec<u16> = path.encode_wide().chain(std::iter::once(0)).collect();
         let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
         if cookie.is_null() {
             return Err(io_err_with_filename(
