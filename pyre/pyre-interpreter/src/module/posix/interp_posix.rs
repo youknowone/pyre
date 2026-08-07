@@ -23,6 +23,27 @@ struct ApplevelForkCallbacks {
     child_w: Vec<usize>,
 }
 
+/// `posix.DirEntry` — native layout `[PyObject | w_name | w_path | w_stat |
+/// w_lstat | dir_fd]`, matching `interp_scandir.py W_DirEntry`: the name and
+/// full path plus the cached `stat` (`follow_symlinks=True`) and `lstat`
+/// (`follow_symlinks=False`) results.  `w_stat`/`w_lstat` are `PY_NULL` until
+/// first requested, so `entry.stat()` re-fetches once and then returns the
+/// same object, and `is_dir`/`is_file`/`inode` share the same on-demand stat.
+/// `dir_fd` is the descriptor a `scandir(fd)` handed the entry (`-1` for a
+/// name), which its own stat resolves the bare `name` against — the native
+/// counterpart of `self.scandir_iterator.orig_fd`.
+/// The layout carries no instance dict; `name`/`path` are read-only getset
+/// descriptors, so the type is not instantiable and not acceptable as a base.
+#[crate::pyre_class("posix.DirEntry")]
+#[derive(Default)]
+pub struct W_DirEntry {
+    pub w_name: PyObjectRef,
+    pub w_path: PyObjectRef,
+    pub w_stat: PyObjectRef,
+    pub w_lstat: PyObjectRef,
+    pub dir_fd: i32,
+}
+
 static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
     LazyLock::new(|| Mutex::new(ApplevelForkCallbacks::default()));
 // PyPy's GIL serializes concurrent fork entry.  Pyre is free-threaded, so the
@@ -3656,9 +3677,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     type PyObjectRef = pyre_object::PyObjectRef;
 
     fn dir_entry_path(self_obj: PyObjectRef) -> Result<(PyObjectRef, Vec<u8>), crate::PyError> {
-        let p = crate::baseobjspace::getattr_str(self_obj, "path")?;
-        let path = extract_path(p)?;
-        Ok((p, path))
+        let de = W_DirEntry::from_obj(self_obj)
+            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
+        let path = extract_path(de.w_path)?;
+        Ok((de.w_path, path))
+    }
+    fn dir_entry_get_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        // GetSetProperty get: `(descriptor, w_obj)` — the entry is `args[1]`.
+        let de = W_DirEntry::from_obj(args[1])
+            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
+        Ok(de.w_name)
+    }
+    fn dir_entry_get_path(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let de = W_DirEntry::from_obj(args[1])
+            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
+        Ok(de.w_path)
     }
     /// The descriptor the `scandir` that produced this entry was handed, or
     /// `-1` where it was given a name instead. An entry from a descriptor
@@ -3666,8 +3699,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// prefix empty — so its own stat calls have to resolve the name against
     /// that descriptor rather than against the process's working directory.
     fn dir_entry_dir_fd(self_obj: PyObjectRef) -> Result<i32, crate::PyError> {
-        let w = crate::baseobjspace::getattr_str(self_obj, "_dir_fd")?;
-        Ok(crate::baseobjspace::int_w(w)? as i32)
+        let de = W_DirEntry::from_obj(self_obj)
+            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
+        Ok(de.dir_fd)
     }
     /// `rposix_stat.fstatat(name, dirfd, follow)` — the call
     /// `interp_scandir.py:252-254,297-299` makes for exactly that reason. The
@@ -3807,14 +3841,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Ok(pyre_object::w_int_new(ino))
         }
     }
-    fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (w_path, path) = dir_entry_path(args[0])?;
-        let follow = dir_entry_follow(args)?;
+    /// Fetch a fresh `stat` (`follow=true`) / `lstat` (`follow=false`) result —
+    /// the uncached path shared by `dir_entry_stat`'s cache miss.  `dir_fd` is
+    /// the descriptor the entry's `scandir` was handed (or `-1`); a real one
+    /// resolves the entry's bare `name` through `fstatat`.
+    fn dir_entry_fetch_stat(
+        w_path: PyObjectRef,
+        path: &[u8],
+        follow: bool,
+        dir_fd: i32,
+    ) -> Result<PyObjectRef, crate::PyError> {
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            let dir_fd = dir_entry_dir_fd(args[0])?;
             if dir_fd != -1 {
-                let st = dir_entry_stat_at(&path, dir_fd, follow)
+                let st = dir_entry_stat_at(path, dir_fd, follow)
                     .map_err(|errno| errno_err_with_filename(errno, w_path))?;
                 #[cfg(target_os = "macos")]
                 let st_flags = st.st_flags;
@@ -3826,9 +3866,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 ));
             }
         }
+        #[cfg(not(all(unix, not(feature = "sandbox"))))]
+        let _ = dir_fd;
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
-            return match win_stat_fields(&path, follow) {
+            return match win_stat_fields(path, follow) {
                 Ok(fields) => Ok(stat_result_from_fields(&fields, 0)),
                 Err(e) => Err(fs_err_with_filename(e, w_path)),
             };
@@ -3836,14 +3878,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
         {
             let meta = if follow {
-                host_fs::metadata(path_from_bytes(&path).as_ref())
+                host_fs::metadata(path_from_bytes(path).as_ref())
             } else {
-                host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
+                host_fs::symlink_metadata(path_from_bytes(path).as_ref())
             };
             match meta {
                 Ok(m) => {
                     #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
-                    let st_flags = macos_path_st_flags(&path, follow);
+                    let st_flags = macos_path_st_flags(path, follow);
                     #[cfg(not(all(target_os = "macos", not(feature = "sandbox"))))]
                     let st_flags = 0u32;
                     Ok(make_stat_result(&m, st_flags))
@@ -3852,15 +3894,50 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
         }
     }
+    /// `interp_scandir.py get_stat` — `follow_symlinks=True` caches into
+    /// `w_stat`, `False` into `w_lstat`, so a repeated call returns the same
+    /// object.  Only a successful fetch is cached; an error re-raises on each
+    /// call.  The entry never moves (`allocate_stable`), so the raw receiver
+    /// stays valid across the fetch's allocation.
+    fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = args[0];
+        let follow = dir_entry_follow(args)?;
+        {
+            let de = W_DirEntry::from_obj(self_obj)
+                .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
+            let cached = if follow { de.w_stat } else { de.w_lstat };
+            if !cached.is_null() {
+                return Ok(cached);
+            }
+        }
+        let dir_fd = dir_entry_dir_fd(self_obj)?;
+        let (w_path, path) = dir_entry_path(self_obj)?;
+        let result = dir_entry_fetch_stat(w_path, &path, follow, dir_fd)?;
+        let de = W_DirEntry::from_obj(self_obj)
+            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
+        if follow {
+            de.w_stat = result;
+        } else {
+            de.w_lstat = result;
+        }
+        // `result` may be a nursery object stored into the stable entry; join
+        // the remembered set so the next minor collection forwards it.
+        unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as *mut u8) };
+        Ok(result)
+    }
     fn dir_entry_fspath(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        crate::baseobjspace::getattr_str(args[0], "path")
+        let de = W_DirEntry::from_obj(args[0])
+            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
+        Ok(de.w_path)
     }
     /// `posixmodule.c DirEntry_repr` — `"<DirEntry %R>"`, so the name is
     /// rendered by its own `repr`.  That keeps `os.scandir(b'.')`'s bytes
     /// name spelled `b'…'` and lets a name whose bytes have no UTF-8 form
     /// keep the lone surrogate `fs_name_obj` decoded it to.
     fn dir_entry_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let name = crate::baseobjspace::getattr_str(args[0], "name")?;
+        let name = W_DirEntry::from_obj(args[0])
+            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?
+            .w_name;
         let mut out = rustpython_wtf8::Wtf8Buf::new();
         out.push_str("<DirEntry ");
         out.push_wtf8(&unsafe { crate::py_repr_wtf8(name)? });
@@ -3890,48 +3967,77 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // builtin name into a `__module__` entry, so `type(e).__module__`
             // reports `posix` and every type-name-bearing error message is
             // spelled the way the typedef spells it.
-            let tp = crate::typedef::make_builtin_type("posix.DirEntry", |ns| {
-                for (name, f) in [
-                    ("is_dir", dir_entry_is_dir as crate::gateway::BuiltinCodeFn),
-                    ("is_file", dir_entry_is_file),
-                    ("is_symlink", dir_entry_is_symlink),
-                    ("is_junction", dir_entry_is_junction),
-                    ("inode", dir_entry_inode),
-                    ("stat", dir_entry_stat),
-                    ("__fspath__", dir_entry_fspath),
-                    ("__repr__", dir_entry_repr),
-                    ("__reduce_ex__", dir_entry_reduce_ex),
-                ] {
+            // The native `W_DirEntry` layout backs the type; `name`/`path` are
+            // read-only getset descriptors over the inline fields, so instances
+            // carry no `__dict__` (matching a `W_DirEntry` typedef with no
+            // `makedict`).
+            let tp = crate::typedef::make_builtin_type_with_layout(
+                "posix.DirEntry",
+                |ns| {
+                    for (name, getter) in [
+                        ("name", dir_entry_get_name as crate::gateway::BuiltinCodeFn),
+                        ("path", dir_entry_get_path),
+                    ] {
+                        unsafe {
+                            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                                ns,
+                                name,
+                                crate::typedef::make_getset_descriptor_named(
+                                    crate::gateway::make_builtin_function_with_arity(
+                                        name, getter, 2,
+                                    ),
+                                    name,
+                                ),
+                            )
+                        };
+                    }
+                    for (name, f) in [
+                        ("is_dir", dir_entry_is_dir as crate::gateway::BuiltinCodeFn),
+                        ("is_file", dir_entry_is_file),
+                        ("is_symlink", dir_entry_is_symlink),
+                        ("is_junction", dir_entry_is_junction),
+                        ("inode", dir_entry_inode),
+                        ("stat", dir_entry_stat),
+                        ("__fspath__", dir_entry_fspath),
+                        ("__repr__", dir_entry_repr),
+                        ("__reduce_ex__", dir_entry_reduce_ex),
+                    ] {
+                        unsafe {
+                            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                                ns,
+                                name,
+                                crate::make_builtin_function(name, f),
+                            )
+                        };
+                    }
+                    // CPython 3.14 Modules/posixmodule.c DirEntry_methods —
+                    // Py_GenericAlias with METH_CLASS.
                     unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        pyre_object::w_dict_setitem_str(
                             ns,
-                            name,
-                            crate::make_builtin_function(name, f),
+                            "__class_getitem__",
+                            pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+                                "__class_getitem__",
+                                crate::_pypy_generic_alias::generic_alias_class_getitem,
+                            )),
                         )
                     };
-                }
-                // CPython 3.14 Modules/posixmodule.c DirEntry_methods —
-                // Py_GenericAlias with METH_CLASS.
-                unsafe {
-                    pyre_object::w_dict_setitem_str(
-                        ns,
-                        "__class_getitem__",
-                        pyre_object::function::w_classmethod_new(crate::make_builtin_function(
-                            "__class_getitem__",
-                            crate::_pypy_generic_alias::generic_alias_class_getitem,
-                        )),
-                    )
-                };
-            });
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+                },
+                crate::typedef::w_object(),
+                <W_DirEntry as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+            );
+            pyre_object::pyobject::set_instantiate(
+                unsafe { &*<W_DirEntry as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
+                tp,
+            );
             // `interp_scandir.py:468-487` declares no `__new__` on the typedef
             // and `:487` sets `acceptable_as_base_class = False`; `typedef.py:55
             // acceptable_as_base_class = '__new__' in rawdict` is the rule, and
             // `typedef.py:754 assert not PyFrame.typedef.acceptable_as_base_class
             // # no __new__` is the same shape typedef.rs:534-539 already ports.
-            // `scandir_fn` below allocates entries with
-            // `pyre_object::w_instance_new`, which never enters `type.__call__`,
-            // so the producer is untouched by the instantiation gate.
+            // `scandir_fn` below allocates entries with `W_DirEntry::
+            // allocate_stable`, which never enters `type.__call__`, so the
+            // producer is untouched by the instantiation gate.
             unsafe {
                 pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
                 pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
@@ -4000,6 +4106,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }) as PyObjectRef
     }
 
+    /// Allocate one `W_DirEntry` and append it to `list` (pinned at `list_slot`
+    /// on the shadow stack).  Each string is pinned before the next allocation
+    /// so a moving collection during `allocate_stable` forwards it; the entry
+    /// is stable but its young strings join the remembered set.  `dir_fd` is the
+    /// descriptor the entry resolves its own `name` against, or `-1`.
+    fn scandir_push_entry(
+        list_slot: usize,
+        bytes_mode: bool,
+        name: &[u8],
+        full: &[u8],
+        dir_fd: i32,
+    ) {
+        let _entry_scope = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, name));
+        pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, full));
+        pyre_object::gc_roots::pin_root(W_DirEntry::allocate_stable(W_DirEntry::default()));
+        let obj = pyre_object::gc_roots::shadow_stack_get(base + 2);
+        let de = W_DirEntry::from_obj(obj).expect("freshly allocated posix.DirEntry");
+        de.w_name = pyre_object::gc_roots::shadow_stack_get(base);
+        de.w_path = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        de.dir_fd = dir_fd;
+        unsafe { pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8) };
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        unsafe { pyre_object::w_list_append(list, obj) };
+    }
     fn scandir_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // One resolution yields both the path and its bytes-ness, so
         // `__fspath__` runs exactly once. The omitted argument is the same
@@ -4010,64 +4142,64 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let bytes_mode = unsafe { resolved.is_bytes() };
         let path = resolved.as_bytes.as_slice();
         let w_path = || resolved.w_path();
+        // Initialise the DirEntry type (`set_instantiate`) before allocating
+        // any entry of it.
+        let _ = dir_entry_type();
         let list = pyre_object::w_list_new(Vec::new());
-        // Every entry records the descriptor it must resolve its own name
-        // against, which is `-1` for the entries a name produced.
-        let mut entry_dir_fd = -1i32;
+        // The entries are `allocate_stable` (non-nursery) objects, but a stable
+        // allocation can still drive a moving collection over a large listing,
+        // so `list` and each per-entry temporary live on the shadow stack.
+        let _list_scope = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(list);
+        let list_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        // A `scandir(fd)` lists through the descriptor and every entry records
+        // it (`-1` for the entries a name produced), so its own stat resolves
+        // the bare name against that descriptor.
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         let from_fd = Some(resolved.as_fd).filter(|&fd| fd != -1);
         #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
         let from_fd: Option<i32> = None;
-        if let Some(fd) = from_fd {
-            entry_dir_fd = fd;
+        match from_fd {
             #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-            for name in
-                fdlistdir(fd).map_err(|errno| errno_err_with_filename(errno, w_path()))?
-            {
+            Some(fd) => {
                 // `interp_scandir.py:50` leaves the path prefix empty for a
-                // descriptor — there is no directory name to join — so an
-                // entry's `path` is its bare name, and a descriptor is not
-                // `bytes`, so both come back as `str`.
-                let w_name = fs_name_obj(false, &name);
-                let de = pyre_object::w_instance_new(dir_entry_type());
-                let _ = crate::baseobjspace::setattr_str(de, "name", w_name);
-                let _ = crate::baseobjspace::setattr_str(de, "path", w_name);
-                let _ = crate::baseobjspace::setattr_str(
-                    de,
-                    "_dir_fd",
-                    pyre_object::w_int_new(i64::from(fd)),
-                );
-                unsafe { pyre_object::w_list_append(list, de) };
+                // descriptor — there is no directory to join — so an entry's
+                // `path` is its bare `name`, and a descriptor is not `bytes`,
+                // so both come back as `str`.
+                for name in
+                    fdlistdir(fd).map_err(|errno| errno_err_with_filename(errno, w_path()))?
+                {
+                    scandir_push_entry(list_slot, false, &name, &name, fd);
+                }
             }
-        } else {
-            let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
-                .map_err(|e| fs_err_with_filename(e, w_path()))?;
-            for entry in entries {
-                let entry = entry.map_err(|e| fs_err_with_filename(e, w_path()))?;
-                let name = entry.file_name();
-                let full = entry.path().into_os_string();
-                let de = pyre_object::w_instance_new(dir_entry_type());
-                let _ = crate::baseobjspace::setattr_str(
-                    de,
-                    "name",
-                    fs_name_obj(bytes_mode, name.as_encoded_bytes()),
-                );
-                let _ = crate::baseobjspace::setattr_str(
-                    de,
-                    "path",
-                    fs_name_obj(bytes_mode, full.as_encoded_bytes()),
-                );
-                let _ = crate::baseobjspace::setattr_str(
-                    de,
-                    "_dir_fd",
-                    pyre_object::w_int_new(i64::from(entry_dir_fd)),
-                );
-                unsafe { pyre_object::w_list_append(list, de) };
+            _ => {
+                let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
+                    .map_err(|e| fs_err_with_filename(e, w_path()))?;
+                for entry in entries {
+                    let entry = entry.map_err(|e| fs_err_with_filename(e, w_path()))?;
+                    let name = entry.file_name();
+                    let full = entry.path().into_os_string();
+                    scandir_push_entry(
+                        list_slot,
+                        bytes_mode,
+                        name.as_encoded_bytes(),
+                        full.as_encoded_bytes(),
+                        -1,
+                    );
+                }
             }
         }
-        let it = pyre_object::w_instance_new(scandir_iter_type());
+        // Pin the iterator so the `_entries`/`_index` setattr allocations cannot
+        // strand it, re-reading `it`/`list` from their slots after each.
+        pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(scandir_iter_type()));
+        let it_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         let _ = crate::baseobjspace::setattr_str(it, "_entries", list);
+        let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
         let _ = crate::baseobjspace::setattr_str(it, "_index", pyre_object::w_int_new(0));
+        let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
+        drop(_list_scope);
         Ok(it)
     }
     crate::module_ns_store(

@@ -3488,6 +3488,20 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_StringIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `posix.DirEntry`: four inline GC edges (`w_name`/`w_path` and the cached
+    // `w_stat`/`w_lstat`, the latter two NULL until first requested).  Appended
+    // after the last vtable-bearing object (`W_StringIO`) so no established GC
+    // id moves; only the trailing bare-`with_gc_ptrs` ids (twister, leaf
+    // storage boxes) shift, and those carry no census alias.  `posix` is
+    // compiled out on wasm32, so this registration and its census aliases are
+    // gated to match.
+    #[cfg(not(target_arch = "wasm32"))]
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::posix::W_DirEntry
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // `rrandom.Random` — the Mersenne Twister `interp_random.py:21` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an
     // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a

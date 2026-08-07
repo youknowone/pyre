@@ -5,3 +5,5 @@
 //! exercises.  The shared `stat_result` builtin type lives here too.
 
 crate::pyre_module_init!(interp_posix);
+
+pub use interp_posix::W_DirEntry;
