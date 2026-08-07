@@ -1011,11 +1011,18 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
         both in one pass, and the source digest already answers the question a
         timestamp only approximates.
 
-    Nothing here re-extracts. Re-extraction is a whole-crate Charon build —
-    multi-GB RSS — that writes into the working tree, so it stays a human's
-    scheduling decision and the refusal names the command instead. `LLBC_DEST`
-    points the check at a directory other than the driver's default, which is
-    what a caller who must not disturb the live artefacts uses.
+    Nothing here re-extracts. Re-extraction runs a whole-crate Charon build and
+    writes into the working tree, so it stays a human's scheduling decision and
+    the refusal names the command instead. No cost figure is quoted anywhere in
+    this function: what it costs depends on how warm the cargo cache is, and a
+    number carried over from one cold run reads as measured when it is not.
+    `LLBC_DEST` points the check at a directory other than the driver's default,
+    which is what a caller who must not disturb the live artefacts uses.
+
+    Exit 0 has to be EARNED, never fallen into. `verified` records the crates
+    that positively matched, and the epilogue refuses unless every requested
+    crate is in it — so an empty crate list, or any future branch that forgets
+    to file a failure, refuses instead of reporting success by default.
     """
     platform_key, charon_dest, _ = charon_paths(eng.charon_root)
     charon_stamp = charon_version(charon_dest)
@@ -1023,6 +1030,7 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
     crates = args.crates or eng.default_crates
 
     stale: list[str] = []
+    verified: set[str] = set()
     # Feature set to re-extract each crate under: the one its stamp records, so
     # a mixed set does not collapse into one wrong remedy command. A crate whose
     # stamp never got read keeps this process's feature set.
@@ -1102,6 +1110,7 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
         )
         if text == expected + "\n":
             print(f"    fingerprint matches the tree (source={recorded['source']})")
+            verified.add(crate)
             continue
 
         want = parse_stamp(expected)
@@ -1122,6 +1131,15 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
                 f"tree says {want.get(key)!r}"
             )
 
+    # Exit 0 requires a positive match for every requested crate, and at least
+    # one crate to have been requested. Both halves matter: an empty list has no
+    # unaccounted crates, so testing only for those would let "checked nothing"
+    # through as success — the exact shape this whole function exists to refuse.
+    unaccounted = [crate for crate in crates if crate not in verified]
+    if not stale and (not crates or unaccounted):
+        stale.append(
+            "checked nothing for: " + (" ".join(unaccounted) or "(no crates requested)")
+        )
     if not stale:
         print()
         print(f"llbc artefacts current: {' '.join(crates)}")
@@ -1139,9 +1157,9 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
         print(f"  {line}", file=sys.stderr)
     print(
         "\n"
-        "  Re-extract before reading. This is a whole-crate Charon build —\n"
-        "  multi-GB RSS, and it writes into the working tree — so nothing\n"
-        "  here runs it for you. Schedule it:",
+        "  Re-extract before reading. This runs a whole-crate Charon build and\n"
+        "  writes into the working tree, so nothing here runs it for you —\n"
+        "  how long it takes depends on how warm the cargo cache is:",
         file=sys.stderr,
     )
     for features in dict.fromkeys(stamped_features.values()):
