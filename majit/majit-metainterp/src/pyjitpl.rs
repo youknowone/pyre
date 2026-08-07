@@ -5204,18 +5204,22 @@ impl<M: Clone> MetaInterp<M> {
         let outermost_merge_key = ctx.current_merge_points_first_greenkey();
         // pyjitpl.py:2793: find_biggest_function — if an inlined function
         // caused the bloat, disable just that function.
-        let huge_fn_key = self.find_biggest_function();
+        let huge_fn = self.find_biggest_function();
         // pyjitpl.py:2795: `self.portal_trace_positions = None` marks the
         // abort boundary so post-abort consumers (e.g. test inspections
         // at pyjitpl.py:3547) can detect a terminated trace session.
         self.portal_trace_positions = None;
-        if let Some(huge_fn_key) = huge_fn_key {
+        if let Some((huge_fn_jd_no, huge_fn_key)) = huge_fn {
+            // pyjitpl.py:2822 disables through `jd_sd.warmstate`, the warmstate
+            // of the driver that owns the oversized frame.  Pyre keeps one
+            // `WarmEnterState` on the MetaInterp rather than one per
+            // `JitDriverStaticData`, so the disable lands on that single state;
+            // the owning index is still carried through below.
             self.warm_state.disable_noninlinable_function(huge_fn_key);
             // pyjitpl.py:2799-2800: stash the aborted jd_sd + greenkey so
             // `aborted_tracing(reason)` can fire `on_trace_too_long` when
-            // the hook is ported.  Pyre only registers a single jitdriver
-            // so jd_sd.index is always 0.
-            self.aborted_tracing_jitdriver = Some(0);
+            // the hook is ported.
+            self.aborted_tracing_jitdriver = Some(huge_fn_jd_no);
             self.aborted_tracing_greenkey = Some(huge_fn_key);
             // pyjitpl.py:2801-2804: only boost retrace for the outermost
             // loop (when `current_merge_points` is non-empty).  Bridge
@@ -14208,30 +14212,33 @@ impl<M: Clone> MetaInterp<M> {
     /// `size` is the distance between two `TracePosition::_pos` cursors, the
     /// `pos[0]` upstream subtracts (opencoder.py:475).
     ///
-    /// Returns the green key of the largest frame, or `None` when the log
+    /// Returns the owning jitdriver's index and the green key of the largest
+    /// frame — `max_jdsd, max_key` upstream, which the caller needs both of
+    /// (`pyjitpl.py:2821-2824` disables through the frame's OWN driver and
+    /// stashes that driver in `aborted_tracing_jitdriver`). `None` when the log
     /// holds no closed or open portal frame — the root frame is created by
     /// `initialize_state_from_start` without a greenkey and never enters the
     /// log, so a trace that inlined nothing answers `None` and the caller
     /// falls through to `prepare_trace_segmenting`.
-    pub fn find_biggest_function(&self) -> Option<u64> {
+    pub fn find_biggest_function(&self) -> Option<(usize, u64)> {
         let positions = self.portal_trace_positions.as_ref()?;
-        let mut start_stack: Vec<(u64, usize)> = Vec::new();
+        let mut start_stack: Vec<(usize, u64, usize)> = Vec::new();
         let mut max_size = 0usize;
         let mut max_key = None;
-        for &(_jd_no, key, pos) in positions {
+        for &(jd_no, key, pos) in positions {
             match key {
                 // pyjitpl.py:3547-3548 `if key is not None: start_stack.append`.
-                Some(key) => start_stack.push((key, pos._pos)),
+                Some(key) => start_stack.push((jd_no, key, pos._pos)),
                 // pyjitpl.py:3549-3559 the closing entry sizes the frame it
                 // closes. An unmatched close cannot happen while `newframe` /
                 // `popframe` are the only writers, so it is left to `pop`'s
                 // `None` rather than given a recovery path.
                 None => {
-                    if let Some((green_key, start_pos)) = start_stack.pop() {
+                    if let Some((jd_no, green_key, start_pos)) = start_stack.pop() {
                         let size = pos._pos.saturating_sub(start_pos);
                         if size > max_size {
                             max_size = size;
-                            max_key = Some(green_key);
+                            max_key = Some((jd_no, green_key));
                         }
                     }
                 }
@@ -14243,12 +14250,12 @@ impl<M: Clone> MetaInterp<M> {
         // and a `?` on it would return `None` for the whole function and throw
         // away a `max_key` the closed frames above already produced.  Only the
         // open frame is unmeasurable without a recorder, so only it is skipped.
-        if let Some(&(green_key, start_pos)) = start_stack.first()
+        if let Some(&(jd_no, green_key, start_pos)) = start_stack.first()
             && let Some(tracing) = self.tracing.as_ref()
         {
             let current = tracing.get_trace_position()._pos;
             if current.saturating_sub(start_pos) > max_size {
-                max_key = Some(green_key);
+                max_key = Some((jd_no, green_key));
             }
         }
         max_key
@@ -20484,7 +20491,7 @@ mod metainterp_static_data_tests {
 
         assert_eq!(
             meta.find_biggest_function(),
-            Some(0xa11),
+            Some((0, 0xa11)),
             "the larger frame wins even though both have returned"
         );
     }
@@ -20504,7 +20511,7 @@ mod metainterp_static_data_tests {
         meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
         record_ops(&mut meta, 5);
 
-        assert_eq!(meta.find_biggest_function(), Some(0xb22));
+        assert_eq!(meta.find_biggest_function(), Some((0, 0xb22)));
     }
 
     #[test]
@@ -20527,7 +20534,7 @@ mod metainterp_static_data_tests {
 
         assert_eq!(
             meta.find_biggest_function(),
-            Some(0xa11),
+            Some((0, 0xa11)),
             "the closed frame's size survives a missing recorder"
         );
     }

@@ -700,26 +700,6 @@ fn sys_getframe(args: &[PyObjectRef]) -> crate::PyResult {
     getframe(depth)
 }
 
-/// `vm.py:54 f.mark_as_escaped()` as one non-forcing call, for the walker's
-/// constant-depth [`getframe`] arm.
-///
-/// Upstream's traced-through `getframe` emits it as `setfield_gc(p0, 1,
-/// inst_escaped)`; `escaped` is a plain field, not one of the six
-/// `interp_jit.py:25-30` declares, so writing it neither reads nor materialises
-/// the virtualizable.  The frame reaches this helper only to address the flag
-/// byte — nothing under it can call
-/// [`crate::executioncontext::force_frame`], which is what keeps the arm's
-/// whole point (no residual force) intact.
-///
-/// Emitted as a void `CallN`, matching the upstream `setfield_gc`'s lack of a
-/// result: the store is the whole point, so nothing may drop it as dead.
-pub extern "C" fn jit_frame_mark_as_escaped(frame: i64) {
-    let f = frame as *mut crate::PyFrame;
-    if !f.is_null() {
-        unsafe { (*f).mark_as_escaped() };
-    }
-}
-
 /// True iff `callable` is the canonical `sys._getframe` builtin.
 ///
 /// `sys` is an ordinary mutable module, so the JIT walker has to key on

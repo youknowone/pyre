@@ -7688,16 +7688,26 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // `f.mark_as_escaped()` — vm.py:54.  `escaped` is not one of the six fields
     // `interp_jit.py:25-30` declares, so the store cannot force; it is
     // load-bearing at `executioncontext.py:99-106 leave`, which forces the
-    // leaving frame's own vref only for a frame that escaped.
-    ctx.trace_ctx.call_void_typed_with_effect(
-        pyre_interpreter::module::sys::vm::jit_frame_mark_as_escaped as *const (),
-        &[vable_op],
-        &[majit_ir::Type::Ref],
-        majit_ir::EffectInfo::new(
-            majit_ir::ExtraEffect::CannotRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
+    // leaving frame's own vref only for a frame that escaped.  Upstream traces
+    // it as the ordinary `setfield_gc` on the flag, so it is emitted as the
+    // read/or/store the `tb_frame` fold above already uses — an opaque call
+    // would hide the update from the optimizer and its heap cache.
+    let flags_descr = crate::descr::pyframe_flags_descr();
+    let live_flags =
+        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, vable_op, flags_descr.clone());
+    let escaped_bit = ctx
+        .trace_ctx
+        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_ESCAPED));
+    let new_flags = ctx
+        .trace_ctx
+        .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[vable_op, new_flags],
+        flags_descr.clone(),
     );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(vable_op, flags_descr.index(), new_flags);
     // The walk IS the interpreter running, so the recorded store has to take
     // effect here too — the residual would have applied it before returning.
     unsafe { (*frame).mark_as_escaped() };
