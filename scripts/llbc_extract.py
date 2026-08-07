@@ -10,6 +10,7 @@ declared by the driver, so the engine stays neutral about which consumer
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -660,6 +661,44 @@ def stamp_for(
     )
 
 
+# Every field `stamp_for` writes, in order. A stamp that does not carry all of
+# them was not written by this engine — or was truncated mid-write — and the
+# comparison in `check` would then quietly skip whatever is absent.
+STAMP_KEYS = (
+    "crate",
+    "platform",
+    "charon",
+    "features",
+    "flags",
+    "charon_flags",
+    "layout_targets",
+    "layout_flags",
+    "layout_rustflags",
+    "source",
+)
+
+
+def parse_stamp(text: str) -> dict[str, str]:
+    """Split a stamp into its `key=value` fields.
+
+    Only used to replay `features=` and to render a readable per-field diff;
+    the verdict in `check` is an exact text comparison, so a line this drops
+    (blank, or without a `=`) still fails the check.
+    """
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key] = value
+    return fields
+
+
+def file_mtime(path: Path) -> str:
+    return datetime.datetime.fromtimestamp(path.stat().st_mtime).isoformat(
+        timespec="seconds"
+    )
+
+
 def crate_layout_targets(eng: Engine, spec: CrateSpec) -> list[str]:
     """Cross targets this crate emits a layout sidecar for.
 
@@ -941,6 +980,181 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     print(f"all extractions complete. artefacts under: {dest_dir}")
 
 
+def check(eng: Engine, args: argparse.Namespace) -> None:
+    """Refuse an artefact whose stamp does not match the tree it sits beside.
+
+    `extract` already computes this comparison — it is the `skipping <crate>
+    (fingerprint unchanged)` test — but only a caller who runs the extractor
+    ever benefits from it. A consumer that opens `<out_dir>/<crate>.ullbc` as
+    found gets whatever was last written there, and a stale artefact does not
+    fail: it answers, in detail, about sources that no longer exist. So this is
+    the same comparison, run by the consumer, reported through the exit status.
+    Nonzero means DO NOT READ the artefact.
+
+    Every way of reaching the end WITHOUT having compared the stamp against a
+    freshly computed one is a refusal, not a pass: an absent stamp, an empty
+    stamp, a stamp missing fields. Treating "nothing to compare" as "nothing
+    wrong" is what makes a gate decorative — a harness reads the exit status,
+    not the output.
+
+    Two things are deliberately not gated:
+
+      * `features=` is replayed out of the stamp rather than compared. The
+        stamp records the configuration the artefact was built under, and the
+        question here is whether the artefact is current FOR that
+        configuration; comparing it against this process's `CARGO_FEATURES`
+        would refuse a byte-correct artefact whenever the caller left the
+        default in place. Replaying keeps `flags=`, `charon_flags=`,
+        `layout_flags=` and `source=` real comparisons — all four are
+        recomputed from the replayed value.
+      * artefact and stamp mtimes are printed, never gated. `extract` writes
+        both in one pass, and the source digest already answers the question a
+        timestamp only approximates.
+
+    Nothing here re-extracts. Re-extraction is a whole-crate Charon build —
+    multi-GB RSS — that writes into the working tree, so it stays a human's
+    scheduling decision and the refusal names the command instead. `LLBC_DEST`
+    points the check at a directory other than the driver's default, which is
+    what a caller who must not disturb the live artefacts uses.
+    """
+    platform_key, charon_dest, _ = charon_paths(eng.charon_root)
+    charon_stamp = charon_version(charon_dest)
+    dest_dir = llbc_dest(eng.out_dir, eng.root)
+    crates = args.crates or eng.default_crates
+
+    stale: list[str] = []
+    # Feature set to re-extract each crate under: the one its stamp records, so
+    # a mixed set does not collapse into one wrong remedy command. A crate whose
+    # stamp never got read keeps this process's feature set.
+    stamped_features: dict[str, str] = {crate: eng.cargo_features for crate in crates}
+
+    for crate in crates:
+        spec = eng.spec(crate)
+        dest = dest_dir / spec.output_name
+        stamp_path = dest.with_suffix(dest.suffix + ".fingerprint")
+        print(f"=== checking {crate} -> {dest} ===")
+
+        if not dest.exists():
+            stale.append(f"{crate}: no artefact at {dest}")
+            continue
+        if dest.stat().st_size == 0:
+            stale.append(
+                f"{crate}: artefact {dest} is 0 bytes — Charon aborted before "
+                f"writing it"
+            )
+            continue
+        print(f"    artefact {dest.stat().st_size} bytes, mtime {file_mtime(dest)}")
+
+        for target in crate_layout_targets(eng, spec):
+            sidecar = dest_dir / spec.layout_sidecar_name(target)
+            if not sidecar.exists() or sidecar.stat().st_size == 0:
+                stale.append(
+                    f"{crate}: {target} layout sidecar {sidecar} is missing or "
+                    f"empty — field offsets for that target would be read out "
+                    f"of the extraction host's layouts"
+                )
+
+        if not stamp_path.exists():
+            stale.append(
+                f"{crate}: no fingerprint stamp at {stamp_path} — the artefact "
+                f"records nothing about the sources it came from, so there is "
+                f"nothing to compare it against"
+            )
+            continue
+        stamp_bytes = stamp_path.read_bytes()
+        if not stamp_bytes:
+            stale.append(
+                f"{crate}: fingerprint stamp {stamp_path} is 0 bytes — it "
+                f"records no source digest, so it cannot match the tree"
+            )
+            continue
+        text = stamp_bytes.decode("utf-8", errors="replace")
+        if not text.strip():
+            stale.append(
+                f"{crate}: fingerprint stamp {stamp_path} holds only whitespace"
+            )
+            continue
+        print(f"    stamp {len(stamp_bytes)} bytes, mtime {file_mtime(stamp_path)}")
+
+        recorded = parse_stamp(text)
+        missing = [key for key in STAMP_KEYS if key not in recorded]
+        if missing:
+            stale.append(
+                f"{crate}: fingerprint stamp {stamp_path} has no "
+                f"{', '.join(missing)} field — it was not written by this "
+                f"engine, or was truncated"
+            )
+            continue
+
+        features = recorded["features"]
+        stamped_features[crate] = features
+        flags = crate_flags(spec, features)
+        expected = stamp_for(
+            eng,
+            crate=crate,
+            platform_key=platform_key,
+            charon_stamp=charon_stamp,
+            cargo_features=features,
+            flags=flags,
+            charon_flags=charon_crate_flags(spec, features),
+            layout_targets=crate_layout_targets(eng, spec),
+            layout_flags=crate_layout_flags(spec, features, flags),
+        )
+        if text == expected + "\n":
+            print(f"    fingerprint matches the tree (source={recorded['source']})")
+            continue
+
+        want = parse_stamp(expected)
+        differing = [key for key in STAMP_KEYS if recorded[key] != want.get(key)]
+        if not differing:
+            # The text differs while every modelled field agrees, so the stamp
+            # carries content this engine does not write. Reporting nothing
+            # here would turn a mismatch into a silent pass.
+            stale.append(
+                f"{crate}: fingerprint stamp {stamp_path} does not match "
+                f"byte-for-byte although every field agrees — it carries "
+                f"content this engine did not write"
+            )
+            continue
+        for key in differing:
+            stale.append(
+                f"{crate}: {key}: artefact says {recorded[key]!r}, "
+                f"tree says {want.get(key)!r}"
+            )
+
+    if not stale:
+        print()
+        print(f"llbc artefacts current: {' '.join(crates)}")
+        return
+
+    driver = sys.argv[0] or "scripts/extract-llbc.py"
+    # The per-crate lines above went to stdout, which is block-buffered when
+    # this runs under a harness; flush so the verdict does not land before the
+    # evidence it was drawn from.
+    sys.stdout.flush()
+    print(file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print("LLBC STALE — do not read these artefacts", file=sys.stderr)
+    for line in stale:
+        print(f"  {line}", file=sys.stderr)
+    print(
+        "\n"
+        "  Re-extract before reading. This is a whole-crate Charon build —\n"
+        "  multi-GB RSS, and it writes into the working tree — so nothing\n"
+        "  here runs it for you. Schedule it:",
+        file=sys.stderr,
+    )
+    for features in dict.fromkeys(stamped_features.values()):
+        group = [c for c in crates if stamped_features[c] == features]
+        print(
+            f"      CARGO_FEATURES={features} python3 {driver} --force "
+            f"{' '.join(group)}",
+            file=sys.stderr,
+        )
+    print("=" * 72, file=sys.stderr)
+    raise SystemExit(1)
+
+
 def run_cli(
     specs: dict[str, CrateSpec],
     default_crates: list[str],
@@ -962,6 +1176,12 @@ def run_cli(
     parser.add_argument("crates", nargs="*", help=f"known: {all_crates}")
     parser.add_argument("--fingerprint", action="store_true")
     parser.add_argument("--list-inputs", action="store_true")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="compare the existing artefacts against the tree and exit nonzero "
+        "if any is stale; never extracts",
+    )
     parser.add_argument(
         "--force",
         action="store_true",
@@ -1002,5 +1222,8 @@ def run_cli(
         return
     if args.fingerprint:
         print(source_fingerprint(eng, crates, cargo_features))
+        return
+    if args.check:
+        check(eng, args)
         return
     extract(eng, args)
