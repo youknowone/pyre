@@ -2800,6 +2800,24 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             let operand = args[2] as pyre_object::PyObjectRef;
             !operand.is_null() && unsafe { pyre_object::is_str(operand) }
         };
+    // `tuple(exact_list)` arrives through the generic `CallFn` helper, not the
+    // BUILD_TUPLE or CALL_INTRINSIC_1 helpers.  `builtin_tuple`'s exact-list
+    // arm reads the strategy-aware length/items through `w_list_len` and
+    // `w_list_getitem`, then passes the copied items to `w_tuple_new`
+    // (`builtins.rs`).  It neither calls user code nor writes the list, and it
+    // always returns a fresh tuple.  The exact callable, no-receiver, one-arg,
+    // exact-list checks below are therefore the complete replay-safe surface;
+    // every other `CallFn` remains opaque and effectful.  It shares the `CallFn`
+    // helper with the `str` and `ord` arms above and is separated from them by
+    // the callable identity each one pins, so at most one can hold.
+    let replay_safe_tuple_from_list = helper == majit_ir::PyreHelperKind::CallFn
+        && args.len() == 3
+        && args[1] == 0
+        && args[0] as usize
+            == pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
+                as usize
+        && args[2] != 0
+        && unsafe { pyre_object::is_exact_list(args[2] as usize as pyre_object::PyObjectRef) };
     // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
     // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
     // cannot mutate an object visible before the call.  Upstream records list
@@ -2821,12 +2839,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         || observed_exact_scalar_str
         || observed_exact_str_iter
         || observed_exact_str_ord
-        || replay_safe_fresh_allocation;
+        || replay_safe_fresh_allocation
+        || replay_safe_tuple_from_list;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
+        || (helper == majit_ir::PyreHelperKind::CallFn && !replay_safe_tuple_from_list)
         || matches!(
             helper,
-            majit_ir::PyreHelperKind::CallFn
-                | majit_ir::PyreHelperKind::StoreSubscr
+            majit_ir::PyreHelperKind::StoreSubscr
                 | majit_ir::PyreHelperKind::SetCurrentException
                 | majit_ir::PyreHelperKind::StoreDeref
         );
