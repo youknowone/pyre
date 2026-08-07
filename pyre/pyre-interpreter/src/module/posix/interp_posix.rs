@@ -7044,15 +7044,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         //     wrapper (macos).
         //   * Returns bytes-sent as int (PyPy: space.newint(res)).
         //
-        // Both arms of `interp_posix.py:2958-2974` retry under
-        // `wrap_oserror(..., eintr_retry=True)` and this one does not, so an
-        // interrupted transfer surfaces as `InterruptedError` here where
-        // upstream runs the signal handlers and resumes. The reason recorded
-        // for the omission — that a retry would be the module's only one — no
-        // longer holds: `ftruncate`, `truncate`'s `open` and `lockf` all retry
-        // through `builtins::eintr_retry_with`. What the BSD arm should do with
-        // a partial `sbytes` on EINTR is the open question, so it is left to
-        // its own change.
+        // Both arms of `interp_posix.py:2958-2974` sit in a
+        // `while True: ... except OSError: wrap_oserror(..., eintr_retry=True)`,
+        // so an interrupted transfer runs the pending Python signal handlers and
+        // then goes back to the call. The three below do the same through
+        // `builtins::eintr_retry_with`.
+        //
+        // The BSD arm discards a partial `sbytes` on EINTR rather than reporting
+        // it: `rposix.py:3086-3095` rescues a partial transfer for `EAGAIN` and
+        // `EBUSY` alone, and EINTR falls through to `handle_posix_error`, which
+        // raises. The loop then re-runs the whole call with the same `offset` and
+        // `count` — both are loop-invariant in `interp_posix.py`, and `rposix`
+        // never sees the retry — so the transfer restarts from the range the
+        // caller asked for, not from where it had got to.
         #[cfg(all(
             any(target_os = "linux", target_os = "macos"),
             not(feature = "sandbox")
@@ -7091,14 +7095,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         // libc::sendfile directly with a null pointer, matching
                         // rposix.sendfile_no_offset (rposix.py:3066-3069).
                         let count = count_raw as libc::size_t;
-                        let (res, errno) =
-                            crate::module::thread::call_external_function(|| unsafe {
-                                libc::sendfile(out_fd, in_fd, core::ptr::null_mut(), count)
-                            });
-                        if res < 0 {
-                            return Err(io_err(std::io::Error::from_raw_os_error(errno), ""));
+                        loop {
+                            let (res, errno) =
+                                crate::module::thread::call_external_function(|| unsafe {
+                                    libc::sendfile(out_fd, in_fd, core::ptr::null_mut(), count)
+                                });
+                            if res >= 0 {
+                                return Ok(pyre_object::w_int_new(res as i64));
+                            }
+                            crate::builtins::eintr_retry_with(
+                                std::io::Error::from_raw_os_error(errno),
+                                |e| io_err(e, ""),
+                            )?;
                         }
-                        return Ok(pyre_object::w_int_new(res as i64));
                     }
                 }
                 // interp_posix.py:2968 `space.gateway_r_longlong_w(w_offset)`.
@@ -7108,42 +7117,61 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(target_os = "linux")]
                 {
                     let count = count_raw as usize;
-                    let mut offset: rustpython_host_env::crt_fd::Offset = offset_i64 as _;
-                    let n = {
-                        let _blocked = crate::module::thread::before_external_block();
-                        host_posix::sendfile(out_b, in_b, &mut offset, count)
+                    loop {
+                        // Seeded from the caller's value on every attempt.
+                        // `rposix.sendfile` (`rposix.py:3061-3065`) writes the
+                        // offset into a fresh cell each call from the argument it
+                        // was passed, and the retry sits above it holding that
+                        // argument unchanged, so what a failed call left behind
+                        // here is not what the next one starts from.
+                        let mut offset: rustpython_host_env::crt_fd::Offset = offset_i64 as _;
+                        let result = {
+                            let _blocked = crate::module::thread::before_external_block();
+                            host_posix::sendfile(out_b, in_b, &mut offset, count)
+                        };
+                        match result {
+                            Ok(n) => return Ok(pyre_object::w_int_new(n as i64)),
+                            Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                        }
                     }
-                    .map_err(|e| io_err(e, ""))?;
-                    return Ok(pyre_object::w_int_new(n as i64));
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    let (res, written) = {
-                        let _blocked = crate::module::thread::before_external_block();
-                        host_posix::sendfile(
-                            in_b,
-                            out_b,
-                            offset_i64 as rustpython_host_env::crt_fd::Offset,
-                            count_raw,
-                            None,
-                            None,
-                        )
-                    };
-                    // rposix.py:3086-3095: BSD sendfile reports a partial
-                    // transfer through sbytes even when the syscall result is
-                    // EAGAIN/EBUSY. Return that progress so asyncio advances
-                    // its file offset instead of resending the same range.
-                    if let Err(error) = res {
-                        if written == 0
-                            || !matches!(
-                                error.raw_os_error(),
-                                Some(libc::EAGAIN) | Some(libc::EBUSY)
+                    loop {
+                        let (res, written) = {
+                            let _blocked = crate::module::thread::before_external_block();
+                            host_posix::sendfile(
+                                in_b,
+                                out_b,
+                                offset_i64 as rustpython_host_env::crt_fd::Offset,
+                                count_raw,
+                                None,
+                                None,
                             )
-                        {
-                            return Err(io_err(error, ""));
+                        };
+                        match res {
+                            Ok(_) => return Ok(pyre_object::w_int_new(written)),
+                            Err(error) => {
+                                // rposix.py:3086-3095: BSD sendfile reports a
+                                // partial transfer through sbytes even when the
+                                // syscall result is EAGAIN/EBUSY. Return that
+                                // progress so asyncio advances its file offset
+                                // instead of resending the same range. EINTR is
+                                // not in that set, so a partial transfer a signal
+                                // interrupted goes to the retry below, which asks
+                                // for the caller's original range again.
+                                if written != 0
+                                    && matches!(
+                                        error.raw_os_error(),
+                                        Some(libc::EAGAIN) | Some(libc::EBUSY)
+                                    )
+                                {
+                                    return Ok(pyre_object::w_int_new(written));
+                                }
+                                crate::builtins::eintr_retry_with(error, |e| io_err(e, ""))?;
+                            }
                         }
                     }
-                    return Ok(pyre_object::w_int_new(written));
                 }
             }),
         );
