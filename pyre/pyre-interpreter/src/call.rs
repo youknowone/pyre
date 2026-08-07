@@ -2348,7 +2348,10 @@ pub(crate) fn bind_kwargs_to_signature(
     let varkw_slot = varargs_slot + usize::from(has_varargs);
     if has_varkw {
         roots.pin_root(pyre_object::w_dict_new_kwargs());
-        for (i, (key, _)) in extra_kwargs.iter().enumerate() {
+        // The index loop lowers to direct element loads; iterator adapters are residual calls.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..extra_kwargs.len() {
+            let key = &extra_kwargs[i].0;
             unsafe {
                 // The key allocation runs first: as the second argument it
                 // would be evaluated after the receiver, handing
@@ -2358,9 +2361,11 @@ pub(crate) fn bind_kwargs_to_signature(
             }
         }
     }
-    let mut result: Vec<PyObjectRef> = (0..result.len())
-        .map(|i| roots.get(result_slot + i))
-        .collect();
+    let result_len = result.len();
+    let mut result: Vec<PyObjectRef> = Vec::with_capacity(result_len);
+    for i in 0..result_len {
+        result.push(roots.get(result_slot + i));
+    }
     if has_varargs {
         result.push(roots.get(varargs_slot));
     }
