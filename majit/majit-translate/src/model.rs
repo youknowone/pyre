@@ -474,8 +474,50 @@ pub struct FieldDescriptor {
     /// is functionally determined by `owner_root` at the typed sites, and
     /// keeping it out of identity means a descriptor built with the token
     /// stays equal to / hashes with one built without it, so op dedup /
-    /// CSE over `FieldDescriptor` is unaffected.
+    /// CSE over `FieldDescriptor` is unaffected.  That last clause is
+    /// **defensive, not responsive**: there is no such pass.  Nothing keys
+    /// a map on `OpKind` / `SpaceOperation` or compares them, and this
+    /// type's manual `PartialEq` / `Hash` exist only to satisfy `OpKind`'s
+    /// `derive` — the `HashMap<OpKind, …>` registries elsewhere are
+    /// `flowspace::operation::OpKind`, a different type.  Do not reason
+    /// from this exclusion as though a consumer were relying on it.
     pub owner_id: Option<majit_ir::descr::StructId>,
+    /// Whether the access this descriptor was built for reached its
+    /// container through a pointer: `(*p).f` is `Some(true)`, `local.f`
+    /// is `Some(false)`, and `None` means the producer did not record it
+    /// (every synthetic front-end helper, tests, builder construction).
+    ///
+    /// A field read on a *non-dereferenced local aggregate* cannot be an
+    /// access to a live virtualizable — the container is a value in this
+    /// frame, not an object the JIT is tracking — which is what
+    /// `jtransform.py:990-993 fresh_virtualizable` suppresses upstream.
+    /// Upstream obtains that by annotating `Frame.__init__`
+    /// (`pypy/interpreter/pyframe.py:99`); the equivalent annotation is
+    /// unreachable here because the constructor is shredded into ~65
+    /// blocks by its call terminators while `vable_flags` is per-block,
+    /// so the fact is recovered structurally instead.  Only `Some(false)`
+    /// suppresses: `None` keeps the pre-existing behaviour, so a producer
+    /// that does not know cannot silently disable the protocol.
+    ///
+    /// Sitting on `FieldDescriptor` is a compromise and worth naming: this
+    /// describes the *access*, not the *field*, so a purist would put it on
+    /// `OpKind::FieldRead` / `FieldWrite`.  Those are enum variants with no
+    /// field defaults, so that costs an edit at all 282 construction sites
+    /// to say "unknown" 280 times; the two sites that can actually answer
+    /// the question both build the descriptor.  It is only sound here
+    /// because the flag is excluded from equality — see below.
+    ///
+    /// Excluded from `PartialEq` / `Hash` for the same reason as
+    /// `owner_id`.  Unlike `owner_id` it is *not* functionally determined
+    /// by the other fields: `Rvalue::Ref` aliases `&x` to `x`'s own
+    /// Variable, so `let r = &q; (*r).f` and `q.f` reach one base Variable
+    /// with opposite deref-ness.  Excluding it is still sound, because two
+    /// descriptors that compare equal name one base Variable and therefore
+    /// one container object, so they always want the same answer — and in
+    /// that aliased case the container is the local aggregate, making
+    /// `Some(false)` the correct reading and `Some(true)` merely
+    /// conservative.
+    pub base_is_deref: Option<bool>,
 }
 
 impl PartialEq for FieldDescriptor {
@@ -499,6 +541,7 @@ impl FieldDescriptor {
             name: name.into(),
             owner_root,
             owner_id: None,
+            base_is_deref: None,
         }
     }
 
@@ -506,6 +549,19 @@ impl FieldDescriptor {
     pub fn with_owner_id(mut self, owner_id: Option<majit_ir::descr::StructId>) -> Self {
         self.owner_id = owner_id;
         self
+    }
+
+    /// Builder-style setter for the access's container shape.
+    /// `true` for `(*p).f`, `false` for `local.f`.
+    pub fn with_base_is_deref(mut self, base_is_deref: bool) -> Self {
+        self.base_is_deref = Some(base_is_deref);
+        self
+    }
+
+    /// The container is known to be a non-dereferenced local aggregate,
+    /// so this access cannot be reaching a live virtualizable.
+    pub fn base_is_local_aggregate(&self) -> bool {
+        self.base_is_deref == Some(false)
     }
 }
 
@@ -6361,6 +6417,7 @@ mod tests {
                         name: format!("__pos_{i}"),
                         owner_root: Some("Tuple".into()),
                         owner_id: None,
+                        base_is_deref: None,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -6416,6 +6473,7 @@ mod tests {
                     name: "__pos_0".into(),
                     owner_root: Some("Tuple".into()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value: LinkArg::Value(b0),
                 ty: ValueType::Ref(None),
@@ -6523,6 +6581,7 @@ mod tests {
                     name: "ob_type".into(),
                     owner_root: Some("PyObject".into()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value: LinkArg::Value(ty_addr),
                 ty: ValueType::Ref(None),
@@ -6548,6 +6607,7 @@ mod tests {
                     name: "ob_header".into(),
                     owner_root: Some("W_FloatObject".into()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -6562,6 +6622,7 @@ mod tests {
                     name: "floatval".into(),
                     owner_root: Some("W_FloatObject".into()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value: LinkArg::Value(v.clone()),
                 ty: ValueType::Ref(None),
@@ -6694,6 +6755,7 @@ mod tests {
                     name: "ob_type".into(),
                     owner_root: Some("PyObject".into()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value: LinkArg::Value(ty_addr),
                 ty: ValueType::Ref(None),
@@ -6719,6 +6781,7 @@ mod tests {
                     name: "ob_header".into(),
                     owner_root: Some("W_ComplexObject".into()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -6734,6 +6797,7 @@ mod tests {
                         name: name.into(),
                         owner_root: Some("W_ComplexObject".into()),
                         owner_id: None,
+                        base_is_deref: None,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -6866,6 +6930,7 @@ mod tests {
                 name: name.into(),
                 owner_root: Some(owner.into()),
                 owner_id: None,
+                base_is_deref: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -7046,6 +7111,7 @@ mod tests {
                     name: "ob_type".into(),
                     owner_root: Some("PyObject".into()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value: LinkArg::Value(ty_addr),
                 ty: ValueType::Ref(None),
@@ -7070,6 +7136,7 @@ mod tests {
                     name: name.into(),
                     owner_root: Some("W_SetObject".into()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value,
                 ty,
@@ -7195,6 +7262,7 @@ mod tests {
                 name: name.into(),
                 owner_root: None,
                 owner_id: None,
+                base_is_deref: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -7283,6 +7351,7 @@ mod tests {
                 name: name.into(),
                 owner_root: Some("PyObject".into()),
                 owner_id: None,
+                base_is_deref: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -7471,6 +7540,7 @@ mod tests {
                 name: name.into(),
                 owner_root: None,
                 owner_id: None,
+                base_is_deref: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -8273,6 +8343,7 @@ mod tests {
                     name: "payload".into(),
                     owner_root: Some("Box".into()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Float,

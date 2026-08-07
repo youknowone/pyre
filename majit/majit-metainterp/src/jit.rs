@@ -55,6 +55,49 @@ pub fn hint<T>(x: T) -> T {
     x
 }
 
+// ── access_directly / fresh_virtualizable ──
+// rlib/jit.py:88-93
+
+/// Access a virtualizable directly as a structure, without treating it
+/// as a virtualizable.
+///
+/// rlib/jit.py:88 — `hint(x, access_directly=True)`
+#[inline(always)]
+pub fn hint_access_directly<T>(x: T) -> T {
+    hint(x)
+}
+
+/// Declare that the virtualizable was just allocated, so storing
+/// directly on it is what is wanted — `Frame.__init__` is the motivating
+/// case (`pypy/interpreter/pyframe.py:99`).  Its redirected fields are
+/// not under the virtualizable protocol yet, so the codewriter leaves
+/// them as ordinary struct fields instead of lowering them to
+/// `getfield_vable_*` / `setfield_vable_*` and instead of admitting an
+/// array field to `vable_array_vars`
+/// (`rpython/jit/codewriter/jtransform.py:990-993`).
+///
+/// Upstream this hint "has to come with access_directly=True"
+/// (`rlib/jit.py:92-93`, asserted at `rlib/jit.py:313`), because there
+/// the two flags ride one `SomeInstance` and `access_directly` is what
+/// suppresses the `jit_force_virtualizable` call
+/// (`rpython/rtyper/rvirtualizable.py:68-69`).  Pyre dispatches one
+/// helper per kwarg and has no `hook_access_field`, so this helper alone
+/// carries the whole suppression; pair it with [`hint_access_directly`]
+/// to keep the call sites readable as the upstream pair.
+///
+/// Because of that, placement matters here in a way it does not upstream.
+/// The suppression is recorded per basic block, and upstream re-establishes
+/// it in front of every redirected access, so its one `hint()` covers the
+/// whole function.  This helper covers only the block it sits in.  Accesses
+/// on the far side of a branch — an early return, a loop body, an assertion
+/// behind a null test — are not covered, and each needs its own call.
+///
+/// rlib/jit.py:90 — `hint(x, fresh_virtualizable=True)`
+#[inline(always)]
+pub fn hint_fresh_virtualizable<T>(x: T) -> T {
+    hint(x)
+}
+
 // ── promote ──
 // rlib/jit.py:100-124
 

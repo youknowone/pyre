@@ -64,8 +64,18 @@ impl VirtualizableFieldDescriptor {
         if self.name != field.name {
             return false;
         }
+        // An owner-less config entry must match nothing rather than every
+        // struct's field of that name.  A leaf name does not identify a
+        // type here — the corpus carries `FrameBlock.valuestackdepth`
+        // alongside the `PyFrame.valuestackdepth` this config declares
+        // virtualizable — so a name-only match would lower an unrelated
+        // struct's field through the virtualizable protocol.  Failing
+        // closed costs at worst a missed lowering (a plain `getfield`,
+        // which is correct if slower); failing open is wrong code.
+        // No producer builds one: every `VirtualizableFieldDescriptor`
+        // constructor call in the tree passes an owner.
         let Some(cfg_owner) = self.owner_root.as_ref() else {
-            return true;
+            return false;
         };
         let Some(field_owner) = field.owner_root.as_ref() else {
             return false;
@@ -255,7 +265,6 @@ pub struct Transformer<'a> {
     /// RPython: `Transformer.vable_flags`. Keyed by Variable identity
     /// matching upstream `self.vable_flags[op.args[0]] = ...`
     /// (`jtransform.py` populates with `Variable` objects).
-    #[allow(dead_code)]
     vable_flags: std::collections::HashMap<crate::flowspace::model::Variable, VableFlag>,
     /// Value aliases from identity rewrites (same_as / hint rewriting).
     aliases: std::collections::HashMap<
@@ -735,6 +744,12 @@ impl<'a> Transformer<'a> {
             return;
         }
 
+        // `jtransform.py:76-77` — both tables are rebound to empty dicts as
+        // the first statements of every `optimize_block`, so a virtualizable
+        // array read is only visible to the block that performed it.
+        self.vable_array_vars.clear();
+        self.vable_flags.clear();
+
         let mut new_ops = Vec::with_capacity(graph.blocks[block_idx].operations.len());
 
         let original_ops = graph.blocks[block_idx].operations.clone();
@@ -805,6 +820,28 @@ impl<'a> Transformer<'a> {
         // link targets, so the exceptblock note below is unaffected.
         optimize_goto_if_not(graph, block_idx);
 
+        // `jtransform.py:124-127` — a virtualizable array read must be
+        // consumed by the block that performed it: neither a fused
+        // exitswitch operand nor a link argument may name one.
+        //
+        // Upstream interleaves the per-link check with
+        // `_do_renaming_on_link` (`jtransform.py:126-128`), so it reads
+        // the pre-renaming `link.args`; pyre commits the exits remap in
+        // one pass above and therefore reads the post-renaming args.  A
+        // tracked array variable is the result of a kept `getfield`, so
+        // it is never a renaming *key*; the post-renaming list can only
+        // gain occurrences of it, never lose one.
+        //
+        // UNWIRED — see [`Transformer::check_no_vable_array`].  The two
+        // calls that belong here are:
+        //     self.check_no_vable_array(args.iter(), graph_name,
+        //                               "fused exitswitch operand");
+        //     self.check_no_vable_array(
+        //         link.args.iter().filter_map(LinkArg::as_variable),
+        //         graph_name, "link argument");
+        // over `block.exitswitch`'s `ExitSwitch::Fused` args and every
+        // `block.exits` link.
+
         // Upstream `rpython/translator/backendopt/canraise.py:25-47
         // analyze_exceptblock_in_graph` identifies raising blocks by the
         // presence of a Link in `Block.exits` whose target is
@@ -819,6 +856,188 @@ impl<'a> Transformer<'a> {
                 detail: "abort: raises to exceptblock".to_string(),
             });
         }
+    }
+
+    /// `jtransform.py:990-993` — the `fresh_virtualizable` arm of
+    /// `is_virtualizable_getset`:
+    ///
+    /// ```text
+    /// if res:
+    ///     flags = self.vable_flags[op.args[0]]
+    ///     if 'fresh_virtualizable' in flags:
+    ///         return False
+    /// ```
+    ///
+    /// A virtualizable that was just allocated is not yet under the
+    /// virtualizable protocol — its fields are still ordinary struct
+    /// fields — so an access to one of the redirected fields must not
+    /// lower to `getfield_vable_*` / `setfield_vable_*`, and an array
+    /// field read must not enter `vable_array_vars`.
+    ///
+    /// Upstream reads `self.vable_flags[op.args[0]]` with a bare
+    /// subscript because `rvirtualizable.py:49-53 hook_access_field`
+    /// emits a `jit_force_virtualizable` carrying the instance's
+    /// annotator flags in front of *every* redirected-field access, so
+    /// the entry always exists by the time this runs.  Pyre has no
+    /// `hook_access_field`; the flag arrives from the
+    /// `hint(x, fresh_virtualizable=True)` call itself
+    /// (`rlib/jit.py:321-322`), so an absent entry is the ordinary
+    /// "not fresh" case rather than a missing preceding op.
+    ///
+    /// It can also mean "hinted, but not in this block": the hint files
+    /// one entry in the block it sits in, and `vable_flags` is rebuilt
+    /// per block.  See `rewrite_op_hint`'s `FreshVirtualizable` arm for
+    /// why upstream does not have that constraint.
+    ///
+    /// No pyre source calls the hint today, so this arm is not the one
+    /// that fires: the reachable path is the structural sibling below,
+    /// `FieldDescriptor::base_is_local_aggregate`, which recovers the
+    /// same fact from the access reaching a container that was never
+    /// dereferenced.  Keep this arm anyway — the two are not the same
+    /// claim, and the structural one is not a superset.  "The container
+    /// is a value in this frame" and "the programmer asserts this object
+    /// is freshly allocated" diverge for a frame that is heap-allocated
+    /// and then initialised *through* the pointer: fresh, but reached by
+    /// a deref, so only the hint can see it.  The frame constructor takes
+    /// its frame by value today, which is exactly why the structural arm
+    /// suffices; this arm is what survives that becoming by-pointer.
+    ///
+    /// That by-value parameter is not a JIT-imposed constraint, so do not
+    /// "fix" it on the JIT's behalf: the constructor publishes every GCREF
+    /// field into the root bracket, allocates, reads them back, then does a
+    /// single `ptr::write` of the whole aggregate.  Allocating first would
+    /// leave those fields in a heap object live across the allocation —
+    /// the situation the `push_roots` / `pin_roots` / `get` dance exists to
+    /// avoid for a stack aggregate — and would cost a write barrier per
+    /// field instead of one at the end.  The GC and the JIT want the same
+    /// shape here; they simply want it for different reasons.
+    fn is_fresh_virtualizable(&self, base: &crate::flowspace::model::Variable) -> bool {
+        self.vable_flags.get(base) == Some(&VableFlag::FreshVirtualizable)
+    }
+
+    /// `jtransform.py:145-168 _check_no_vable_array`.
+    ///
+    /// `vable_array_vars` is rebuilt per block, so the array a
+    /// virtualizable field read produced can only be lowered by an
+    /// array access sitting in that same block.  Any other consumer —
+    /// a link argument, a fused exitswitch operand, a call argument, a
+    /// `setfield` — would carry the raw array pointer out of reach of
+    /// the lowering, so the graph is rejected instead.
+    ///
+    /// # NOT WIRED — deliberately, and not an oversight
+    ///
+    /// The four call sites this belongs at are marked `UNWIRED` with the
+    /// exact call they should carry: the fused-exitswitch and link-args
+    /// pair in `optimize_block` (`jtransform.py:124-127`),
+    /// `rewrite_call_three_lists` (`jtransform.py:421`), and
+    /// `rewrite_op_setfield` (`jtransform.py:912`).  **Do not wire them
+    /// back up on their own.**  The check is correct; what it rejects is
+    /// not.
+    ///
+    /// pyre's MIR front gives a single-predecessor block inputargs that
+    /// are the *same* `Variable` identities as the predecessor's exit
+    /// args, rather than fresh phis — measured at **92.6% of 153,927
+    /// single-predecessor blocks** across the interpreter corpus.  That
+    /// defeats `transform_dead_op_vars`' positional liveness
+    /// (`simplify.py:512-524`): a value read anywhere in the predecessor
+    /// is in `read_vars`, so the dead link arg naming it is never
+    /// dropped, and the array leaves its block on a link upstream would
+    /// have pruned away.
+    ///
+    /// The witnessed case is `pyre_interpreter::pyframe::<Impl>::_check_stack_index`
+    /// (`index >= self.stack_base() && index < locals_w!(self).len()`).
+    /// Its array read and the `ArrayLen` consuming it sit in the same
+    /// block, exactly as the protocol requires — and the array still
+    /// rides that block's outgoing link **twice**, into a block whose
+    /// only operation is the `int_lt` and which never touches it.
+    ///
+    /// So enabling this check requires the front-end fix first: mint
+    /// fresh inputargs for single-predecessor blocks, restoring the
+    /// distinct-phi invariant `transform_dead_op_vars` assumes.  That is
+    /// its own piece of work, not a follow-up to be picked up casually.
+    /// Eliminating empty blocks does not reach it — the block the array
+    /// escapes into is not empty.
+    ///
+    /// The test that the wiring needs, and that should land with it: for
+    /// every variable in `vable_array_vars`, assert that every consumer
+    /// sits in the block that read it **and** that it appears in no
+    /// link's args anywhere in the graph.  Enumerating individual escape
+    /// routes is what let `_check_stack_index` pass a green test while
+    /// escaping by the one route that test did not look at.
+    ///
+    /// `route` names which of those four the escape took.  Upstream's
+    /// message does not carry it, and the extra line is a deliberate pyre
+    /// addition: the four call sites below share one panic body, this
+    /// function is small enough to be inlined into all of them in an
+    /// optimised build, and the resulting backtrace then names whichever
+    /// site the optimiser happened to keep.  A misread frame sent a whole
+    /// diagnosis round after a residual call for what was a link argument.
+    /// Keep the upstream block verbatim above and add the route last.
+    ///
+    /// The four routes are closed — the call sites are the only ones —
+    /// and each passes its own literal: `"link argument"`,
+    /// `"fused exitswitch operand"`, `"call argument"`,
+    /// `"setfield operand"` (`jtransform.py:912`, the base or the stored
+    /// value of a `setfield`; there is no `setarrayitem` site, because
+    /// that one is the array access the protocol exists to allow).
+    #[allow(dead_code, reason = "ported but not wired — see the doc above")]
+    fn check_no_vable_array<'v>(
+        &self,
+        list: impl IntoIterator<Item = &'v crate::flowspace::model::Variable>,
+        graph_name: &str,
+        route: &str,
+    ) {
+        // `jtransform.py:146-147`
+        if self.vable_array_vars.is_empty() {
+            return;
+        }
+        for v in list {
+            if let Some((_v_base, array_index, _itemsize, _is_signed)) =
+                self.vable_array_vars.get(v)
+            {
+                panic!(
+                    "A virtualizable array is passed around; it should\n\
+                     only be used immediately after being read.  Note\n\
+                     that a possible cause is indexing with an index not\n\
+                     known non-negative, or catching IndexError, or\n\
+                     not inlining at all (for tests: use listops=True).\n\
+                     This is about: vable array field #{array_index}\n\
+                     Occurred in: {graph_name}\n\
+                     Escaped via: {route}"
+                );
+            }
+            // extra explanation: with the way things are organized in
+            // rpython/rlist.py, the ll_getitem becomes a function call
+            // that is typically meant to be inlined by the JIT, but
+            // this does not work with vable arrays because
+            // jtransform.py expects the getfield and the getarrayitem
+            // to be in the same basic block.  It works a bit as a hack
+            // for simple cases where we performed the backendopt
+            // inlining before (even with a very low threshold, because
+            // there is _always_inline_ on the relevant functions).
+        }
+    }
+
+    /// `jtransform.py:421-422` — the two opening statements of
+    /// `rewrite_call`: reject a virtualizable array among the call's
+    /// arguments, then split the surviving arguments by kind.  pyre has
+    /// no single `rewrite_call`; each per-call-kind handler reaches this
+    /// pair directly, so the pairing lives here.
+    fn rewrite_call_three_lists(
+        &self,
+        args: &[crate::flowspace::model::Variable],
+        graph_name: &str,
+    ) -> (
+        Vec<crate::flowspace::model::Variable>,
+        Vec<crate::flowspace::model::Variable>,
+        Vec<crate::flowspace::model::Variable>,
+    ) {
+        // UNWIRED — see [`Transformer::check_no_vable_array`].  The call
+        // that belongs here is
+        //     self.check_no_vable_array(args.iter(), graph_name,
+        //                               "call argument");
+        let _ = graph_name;
+        self.make_three_lists_from_vars(args)
     }
 
     /// Variable-returning helper —
@@ -2369,12 +2588,51 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         match hint_kind {
             crate::hints::HintKind::AccessDirectly | crate::hints::HintKind::FreshVirtualizable => {
-                // RPython: consume as identity (same_as)
+                // `jtransform.py:655-656 if hints.get('fresh_virtualizable')
+                // or hints.get('access_directly'): return` — both are
+                // consumed without emitting an operation.
+                //
+                // `fresh_virtualizable` additionally has to be remembered:
+                // upstream carries it as an annotator flag on the instance
+                // (`rlib/jit.py:321-322`), which `rvirtualizable.py:49-53
+                // hook_access_field` re-materialises as the third argument
+                // of a `jit_force_virtualizable` in front of every
+                // redirected-field access, and `jtransform.py:2171
+                // rewrite_op_jit_force_virtualizable` files under
+                // `vable_flags[v_inst]`.  Pyre has neither the instance
+                // flag nor `hook_access_field`, so the hint call is the
+                // only carrier and files the flag directly against the
+                // virtualizable it names.
+                //
+                // That substitution is weaker than what it replaces, and
+                // the gap is per-block.  `vable_flags` is rebuilt at the
+                // top of every block (`jtransform.py:76-77`); upstream
+                // tolerates that because it re-materialises the entry in
+                // front of *each* redirected access, so its flag holds
+                // wherever the access happens to sit.  A single hint call
+                // cannot: it covers only the accesses in its own block.
+                // A redirected field access on the same instance in any
+                // other block — the far side of a branch, a loop body, an
+                // assertion guarded by a null test — still lowers to
+                // `getfield_vable_*` / `setfield_vable_*` and still admits
+                // an array field to `vable_array_vars`.  The fix for a
+                // surviving access is another hint call in the block that
+                // holds it, not a change here.
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
                     detail: format!("rewrite: {label}(...) → identity"),
                 });
                 if let Some(arg) = args.first() {
+                    if hint_kind == crate::hints::HintKind::FreshVirtualizable {
+                        // Key on the resolved operand: `optimize_block`
+                        // remaps every op through `aliases` before rewriting,
+                        // so this is the same handle the later field reads
+                        // present as their base.
+                        self.vable_flags.insert(
+                            resolve_alias(arg, &self.aliases),
+                            VableFlag::FreshVirtualizable,
+                        );
+                    }
                     RewriteResult::Identity(arg.clone())
                 } else {
                     RewriteResult::Keep
@@ -2601,8 +2859,26 @@ impl<'a> Transformer<'a> {
             .as_ref()
             .and_then(|result| self.get_value_type(result))
             .unwrap_or_else(|| ty.clone());
+        // `jtransform.py:990-993` — a just-allocated virtualizable is not
+        // under the virtualizable protocol yet, so neither the array
+        // tracking nor the scalar lowering below may fire for it.
+        let fresh_virtualizable = match &op.kind {
+            OpKind::FieldRead { base, .. } => self.is_fresh_virtualizable(base),
+            _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
+        };
+        // Same suppression, reached structurally: a container that was
+        // not dereferenced is a value in this frame, so the access cannot
+        // be to a live virtualizable.  This is what covers the frame
+        // constructor, where the hint upstream relies on cannot land.
+        let fresh_virtualizable = fresh_virtualizable || field.base_is_local_aggregate();
         // Track virtualizable array field reads
-        if let Some(array_field) = self.config.vable_arrays.iter().find(|c| c.matches(field)) {
+        if let Some(array_field) = self
+            .config
+            .vable_arrays
+            .iter()
+            .find(|c| c.matches(field))
+            .filter(|_| !fresh_virtualizable)
+        {
             if let Some(result) = op.result.clone() {
                 // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
                 // We store the vable base plus the arraydescr properties.
@@ -2621,7 +2897,13 @@ impl<'a> Transformer<'a> {
             }
         }
         // Virtualizable scalar field → VableFieldRead
-        if let Some(vable_field) = self.config.vable_fields.iter().find(|c| c.matches(field)) {
+        if let Some(vable_field) = self
+            .config
+            .vable_fields
+            .iter()
+            .find(|c| c.matches(field))
+            .filter(|_| !fresh_virtualizable)
+        {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!(
@@ -2764,11 +3046,38 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        // `jtransform.py:912 self._check_no_vable_array(op.args)` —
+        // upstream's `op.args` is `[v_inst, c_fieldname, v_value]`; the
+        // field name rides in a descriptor here, leaving the base and the
+        // stored value as the operands.
+        //
+        // UNWIRED — see [`Transformer::check_no_vable_array`].  The call
+        // that belongs here is
+        //     self.check_no_vable_array(
+        //         std::iter::once(base).chain(value.as_variable()),
+        //         graph_name, "setfield operand");
+        // guarded by `if let OpKind::FieldWrite { base, .. } = &op.kind`.
         let typed_ty = value
             .as_variable()
             .and_then(|v| self.get_value_type(v))
             .unwrap_or_else(|| ty.clone());
-        if let Some(vable_field) = self.config.vable_fields.iter().find(|c| c.matches(field)) {
+        // `jtransform.py:923 if self.is_virtualizable_getset(op)` — the
+        // write side consults the same predicate, so the
+        // `jtransform.py:990-993` fresh-virtualizable arm suppresses it too.
+        let fresh_virtualizable = match &op.kind {
+            OpKind::FieldWrite { base, .. } => self.is_fresh_virtualizable(base),
+            _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
+        };
+        // The structural arm, as on the read side: a write into a
+        // non-dereferenced local aggregate is not a virtualizable write.
+        let fresh_virtualizable = fresh_virtualizable || field.base_is_local_aggregate();
+        if let Some(vable_field) = self
+            .config
+            .vable_fields
+            .iter()
+            .find(|c| c.matches(field))
+            .filter(|_| !fresh_virtualizable)
+        {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!(
@@ -4311,7 +4620,7 @@ impl<'a> Transformer<'a> {
         };
         // RPython jtransform.py:480: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
-        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
+        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
 
@@ -4701,7 +5010,7 @@ impl<'a> Transformer<'a> {
             "conditional_call target must not force virtualizable"
         );
         // jtransform.py:1678-1680: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(func_args);
+        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(func_args, graph_name);
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in conditional_call"
@@ -5066,7 +5375,7 @@ impl<'a> Transformer<'a> {
         // jtransform.py:302-307: record_known_result_{i|r}
         let opname = format!("record_known_result_{result_kind}");
         // jtransform.py:308-310: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(func_args);
+        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(func_args, graph_name);
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in record_known_result"
@@ -5148,7 +5457,7 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         // RPython jtransform.py:467: rewrite_call(op, 'residual_call', ...)
-        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
+        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
         // RPython reads `op.result.concretetype` directly because rtyper
         // has typed every Variable. Pyre's front-end can leave a callee's
         // declared return as `ValueType::Unknown` (re-export shadowing,
@@ -5222,7 +5531,7 @@ impl<'a> Transformer<'a> {
             .map(|(var, _)| var)
             .unwrap_or(funcptr)
             .clone();
-        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
+        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_kind = resolved_result.kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
@@ -5359,7 +5668,7 @@ impl<'a> Transformer<'a> {
             detail: format!("call {target} → elidable"),
         });
         self.calls_classified += 1;
-        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
+        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
@@ -5399,7 +5708,7 @@ impl<'a> Transformer<'a> {
             detail: format!("call {target} → may_force"),
         });
         self.calls_classified += 1;
-        let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
+        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
@@ -7504,6 +7813,398 @@ mod tests {
         };
         assert_eq!(*array_index, 0);
         assert_eq!(rewritten_base, &base_var_held);
+    }
+
+    /// `jtransform.py:126-127` + `:145-168 _check_no_vable_array` — the
+    /// array a virtualizable field read produced may not leave the block
+    /// along a link argument; the block that would consume it has no
+    /// `vable_array_vars` entry for it, so no lowering could ever happen.
+    ///
+    /// Calls the check **directly** rather than through `transform_graph`,
+    /// because it is not wired into the transform on this branch — see
+    /// [`Transformer::check_no_vable_array`] for why, and for what has to
+    /// land before it can be.  This keeps the port covered; it is
+    /// deliberately not evidence that the transform enforces it.
+    ///
+    /// The expectation names the escape route, not just the upstream
+    /// header: all four call sites share one panic body, so without the
+    /// route the message cannot say which one fired.
+    #[test]
+    #[should_panic(expected = "Escaped via: link argument")]
+    fn vable_array_escaping_the_block_on_a_link_arg_is_rejected() {
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let mut transformer = Transformer::new(&config);
+
+        // The array a virtualizable field read produced, as
+        // `rewrite_op_getfield` would have recorded it.
+        let mut graph = FunctionGraph::new("vable_array_escape");
+        let base_var = graph.alloc_value_var();
+        let array_var = graph.alloc_value_var();
+        transformer
+            .vable_array_vars
+            .insert(array_var.clone(), (base_var, 0, 8, true));
+
+        // The consumer block receives it as a link argument instead of
+        // reading it itself.
+        transformer.check_no_vable_array(
+            std::iter::once(&array_var),
+            "vable_array_escape",
+            "link argument",
+        );
+    }
+
+    /// `jtransform.py:990-993` — a virtualizable the graph just allocated
+    /// is not under the virtualizable protocol yet, so its array field
+    /// read is an ordinary `getfield` and must not enter
+    /// `vable_array_vars`.  This is the frame-construction shape
+    /// `pypy/interpreter/pyframe.py:99 hint(self, access_directly=True,
+    /// fresh_virtualizable=True)` marks: the array leaves the block, and
+    /// without the suppression `_check_no_vable_array` would reject the
+    /// graph.
+    #[test]
+    fn fresh_virtualizable_suppresses_vable_array_tracking() {
+        use crate::model::Link;
+
+        let mut graph = FunctionGraph::new("fresh_vable_array");
+        let frame_var = graph.alloc_value_var();
+        let hinted_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_fresh_virtualizable"]),
+                args: vec![frame_var],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(hinted_var.clone());
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: hinted_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+
+        // The same escape that `vable_array_escaping_the_block_on_a_link_arg_is_rejected`
+        // rejects — here it must be accepted, because the array never
+        // became a virtualizable array.
+        let consumer = graph.create_block();
+        let phi = graph.alloc_value_var();
+        graph.push_inputarg_var(consumer, phi.clone());
+        graph.set_return(consumer, Some(phi));
+        let link = Link::from_variables(&graph, vec![array_var], consumer, None);
+        graph.set_control_flow_metadata(graph.startblock, None, vec![link]);
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
+        assert_eq!(
+            result.vable_rewrites, 0,
+            "a fresh virtualizable must produce no virtualizable rewrite"
+        );
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::FieldRead { .. })),
+            "the array field read must stay an ordinary getfield, got {ops:?}"
+        );
+    }
+
+    /// The scalar half of `jtransform.py:990-993`: a redirected field read
+    /// on a just-allocated virtualizable stays a plain `getfield`.
+    /// `access_directly` alone does NOT suppress it — see
+    /// `transform_graph_consumes_identity_virtualizable_hints`, which
+    /// asserts the lowering still fires for that hint.
+    #[test]
+    fn fresh_virtualizable_suppresses_vable_field_read() {
+        let mut graph = FunctionGraph::new("fresh_vable_field");
+        let frame_var = graph.alloc_value_var();
+        let hinted_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_fresh_virtualizable"]),
+                args: vec![frame_var],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(hinted_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: hinted_var,
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(result.vable_rewrites, 0);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::VableFieldRead { .. })),
+            "a fresh virtualizable must not lower to VableFieldRead, got {ops:?}"
+        );
+    }
+
+    /// Build a one-block graph reading `next_instr` off an inputarg whose
+    /// descriptor records the given container shape, and lower it against a
+    /// config that declares `next_instr` a virtualizable field.
+    fn vable_read_with_base_shape(base_is_deref: Option<bool>) -> GraphTransformResult {
+        let mut graph = FunctionGraph::new("base_shape");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        let mut field = crate::model::FieldDescriptor::new("next_instr", Some("Frame".into()));
+        field.base_is_deref = base_is_deref;
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: frame_var,
+                field,
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+        transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A field read on a non-dereferenced local aggregate cannot be an
+    /// access to a live virtualizable, so it must not lower — the
+    /// structural stand-in for the `fresh_virtualizable` hint that cannot
+    /// reach the frame constructor's later blocks.
+    ///
+    /// The `Some(true)` and `None` arms are the control: without them a
+    /// suppression that simply never fires would pass this test.
+    #[test]
+    fn non_dereferenced_base_suppresses_vable_field_read() {
+        // Local aggregate — suppressed.
+        let local = vable_read_with_base_shape(Some(false));
+        assert_eq!(
+            local.vable_rewrites, 0,
+            "a non-dereferenced container must not lower to VableFieldRead"
+        );
+        assert!(
+            !local
+                .graph
+                .block(local.graph.startblock)
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::VableFieldRead { .. }))
+        );
+
+        // Reached through a pointer — this is a real virtualizable access
+        // and MUST still lower.
+        let through_ptr = vable_read_with_base_shape(Some(true));
+        assert_eq!(
+            through_ptr.vable_rewrites, 1,
+            "a dereferenced container is a live virtualizable and must still lower"
+        );
+
+        // Producer did not record the shape — unchanged behaviour, so a
+        // descriptor built anywhere else cannot silently lose the protocol.
+        let unknown = vable_read_with_base_shape(None);
+        assert_eq!(
+            unknown.vable_rewrites, 1,
+            "an unrecorded container shape must keep the pre-existing lowering"
+        );
+    }
+
+    /// Build a one-block graph *writing* `next_instr` on an inputarg whose
+    /// descriptor records the given container shape.
+    fn vable_write_with_base_shape(base_is_deref: Option<bool>) -> GraphTransformResult {
+        let mut graph = FunctionGraph::new("base_shape_write");
+        let frame_var = graph.alloc_value_var();
+        let value_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_inputarg_var(graph.startblock, value_var.clone());
+        let mut field = crate::model::FieldDescriptor::new("next_instr", Some("Frame".into()));
+        field.base_is_deref = base_is_deref;
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: frame_var,
+                field,
+                value: LinkArg::Value(value_var),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The write arm of the structural suppression.
+    ///
+    /// This is the arm worth pinning hardest.  In the frame constructor the
+    /// non-dereferenced sites are 12, and **5 of them are writes** — the
+    /// stores that read the fields back out of the GC root bracket.  An
+    /// unsuppressed `setfield_vable_*` against a stack aggregate that has
+    /// no `vable_token` is a worse failure than an over-tracked read, and
+    /// a read-only test would not see it regress.
+    #[test]
+    fn non_dereferenced_base_suppresses_vable_field_write() {
+        let local = vable_write_with_base_shape(Some(false));
+        assert_eq!(
+            local.vable_rewrites, 0,
+            "a write into a non-dereferenced container must not lower to VableFieldWrite"
+        );
+        assert!(
+            !local
+                .graph
+                .block(local.graph.startblock)
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::VableFieldWrite { .. })),
+            "structural suppression must reach the write arm"
+        );
+
+        // Controls, so a suppression that never fires cannot pass.
+        assert_eq!(
+            vable_write_with_base_shape(Some(true)).vable_rewrites,
+            1,
+            "a write through a pointer is a live virtualizable write and must still lower"
+        );
+        assert_eq!(
+            vable_write_with_base_shape(None).vable_rewrites,
+            1,
+            "an unrecorded container shape must keep the pre-existing lowering"
+        );
+    }
+
+    /// `jtransform.py:923` routes the write side through the same
+    /// `is_virtualizable_getset`, so the fresh-virtualizable arm
+    /// suppresses `setfield_vable_*` too — this is the shape a
+    /// constructor uses to initialise the frame it just allocated.
+    #[test]
+    fn fresh_virtualizable_suppresses_vable_field_write() {
+        let mut graph = FunctionGraph::new("fresh_vable_write");
+        let frame_var = graph.alloc_value_var();
+        let hinted_var = graph.alloc_value_var();
+        let value_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_inputarg_var(graph.startblock, value_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_fresh_virtualizable"]),
+                args: vec![frame_var],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(hinted_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: hinted_var,
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                value: LinkArg::Value(value_var),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(result.vable_rewrites, 0);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::VableFieldWrite { .. })),
+            "a fresh virtualizable must not lower to VableFieldWrite, got {ops:?}"
+        );
     }
 
     #[test]

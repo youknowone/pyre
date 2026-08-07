@@ -534,6 +534,7 @@ fn build_layout_aggregate(
                     name: name.to_string(),
                     owner_root: Some(layout_owner.to_string()),
                     owner_id: None,
+                    base_is_deref: None,
                 },
                 value: LinkArg::Value(value),
                 ty: ValueType::Unsigned,
