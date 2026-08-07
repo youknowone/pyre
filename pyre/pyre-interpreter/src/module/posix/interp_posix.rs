@@ -1650,6 +1650,39 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         )
     }
 
+    /// The width the platform's truncating call takes its length in.
+    #[cfg(windows)]
+    type TruncateLen = i64;
+    #[cfg(not(windows))]
+    type TruncateLen = libc::off_t;
+
+    /// `space.int_w` over the `r_longlong` half of `interp_posix.py:404`.
+    ///
+    /// `Py_off_t_converter` names the C type it could not fit the value
+    /// into, and that type is the platform's: a `long` where the converter
+    /// is `PyLong_AsLong`, and nothing at all where it is
+    /// `PyLong_AsLongLong`.
+    fn truncate_length_w(obj: PyObjectRef) -> Result<TruncateLen, crate::PyError> {
+        const TOO_BIG: &str = if cfg!(windows) {
+            "int too big to convert"
+        } else {
+            "Python int too large to convert to C long"
+        };
+        let w_length = crate::baseobjspace::space_index(obj)?;
+        let length = crate::baseobjspace::int_w(w_length).map_err(|err| {
+            if err.kind == crate::PyErrorKind::OverflowError {
+                crate::PyError::overflow_error(TOO_BIG)
+            } else {
+                err
+            }
+        })?;
+        // `off_t` is the width the call takes the length in, and a value
+        // above it is not a size the file can be given. An `as` cast would
+        // wrap it into one the caller never asked for and truncate the file
+        // to that instead.
+        TruncateLen::try_from(length).map_err(|_| crate::PyError::overflow_error(TOO_BIG))
+    }
+
     fn fs_err_with_filename(e: std::io::Error, w_path: PyObjectRef) -> crate::PyError {
         fs_err_with_filename2(e, 0, w_path, pyre_object::PY_NULL)
     }
@@ -2493,8 +2526,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if !unsafe { pyre_object::is_tuple(obj) }
                     || unsafe { pyre_object::w_tuple_len(obj) } != 2
                 {
+                    // `times` is the argument that also has a `None` spelling
+                    // — it is the one whose default means "now" — and its
+                    // message names that spelling. `ns` has no such form.
+                    let shape = if what == "times" {
+                        "either a tuple of two ints or None"
+                    } else {
+                        "a tuple of two ints"
+                    };
                     return Err(crate::PyError::type_error(format!(
-                        "utime: '{what}' must be a tuple of two ints"
+                        "utime: '{what}' must be {shape}"
                     )));
                 }
                 Ok((
@@ -2502,6 +2543,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     unsafe { pyre_object::w_tuple_getitem(obj, 1) }.unwrap(),
                 ))
             };
+        /// The out-of-range answer for both spellings of a second.
+        ///
+        /// `_PyTime_ObjectToDenominator` refuses a value no `time_t` can hold
+        /// by overflow rather than by value, and `_PyLong_AsTime_t` gives the
+        /// same words for an integer too wide to be one — `(2**200, 0)` and
+        /// `(1e30, 0)` answer alike.
+        fn time_t_overflow() -> crate::PyError {
+            crate::PyError::overflow_error("timestamp out of range for platform time_t")
+        }
         // `_PyTime_ObjectToTimespec(..., _PyTime_ROUND_FLOOR)`: the seconds are
         // the floor of the value and the nanoseconds are what is left above
         // that floor, so they stay in `0..1_000_000_000` however negative the
@@ -2509,34 +2559,88 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // `(-3, 500000000)`, which reads back as `-1_500_000_000` and
         // `-2_500_000_000` nanoseconds.
         let time_from_secs = |v: PyObjectRef| -> Result<UTime, crate::PyError> {
-            let f = crate::builtins::builtin_float(&[v])?;
+            // An integer names its second exactly, so it is read as one
+            // rather than through a float that would round the seconds it is
+            // too wide to hold.
+            if unsafe { pyre_object::is_int_or_long(v) } {
+                let sec = crate::builtins::space_index_w(v).map_err(|_| time_t_overflow())?;
+                return Ok(UTime { sec, nsec: 0 });
+            }
+            // Everything else has to name a float. What cannot is not a time
+            // at all, and is refused by type: `utime(p, ('a', 'b'))` names the
+            // type it was given rather than reporting a failed float parse.
+            let f = crate::builtins::builtin_float(&[v]).map_err(|err| {
+                if err.kind == crate::PyErrorKind::OverflowError {
+                    time_t_overflow()
+                } else {
+                    crate::PyError::type_error(format!(
+                        "argument must be int or float, not {}",
+                        crate::type_methods::arg_type_name(v)
+                    ))
+                }
+            })?;
             let secs = unsafe { pyre_object::w_float_get_value(f) };
+            // A NaN has no floor to take, and it is the one non-finite value
+            // answered by value rather than by range.
+            if secs.is_nan() {
+                return Err(crate::PyError::value_error(
+                    "Invalid value NaN (not a number)",
+                ));
+            }
             let floor = secs.floor();
-            // The floor of a non-finite or too-large value is not a second any
+            // The floor of an infinite or too-large value is not a second any
             // clock names; `i64::MIN`/`MAX` are what an `as` cast would answer
             // for both, so the range is checked before the cast rather than
             // read back out of it.
             if !(floor >= -(2f64.powi(63)) && floor < 2f64.powi(63)) {
-                return Err(crate::PyError::value_error("utime: timestamp out of range"));
+                return Err(time_t_overflow());
             }
             let mut sec = floor as i64;
             let mut nsec = ((secs - floor) * 1e9).floor() as i64;
             if nsec >= 1_000_000_000 {
                 nsec -= 1_000_000_000;
-                sec = sec
-                    .checked_add(1)
-                    .ok_or_else(|| crate::PyError::value_error("utime: timestamp out of range"))?;
+                sec = sec.checked_add(1).ok_or_else(time_t_overflow)?;
             }
             Ok(UTime { sec, nsec })
         };
         let time_from_ns = |v: PyObjectRef| -> Result<UTime, crate::PyError> {
-            let n = crate::builtins::space_index_w(v)?;
-            // `split_py_long_to_s_and_ns` divides by `1_000_000_000` the way
-            // Python's own `//` and `%` do, so a negative count of nanoseconds
+            // `split_py_long_to_s_and_ns` splits with `divmod` before it
+            // narrows anything, so a count of nanoseconds too wide for a
+            // `time_t` is only refused when the SECOND it names is — `ns=2**80`
+            // is a second that fits. Dividing after the narrowing turned away
+            // the whole range instead. `divmod` is also what answers for a
+            // value that is not a number at all.
+            let split = crate::builtins::builtin_divmod(&[
+                v,
+                pyre_object::w_int_new(1_000_000_000),
+            ])?;
+            let (w_sec, w_nsec) = unsafe {
+                (
+                    pyre_object::w_tuple_getitem(split, 0),
+                    pyre_object::w_tuple_getitem(split, 1),
+                )
+            };
+            let (Some(w_sec), Some(w_nsec)) = (w_sec, w_nsec) else {
+                return Err(crate::PyError::type_error(
+                    "utime: divmod() returned a non-pair",
+                ));
+            };
+            // Python's own `//` and `%`, so a negative count of nanoseconds
             // lands on the second below it with a positive remainder.
+            //
+            // Only an integer second can be out of a `time_t`'s range. A
+            // quotient that is not one at all — `divmod` answers a float pair
+            // for `ns=(1.5, 2.5)` — keeps the conversion's own refusal.
+            let sec = crate::builtins::space_index_w(w_sec).map_err(|err| {
+                if err.kind == crate::PyErrorKind::OverflowError {
+                    time_t_overflow()
+                } else {
+                    err
+                }
+            })?;
             Ok(UTime {
-                sec: n.div_euclid(1_000_000_000),
-                nsec: n.rem_euclid(1_000_000_000),
+                sec,
+                nsec: crate::builtins::space_index_w(w_nsec)?,
             })
         };
 
@@ -2597,29 +2701,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "utime: dir_fd and follow_symlinks=False are unavailable on this platform",
                 ));
             }
-            // A FILETIME counts 100-ns intervals from 1601-01-01, so a
-            // pre-epoch time is an ordinary positive count rather than one with
-            // no representation; utimensat and every POSIX host write it, and
-            // 3.14 writes it through `SetFileTime` (rposix.win32_utime). The
-            // sub-100ns of a nanosecond is not a tick the filesystem holds and
-            // is floored, as the call floors it.
+            // `time_t_to_FILE_TIME` (`rwin32file.py:320-323`): a FILETIME
+            // counts 100ns ticks from 1601-01-01, so shifting the epoch is what
+            // makes a second before 1970 an ordinary positive tick count rather
+            // than one with no representation. The sub-100ns of a nanosecond is
+            // not a tick the filesystem holds and is floored, as the conversion
+            // floors it — which is why `ns=-1` reads back as `-100`.
+            //
+            // The arithmetic wraps rather than checks: `r_longlong` there, and
+            // the same `__int64` in the C the line is a transcription of. A
+            // second this filesystem cannot hold writes the bits the
+            // multiplication leaves rather than being diagnosed, and a value no
+            // `time_t` can hold has already been refused by `time_from_secs`.
             const EPOCH_DIFF: i64 = 11_644_473_600;
-            let to_filetime = |t: UTime| -> Result<FILETIME, crate::PyError> {
+            let to_filetime = |t: UTime| -> FILETIME {
                 let ticks = t
                     .sec
-                    .checked_add(EPOCH_DIFF)
-                    .filter(|s| *s >= 0)
-                    .and_then(|s| s.checked_mul(10_000_000))
-                    .and_then(|s| s.checked_add(t.nsec / 100))
-                    .ok_or_else(|| crate::PyError::value_error("utime: timestamp out of range"))?
-                    as u64;
-                Ok(FILETIME {
+                    .wrapping_add(EPOCH_DIFF)
+                    .wrapping_mul(10_000_000)
+                    .wrapping_add(t.nsec / 100) as u64;
+                FILETIME {
                     dwLowDateTime: ticks as u32,
                     dwHighDateTime: (ticks >> 32) as u32,
-                })
+                }
             };
-            let atime = to_filetime(access)?;
-            let mtime = to_filetime(modified)?;
+            let atime = to_filetime(access);
+            let mtime = to_filetime(modified);
             let wide = wide_path(&path.as_bytes)?;
             // FILE_WRITE_ATTRIBUTES is the access `SetFileTime` takes;
             // FILE_FLAG_BACKUP_SEMANTICS lets the name open a directory too.
@@ -3111,9 +3218,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 meta.atime(),
                 meta.mtime(),
                 meta.ctime(),
-                meta.atime() * 1_000_000_000 + meta.atime_nsec(),
-                meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
-                meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                whole_ns(meta.atime(), meta.atime_nsec()),
+                whole_ns(meta.mtime(), meta.mtime_nsec()),
+                whole_ns(meta.ctime(), meta.ctime_nsec()),
             )
         };
         #[cfg(windows)]
@@ -3167,12 +3274,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             let atime_secs = (meta.last_access_time() as i64 / 10_000_000) - EPOCH_DIFF;
             let mtime_secs = (meta.last_write_time() as i64 / 10_000_000) - EPOCH_DIFF;
             let ctime_secs = (meta.creation_time() as i64 / 10_000_000) - EPOCH_DIFF;
-            let atime_ns =
-                ((meta.last_access_time() as i64 % 10_000_000) * 100) + atime_secs * 1_000_000_000;
-            let mtime_ns =
-                ((meta.last_write_time() as i64 % 10_000_000) * 100) + mtime_secs * 1_000_000_000;
-            let ctime_ns =
-                ((meta.creation_time() as i64 % 10_000_000) * 100) + ctime_secs * 1_000_000_000;
+            let atime_ns = whole_ns(atime_secs, (meta.last_access_time() as i64 % 10_000_000) * 100);
+            let mtime_ns = whole_ns(mtime_secs, (meta.last_write_time() as i64 % 10_000_000) * 100);
+            let ctime_ns = whole_ns(ctime_secs, (meta.creation_time() as i64 % 10_000_000) * 100);
             (
                 mode, 0i64, // st_ino — not available on Windows
                 0i64, // st_dev
@@ -3222,6 +3326,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// The `stat_result` fields, read out of whichever source produced them:
     /// `std::fs::Metadata` for the path and descriptor forms, `libc::stat`
     /// for the `fstatat` form a `dir_fd`-relative name takes.
+    /// A whole timestamp in nanoseconds.
+    ///
+    /// `i64` nanoseconds run out in 2262, and a file can carry a later time
+    /// than that — every Windows FILETIME up to the year 30828 is one. The
+    /// product is taken wide so `st_mtime_ns` is the number it is rather than
+    /// the wrap `sec * 1_000_000_000` would answer with, and
+    /// [`w_time_ns`] hands back an int of whatever width it needs.
+    fn whole_ns(sec: i64, nsec: i64) -> i128 {
+        sec as i128 * 1_000_000_000 + nsec as i128
+    }
+
+    /// The `st_*_ns` field as a Python int, which has no width to run out of.
+    fn w_time_ns(ns: i128) -> pyre_object::PyObjectRef {
+        match i64::try_from(ns) {
+            Ok(n) => pyre_object::w_int_new(n),
+            Err(_) => pyre_object::longobject::w_long_new(pyre_object::rbigint::RBigInt::from(ns)),
+        }
+    }
+
     struct StatFields {
         mode: i64,
         ino: i64,
@@ -3233,9 +3356,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         atime: i64,
         mtime: i64,
         ctime: i64,
-        atime_ns: i64,
-        mtime_ns: i64,
-        ctime_ns: i64,
+        atime_ns: i128,
+        mtime_ns: i128,
+        ctime_ns: i128,
         #[cfg(unix)]
         blksize: i64,
         #[cfg(unix)]
@@ -3294,31 +3417,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // `_ll_get_st_atime` — float times keep sub-second precision:
         // `float(seconds) + 1e-9 * nanosecond_fraction`, where the
         // fraction is recovered from the full-nanosecond field.
-        let st_atime_f = st_atime as f64 + 1e-9 * (st_atime_ns - st_atime * 1_000_000_000) as f64;
-        let st_mtime_f = st_mtime as f64 + 1e-9 * (st_mtime_ns - st_mtime * 1_000_000_000) as f64;
-        let st_ctime_f = st_ctime as f64 + 1e-9 * (st_ctime_ns - st_ctime * 1_000_000_000) as f64;
+        let st_atime_f = st_atime as f64 + 1e-9 * (st_atime_ns - whole_ns(st_atime, 0)) as f64;
+        let st_mtime_f = st_mtime as f64 + 1e-9 * (st_mtime_ns - whole_ns(st_mtime, 0)) as f64;
+        let st_ctime_f = st_ctime as f64 + 1e-9 * (st_ctime_ns - whole_ns(st_ctime, 0)) as f64;
         #[allow(unused_mut)]
         let mut extras = vec![
             ("st_atime", pyre_object::w_float_new(st_atime_f)),
             ("st_mtime", pyre_object::w_float_new(st_mtime_f)),
             ("st_ctime", pyre_object::w_float_new(st_ctime_f)),
-            ("st_atime_ns", pyre_object::w_int_new(st_atime_ns)),
-            ("st_mtime_ns", pyre_object::w_int_new(st_mtime_ns)),
-            ("st_ctime_ns", pyre_object::w_int_new(st_ctime_ns)),
+            ("st_atime_ns", w_time_ns(st_atime_ns)),
+            ("st_mtime_ns", w_time_ns(st_mtime_ns)),
+            ("st_ctime_ns", w_time_ns(st_ctime_ns)),
             // `build_stat_result` (interp_posix.py:554-557): the
             // sub-second remainder of each full-nanosecond timestamp,
             // `value % 1_000_000_000` (non-negative for pre-1970 times).
             (
                 "nsec_atime",
-                pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000)),
+                pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000) as i64),
             ),
             (
                 "nsec_mtime",
-                pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000)),
+                pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000) as i64),
             ),
             (
                 "nsec_ctime",
-                pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000)),
+                pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000) as i64),
             ),
         ];
         #[cfg(unix)]
@@ -3343,9 +3466,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let st_atime = st.atime;
         let st_mtime = st.mtime;
         let st_ctime = st.ctime;
-        let st_atime_ns = st.atime * 1_000_000_000 + st.atime_nsec;
-        let st_mtime_ns = st.mtime * 1_000_000_000 + st.mtime_nsec;
-        let st_ctime_ns = st.ctime * 1_000_000_000 + st.ctime_nsec;
+        let st_atime_ns = whole_ns(st.atime, st.atime_nsec);
+        let st_mtime_ns = whole_ns(st.mtime, st.mtime_nsec);
+        let st_ctime_ns = whole_ns(st.ctime, st.ctime_nsec);
         let seq = vec![
             pyre_object::w_int_new(st.mode as i64),
             pyre_object::w_int_new(st.ino as i64),
@@ -3358,28 +3481,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             pyre_object::w_int_new(st_mtime),
             pyre_object::w_int_new(st_ctime),
         ];
-        let st_atime_f = st_atime as f64 + 1e-9 * (st_atime_ns - st_atime * 1_000_000_000) as f64;
-        let st_mtime_f = st_mtime as f64 + 1e-9 * (st_mtime_ns - st_mtime * 1_000_000_000) as f64;
-        let st_ctime_f = st_ctime as f64 + 1e-9 * (st_ctime_ns - st_ctime * 1_000_000_000) as f64;
+        let st_atime_f = st_atime as f64 + 1e-9 * (st_atime_ns - whole_ns(st_atime, 0)) as f64;
+        let st_mtime_f = st_mtime as f64 + 1e-9 * (st_mtime_ns - whole_ns(st_mtime, 0)) as f64;
+        let st_ctime_f = st_ctime as f64 + 1e-9 * (st_ctime_ns - whole_ns(st_ctime, 0)) as f64;
         #[allow(unused_mut)]
         let mut extras = vec![
             ("st_atime", pyre_object::w_float_new(st_atime_f)),
             ("st_mtime", pyre_object::w_float_new(st_mtime_f)),
             ("st_ctime", pyre_object::w_float_new(st_ctime_f)),
-            ("st_atime_ns", pyre_object::w_int_new(st_atime_ns)),
-            ("st_mtime_ns", pyre_object::w_int_new(st_mtime_ns)),
-            ("st_ctime_ns", pyre_object::w_int_new(st_ctime_ns)),
+            ("st_atime_ns", w_time_ns(st_atime_ns)),
+            ("st_mtime_ns", w_time_ns(st_mtime_ns)),
+            ("st_ctime_ns", w_time_ns(st_ctime_ns)),
             (
                 "nsec_atime",
-                pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000)),
+                pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000) as i64),
             ),
             (
                 "nsec_mtime",
-                pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000)),
+                pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000) as i64),
             ),
             (
                 "nsec_ctime",
-                pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000)),
+                pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000) as i64),
             ),
             ("st_blksize", pyre_object::w_int_new(st.blksize as i64)),
             ("st_blocks", pyre_object::w_int_new(st.blocks as i64)),
@@ -3501,9 +3624,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             atime: st.st_atime as i64,
             mtime: st.st_mtime as i64,
             ctime: st.st_ctime as i64,
-            atime_ns: st.st_atime as i64 * 1_000_000_000 + st.st_atime_nsec as i64,
-            mtime_ns: st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
-            ctime_ns: st.st_ctime as i64 * 1_000_000_000 + st.st_ctime_nsec as i64,
+            atime_ns: whole_ns(st.st_atime as i64, st.st_atime_nsec as i64),
+            mtime_ns: whole_ns(st.st_mtime as i64, st.st_mtime_nsec as i64),
+            ctime_ns: whole_ns(st.st_ctime as i64, st.st_ctime_nsec as i64),
             blksize: st.st_blksize as i64,
             blocks: st.st_blocks as i64,
             rdev: st.st_rdev as i64,
@@ -3534,9 +3657,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             atime: st.st_atime as i64,
             mtime: st.st_mtime as i64,
             ctime: st.st_birthtime as i64,
-            atime_ns: st.st_atime as i64 * 1_000_000_000 + st.st_atime_nsec as i64,
-            mtime_ns: st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
-            ctime_ns: st.st_birthtime as i64 * 1_000_000_000 + st.st_birthtime_nsec as i64,
+            atime_ns: whole_ns(st.st_atime as i64, st.st_atime_nsec as i64),
+            mtime_ns: whole_ns(st.st_mtime as i64, st.st_mtime_nsec as i64),
+            ctime_ns: whole_ns(st.st_birthtime as i64, st.st_birthtime_nsec as i64),
         }
     }
 
@@ -5727,25 +5850,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
         }
 
-        /// `space.int_w` over the `r_longlong` half of `interp_posix.py:404`.
-        #[cfg(all(unix, not(feature = "sandbox")))]
-        fn truncate_length_w(obj: PyObjectRef) -> Result<libc::off_t, crate::PyError> {
-            let w_length = crate::baseobjspace::space_index(obj)?;
-            let length = crate::baseobjspace::int_w(w_length).map_err(|err| {
-                if err.kind == crate::PyErrorKind::OverflowError {
-                    crate::PyError::overflow_error("Python int too large to convert to C long")
-                } else {
-                    err
-                }
-            })?;
-            // `off_t` is the width the call takes the length in, and a value
-            // above it is not a size the file can be given. An `as` cast would
-            // wrap it into one the caller never asked for and truncate the file
-            // to that instead.
-            libc::off_t::try_from(length).map_err(|_| {
-                crate::PyError::overflow_error("Python int too large to convert to C long")
-            })
-        }
 
         // os.truncate(path, length) -> None
         //
@@ -8014,7 +8118,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "ftruncate() requires 2 arguments",
                         ));
                     }
-                    let length = crate::baseobjspace::int_w(args[1])?;
+                    let length = truncate_length_w(args[1])?;
                     crt_result(crt_fd::ftruncate(borrowed_fd(args[0])?, length))
                 },
                 2,
@@ -8035,7 +8139,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(crate::PyError::type_error("truncate() requires 2 arguments"));
                     }
                     let path = crate::gateway::fsencode_path_or_fd_w(args[0], "truncate", true)?;
-                    let length = crate::baseobjspace::int_w(args[1])?;
+                    let length = truncate_length_w(args[1])?;
                     if path.as_fd != -1 {
                         let bfd = unsafe { crt_fd::Borrowed::borrow_raw(path.as_fd) };
                         return crt_result(crt_fd::ftruncate(bfd, length));
