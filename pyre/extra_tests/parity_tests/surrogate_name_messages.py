@@ -52,6 +52,28 @@ def check_function_qualname():
     else:
         raise AssertionError("no TypeError")
 
+    # A defaulted parameter takes the binder down its other arm, which builds
+    # the same two messages from the same name.
+    def g(a, b=1):
+        return a, b
+
+    g.__qualname__ = S
+
+    try:
+        g(1, 2, 3)
+    except TypeError as e:
+        expected = S + "() takes from 1 to 2 positional arguments but 3 were given"
+        assert str(e) == expected, ascii(str(e))
+    else:
+        raise AssertionError("no TypeError")
+
+    try:
+        g(1, a=2)
+    except TypeError as e:
+        assert str(e) == S + "() got multiple values for argument 'a'", ascii(str(e))
+    else:
+        raise AssertionError("no TypeError")
+
 
 def check_generator_qualname():
     def g():

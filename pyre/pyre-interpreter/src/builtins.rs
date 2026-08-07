@@ -13989,7 +13989,9 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             file_get_fd(self_obj).unwrap_or(-1)
         ))
     };
-    Ok(w_str_new(&format!("<{repr_type} {body}>")))
+    Ok(pyre_object::w_str_from_wtf8(
+        crate::display::wtf8_format!(format!("<{repr_type} "), body, ">"),
+    ))
 }
 
 /// `_io.FileIO.__init__` — PyPy `W_FileIO.descr_init`.

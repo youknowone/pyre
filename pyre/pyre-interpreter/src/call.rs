@@ -1975,10 +1975,12 @@ pub(crate) fn resolve_kwargs(
                 }
                 // argument.py:410 — duplicate keyword argument
                 if !result[pi].is_null() {
-                    return Err(crate::PyError::type_error(format!(
-                        "{}() got multiple values for argument '{}'",
-                        fname, param_name
-                    )));
+                    let mut msg = Wtf8Buf::new();
+                    msg.push_wtf8(&fname);
+                    msg.push_str(&format!(
+                        "() got multiple values for argument '{param_name}'"
+                    ));
+                    return Err(crate::PyError::type_error(msg));
                 }
                 result[pi] = kw_value;
                 matched = true;
@@ -2071,10 +2073,10 @@ pub(crate) fn resolve_kwargs(
                 if n_pos != 1 { "were" } else { "was" }
             )
         };
-        return Err(crate::PyError::type_error(format!(
-            "{}() takes {} but {}",
-            fname, takes_str, given_str
-        )));
+        let mut msg = Wtf8Buf::new();
+        msg.push_wtf8(&fname);
+        msg.push_str(&format!("() takes {takes_str} but {given_str}"));
+        return Err(crate::PyError::type_error(msg));
     }
 
     // Fill positional defaults (PyPy: _match_signature defs_w)
@@ -2717,10 +2719,12 @@ pub fn call_with_kwargs_in_ctx(
                         // argument.py:495 — ArgErrMultipleValues: keyword
                         // duplicates an already-bound positional argument.
                         if !result[pi].is_null() {
-                            return Err(crate::PyError::type_error(format!(
-                                "{}() got multiple values for argument '{}'",
-                                fname, key
-                            )));
+                            let mut msg = Wtf8Buf::new();
+                            msg.push_wtf8(&fname);
+                            msg.push_str(&format!(
+                                "() got multiple values for argument '{key}'"
+                            ));
+                            return Err(crate::PyError::type_error(msg));
                         }
                         result[pi] = value;
                         matched = true;
@@ -2779,10 +2783,10 @@ pub fn call_with_kwargs_in_ctx(
                     pos_args.len(),
                     if pos_args.len() != 1 { "were" } else { "was" }
                 );
-                return Err(crate::PyError::type_error(format!(
-                    "{}() takes {} but {} given",
-                    fname, takes_str, given_str
-                )));
+                let mut msg = Wtf8Buf::new();
+                msg.push_wtf8(&fname);
+                msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
+                return Err(crate::PyError::type_error(msg));
             }
 
             // Fill positional defaults from __defaults__ tuple.
