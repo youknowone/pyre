@@ -11262,15 +11262,22 @@ fn handle<Sym: WalkSym>(
                     .bridge_info()
                     .map(|b| (b.trace_id, b.fail_index));
                 let has_targets = driver.meta_interp().has_compiled_targets(key);
-                // A close that did not compile is not retried on a later
+                // A close an attempt *rejected* is not retried on a later
                 // crossing of the same header: the attempt runs the optimizer
                 // over the whole trace-so-far, and the decline is deterministic,
                 // so an inner loop crossed N times would pay N optimizer passes
                 // over a growing trace (see
-                // `TraceCtx::declined_cross_loop_closes`).
+                // `TraceCtx::declined_cross_loop_closes`).  Which outcomes count
+                // as rejected is the `classify_compile_outcome` match below.
                 let already_declined = ctx.trace_ctx.cross_loop_close_declined(key);
                 if !has_partial && has_targets {
                     if !already_declined {
+                        // jitdriver.rs:2981-2988 states the rule the latch runs
+                        // under: only latch what an attempt actually rejected.
+                        // The give-up below returns without calling into
+                        // `compile_trace` at all, so it costs no optimizer pass
+                        // and has nothing to report about this header.
+                        let mut attempted = true;
                         let outcome = match bridge_origin {
                             // Guard-origin: existing bridge path.
                             Some(_) => driver.meta_interp_mut().compile_trace(
@@ -11321,31 +11328,57 @@ fn handle<Sym: WalkSym>(
                                 // halves, so this is unreachable from a jd0 walk; only
                                 // `MetaInterp::force_start_tracing` opens a tracer with
                                 // no session envelope.
-                                None => majit_metainterp::CompileOutcome::Cancelled,
+                                None => {
+                                    attempted = false;
+                                    majit_metainterp::CompileOutcome::Cancelled
+                                }
                             },
                         };
-                        if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
-                            if majit_metainterp::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit][walker-reached-loop-header] compile_trace success: \
+                        // pyjitpl.py:2982-2983 `classify_compile_outcome` is
+                        // the shared reading of a close's outcome; the sibling
+                        // close in `jitdriver.rs:2947` already goes through it.
+                        // Reading `Compiled` here and treating every other
+                        // outcome as one declined close collapses three states
+                        // the classifier keeps apart, and latches the one that
+                        // is explicitly retryable.
+                        match driver.meta_interp().classify_compile_outcome(outcome) {
+                            majit_metainterp::BridgeCompileResult::Compiled => {
+                                if majit_metainterp::majit_log_enabled() {
+                                    eprintln!(
+                                        "[jit][walker-reached-loop-header] compile_trace success: \
                                  key={} pc={} bridge={:?}",
-                                    key, next_instr, bridge_origin
-                                );
+                                        key, next_instr, bridge_origin
+                                    );
+                                }
+                                // pyjitpl.py raise_if_successful() — the
+                                // successful compile_trace ends tracing; surface
+                                // the dedicated outcome so the driver maps it to
+                                // `TraceAction::CompileTrace` (no further compile
+                                // or abort on this session).
+                                driver.note_compile_trace_success();
+                                return Ok((
+                                    DispatchOutcome::CompileTracePending {
+                                        loop_header_pc: next_instr,
+                                    },
+                                    op.next_pc,
+                                ));
                             }
-                            // pyjitpl.py raise_if_successful() — the
-                            // successful compile_trace ends tracing; surface
-                            // the dedicated outcome so the driver maps it to
-                            // `TraceAction::CompileTrace` (no further compile
-                            // or abort on this session).
-                            driver.note_compile_trace_success();
-                            return Ok((
-                                DispatchOutcome::CompileTracePending {
-                                    loop_header_pc: next_instr,
-                                },
-                                op.next_pc,
-                            ));
+                            // pyjitpl.py:3000, jitdriver.rs:2967-2974: the
+                            // attempt armed `partial_trace`, so the next visit
+                            // of this header takes the `has_partial` arm of the
+                            // gate above and runs no optimizer pass either way.
+                            // Once the retrace lands, the state this close was
+                            // refused against is gone -- latching it would
+                            // refuse the close forever for a reason that has
+                            // already stopped holding.
+                            majit_metainterp::BridgeCompileResult::RetraceNeeded => {}
+                            majit_metainterp::BridgeCompileResult::Declined
+                            | majit_metainterp::BridgeCompileResult::Failed => {
+                                if attempted {
+                                    ctx.trace_ctx.note_cross_loop_close_declined(key);
+                                }
+                            }
                         }
-                        ctx.trace_ctx.note_cross_loop_close_declined(key);
                     }
                     // The jump did not take (`compile.compile_trace` returns
                     // None when none of the existing loop tokens match). Fall

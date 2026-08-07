@@ -11083,7 +11083,7 @@ impl<M: Clone> MetaInterp<M> {
     /// bridge (`close_bridge`) and the interp-origin entry bridge
     /// (`compile_trace_from_interp`) alike, since `retrace_after_bridge` is armed
     /// inside the shared compile path rather than per origin.
-    pub(crate) fn classify_compile_outcome(&self, outcome: CompileOutcome) -> BridgeCompileResult {
+    pub fn classify_compile_outcome(&self, outcome: CompileOutcome) -> BridgeCompileResult {
         match outcome {
             CompileOutcome::Compiled { .. } => BridgeCompileResult::Compiled,
             _ if self.retrace_after_bridge => {

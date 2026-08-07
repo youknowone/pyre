@@ -147,12 +147,12 @@ pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_
 /// pool-side resolution without re-deriving a second copy of the logic.
 pub use pyjitpl::dispatch::field_descr_ref_from_bh;
 pub use pyjitpl::{
-    BackEdgeAction, BridgeRetraceResult, ClosureRuntime, ClosureRuntimeWithResolver,
-    CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
-    DeadFrameArtifacts, DetailedDriverRunOutcome, InlineDecision, JitCodeMachine, JitCodeRuntime,
-    JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
-    MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, build_state_field_snapshot,
-    call_int_function, call_ref_function, call_void_function, counters,
+    BackEdgeAction, BridgeCompileResult, BridgeRetraceResult, ClosureRuntime,
+    ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout,
+    CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, InlineDecision,
+    JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack,
+    MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, RawCompileResult, StandaloneFrameStack,
+    build_state_field_snapshot, call_int_function, call_ref_function, call_void_function, counters,
     record_application_traceback_for_recording, record_application_traceback_hook_address,
     record_discarded_level_traceback_for_recording, record_discarded_level_traceback_hook_address,
     record_inline_application_traceback_for_recording,
