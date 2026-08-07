@@ -1177,6 +1177,57 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
     raise SystemExit(1)
 
 
+def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
+    """A/B/A the fingerprint against a new untracked `.rs` under a covered path.
+
+    The blind spot being guarded is silent by construction: `git ls-files` lists
+    tracked paths only, so before `fingerprint_inputs` folded in `--others
+    --exclude-standard`, adding a brand-new module left the hash unmoved and
+    `--check` blessed an artefact built from different source. A wrong answer
+    there prints nothing, so the guard needs a demonstration rather than a
+    reading of the patch. Both legs are required: that the hash *moves* for the
+    new file, and that removing the probe *restores* it, so a change which
+    invalidated every stamp cannot pass by refusing everything.
+
+    The probe exists for one `source_fingerprint` call and is removed in a
+    `finally`. On a shared worktree that is a real if brief mutation — anyone
+    fingerprinting the same crate in that instant sees the moved hash.
+    """
+    inputs = fingerprint_inputs(eng, crates, cargo_features)
+    # Deepest `.rs`: exact-file pathspecs (Cargo.toml, target roots, build.rs)
+    # sit shallow, so a deeply nested file was listed by a `dir/` pathspec and
+    # its directory is therefore covered for new files too.
+    covered = max((p for p in inputs if p.suffix == ".rs"), key=lambda p: (len(p.parts), p.as_posix()), default=None)
+    if covered is None:
+        raise SystemExit(f"self-test: no .rs input for {' '.join(crates)}")
+    probe = eng.root / covered.parent / "__llbc_self_test_probe.rs"
+    if probe.exists():
+        raise SystemExit(f"self-test: {probe} already exists; refusing to clobber it")
+    before = source_fingerprint(eng, crates, cargo_features)
+    try:
+        probe.write_text("// transient probe written by --self-test; safe to delete\n")
+        moved = source_fingerprint(eng, crates, cargo_features)
+        listed = probe.relative_to(eng.root) in set(fingerprint_inputs(eng, crates, cargo_features))
+    finally:
+        probe.unlink(missing_ok=True)
+    after = source_fingerprint(eng, crates, cargo_features)
+    print(f"    probe          {probe.relative_to(eng.root).as_posix()}")
+    print(f"    before         {before}")
+    print(f"    with probe     {moved}  (listed as an input: {listed})")
+    print(f"    after removal  {after}")
+    failures = []
+    if moved == before:
+        failures.append("a new untracked .rs did not move the fingerprint — the guard is blind")
+    if after != before:
+        failures.append("removing the probe did not restore the fingerprint — it left residue")
+    if failures:
+        sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
+        for line in failures:
+            print(f"self-test FAILED: {line}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"\nself-test passed: {' '.join(crates)}")
+
+
 def run_cli(
     specs: dict[str, CrateSpec],
     default_crates: list[str],
@@ -1203,6 +1254,12 @@ def run_cli(
         action="store_true",
         help="compare the existing artefacts against the tree and exit nonzero "
         "if any is stale; never extracts",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="prove the source fingerprint still sees a new untracked .rs; "
+        "writes and removes one transient probe file, never extracts",
     )
     parser.add_argument(
         "--force",
@@ -1244,6 +1301,9 @@ def run_cli(
         return
     if args.fingerprint:
         print(source_fingerprint(eng, crates, cargo_features))
+        return
+    if args.self_test:
+        self_test(eng, crates, cargo_features)
         return
     if args.check:
         check(eng, args)
