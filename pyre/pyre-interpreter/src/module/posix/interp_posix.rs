@@ -574,6 +574,11 @@ mod win_nt {
 
     /// Read argument 0 as a filesystem path; the flag reports whether the
     /// input was bytes so the result can be encoded back to match.
+    ///
+    /// The conversion is the caller-less one. Every entry point reached through
+    /// here is Windows-only, so what it should name itself and its argument is
+    /// not something this host can measure, and a guessed wording would be
+    /// worse than the one uniform gap. See the follow-up task.
     fn arg_path(
         args: &[PyObjectRef],
         func: &str,
@@ -2236,7 +2241,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 .first()
                 .copied()
                 .ok_or_else(|| crate::PyError::type_error("readlink() requires 1 argument"))?;
-            let path = crate::gateway::fsencode_path_w(arg)?;
+            let path = crate::gateway::fsencode_path_named_w(arg, "readlink", "path")?;
             let bytes_mode = unsafe { path.is_bytes() };
             match std::fs::read_link(path_from_bytes(&path.as_bytes).as_ref()) {
                 Ok(target) => {
@@ -2377,8 +2382,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             )));
         }
         crate::builtins::kwarg_reject_unknown(kwargs, &["src_dir_fd", "dst_dir_fd"], name)?;
-        let src = crate::gateway::fsencode_path_w(pos[0])?;
-        let dst = crate::gateway::fsencode_path_w(pos[1])?;
+        // `rename` and `replace` are one body here and two argument-clinic
+        // declarations there, so the rejected argument is named after whichever
+        // of the two the caller reached.
+        let src = crate::gateway::fsencode_path_named_w(pos[0], name, "src")?;
+        let dst = crate::gateway::fsencode_path_named_w(pos[1], name, "dst")?;
         let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
             match crate::builtins::kwarg_get(kwargs, name) {
                 // interp_posix.py:274-278 `_unwrap_dirfd` — a non-`None` value
@@ -2840,6 +2848,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "_path_splitroot() missing required argument 'path'",
                     ));
                 };
+                // Windows-only, so what it should name itself with is not
+                // measurable from a POSIX host; it keeps the caller-less
+                // conversion meanwhile. See the follow-up task.
                 let path = extract_path(arg)?;
                 // Splitting a drive or UNC prefix is a text operation on a
                 // Windows path, and both halves are handed back as `str`, so
@@ -4962,6 +4973,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             let mut argv = Vec::with_capacity(items.len());
             for item in items {
+                // An element is converted on the sequence's behalf, not as an
+                // argument of the call, so the caller-less message is the one
+                // it reports — measured, and the same for the environment
+                // below and for `posix_spawn`'s file actions.
                 let value = extract_path(item)?;
                 argv.push(std::ffi::CString::new(value).map_err(|_| {
                     crate::PyError::value_error(format!(
@@ -4991,7 +5006,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "execv",
                 |args| {
-                    let command = extract_path(args[0])?;
+                    // The path names itself; the argv entries below do not,
+                    // because each of those is converted on the sequence's
+                    // behalf rather than as an argument of its own.
+                    let command =
+                        crate::gateway::fsencode_path_named_w(args[0], "execv", "path")?.as_bytes;
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execv() path contains an embedded null byte")
                     })?;
@@ -5015,7 +5034,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "execve",
                 |args| {
-                    let command = extract_path(args[0])?;
+                    let command =
+                        crate::gateway::fsencode_path_named_w(args[0], "execve", "path")?.as_bytes;
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execve() path contains an embedded null byte")
                     })?;
@@ -6387,8 +6407,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("symlink() requires 2 arguments"));
                 }
-                let src = crate::gateway::fsencode_path_w(args[0])?;
-                let dst = crate::gateway::fsencode_path_w(args[1])?;
+                let src = crate::gateway::fsencode_path_named_w(args[0], "symlink", "src")?;
+                let dst = crate::gateway::fsencode_path_named_w(args[1], "symlink", "dst")?;
                 let c_src = std::ffi::CString::new(src.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
                 let c_dst = std::ffi::CString::new(dst.as_bytes.as_slice())
@@ -6420,8 +6440,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "link",
                 )?;
                 link_positional(args)?;
-                let src = crate::gateway::fsencode_path_w(args[0])?;
-                let dst = crate::gateway::fsencode_path_w(args[1])?;
+                let src = crate::gateway::fsencode_path_named_w(args[0], "link", "src")?;
+                let dst = crate::gateway::fsencode_path_named_w(args[1], "link", "dst")?;
                 let c_src = std::ffi::CString::new(src.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
                 let c_dst = std::ffi::CString::new(dst.as_bytes.as_slice())
@@ -6867,7 +6887,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("access() requires 2 arguments"));
                 }
-                let path = extract_path(args[0])?;
+                let path = crate::gateway::fsencode_path_named_w(args[0], "access", "path")?
+                    .as_bytes;
                 // interp_posix.py:744 `@unwrap_spec(mode=c_int, ...)`.
                 let mode = crate::baseobjspace::c_int_w(args[1])?;
                 #[cfg(feature = "sandbox")]
@@ -6903,7 +6924,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("chroot() requires 1 argument"));
                     }
-                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    let path = crate::gateway::fsencode_path_named_w(args[0], "chroot", "path")?;
                     host_posix::chroot(path_from_bytes(&path.as_bytes).as_ref())
                         .map_err(|e| io_err_with_filename(e, path.w_path()))?;
                     Ok(pyre_object::w_none())
@@ -7146,7 +7167,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "posix_spawn() requires path, argv, env",
                     ));
                 }
-                let path = crate::gateway::fsencode_path_w(positional[0])?;
+                // The two entry points share this body and have an argument
+                // clinic declaration each, so the one the caller reached is the
+                // name its rejected path reports.
+                let func = if spawnp { "posix_spawnp" } else { "posix_spawn" };
+                let path = crate::gateway::fsencode_path_named_w(positional[0], func, "path")?;
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice()).map_err(|_| {
                     crate::PyError::value_error("posix_spawn: embedded null in path")
                 })?;
@@ -8211,7 +8236,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("chdir() requires 1 argument"));
                     }
-                    let path = crate::gateway::fsencode_path_w(args[0])?;
+                    // The POSIX `chdir` names `integer` in its allowed types
+                    // because it can `fchdir`; there is none here, so the list
+                    // this one shows is the path-only one.
+                    let path = crate::gateway::fsencode_path_named_w(args[0], "chdir", "path")?;
                     std::env::set_current_dir(path_from_bytes(&path.as_bytes).as_ref())
                         .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
                     Ok(pyre_object::w_none())
@@ -8230,7 +8258,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("access() requires 2 arguments"));
                 }
-                let path = crate::gateway::fsencode_path_w(args[0])?;
+                let path = crate::gateway::fsencode_path_named_w(args[0], "access", "path")?;
                 // Only `W_OK` is read, so the byte holding it is the whole of
                 // the mode as far as the answer goes.
                 let mode = crate::baseobjspace::c_int_w(args[1])? as u8;
@@ -8373,8 +8401,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 link_positional(args)?;
-                let src = crate::gateway::fsencode_path_w(args[0])?;
-                let dst = crate::gateway::fsencode_path_w(args[1])?;
+                let src = crate::gateway::fsencode_path_named_w(args[0], "link", "src")?;
+                let dst = crate::gateway::fsencode_path_named_w(args[1], "link", "dst")?;
                 let (wide_src, wide_dst) =
                     (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);
                 let ok = unsafe {
@@ -8423,8 +8451,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("symlink() requires 2 arguments"));
                 }
-                let src = crate::gateway::fsencode_path_w(args[0])?;
-                let dst = crate::gateway::fsencode_path_w(args[1])?;
+                let src = crate::gateway::fsencode_path_named_w(args[0], "symlink", "src")?;
+                let dst = crate::gateway::fsencode_path_named_w(args[1], "symlink", "dst")?;
                 let target_is_directory = match args
                     .get(2)
                     .copied()
@@ -8550,6 +8578,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
                 // Every optional argument is positional-or-keyword, so the
                 // four of them are looked up either way round.
+                //
+                // `filepath` and `cwd` convert through the caller-less form:
+                // this entry point exists only here, so the wording it should
+                // name itself with is unmeasured on this host. See the
+                // follow-up task.
                 let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
                 crate::builtins::kwarg_reject_unknown(
                     kwargs,
@@ -8635,6 +8668,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // one re-encodes it through the ANSI code page.  Neither reports a
         // failure other than through the status, which `os_system_impl`
         // returns as it is.
+        //
+        // The POSIX `system` converts its command as a filesystem name and so
+        // reports the caller-less message — measured. This one declares text
+        // rather than a path, so the message it should report is a different
+        // shape entirely and is unmeasured here; it keeps the same conversion
+        // meanwhile. See the follow-up task.
         crate::module_ns_store(
             ns,
             "system",
@@ -8745,6 +8784,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 0,
             ),
         );
+        // `volume` converts through the caller-less form: 3.14 added this entry
+        // point on Windows alone, so what it names itself with is unmeasured on
+        // this host. See the follow-up task.
         crate::module_ns_store(
             ns,
             "listmounts",

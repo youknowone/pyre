@@ -1690,8 +1690,24 @@ impl FsEncodedPath {
     }
 }
 
+/// The caller-less conversion, which names neither a function nor an argument.
+/// It is what `os.fspath`, `os.fsencode` and the builtin `open` report, and what
+/// a boundary spelling its path some other way than `path_converter` — Windows'
+/// `os.system`, whose argument is text rather than a path — falls back to.
 pub fn fsencode_path_w(obj: pyre_object::PyObjectRef) -> Result<FsEncodedPath, crate::PyError> {
     path_or_fd_w(obj, None, false, false)
+}
+
+/// [`fsencode_path_w`] for a path-only boundary that names itself. The argument
+/// name is the second half: `path_converter` fills `function_name` and
+/// `argument_name` from the argument clinic, so `link` rejects its first
+/// argument as `src` and its second as `dst` rather than calling both `path`.
+pub fn fsencode_path_named_w(
+    obj: pyre_object::PyObjectRef,
+    funcname: &str,
+    argname: &str,
+) -> Result<FsEncodedPath, crate::PyError> {
+    path_or_fd_w(obj, Some((funcname, argname)), false, false)
 }
 
 /// [`fsencode_path_w`] for a boundary that also takes an open file descriptor —
@@ -1704,7 +1720,7 @@ pub fn fsencode_path_or_fd_w(
     funcname: &str,
     allow_fd: bool,
 ) -> Result<FsEncodedPath, crate::PyError> {
-    path_or_fd_w(obj, Some(funcname), allow_fd, false)
+    path_or_fd_w(obj, Some((funcname, "path")), allow_fd, false)
 }
 
 /// [`fsencode_path_or_fd_w`] for a boundary whose path argument also takes
@@ -1717,7 +1733,7 @@ pub fn fsencode_path_or_fd_nullable_w(
     funcname: &str,
     allow_fd: bool,
 ) -> Result<FsEncodedPath, crate::PyError> {
-    path_or_fd_w(obj, Some(funcname), allow_fd, true)
+    path_or_fd_w(obj, Some((funcname, "path")), allow_fd, true)
 }
 
 /// `_PyType_Name` — the type's own name, with any module that qualifies it
@@ -1734,13 +1750,13 @@ pub(crate) fn short_type_name(obj: pyre_object::PyObjectRef) -> String {
 
 fn path_or_fd_w(
     obj: pyre_object::PyObjectRef,
-    funcname: Option<&str>,
+    caller: Option<(&str, &str)>,
     allow_fd: bool,
     nullable: bool,
 ) -> Result<FsEncodedPath, crate::PyError> {
-    // interp_posix.py:170-180 builds this list from the same two flags, and the
-    // caller-named form is the only one CPython ever shows for these entry
-    // points; the unnamed form is what every path-only boundary already emits.
+    // interp_posix.py:170-180 builds this list from the same two flags. The
+    // caller pair is `path_converter`'s `function_name` and `argument_name`;
+    // the entry points that convert on someone else's behalf carry neither.
     let allowed_types = match (nullable, allow_fd) {
         (true, true) => "string, bytes, os.PathLike, integer or None",
         (true, false) => "string, bytes, os.PathLike or None",
@@ -1749,9 +1765,9 @@ fn path_or_fd_w(
     };
     let reject = |obj: pyre_object::PyObjectRef| -> crate::PyError {
         let tp = short_type_name(obj);
-        match funcname {
-            Some(name) => crate::PyError::type_error(format!(
-                "{name}: path should be {allowed_types}, not {tp}"
+        match caller {
+            Some((name, arg)) => crate::PyError::type_error(format!(
+                "{name}: {arg} should be {allowed_types}, not {tp}"
             )),
             None => crate::PyError::type_error(format!(
                 "expected str, bytes or os.PathLike object, not {tp}"
