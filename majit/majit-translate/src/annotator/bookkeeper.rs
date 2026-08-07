@@ -2134,6 +2134,21 @@ impl Bookkeeper {
         // (`valuetype_to_someshell(Ref) -> SomeInstance(classdef=None)`), which
         // `generalize_attr` can only widen, so a reference-typed tuple element
         // stays classdef-less however precisely its writers are annotated.
+        let filtered_nullable_fields: Vec<String> = {
+            if !majit_ir::descr::is_shaped_tuple_name(n) {
+                Vec::new()
+            } else {
+                let guard = self.pyre_struct_fields.borrow();
+                guard
+                    .as_ref()
+                    .and_then(|r| r.fields.get(n))
+                    .into_iter()
+                    .flat_map(|fields| fields.iter())
+                    .filter(|(_, ty)| is_nullable_sum_spelling(ty))
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            }
+        };
         let mut fields: Vec<(String, String)> = {
             let guard = self.pyre_struct_fields.borrow();
             match guard.as_ref().and_then(|r| {
@@ -2205,6 +2220,32 @@ impl Bookkeeper {
         }
         let host = self.intern_class_by_qualname(n);
         let classdef = self.getuniqueclassdef(&host)?;
+        // The constructor materializes the nullable sum variant in each
+        // filtered tuple field.  `register_struct_fields` may already have
+        // seeded that same slot with the untyped Ref force shell, but the
+        // constructor's `generalize_attr` must start from lattice bottom or
+        // the classless shell wins the union and discards the variant
+        // ClassDef.  Reset ONLY rows removed by the nullable-sum retain;
+        // real annotation flow remains monotonic.
+        if !filtered_nullable_fields.is_empty() {
+            let mut classdef_mut = classdef.borrow_mut();
+            for field_name in &filtered_nullable_fields {
+                let Some(attr) = classdef_mut.attrs.get_mut(field_name) else {
+                    continue;
+                };
+                let is_untyped_force_shell = matches!(
+                    &attr.s_value,
+                    SomeValue::Instance(inst)
+                        if inst.classdef.is_none()
+                            && !inst.can_be_none
+                            && inst.flags.is_empty()
+                            && inst.base.const_box.is_none()
+                );
+                if is_untyped_force_shell {
+                    attr.s_value = SomeValue::Impossible;
+                }
+            }
+        }
         for (field_name, field_ty) in &fields {
             if field_name == "__class__" {
                 continue;
@@ -6341,6 +6382,112 @@ mod tests {
             "varnames must project to SomeList, got {:?}",
             varnames.s_value
         );
+    }
+
+    #[test]
+    fn shaped_tuple_nullable_rows_keep_variant_classdefs_after_constructor_setattr() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let tuple = "Tuple<Option<Vec<*mut PyObject>>,Result<Vec<*mut PyObject>,PyErr>>";
+        crate::annotator::classdesc::register_struct_fields(
+            tuple,
+            &[
+                ("__pos_0".to_string(), crate::model::ValueType::Ref(None)),
+                ("__pos_1".to_string(), crate::model::ValueType::Ref(None)),
+            ],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            tuple.to_string(),
+            vec![
+                (
+                    "__pos_0".to_string(),
+                    "Option<Vec<*mut PyObject>>".to_string(),
+                ),
+                (
+                    "__pos_1".to_string(),
+                    "Result<Vec<*mut PyObject>,PyErr>".to_string(),
+                ),
+            ],
+        );
+        reg.fields.insert(
+            "Option<Vec<*mut PyObject>>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "Option<Vec<*mut PyObject>>::Some".to_string(),
+            vec![("__pos_0".to_string(), "Vec<*mut PyObject>".to_string())],
+        );
+        reg.fields.insert(
+            "Result<Vec<*mut PyObject>,PyErr>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "Result<Vec<*mut PyObject>,PyErr>::Ok".to_string(),
+            vec![("__pos_0".to_string(), "Vec<*mut PyObject>".to_string())],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        let tuple_host = bk.intern_class_by_qualname(tuple);
+        let tuple_cd = bk.getuniqueclassdef(&tuple_host).expect("tuple classdef");
+        {
+            let attrs = tuple_cd.borrow();
+            for field in ["__pos_0", "__pos_1"] {
+                let value = &attrs.attrs.get(field).expect("tuple field").s_value;
+                assert!(
+                    matches!(value, SomeValue::Instance(inst)
+                    if inst.classdef.is_none() && !inst.can_be_none
+                        && inst.flags.is_empty() && inst.base.const_box.is_none()),
+                    "{field} pre-seed must be untyped force shell, got {value:?}"
+                );
+                eprintln!("probe {field} after force seeding, before projection: {value:?}");
+            }
+        }
+        bk.project_struct_rows(tuple).expect("tuple rows project");
+        {
+            let attrs = tuple_cd.borrow();
+            for field in ["__pos_0", "__pos_1"] {
+                assert!(
+                    matches!(
+                        attrs.attrs.get(field).expect("tuple field").s_value,
+                        SomeValue::Impossible
+                    ),
+                    "{field} filtered row must reset its force shell before setattr"
+                );
+            }
+        }
+
+        let some_cd = bk
+            .getuniqueclassdef_for_enum_variant("Option<Vec<*mut PyObject>>", "Some")
+            .expect("Option::Some");
+        let ok_cd = bk
+            .getuniqueclassdef_for_enum_variant("Result<Vec<*mut PyObject>,PyErr>", "Ok")
+            .expect("Result::Ok");
+        for (field, classdef) in [("__pos_0", some_cd.clone()), ("__pos_1", ok_cd.clone())] {
+            ClassDef::generalize_attr(
+                &tuple_cd,
+                field,
+                Some(SomeValue::Instance(SomeInstance::new(
+                    Some(classdef),
+                    false,
+                    std::collections::BTreeMap::new(),
+                ))),
+            )
+            .expect("constructor setattr");
+        }
+        let attrs = tuple_cd.borrow();
+        for (field, expected) in [("__pos_0", some_cd), ("__pos_1", ok_cd)] {
+            let value = &attrs.attrs.get(field).expect("tuple field").s_value;
+            eprintln!("probe {field} after constructor setattr: {value:?}");
+            assert!(
+                matches!(value, SomeValue::Instance(inst)
+                if inst.classdef.as_ref().is_some_and(|cd| Rc::ptr_eq(cd, &expected))),
+                "{field} must retain variant ClassDef, got {value:?}"
+            );
+        }
     }
 
     /// Fixture for the methods-on-classdef capability that `dyn Trait`
