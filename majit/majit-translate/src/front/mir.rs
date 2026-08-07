@@ -4650,10 +4650,6 @@ impl<'a> Lowering<'a> {
                 // Resolve operand Variables up front; they flow into the
                 // synthesised FieldWrite chain rather than the ctor's
                 // arg list.
-                let rangeto_end_is_unsigned = operands
-                    .first()
-                    .and_then(operand_tyref)
-                    .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Unsigned);
                 let mut arg_vars: Vec<Variable> = Vec::with_capacity(operands.len());
                 for op in operands {
                     arg_vars.push(self.resolve_operand(mir_bb, op)?);
@@ -4758,7 +4754,6 @@ impl<'a> Lowering<'a> {
                         crate::front::slice_index::SliceIndexRangeToSite {
                             range_result: res.clone(),
                             end: arg_vars[0].clone(),
-                            end_is_unsigned: rangeto_end_is_unsigned,
                         },
                     );
                 }
@@ -23252,63 +23247,6 @@ mod tests {
         );
     }
 
-    /// Real-LLBC anchor for the `usize` stop in
-    /// `split_builtin_kwargs`'s `&args[..args.len() - 1]`. Rust's checked
-    /// MIR represents the subtraction destination as `(usize, bool)`, while
-    /// the graph deliberately collapses its `.0` projection to the scalar
-    /// arithmetic result. That scalar must retain the tuple's `usize`
-    /// element type so annotation learns it is unsigned/non-negative.
-    #[test]
-    #[ignore]
-    fn split_builtin_kwargs_getslice_stop_is_unsigned() {
-        use crate::model::{OpKind, ValueType};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
-        let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "split_builtin_kwargs")
-            .expect("lower split_builtin_kwargs");
-        let stop = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .find_map(|space_op| match (&space_op.result, &space_op.kind) {
-                (
-                    Some(result),
-                    OpKind::BinOp {
-                        result_ty: ValueType::Unsigned,
-                        op,
-                        ..
-                    },
-                ) if op == "sub" => Some(result.clone()),
-                _ => None,
-            })
-            .expect("RangeTo end must retain an unsigned subtraction");
-        let producer = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .find(|op| {
-                op.result
-                    .as_ref()
-                    .is_some_and(|result| result.id() == stop.id())
-            })
-            .expect("getslice stop producer");
-        assert!(
-            matches!(
-                &producer.kind,
-                OpKind::BinOp {
-                    op,
-                    result_ty: ValueType::Unsigned,
-                    ..
-                } if op == "sub"
-            ),
-            "usize stop producer must be an unsigned subtraction, got {:?}",
-            producer.kind
-        );
-    }
-
     /// Real-LLBC anchor for the `Option::is_some_and` closure-select fold:
     /// `is_mmap` is `type(obj).is_some_and(|tp| ptr::eq(tp.as_ptr(),
     /// mmap_type()))`.  After the `option_closure_select` post-pass there must
@@ -23951,8 +23889,9 @@ mod tests {
         );
     }
 
-    /// Array slicing uses the general RangeTo lever; mutable indexing remains
-    /// residual because it writes through a view.
+    /// Array slicing keeps the residual RangeTo path because the general stop
+    /// has no length proof; mutable indexing is likewise residual because it
+    /// writes through a view.
     #[test]
     #[ignore]
     fn call_function_impl_result_has_no_residual_array_index() {
@@ -23964,16 +23903,19 @@ mod tests {
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "call_function_impl_result")
             .expect("lower call_function_impl_result");
-        assert!(!graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath { segments },
-                    ..
-                } if segments
-                    == &["core", "array", "<Impl>", "index"]
-                        .map(str::to_string)
-            )
-        }));
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments
+                        == &["core", "array", "<Impl>", "index"]
+                            .map(str::to_string)
+                )
+            }),
+            "general RangeTo array index remains residual"
+        );
     }
 }
