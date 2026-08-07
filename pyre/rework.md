@@ -1,441 +1,239 @@
 # pyre Rework Program
 
-**Status**: proposed. Companion to `design.md` (the charter). Where the
-charter states what pyre must be, this document states where today's code
-violates it, with evidence, and defines the corrective program. It was
-produced by auditing the tree (branch `pc-map`, 2026-07-05) against the
-charter's axioms A1–A7 and norms N1–N7. Evidence citations are of two kinds:
-code locations verified in this audit, and the issue/epic record (memory
-files, PRs) for damage history.
+**Status**: living record, companion to `design.md` (the charter). Where the
+charter states what pyre must be, this states where today's code violates it and
+what is left to do about it. **Findings are deleted as they close** — the history
+of what was once wrong belongs in git, not here. Keep this document small enough
+that it is worth re-reading.
 
-The verdict up front: **the skeleton is right, the JIT spine is where the
-violations live.** The layer map of charter §1 is real in the tree; none of
-the anti-roadmap (§3.5) items have been rebuilt. The structural defects are
-concentrated in four places, all inside trace/resume/translate/GC-roots —
-exactly the Phase A territory the charter says outranks everything.
+Original audit: branch `pc-map`, 2026-07-05, against the charter's axioms A1–A7
+and norms N1–N7. Re-measured 2026-08-07 on `ec-wiring`.
 
-## Audit refresh — 2026-08-06 (`ec-wiring`, base `58fcd373e05`)
-
-The findings below were written against `pc-map` on 2026-07-05. Re-measured a
-month later, **the priority order has inverted**: F1 and F2, the two the program
-called critical path, are substantially done; F3, filed as the least urgent of
-the four, has quietly moved to one slot from a hard failure.
-
-| finding | 2026-07-05 | 2026-08-06 |
-|---|---|---|
-| F1 resume coordinates | two systems + lossy `pc_map` | **largely resolved** — gh#366/367/368/369 all closed, both named artifacts gone from the tree; residue is comment rot and a `py_pc` that is still stored rather than derived |
-| F2 three executors | trait twin alive | **done, verified** — `is_full_body_walk`, `PYRE_FULL_BODY_WALK`, `OpcodeHandler for MIFrame`: 0 hits each |
-| F3 root-walker registry | 14 of 16 slots | **regressed — 15 of 16**; the 16th registration is a startup `panic!` |
-| F4 translate coverage | ~124-graph gap | gh#346 and gh#373 closed, work still landing (#1065); `abort_permanent` unchanged in scale |
-| F5 gate debt | 119 `PYRE_*` matches | 126 `PYRE_*` names read from the environment; `gate-triage.md` refreshed 2026-08-02 |
-
-Of the fifteen issues this document tracks, **thirteen are closed**. Only gh#376
-(Phase C decision document) and gh#126 (fib_recursive residual) remain open.
+The verdict has not changed shape: **the skeleton is right, the JIT spine is
+where the violations live.** The layer map of charter §1 is real in the tree and
+none of the anti-roadmap (§3.5) items have been rebuilt. What changed is the size
+of the remainder — two of the original five findings are closed and deleted, and
+thirteen of the fifteen tracked issues are closed.
 
 ---
 
-## 1. Findings
+## Open findings
 
-### F1 — The snapshot/resume machinery invented its own coordinate system
+### F4 — one `_other` catch-all is the whole unlisted-cliff surface
 
-**What exists.** `SnapshotFrame` stores the *Python bytecode* PC where
-RPython's `resume.py` stores the JitCode offset, and recovers the JitCode
-position through a lossy `pc_map` built at trace time
-(`majit-metainterp/src/pyjitpl.rs:506`, readers at
-`pyre-jit-trace/src/state.rs:1009–1248`, `resumedata.rs:84`). Bolted on top
-is a second, correct coordinate — a per-frame `jitcode_pc: i32` word
-(`resume.rs:279`) with a `NO_JITCODE_PC` sentinel — which branch-guard
-resume now prefers (#73/#366, gates already removed). So one snapshot
-carries **two coordinate systems**, one of them lossy, plus a translation
-layer that PyPy never needed.
+**Counted 2026-08-07.** Earlier revisions of this finding reported "~214 matches,
+unchanged in scale" and left it unmeasurable behind a census that was never
+built. Counting *emission sites* rather than mentions changes the picture:
+the 219 textual matches across 20 files are almost all comments. The real surface
+is **23 `emit_abort_permanent!` sites, all in `pyre-jit/src/jit/codewriter.rs`**
+— 22 named-opcode arms plus one catch-all — and every named arm already carries
+its reason inline.
 
-**Violates.** A6/N2 (parity: no invented representations), and via its
-consequences A1 (traces that resume at the wrong position are semantics the
-interpreter never had).
-
-**Evidenced damage.** This is the root of the worst shipped-bug class:
-the FOR_ITER "not an iterator" crash live on origin/main (guard-failure
-resume writes a green pycode into a red iterator slot), the loop-carried
-`or` deopt underflow, and the whole task50/#215 slot-vs-color epic. Each
-was a symptom of resume reconstructing state through the invented
-coordinates instead of resume.py's.
-
-**Correct shape.** `rpython/jit/metainterp/resume.py`: snapshot frames
-keyed by JitCode position natively; numbering via `rd_numb`/numb_state;
-`rebuild_from_resumedata` as the single reconstruction path. pyre already
-has the analog entry points (`eval.rs:6429–6743`, `dispatch_perfn_frame`,
-`setup_reconstructed_callee_frame`) — the representation underneath must
-converge.
-
-**Tracking.** Fully issued: gh#366 (tracer interprets JitCode directly —
-the enabling engine), gh#368 (delete `pc_map` + the legacy Python-pc resume map,
-Artifact 1), gh#369 (retire the carried `jitcode_pc` side-channel,
-Artifact 3), gh#367 (bank-aware pcdep color-slot map, Artifact 2 /
-slot-vs-color); groundwork gh#73 + PR#365 (closed, M3 milestone). Related:
-gh#343 (multi-frame virtual-PyFrame rematerialization on deopt),
-gh#371 (compile-time walker coalescing residual).
-
-**Status (2026-08-06) — largely resolved.** gh#366, gh#367, gh#368, gh#369 and
-gh#343 are all closed; `3ebf2f9280c` deleted the py_pc↔JitCode resume
-translation and `4e53480018d` cleaned up the `pc_map` dead names. Measured on
-the tree: `metadata.pc_map` and `resume_jitcode_pc_for` have **zero** hits, and
-`resume::SnapshotFrame` now carries `jitcode_index` plus a `pc` documented and
-written as the JitCode byte offset (`resume.py:250` parity). The ~56 surviving
-`pc_map` matches are an unrelated compile-time `Vec<usize>` in
-`jit/codewriter.rs` and `jit/flatten.rs` that drives exit-recovery construction;
-it is not the resume translation table and is not F1.
-
-Three pieces of residue remain, none of them the original defect:
-
-1. **Comment rot.** `majit-metainterp/src/recorder.rs`'s `SnapshotFrame::pc`
-   still documents "Pyre's tracer populates this slot with the Python bytecode
-   PC because pyre traces Python bytecode rather than JitCode … the runtime
-   translates `py_pc` through `pc_map` at resume time until pyre's
-   walker-as-tracer epic lands." All three claims are now false — the tracer
-   interprets JitCode, the translation is deleted, and the epic landed. Its
-   writers (`pyjitpl/dispatch.rs build_state_field_snapshot`,
-   `history.rs`) stamp the JitCode offset.
-2. **`py_pc` is stored, not derived.** WS1 increment 2 called for the
-   Python-level PC to be derived the way PyPy derives it. It is instead
-   forward-carried in every snapshot frame and serialized into
-   `rd_numb`/`numb_state`, then read back as a Python coordinate by
-   `pyre-jit/src/eval.rs` for frame and traceback reconstruction. That is the
-   §4 falsifier "keep derived, not stored" outcome — it should be recorded as
-   the deliberate adaptation it now is, or finished.
-3. **Unproven: a coordinate mixed at one writer.** `build_state_field_snapshot`
-   stamps `py_pc: frame.pc`, i.e. the same JitCode offset it writes to `pc`,
-   into the field whose readers treat it as a Python pc. The corpus is green,
-   so if this is wrong it is latent; it needs a repro before it is a finding.
-
-### F2 — Trace time has a hand-written interpreter twin (three executors)
-
-**What exists.** PyPy has two executors: metainterp (trace time) and
-blackhole (deopt time). pyre has three: inside trace time, a walker leg
-(`full_body_walk_trace` / `run_perfn_walk`,
-`pyre-jit-trace/src/jitcode_dispatch.rs:466,2265,2464`) coexists with a
-trait leg — `OpcodeHandler` impls on `MIFrame` that the code itself
-describes as "the trace-time twin of PyFrame's impls in pyre-interpreter"
-(`pyre-jit-trace/src/lib.rs:87`). Virtualizable handling stays on the trait
-leg because the walker cannot observe a force without executing the callee.
-
-**Violates.** A1 directly. A hand-written trace-time twin *is* a JIT with
-semantics of its own; every divergence between the twin and PyFrame is a
-miscompile waiting for an input. Two trace-time legs over the same bytecode
-double the divergence surface.
-
-**Evidenced damage.** walker BYPASS misfire under suspend → stack
-underflow (task#29), wasm re-entry corruption by the walk loop (timeout
-BUG#2), aheui never-close. Each was the two legs disagreeing.
-
-**Correct shape.** One trace-time executor. The W4 single-executor epic
-(PR#311, walker-as-tracer) already points here; it must finish, and the
-trait twin must be deleted (A7), with the vable-force blocker solved the
-way PyPy's metainterp does it rather than by keeping a second leg.
-
-**Tracking.** gh#344 (observer/replay two-executor → single authoritative
-walker) is the epic; its original scope was the generic majit engine only,
-and the pyre-side half — deleting the `OpcodeHandler` trace-time twin and
-the full-body-walk mode bifurcation — is now recorded there as a scope
-supplement (2026-07-05 comment). gh#342 and gh#115 track the walker
-coverage gaps that force the trait leg to stay alive.
-
-**Status — pyre-side done.** The `is_full_body_walk` field and its fork, the
-`OpcodeHandler`-on-`MIFrame` trace-time methods, and the `PYRE_FULL_BODY_WALK`
-gate are deleted; the walker is the sole trace-time executor and observes a
-vable-force via the residual-call token protocol
-(`try_execute_residual_call_via_executor`), the metainterp mechanism — no
-second leg. The generic majit-engine half of gh#344 is separate; the F1
-resume side (pc_map / resume translation) is WS1 increments 1–2.
-
-### F3 — GC root registration is a post-hoc walker registry
-
-**What exists.** `MAX_EXTRA_ROOT_WALKERS = 16`
-(`majit-gc/src/shadow_stack.rs:681`), a fixed array that panics on
-overflow, currently holding **14 walkers**: 13 registered from
-`pyre-jit/src/eval.rs:2106–2247` (rd_consts, partial/active trace, compile
-snapshot, jitcode constants, FBW journals ×2, interpreter side table,
-signal handlers, weakref boxes, sre patterns, jit callee frames, pyre
-objects) plus the gc-table walker (`majit-gc/src/gcreftracer.rs:175`).
-
-**Violates.** A2 (memory policy woven, not accreted). Nearly every walker
-was added *after* a use-after-free (signal handlers #30, weakref boxes #31,
-sre patterns #29, weakref registration #188…). Each is a confession that
-some object lives outside GC discipline as an untracked immortal; the
-registry is reactive whack-a-mole with a hard cap.
-
-**Correct shape.** incminimark's model: shadow stack for stack roots,
-the prebuilt-object protocol for immortals, GC-traced frames for the JIT
-(the resolution D05.x itself predicted — "let the JIT find roots since it
-knows frame layout"). gh#355 (PyFrame→W_Root, landed through S2) is the
-template: move each walker's object population under normal GC tracing and
-delete the walker.
-
-**Tracking.** gh#355. Originally it covered frames only; the full registry
-retirement (taxonomy of the 14 walkers, prebuilt-protocol absorption of the
-immortal populations, shrinking `MAX_EXTRA_ROOT_WALKERS` as the progress
-metric) is now recorded there as a scope supplement (2026-07-05 comment).
-
-**Status (2026-08-06) — REGRESSED, and now the live risk.** gh#355 is closed,
-but the registry retirement it was supplemented with did not happen. The
-registry grew instead: **15 registrations against `MAX_EXTRA_ROOT_WALKERS = 16`**
-(`shadow_stack.rs`), so exactly one slot is left and the 16th caller dies on
-`panic!("register_extra_root_walker: capacity exceeded")` — at startup, on every
-platform, for whoever adds the next walker. The current population is 11 from
-`pyre-jit/src/eval.rs` (jit/bh/guard exc values, rbigint parts cache, immortal
-exception singletons, last CA exception, sre patterns, w_globals-stamped code,
-mapdict method cache, …), 3 from `pyre-interpreter/src/eval.rs` (global
-prebuilt roots, thread roots, …) and 1 from `majit-gc/src/gcreftracer.rs`.
-
-This inverts the program's sequencing: F3 is no longer the low-urgency
-workstream. Raising the constant is the accretion the finding condemns, so the
-next walker to be added should instead be the trigger for the class-(a)/(b)
-absorption in WS3 — with the caveat that the shrinking constant can no longer
-serve as the progress metric until it first stops growing.
-
-### F4 — majit-translate coverage is sustained by per-case seams
-
-**What exists.** Rust idioms still lack systematic lowering: the #346
-generic `E::Value` monomorphization gap diverges ~124 opcode graphs
-(front-end abstract-shell on multi-impl traits); the #131 Result/Option
-work concluded its clean front-synth seam is **exhausted** (remaining:
-UnionError lattice, Vec/IndexMap, boxing, iterators). Constructs that don't
-lower degrade not into tracked residual calls but into `abort_permanent`
-**compilation cliffs** — the gh#373 class, where a hot loop silently never
-compiles (demonstrated 32×/20× cliffs; latent no-token variants).
+| class | n | opcodes |
+|---|---|---|
+| **genuine trace boundaries** — a trace records one continuous execution, so no residual can express the resume | 9 | `YieldValue`, `Send`, `EndSend`, `ReturnGenerator`, `GetYieldFromIter`, `GetAiter`, `GetAnext`, `EndAsyncFor`, `CleanupThrow` |
+| **narrow conditional shapes** inside an otherwise-lowered opcode | 5 | `Call` / `CallKw` (nargs past the backend dispatch ceiling), `LoadFastCheck`, `LoadLocals` (non-portal `is_locals`), `DeleteDeref` (compiler-normalized class-scope case) |
+| **unported opcodes** — the real coverage gap | 8 | `CheckEgMatch`, `BuildInterpolation`, `BuildTemplate`, `CallIntrinsic1`, `CallIntrinsic2`, `LoadSpecial`, `LoadFromDictOrDeref`, `SetupAnnotations` |
+| **catch-all** `_other => emit_abort_permanent!(py_pc)` | 1 | whatever the match does not name |
 
 **Violates.** A1 ("Rust can't be meta-traced is never a valid excuse") and
-charter §3.1's norm that every fallback is a census-tracked gap, never a
-silent hole.
+charter §3.1's norm that every fallback is a census-tracked gap, never a silent
+hole.
 
-**Correct shape.** The rtyper/exceptiontransform parity ports already
-chosen: Epic A approach-1 (unique-KIND monomorphization) for #346, Option A
-shape-agnostic exceptiontransform for #131, with the census workflow as the
-completeness instrument and `abort_permanent` reduced to a small, listed,
-justified residue.
+**Where the violation actually lives.** Not in the 22 — those are listed by
+construction, each beside its reason. It lives in the **`_other` arm**: an opcode
+nobody has looked at declines the whole loop with no record of which opcode it
+was. That single arm is the entire unlisted surface, which is why the finding
+could never be closed by counting matches.
 
-**Tracking.** Well issued: gh#346 (two-phase coverage roadmap, the epic;
-successor of the closed gh#131) with per-gap instance issues gh#336
-(rrange), gh#337 (rlist), gh#182 (rbuiltin typers), gh#339 (boxing
-NewWithVtable), gh#181 (box_value Void), gh#176 (phi threading), gh#180
-(gctransform), gh#139 (EffectInfo). The cliff symptom is gh#373.
+**What is left.**
 
-**Status (2026-08-06) — epic closed, work continuing under it.** gh#346 and
-gh#373 are both closed, and coverage is still landing against the #346 line
-(most recently #1065, the `ll_alloc_and_set` list-allocation family and the
-full `newlist_clear` compound jitcode opcode). `abort_permanent` has not
-shrunk in scale — ~214 matches, concentrated in `jit/codewriter.rs`,
-`pyre-jit-trace/src/trace.rs` and `jit/flatten.rs` — but the exit criterion was
-never "few matches", it was "zero UNLISTED sources", which the census answers
-and a raw match count does not. Re-run the census before treating this
-finding as open or closed.
+1. **Make `_other` name its opcode.** A cliff that says which instruction caused
+   it stops being a silent hole, and the gap list below becomes self-maintaining
+   instead of needing a census run to rediscover.
+2. **Port the 8.** `CALL_INTRINSIC_1 → HLOp` is the template; `CallIntrinsic1`
+   still aborts on the intrinsic kinds that arm does not cover.
+3. **Record the 9 as boundaries, not gaps.** They are correct, and counting them
+   is most of what made the raw number look like a wall.
 
-### F5 — Deficiencies (right design, unfinished) — the debt list
+**Tracking.** gh#346 (two-phase coverage roadmap) and gh#373 (the cliff symptom)
+are closed; coverage work continues against the #346 line.
 
-- **Compilation cliffs**: unported opcode classes (CallIntrinsic2, GetLen,
-  LoadSpecial — the CALL_INTRINSIC_1 fix `f0f68547ba` is the template;
-  gh#373), nested-loop/cross-loop no-token walls (gh#152, gh#177;
-  cross-loop-cut S0–S3 approved), recursion/call-frame wall (gh#126,
-  gh#343; the closed gh#215 was the umbrella).
-- **Gate debt**: **119 distinct `PYRE_*` env gates** in the tree (28 in the
-  FBW family alone). Charter §3.6: a gate is a staging area, not a home.
-  No triage table exists. *No tracking issue.* **2026-08-06: the table now
-  exists (`gate-triage.md`, refreshed 2026-08-02), and the population has grown
-  only modestly — 126 distinct `PYRE_*` names are read from the environment,
-  against the 119 this audit counted:**
+### F3 — GC roots are walked by an embedder registry, not absorbed into GC discipline
 
-  ```
-  rg -o 'env::var[_a-z]*\("(PYRE_[A-Z0-9_]+)"' -r '$1' --glob '*.rs' | sort -u | wc -l
-  ```
+**What exists.** `majit-gc`'s `EXTRA_ROOT_WALKERS` is a fixed array the embedder
+plugs callbacks into, walked from `do_collect_nursery`'s Phase 1e. **Four sources
+are registered** (of a cap of 8): the interpreter's process-global off-GC slots
+(`walk_interpreter_global_roots`), the exceptions parked outside GC discipline
+(`walk_parked_exception_roots`), the immortal process-global stores
+(`walk_immortal_store_roots`), and the per-loop gc_table walker in
+`majit-gc/src/gcreftracer.rs`.
 
-  **Counting identifiers rather than environment reads inflates this — 131
-  distinct `PYRE_*` identifiers appear in tracked `*.rs`, 174 across all tracked
-  files, 548 raw matches — so state which of the four the number is. The triage
-  is still a snapshot, not a brake: nothing makes a new gate enter the table at
-  birth, which is what WS4 item 1 asked for.**
-- **Documentation rot (N7)**: `majit/README.md` documented the deleted
-  majit-analyze era (crates majit-opt/meta/codegen/runtime/analyze vs the
-  actual majit-translate/metainterp/backend-* tree). **Resolved 2026-07-05:
-  rewritten to the actual crate tree and pipeline.** (The suspected
-  duplicate `readme.md` was a case-insensitive-filesystem artifact; only
-  `README.md` is tracked.)
-- **Phase C debt with a deadline flavor**: no C-extension strategy decision
-  document. The EU final report's admitted decade-costing error is exactly
-  this deferral; the charter (§5 Phase C) requires a decision document —
-  writing it does not require Phase A to be finished. Tracked as gh#376.
+**Violates.** A2 (memory policy woven, not accreted). Almost every population
+inside those four sources was added *after* a use-after-free — signal handlers,
+weakref boxes, sre patterns, the immortal exception singletons' children. Each is
+a confession that some object lives outside GC discipline as an untracked
+immortal, and grouping them by storage kind did not change that.
 
-### Explicit non-findings (audited and ruled parity or justified)
+**Correct shape.** incminimark's model: shadow stack for stack roots, the
+prebuilt-object protocol for immortals, GC-traced frames for the JIT.
+`framework.py root_walker.walk_roots` registers a *fixed* set of root-storage
+kinds; it has no per-data-structure callback array at all.
 
-- `MIFrame` as a type distinct from `PyFrame` is **parity** (PyPy's
-  pyjitpl has MIFrame); the defect is the hand-written *OpcodeHandler twin*
-  on it (F2), not the type split.
-- Snapshots staying `Box` while frames became W_Root (#355 policy) —
-  deliberate, documented, keep.
-- TLS singletons (BACK_EDGE_BH_BUILDER etc.) — audited against PyPy's
-  GIL-justified singletons and documented per charter §3.3; keep.
+**What is left.**
+
+1. **Class (a) — trace/JIT state** into GC-traced structures. Largely done: the
+   per-mutator `MutatorEntry.extra_areas` already carries frame roots, jitcode
+   constants, the FBW journals, mapdict and callee frames.
+2. **Class (b) — interpreter-global and parked-exception populations** onto the
+   prebuilt/immortal protocol with traced children, deleting each carrier as its
+   population moves.
+3. **Class (c) — `gcreftracer`** is genuinely GC-internal and stays.
+
+The concrete next step is already scouted. `BH_LAST_EXC_VALUE`,
+`GUARD_EXC_VALUE` and `TL_JIT_PENDING_EXCEPTION` are **already** walked by the
+per-mutator `PyFrameRootArea`: `walk_pyframe_roots_area` forwards all three
+cells (alongside the in-flight exception and the pending call/hash errors), and
+the collector reaches it through `walk_all_extra_areas` or `walk_my_extra_areas`
+— both of which include the collecting thread. So those three entries in
+`walk_parked_exception_roots` are duplication on every path *except*
+`rescan_major_nonstack_roots_and_drain`, which re-walks `walk_extra_roots` but
+deliberately not the per-mutator areas ("upstream repeats only
+`collect_nonstack_roots`, not `collect_roots`"). **Whether a TLS exception cell
+needs that mid-major rescan is the single question standing between here and
+deleting three of the seven carriers** — and it decides the shape of the rest of
+class (b), because every carrier there is thread-local.
+
+**Progress metric.** `MAX_EXTRA_ROOT_WALKERS`, which shrinks as sources are
+absorbed; the panic-on-overflow branch should become unreachable and then be
+deleted. Raising it is the accretion this finding condemns — a source that has
+nowhere to go belongs inside an existing kind, not in a new slot.
+
+**Verification.** The GC probe suite, the nursery-stress oracle (small-nursery
+runs), and the regrtest harness under moving collection. The real exit test is
+that the oldgen-nonmoving concession becomes deletable.
+
+### F5 — 66 of the 105 live `PYRE_*` gates are undocumented, and nothing stops a 67th
+
+**Measured 2026-08-07**, distinguishing the counts this has been confused between
+before:
+
+| count | value | what it is |
+|---|---|---|
+| distinct names read from the environment | **105** | the gate population |
+| (file, name) read pairs | 127 | read *sites*, not gates |
+| names mentioned in `gate-triage.md` | 90 | of which only 39 are still read |
+| **live gates absent from `gate-triage.md`** | **66** | the debt |
+
+```
+git ls-files '*.rs' | xargs rg --no-filename -o 'env::var[_a-z]*\("(PYRE_[A-Z0-9_]+)"' -r '$1' | sort -u
+```
+
+Earlier revisions of this document reported 119 and then 126 "distinct names".
+Both were the (file, name) pair count: the command as previously written kept
+rg's filename prefix, so `sort -u` counted sites. `--no-filename` is what makes it
+a gate count. Say which of the four a number is.
+
+**Violates.** Charter §3.6: a gate is a staging area, not a home. The triage
+table is a snapshot that is 63% empty, and nothing makes a new gate enter it at
+birth — which is what the hygiene workstream asked for and never got.
+
+**What is left.**
+
+1. **List the 66.** Most are default-OFF diagnostics (`*_DIAG`, `*_AUDIT`,
+   `*_CENSUS`, `*_PROBE`), which `gate-triage.md`'s own polarity rule classifies
+   mechanically from the read expression. The default-ON ones are the removal
+   targets; the rest are book-keeping.
+2. **Add the brake**: a check that fails when a `PYRE_*` env read has no entry in
+   `gate-triage.md`. Without it the table re-rots the moment it is filled, which
+   is how it got to 63% empty.
+3. Retire the 51 documented names that no longer have a read site.
+
+### Smaller open items
+
+- **One unproven resume coordinate.** `build_state_field_snapshot` stamps
+  `py_pc: frame.pc` — the JitCode offset — into the field whose readers in
+  `pyre-jit/src/eval.rs` treat it as a Python pc (`f_lasti`, traceback
+  reconstruction, the pcdep colour lookup). The walker's own
+  `build_framestack_snapshot` does the opposite, and correctly: it resolves the
+  Python pc from the codewriter's marker table and *declines the trace* rather
+  than publish a fallback. The corpus is green, so if the state-field writer's
+  value does reach frame reconstruction the damage is latent — a mismatched
+  colour lookup returns `None` rather than crashing. **Needs a runtime probe**
+  (cross-check the decoded `py_pc` against
+  `containing_py_pc_for_jitcode_pc_public(jitcode_index, pc)` over the corpus)
+  before it is a finding rather than a suspicion.
+- **A misleading survivor of the resume rework.** `pyjitpl.rs` still calls its
+  `SnapshotFramePcs` local `pc_map`, the name of the deleted translation table.
+  Rename it so the name stops implying a mechanism that no longer exists.
+- **Compilation cliffs** outside F4's census: nested-loop / cross-loop no-token
+  walls (gh#152, gh#177) and the recursion / call-frame wall (gh#126, open).
+- **Phase C decision document** (gh#376, open): a C-extension strategy document,
+  not an implementation. Writing it does not require Phase A to finish, and the
+  EU final report's admitted decade-costing error is exactly this deferral.
+
+---
+
+## Sequencing
+
+**F4 > F3 > F5.** The charter's own §5 order, restored — it was inverted in an
+earlier revision because the root-walker registry had a hard failure one
+registration away, and that is gone.
+
+- **F4 first**, and it is now small. Naming the opcode in the `_other` arm is a
+  one-site change that converts the only silent hole into a reported one; the
+  eight unported opcodes are then a list somebody can work through, and Phase A's
+  cliff-free exit criterion becomes checkable without any new instrument.
+- **F3 next**: the deepest structural work, unblocked by one answerable question
+  (the mid-major rescan above) rather than by a taxonomy.
+- **F5 out of order whenever convenient** — it is cheap, it is the only item that
+  gets *worse* while ignored, and its brake is what keeps it closed.
+
+F4 and F3 are parallel-safe: different crates, no shared surface.
+
+Each item closes by the charter's instruments: N4 gates for every landing, N5
+evidence for every default flip, N7 written rationale for every mechanism deleted
+or replaced. **And then its section here is deleted.**
+
+---
+
+## Settled — do not re-litigate
+
+**Closed findings.**
+
+- *Resume coordinates invented their own system.* The lossy `pc_map` translation
+  and the duplicate Python-PC coordinate are gone: `metadata.pc_map` and
+  `resume_jitcode_pc_for` have zero hits, and `SnapshotFrame.pc` is the JitCode
+  byte offset at every writer. The `pc_map` name that survives in
+  `jit/codewriter.rs` / `jit/flatten.rs` is an unrelated compile-time
+  `Vec<usize>` driving exit-recovery construction.
+- *Three trace-time executors.* `is_full_body_walk`, `PYRE_FULL_BODY_WALK` and
+  the `OpcodeHandler`-on-`MIFrame` twin are deleted — zero hits each. The walker
+  is the sole trace-time executor and observes a vable-force through the
+  residual-call token protocol, which is the metainterp mechanism, not a second
+  leg.
+
+**Deliberate adaptations, decided — keep.**
+
+- `SnapshotFrame.py_pc` is **carried, not derived**. The derivation exists
+  (`py_coord::containing_py_pc_for_jitcode_pc`) and is the dominant mechanism
+  everywhere else, but the resume decoder that reads `py_pc` back holds no
+  jitcode metadata and so has no inverse available at that point.
+- `MIFrame` as a type distinct from `PyFrame` is parity — pyjitpl has MIFrame.
+  The defect was the hand-written OpcodeHandler twin on it, now deleted.
+- Snapshots stay `Box` while frames became `W_Root`.
+- TLS singletons (`BACK_EDGE_BH_BUILDER` and friends), audited against upstream's
+  GIL-justified singletons.
 - Thin backends behind one trait (dynasm primary, Cranelift, wasm) — charter
-  §3.4 answer; not rework territory even where compile latency hurts
-  (recourse ladder applies).
+  §3.4's answer, not rework territory, even where compile latency hurts.
+- `majit/README.md` was rewritten to the actual crate tree.
 
 ---
 
-## 2. Workstreams
+## What falsifies this
 
-### WS1 — Trace/resume convergence (F1 + F2) — *the* priority
-
-Goal: one trace-time executor, one resume coordinate system, both at
-resume.py/pyjitpl.py parity. F1 and F2 are one workstream because the
-resume representation is written by the tracer: retiring pc_map requires
-every snapshot writer to know its JitCode position, which is what the
-single-executor walker provides.
-
-Increments (each lands green on N4 gates, each with its kill switch):
-
-1. **Finish gh#366 direct-pc coverage**: extend `jitcode_pc` capture to the
-   remaining guard classes (GuardNoException/GuardNotForced), flip default.
-   Exit: every snapshot frame carries a valid direct coordinate.
-2. **Invert the representation** (gh#368 + gh#369): make the JitCode offset
-   the primary `SnapshotFrame` field (resume.py shape); delete the
-   Python-PC field, the snapshot `pc_map` (pyjitpl.rs:506), and the
-   resume translation layer (gh#368), then the carried
-   `jitcode_pc` side-channel it obsoletes (gh#369). Python-level PC, where
-   genuinely needed (frame f_lasti, tracebacks), is derived the way PyPy
-   derives it, not stored as the resume key.
-3. **Numbering parity**: converge serialization on resume.py's
-   rd_numb/numb_state tagged numbering, including non-Ref banks (gh#367);
-   complete rebuild_from_resumedata parity for multi-frame reconstruction
-   (gh#343; the dispatch_perfn_frame / setup_reconstructed_callee_frame
-   scaffolding exists; the slot-vs-color seeding panic is the open edge).
-   *The full-numbering-parity umbrella itself has no issue* — file one if
-   residue remains after gh#367/gh#368/gh#369 close.
-4. **Single executor (W4)**: make walker-as-tracer the only trace-time
-   leg; solve the vable-force observation blocker via the metainterp
-   mechanism; delete the `OpcodeHandler` trace-time twin and the
-   full-body-walk mode bifurcation (A7). gh#344 owns both halves (the
-   pyre-side twin deletion was added to its scope 2026-07-05);
-   gh#342/gh#115 track the walker coverage gaps. *Pyre-side done
-   (2026-07-20): twin methods, mode field/fork, and the PYRE_FULL_BODY_WALK
-   gate deleted; walker is the sole trace-time leg.*
-
-Regression corpus (all must be tests before the increments that fix them):
-the pr354 FOR_ITER-in-called-function crash repro, the loop-carried `or`
-deopt underflow repro, rc_d32.py double-append, aheui logo --jit, the wasm
-timeout re-entry cases.
-
-Exit criteria: `pc_map`, the resume translation layer, `OpcodeHandler` twin, and
-the full-body-walk mode flag no longer exist in the tree; full benchmark suite (all
-8) no regressions; crash corpus green; slot-vs-color epic closeable.
-
-### WS2 — majit-translate systematization (F4)
-
-Goal: no silent cliffs; Rust-idiom lowering is systematic, census-driven.
-
-1. **#346 Epic A** (unique-KIND generic monomorphization) to close the
-   ~124-graph divergence — this is the current largest single source of
-   un-lowered bodies.
-2. **#131 Option A** shape-agnostic exceptiontransform through the
-   remaining inventory (UnionError lattice, Vec/IndexMap, boxing,
-   iterators), in census order.
-3. **Cliff conversion**: every remaining `abort_permanent` source either
-   ports (the CALL_INTRINSIC_1 → HLOp template: CallIntrinsic2, GetLen,
-   LoadSpecial) or becomes a *tracked* residual call in the census with an
-   owner issue. The latent gh#373 no-token variants get repros first.
-
-Exit criteria: census reports zero unlisted abort_permanent sources; the
-known 32×/20× cliff benchmarks compile; gh#346 (and its instance issues)
-closed or reduced to listed residue. Parallelizable with WS1 (different
-crates, different people-time).
-
-### WS3 — GC roots rework (F3)
-
-Goal: retire the extra-root-walker registry by absorbing its populations
-into normal GC discipline. Tracked in gh#355 (scope supplemented
-2026-07-05 to cover the full registry retirement).
-
-1. **Taxonomy pass**: classify the 14 walkers into (a) trace/JIT state
-   that belongs in GC-traced structures (rd_consts, partial/active trace,
-   compile snapshot, jitcode constants, callee frames — the #355/W_Root
-   track), (b) interpreter-global populations that belong on the
-   prebuilt-object protocol (signal handlers, sre patterns, side tables),
-   (c) genuine GC-internal tables (gcreftracer) that stay.
-2. **Absorb class (a)** along the #355 S2c/S3/S4 track (arena task#7,
-   typedef, stub retirement) — this work is already sequenced.
-3. **Absorb class (b)** via the prebuilt/immortal protocol with traced
-   children (the #29 immortal-children fix generalized), deleting each
-   walker as its population moves.
-4. Shrink `MAX_EXTRA_ROOT_WALKERS` as walkers retire — the shrinking
-   constant is the progress metric; the panic-on-overflow branch should
-   become unreachable and then deleted.
-
-Verification: the GC probe suite, nursery-stress oracle
-(small-nursery runs, the PYPY_GC_NURSERY=131072 technique), and the
-regrtest harness under moving collection (the oldgen-nonmoving concession
-should become deletable — that is the real exit test).
-
-### WS4 — Hygiene batch (F5, continuous)
-
-1. **Gate triage** (done 2026-07-05): `gate-triage.md` classifies all
-   ~119 `PYRE_*` matches. Findings: ~20 are not gates (Rust
-   identifiers) or dead (no read site); ~99 real env vars, ~33 default-ON
-   experiments. The **wasm trio** (`PYRE_WASM_CA`, `_ENABLE_BRIDGES`,
-   `_INLINE_ALLOC`) was retired (hardwired ON, machinery deleted, verified
-   compile-clean native + wasm32). The other ~30 default-ON gates are
-   load-bearing kill switches for open reworks (FBW/executor #344/#366,
-   rtyper #346, GC #355, for-iter #57) — each retires when its epic closes
-   (A7). See `gate-triage.md` §4 for the per-gate retire trigger.
-2. **README rewrite**: `majit/README.md` to the actual crate tree.
-   **Done 2026-07-05.**
-3. **Phase C decision document** (gh#376): C-extension strategy
-   (HPy/cpyext-class options, rctypes failure and cpyext cost curve as
-   priors) — a document, not an implementation; unblocks nothing but
-   forgets nothing.
-
----
-
-## 3. Sequencing and interaction
-
-Priority under contention (charter §5 order): **WS1 > WS2 > WS3 > WS4**,
-with the qualifications:
-
-> **Amended 2026-08-06.** This ordering was written when WS1 held the shipped
-> miscompile class. It no longer does: WS1's increments 1–3 landed and its
-> increment 4 is done pyre-side, while WS3's registry moved to 15 of 16 slots
-> with a startup panic behind the last one. Under contention today the order is
-> **WS3 > WS2 > WS1-residue > WS4** — WS3 because the next walker registration
-> is an immediate hard failure, WS1-residue last because what remains of it is
-> comment rot plus one policy decision (store-vs-derive `py_pc`), not a
-> correctness risk.
-
-- WS1 increments 1–3 are the critical path — they root out the shipped
-  miscompile class. Increment 4 (W4) is the largest single piece; its
-  prerequisite work (per-opcode entry_py_pc advance, concrete seeding) is
-  already landed on the for-iter/rewrite-tracer lines.
-- WS2 is parallel-safe with WS1 (majit-translate vs
-  majit-metainterp/pyre-jit-trace) and is the precondition for Phase A's
-  cliff-free exit criterion.
-- WS3 rides the already-sequenced #355 track; its class-(b) work is
-  independent and can interleave.
-- WS4 items 1–2 are cheap and immediate; the gate triage should happen
-  *early* because WS1/WS2 will otherwise keep adding gates to an untriaged
-  pile (every WS increment's kill switch enters the table at birth, with
-  its flip-or-delete date).
-
-Each workstream closes by the charter's own instruments: N4 gates for
-every landing, N5 evidence for every default flip, N7 written rationale
-(epic memory file or issue) for every mechanism deleted or replaced.
-
----
-
-## 4. What falsifies this program
-
-Per charter §6, the program is amendable by evidence. Specifically:
-
-- If WS1 increment 2 shows the Python-PC field is load-bearing for
-  something PyPy handles differently at a structural level (not a bug),
-  the finding F1 remedy narrows to "keep derived, not stored".
-- If the W4 vable-force blocker proves to require metainterp behavior that
-  the walker architecture cannot express, F2's remedy escalates from
-  "finish W4" to "re-evaluate the walker against a straight pyjitpl port"
-  — a bigger rework, to be proposed separately with the evidence.
-- If WS3's class-(b) absorption measurably regresses minor-collection
-  pause (prebuilt scanning cost), the registry survives *for that class
-  only*, documented as the deliberate adaptation it currently isn't.
+- If the F4 census, once built, shows the unlisted set is already empty, F4
+  closes on the spot and only the tracked residue remains.
+- If F3's class-(b) absorption measurably regresses minor-collection pause
+  (prebuilt scanning cost), the registry survives *for that class only*,
+  documented as the deliberate adaptation it currently is not.
