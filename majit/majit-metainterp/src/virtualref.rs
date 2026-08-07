@@ -266,12 +266,8 @@ pub fn token_tracing_rescall() -> *mut u8 {
     // Racing minters both produce a valid sentinel, but the token protocol
     // compares tokens by address, so exactly one may be published. The loser's
     // object is immortal either way — upstream's `_dummy` is prebuilt.
-    match TRACING_RESCALL_DUMMY_PTR.compare_exchange(
-        0,
-        fresh,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    ) {
+    match TRACING_RESCALL_DUMMY_PTR.compare_exchange(0, fresh, Ordering::Relaxed, Ordering::Relaxed)
+    {
         Ok(_) => fresh as *mut u8,
         Err(published) => published as *mut u8,
     }
