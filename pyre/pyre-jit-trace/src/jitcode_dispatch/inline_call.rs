@@ -4094,6 +4094,18 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // the CALL site but stamping the walk-entry header desyncs the two windows
     // (count-mismatch assert / wrong slot layout), so carry the box coordinate
     // to the header alongside the boxes.
+    // The coordinate published onto the outer portal frame's `last_instr`
+    // while a residual runs inside the callee.  `op.pc` indexes the snapshot
+    // sym's jitcode only while the walk is the portal's own; one level down it
+    // is the INTERMEDIATE callee's offset, and mapping it through the portal's
+    // pc tables stamps whatever py_pc that byte happens to land on onto a frame
+    // that is still paused at the CALL the outermost sub-walk entered under —
+    // which is exactly what the inherited coordinate already names.
+    let inherited_caller_py_pc = if ctx.fbw_mode.inline_subwalk {
+        ctx.fbw_mode.inline_caller_py_pc
+    } else {
+        inline_caller_py_pc_from_snapshot(ctx, op.pc)
+    };
     let (
         inline_outer_active_boxes,
         inline_outer_entry_py_pc,
@@ -4108,7 +4120,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 ctx.entry_py_pc,
                 ctx.outer_jitcode_index,
                 ctx.outer_resume_marker_jit_pc,
-                inline_caller_py_pc_from_snapshot(ctx, op.pc).or(ctx.fbw_mode.inline_caller_py_pc),
+                inherited_caller_py_pc,
             )
         } else {
             let sym = unsafe { &*sym_ptr };
@@ -4118,8 +4130,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     ctx.entry_py_pc,
                     ctx.outer_jitcode_index,
                     ctx.outer_resume_marker_jit_pc,
-                    inline_caller_py_pc_from_snapshot(ctx, op.pc)
-                        .or(ctx.fbw_mode.inline_caller_py_pc),
+                    inherited_caller_py_pc,
                 )
             } else {
                 // Liveness coordinate is the CALL op's own (jitcode index,
@@ -4185,7 +4196,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             ctx.entry_py_pc,
             ctx.outer_jitcode_index,
             ctx.outer_resume_marker_jit_pc,
-            inline_caller_py_pc_from_snapshot(ctx, op.pc).or(ctx.fbw_mode.inline_caller_py_pc),
+            inherited_caller_py_pc,
         )
     };
     // `executioncontext.py:88 enter` — emitted here, past every decline gate,
@@ -5832,7 +5843,7 @@ pub(crate) fn try_walker_specialize_seqiter_getitem_next<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let body_coord = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op.pc)
+    let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
     fbw_foriter_inflight_mark_attempt(body_coord);
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();

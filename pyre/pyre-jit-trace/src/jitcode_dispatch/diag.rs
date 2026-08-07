@@ -147,9 +147,9 @@ pub(crate) fn inflight_foriter_body_pc(body: InflightForiterBody) -> Option<usiz
     match body {
         InflightForiterBody::Py(body_pc) => Some(body_pc),
         InflightForiterBody::Jit {
-            outer_jitcode_index,
+            jitcode_index,
             op_pc,
-        } => crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32).map(|jc| {
+        } => crate::state::pyjitcode_for_jitcode_index(jitcode_index).map(|jc| {
             crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.metadata, op_pc) as usize + 1
         }),
     }
@@ -157,10 +157,29 @@ pub(crate) fn inflight_foriter_body_pc(body: InflightForiterBody) -> Option<usiz
 
 /// Capture the native coordinates that identify a `for_iter_next` residual.
 /// The Python continue-arm fallthrough is intentionally not derived here.
+///
+/// `op_pc` is an offset into the JitCode the walk is currently executing, so
+/// the identity paired with it must be that JitCode's.  Inside an inline
+/// sub-walk that is the callee's ([`InlineCalleeConsts::jitcode_index`], the
+/// same resolution `build_multi_frame_miframe` applies to its innermost
+/// frame); `fbw_mode.snapshot_sym` still names the outer portal.  Pairing the
+/// portal with a callee offset invents a coordinate: `inflight_foriter_body_pc`
+/// resolves it through the CALLER's pc tables and answers with a Python pc that
+/// belongs to neither loop, so a callee loop's item is stashed under an
+/// identity no resume coordinate can match, and a caller loop that happens to
+/// resolve to the same pc has its own in-flight entry truncated away and
+/// replaced by the callee's item.
 pub(crate) fn fbw_foriter_body_from_op_pc<Sym: WalkSym>(
-    snapshot_sym: *const Sym,
+    ctx: &WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Option<InflightForiterBody> {
+    if let Some(consts) = ctx.inline_callee_consts {
+        return Some(InflightForiterBody::Jit {
+            jitcode_index: consts.jitcode_index,
+            op_pc,
+        });
+    }
+    let snapshot_sym = ctx.fbw_mode.snapshot_sym;
     if snapshot_sym.is_null() {
         return None;
     }
@@ -171,7 +190,7 @@ pub(crate) fn fbw_foriter_body_from_op_pc<Sym: WalkSym>(
         return None;
     }
     Some(InflightForiterBody::Jit {
-        outer_jitcode_index: unsafe { (*sym.jitcode()).index as u32 },
+        jitcode_index: unsafe { (*sym.jitcode()).index as i32 },
         op_pc,
     })
 }

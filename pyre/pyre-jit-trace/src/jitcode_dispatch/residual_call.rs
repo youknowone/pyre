@@ -2980,7 +2980,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // exhaustion arm) still records the completion; a successful attempt
     // replaces the entry with a fresh one anyway.
     if helper == majit_ir::PyreHelperKind::ForIterNext {
-        let body = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+        let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
             .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
         fbw_foriter_inflight_mark_attempt(body);
     }
@@ -3543,7 +3543,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // body and deliver to the wrong pc.  The fallback (no outer
                 // full-body sym / metadata) keeps the entry coordinate, which
                 // is correct for the loop-header FOR_ITER.
-                let body = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+                let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
                     .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
                 fbw_foriter_inflight_capture(result_i64 as usize as pyre_object::PyObjectRef, body);
                 // #73/#267: the item lands on the operand-stack TOS through the

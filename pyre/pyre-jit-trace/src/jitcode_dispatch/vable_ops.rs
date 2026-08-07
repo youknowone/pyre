@@ -638,12 +638,22 @@ fn folded_store_is_observable_local<Sym: WalkSym>(
 }
 
 /// `CodeObject` of the frame a vable op names — the callee's inside an inline
-/// sub-walk, the outer portal frame's otherwise.
+/// sub-walk that owns a [`CalleeLocalsShadow`], the outer portal frame's
+/// otherwise.
+///
+/// Shadow ownership, not `fbw_mode.inline_subwalk`, is the discriminant: the
+/// flag is also set for a canonical-helper descent (`run_sub_jitcode_walk`)
+/// and for a recursive root closure driven through the same entry, neither of
+/// which resolves a callee shadow.  Those walk the frame the outer sym already
+/// describes, so keying off the flag would leave them with no frame at all.
 fn active_frame_code<'a, Sym: WalkSym>(
     ctx: &'a WalkContext<'_, '_, Sym>,
 ) -> Option<&'a pyre_interpreter::CodeObject> {
-    let code_ptr = if ctx.fbw_mode.inline_subwalk {
-        ctx.callee_shadow.as_ref()?.code_ptr
+    // A resolved shadow is authoritative: falling back to the outer sym when
+    // its `code_ptr` is unset would answer with the CALLER's frame, the exact
+    // misattribution `active_frame_nlocals` exists to prevent.
+    let code_ptr = if let Some(shadow) = ctx.callee_shadow.as_ref() {
+        shadow.code_ptr
     } else {
         let sym = ctx.fbw_mode.snapshot_sym;
         if sym.is_null() {
@@ -676,10 +686,13 @@ fn active_frame_code<'a, Sym: WalkSym>(
 /// callee then read them back as NULL from the reconstructed frame — the next
 /// call in the callee arrived one positional argument short.
 fn active_frame_nlocals<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<i64> {
-    if ctx.fbw_mode.inline_subwalk {
+    if ctx.callee_shadow.is_some() {
         return active_frame_code(ctx)
             .map(|code| crate::state::callee_layout_for_call_assembler(code).0 as i64);
     }
+    // No callee shadow: the walk names the outer portal frame, and the sym is
+    // the authority for it even where its jitcode carries no code object (a
+    // fixture install), which the code-derived count could not answer.
     let sym = ctx.fbw_mode.snapshot_sym;
     if sym.is_null() {
         return None;

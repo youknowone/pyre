@@ -11186,7 +11186,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
 
     // A new consume attempt completes the prior in-flight iteration before
     // this irreversible concrete advance, matching the residual executor.
-    let body = fbw_foriter_body_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+    let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
     fbw_foriter_inflight_mark_attempt(body);
 

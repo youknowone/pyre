@@ -12437,3 +12437,82 @@ fn ref_var_list_offset_follows_the_argcodes_not_a_fixed_byte() {
     let op = crate::jitcode_runtime::decode_op_at(&code, 0).expect("must decode");
     assert_eq!(ref_var_list_operand_offset(&code, &op), None);
 }
+
+#[test]
+fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
+    // The in-flight FOR_ITER coordinate pairs a `for_iter_next` residual's own
+    // JitCode offset with a JitCode identity, and
+    // `inflight_foriter_body_pc` resolves the pair through THAT jitcode's pc
+    // tables.  Inside an inline sub-walk the offset is the callee's, so the
+    // identity must be the callee's too — `fbw_mode.snapshot_sym` still names
+    // the outer portal.
+    //
+    // A null `snapshot_sym` is the discriminating fixture: it is the one input
+    // for which the portal arm can produce nothing at all, so a returned
+    // identity can only have come from `inline_callee_consts`.  The callee arm
+    // returns before the sym is read, so a live portal can never outrank it.
+    let mut tc = fresh_trace_ctx();
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let callee_index = 4242;
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut [],
+        registers_i: &mut [],
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert!(
+        wc.fbw_mode.snapshot_sym.is_null(),
+        "fixture premise: no portal identity is available",
+    );
+    assert!(
+        fbw_foriter_body_from_op_pc(&wc, 96).is_none(),
+        "with neither a callee nor a portal there is no coordinate to record",
+    );
+
+    wc.inline_callee_consts = Some(InlineCalleeConsts {
+        w_globals: 0,
+        w_code: 0,
+        jitcode_index: callee_index,
+    });
+    wc.fbw_mode.inline_subwalk = true;
+    match fbw_foriter_body_from_op_pc(&wc, 96) {
+        Some(InflightForiterBody::Jit {
+            jitcode_index,
+            op_pc,
+        }) => {
+            assert_eq!(jitcode_index, callee_index, "identity must be the callee's");
+            assert_eq!(op_pc, 96, "offset must be recorded verbatim");
+        }
+        other => panic!("expected the callee's Jit coordinate, got {other:?}"),
+    }
+}
