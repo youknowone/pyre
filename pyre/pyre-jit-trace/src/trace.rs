@@ -4112,6 +4112,13 @@ fn run_perfn_walk<Sym: WalkSym>(
         {
             crate::jitcode_dispatch::restore_escape_flush_undo();
         }
+        // Measured, so that the next reader does not re-derive it: an "is the
+        // capture still armed here" invariant does NOT gate this leg. On
+        // `getframe_caller_resume_coord_two_call_sites` every walk that
+        // reaches this point reports `armed=false fb=true` — the blackhole
+        // adoption above claims the flushed frame, and the capture is already
+        // consumed. A counter conditioned on the three flags being false would
+        // read 0 both with and without the force arm's deferred restore.
         // The third field marks an abort that may only consume the `Entry`
         // carrier: the `MidBody` carrier is latched exclusively by the first two
         // variants (`inline_call.rs`), so a kept-stack abort matching a MidBody
@@ -6160,6 +6167,9 @@ pub mod fbw_diag {
     /// slot, little-endian) followed by one slot of packed counters.  A `u64`
     /// export cannot carry a string, and the outcome set is far too large to
     /// spend a tally slot per variant.
+    ///
+    /// `pyre-wasm-runner` decodes the ring through its OWN copy of this
+    /// constant (`main.rs`); the two have to move together.
     pub const RING_BASE: usize = 14;
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;
