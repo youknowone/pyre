@@ -386,6 +386,14 @@ fn llbc_source_fingerprint(
 /// reads it.  `PYRE_LLBC_STRICT=0` demotes it back to a warning for a
 /// deliberately-stale working build, and `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`
 /// skips the comparison entirely.
+///
+/// Three outcomes per crate, on two channels: **fresh** is silent, **stale**
+/// errors (or warns with strict mode disabled), and **unknown** — unreadable stamp, or an
+/// oracle that did not answer — warns without ever being promoted.  Keeping
+/// unknown off the silent channel is the point: otherwise "no warning" means
+/// both *checked and current* and *nobody checked*, and a reader cannot tell
+/// which build they got.  Cf. the same conflation in `llbc_extract.py`'s
+/// direct-invocation no-op.
 fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     println!("cargo::rerun-if-env-changed=PYRE_LLBC_STRICT");
     println!("cargo::rerun-if-env-changed=PYRE_LLBC_SKIP_FINGERPRINT_CHECK");
@@ -398,12 +406,26 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     }
     let llbc_dir = repo_root.join("build").join("llbc");
     let mut stale: Vec<(&str, String, String)> = Vec::new();
+    // Freshness has THREE outcomes, and the third used to be spelled the same
+    // way as "fresh": silence.  A crate whose stamp is unreadable, or whose
+    // oracle does not answer, is *unknown* — and "nobody checked" is not a
+    // licence to read its field offsets, it is the absence of the check that
+    // would grant one.
+    let mut unknown: Vec<(&str, &'static str)> = Vec::new();
     for &crate_name in LLBC_CRATES {
+        // An absent artefact is the bootstrap case, already reported by the
+        // prepass; only an artefact that EXISTS can be silently trusted, so
+        // only that case is worth calling unknown.
+        let artefact_exists = llbc_dir.join(format!("{crate_name}.ullbc")).is_file();
         let stamp_path = llbc_dir.join(format!("{crate_name}.ullbc.fingerprint"));
         let Ok(stamp) = std::fs::read_to_string(&stamp_path) else {
+            if artefact_exists {
+                unknown.push((crate_name, "no .fingerprint stamp beside the artefact"));
+            }
             continue;
         };
         let Some(recorded) = stamp_field(&stamp, "source=") else {
+            unknown.push((crate_name, "stamp carries no source= line"));
             continue;
         };
         let features = stamp_field(&stamp, "features=").unwrap_or_default();
@@ -411,11 +433,23 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
         let current =
             llbc_source_fingerprint(repo_root, &driver, crate_name, &features, &layout_targets);
         let Some(current) = current else {
+            unknown.push((crate_name, "the fingerprint oracle did not answer"));
             continue;
         };
         if current != recorded {
             stale.push((crate_name, recorded, current));
         }
+    }
+    // Reported as a warning and never promoted by `PYRE_LLBC_STRICT`: the
+    // documented contract is that an unavailable oracle must not break offline,
+    // hermetic or vendored builds, and failing here would break exactly the
+    // builds the fallback exists for.  Saying so costs one line and removes the
+    // ambiguity.  `PYRE_LLBC_SKIP_FINGERPRINT_CHECK` acknowledges and silences.
+    for (crate_name, reason) in &unknown {
+        println!(
+            "cargo::warning=LLBC FRESHNESS UNKNOWN: {crate_name}.ullbc was not checked \
+             ({reason}); it may or may not match the current sources"
+        );
     }
     if stale.is_empty() {
         return;
