@@ -36,6 +36,83 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// Lowering switches read by `majit-translate` while this build script runs.
 /// They affect generated graphs, so Cargo and the content cache must both see
 /// their values; otherwise an A/B can silently restore the opposite setting.
+
+/// Outputs whose bytes are this build-script process's own addresses, by
+/// construction: `fnaddr_bindings` is `(path, build_fnaddr)` and the two
+/// `*_bindings` tables are `(name, build_addr)`, captured so
+/// `runtime_fnaddr_patch` can re-pair them with the runtime's addresses (see
+/// the comments at their write sites). ASLR moves them on every process, so
+/// two processes always disagree and that disagreement is not a defect.
+///
+/// Excluded from the cross-process verdict only. Within one process the
+/// addresses are the same, so `DeterminismCheck::InProcess` still judges
+/// them — a difference there would be real.
+///
+/// Caching them is still sound: a restore serves this table and the
+/// `constants_i` baked against it from the *same* generation, so they stay
+/// consistent with each other.
+const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
+    "fnaddr_bindings.bin",
+    "static_pytype_bindings.bin",
+    "static_ref_bindings.bin",
+];
+
+/// Opt-in self-check that the generated outputs are a function of the inputs
+/// [`codegen_cache_key`] hashes. Deliberately not part of that key: it changes
+/// nothing about what gets generated, it only compares two generations.
+const DETERMINISM_CHECK_ENV: &str = "PYRE_CODEGEN_DETERMINISM_CHECK";
+/// Subdirectory of `OUT_DIR` holding the second generation's outputs. Left in
+/// place after the comparison so a reported difference can be diffed by hand.
+const DETERMINISM_PROBE_SUBDIR: &str = "determinism-probe";
+/// Changing this value re-runs the build script and nothing else — see
+/// [`emit_rerun_directives`] for why the `cache` mode cannot be exercised
+/// without it.
+const DETERMINISM_NONCE_ENV: &str = "PYRE_CODEGEN_NONCE";
+
+/// Which pair of generations [`codegen_outputs_match`] compares.
+///
+/// Off by default because it doubles a multi-minute prepass.
+///
+/// * `1` / `in-process` — generate a second time into
+///   [`DETERMINISM_PROBE_SUBDIR`] and compare the two sets byte for byte.
+/// * `cache` — compare this run's outputs against the entry already stored
+///   under the same cache key, i.e. against a *different* process's bytes.
+///   Reports that it compared nothing when no entry exists yet; editing this
+///   file rekeys the cache, so that is the expected result of the first run
+///   after any change here.
+///
+/// Neither mode subsumes the other. `in-process` catches whatever is carried
+/// in mutable process state — a never-reset global registry, an allocation
+/// address used as an order — but it shares this process's hash seeds with
+/// the run it compares against, so a seed-derived order is invisible to it.
+/// `cache` sees the seed class as well, and only ever compares against a key
+/// that already has an entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeterminismCheck {
+    Off,
+    InProcess,
+    AgainstCache,
+}
+
+impl DeterminismCheck {
+    /// Panics on an unrecognised value rather than reading it as `Off`: a
+    /// misspelled gate that silently checks nothing reports exactly like a
+    /// clean run.
+    fn from_env() -> Self {
+        match std::env::var(DETERMINISM_CHECK_ENV)
+            .unwrap_or_default()
+            .as_str()
+        {
+            "" | "0" => Self::Off,
+            "1" | "in-process" => Self::InProcess,
+            "cache" => Self::AgainstCache,
+            other => {
+                panic!("{DETERMINISM_CHECK_ENV}={other} is not one of: 0, 1, in-process, cache")
+            }
+        }
+    }
+}
+
 const LOWERING_GATE_ENV: [&str; 5] = [
     "PYRE_DYN_INDIRECT",
     "PYRE_FNPTR_INDIRECT",
@@ -70,12 +147,22 @@ fn main() {
     // visit order is keyed off the annotator/rtyper worklist maps
     // (`genpendingblocks`, `annotated`, `all_blocks`, …), which are
     // insertion-ordered `IndexMap`s, so the order in which the callee
-    // specialization chain is walked is deterministic and independent of the
-    // per-process SipHash seed.  A single in-process run suffices, matching
-    // RPython's single-shot translator.  The 1 GiB thread stack is needed
-    // for syn's recursive parse of ~150 files plus the rtyper chain
-    // (on Windows the main thread's 1 MiB default would
-    // STATUS_STACK_OVERFLOW).
+    // specialization chain is walked does not depend on the per-process
+    // SipHash seed.
+    //
+    // That covers the walk order and nothing downstream of it.  It does not
+    // establish that the emitted bytes are a function of the inputs: two
+    // generations of the same sources have been observed to produce different
+    // `jitcodes.bin` / `descrs.bin` / `ei_descr_mints.bin` while
+    // `jitcodes_index.bin` held still, from ordering and population decided
+    // after the walk (heap addresses used as a canonical order, a
+    // process-global mint registry).  `DeterminismCheck` is the opt-in check;
+    // an earlier reading of the paragraph above concluded "a single in-process
+    // run suffices", and that conclusion is why no check existed to catch it.
+    //
+    // The 1 GiB thread stack is needed for syn's recursive parse of ~150
+    // files plus the rtyper chain (on Windows the main thread's 1 MiB default
+    // would STATUS_STACK_OVERFLOW).
     run_worker();
 }
 
@@ -703,7 +790,14 @@ fn real_main() {
     // The callee census is emitted from the analysis itself. A cache restore
     // would print no rows, which is indistinguishable from an empty census.
     let callee_census = std::env::var_os("PYRE_CALLEE_CENSUS").is_some_and(|value| value == "1");
-    if !verbose_prepass && !callee_census && restore_codegen_cache(&cache_dir, &out_dir) {
+    // Restoring the outputs leaves the self-check nothing to compare, so it
+    // bypasses the cache for the same reason the verbose prepass does.
+    let determinism_check = DeterminismCheck::from_env();
+    if !verbose_prepass
+        && !callee_census
+        && determinism_check == DeterminismCheck::Off
+        && restore_codegen_cache(&cache_dir, &out_dir)
+    {
         eprintln!(
             "[pyre-jit-trace build.rs] restored generated JIT trace artifacts from cache {}",
             cache_key
@@ -713,177 +807,257 @@ fn real_main() {
         return;
     }
 
-    let pipeline = majit_translate::analyze_multiple_pipeline_with_modules(
-        &module_path_refs,
-        &analyze_config,
-        None,
-        vinfo_factory,
-        &fnaddr_bindings,
-        static_addrs,
-    );
-
-    // Generate tracing code from the canonical graph-first analysis result.
-    let code = majit_translate::generate_trace_code_from_pipeline(&pipeline);
-
-    std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
-
-    // JSON metadata for debugging
-    let json = serde_json::to_string_pretty(&pipeline).unwrap();
-    std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
-
-    // Persist `pipeline.jitcodes` (RPython `all_jitcodes` from
-    // codewriter.py:89) as individually encoded entries plus a name/offset
-    // index. Runtime materializes entries lazily into the shared
-    // MetaInterpStaticData jitcodes store — same single-store model as
-    // RPython `warmspot.py:281-282` `self.metainterp_sd.jitcodes =
-    // codewriter.make_jitcodes()`.
-    let mut jitcodes_bin = Vec::new();
-    let mut jitcode_names = Vec::with_capacity(pipeline.jitcodes.len());
-    let mut jitcode_offsets = Vec::with_capacity(pipeline.jitcodes.len() + 1);
-    jitcode_offsets.push(0_u32);
-    for jitcode in &pipeline.jitcodes {
-        jitcode_names.push(jitcode.name.clone());
-        jitcodes_bin.extend(bincode::serialize(jitcode).unwrap());
-        jitcode_offsets.push(
-            u32::try_from(jitcodes_bin.len())
-                .expect("serialized jitcodes.bin exceeds the u32 offset range"),
+    // One whole generation, writing every [`CODEGEN_OUTPUTS`] entry into the
+    // directory it is handed. That directory is `OUT_DIR` for the build's own
+    // outputs and the probe subdirectory for the second generation
+    // `DeterminismCheck::InProcess` compares against; the parameter shadows
+    // the outer `out_dir` so both calls read as "write into out_dir".
+    let generate_into = |out_dir: &str| {
+        let pipeline = majit_translate::analyze_multiple_pipeline_with_modules(
+            &module_path_refs,
+            &analyze_config,
+            None,
+            vinfo_factory,
+            &fnaddr_bindings,
+            static_addrs,
         );
+
+        // Generate tracing code from the canonical graph-first analysis result.
+        let code = majit_translate::generate_trace_code_from_pipeline(&pipeline);
+
+        std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
+
+        // JSON metadata for debugging
+        let json = serde_json::to_string_pretty(&pipeline).unwrap();
+        std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
+
+        // Persist `pipeline.jitcodes` (RPython `all_jitcodes` from
+        // codewriter.py:89) as individually encoded entries plus a name/offset
+        // index. Runtime materializes entries lazily into the shared
+        // MetaInterpStaticData jitcodes store — same single-store model as
+        // RPython `warmspot.py:281-282` `self.metainterp_sd.jitcodes =
+        // codewriter.make_jitcodes()`.
+        let mut jitcodes_bin = Vec::new();
+        let mut jitcode_names = Vec::with_capacity(pipeline.jitcodes.len());
+        let mut jitcode_offsets = Vec::with_capacity(pipeline.jitcodes.len() + 1);
+        jitcode_offsets.push(0_u32);
+        for jitcode in &pipeline.jitcodes {
+            jitcode_names.push(jitcode.name.clone());
+            jitcodes_bin.extend(bincode::serialize(jitcode).unwrap());
+            jitcode_offsets.push(
+                u32::try_from(jitcodes_bin.len())
+                    .expect("serialized jitcodes.bin exceeds the u32 offset range"),
+            );
+        }
+        let jitcodes_index_bin = bincode::serialize(&(jitcode_names, jitcode_offsets)).unwrap();
+        std::fs::write(format!("{out_dir}/jitcodes.bin"), &jitcodes_bin).unwrap();
+        std::fs::write(format!("{out_dir}/jitcodes_index.bin"), &jitcodes_index_bin).unwrap();
+        let indirectcalltargets_bin =
+            bincode::serialize(&pipeline.indirectcalltarget_indices).unwrap();
+        std::fs::write(
+            format!("{out_dir}/indirectcalltargets.bin"),
+            &indirectcalltargets_bin,
+        )
+        .unwrap();
+
+        // Persist the explicit portal → main-JitCode mapping. Runtime consumes
+        // this directly instead of rediscovering the portal through name or flag
+        // scans.
+        let jit_drivers_bin = bincode::serialize(&pipeline.jit_drivers).unwrap();
+        std::fs::write(format!("{out_dir}/jit_drivers.bin"), &jit_drivers_bin).unwrap();
+
+        // Persist the runtime opname → u8 table so
+        // `JitCode.code` (assembler-local mapping) decodes back to the
+        // canonical `(opname, argcodes)` shape at runtime (shadow dispatch,
+        // IR diffing).  RPython equivalent: the table handed to
+        // `BlackholeInterpBuilder::setup_insns` at metainterp startup
+        // (`pyjitpl.py:2227-2243`).
+        //
+        // RPython parity (`assembler.py:220 self.insns.setdefault(key,
+        // len(self.insns))`): the table is the assembler's emission-driven
+        // dict, populated by `write_insn` calls during graph flattening.
+        // Pyre's analog is `pipeline.insns`, snapshotted from
+        // `codewriter.assembler.insns()` after `make_jitcodes` finishes
+        // (`majit-translate/src/lib.rs:910`).  Each distinct key gets a
+        // fresh byte; the forward map is injective.  `blackhole.py:913`
+        // aliases the bhimpl handler under two Python attribute names
+        // (`bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`) but
+        // does NOT register a second opname in `Assembler.insns`; the
+        // alias is at the dispatch-function-name level only.  Pyre
+        // therefore registers exactly one opname per byte; the runtime
+        // inverse (`byte → opname`) is 1:1 and panics on duplicate-byte
+        // collisions (`jitcode_runtime.rs:INSNS_BYTE_TO_OPNAME`).
+        //
+        // Serialize through a `BTreeMap` view so the byte output is stable
+        // across processes (Rust's `HashMap` SipHash makes raw iteration
+        // non-deterministic; RPython's Python dict is insertion-ordered).
+        let insns_sorted: std::collections::BTreeMap<&String, &u8> =
+            pipeline.insns.iter().collect();
+        let insns_bin = bincode::serialize(&insns_sorted).unwrap();
+        std::fs::write(format!("{out_dir}/insns.bin"), &insns_bin).unwrap();
+
+        // RPython `blackhole.py:59 self.setup_descrs(asm.descrs)` + `:102-103
+        // def setup_descrs(self, descrs): self.descrs = descrs`. Persists the
+        // build-time assembler's shared descr pool so that 'd'/'j' argcodes
+        // in `JitCode.code` resolve at runtime via
+        // `BlackholeInterpBuilder::setup_descrs(...)` — the single-store
+        // model (same list consumed by every `BlackholeInterpreter` produced
+        // by `acquire_interp`).
+        let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
+        std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
+
+        // The table above is RPython's `opcode_descrs` (`pyjitpl.py:2261
+        // setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py:2289
+        // self.cpu.setup_descrs()` = the full gccache walk at `descr.py:25-47`).
+        // Upstream never has to distinguish them here because one gccache serves
+        // one process, so `compute_bitstrings` unions descrs that are already
+        // present. Pyre mints in this process and resolves in another, so the
+        // raw-set members no opcode names would have no slot on the far side;
+        // persist their mint arguments and let the runtime cache take the same
+        // `descr.py:224-238` miss branch this one did.
+        let ei_descr_mints_bin = bincode::serialize(&pipeline.ei_descr_mints).unwrap();
+        std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), &ei_descr_mints_bin).unwrap();
+
+        // RPython `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
+        // Persist the build-time assembler's shared `all_liveness` byte stream so a
+        // runtime consumer re-tracing a build-time jitcode (whose `BC_LIVE` ops
+        // carry offsets baked against this table) can install it into
+        // `metainterp_sd.liveness_info` and resolve those offsets.
+        let liveness_bin = bincode::serialize(&pipeline.all_liveness).unwrap();
+        std::fs::write(format!("{out_dir}/liveness.bin"), &liveness_bin).unwrap();
+
+        // RPython's translator AOT-compiles every helper into a single binary, so
+        // `JitCode.fnaddr` / `constants_i` funcptrs are linker-resolved and stable
+        // at runtime.  Pyre's `majit-translate` runs in `build.rs` — a separate
+        // process from `pyre-dynasm` — so every fnaddr captured here is the
+        // build-script process's address, which ASLR (and the divergent executable
+        // layouts) invalidates at runtime.  Persist the `(path, build_fnaddr)`
+        // table the codewriter consumed so the runtime patcher
+        // (`runtime_fnaddr_patch::patch_constants_i_fnaddrs`) can pair each build
+        // address with the matching runtime address from
+        // `pyre_interpreter::jit_trace_fnaddrs()` and overwrite stale constants
+        // before the walker invokes them.
+        let fnaddr_bindings_owned: Vec<(String, i64)> = fnaddr_bindings
+            .iter()
+            .map(|(p, a)| ((*p).to_string(), *a))
+            .collect();
+        let fnaddr_bindings_bin = bincode::serialize(&fnaddr_bindings_owned).unwrap();
+        std::fs::write(
+            format!("{out_dir}/fnaddr_bindings.bin"),
+            &fnaddr_bindings_bin,
+        )
+        .unwrap();
+
+        // Same ASLR hazard for the static-data addresses the codewriter baked
+        // into `constants_i` (host `PyType` singletons and prebuilt refs supplied
+        // via `HostStaticAddrs`): the build-script process's `&pyre_object::X`
+        // address does not survive into the runtime executable.  Persist the
+        // `(name, build_addr)` tables so `runtime_fnaddr_patch::
+        // patch_constants_i_static_addrs` can re-pair them with the runtime
+        // addresses from `jit_static_pytype_addrs` / `jit_static_ref_addrs`.
+        let pytype_bindings_owned: Vec<(String, i64)> = static_pytype_addrs
+            .iter()
+            .map(|(n, a)| ((*n).to_string(), *a))
+            .collect();
+        std::fs::write(
+            format!("{out_dir}/static_pytype_bindings.bin"),
+            bincode::serialize(&pytype_bindings_owned).unwrap(),
+        )
+        .unwrap();
+        let ref_bindings_owned: Vec<(String, i64)> = static_ref_addrs
+            .iter()
+            .map(|(n, a)| ((*n).to_string(), *a))
+            .collect();
+        std::fs::write(
+            format!("{out_dir}/static_ref_bindings.bin"),
+            bincode::serialize(&ref_bindings_owned).unwrap(),
+        )
+        .unwrap();
+
+        // Report
+        eprintln!(
+            "[pyre-jit-trace build.rs] canonical analysis: {} JIT drivers, {} functions, {} blocks, {} flat ops, {} all_jitcodes ({} bytes bodies + {} bytes index), generated {} bytes",
+            pipeline.jit_drivers.len(),
+            pipeline.functions.len(),
+            pipeline.total_blocks,
+            pipeline.total_ops,
+            pipeline.jitcodes.len(),
+            jitcodes_bin.len(),
+            jitcodes_index_bin.len(),
+            code.len(),
+        );
+    };
+
+    generate_into(&out_dir);
+
+    let reproducible = match determinism_check {
+        DeterminismCheck::Off => true,
+        DeterminismCheck::InProcess => {
+            let probe_dir = std::path::Path::new(&out_dir).join(DETERMINISM_PROBE_SUBDIR);
+            let _ = std::fs::remove_dir_all(&probe_dir);
+            std::fs::create_dir_all(&probe_dir).expect("create the determinism probe directory");
+            eprintln!(
+                "[pyre-jit-trace build.rs] codegen determinism: generating a second time into {}",
+                probe_dir.display()
+            );
+            // The second generation runs against whatever process-global
+            // state the first one left behind. If that state makes it panic,
+            // the outputs are not a function of the inputs either, so report
+            // it rather than take down a build whose own outputs — the first
+            // generation's, already written — are intact.
+            let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                generate_into(&probe_dir.to_string_lossy())
+            }))
+            .is_ok();
+            if completed {
+                codegen_outputs_match(
+                    "a second in-process generation",
+                    std::path::Path::new(&out_dir),
+                    &probe_dir,
+                    false,
+                )
+            } else {
+                println!(
+                    "cargo::warning=codegen determinism: the second in-process generation \
+                     panicked (see the panic above), so nothing was compared; the codegen does \
+                     not survive running twice in one process. Compare across processes with \
+                     {DETERMINISM_CHECK_ENV}=cache instead"
+                );
+                false
+            }
+        }
+        DeterminismCheck::AgainstCache => {
+            if CODEGEN_OUTPUTS
+                .iter()
+                .all(|name| cache_dir.join(name).is_file())
+            {
+                codegen_outputs_match(
+                    &format!("the stored cache entry {cache_key}"),
+                    &cache_dir,
+                    std::path::Path::new(&out_dir),
+                    true,
+                )
+            } else {
+                // Compared nothing, which is neither a pass nor a failure —
+                // say so rather than let an empty comparison read as clean.
+                // Storing below is what gives the next run something to
+                // compare against.
+                println!(
+                    "cargo::warning=codegen determinism: cache key {cache_key} has no stored \
+                     entry, so nothing was compared; re-run this build to compare against the \
+                     entry it is about to store"
+                );
+                true
+            }
+        }
+    };
+    if !reproducible {
+        println!(
+            "cargo::warning=codegen determinism: the outputs at cache key {cache_key} are not \
+             reproducible; refusing to store them"
+        );
+        return;
     }
-    let jitcodes_index_bin = bincode::serialize(&(jitcode_names, jitcode_offsets)).unwrap();
-    std::fs::write(format!("{out_dir}/jitcodes.bin"), &jitcodes_bin).unwrap();
-    std::fs::write(format!("{out_dir}/jitcodes_index.bin"), &jitcodes_index_bin).unwrap();
-    let indirectcalltargets_bin = bincode::serialize(&pipeline.indirectcalltarget_indices).unwrap();
-    std::fs::write(
-        format!("{out_dir}/indirectcalltargets.bin"),
-        &indirectcalltargets_bin,
-    )
-    .unwrap();
-
-    // Persist the explicit portal → main-JitCode mapping. Runtime consumes
-    // this directly instead of rediscovering the portal through name or flag
-    // scans.
-    let jit_drivers_bin = bincode::serialize(&pipeline.jit_drivers).unwrap();
-    std::fs::write(format!("{out_dir}/jit_drivers.bin"), &jit_drivers_bin).unwrap();
-
-    // Persist the runtime opname → u8 table so
-    // `JitCode.code` (assembler-local mapping) decodes back to the
-    // canonical `(opname, argcodes)` shape at runtime (shadow dispatch,
-    // IR diffing).  RPython equivalent: the table handed to
-    // `BlackholeInterpBuilder::setup_insns` at metainterp startup
-    // (`pyjitpl.py:2227-2243`).
-    //
-    // RPython parity (`assembler.py:220 self.insns.setdefault(key,
-    // len(self.insns))`): the table is the assembler's emission-driven
-    // dict, populated by `write_insn` calls during graph flattening.
-    // Pyre's analog is `pipeline.insns`, snapshotted from
-    // `codewriter.assembler.insns()` after `make_jitcodes` finishes
-    // (`majit-translate/src/lib.rs:910`).  Each distinct key gets a
-    // fresh byte; the forward map is injective.  `blackhole.py:913`
-    // aliases the bhimpl handler under two Python attribute names
-    // (`bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`) but
-    // does NOT register a second opname in `Assembler.insns`; the
-    // alias is at the dispatch-function-name level only.  Pyre
-    // therefore registers exactly one opname per byte; the runtime
-    // inverse (`byte → opname`) is 1:1 and panics on duplicate-byte
-    // collisions (`jitcode_runtime.rs:INSNS_BYTE_TO_OPNAME`).
-    //
-    // Serialize through a `BTreeMap` view so the byte output is stable
-    // across processes (Rust's `HashMap` SipHash makes raw iteration
-    // non-deterministic; RPython's Python dict is insertion-ordered).
-    let insns_sorted: std::collections::BTreeMap<&String, &u8> = pipeline.insns.iter().collect();
-    let insns_bin = bincode::serialize(&insns_sorted).unwrap();
-    std::fs::write(format!("{out_dir}/insns.bin"), &insns_bin).unwrap();
-
-    // RPython `blackhole.py:59 self.setup_descrs(asm.descrs)` + `:102-103
-    // def setup_descrs(self, descrs): self.descrs = descrs`. Persists the
-    // build-time assembler's shared descr pool so that 'd'/'j' argcodes
-    // in `JitCode.code` resolve at runtime via
-    // `BlackholeInterpBuilder::setup_descrs(...)` — the single-store
-    // model (same list consumed by every `BlackholeInterpreter` produced
-    // by `acquire_interp`).
-    let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
-    std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
-
-    // The table above is RPython's `opcode_descrs` (`pyjitpl.py:2261
-    // setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py:2289
-    // self.cpu.setup_descrs()` = the full gccache walk at `descr.py:25-47`).
-    // Upstream never has to distinguish them here because one gccache serves
-    // one process, so `compute_bitstrings` unions descrs that are already
-    // present. Pyre mints in this process and resolves in another, so the
-    // raw-set members no opcode names would have no slot on the far side;
-    // persist their mint arguments and let the runtime cache take the same
-    // `descr.py:224-238` miss branch this one did.
-    let ei_descr_mints_bin = bincode::serialize(&pipeline.ei_descr_mints).unwrap();
-    std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), &ei_descr_mints_bin).unwrap();
-
-    // RPython `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
-    // Persist the build-time assembler's shared `all_liveness` byte stream so a
-    // runtime consumer re-tracing a build-time jitcode (whose `BC_LIVE` ops
-    // carry offsets baked against this table) can install it into
-    // `metainterp_sd.liveness_info` and resolve those offsets.
-    let liveness_bin = bincode::serialize(&pipeline.all_liveness).unwrap();
-    std::fs::write(format!("{out_dir}/liveness.bin"), &liveness_bin).unwrap();
-
-    // RPython's translator AOT-compiles every helper into a single binary, so
-    // `JitCode.fnaddr` / `constants_i` funcptrs are linker-resolved and stable
-    // at runtime.  Pyre's `majit-translate` runs in `build.rs` — a separate
-    // process from `pyre-dynasm` — so every fnaddr captured here is the
-    // build-script process's address, which ASLR (and the divergent executable
-    // layouts) invalidates at runtime.  Persist the `(path, build_fnaddr)`
-    // table the codewriter consumed so the runtime patcher
-    // (`runtime_fnaddr_patch::patch_constants_i_fnaddrs`) can pair each build
-    // address with the matching runtime address from
-    // `pyre_interpreter::jit_trace_fnaddrs()` and overwrite stale constants
-    // before the walker invokes them.
-    let fnaddr_bindings_owned: Vec<(String, i64)> = fnaddr_bindings
-        .iter()
-        .map(|(p, a)| ((*p).to_string(), *a))
-        .collect();
-    let fnaddr_bindings_bin = bincode::serialize(&fnaddr_bindings_owned).unwrap();
-    std::fs::write(
-        format!("{out_dir}/fnaddr_bindings.bin"),
-        &fnaddr_bindings_bin,
-    )
-    .unwrap();
-
-    // Same ASLR hazard for the static-data addresses the codewriter baked
-    // into `constants_i` (host `PyType` singletons and prebuilt refs supplied
-    // via `HostStaticAddrs`): the build-script process's `&pyre_object::X`
-    // address does not survive into the runtime executable.  Persist the
-    // `(name, build_addr)` tables so `runtime_fnaddr_patch::
-    // patch_constants_i_static_addrs` can re-pair them with the runtime
-    // addresses from `jit_static_pytype_addrs` / `jit_static_ref_addrs`.
-    let pytype_bindings_owned: Vec<(String, i64)> = static_pytype_addrs
-        .iter()
-        .map(|(n, a)| ((*n).to_string(), *a))
-        .collect();
-    std::fs::write(
-        format!("{out_dir}/static_pytype_bindings.bin"),
-        bincode::serialize(&pytype_bindings_owned).unwrap(),
-    )
-    .unwrap();
-    let ref_bindings_owned: Vec<(String, i64)> = static_ref_addrs
-        .iter()
-        .map(|(n, a)| ((*n).to_string(), *a))
-        .collect();
-    std::fs::write(
-        format!("{out_dir}/static_ref_bindings.bin"),
-        bincode::serialize(&ref_bindings_owned).unwrap(),
-    )
-    .unwrap();
-
-    // Report
-    eprintln!(
-        "[pyre-jit-trace build.rs] canonical analysis: {} JIT drivers, {} functions, {} blocks, {} flat ops, {} all_jitcodes ({} bytes bodies + {} bytes index), generated {} bytes",
-        pipeline.jit_drivers.len(),
-        pipeline.functions.len(),
-        pipeline.total_blocks,
-        pipeline.total_ops,
-        pipeline.jitcodes.len(),
-        jitcodes_bin.len(),
-        jitcodes_index_bin.len(),
-        code.len(),
-    );
 
     if let Err(e) = store_codegen_cache(&cache_dir, &out_dir) {
         eprintln!(
@@ -959,6 +1133,14 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     println!("cargo::rerun-if-env-changed=PYRE_RTYPER_VERBOSE");
     println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS");
     println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS_ROWS");
+    println!("cargo::rerun-if-env-changed={DETERMINISM_CHECK_ENV}");
+    // Re-runs this script without changing anything it hashes. That is the
+    // only way to exercise `DeterminismCheck::AgainstCache`, which needs two
+    // runs at the *same* cache key: with the gate value held constant Cargo
+    // considers the script fresh and skips the second run, and any input edit
+    // that would force one also rekeys the cache and leaves nothing to
+    // compare against. Deliberately absent from `codegen_cache_key`.
+    println!("cargo::rerun-if-env-changed={DETERMINISM_NONCE_ENV}");
     for key in LOWERING_GATE_ENV {
         println!("cargo::rerun-if-env-changed={key}");
     }
@@ -1073,6 +1255,105 @@ fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
     for (_, path) in by_last_use.into_iter().skip(retained) {
         let _ = std::fs::remove_dir_all(path);
     }
+}
+
+/// Compare two generated output sets file by file. True only when every
+/// [`CODEGEN_OUTPUTS`] entry was read on both sides and is byte-identical: an
+/// output that cannot be read on one side is an inconclusive comparison, and
+/// an inconclusive comparison must not report as a clean one.
+///
+/// Reports through `cargo::warning`, which cargo surfaces for a workspace
+/// crate's build script. A bare `println!` / `eprintln!` needs `-vv`, which is
+/// how a build-script line documenting the cache restore went unread long
+/// enough to be mistaken for the restore not happening.
+///
+/// Names the identical outputs as well as the differing ones. Which files hold
+/// still localises the cause faster than which files move: `jitcodes.bin`
+/// moving while `jitcodes_index.bin` holds says the entries changed while
+/// their names and boundaries did not, which rules out the walk order and
+/// points at what is written into each entry. A size change and an
+/// equal-size change are different findings too — one moved a count, the
+/// other only an order — so both lengths are reported, not just that they
+/// differ.
+///
+/// `cross_process` excuses [`HOST_ADDRESSED_OUTPUTS`] from the verdict. They
+/// are still reported, on their own line: a check that files a by-design
+/// difference as a defect is one people learn to ignore, and then it reports
+/// nothing at all.
+fn codegen_outputs_match(
+    label: &str,
+    baseline: &std::path::Path,
+    probe: &std::path::Path,
+    cross_process: bool,
+) -> bool {
+    let mut identical: Vec<&str> = Vec::new();
+    let mut differing: Vec<String> = Vec::new();
+    let mut host_addressed: Vec<&str> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    for name in CODEGEN_OUTPUTS {
+        match (
+            std::fs::read(baseline.join(name)),
+            std::fs::read(probe.join(name)),
+        ) {
+            (Ok(a), Ok(b)) if a == b => identical.push(name),
+            (Ok(_), Ok(_)) if cross_process && HOST_ADDRESSED_OUTPUTS.contains(name) => {
+                host_addressed.push(name);
+            }
+            (Ok(a), Ok(b)) => {
+                let offset = a
+                    .iter()
+                    .zip(b.iter())
+                    .position(|(x, y)| x != y)
+                    .unwrap_or_else(|| a.len().min(b.len()));
+                differing.push(format!(
+                    "{name} ({} vs {} bytes, first difference at offset {offset})",
+                    a.len(),
+                    b.len()
+                ));
+            }
+            (a, b) => unreadable.push(format!(
+                "{name} (baseline {}, probe {})",
+                if a.is_ok() { "read" } else { "unreadable" },
+                if b.is_ok() { "read" } else { "unreadable" }
+            )),
+        }
+    }
+    if !host_addressed.is_empty() {
+        eprintln!(
+            "[pyre-jit-trace build.rs] codegen determinism: {} host-address table(s) differ from \
+             {label} as expected, excluded from the verdict: {}",
+            host_addressed.len(),
+            host_addressed.join(" ")
+        );
+    }
+    if differing.is_empty() && unreadable.is_empty() {
+        eprintln!(
+            "[pyre-jit-trace build.rs] codegen determinism: all {} reproducible outputs are \
+             identical to {label}",
+            identical.len()
+        );
+        return true;
+    }
+    for entry in &differing {
+        println!("cargo::warning=codegen determinism: DIFFERS from {label}: {entry}");
+    }
+    for entry in &unreadable {
+        println!("cargo::warning=codegen determinism: NOT COMPARED against {label}: {entry}");
+    }
+    println!(
+        "cargo::warning=codegen determinism: {} of {} outputs unchanged from {label}: {}",
+        identical.len(),
+        CODEGEN_OUTPUTS.len(),
+        identical.join(" ")
+    );
+    if !host_addressed.is_empty() {
+        println!(
+            "cargo::warning=codegen determinism: excluded as host addresses (expected to differ \
+             across processes): {}",
+            host_addressed.join(" ")
+        );
+    }
+    false
 }
 
 fn restore_codegen_cache(cache_dir: &std::path::Path, out_dir: &str) -> bool {
