@@ -14238,9 +14238,15 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         // pyjitpl.py:3560-3570 `if start_stack:` — one frame, the outermost,
-        // measured against where the trace stopped.
-        if let Some(&(green_key, start_pos)) = start_stack.first() {
-            let current = self.tracing.as_ref()?.get_trace_position()._pos;
+        // measured against where the trace stopped.  Upstream reads
+        // `self.history` there unconditionally; pyre's recorder is an `Option`,
+        // and a `?` on it would return `None` for the whole function and throw
+        // away a `max_key` the closed frames above already produced.  Only the
+        // open frame is unmeasurable without a recorder, so only it is skipped.
+        if let Some(&(green_key, start_pos)) = start_stack.first()
+            && let Some(tracing) = self.tracing.as_ref()
+        {
+            let current = tracing.get_trace_position()._pos;
             if current.saturating_sub(start_pos) > max_size {
                 max_key = Some(green_key);
             }
@@ -20499,6 +20505,31 @@ mod metainterp_static_data_tests {
         record_ops(&mut meta, 5);
 
         assert_eq!(meta.find_biggest_function(), Some(0xb22));
+    }
+
+    #[test]
+    fn find_biggest_function_keeps_a_closed_frame_when_the_recorder_is_gone() {
+        // pyjitpl.py:3560-3570 reads `self.history` unconditionally, so a
+        // closed frame's size always survives to the return. pyre's recorder is
+        // an `Option`: an unmatched open entry plus `tracing = None` must skip
+        // only the open frame's measurement, not discard `max_key`.
+        let (mut meta, jc) = meta_with_recursive_portal();
+        start_tracing(&mut meta);
+
+        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        record_ops(&mut meta, 5);
+        meta.popframe(true);
+
+        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        record_ops(&mut meta, 1);
+        // Left open, and the recorder retired under it.
+        meta.tracing = None;
+
+        assert_eq!(
+            meta.find_biggest_function(),
+            Some(0xa11),
+            "the closed frame's size survives a missing recorder"
+        );
     }
 
     #[test]
