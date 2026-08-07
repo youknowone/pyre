@@ -143,45 +143,40 @@ fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
 }
 
 #[test]
-fn keyword_builtin_wrapper_finds_colored_argument_slice_item_descr() {
+fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     let wrapper =
         named_jitcode("__pyre_wrap_getrandbits").expect("getrandbits builtin wrapper jitcode");
-    let mut ops = crate::jitcode_runtime::decoded_ops(&wrapper.code);
-    let first = ops.next().expect("wrapper first op");
-    // The result colour is not pinned. `split_builtin_kwargs` returns the
-    // aggregate `(&[PyObjectRef], Option<PyObjectRef>)`; when the codewriter
-    // materializes that pair the entry call yields it by reference
-    // (`inline_call_r_r`), and when it inlines the body far enough to leave
-    // only the leading `args.is_empty()` test at the entry the same call
-    // yields that by value (`inline_call_r_i`). Both start the wrapper by
-    // splitting positional from keyword arguments, which is what this asserts.
+    let first = crate::jitcode_runtime::decoded_ops(&wrapper.code)
+        .next()
+        .expect("wrapper first op");
+    // `getrandbits` registers with a `Signature`, so the call path resolves
+    // keywords into positional PY_NULL-padded slots before the wrapper runs.
+    // There is no `split_builtin_kwargs(args)` peel at the entry, so the
+    // wrapper does not open with the splitter's `inline_call_*`; it reads its
+    // argument array directly.
     assert!(
-        first.opname.starts_with("inline_call_"),
-        "keyword wrapper starts by splitting positional and keyword arguments, got {}",
+        !first.opname.starts_with("inline_call_"),
+        "signature-bound wrapper does not open with a keyword-split call, got {}",
         first.key
     );
 
     let item_descr_index =
         wrapper_args_item_descr_index(&wrapper.code).expect("wrapper item descriptor");
-    // Select by descr identity rather than by position. The inlined splitter
-    // reads `args.len()` off the wrapper's own `r0` before the split, so "the
-    // first `arraylen_gc`" names that read and not the positional slice's once
-    // the body inlines; the item descr names the slice under every inline
-    // depth.
+    // Select by descr identity rather than by position: the length read names
+    // the array itself and the item read names its elements, so the two carry
+    // distinct heap-cache descriptors even though both index the same slice.
     let getitem = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| {
             op.key == "getarrayitem_gc_r/rid>r"
                 && item_pool_descr_index(&wrapper.code, op.pc + 3) == item_descr_index
         })
-        .expect("keyword wrapper argument-slice item read");
+        .expect("wrapper argument-slice item read");
     let slice_reg = wrapper.code[getitem.pc + 1];
-    assert_ne!(
-        slice_reg, 0,
-        "register coloring keeps the argument slice off r0 at extraction"
-    );
+    // With no keyword split the argument slice is the wrapper input itself
+    // (r0); the length read names the same register.
     crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| op.key == "arraylen_gc/rd>i" && wrapper.code[op.pc + 1] == slice_reg)
-        .expect("keyword wrapper reads the argument-slice length off the colored slice");
+        .expect("wrapper reads the argument-slice length off the same slice register");
 }
 
 /// Descr-pool index encoded little-endian at `at`, resolved to its

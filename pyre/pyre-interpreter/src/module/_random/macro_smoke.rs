@@ -39,6 +39,20 @@ impl Demo {
     fn __reduce__(&self) -> PyObjectRef {
         crate::pytuple![type_object(), crate::pytuple![], self.getstate()]
     }
+    // A positional-or-keyword parameter plus a keyword-only default: the
+    // instance-method arm must build a `Signature` (`self` posonly, then
+    // `factor`, then a `marker_kwonly()` tail with `bias`) so the call path
+    // binds keywords by name and the wrapper preamble needs no marker-dict
+    // strip.
+    fn combine(
+        &self,
+        factor: i64,
+        #[kwonly]
+        #[default(0i64)]
+        bias: i64,
+    ) -> i64 {
+        self.state as i64 * factor + bias
+    }
     // `#[getter]` / `#[setter]` / `#[deleter]` GetSetProperty quad.
     #[getter(doc = "raw 64-bit state as a signed int")]
     fn raw_state(&self) -> i64 {
@@ -191,6 +205,44 @@ mod tests {
         assert_eq!(demo.state, 0);
         __pyre_wrap___init__(&[obj, seed]).expect("Demo.__init__");
         assert_eq!(Demo::from_obj(obj).expect("initialized Demo").state, 37);
+    }
+
+    /// A `#[pyre_methods]` instance method with a positional-or-keyword and a
+    /// keyword-only parameter binds identically whether the keyword arrives
+    /// positionally or by name through `bind_kwargs_to_signature` — the same
+    /// invariant the caller relies on to hand the wrapper a marker-free,
+    /// PY_NULL-padded scope.
+    #[test]
+    fn instance_method_binds_keyword_only_through_signature() {
+        crate::typedef::init_typeobjects();
+        let cls = type_object();
+        let obj = __pyre_wrap___new__(&[cls]).expect("synthesized __new__");
+        __pyre_wrap___init__(&[obj, w_int_new(7)]).expect("Demo.__init__");
+
+        // The `Signature` the instance-method arm derives for
+        // `combine(&self, factor, #[kwonly] bias)`: `self` positional-only,
+        // then `factor`, then a keyword-only `bias`.
+        let signature = crate::gateway::Signature::new(
+            vec!["self", "factor", "bias"],
+            None,
+            None,
+            /*kwonlyargcount*/ 1,
+            /*posonlyargcount*/ 1,
+        );
+        let bound = crate::call::bind_kwargs_to_signature(
+            &signature,
+            "combine",
+            &[obj, w_int_new(3)],
+            &[(rustpython_wtf8::Wtf8Buf::from("bias"), w_int_new(5))],
+        )
+        .expect("signature binding");
+        // 7 * 3 + 5 through the bound (marker-free, PY_NULL-padded) scope.
+        let via_keyword = __pyre_wrap_combine(&bound).expect("keyword-bound combine");
+        assert_eq!(unsafe { w_int_get_value(via_keyword) }, 26);
+
+        // The all-positional call omits `bias`, so its `#[default(0)]` applies.
+        let via_positional = __pyre_wrap_combine(&[obj, w_int_new(3)]).expect("positional combine");
+        assert_eq!(unsafe { w_int_get_value(via_positional) }, 21);
     }
 
     /// TypeDef ownership is process-global: another OS thread must observe

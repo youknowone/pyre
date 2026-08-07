@@ -2606,6 +2606,19 @@ pub(crate) fn make_new_descr_with_signature(
     crate::make_builtin_function_as_builtin_with_signature("__new__", func, signature)
 }
 
+/// [`make_new_descr`] optionally carrying a `Signature`: `Some` binds keyword
+/// arguments by name before the constructor runs; `None` (a variadic
+/// whole-args `__new__`) keeps the positional-only carrier.
+pub(crate) fn make_new_descr_maybe_sig(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    signature: Option<crate::gateway::Signature>,
+) -> PyObjectRef {
+    match signature {
+        Some(signature) => make_new_descr_with_signature(func, signature),
+        None => make_new_descr(func),
+    }
+}
+
 /// `typeobject.c tp_new_wrapper` — `__new__` takes the class to instantiate
 /// as its first argument, so a call without one is rejected before the body
 /// reads the value positionals behind it.

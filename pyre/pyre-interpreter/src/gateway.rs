@@ -1191,6 +1191,24 @@ pub fn make_builtin_function_with_text_signature(
     function
 }
 
+/// `make_builtin_function_with_text_signature` that also records an argument
+/// `Signature` (`Some` routes through the keyword-binding constructor; `None`
+/// falls back to the positional-only one).  Used by the `#[pyre_methods]`
+/// all-required instance-method arm, which wants both the generated
+/// `__text_signature__` for introspection and by-name keyword binding.
+pub fn make_builtin_function_with_text_signature_and_sig(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    text_signature: &'static str,
+    signature: Option<Signature>,
+) -> PyObjectRef {
+    let function = make_builtin_function_maybe_sig(name, func, signature);
+    unsafe {
+        crate::function::fset_func_text_signature(function, pyre_object::w_str_new(text_signature));
+    }
+    function
+}
+
 /// Fixed-arity twin of `make_builtin_function_with_text_signature`.
 pub fn make_builtin_function_with_arity_and_text_signature(
     name: &'static str,

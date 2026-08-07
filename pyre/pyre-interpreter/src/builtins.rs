@@ -4257,6 +4257,23 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
     (args, None)
 }
 
+/// Length of the leading non-null run of `args`.
+///
+/// `bind_kwargs_to_signature` pads the flat argument slice out to the full
+/// parameter count with PY_NULL for keyword-only slots and absent optionals,
+/// so the true positional count is the prefix before the first PY_NULL.
+/// A single named function keeps the count off the annotator's shared
+/// iterator-adapter graph: a `take_while` closure inlined per wrapper gives
+/// every `__pyre_wrap_*` shim its own closure type, and merging those
+/// distinct types on one `TakeWhile` graph's input has no common base class.
+pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> usize {
+    let mut count = 0;
+    while count < args.len() && !args[count].is_null() {
+        count += 1;
+    }
+    count
+}
+
 /// Cold dictionary-strategy half of the flat builtin-keyword ABI.
 ///
 /// The caller first proves `last` is a dict.  Keeping the strategy dispatch

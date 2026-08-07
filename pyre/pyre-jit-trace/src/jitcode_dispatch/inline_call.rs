@@ -2031,13 +2031,11 @@ pub(crate) fn walker_ec_leave(
 /// descriptor. The first instruction's arraylen descriptor is deliberately
 /// not interchangeable with the later getarrayitem descriptor.
 pub(super) fn wrapper_args_item_descr_index(code: &[u8]) -> Option<u32> {
-    // Keyword-capable generated wrappers first call
-    // `split_builtin_kwargs(args)` before their arity/unwrap code.  Its
-    // positional-slice result can therefore occupy a register other than the
-    // wrapper input r0, and register colouring can move it again between the
-    // arity check and unwrap.  Generated gateways perform their argument
-    // extraction before entering the typed body, so the first Ref item read
-    // after the first slice-length read is the wrapper-argument descriptor.
+    // Generated gateways perform their argument extraction before entering the
+    // typed body, reading the slice length before any element.  The first Ref
+    // item read after the first slice-length read is therefore the
+    // wrapper-argument descriptor, independent of which register colouring
+    // assigns to the slice.
     let arraylen_pc = crate::jitcode_runtime::decoded_ops(code)
         .find(|decoded| decoded.key == "arraylen_gc/rd>i")
         .map(|decoded| decoded.pc)?;
