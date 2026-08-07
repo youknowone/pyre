@@ -133,9 +133,6 @@ that the oldgen-nonmoving concession becomes deletable.
   (cross-check the decoded `py_pc` against
   `containing_py_pc_for_jitcode_pc_public(jitcode_index, pc)` over the corpus)
   before it is a finding rather than a suspicion.
-- **A misleading survivor of the resume rework.** `pyjitpl.rs` still calls its
-  `SnapshotFramePcs` local `pc_map`, the name of the deleted translation table.
-  Rename it so the name stops implying a mechanism that no longer exists.
 - **Compilation cliffs** outside F4's census: nested-loop / cross-loop no-token
   walls (gh#152, gh#177) and the recursion / call-frame wall (gh#126, open).
 - **Phase C decision document** (gh#376, open): a C-extension strategy document,

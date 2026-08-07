@@ -514,7 +514,10 @@ fn snapshot_map_from_trace_snapshots(
     let mut size_map = Vec::new();
     let mut vable_map = Vec::new();
     let mut vref_map = Vec::new();
-    let mut pc_map = Vec::new();
+    // Not `pc_map`: that name belongs to the `-live-` marker table keyed by
+    // Python pc (`pc_map[py_pc]`, `pyre-jit/src/jit/codewriter.rs`). This is
+    // keyed by snapshot id and holds one `(jitcode_index, pc, py_pc)` per frame.
+    let mut frame_pcs_map = Vec::new();
     // opencoder.py:603 _encode: trace snapshot recorder only emits Box
     // (live deadframe slot) and Const (compile-time pool) payloads.
     // TAGVIRTUAL belongs to resume numbering (resume.py:_number_boxes)
@@ -575,9 +578,9 @@ fn snapshot_map_from_trace_snapshots(
         snapshot_insert(&mut size_map, id, frame_sizes);
         snapshot_insert(&mut vable_map, id, vable_boxes);
         snapshot_insert(&mut vref_map, id, vref_boxes);
-        snapshot_insert(&mut pc_map, id, frame_pcs);
+        snapshot_insert(&mut frame_pcs_map, id, frame_pcs);
     }
-    (box_map, size_map, vable_map, vref_map, pc_map)
+    (box_map, size_map, vable_map, vref_map, frame_pcs_map)
 }
 
 struct PreparedBridgeTrace {
@@ -6025,7 +6028,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_pc_map,
+            snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         // history.py:220/261/307 — `Const{Int,Float,Ptr}.type` is an
         // intrinsic attribute on the Box itself, so no raw-u32 type
@@ -6035,7 +6038,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
-        unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
+        unroll_opt.snapshot_frame_pcs = snapshot_frame_pcs.clone();
         // The original snapshot maps are re-cloned into `simple_opt` on the
         // InvalidLoop retry below, so they must stay rooted across the WHOLE
         // unroll. Each phase's `replace_compile_snapshot_roots` overwrites the
@@ -6169,7 +6172,7 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map;
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map;
                         simple_opt.snapshot_vref_boxes = snapshot_vref_map;
-                        simple_opt.snapshot_frame_pcs = snapshot_pc_map;
+                        simple_opt.snapshot_frame_pcs = snapshot_frame_pcs;
                         simple_opt.call_pure_results = call_pure_results.clone();
                         // Forward the recorder's operand pool — the retry path
                         // uses the same upstream `Rc<Box>` allocations from
@@ -8561,7 +8564,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_pc_map,
+            snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
@@ -8580,7 +8583,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
-        optimizer.snapshot_frame_pcs = snapshot_pc_map;
+        optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
 
         // InvalidLoop during optimization should abort the trace, not crash
         // the process. Matches compile_loop.
@@ -9003,7 +9006,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_pc_map,
+            snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
@@ -9014,7 +9017,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
-        optimizer.snapshot_frame_pcs = snapshot_pc_map;
+        optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
 
         let optimize_start = Instant::now();
         let optimize_result = optimizer.optimize_with_constants_and_inputs_oprc(
