@@ -31,6 +31,7 @@ wasm-encoder = { workspace = true }
 wasm-bindgen = { workspace = true, optional = true }
 
 [dev-dependencies]
+majit-gc = { workspace = true, features = ["gc_box"] }
 majit-ir = { workspace = true, features = ["test-support"] }
 wasmparser = { workspace = true }
 smallvec = { workspace = true }

@@ -110,8 +110,9 @@ thread_local! {
     /// `install_gc_box` fills it and only tests reach that; the production
     /// build goes through `install_gc_standalone` and routes to the `gc_sync`
     /// singleton. Every read of it is therefore guarded by
-    /// `majit_gc::gc_box_installed()`, so the path the cell does not serve
-    /// does not pay for it.
+    /// `majit_gc::gc_box_installed()`, which without `majit-gc/gc_box` is a
+    /// constant `false` — so in a production build every branch that reaches
+    /// this cell folds away and the trampolines call `gc_sync` directly.
     pub static DYNASM_ACTIVE_GC: RefCell<Option<Box<dyn majit_gc::GcAllocator>>> =
         const { RefCell::new(None) };
     static DYNASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn majit_gc::GcAllocator>> =

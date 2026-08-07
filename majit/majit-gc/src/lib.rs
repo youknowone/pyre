@@ -1626,18 +1626,46 @@ pub fn supports_guard_gc_type() -> bool {
 /// `malloc` against the single translation-time `gcdata`
 /// (`gctransform/framework.py`) — so the box is pyre-side test scaffolding, and
 /// the queries below let the allocation path it does not serve skip it.
+///
+/// Only compiled when a box can exist at all, i.e. under `gc_box`; see
+/// [`gc_box_installed`] for what the other build spells instead.
+#[cfg(any(test, feature = "gc_box"))]
 static GC_BOX_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Record that a backend has installed a per-thread GC box. Called from each
 /// backend's box-installing entry point.
+#[cfg(any(test, feature = "gc_box"))]
 pub fn note_gc_box_installed() {
     GC_BOX_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// A build without `gc_box` answers every [`gc_box_installed`] query with a
+/// constant `false`, so a box installed here would be invisible to all of them
+/// and its owner would silently allocate out of the singleton instead. Refuse
+/// loudly rather than let that read as a pass.
+#[cfg(not(any(test, feature = "gc_box")))]
+pub fn note_gc_box_installed() {
+    panic!(
+        "a per-thread GC box was installed in a build without the `gc_box` feature; \
+         production installs the backend standalone (`install_gc_standalone`), and a \
+         test that needs a box must depend on `majit-gc` with `features = [\"gc_box\"]`"
+    );
+}
+
 /// Whether any thread may own a per-thread GC box. See [`GC_BOX_INSTALLED`].
+#[cfg(any(test, feature = "gc_box"))]
 #[inline]
 pub fn gc_box_installed() -> bool {
     GC_BOX_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// No backend can hold a box in this build, so every `gc_box_installed() && …`
+/// probe folds away and the allocation, write-barrier and query trampolines
+/// call `gc_sync` directly — which is the whole shape RPython has.
+#[cfg(not(any(test, feature = "gc_box")))]
+#[inline(always)]
+pub fn gc_box_installed() -> bool {
+    false
 }
 
 // ── Host-side nursery allocation hook ───────────────────────────────
