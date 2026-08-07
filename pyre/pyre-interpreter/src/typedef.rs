@@ -3449,12 +3449,12 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if let Some(w_bool) = gettypefor(&pyre_object::BOOL_TYPE) {
         check_user_subclass(w_bool.as_ptr(), w_booltype)?;
     }
-    // boolobject.py: descr_new(space, w_booltype, w_obj)
-    // Takes exactly (cls) or (cls, obj). No extra args, no kwargs.
+    // boolobject.py:41-46 `descr_new` counts the class argument.
     if args.len() > 2 {
-        return Err(crate::PyError::type_error(
-            "bool expected at most 1 argument, got more",
-        ));
+        return Err(crate::PyError::type_error(format!(
+            "bool.__new__() takes from 1 to 2 positional arguments but {} were given",
+            args.len()
+        )));
     }
     // args[1] = w_obj (default: False)
     let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);

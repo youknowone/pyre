@@ -4897,65 +4897,49 @@ fn min_max_multiple_args(
     Ok(pyre_object::gc_roots::shadow_stack_get(best_item_slot))
 }
 
-/// `type(obj)` — return the type name as a string (simplified).
-/// `type(obj)` — return the type of an object as a W_TypeObject.
+/// typeobject.py:886 `descr__new__` — `type.__new__(metatype, name, bases, dict)`
+/// and its one-argument form `type(obj)`.
 ///
-/// PyPy: `space.type(w_obj)` → W_TypeObject
+/// `descr__new__(space, w_typetype, __args__)` takes the metatype as its own
+/// gateway parameter and everything behind it as `__args__`, so `pos[0]` is the
+/// metatype and `pos[1..]` is `arguments_w`.  A bound `__new__` does not prepend
+/// its `__self__`, on the direct path or through `super()`, so the split is the
+/// same however the call arrives.
 pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // type.__new__(metatype, name, bases, dict)
-    // May be called with extra self-binding from super():
-    //   [self, metatype, name, bases, dict] — 5 args
-    //   [metatype, name, bases, dict] — 4 args
-    //   [metatype, obj] — 2 args (type(obj))
-    // Find the (name, bases, dict) triple by scanning for the first str arg.
-    // Also extract the metatype (first type arg before the name str).
     // The class-definition keywords arrive as a trailing `__pyre_kw__`
-    // dict (the builtin kwargs ABI); strip it before the arity scan and
+    // dict (the builtin kwargs ABI); strip it before the arity check and
     // hand it to __init_subclass__ via `type_descr_new_with_metaclass`.
     let (pos, kwargs) = split_builtin_kwargs(args);
-    let mut w_metaclass = pyre_object::PY_NULL;
-    for i in 0..pos.len() {
-        if unsafe { pyre_object::is_str(pos[i]) } && i + 2 < pos.len() {
-            // Extract metatype from preceding args
-            for j in 0..i {
-                if unsafe { pyre_object::is_type(pos[j]) } {
-                    w_metaclass = pos[j];
-                }
-            }
-            return type_descr_new_with_metaclass(&pos[i..], w_metaclass, kwargs);
-        }
+    // The gateway supplies `w_typetype` from a declared parameter, so upstream
+    // never sees this shape; pyre reads it out of the same slice and has to
+    // refuse it here, in `tp_new_wrapper`'s words.
+    if pos.is_empty() {
+        return Err(crate::PyError::type_error(
+            "type.__new__(): not enough arguments",
+        ));
     }
-    if pos.len() == 1 {
-        // `type.__new__(metatype)` — no name, bases or namespace follows, so
-        // `arguments_w` is empty and the count is neither one nor three.  The
-        // arity is decided before `_precheck_for_new`, which is why a
-        // non-metatype is named here rather than refused as one.
-        return Err(crate::PyError::type_error(new_arity_message(pos[0])));
+
+    let w_typetype = pos[0];
+    let arguments_w = &pos[1..];
+    // The count decides the form before any argument is read; `w_typetype` is
+    // touched only to word the refusal, which is why `_precheck_for_new` runs
+    // after it and not before.
+    if arguments_w.len() != 1 && arguments_w.len() != 3 {
+        return Err(crate::PyError::type_error(new_arity_message(w_typetype)));
     }
-    if pos.len() == 2 {
-        precheck_for_new(pos[0])?;
+
+    precheck_for_new(w_typetype)?;
+    if arguments_w.len() == 1 {
         // typeobject.py:901-908 — the one-argument form belongs to `type`
         // alone: `type(x)` reports the type of `x`, while `Metaclass(x)` is a
         // class statement missing its bases and its namespace.
-        if !unsafe { std::ptr::eq(pos[0], crate::typedef::w_type()) } {
-            return Err(crate::PyError::type_error(new_arity_message(pos[0])));
+        if !unsafe { std::ptr::eq(w_typetype, crate::typedef::w_type()) } {
+            return Err(crate::PyError::type_error(new_arity_message(w_typetype)));
         }
-        return type_descr_new_without_metaclass(&pos[1..], kwargs);
+        return type_descr_new_without_metaclass(arguments_w, kwargs);
     }
-    // `descr__new__` (typeobject.py:885) keys the one-vs-three form on the
-    // argument *count*, and `_check_new_args` is what names an argument of
-    // the wrong type.  The scan above keys on a str being present instead,
-    // so `type(1, (), {})` arrives here with its three arguments intact;
-    // hand that unambiguous `[metatype, name, bases, dict]` shape on so the
-    // name gets reported rather than the arity.
-    if pos.len() == 4 {
-        // Three arguments, so the count is settled and `_precheck_for_new`
-        // (typeobject.py:899) runs before either of them is read.
-        precheck_for_new(pos[0])?;
-        w_metaclass = pos[0];
-        return type_descr_new_with_metaclass(&pos[1..], w_metaclass, kwargs);
-    }
-    Err(crate::PyError::type_error("type() takes 1 or 3 arguments"))
+
+    type_descr_new_with_metaclass(arguments_w, w_typetype, kwargs)
 }
 /// typeobject.py:888-895 `descr__new__` — the wording for a `type.__new__`
 /// call whose argument count is neither one nor three.  `type` itself names
@@ -5383,7 +5367,7 @@ fn type_descr_new_with_metaclass(
             } else {
                 bases
             };
-        // CPython: calculate_metaclass — delegate to winner if different
+        // calculate_metaclass — delegate to winner if different
         let default_meta = if w_metaclass.is_null() {
             crate::typedef::w_type()
         } else {
@@ -5392,7 +5376,14 @@ fn type_descr_new_with_metaclass(
         // A metaclass conflict among the bases (or an explicit metaclass that
         // is not a subclass of every base's metaclass) is a hard error, not a
         // silent fall-back to `default_meta`.
-        let w_winner = crate::call::calculate_metaclass(default_meta, w_effective_bases)?;
+        //
+        // `_calculate_metaclass` (typeobject.py:945) sees the bases as written.
+        // `(object,)` is substituted for an empty tuple only in
+        // `W_TypeObject.__init__` (`bases_w or [space.w_object]`), which runs
+        // after the winner is settled — supplying it here would weigh an
+        // explicit metatype against `type(object)` and report a conflict where
+        // the metatype itself is what upstream goes on to refuse.
+        let w_winner = crate::call::calculate_metaclass(default_meta, bases)?;
         if !std::ptr::eq(w_winner, default_meta) {
             // Winner is a different metaclass — delegate to its __new__
             if let Some(w_metaclass_new) =
@@ -5416,6 +5407,18 @@ fn type_descr_new_with_metaclass(
             }
         }
         let w_metaclass = w_winner;
+        // `_create_new_type` reaches the instance through
+        // `space.allocate_instance(W_TypeObject, w_typetype)`, and that runs
+        // `W_TypeObject.check_user_subclass` (typeobject.py:555-567) on the way
+        // in: the winning metatype has to be a subtype of `type` before a type
+        // is laid out for it.
+        if !unsafe { crate::baseobjspace::issubtype_w(w_metaclass, crate::typedef::w_type()) } {
+            let self_name = type_new_getname(crate::typedef::w_type());
+            let subtype_name = type_new_getname(w_metaclass);
+            return Err(crate::PyError::type_error(format!(
+                "{self_name}.__new__({subtype_name}): {subtype_name} is not a subtype of {self_name}"
+            )));
+        }
 
         // This is type.__new__'s own construction path. A different winning
         // metaclass above received the original bases without a C3 pre-check.

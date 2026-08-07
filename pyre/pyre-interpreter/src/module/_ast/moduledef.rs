@@ -171,6 +171,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         )
         .expect("set _field_types on _ast type namespace");
         let args = [
+            crate::typedef::w_type(),
             pyre_object::w_str_new(name),
             pyre_object::w_tuple_new(vec![base]),
             dict,
