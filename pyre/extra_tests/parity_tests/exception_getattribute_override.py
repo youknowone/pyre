@@ -63,6 +63,31 @@ except E as raised:
     assert raised.__traceback__ == "overridden-traceback"
 
 
+# `__exit__` is handed the traceback the interpreter stored, not whatever the
+# override answers for `__traceback__` — the unwinder reads the slot directly.
+class Recorder:
+    seen = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        type(self).seen = (exc_type, exc, tb)
+        return True
+
+
+with Recorder() as recorder:
+    raise E("in-with")
+seen_type, seen_exc, seen_tb = Recorder.seen
+assert seen_type is E
+assert isinstance(seen_exc, E)
+assert seen_tb is not None
+assert seen_tb != "overridden-traceback"
+assert type(seen_tb).__name__ == "traceback"
+# The override is still what attribute access answers on the same object.
+assert seen_exc.__traceback__ == "overridden-traceback"
+
+
 # Receivers whose builtin type carries a `__getattribute__` of its own read
 # their attributes unchanged: super proxies, bound methods, unions, generic
 # aliases, weak proxies and struct objects.
