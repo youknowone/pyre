@@ -3899,9 +3899,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
         }
     }
-    /// `interp_scandir.py get_stat` — `follow_symlinks=True` caches into
-    /// `w_stat`, `False` into `w_lstat`, so a repeated call returns the same
-    /// object.  Only a successful fetch is cached; an error re-raises on each
+    /// `posixmodule.c DirEntry_get_stat` caches the built result and hands back
+    /// the same object — `follow_symlinks=True` into `w_stat`, `False` into
+    /// `w_lstat` — so `entry.stat() is entry.stat()`.  (`interp_scandir.py
+    /// descr_stat` caches only the raw stat data and rebuilds a fresh
+    /// `build_stat_result` on every call, so under it the result identity
+    /// differs; the 3.14 behavior is to cache the object, which is what this
+    /// does.)  Only a successful fetch is cached; an error re-raises on each
     /// call.  The entry never moves (`allocate_stable`), so the raw receiver
     /// stays valid across the fetch's allocation.
     fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
