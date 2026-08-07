@@ -81,6 +81,19 @@ unsafe impl Sync for GcTable {}
 /// drop).
 static LIVE_GC_TABLES: RwLock<Vec<Weak<GcTable>>> = RwLock::new(Vec::new());
 
+/// Test-only lock modeling the stop-the-world invariant that no table is
+/// dropped while a walk is in flight. The harness runs tests in parallel, so
+/// a collector test's collection — which walks this registry through the
+/// globally-registered [`gc_table_extra_root_walker`] once any table has
+/// existed — can call [`walk_all_gc_tables`] concurrently with a registry
+/// test's table drop, transiently upgrading a `Weak` the dropping test
+/// expects to be dead. A registry test takes the write side to exclude every
+/// walk across its drop/observe window; each walk takes the read side.
+/// Compiled out in production, where the STW collector already guarantees no
+/// concurrent drop.
+#[cfg(test)]
+static GC_TABLE_WALK_LOCK: RwLock<()> = RwLock::new(());
+
 impl GcTable {
     /// Build a per-loop table from the rewrite's gcref output list and
     /// register it for GC forwarding.
@@ -149,6 +162,18 @@ fn register_table(table: &Arc<GcTable>) {
 /// (`collector.rs:668`) and major (`collector.rs:1185`) collection
 /// phases.
 fn walk_all_gc_tables(visitor: &mut dyn FnMut(&mut GcRef)) {
+    // In test builds, hold the read side of the walk lock so a registry
+    // test's drop/observe window (which takes the write side) is never
+    // interleaved with a walk. Compiles out in production.
+    #[cfg(test)]
+    let _walk = GC_TABLE_WALK_LOCK.read().unwrap_or_else(|e| e.into_inner());
+    walk_all_gc_tables_inner(visitor);
+}
+
+/// The walk itself, without the test-only lock, so a registry test that
+/// already holds the write side observes the registry without re-entering
+/// the lock.
+fn walk_all_gc_tables_inner(visitor: &mut dyn FnMut(&mut GcRef)) {
     // Snapshot the live tables under a read guard, then release the lock
     // before tracing (same snapshot-then-iterate discipline as
     // `walk_extra_roots`, `shadow_stack.rs:622`). Dead `Weak`s are
@@ -182,15 +207,17 @@ mod tests {
     // `LIVE_GC_TABLES` is a process-global registry; in production it is
     // only mutated outside a collection (table build at compile time) and
     // only read inside a stop-the-world collection, so there is never a
-    // concurrent build-vs-walk. The test harness runs tests in parallel,
-    // which would let one table-building test's registry mutation race
-    // another's global `walk_all_gc_tables` assertion. Serialize the
-    // table-touching tests against each other to model the STW invariant.
-    static TEST_REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // concurrent build-vs-walk. The test harness runs tests in parallel, so
+    // besides serializing the table-touching tests against each other, the
+    // write side of [`GC_TABLE_WALK_LOCK`] also excludes any concurrent
+    // collector-test collection whose walk would otherwise transiently
+    // resurrect a table this test is dropping — modeling the STW invariant.
 
     #[test]
     fn trace_forwards_slots_in_place() {
-        let _serialize = TEST_REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialize = GC_TABLE_WALK_LOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
         // A moving collection relocates 0x1000 -> 0x9000.
         table.trace(&mut |r| {
@@ -215,7 +242,9 @@ mod tests {
         // is the shared dynasm/cranelift `LoadFromGcTable` contract; wasm never
         // runs the GC rewrite (loud-panic), so it has no moving-GC ref-const
         // path to cover.
-        let _serialize = TEST_REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialize = GC_TABLE_WALK_LOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
         // `base` is the value baked into the trace at compile time.
         let base = table.base_addr();
@@ -253,12 +282,16 @@ mod tests {
 
     #[test]
     fn dropping_table_deregisters_from_walk() {
-        let _serialize = TEST_REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialize = GC_TABLE_WALK_LOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         // A sentinel unlikely to collide with any other test's table.
         const SENTINEL: GcRef = GcRef(0x0DEAD_BEEF);
+        // The write side is already held, so count through the unlocked
+        // walk to avoid re-entering the lock.
         let count_sentinels = || {
             let mut n = 0usize;
-            walk_all_gc_tables(&mut |r| {
+            walk_all_gc_tables_inner(&mut |r| {
                 if *r == SENTINEL {
                     n += 1;
                 }
