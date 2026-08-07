@@ -40,10 +40,11 @@ with open(p, "wb") as f:
 # above it, so -1ns is the last nanosecond of 1969 rather than a value with no
 # representation.
 #
-# Windows is left out: a FILETIME counts 100ns ticks, so a nanosecond that is
-# not a multiple of 100 is not a time that filesystem can hold — CPython reads
-# -1 back as -100 — and this build's Windows path carries the timestamp as an
-# unsigned duration and refuses the whole range. See the follow-up task.
+# Windows is left out of this block: a FILETIME counts 100ns ticks, so
+# ns=(-1, -1) is not a time that filesystem can hold (it reads -1 back as
+# -100), and the descriptor form below is not one Windows advertises. The
+# keyword `times` case after the block, which lands on whole seconds, is
+# written through SetFileTime everywhere.
 if sys.platform != "win32":
     os.utime(p, ns=(-1, -1))
     check(os.stat(p).st_mtime_ns == -1, f"utime(ns=(-1,-1)) -> {os.stat(p).st_mtime_ns}")
@@ -82,33 +83,37 @@ os.utime(p, ns=(1_000_000_000, 2_000_000_000))
 # Every name the table carries either answers with a number or refuses the
 # question — the terminal-only limits are not ones a regular file has. What no
 # answer may be is None: a host with no determinate value says so with -1.
-def limits(target):
-    for name in sorted(os.pathconf_names):
+#
+# pathconf and pathconf_names are POSIX-only; Windows has neither, so the
+# section is skipped there rather than asked of a name that cannot answer.
+if sys.platform != "win32":
+
+    def limits(target):
+        for name in sorted(os.pathconf_names):
+            try:
+                limit = os.pathconf(target, name)
+            except OSError:
+                continue
+            check(isinstance(limit, int), f"pathconf({name!r}) answered {limit!r}")
+            check(limit >= -1, f"pathconf({name!r}) answered {limit}")
+            yield name, limit
+
+    answered = dict(limits(p))
+    check(answered, "pathconf answered no name at all")
+    check("PC_NAME_MAX" in answered, "pathconf refused PC_NAME_MAX on a regular file")
+
+    if os.pathconf in os.supports_fd:
+        fd = os.open(p, os.O_RDONLY)
         try:
-            limit = os.pathconf(target, name)
-        except OSError:
-            continue
-        check(isinstance(limit, int), f"pathconf({name!r}) answered {limit!r}")
-        check(limit >= -1, f"pathconf({name!r}) answered {limit}")
-        yield name, limit
+            by_fd = dict(limits(fd))
+            check(
+                by_fd.get("PC_NAME_MAX") == answered["PC_NAME_MAX"],
+                "the descriptor and the name disagree about PC_NAME_MAX",
+            )
+        finally:
+            os.close(fd)
 
-
-answered = dict(limits(p))
-check(answered, "pathconf answered no name at all")
-check("PC_NAME_MAX" in answered, "pathconf refused PC_NAME_MAX on a regular file")
-
-if os.pathconf in os.supports_fd:
-    fd = os.open(p, os.O_RDONLY)
-    try:
-        by_fd = dict(limits(fd))
-        check(
-            by_fd.get("PC_NAME_MAX") == answered["PC_NAME_MAX"],
-            "the descriptor and the name disagree about PC_NAME_MAX",
-        )
-    finally:
-        os.close(fd)
-
-raises(lambda: os.pathconf(p, "PC_NOT_A_REAL_NAME"), ValueError)
+    raises(lambda: os.pathconf(p, "PC_NOT_A_REAL_NAME"), ValueError)
 
 # ── truncate's length ─────────────────────────────────────────────────────
 # A length wider than off_t is not a size the file can be given; the cast that
