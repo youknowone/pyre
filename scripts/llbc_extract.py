@@ -89,6 +89,12 @@ class Engine:
     metadata_feature_crates: tuple[str, ...] = ()
     layout_targets: tuple[str, ...] = ()
     layout_target_rustflags: str = ""
+    # Files/directories outside `root` that a driver declares by hand, for
+    # inputs the dependency walk cannot find: the engine module itself, and
+    # any build-determining file `git ls-files` refuses to list (an ignored
+    # `.cargo/config.toml`, a lockfile a repo does not commit). Patched path
+    # deps need no declaration — `_collect_inputs` discovers those.
+    external_inputs: tuple[Path, ...] = ()
 
     def spec(self, crate: str) -> CrateSpec:
         try:
@@ -371,10 +377,34 @@ def _reject_unresolvable_include(where: str, tail: str) -> None:
     )
 
 
-def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
+def _collect_inputs(
+    eng: Engine, crates: list[str], cargo_features: str
+) -> tuple[list[str], list[Path]]:
+    """Split the fingerprint's inputs by which channel can carry them.
+
+    Returns `(pathspecs, external)`:
+
+    * `pathspecs` — repo-relative, resolved through `git ls-files` below, so
+      the working tree (including untracked-not-ignored files) is what gets
+      hashed.
+    * `external` — absolute paths OUTSIDE `eng.root`, which `git ls-files`
+      cannot name at all: it refuses a pathspec that leaves the repository.
+      These are hashed by content instead, by `external_fingerprint`.
+
+    The second list used to be dropped on the floor. The dependency walk below
+    admits path deps by `source is None`, which is how cargo spells BOTH an
+    in-tree workspace member and a `[patch]` redirect into a sibling checkout —
+    so a patched dependency was discovered, found to be out-of-root, and
+    discarded with no diagnostic. cel-jit patches `majit-{ir,macros,metainterp}`
+    to `../majit/*`, which pulls the rest of that workspace by path: 10 of the
+    11 closure members landed here, `majit-macros` among them. That one is a
+    proc macro, so its expansion IS the extracted crate's bodies, and editing it
+    changed the artefact's content without moving its fingerprint.
+    """
     root = eng.root
     target_names: list[str] = []
     pathspecs = list(eng.base_pathspecs)
+    external: list[Path] = [Path(p).resolve() for p in eng.external_inputs]
 
     for crate in crates:
         spec = eng.spec(crate)
@@ -461,6 +491,8 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
                 if package_dir.is_relative_to(root):
                     rel_dir = package_dir.relative_to(root).as_posix()
                     pathspecs.append(f"{rel_dir}/Cargo.toml")
+                else:
+                    external.append(package_dir / "Cargo.toml")
                 for target in package["targets"]:
                     kinds = set(target["kind"])
                     if not ({"lib", "bin", "custom-build"} & kinds):
@@ -471,6 +503,16 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
                         pathspecs.append(rel_src)
                         if "custom-build" not in kinds:
                             pathspecs.append(str(Path(rel_src).parent) + "/")
+                    else:
+                        # Same shape as the in-root arm, one channel over: the
+                        # entry point always, its directory only for a real
+                        # target. A `custom-build`'s src_path is the crate's
+                        # own `build.rs`, so its parent is the CRATE ROOT —
+                        # walking that would pull in `target/` and every
+                        # sibling target's sources.
+                        external.append(src_path)
+                        if "custom-build" not in kinds:
+                            external.append(src_path.parent)
 
     # git is the enumerator, but the index is not the input set: Charon and
     # rustc read the working tree, so a source file that is on disk and not yet
@@ -504,7 +546,77 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
         if raw
     }
     files |= include_closure(root, files)
-    return sorted(files, key=lambda path: path.as_posix())
+    return sorted(files, key=lambda path: path.as_posix()), external
+
+
+def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
+    """Repo-relative inputs hashed into `source=`."""
+    return _collect_inputs(eng, crates, cargo_features)[0]
+
+
+def external_input_entries(
+    eng: Engine, crates: list[str], cargo_features: str
+) -> list[tuple[str, Path]]:
+    """Out-of-root inputs hashed into `external=`, as `(label, absolute path)`.
+
+    Deliberately NOT named `external_inputs`: that is the driver-facing keyword
+    of `run_cli`, and a parameter of that name shadows the module-level
+    function for the whole body.
+
+    The label — not the absolute path — is what enters the digest, so two
+    checkouts of the same layout in different directories agree. Directories
+    are expanded here rather than at collection time so the walk sees the
+    working tree at hashing time, matching `source=`'s
+    save-not-commit behaviour for the in-root half.
+    """
+    _, roots = _collect_inputs(eng, crates, cargo_features)
+
+    def label_for(path: Path) -> str:
+        # Relative to the artefact root, so the stamp survives relocating the
+        # whole cohabitation (`<super>/{pyre,cel-jit,majit}`) as a unit. It
+        # does not survive rearranging the repos RELATIVE to each other, which
+        # is the correct sensitivity: that changes which sources are compiled.
+        return Path(os.path.relpath(path, eng.root)).as_posix()
+
+    found: dict[str, Path] = {}
+    for entry in roots:
+        if entry.is_file():
+            found[label_for(entry)] = entry
+            continue
+        if not entry.is_dir():
+            # A declared input that does not exist still has to move the
+            # digest, exactly as a deleted tracked file does in `source=`.
+            found.setdefault(label_for(entry), entry)
+            continue
+        for sub in entry.rglob("*"):
+            # `target/` is build output and dot-dirs are VCS/tooling state;
+            # neither is a compiler input, and `target/` alone is tens of GB.
+            parts = set(sub.relative_to(entry).parts[:-1])
+            if "target" in parts or any(p.startswith(".") for p in parts):
+                continue
+            if sub.is_file():
+                found[label_for(sub)] = sub
+    return sorted(found.items())
+
+
+def external_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
+    """Digest of the out-of-root inputs, or `""` when there are none.
+
+    Empty is the common case (a consumer whose whole dependency closure lives
+    inside its own repo, which is every pyre crate today) and it is spelled as
+    an empty value rather than a digest-of-nothing so the stamp says plainly
+    that nothing outside the repo was folded in.
+    """
+    entries = external_input_entries(eng, crates, cargo_features)
+    if not entries:
+        return ""
+    digest = hashlib.sha256()
+    for label, path in entries:
+        digest.update(label.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes() if path.is_file() else b"<absent>")
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
@@ -657,6 +769,13 @@ def stamp_for(
             f"layout_flags={' '.join(layout_flags)}",
             f"layout_rustflags={eng.layout_target_rustflags}",
             f"source={source_fingerprint(eng, [crate], cargo_features)}",
+            # Inputs `source=` structurally cannot cover: everything outside
+            # this repo. Kept as its own field rather than folded into
+            # `source=` so `check`'s per-field diff can say WHICH side moved —
+            # "your own sources changed" and "a patched dependency in another
+            # checkout changed" call for different actions, and collapsing
+            # them would repeat the mistake this field exists to fix.
+            f"external={external_fingerprint(eng, [crate], cargo_features)}",
         ]
     )
 
@@ -675,6 +794,7 @@ STAMP_KEYS = (
     "layout_flags",
     "layout_rustflags",
     "source",
+    "external",
 )
 
 
@@ -1240,6 +1360,7 @@ def run_cli(
     metadata_feature_crates: tuple[str, ...] = (),
     layout_targets: tuple[str, ...] = (),
     layout_target_rustflags: str = "",
+    external_inputs: tuple[Path, ...] = (),
 ) -> None:
     """Argparse UX shared by every driver (positional crates, --force, …)."""
     all_crates = " ".join(specs)
@@ -1292,15 +1413,25 @@ def run_cli(
         metadata_feature_crates=metadata_feature_crates,
         layout_targets=layout_targets,
         layout_target_rustflags=layout_target_rustflags,
+        external_inputs=tuple(external_inputs),
     )
 
     crates = args.crates or default_crates
     if args.list_inputs:
         for path in fingerprint_inputs(eng, crates, cargo_features):
             print(path.as_posix())
+        # Marked, because the two channels are hashed into different stamp
+        # fields and an unmarked union would read as one list of repo-relative
+        # paths — which is what made the out-of-root inputs easy to miss.
+        for label, _ in external_input_entries(eng, crates, cargo_features):
+            print(f"external:{label}")
         return
     if args.fingerprint:
-        print(source_fingerprint(eng, crates, cargo_features))
+        # BOTH fields. Printing only `source=` here previously cost a session:
+        # three legs returned identical hashes that were consistent with every
+        # hypothesis, because the field under test was not in the output.
+        print(f"source={source_fingerprint(eng, crates, cargo_features)}")
+        print(f"external={external_fingerprint(eng, crates, cargo_features)}")
         return
     if args.self_test:
         self_test(eng, crates, cargo_features)
