@@ -1027,6 +1027,10 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
     platform_key, charon_dest, _ = charon_paths(eng.charon_root)
     charon_stamp = charon_version(charon_dest)
     dest_dir = llbc_dest(eng.out_dir, eng.root)
+    # ⚠ `crates` is what was REQUESTED, and the epilogue's `unaccounted` check
+    # depends on it staying that way. Rebuilding this list from resolved specs
+    # would drop a name the loop could not process before the epilogue ever saw
+    # it, turning "this crate was never confirmed" back into silent success.
     crates = args.crates or eng.default_crates
 
     stale: list[str] = []
