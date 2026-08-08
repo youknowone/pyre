@@ -4496,14 +4496,29 @@ impl OpcodeStepExecutor for PyFrame {
                 ))
             })?;
         let next = crate::call::call_function_impl_result(method, &[])?;
-        let awaitable = crate::baseobjspace::get_awaitable_iter(next, 0).map_err(|err| {
-            if err.kind == crate::PyErrorKind::TypeError {
-                crate::PyError::type_error(format!(
-                    "'async for' received an invalid object from __anext__: {}",
-                    crate::type_methods::arg_type_name(next)
-                ))
-            } else {
-                err
+        let awaitable = crate::baseobjspace::get_awaitable_iter(next, 0).map_err(|mut cause| {
+            // CPython 3.14 `_PyEval_GetANext` uses
+            // `_PyErr_FormatFromCause` for *every* failure produced while
+            // converting `__anext__`'s result to an awaitable.  In
+            // particular, an exception raised by `result.__await__()` is the
+            // explicit cause of this TypeError; only an exception raised by
+            // `__anext__` itself propagates unchanged above.
+            let message = format!(
+                "'async for' received an invalid object from __anext__: {}",
+                crate::type_methods::arg_type_name(next)
+            );
+            let cause_obj = cause.to_exc_object();
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(cause_obj);
+            let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let mut error = crate::PyError::type_error(message);
+            let error_obj = error.to_exc_object();
+            let cause_obj = pyre_object::gc_roots::shadow_stack_get(cause_slot);
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_context(error_obj, cause_obj);
+                pyre_object::interp_exceptions::w_exception_set_cause(error_obj, cause_obj);
+                pyre_object::interp_exceptions::w_exception_set_suppress_context(error_obj, true);
+                crate::PyError::from_exc_object(error_obj)
             }
         })?;
         self.push(awaitable);
