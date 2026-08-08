@@ -1121,11 +1121,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
     }
 
-    // `interp_socket.py:1041-1063 SocketAPI`:
-    //   error    = w_OSError                       (alias)
-    //   herror   = new_exception_class("_socket.herror",   w_OSError)
-    //   gaierror = new_exception_class("_socket.gaierror", w_OSError)
-    //   timeout  = new_exception_class("_socket.timeout",  w_OSError)
+    // `moduledef.py:12-16`:
+    //   error    = get_error(space, "error")
+    //   herror   = get_error(space, "herror")
+    //   gaierror = get_error(space, "gaierror")
+    //   timeout  = space.w_TimeoutError
     // `socketmodule.c` names them `socket.herror` / `socket.gaierror`
     // instead, and `type.__module__` reads the qualified prefix back, so
     // `socket.gaierror.__module__` is `"socket"` rather than `"_socket"`.
@@ -1150,15 +1150,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             w_os_error,
         ),
     );
-    crate::module_ns_store(
-        ns,
-        "timeout",
-        crate::builtins::make_exc_type(
-            "socket.timeout",
-            crate::builtins::exc_exception_new,
-            w_os_error,
-        ),
-    );
+    let w_timeout_error = crate::builtins::lookup_exc_class("TimeoutError")
+        .expect("TimeoutError must be installed before _socket init");
+    crate::module_ns_store(ns, "timeout", w_timeout_error);
 
     // Default timeout (None) — modulus has a getter/setter; we just stash
     // a None so attribute lookups succeed.
