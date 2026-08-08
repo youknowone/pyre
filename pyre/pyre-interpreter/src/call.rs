@@ -5145,6 +5145,18 @@ pub unsafe fn create_all_slots(
         } else {
             (*base_layout).nslots
         };
+        // CPython 3.14 `type_new_slots`: a variable-sized base may add a
+        // managed instance dict, but may not add weakrefs or any explicit
+        // `__slots__` entry.  These are the three variable layouts currently
+        // exposed by pyre's builtin type registry.
+        let base_has_variable_items = if base_layout.is_null() {
+            false
+        } else {
+            let typedef = (*base_layout).typedef;
+            std::ptr::eq(typedef, &pyre_object::INT_TYPE)
+                || std::ptr::eq(typedef, &pyre_object::TUPLE_TYPE)
+                || std::ptr::eq(typedef, &pyre_object::bytesobject::BYTES_TYPE)
+        };
 
         // typeobject.py:1150-1204 create_all_slots
         let mut newslotnames = Vec::new();
@@ -5154,6 +5166,12 @@ pub unsafe fn create_all_slots(
             wantdict = false;
             wantweakref = false;
             let all_names = collect_slot_names(w_slots)?;
+            if base_has_variable_items && !all_names.is_empty() {
+                return Err(crate::PyError::type_error(format!(
+                    "nonempty __slots__ not supported for subtype of '{}'",
+                    pyre_object::w_type_get_name(w_bestbase)
+                )));
+            }
             if !all_names.iter().any(|name| name == "__doc__")
                 && !crate::type_dict_contains(w_type, "__doc__")
             {
@@ -5194,24 +5212,6 @@ pub unsafe fn create_all_slots(
             }
             // typeobject.py:1178: string_sort(newslotnames)
             newslotnames.sort();
-
-            // CPython 3.14 rejects additional instance slots on the remaining
-            // variable-size builtin layouts. `str` is deliberately excluded:
-            // current CPython permits them (configparser._Line relies on it),
-            // and PyPy stores them in BaseUserClassMapdict like every other
-            // app-level subclass slot.
-            if !newslotnames.is_empty() && !base_layout.is_null() {
-                let typedef = (*base_layout).typedef;
-                if std::ptr::eq(typedef, &pyre_object::INT_TYPE)
-                    || std::ptr::eq(typedef, &pyre_object::TUPLE_TYPE)
-                    || std::ptr::eq(typedef, &pyre_object::bytesobject::BYTES_TYPE)
-                {
-                    return Err(crate::PyError::type_error(format!(
-                        "nonempty __slots__ not supported for subtype of '{}'",
-                        pyre_object::w_type_get_name(w_bestbase)
-                    )));
-                }
-            }
 
             // typeobject.py:1183-1189: create_slot loop
             let type_name = pyre_object::w_type_get_name(w_type);
@@ -5257,7 +5257,7 @@ pub unsafe fn create_all_slots(
         } else {
             // typeobject.py:1151-1153: no __slots__
             wantdict = true;
-            wantweakref = true;
+            wantweakref = !base_has_variable_items;
         }
 
         // PyPy dict subclasses are W_DictMultiObject instances, so their

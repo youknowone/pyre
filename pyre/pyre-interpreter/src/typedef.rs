@@ -822,7 +822,12 @@ pub fn init_typeobjects() {
         );
 
         // slice — PyPy: sliceobject.py, bases=(object,)
-        let slice_type = new_typeobject_with_base("slice", init_slice_type, object_type);
+        let slice_type = new_typeobject_with_base_and_layout(
+            "slice",
+            init_slice_type,
+            object_type,
+            &pyre_object::sliceobject::SLICE_TYPE as *const PyType,
+        );
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(slice_type, false) };
         reg.insert(
             &pyre_object::sliceobject::SLICE_TYPE as *const PyType as usize,
@@ -1026,17 +1031,23 @@ pub fn init_typeobjects() {
         );
         // rangeobject.c PyRange_Type carries no Py_TPFLAGS_BASETYPE, so
         // `range` is not an acceptable base class.
-        let range_type = new_typeobject_with_base("range", init_range_type, object_type);
+        let range_type = new_typeobject_with_base_and_layout(
+            "range",
+            init_range_type,
+            object_type,
+            &pyre_object::functional::RANGE_TYPE as *const PyType,
+        );
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(range_type, false) };
         reg.insert(
             &pyre_object::functional::RANGE_TYPE as *const PyType as usize,
             range_type as usize,
         );
         // memoryobject.py:731 W_MemoryView.typedef.acceptable_as_base_class = False
-        let memoryview_type = new_typeobject_with_base(
+        let memoryview_type = new_typeobject_with_base_and_layout(
             "memoryview",
             crate::builtins::init_memoryview_type,
             object_type,
+            &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType,
         );
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(memoryview_type, false);
@@ -10243,16 +10254,108 @@ fn make_getset_property_full(
 /// These belong to the type object, not to its Python namespace: CPython's
 /// `type_members` exposes both through read-only data descriptors.
 fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
-    if std::ptr::eq(w_type, w_object()) {
-        return Some(((2 * std::mem::size_of::<usize>()) as i64, 0));
+    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
+        return None;
     }
-    let int_type = gettypefor(&pyre_object::INT_TYPE)?.as_ptr();
-    if std::ptr::eq(w_type, int_type)
-        || unsafe { crate::baseobjspace::issubtype_w(w_type, int_type) }
+    let word = std::mem::size_of::<usize>() as i64;
+    let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
+    let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
+    let (base, item) = if is(&pyre_object::INSTANCE_TYPE) {
+        (2 * word, 0)
+    } else if is(&pyre_object::TYPE_TYPE) {
+        (117 * word, 5 * word)
+    } else if is(&pyre_object::INT_TYPE)
+        || is(&pyre_object::LONG_TYPE)
+        || is(&pyre_object::BOOL_TYPE)
     {
-        return Some(((3 * std::mem::size_of::<usize>()) as i64, 4));
+        (3 * word, 4)
+    } else if is(&pyre_object::FLOAT_TYPE) {
+        (3 * word, 0)
+    } else if is(&pyre_object::COMPLEX_TYPE) {
+        (4 * word, 0)
+    } else if is(&pyre_object::STR_TYPE) {
+        (8 * word, 0)
+    } else if is(&pyre_object::bytesobject::BYTES_TYPE) {
+        (4 * word + 1, 1)
+    } else if is(&pyre_object::bytearrayobject::BYTEARRAY_TYPE) {
+        (7 * word, 0)
+    } else if is(&pyre_object::LIST_TYPE) {
+        (5 * word, 0)
+    } else if is(&pyre_object::TUPLE_TYPE) {
+        (4 * word, word)
+    } else if is(&pyre_object::DICT_TYPE) {
+        (6 * word, 0)
+    } else if is(&pyre_object::setobject::SET_TYPE) || is(&pyre_object::setobject::FROZENSET_TYPE) {
+        (25 * word, 0)
+    } else if is(&pyre_object::functional::RANGE_TYPE) {
+        (6 * word, 0)
+    } else if is(&pyre_object::sliceobject::SLICE_TYPE) {
+        (5 * word, 0)
+    } else if is(&pyre_object::memoryview::MEMORYVIEW_TYPE) {
+        (18 * word, word)
+    } else if is(&pyre_object::functional::MAP_TYPE) {
+        (5 * word, 0)
+    } else if is(&pyre_object::functional::FILTER_TYPE)
+        || is(&pyre_object::functional::REVERSED_TYPE)
+    {
+        (4 * word, 0)
+    } else if is(&pyre_object::functional::ZIP_TYPE) {
+        (6 * word, 0)
+    } else if is(&pyre_object::functional::ENUMERATE_TYPE) {
+        (7 * word, 0)
+    } else {
+        return None;
+    };
+    // PyPy typeobject.py:103-129 keeps the total slot count on Layout, whose
+    // typedef identifies the fixed builtin prefix. CPython appends one pointer
+    // per user slot to that same prefix.
+    let mut slots = unsafe { pyre_object::w_type_get_nslots(w_type) } as i64;
+    // A dict subclass is represented by a composed instance in pyre and owns
+    // one private `__dict_data__` Layout slot for its mapping payload. CPython
+    // keeps that payload in the fixed PyDictObject prefix, so the private slot
+    // must not contribute to the public `tp_basicsize` projection.
+    let mut current = unsafe { pyre_object::w_type_get_layout_ptr(w_type) };
+    while !current.is_null() {
+        if unsafe {
+            (*current)
+                .newslotnames
+                .iter()
+                .any(|name| name == "__dict_data__")
+        } {
+            slots -= 1;
+            break;
+        }
+        current = unsafe { (*current).base_layout };
     }
-    None
+    Some((base + slots * word, item))
+}
+
+fn cpython_type_offsets(w_type: PyObjectRef) -> Option<(i64, i64)> {
+    cpython_type_layout(w_type)?;
+    let word = std::mem::size_of::<usize>() as i64;
+    let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
+    let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
+    let (mut dict, mut weakref) = if is(&pyre_object::TYPE_TYPE) {
+        (33 * word, 46 * word)
+    } else if is(&pyre_object::setobject::SET_TYPE) || is(&pyre_object::setobject::FROZENSET_TYPE) {
+        (0, 24 * word)
+    } else if is(&pyre_object::memoryview::MEMORYVIEW_TYPE) {
+        (0, 17 * word)
+    } else {
+        (0, 0)
+    };
+    // Python 3.14 managed dict/weakref storage lives in the negative
+    // pre-header. Preserve a builtin's positive inline offset when it already
+    // owns the slot; otherwise heap types use the managed sentinel/offset.
+    if unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+        if dict == 0 && unsafe { pyre_object::w_type_get_hasdict(w_type) } {
+            dict = -1;
+        }
+        if weakref == 0 && unsafe { pyre_object::w_type_get_weakrefable(w_type) } {
+            weakref = -4 * word;
+        }
+    }
+    Some((dict, weakref))
 }
 
 fn type_basicsize_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -10267,6 +10370,20 @@ fn type_itemsize_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         return Err(crate::PyError::attribute_error("__itemsize__"));
     };
     Ok(w_int_new(item))
+}
+
+fn type_dictoffset_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some((dict, _)) = cpython_type_offsets(args[1]) else {
+        return Err(crate::PyError::attribute_error("__dictoffset__"));
+    };
+    Ok(w_int_new(dict))
+}
+
+fn type_weakrefoffset_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some((_, weakref)) = cpython_type_offsets(args[1]) else {
+        return Err(crate::PyError::attribute_error("__weakrefoffset__"));
+    };
+    Ok(w_int_new(weakref))
 }
 
 fn init_type_type(ns: PyObjectRef) {
@@ -10455,6 +10572,8 @@ fn init_type_type(ns: PyObjectRef) {
     for (name, function) in [
         ("__basicsize__", type_basicsize_getter as DunderFn),
         ("__itemsize__", type_itemsize_getter as DunderFn),
+        ("__dictoffset__", type_dictoffset_getter as DunderFn),
+        ("__weakrefoffset__", type_weakrefoffset_getter as DunderFn),
     ] {
         let getter = make_builtin_function_with_arity(name, function, 2);
         unsafe {
