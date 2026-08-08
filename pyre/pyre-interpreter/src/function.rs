@@ -2813,13 +2813,18 @@ pub unsafe fn descr_method_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::
         }
         Err(err) => return Err(err),
     };
+    // The name is spliced in as itself, so a lone surrogate in a `__qualname__`
+    // reaches the repr rather than collapsing the whole name to the placeholder.
+    // The `is_str` filter is what makes the unchecked WTF-8 read sound.
     let name = w_name
         .filter(|&value| unsafe { pyre_object::is_str(value) })
-        .and_then(|value| unsafe { pyre_object::w_str_get_value_opt(value) })
-        .unwrap_or("?");
+        .map(|value| unsafe { pyre_object::w_str_get_wtf8(value) }.to_wtf8_buf())
+        .unwrap_or_else(|| Wtf8Buf::from_string("?".to_owned()));
     let instance_repr = unsafe { crate::display::py_repr_wtf8(instance)? };
     Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
-        format!("<bound method {name} of "),
+        "<bound method ",
+        name,
+        " of ",
         instance_repr,
         ">"
     )))

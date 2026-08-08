@@ -1490,12 +1490,13 @@ impl PyError {
             Ok(w) if !w.is_null() && !unsafe { pyre_object::is_none(w) } => w,
             _ => return false,
         };
-        // The buffer is assembled from text the printer already escaped, so
-        // it is well-formed; a decode failure would mean a byte no writer put
-        // there, and the lossy read is the last resort for it.
+        // Every writer into the buffer emits WTF-8, filenames included.  A
+        // decode failure would mean a byte none of them put there; read it the
+        // way a filesystem name is read so it keeps its escape instead of
+        // folding to U+FFFD, and so this sink and the fd sink agree.
         let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
             Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
-            None => pyre_object::w_str_new(&String::from_utf8_lossy(buf)),
+            None => pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_filename_wtf8(buf)),
         };
         let result = crate::baseobjspace::call_method(stderr, "write", &[w_text]);
         if result.is_null() {
@@ -1898,14 +1899,10 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
         (!w.is_null() && unsafe { pyre_object::is_str(w) })
             .then(|| unsafe { pyre_object::w_str_get_wtf8(w) }.to_owned())
     };
-    // `text` is a line of source, which the compiler only accepted as UTF-8, so
-    // the caret arithmetic below can work on a `str`.
-    let str_of = |w: PyObjectRef| -> Option<String> {
-        wtf8_of(w).map(|wtf8| match wtf8.as_str() {
-            Ok(s) => s.to_owned(),
-            Err(_) => "<unprintable>".to_string(),
-        })
-    };
+    // Code points in a WTF-8 byte run: every byte that is not a continuation
+    // byte starts one, and a lone surrogate is a single three-byte run, so it
+    // counts as the one column the caret arithmetic treats it as.
+    let code_point_len = |bytes: &[u8]| bytes.iter().filter(|b| (*b & 0xC0) != 0x80).count();
     let int_of = |w: PyObjectRef| -> Option<i64> {
         (!w.is_null() && unsafe { pyre_object::is_int(w) })
             .then(|| unsafe { pyre_object::intobject::w_int_get_value(w) })
@@ -1917,18 +1914,31 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
         writer.write_all(fname.as_bytes())?;
         writeln!(writer, "\", line {lineno}")?;
     }
-    if let Some(text) = str_of(attr("text")) {
-        let raw = text.trim_end_matches(['\n', '\r']);
-        let shown = raw.trim_start();
-        let lead_bytes = raw.len() - shown.len();
-        let lead = raw[..lead_bytes].chars().count();
-        writeln!(writer, "    {shown}")?;
+    if let Some(text) = wtf8_of(attr("text")) {
+        // A constructor-supplied `text` is any str, so it may hold a lone
+        // surrogate even though a compiled line cannot.  It goes out as the
+        // report's own WTF-8 like the filename above; the trims below cut only
+        // ASCII, which leaves the run well-formed.
+        let bytes = text.as_bytes();
+        let end = bytes.len()
+            - bytes
+                .iter()
+                .rev()
+                .take_while(|b| **b == b'\n' || **b == b'\r')
+                .count();
+        let raw = &bytes[..end];
+        let lead_bytes = raw.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        let shown = &raw[lead_bytes..];
+        let lead = code_point_len(&raw[..lead_bytes]);
+        writer.write_all(b"    ")?;
+        writer.write_all(shown)?;
+        writer.write_all(b"\n")?;
         if let Some(offset) = int_of(attr("offset")).filter(|&offset| offset > 0) {
             // Traceback formatting treats the stored columns as display
             // columns and clamps malformed constructor-supplied offsets to
             // the displayed line.  Offsets at or below zero suppress the
             // marker entirely.
-            let displayed_len = raw.chars().count();
+            let displayed_len = code_point_len(raw);
             let display_col = |offset: i64| ((offset as usize) - 1).min(displayed_len);
             let start_col = display_col(offset);
             let end_col = int_of(attr("end_offset"))
@@ -2863,11 +2873,15 @@ fn write_traceback_chain_from_tb<W: Write>(
             continue;
         }
         let (filename, lineno, funcname) = key;
-        // The filesystem bytes, not their WTF-8 decoding: a lone surrogate has
-        // no UTF-8 spelling either way, and the byte form is the one that
-        // still names the file to whatever reads the stream.
+        // The name is *reported* as the text it decodes to, with the same error
+        // handler that read it off the filesystem, so a byte with no UTF-8
+        // spelling reaches the stream as its escape.  Writing the raw bytes
+        // instead would leave the report a mix of those bytes and the WTF-8
+        // around them, which no sink can encode as a whole.  Opening the source
+        // still wants the bytes, which `filename` keeps.
+        let shown_filename = crate::gateway::fsdecode_filename_wtf8(&filename);
         writer.write_all(b"  File \"")?;
-        writer.write_all(&filename)?;
+        writer.write_all(shown_filename.as_bytes())?;
         writeln!(writer, "\", line {lineno}, in {funcname}")?;
         // `FrameSummary._set_lines` collects every line the failing
         // instruction spans, so a statement written across several lines (a
@@ -3142,14 +3156,15 @@ pub(crate) fn emit_report_to_host_stderr(buf: &[u8]) {
             let text = crate::display::wtf8_display_string(report.to_wtf8_buf(), "<unprintable>");
             crate::host_seam::emit_stderr(text.as_bytes());
         }
-        // A frame's `co_filename` goes out as the filesystem bytes it was read
-        // as, so a path byte with no UTF-8 spelling leaves the report a mix of
-        // those bytes and the WTF-8 around them, which is not a WTF-8 buffer
-        // and has no encode to spend. Pass it through: the byte form is what
-        // still names the file to whatever reads the stream, and re-reading it
-        // as UTF-8 would substitute U+FFFD for the one byte that carries the
-        // name.
-        None => crate::host_seam::emit_stderr(buf),
+        // Every writer into the buffer emits WTF-8, so this is a byte none of
+        // them put there.  Read it the way a filesystem name is read, then
+        // spend the same encode the arm above does: the byte survives as its
+        // escape, and this sink and the `sys.stderr` sink agree on the report.
+        None => {
+            let decoded = crate::gateway::fsdecode_filename_wtf8(buf);
+            let text = crate::display::wtf8_display_string(decoded, "<unprintable>");
+            crate::host_seam::emit_stderr(text.as_bytes());
+        }
     }
 }
 

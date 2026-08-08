@@ -154,10 +154,15 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
             return err;
         }
     }
-    PyError::type_error(format!(
-        "cannot use '{}' as a dict key ({})",
-        object_functionstr_type_name(key),
-        err.message_text(),
+    // The wrapped message becomes this exception's own `args[0]`, so it is
+    // carried as the value it is; escaping belongs to whatever displays it.
+    PyError::type_error(crate::display::wtf8_format!(
+        format!(
+            "cannot use '{}' as a dict key (",
+            object_functionstr_type_name(key)
+        ),
+        err.message_wtf8(),
+        ")",
     ))
 }
 
@@ -173,10 +178,13 @@ pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
             return err;
         }
     }
-    PyError::type_error(format!(
-        "cannot use '{}' as a set element ({})",
-        object_functionstr_type_name(item),
-        err.message_text(),
+    PyError::type_error(crate::display::wtf8_format!(
+        format!(
+            "cannot use '{}' as a set element (",
+            object_functionstr_type_name(item)
+        ),
+        err.message_wtf8(),
+        ")",
     ))
 }
 
