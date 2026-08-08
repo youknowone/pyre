@@ -670,6 +670,17 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             "pop from empty list",
         ));
     }
+    // listobject.py:766-767 — clearly distinguish list.pop() from the
+    // general list.pop(index) path.
+    if index == -1 {
+        return match unsafe { pyre_object::listobject::w_list_pop_end(args[0]) } {
+            Some(v) => Ok(v),
+            None => Err(crate::PyError::new(
+                crate::PyErrorKind::IndexError,
+                "pop index out of range",
+            )),
+        };
+    }
     match unsafe { pyre_object::listobject::w_list_pop(args[0], index) } {
         Some(v) => Ok(v),
         None => Err(crate::PyError::new(

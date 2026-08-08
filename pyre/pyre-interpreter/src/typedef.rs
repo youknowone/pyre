@@ -4755,6 +4755,27 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 // ── List TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/listobject.py TypeDef("list", ...)
 
+/// `listobject.py:758 W_ListObject.descr_pop`, exposed through
+/// `interp2app` (`listobject.py:2455`).
+///
+/// This must be a named gateway wrapper, not a direct `init_list_type`
+/// registration: RPython's `BuiltinCode.func` is a PBC containing the
+/// generated interp2app function graphs. Publishing the wrapper descriptor
+/// below gives pyre's source translator the same candidate graph and lets a
+/// traced `list.pop()` call descend to `w_list_pop_end_inner`.
+pub fn __pyre_wrap_list_descr_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::list_method_pop(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_list_descr_pop: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__pyre_wrap_list_descr_pop)),
+        func: __pyre_wrap_list_descr_pop,
+    };
+
 /// Name of `obj`'s type, for operand-type error messages.
 fn arg_type_name(obj: PyObjectRef) -> String {
     unsafe {
@@ -4855,7 +4876,7 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "pop",
-            make_builtin_function("pop", crate::type_methods::list_method_pop),
+            make_builtin_function("pop", __pyre_wrap_list_descr_pop),
         )
     };
     unsafe {

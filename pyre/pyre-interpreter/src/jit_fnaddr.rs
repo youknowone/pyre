@@ -1797,6 +1797,22 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_list_append",
         w_list_append as *const (),
     );
+    let w_list_pop_end_inner: unsafe fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef =
+        pyre_object::listobject::w_list_pop_end_inner;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::w_list_pop_end_inner",
+        "pyre_object::w_list_pop_end_inner",
+        w_list_pop_end_inner as *const (),
+    );
+    let w_list_pop_end: unsafe fn(pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> =
+        pyre_object::listobject::w_list_pop_end;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::w_list_pop_end",
+        "pyre_object::w_list_pop_end",
+        w_list_pop_end as *const (),
+    );
     let w_list_len: unsafe fn(pyre_object::PyObjectRef) -> usize =
         pyre_object::listobject::w_list_len;
     push_alias_pair(

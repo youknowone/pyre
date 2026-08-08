@@ -1593,7 +1593,22 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     }
 }
 
-/// Remove and return last item. Returns `None` if empty.
+/// Remove and return the last item. Returns `None` if empty.
+///
+/// Splits into a guard-taking wrapper and a lock-free
+/// [`w_list_pop_end_inner`], matching [`w_list_append`] /
+/// [`w_list_append_inner`], because the pop fold descends this body:
+///
+/// * the wrapper must stay look-inside — the codewriter only reaches graphs
+///   through look-inside calls from a jitdriver portal
+///   (`grab_initial_jitcodes` / `enum_pending_graphs`), so a
+///   `dont_look_inside` wrapper hides the inner body from the pipeline as
+///   well;
+/// * the descended body must hold no guard — a `w_list_lock` acquire/release
+///   pair inside it declines the fold's sub-walk.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
@@ -1601,28 +1616,40 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &*(obj as *const W_ListObject);
+    let length = match list.strategy {
+        ListStrategy::Empty => 0,
+        ListStrategy::Integer => ll_list_int_length(list),
+        ListStrategy::Float => list.float_items.len(),
+        ListStrategy::Object => list.length,
+    };
+    if length == 0 {
+        None
+    } else {
+        Some(w_list_pop_end_inner(obj))
+    }
+}
+
+/// [`w_list_pop_end`]'s body, run with the list's guard already held.
+///
+/// # Safety
+/// `obj` must point to a valid non-empty `W_ListObject`, the caller must hold
+/// `w_list_lock(obj)`, and the list's length must be greater than zero.
+pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> PyObjectRef {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
-        // listobject.py:1180 EmptyListStrategy.pop raises IndexError.
-        ListStrategy::Empty => None,
+        // EmptyListStrategy.pop is unreachable after descr_pop's length check
+        // (pypy/objspace/std/listobject.py).
+        ListStrategy::Empty => PY_NULL,
         ListStrategy::Integer => {
-            if list.int_items.len() == 0 {
-                return None;
-            }
-            Some(w_int_new(list.int_items.pop()))
+            let length = ll_list_int_length(list);
+            let index = length - 1;
+            let item = ll_list_int_getitem_fast(list, index);
+            ll_list_int_set_len(list, index);
+            w_int_new(item)
         }
-        ListStrategy::Float => {
-            if list.float_items.len() == 0 {
-                return None;
-            }
-            Some(w_float_new(list.float_items.pop()))
-        }
-        ListStrategy::Object => {
-            if list.length == 0 {
-                return None;
-            }
-            Some(list.object_pop())
-        }
+        ListStrategy::Float => w_float_new(list.float_items.pop()),
+        ListStrategy::Object => list.object_pop(),
     }
 }
 
@@ -2250,6 +2277,30 @@ mod tests {
             assert!(w_list_pop(list, 5).is_none());
             assert!(w_list_pop(list, -5).is_none());
             assert_eq!(w_list_len(list), 1);
+        }
+    }
+
+    #[test]
+    fn test_w_list_pop_end_returns_none_for_empty_every_strategy() {
+        let empty = w_list_new(Vec::new());
+        let integer = w_list_new(vec![w_int_new(1)]);
+        let float = w_list_new(vec![crate::floatobject::w_float_new(1.0)]);
+        let object = w_list_new_object(vec![w_int_new(1)]);
+
+        unsafe {
+            assert!(w_list_pop_end(integer).is_some());
+            assert!(w_list_pop_end(float).is_some());
+            assert!(w_list_pop_end(object).is_some());
+
+            assert!(w_list_uses_empty_storage(empty));
+            assert!(w_list_uses_int_storage(integer));
+            assert!(w_list_uses_float_storage(float));
+            assert!(w_list_uses_object_storage(object));
+
+            assert!(w_list_pop_end(empty).is_none());
+            assert!(w_list_pop_end(integer).is_none());
+            assert!(w_list_pop_end(float).is_none());
+            assert!(w_list_pop_end(object).is_none());
         }
     }
 
