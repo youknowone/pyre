@@ -1311,6 +1311,13 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     if fresh.is_empty() {
         return None;
     }
+    // Validate the CALL operand slice itself, not the complete reconstructed
+    // stack.  A CALL inside WITH/FOR_ITER can retain non-null prefix operands;
+    // checking `stack.first()` after prepending them lets an unresolved NULL
+    // callable slip through and publishes an invalid frame at the CALL.
+    if !matches!(fresh.first(), Some(ConcreteValue::Ref(r)) if !r.is_null()) {
+        return None;
+    }
     // The encoded residual args describe only the CALL operands.  Values can
     // remain below them on the Python operand stack (notably the iterator of
     // an enclosing FOR_ITER).  RPython resumes the complete MIFrame stack, so
@@ -1333,7 +1340,7 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
             _ => return None,
         }
     }
-    stack.first().is_some_and(|c| !c.is_null()).then_some(stack)
+    Some(stack)
 }
 
 /// Fold a keyword call's `kwnames`->parameter permutation at trace time so a
