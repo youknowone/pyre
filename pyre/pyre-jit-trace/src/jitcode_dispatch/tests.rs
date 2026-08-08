@@ -2292,7 +2292,7 @@ fn append_journal_rollback_rewinds_length() {
     // Rollback path: journal push + eager append (production order, see
     // try_walker_orthodox_list_append), then a non-commit exit rewinds
     // the length.
-    super::fbw_append_journal_push(list, len_before);
+    super::fbw_list_journal_push_append(list, len_before);
     unsafe { w_list_append(list, w_int_new(50)) };
     assert_eq!(unsafe { w_list_len(list) }, 5);
     super::fbw_store_journal_rollback();
@@ -2303,7 +2303,7 @@ fn append_journal_rollback_rewinds_length() {
     );
 
     // Commit path: the eager append stands; the log is dropped.
-    super::fbw_append_journal_push(list, len_before);
+    super::fbw_list_journal_push_append(list, len_before);
     unsafe { w_list_append(list, w_int_new(60)) };
     super::fbw_store_journal_commit();
     assert_eq!(
@@ -2318,9 +2318,94 @@ fn append_journal_rollback_rewinds_length() {
 }
 
 #[test]
+fn pop_end_journal_rollback_restores_item_and_length() {
+    use pyre_object::listobject::{W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new};
+    use pyre_object::{w_int_new, w_list_pop_end};
+
+    super::fbw_store_journal_reset();
+    let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
+    let len_before = unsafe { w_list_len(list) };
+    let raw_item =
+        unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), len_before - 1) };
+    unsafe { w_list_pop_end(list) };
+    super::fbw_list_journal_push_pop_end(list, len_before, w_int_new(raw_item));
+    assert_eq!(unsafe { w_list_len(list) }, len_before - 1);
+
+    super::fbw_store_journal_rollback();
+    assert_eq!(unsafe { w_list_len(list) }, len_before);
+    assert_eq!(
+        unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), len_before - 1) },
+        raw_item
+    );
+}
+
+#[test]
+fn pop_end_journal_rollback_after_strategy_switch() {
+    use pyre_object::listobject::{
+        W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new, w_list_uses_object_storage,
+    };
+    use pyre_object::{w_int_get_value, w_int_new, w_list_append, w_list_getitem, w_list_pop_end};
+
+    super::fbw_store_journal_reset();
+    let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
+    let len_before = unsafe { w_list_len(list) };
+    let raw_item =
+        unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), len_before - 1) };
+    unsafe { w_list_pop_end(list) };
+    super::fbw_list_journal_push_pop_end(list, len_before, w_int_new(raw_item));
+
+    unsafe { w_list_append(list, pyre_object::w_str_new("strategy switch")) };
+    assert!(unsafe { w_list_uses_object_storage(list) });
+
+    super::fbw_store_journal_rollback();
+    assert_eq!(unsafe { w_list_len(list) }, len_before);
+    let restored = unsafe { w_list_getitem(list, (len_before - 1) as i64).unwrap() };
+    assert_eq!(unsafe { w_int_get_value(restored) }, raw_item);
+}
+
+#[test]
+fn interleaved_append_pop_journal_rollback_restores_original() {
+    use pyre_object::listobject::{W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new};
+    use pyre_object::{w_int_new, w_list_append, w_list_pop_end};
+
+    super::fbw_store_journal_reset();
+    let original = [10, 20, 30];
+    let list = w_list_new(original.into_iter().map(w_int_new).collect());
+
+    let len_before_append = unsafe { w_list_len(list) };
+    super::fbw_list_journal_push_append(list, len_before_append);
+    unsafe { w_list_append(list, w_int_new(40)) };
+
+    let len_before_pop = unsafe { w_list_len(list) };
+    let raw_item =
+        unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), len_before_pop - 1) };
+    unsafe { w_list_pop_end(list) };
+    super::fbw_list_journal_push_pop_end(list, len_before_pop, w_int_new(raw_item));
+
+    let len_before_append = unsafe { w_list_len(list) };
+    super::fbw_list_journal_push_append(list, len_before_append);
+    unsafe { w_list_append(list, w_int_new(50)) };
+
+    let len_before_pop = unsafe { w_list_len(list) };
+    let raw_item =
+        unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), len_before_pop - 1) };
+    unsafe { w_list_pop_end(list) };
+    super::fbw_list_journal_push_pop_end(list, len_before_pop, w_int_new(raw_item));
+
+    super::fbw_store_journal_rollback();
+    assert_eq!(unsafe { w_list_len(list) }, original.len());
+    for (index, expected) in original.into_iter().enumerate() {
+        assert_eq!(
+            unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), index) },
+            expected
+        );
+    }
+}
+
+#[test]
 fn append_journal_rollback_rewinds_object_length() {
     // #171 object-append: the orthodox fold journals object-strategy
-    // appends through the SAME `FBW_APPEND_JOURNAL` as the int spec, so a
+    // appends through the SAME `FBW_LIST_EFFECT_JOURNAL` as the int spec, so a
     // non-commit rollback must rewind the strategy-correct length — the
     // `W_ListObject.length` header (`ll_list_obj_set_len`), not
     // `int_items.len`.  Rewinding via the int leaf would leave the object
@@ -2344,7 +2429,7 @@ fn append_journal_rollback_rewinds_object_length() {
         "post-grow object list must have spare capacity for the in-place append"
     );
 
-    super::fbw_append_journal_push(list, len_before);
+    super::fbw_list_journal_push_append(list, len_before);
     unsafe { w_list_append(list, w_none()) };
     assert_eq!(unsafe { w_list_len(list) }, 5);
     super::fbw_store_journal_rollback();

@@ -9581,9 +9581,276 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // iterations, a traceback name list with its last frame doubled).
     // Re-read the length instead of assuming which side ran: it is the
     // receiver's own state, so it answers for both.
-    fbw_append_journal_push(inner_self, len_before);
+    fbw_list_journal_push_append(inner_self, len_before);
     if unsafe { pyre_object::w_list_len(inner_self) } == len_before {
         unsafe { pyre_object::w_list_append(inner_self, value) };
+    }
+    Ok(())
+}
+
+/// Descend the guard-free Integer-strategy `w_list_pop_end_inner` body for a
+/// bound `list.pop()` call, recording its length/item array operations instead
+/// of an opaque residual call.
+pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 2 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    if callable.is_null() || !null_or_self.is_null() {
+        return Ok(None);
+    }
+
+    let (inner_func, inner_self, len_before, raw_item) = unsafe {
+        if !pyre_object::function::is_method(callable) {
+            return Ok(None);
+        }
+        let inner_func = pyre_object::function::w_method_get_func(callable);
+        let inner_self = pyre_object::function::w_method_get_self(callable);
+        if inner_func.is_null() || inner_self.is_null() {
+            return Ok(None);
+        }
+        let list_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
+        if pyre_interpreter::lookup_in_type(list_type, "pop") != Some(inner_func) {
+            return Ok(None);
+        }
+        let Some((len_before, raw_item)) = orthodox_list_pop_recognize(inner_self) else {
+            return Ok(None);
+        };
+        (inner_func, inner_self, len_before, raw_item)
+    };
+
+    // Resolve every possible decline before recording a guard.
+    let Some((sub_body, sym_ptr)) = orthodox_list_pop_body_and_sym(ctx) else {
+        return Ok(None);
+    };
+    let sym = unsafe { &*sym_ptr };
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let callable_op = r_args[0];
+
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
+        let type_const = ctx.trace_ctx.const_int(method_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(callable_op, method_type_addr);
+    let func_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_function_descr(),
+    );
+    let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(func_ref, func_const);
+    let self_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_self_descr(),
+    );
+
+    match orthodox_list_pop_commit(
+        ctx, op, sym, &sub_body, self_ref, inner_self, len_before, raw_item, dst,
+    ) {
+        Ok(()) => Ok(Some(())),
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            ctx.trace_ctx.cut_trace(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            bool_box_truth_reset();
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Recognize a non-empty Integer-strategy list and sample its final unboxed
+/// item before the descended executor can mutate the live list.
+unsafe fn orthodox_list_pop_recognize(
+    inner_self: pyre_object::PyObjectRef,
+) -> Option<(usize, i64)> {
+    if !pyre_object::pyobject::is_list(inner_self)
+        || !pyre_object::w_list_uses_int_storage(inner_self)
+    {
+        return None;
+    }
+    let len_before = pyre_object::w_list_len(inner_self);
+    if len_before == 0 {
+        return None;
+    }
+    let list = &*(inner_self as *const pyre_object::listobject::W_ListObject);
+    let raw_item = pyre_object::listobject::ll_list_int_getitem_fast(list, len_before - 1);
+    Some((len_before, raw_item))
+}
+
+/// Resolve the pop body and enclosing full-body snapshot before IR emission.
+pub(crate) fn orthodox_list_pop_body_and_sym<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(SubJitCodeBody, *const Sym)> {
+    let jc_arc = crate::jitcode_runtime::list_pop_end_jitcode()?;
+    let sub_body = sub_jitcode_body_by_index(jc_arc.index())?;
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return None;
+    }
+    Some((sub_body, sym_ptr))
+}
+
+/// Publish the pop call-site resume coordinate, descend the real helper body,
+/// write its Ref result, and journal/apply the concrete shrink exactly once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    sym: &Sym,
+    sub_body: &SubJitCodeBody,
+    self_ref: OpRef,
+    inner_self: pyre_object::PyObjectRef,
+    len_before: usize,
+    raw_item: i64,
+    dst: usize,
+) -> Result<(), DispatchError> {
+    ctx.trace_ctx
+        .set_opref_concrete(self_ref, Value::Ref(majit_ir::GcRef(inner_self as usize)));
+
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
+        let jc = &*sym.jitcode();
+        let jc_index = jc.index as u32;
+        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+        let mut py = jc
+            .payload
+            .forward_py_pc_for_jitcode_pc(op.pc)
+            .unwrap_or_else(|| {
+                crate::py_coord::note_empty_twin_fallback(
+                    "list_pop_commit",
+                    jc.index,
+                    op.pc as i32,
+                );
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
+            });
+        if jc.payload.code_ptr.is_null() {
+            (py, sym.valuestackdepth() as i64, jc_index, marker)
+        } else {
+            let codeobj = &*jc.payload.code_ptr;
+            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+            let depth = if jc.payload.depth_trivia_populated() {
+                jc.payload.depth_trivia_for_jitcode_pc(op.pc)
+            } else {
+                crate::liveness::liveness_for(jc.payload.code_ptr)
+                    .depth_at_py_pc()
+                    .get(py as usize)
+                    .copied()
+            };
+            let vsd = match depth {
+                Some(d) => (sym.nlocals() + d as usize) as i64,
+                None => sym.valuestackdepth() as i64,
+            };
+            (py, vsd, jc_index, marker)
+        }
+    };
+    if sym.owns_virtualizable_shadow() {
+        let li = call_site_py_pc as i64 - 1;
+        let li_op = ctx.trace_ctx.const_int(li);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "last_instr",
+            li_op,
+            Value::Int(li),
+        );
+        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "valuestackdepth",
+            vsd_op,
+            Value::Int(vsd_value),
+        );
+    }
+    let call_site_word = call_site_marker
+        .map(|marker| marker as i32)
+        .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+    let active = collect_outer_active_boxes(
+        sym,
+        ctx.trace_ctx,
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        outer_jitcode_index,
+        false,
+        call_site_word,
+        op.pc as i32,
+        OuterActiveBoxesEntryTwin::Plain,
+        "w_list_pop_end_call_site",
+        None,
+        &[],
+    );
+
+    let saved_entry = ctx.entry_py_pc;
+    let saved_marker = ctx.outer_resume_marker_jit_pc;
+    let saved_oji = ctx.outer_jitcode_index;
+    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
+    let saved_descr_refs = ctx.descr_refs;
+    let saved_raw_descrs = ctx.raw_descrs;
+    let saved_lookup = ctx.sub_jitcode_lookup;
+    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
+    ctx.outer_resume_marker_jit_pc = call_site_marker;
+    ctx.outer_jitcode_index = outer_jitcode_index;
+    ctx.outer_active_boxes = active;
+    ctx.descr_refs = crate::jitcode_runtime::all_descr_refs();
+    ctx.raw_descrs = RawDescrPool::Global;
+    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
+
+    let saved_fbw_mode = ctx.fbw_mode;
+    ctx.fbw_mode.inline_subwalk = true;
+    let walk_result = run_sub_jitcode_walk(
+        ctx,
+        op.pc,
+        sub_body,
+        &[],
+        &[],
+        &[self_ref],
+        &[ConcreteValue::Ref(inner_self)],
+        &[],
+    );
+    ctx.fbw_mode = saved_fbw_mode;
+    ctx.entry_py_pc = saved_entry;
+    ctx.outer_resume_marker_jit_pc = saved_marker;
+    ctx.outer_jitcode_index = saved_oji;
+    ctx.outer_active_boxes = saved_active;
+    ctx.descr_refs = saved_descr_refs;
+    ctx.raw_descrs = saved_raw_descrs;
+    ctx.sub_jitcode_lookup = saved_lookup;
+
+    let result = match walk_result? {
+        DispatchOutcome::SubReturn {
+            result: Some(result),
+        } => result,
+        DispatchOutcome::SubReturn { result: None } => {
+            return Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc });
+        }
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
+    };
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+
+    let w_item = pyre_object::w_int_new(raw_item);
+    fbw_list_journal_push_pop_end(inner_self, len_before, w_item);
+    if unsafe { pyre_object::w_list_len(inner_self) } == len_before {
+        unsafe { pyre_object::w_list_pop_end(inner_self) };
     }
     Ok(())
 }

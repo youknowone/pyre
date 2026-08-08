@@ -2084,7 +2084,7 @@ pub enum DispatchError {
     /// strategy/value is unsupported — `orthodox_list_append_recognize`
     /// returned `None`) or the fold is disabled.  Unlike the fold's
     /// `orthodox_list_append_commit`, the generic residual dispatcher
-    /// concrete-executes `jit_list_append` WITHOUT `fbw_append_journal_push`,
+    /// concrete-executes `jit_list_append` WITHOUT `fbw_list_journal_push_append`,
     /// so `fbw_store_journal_rollback` cannot rewind it; a later trace abort +
     /// interpreter replay would then apply the SAME append twice. Decline the
     /// trace to interpretation instead of falling through, mirroring the
@@ -5670,22 +5670,20 @@ thread_local! {
     static FBW_STORE_JOURNAL: std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
-    /// Undo log for the walked region's eagerly executed list APPENDS:
-    /// `(list, length_before_append)` pairs pushed by the `list.append`
-    /// specialization before it grows the list.  Same rationale as
-    /// [`FBW_STORE_JOURNAL`] — the append is admitted only when
-    /// `w_list_can_append_without_realloc` holds, so the undo is a pure
-    /// length rewind (`w_list_int_set_len`, no reallocation, no boxing) and
-    /// the backing array still has the slot.  A committing walk drops the
-    /// log; a non-commit walk rewinds each list's length in reverse push
-    /// order so the legacy replay re-appends against the pre-walk heap.
-    /// Entries' list refs are GC roots via [`fbw_store_journal_root_walker`].
-    static FBW_APPEND_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>> =
+    /// Ordered undo log for eagerly executed list effects. Same transitional
+    /// rationale as [`FBW_STORE_JOURNAL`]: a committing walk drops the log;
+    /// a non-commit walk replays it in reverse push order so interleaved
+    /// appends and end-pops restore the exact pre-walk list state. Dies with
+    /// the legacy replay paths. Entries' list refs are GC roots via
+    /// [`fbw_store_journal_root_walker`]. `PopEnd::w_item` is boxed so a
+    /// strategy change can restore it into Object storage, and is visited
+    /// because the journal holds it live across safepoints.
+    static FBW_LIST_EFFECT_JOURNAL: std::cell::RefCell<Vec<FbwListEffect>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
     /// Undo log for Empty-list first-append promotion during pyre's
     /// speculative full-body walk.  Entries ride the same commit/rollback
-    /// lifecycle as [`FBW_APPEND_JOURNAL`]: a committed walk keeps the typed
+    /// lifecycle as [`FBW_LIST_EFFECT_JOURNAL`]: a committed walk keeps the typed
     /// strategy, while a replayed walk restores the list to Empty so replay
     /// can execute the append from the original shape.  This exists only for
     /// pyre's speculative-replay walk and can be removed when
@@ -5900,6 +5898,18 @@ thread_local! {
     static FBW_EXC_PENDING_PUSH_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+enum FbwListEffect {
+    Append {
+        list: pyre_object::PyObjectRef,
+        length_before: usize,
+    },
+    PopEnd {
+        list: pyre_object::PyObjectRef,
+        length_before: usize,
+        w_item: pyre_object::PyObjectRef,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum InlineAbortCarrier {
     Entry {
@@ -5963,7 +5973,7 @@ pub(crate) struct EntryFallback {
 
 struct FbwStoreJournalRootArea {
     stores: *const std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>>,
-    appends: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>>,
+    list_effects: *const std::cell::RefCell<Vec<FbwListEffect>>,
     append_promote: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
@@ -5982,7 +5992,7 @@ struct FbwStoreJournalRootArea {
 thread_local! {
     static FBW_STORE_JOURNAL_ROOT_AREA: FbwStoreJournalRootArea = FbwStoreJournalRootArea {
         stores: FBW_STORE_JOURNAL.with(|value| value as *const _),
-        appends: FBW_APPEND_JOURNAL.with(|value| value as *const _),
+        list_effects: FBW_LIST_EFFECT_JOURNAL.with(|value| value as *const _),
         append_promote: FBW_APPEND_PROMOTE_JOURNAL.with(|value| value as *const _),
         abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
@@ -6235,9 +6245,17 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
         }
     }
-    let appends = unsafe { &mut *(*area.appends).as_ptr() };
-    for (list, _len) in appends.iter_mut() {
-        visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
+    let list_effects = unsafe { &mut *(*area.list_effects).as_ptr() };
+    for effect in list_effects.iter_mut() {
+        match effect {
+            FbwListEffect::Append { list, .. } => {
+                visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
+            }
+            FbwListEffect::PopEnd { list, w_item, .. } => {
+                visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
+                visitor(unsafe { &mut *(w_item as *mut pyre_object::PyObjectRef).cast() });
+            }
+        }
     }
     // SAFETY: promoted-list refs can be nursery-resident across the rest of
     // the walk; a minor collection may move them before rollback restores

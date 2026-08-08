@@ -318,6 +318,9 @@ thread_local! {
     /// Cached `ALL_JITCODES` index of `w_list_append` for the current
     /// thread. `thread_local!` because the names index is also thread-local.
     static LIST_APPEND_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
+    /// Cached `ALL_JITCODES` index of `w_list_pop_end_inner` for the current
+    /// thread. Resolved by name because jitcode indices are build-dependent.
+    static LIST_POP_END_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
 }
 
 /// Scan the build-time names index for the unique entry equal to `name`.
@@ -359,6 +362,14 @@ pub(crate) fn named_jitcode(name: &str) -> Option<Arc<JitCode>> {
 pub fn list_append_jitcode() -> Option<Arc<JitCode>> {
     let idx = LIST_APPEND_JITCODE_INDEX
         .with(|cell| *cell.get_or_init(|| compute_named_jitcode_index("w_list_append_inner")))?;
+    get_jitcode_by_index(idx)
+}
+
+/// The guard-free charon `w_list_pop_end_inner` body in `ALL_JITCODES`,
+/// resolved by name and cached per thread.
+pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
+    let idx = LIST_POP_END_JITCODE_INDEX
+        .with(|cell| *cell.get_or_init(|| compute_named_jitcode_index("w_list_pop_end_inner")))?;
     get_jitcode_by_index(idx)
 }
 
@@ -1797,6 +1808,17 @@ mod tests {
         assert!(
             !jc.code.is_empty(),
             "w_list_append_inner jitcode should have non-empty bytecode (assembled body)"
+        );
+    }
+
+    #[test]
+    fn list_pop_end_jitcode_resolves_charon_body() {
+        let jc = list_pop_end_jitcode()
+            .expect("build-time pipeline must contain the charon `w_list_pop_end_inner` jitcode");
+        assert_eq!(jc.name, "w_list_pop_end_inner");
+        assert!(
+            !jc.code.is_empty(),
+            "w_list_pop_end_inner jitcode should have non-empty bytecode (assembled body)"
         );
     }
 

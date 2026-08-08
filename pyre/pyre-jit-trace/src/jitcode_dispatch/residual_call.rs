@@ -75,7 +75,7 @@ thread_local! {
     ///
     /// Reset at walk start.  Residuals are the only executor that can put
     /// something irreversible between two points of ONE opcode: the eager
-    /// journaled folds (`fbw_store_journal_push` / `fbw_append_journal_push` /
+    /// journaled folds (`fbw_store_journal_push` / `fbw_list_journal_push_append` /
     /// `fbw_cell_store_journal_push`) each terminate their own opcode
     /// (STORE_SUBSCR, the `append` CALL, STORE_NAME/STORE_GLOBAL), so no
     /// residual of the same opcode instance can follow one.
@@ -2625,7 +2625,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // un-lowered allocating helper).  Executing it here mutates `list` in place
     // (resize + store); journal the pre-append length so an aborting walk's
     // rollback rewinds the one append and the deliver re-applies it exactly once
-    // (the same `fbw_append_journal_push` contract the fold's own commit uses),
+    // (the same `fbw_list_journal_push_append` contract the fold's own commit uses),
     // making the fall-through abort-safe instead of a silent double.
     let list_append_journal: Option<(pyre_object::PyObjectRef, usize)> =
         if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ListAppendValue {
@@ -3477,7 +3477,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // self) rather than a fresh-object op that merely shared the slot.
             if let Some((lhs, len_before)) = inplace_list_journal {
                 if result_i64 as usize == lhs as usize {
-                    fbw_append_journal_push(lhs, len_before);
+                    fbw_list_journal_push_append(lhs, len_before);
                 }
             }
             // A folded-decline `jit_list_append` fall-through (realloc-boundary
@@ -3486,7 +3486,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // once.  The append always mutates its receiver (void `0` result),
             // so no in-place `result == lhs` re-check is needed.
             if let Some((list, len_before)) = list_append_journal {
-                fbw_append_journal_push(list, len_before);
+                fbw_list_journal_push_append(list, len_before);
             }
             // pyjitpl.py `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
@@ -3571,7 +3571,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                         result_i64 as usize,
                         ctx.entry_py_pc(),
                         fbw_store_journal_len(),
-                        FBW_APPEND_JOURNAL.with(|j| j.borrow().len()),
+                        FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()),
                         fbw_has_unjournaled_effect(),
                     );
                 }
@@ -4630,6 +4630,21 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // linear `catch_exception/L`.
     clear_walk_exception(ctx);
 
+    // Offer the specific pop fold before generic builtin inlining. Now that
+    // `list.pop` has a `__pyre_wrap_*` gateway, the generic path finds its
+    // jitcode and otherwise descends into the wrapper until `w_list_len`'s
+    // lock seam. Restrict this to the root walk: guards emitted in an inline
+    // subwalk resume at the caller CALL boundary and could repeat an earlier
+    // caller side effect.
+    if ctx.is_authoritative_executor
+        && !ctx.fbw_mode.inline_subwalk
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_orthodox_list_pop(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
     // user-function-only full-body walk below.
@@ -5085,7 +5100,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // call arrives as `CallFn` with `dst_bank == 'r'` (the None result is a
     // Ref, not void) and `r_args = [bound-method, PY_NULL, value]`.  Falls
     // through to the residual for any non-matching shape (SAFE).  The eager append rides
-    // `FBW_APPEND_JOURNAL`, whose commit/rollback epilogues run on FBW walk
+    // `FBW_LIST_EFFECT_JOURNAL`, whose commit/rollback epilogues run on FBW walk
     // ends (same lifecycle as the STORE_SUBSCR store journal).
     //
     // Restrict to the top full-body frame: inside an inlined callee sub-walk
@@ -5138,7 +5153,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // Fold to native array stores when the receiver has spare capacity, or
         // fall through to the generic `jit_list_append` residual below.  The
         // fold's `orthodox_list_append_commit` journals the append
-        // (`fbw_append_journal_push`) so `fbw_store_journal_rollback` rewinds it
+        // (`fbw_list_journal_push_append`) so `fbw_store_journal_rollback` rewinds it
         // on abort; the generic executor is now equally abort-safe — its
         // `list_append_journal` records the same pre-append length before
         // running `jit_list_append`, so a later abort + interpreter replay
