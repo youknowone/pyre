@@ -1,0 +1,150 @@
+//! The `key=value` line format shared by the LLBC fingerprint stamp and the
+//! extraction driver's `--fingerprint` output.
+//!
+//! One format, two producers, two readers.  `scripts/llbc_extract.py` writes
+//! the stamp beside each `.ullbc` and prints the same fields on stdout for
+//! `--fingerprint`; `build.rs` reads both.  Keeping the parse here — rather
+//! than open-coding it per reader — is deliberate: the fields are extended
+//! from the Python side, and a reader that models the format loosely goes
+//! quiet instead of failing when a field is added.
+
+/// Read one `key=value` line out of a `key=value`-per-line block.
+///
+/// `key` includes the `=`.  A prefix match is the whole parse.
+pub fn stamp_field(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key).map(str::to_string))
+}
+
+/// What the freshness check should do, given its two switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshnessMode {
+    /// Do not check at all.
+    Skip,
+    /// Check; report a stale artefact as a warning.
+    Warn,
+    /// Check; report a stale artefact as an error and fail the build.
+    Strict,
+    /// The switches contradict each other; fail without checking.
+    Refuse,
+}
+
+/// The outcome of reading both switches: what to do, and what to say.
+#[derive(Debug, Clone)]
+pub struct FreshnessPolicy {
+    pub mode: FreshnessMode,
+    /// Lines the caller must emit. Never silently empty when a switch was set
+    /// to something unrecognised.
+    pub diagnostics: Vec<String>,
+}
+
+/// One switch's raw value, classified. An unrecognised value must not be
+/// silently treated as either enabled or disabled.
+enum Switch {
+    Unset,
+    On,
+    Off,
+    Unrecognised,
+}
+
+fn classify_skip(value: Option<&str>) -> Switch {
+    match value {
+        None => Switch::Unset,
+        Some("1") => Switch::On,
+        Some(_) => Switch::Unrecognised,
+    }
+}
+
+fn classify_strict(value: Option<&str>) -> Switch {
+    match value {
+        None => Switch::Unset,
+        Some("1") => Switch::On,
+        Some("0") => Switch::Off,
+        Some(_) => Switch::Unrecognised,
+    }
+}
+
+/// Decide the mode from the raw values of `PYRE_LLBC_STRICT` and
+/// `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`.
+///
+/// Strict checking is the default; `PYRE_LLBC_STRICT=0` deliberately demotes
+/// stale artefacts to warnings. The skip switch takes exactly `1`. Unknown
+/// values are diagnosed and retain the safe strict default.
+///
+/// Setting both is refused rather than resolved by precedence.  Honouring the
+/// opt-out silently would tell a caller who asked for a hard gate that their
+/// build passed; honouring strict would override an opt-out that exists so
+/// offline, hermetic and vendored builds keep working.  Neither is a defensible
+/// reading of "strict, and also do not check".
+pub fn freshness_policy(strict: Option<&str>, skip: Option<&str>) -> FreshnessPolicy {
+    const STRICT: &str = "PYRE_LLBC_STRICT";
+    const SKIP: &str = "PYRE_LLBC_SKIP_FINGERPRINT_CHECK";
+
+    let mut diagnostics = Vec::new();
+    let mut note_unrecognised = |name: &str, value: Option<&str>, valid: &str| {
+        if let Some(raw) = value {
+            diagnostics.push(format!(
+                "{name}={raw:?} is not a value this build understands, so it is \
+                 being ignored; {valid}"
+            ));
+        }
+    };
+
+    let strict_switch = classify_strict(strict);
+    if matches!(strict_switch, Switch::Unrecognised) {
+        note_unrecognised(
+            STRICT,
+            strict,
+            "use `0` to demote stale artefacts to warnings or `1` for strict mode",
+        );
+    }
+    let skip_switch = classify_skip(skip);
+    if matches!(skip_switch, Switch::Unrecognised) {
+        note_unrecognised(SKIP, skip, "the only value that skips the check is `1`");
+    }
+
+    let mode = match (strict_switch, skip_switch) {
+        (Switch::On, Switch::On) => FreshnessMode::Refuse,
+        (_, Switch::On) => FreshnessMode::Skip,
+        (Switch::Off, _) => FreshnessMode::Warn,
+        (Switch::Unset | Switch::On | Switch::Unrecognised, _) => FreshnessMode::Strict,
+    };
+
+    match mode {
+        FreshnessMode::Refuse => diagnostics.push(format!(
+            "{STRICT}=1 and {SKIP}=1 are contradictory: the first asks for a \
+             hard failure on a stale artefact, the second asks for no check at \
+             all. Refusing rather than silently honouring one of them — unset \
+             whichever you did not mean."
+        )),
+        // Announced, not silent: an opt-out that says nothing makes "did not
+        // check" and "checked and fresh" the same absence of output, which is
+        // the conflation the FRESHNESS UNKNOWN channel exists to prevent.
+        FreshnessMode::Skip => diagnostics.push(format!(
+            "{SKIP}=1 — the LLBC freshness check was skipped; field offsets \
+             read out of build/llbc may not match the current sources"
+        )),
+        FreshnessMode::Warn | FreshnessMode::Strict => {}
+    }
+
+    FreshnessPolicy { mode, diagnostics }
+}
+
+/// Parse the source digest out of `--fingerprint`'s stdout.
+///
+/// The driver prints the same `key=value` lines it writes into the stamp, so
+/// the field is parsed by name and the hex test is an assertion on the parsed
+/// value — not the parser.  Reading the whole of stdout as the digest is what
+/// broke when `external=` was added: a second line made the bare-sha256 test
+/// fail, every crate collapsed to "the oracle did not answer", and the build
+/// went quiet.
+///
+/// Deliberately no bare-digest fallback.  Accepting the pre-`external=` shape
+/// would let this keep silently honouring a format the driver no longer emits,
+/// which is the mechanism that produced that defect; the two version together
+/// in one repository, so refusing an unmodelled shape is the safe direction.
+pub fn parse_fingerprint_stdout(stdout: &str) -> Option<String> {
+    let source = stamp_field(stdout, "source=")?;
+    let is_hash = source.len() == 64 && source.bytes().all(|b| b.is_ascii_hexdigit());
+    is_hash.then_some(source)
+}
