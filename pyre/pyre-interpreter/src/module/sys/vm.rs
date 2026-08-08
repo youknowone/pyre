@@ -10,39 +10,68 @@ use crate::{
 use pyre_object::*;
 use std::sync::OnceLock;
 
-const GETSIZEOF_MISSING: &str = r#"getsizeof(...)
-    getsizeof(object, default) -> int
+const GETSIZEOF_DOC: &str = "getsizeof(object [, default]) -> int\n\n\
+Return the size of object in bytes.";
 
-    Return the size of object in bytes.
+/// CPython 3.14 `_PySys_GetSizeOf`: look up `__sizeof__` on the type,
+/// call the bound method, require a non-negative Py_ssize_t result, then add
+/// the pre-header used by a heap type.  Pyre has no physical CPython object
+/// pre-header, but exposes the 3.14 logical size required by `sys.getsizeof`.
+fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    roots.pin_root(w_obj);
+    let current = || roots.get(obj_slot);
+    let method = unsafe { crate::baseobjspace::lookup_special(current(), "__sizeof__")? }
+        .ok_or_else(|| {
+            crate::PyError::type_error(format!(
+                "Type {} doesn't define __sizeof__",
+                crate::baseobjspace::object_functionstr_type_name(current()),
+            ))
+        })?;
+    let w_size = crate::call::call_function_impl_result(method, &[])?;
 
-sys.getsizeof(object, default) will always return default on PyPy, and
-raise a TypeError if default is not provided.
+    // PyLong_AsSsize_t accepts bool/int subclasses but performs no __index__
+    // conversion on an arbitrary return value.
+    let size = if unsafe { pyre_object::is_bool(w_size) } {
+        unsafe { pyre_object::w_bool_get_value(w_size) as i64 }
+    } else if unsafe { pyre_object::is_int(w_size) } {
+        unsafe { pyre_object::w_int_get_value(w_size) }
+    } else if unsafe { pyre_object::is_long(w_size) } {
+        let value = unsafe { pyre_object::w_long_get_value(w_size) };
+        if pyre_object::longobject::jit_bigint_to_i64_fits(value) == 0 {
+            return Err(crate::PyError::overflow_error(
+                "Python int too large to convert to C ssize_t",
+            ));
+        }
+        pyre_object::longobject::jit_bigint_to_i64_value(value)
+    } else {
+        return Err(crate::PyError::type_error("an integer is required"));
+    };
+    if size < 0 {
+        return Err(crate::PyError::value_error(
+            "__sizeof__() should return >= 0",
+        ));
+    }
 
-First note that the CPython documentation says that this function may
-raise a TypeError, so if you are seeing it, it means that the program
-you are using is not correctly handling this case.
-
-On PyPy, though, it always raises TypeError.  Before looking for
-alternatives, please take a moment to read the following explanation as
-to why it is the case.  What you are looking for may not be possible.
-
-A memory profiler using this function is most likely to give results
-inconsistent with reality on PyPy.  It would be possible to have
-sys.getsizeof() return a number (with enough work), but that may or
-may not represent how much memory the object uses.  It doesn't even
-make really sense to ask how much *one* object uses, in isolation
-with the rest of the system.  For example, instances have maps,
-which are often shared across many instances; in this case the maps
-would probably be ignored by an implementation of sys.getsizeof(),
-but their overhead is important in some cases if they are many
-instances with unique maps.  Conversely, equal strings may share
-their internal string data even if they are different objects---or
-empty containers may share parts of their internals as long as they
-are empty.  Even stranger, some lists create objects as you read
-them; if you try to estimate the size in memory of range(10**6) as
-the sum of all items' size, that operation will by itself create one
-million integer objects that never existed in the first place.
-"#;
+    // `_PyType_PreHeaderSize(Py_TYPE(o))`: on 64-bit CPython a managed heap
+    // instance has a 16-byte GC header plus a 16-byte managed dict/weakref
+    // prefix (half those sizes on 32-bit). This unit covers heap instances and
+    // untracked str; tracked builtin types will extend the type-layout port.
+    let pre_header = crate::typedef::r#type(current())
+        .filter(|tp| unsafe { pyre_object::w_type_is_heaptype(tp.as_ptr()) })
+        .map_or(0u64, |_| (4 * std::mem::size_of::<usize>()) as u64);
+    let total = (size as u64)
+        .checked_add(pre_header)
+        .expect("Py_ssize_t plus the fixed pre-header fits in size_t");
+    if total <= i64::MAX as u64 {
+        Ok(w_int_new(total as i64))
+    } else {
+        Ok(pyre_object::w_long_new(
+            pyre_object::rbigint::RBigInt::from_u128(total as u128),
+        ))
+    }
+}
 
 /// Shared stub type for `sys._getframe`, `sys.stdout` and other module-level
 /// sys attributes that expose attribute bags.
@@ -2274,13 +2303,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     &[true, false],
                     "getsizeof",
                 )?;
+                let w_obj = scope[0];
                 let w_default = scope[1];
-                if w_default.is_null() {
-                    return Err(crate::PyError::type_error(GETSIZEOF_MISSING));
+                let roots = pyre_object::gc_roots::push_roots();
+                let obj_slot = roots.base();
+                roots.pin_root(w_obj);
+                let default_slot = obj_slot + 1;
+                roots.pin_root(w_default);
+                match get_sizeof(roots.get(obj_slot)) {
+                    Ok(size) => Ok(size),
+                    Err(err)
+                        if !w_default.is_null() && err.kind == crate::PyErrorKind::TypeError =>
+                    {
+                        Ok(roots.get(default_slot))
+                    }
+                    Err(err) => Err(err),
                 }
-                Ok(w_default)
             },
-            GETSIZEOF_MISSING,
+            GETSIZEOF_DOC,
         ),
     );
     // PyPy normally omits CPython's raw refcount API.  The shared ctypes

@@ -5273,6 +5273,47 @@ fn init_str_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                |args| {
+                    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+                    let value = pyre_object::w_str_get_wtf8(args[0]);
+                    let len = value.code_points().count();
+                    let maxchar = value.code_points().map(|cp| cp.to_u32()).max().unwrap_or(0);
+                    let kind = if maxchar < 0x100 {
+                        1usize
+                    } else if maxchar < 0x10000 {
+                        2
+                    } else {
+                        4
+                    };
+                    let word = std::mem::size_of::<usize>();
+                    // unicodeobject.c:unicode_sizeof_impl. Exact ASCII uses
+                    // PyASCIIObject (5 words), exact non-ASCII uses
+                    // PyCompactUnicodeObject (7 words), and Unicode
+                    // subclasses use the two-block PyUnicodeObject (8 words).
+                    let base =
+                        if pyre_object::pyobject::is_exact_type(args[0], &pyre_object::STR_TYPE) {
+                            if maxchar < 0x80 { 5 * word } else { 7 * word }
+                        } else {
+                            8 * word
+                        };
+                    let size =
+                        base.checked_add((len + 1).checked_mul(kind).ok_or_else(|| {
+                            crate::PyError::overflow_error("string is too large")
+                        })?)
+                        .ok_or_else(|| crate::PyError::overflow_error("string is too large"))?;
+                    Ok(w_int_new(size as i64))
+                },
+                1,
+                "($self, /)",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__format__",
             make_builtin_function_with_arity(
                 "__format__",
