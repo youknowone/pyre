@@ -506,16 +506,35 @@ pub(crate) fn function_new_impl(
     let globals_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_func_globals_obj);
 
-    // CPython 3.14 `_PyEval_BuiltinsFromGlobals` at function construction:
+    // CPython 3.14 `_PyDict_LoadBuiltinsFromGlobals` at function construction:
     // retain the selected mapping identity even if the globals entry changes
-    // later.  Builtin/gateway carriers have no globals and keep a null slot.
+    // later.  Its `_Py_dict_lookup_threadsafe_stackref` reads the native dict
+    // backing directly (including for a dict subclass), and a missing key
+    // inherits `PyEval_GetBuiltins()` from the live caller frame.  This differs
+    // from PyPy's `pick_builtin`, whose missing-key result is a fresh anonymous
+    // module containing only `None`; 3.14 is pyre's compatibility target for
+    // the observable `function.__builtins__` field.
+    //
+    // Builtin/gateway carriers have no globals and keep a null slot.
     let w_builtins = if w_func_globals_obj.is_null() {
         PY_NULL
     } else {
-        let selected = crate::baseobjspace::pick_builtin_obj(
-            w_func_globals_obj,
-            crate::call::take_last_exec_ctx(),
-        );
+        let globals_backing = crate::type_methods::resolve_dict_backing(w_func_globals_obj);
+        let selected = unsafe {
+            pyre_object::w_dict_getitem_str(globals_backing, "__builtins__")
+        }
+        .unwrap_or_else(|| {
+            let exec_ctx = crate::call::take_last_exec_ctx();
+            if exec_ctx.is_null() {
+                return PY_NULL;
+            }
+            let frame = unsafe { (*exec_ctx).gettopframe_raw() };
+            if frame.is_null() {
+                unsafe { (*exec_ctx).get_builtin_dict() }
+            } else {
+                unsafe { (*frame).fget_f_builtins() }
+            }
+        });
         if !selected.is_null() && unsafe { pyre_object::is_module(selected) } {
             unsafe { pyre_object::w_module_get_w_dict(selected) }
         } else {
@@ -525,7 +544,7 @@ pub(crate) fn function_new_impl(
     let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_builtins);
 
-    // `pick_builtin_obj` and later allocations may collect.  Reload every
+    // Resolving the caller vref and later allocations may collect.  Reload every
     // pinned input before embedding it in the new Function; the original raw
     // locals are not rewritten when the shadow-stack slots are forwarded.
     let closure = pyre_object::gc_roots::shadow_stack_get(closure_slot);
