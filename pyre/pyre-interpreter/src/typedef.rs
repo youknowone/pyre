@@ -10239,6 +10239,36 @@ fn make_getset_property_full(
     )
 }
 
+/// Logical CPython 3.14 `tp_basicsize` / `tp_itemsize` values ported so far.
+/// These belong to the type object, not to its Python namespace: CPython's
+/// `type_members` exposes both through read-only data descriptors.
+fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
+    if std::ptr::eq(w_type, w_object()) {
+        return Some(((2 * std::mem::size_of::<usize>()) as i64, 0));
+    }
+    let int_type = gettypefor(&pyre_object::INT_TYPE)?.as_ptr();
+    if std::ptr::eq(w_type, int_type)
+        || unsafe { crate::baseobjspace::issubtype_w(w_type, int_type) }
+    {
+        return Some(((3 * std::mem::size_of::<usize>()) as i64, 4));
+    }
+    None
+}
+
+fn type_basicsize_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some((basic, _)) = cpython_type_layout(args[1]) else {
+        return Err(crate::PyError::attribute_error("__basicsize__"));
+    };
+    Ok(w_int_new(basic))
+}
+
+fn type_itemsize_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some((_, item)) = cpython_type_layout(args[1]) else {
+        return Err(crate::PyError::attribute_error("__itemsize__"));
+    };
+    Ok(w_int_new(item))
+}
+
 fn init_type_type(ns: PyObjectRef) {
     // type.__new__(metatype, name, bases, dict) — creates new type
     unsafe {
@@ -10419,6 +10449,22 @@ fn init_type_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 `typeobject.c:type_members`: these are read-only member
+    // descriptors on `type`, rather than ordinary entries inherited through
+    // the inspected class's MRO.
+    for (name, function) in [
+        ("__basicsize__", type_basicsize_getter as DunderFn),
+        ("__itemsize__", type_itemsize_getter as DunderFn),
+    ] {
+        let getter = make_builtin_function_with_arity(name, function, 2);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_property_named(getter, PY_NULL, PY_NULL, name),
+            )
+        };
+    }
     // typeobject.py:833-841 `W_TypeObject.descr_or` / `descr_ror` delegate
     // to `_pypy_generic_alias._create_union`.
     unsafe {
@@ -16864,6 +16910,22 @@ fn long_bit_length(value: &BigInt) -> Result<i64, crate::PyError> {
     }
 }
 
+/// CPython 3.14 `longobject.c:int___sizeof___impl` counts base-2**30
+/// `digit` cells, independently of pyre's internal RBigInt digit width.
+fn int_cpython_digit_count(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let bits = if unsafe { pyre_object::is_bool(w_obj) } {
+        i64::from(unsafe { pyre_object::w_bool_get_value(w_obj) })
+    } else if unsafe { pyre_object::is_int(w_obj) } {
+        let magnitude = unsafe { pyre_object::w_int_get_value(w_obj) }.unsigned_abs();
+        i64::from(u64::BITS - magnitude.leading_zeros())
+    } else if unsafe { pyre_object::is_long(w_obj) } {
+        long_bit_length(unsafe { pyre_object::w_long_get_value(w_obj) })?
+    } else {
+        0
+    };
+    Ok(if bits == 0 { 1 } else { (bits - 1) / 30 + 1 })
+}
+
 /// `intobject.py:657 W_IntObject.descr_bit_length` /
 /// `longobject.py:48 W_AbstractLongObject.descr_bit_length`, exposed through
 /// `interpindirect2app` (`intobject.py:1171`).
@@ -16955,6 +17017,27 @@ fn init_int_type(ns: PyObjectRef) {
                 "__hash__",
                 |args| Ok(w_int_new(crate::builtins::hash_value(args[0]))),
                 1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                |args| {
+                    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+                    let ndigits = int_cpython_digit_count(args[0])?;
+                    let w_type = crate::typedef::r#type(args[0])
+                        .expect("every int has a type")
+                        .as_ptr();
+                    let (basicsize, itemsize) = cpython_type_layout(w_type)
+                        .expect("int and its subclasses have CPython layout metadata");
+                    Ok(w_int_new(basicsize + itemsize * ndigits))
+                },
+                1,
+                "($self, /)",
             ),
         )
     };
@@ -18822,6 +18905,34 @@ fn init_object_type(ns: PyObjectRef) {
                         return Err(crate::PyError::type_error(message));
                     }
                     Ok(default_identity_hash(pyre_object::PY_NULL, args[0]))
+                },
+                1,
+                "($self, /)",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            // CPython 3.14 `typeobject.c:object___sizeof___impl`: add the
+            // live type's basicsize and its variable item contribution.  The
+            // latter is currently non-zero for the CPython-layout `int` port.
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                |args| {
+                    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+                    let w_type = crate::typedef::r#type(args[0])
+                        .expect("every Python object has a type")
+                        .as_ptr();
+                    let (basicsize, itemsize) = cpython_type_layout(w_type)
+                        .unwrap_or((2 * std::mem::size_of::<usize>() as i64, 0));
+                    let nitems = if itemsize == 0 {
+                        0
+                    } else {
+                        int_cpython_digit_count(args[0])?
+                    };
+                    Ok(w_int_new(basicsize + itemsize * nitems))
                 },
                 1,
                 "($self, /)",
