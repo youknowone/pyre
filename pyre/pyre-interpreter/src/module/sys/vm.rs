@@ -2672,19 +2672,39 @@ pub fn audit_hooks_armed() -> bool {
     !holder.is_null() && unsafe { (*holder).hooks_armed.get() }
 }
 
+/// `vm.py:474 audit(space, event, args_w)` under `@unwrap_spec(event="text")`.
+///
+/// The unwrap in front of the hook dispatch is observable on its own: the
+/// parameters are positional-only, and the event name has to be a `str` with a
+/// UTF-8 spelling, so a bad event name is reported at the call rather than
+/// carried to whichever hook reads it.
 fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
-    let Some(&w_event) = args.first() else {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
-            "audit() missing 1 required positional argument: 'event'",
+            "sys.audit() takes no keyword arguments",
+        ));
+    }
+    let Some(&w_event) = positional.first() else {
+        return Err(crate::PyError::type_error(
+            "audit expected at least 1 argument, got 0",
         ));
     };
     // `@unwrap_spec(event="text")`
     if !unsafe { pyre_object::is_str(w_event) } {
-        return Err(crate::PyError::type_error(
-            "audit() argument 1 must be str, not other",
-        ));
+        // `_PyArg_BadArgument` names the `None` singleton itself rather than
+        // its type.
+        let given = if unsafe { pyre_object::is_none(w_event) } {
+            "None".to_string()
+        } else {
+            crate::type_methods::arg_type_name(w_event)
+        };
+        return Err(crate::PyError::type_error(format!(
+            "audit() argument 1 must be str, not {given}"
+        )));
     }
-    audit_w(w_event, &args[1..])?;
+    crate::baseobjspace::str_utf8_w(w_event)?;
+    audit_w(w_event, &positional[1..])?;
     Ok(w_none())
 }
 

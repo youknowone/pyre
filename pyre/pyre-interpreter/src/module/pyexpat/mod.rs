@@ -1742,6 +1742,16 @@ fn init_parser_slots(parser: PyObjectRef) {
     );
 }
 
+/// `ParserCreate()`'s spelling for a `str`-or-`None` parameter handed
+/// something else.  Both parameters report it, so the argument name is the only
+/// thing that varies.
+fn parser_create_not_str(param: &str, obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "ParserCreate() argument '{param}' must be str or None, not {}",
+        crate::type_methods::arg_type_name(obj)
+    ))
+}
+
 /// `ParserCreate(encoding=None, namespace_separator=None, intern=None)`.
 fn parser_create3(
     encoding: PyObjectRef,
@@ -1752,10 +1762,12 @@ fn parser_create3(
     init_parser_slots(parser);
     if unsafe { !is_none(encoding) } {
         if unsafe { !is_str(encoding) } {
-            return Err(crate::PyError::type_error(
-                "ParserCreate() argument 'encoding' must be str or None",
-            ));
+            return Err(parser_create_not_str("encoding", encoding));
         }
+        // The name reaches the expat setup as a `&str`, the same view the
+        // sibling `namespace_separator` arm takes below: a value with no UTF-8
+        // spelling is refused here rather than at that read.
+        crate::baseobjspace::str_utf8_w(encoding)?;
         crate::baseobjspace::setdictvalue_native(parser, "_pyre_forced_encoding", encoding);
     }
     if unsafe { is_none(namespace_separator) } {
@@ -1772,8 +1784,9 @@ fn parser_create3(
             w_str_new(value),
         );
     } else {
-        return Err(crate::PyError::type_error(
-            "ParserCreate() argument 'namespace_separator' must be str or None, not int",
+        return Err(parser_create_not_str(
+            "namespace_separator",
+            namespace_separator,
         ));
     }
     if unsafe { !is_none(intern) } {
