@@ -13033,7 +13033,7 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     // directly).  Otherwise call `space.iter(w_iterable)`.
     let source = unsafe { pyre_object::gc_roots::shadow_stack_get(source_slot) };
     let w_iter_or_list =
-        if start == 0 && w_start.is_null() && unsafe { pyre_object::is_list(source) } {
+        if start == 0 && w_start.is_null() && unsafe { pyre_object::is_exact_list(source) } {
             source
         } else {
             crate::baseobjspace::iter(source)?

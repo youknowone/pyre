@@ -1139,12 +1139,19 @@ pub fn call_function_ex_in_ctx(
     kwargs_or_null: PyObjectRef,
 ) -> PyResult {
     let mut args: Vec<PyObjectRef> = unsafe {
-        if pyre_object::is_tuple(starargs) {
+        // argument.py:92-104 reaches `space.fixedview`, whose fast paths
+        // (`objspace.py:519-527`) are a tuple whose `__iter__` is still
+        // `tuple.__iter__` and an exact list.  A subtype that replaced
+        // `__iter__` falls through to the generic path so the override runs.
+        if pyre_object::is_tuple(starargs)
+            && crate::baseobjspace::builtin_iter_replacement(starargs, &pyre_object::TUPLE_TYPE)
+                .is_none()
+        {
             let n = pyre_object::w_tuple_len(starargs);
             (0..n as i64)
                 .filter_map(|i| pyre_object::w_tuple_getitem(starargs, i))
                 .collect()
-        } else if pyre_object::is_list(starargs) {
+        } else if pyre_object::is_exact_list(starargs) {
             let n = pyre_object::w_list_len(starargs);
             (0..n as i64)
                 .filter_map(|i| pyre_object::w_list_getitem(starargs, i))

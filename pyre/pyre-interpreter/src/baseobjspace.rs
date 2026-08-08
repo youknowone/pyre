@@ -14084,6 +14084,55 @@ unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
     }
 }
 
+/// `objspace.py:633-643 _uses_list_iter` / `_uses_tuple_iter` /
+/// `_uses_unicode_iter` — the concrete storage iterator is only correct while
+/// the receiver's `__iter__` is still the one `base` defines.  `Some(method)`
+/// is the replacement a heap subtype installed; `None` leaves the fast path
+/// available.
+///
+/// # Safety
+/// `obj` must point to a valid object whose header is readable.
+pub(crate) unsafe fn builtin_iter_replacement(
+    obj: PyObjectRef,
+    base: &'static pyre_object::PyType,
+) -> Option<PyObjectRef> {
+    let exact = get_instantiate(base);
+    let w_class = unsafe { (*obj).w_class };
+    if w_class.is_null() || std::ptr::eq(w_class, exact) {
+        return None;
+    }
+    let (src, method) = unsafe { lookup_where_pair(w_class, "__iter__") }?;
+    if std::ptr::eq(src, exact) {
+        None
+    } else {
+        Some(method)
+    }
+}
+
+/// Run the `__iter__` a heap subtype installed over `base`.  `Ok(None)` means
+/// the receiver still uses the builtin one and the caller takes its fast path.
+///
+/// # Safety
+/// `obj` must point to a valid object whose header is readable.
+unsafe fn builtin_iter_override(
+    obj: PyObjectRef,
+    base: &'static pyre_object::PyType,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let Some(method) = (unsafe { builtin_iter_replacement(obj, base) }) else {
+        return Ok(None);
+    };
+    // descroperation.py:339-341 — an explicit `__iter__ = None` override marks
+    // the subclass non-iterable even though the lookup succeeds.
+    if unsafe { is_none(method) } {
+        return Err(PyError::type_error(format!(
+            "'{}' object is not iterable",
+            unsafe { obj_type_name(obj) }
+        )));
+    }
+    let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+    iter_check_is_iterator(w_iter).map(Some)
+}
+
 /// `iter(obj)` — PyPy: space.iter(w_obj)
 /// Calls __iter__ on the object if available.
 pub fn iter(obj: PyObjectRef) -> PyResult {
@@ -14128,42 +14177,14 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // (which itself calls back into `iter()`) is collapsed to the
         // storage iterator to avoid an infinite recursion.
         if is_list(obj) {
-            if !pyre_object::is_exact_list(obj) {
-                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::LIST_TYPE)) {
-                        // descroperation.py:339-341 — an explicit
-                        // `__iter__ = None` override marks the subclass
-                        // non-iterable even though the lookup succeeds.
-                        if is_none(method) {
-                            return Err(PyError::type_error(format!(
-                                "'{}' object is not iterable",
-                                obj_type_name(obj)
-                            )));
-                        }
-                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-                        return iter_check_is_iterator(w_iter);
-                    }
-                }
+            if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::LIST_TYPE)? {
+                return Ok(w_iter);
             }
             return Ok(pyre_object::w_list_iter_new(obj));
         }
         if is_tuple(obj) {
-            if !pyre_object::is_exact_tuple(obj) {
-                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE)) {
-                        // descroperation.py:339-341 — an explicit
-                        // `__iter__ = None` override marks the subclass
-                        // non-iterable even though the lookup succeeds.
-                        if is_none(method) {
-                            return Err(PyError::type_error(format!(
-                                "'{}' object is not iterable",
-                                obj_type_name(obj)
-                            )));
-                        }
-                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-                        return iter_check_is_iterator(w_iter);
-                    }
-                }
+            if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::TUPLE_TYPE)? {
+                return Ok(w_iter);
             }
             return Ok(pyre_object::w_tuple_iter_new(obj));
         }
@@ -14176,6 +14197,9 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             return Ok(pyre_object::w_seq_iter_new(obj, 1));
         }
         if is_str(obj) {
+            if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::STR_TYPE)? {
+                return Ok(w_iter);
+            }
             // Code-point count (not byte count) seeds the sequence
             // iterator, read straight from the cached length so a
             // lone-surrogate backing does not panic.
@@ -14183,6 +14207,14 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
+            let base = if pyre_object::bytearrayobject::is_bytearray(obj) {
+                &pyre_object::bytearrayobject::BYTEARRAY_TYPE
+            } else {
+                &pyre_object::bytesobject::BYTES_TYPE
+            };
+            if let Some(w_iter) = builtin_iter_override(obj, base)? {
+                return Ok(w_iter);
+            }
             // The cursor holds the bytes object itself, as the str arm above
             // does: `space.iter` builds a sequence iterator over the sequence
             // (`iterobject.py W_SeqIterObject`), it does not unpack it.  A
@@ -14208,20 +14240,8 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             // path. This is load-bearing for `mappingproxy(OrderedDict)` in
             // `inspect.Signature`: treating the subclass as an exact raw dict
             // bypasses its iterator and casts the wrong layout.
-            let exact_dict_type = get_instantiate(&pyre_object::DICT_TYPE);
-            if !std::ptr::eq((*obj).w_class, exact_dict_type) {
-                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, exact_dict_type) {
-                        if is_none(method) {
-                            return Err(PyError::type_error(format!(
-                                "'{}' object is not iterable",
-                                obj_type_name(obj)
-                            )));
-                        }
-                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-                        return iter_check_is_iterator(w_iter);
-                    }
-                }
+            if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::DICT_TYPE)? {
+                return Ok(w_iter);
             }
             return Ok(pyre_object::dictmultiobject::w_dict_view_iterator_new(
                 obj,
@@ -14231,6 +14251,14 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // set / frozenset → a live W_SetIterObject over the source storage.
         // setobject.py:216 descr_iter / :1567 W_SetIterObject.
         if pyre_object::is_set_or_frozenset(obj) {
+            let base = if pyre_object::setobject::is_frozenset(obj) {
+                &pyre_object::setobject::FROZENSET_TYPE
+            } else {
+                &pyre_object::setobject::SET_TYPE
+            };
+            if let Some(w_iter) = builtin_iter_override(obj, base)? {
+                return Ok(w_iter);
+            }
             return Ok(pyre_object::w_set_iter_new(obj));
         }
         if pyre_object::is_set_iterator(obj) {
@@ -14256,78 +14284,38 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `__iter__`; dispatch that override before taking the native fast
         // path, as space.iter does for every W_Root TypeDef.
         if pyre_object::interp_itertools::is_islice(obj) {
-            let exact = get_instantiate(&pyre_object::interp_itertools::ISLICE_TYPE);
-            if !std::ptr::eq((*obj).w_class, exact) {
-                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, exact) {
-                        if is_none(method) {
-                            return Err(PyError::type_error(format!(
-                                "'{}' object is not iterable",
-                                obj_type_name(obj)
-                            )));
-                        }
-                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-                        return iter_check_is_iterator(w_iter);
-                    }
-                }
+            if let Some(w_iter) =
+                builtin_iter_override(obj, &pyre_object::interp_itertools::ISLICE_TYPE)?
+            {
+                return Ok(w_iter);
             }
             return Ok(obj);
         }
         // CPython 3.14 batched is likewise self-iterating while permitting a
         // heap subtype to replace `__iter__`.
         if pyre_object::interp_itertools::is_batched(obj) {
-            let exact = get_instantiate(&pyre_object::interp_itertools::BATCHED_TYPE);
-            if !std::ptr::eq((*obj).w_class, exact) {
-                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, exact) {
-                        if is_none(method) {
-                            return Err(PyError::type_error(format!(
-                                "'{}' object is not iterable",
-                                obj_type_name(obj)
-                            )));
-                        }
-                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-                        return iter_check_is_iterator(w_iter);
-                    }
-                }
+            if let Some(w_iter) =
+                builtin_iter_override(obj, &pyre_object::interp_itertools::BATCHED_TYPE)?
+            {
+                return Ok(w_iter);
             }
             return Ok(obj);
         }
         // PyPy W_Product.iter_w returns self, with normal heap-subtype
         // override dispatch.
         if pyre_object::interp_itertools::is_product(obj) {
-            let exact = get_instantiate(&pyre_object::interp_itertools::PRODUCT_TYPE);
-            if !std::ptr::eq((*obj).w_class, exact) {
-                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, exact) {
-                        if is_none(method) {
-                            return Err(PyError::type_error(format!(
-                                "'{}' object is not iterable",
-                                obj_type_name(obj)
-                            )));
-                        }
-                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-                        return iter_check_is_iterator(w_iter);
-                    }
-                }
+            if let Some(w_iter) =
+                builtin_iter_override(obj, &pyre_object::interp_itertools::PRODUCT_TYPE)?
+            {
+                return Ok(w_iter);
             }
             return Ok(obj);
         }
         if pyre_object::interp_itertools::is_combinations(obj) {
-            let exact = get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_TYPE);
-            if !std::ptr::eq((*obj).w_class, exact) {
-                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, exact) {
-                        if is_none(method) {
-                            return Err(PyError::type_error(format!(
-                                "'{}' object is not iterable",
-                                obj_type_name(obj)
-                            )));
-                        }
-                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-                        return iter_check_is_iterator(w_iter);
-                    }
-                }
+            if let Some(w_iter) =
+                builtin_iter_override(obj, &pyre_object::interp_itertools::COMBINATIONS_TYPE)?
+            {
+                return Ok(w_iter);
             }
             return Ok(obj);
         }
@@ -14351,38 +14339,18 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             return Ok(obj);
         }
         if pyre_object::interp_itertools::is_permutations(obj) {
-            let exact = get_instantiate(&pyre_object::interp_itertools::PERMUTATIONS_TYPE);
-            if !std::ptr::eq((*obj).w_class, exact) {
-                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, exact) {
-                        if is_none(method) {
-                            return Err(PyError::type_error(format!(
-                                "'{}' object is not iterable",
-                                obj_type_name(obj)
-                            )));
-                        }
-                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-                        return iter_check_is_iterator(w_iter);
-                    }
-                }
+            if let Some(w_iter) =
+                builtin_iter_override(obj, &pyre_object::interp_itertools::PERMUTATIONS_TYPE)?
+            {
+                return Ok(w_iter);
             }
             return Ok(obj);
         }
         if pyre_object::interp_itertools::is_groupby(obj) {
-            let exact = get_instantiate(&pyre_object::interp_itertools::GROUPBY_TYPE);
-            if !std::ptr::eq((*obj).w_class, exact) {
-                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, exact) {
-                        if is_none(method) {
-                            return Err(PyError::type_error(format!(
-                                "'{}' object is not iterable",
-                                obj_type_name(obj)
-                            )));
-                        }
-                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-                        return iter_check_is_iterator(w_iter);
-                    }
-                }
+            if let Some(w_iter) =
+                builtin_iter_override(obj, &pyre_object::interp_itertools::GROUPBY_TYPE)?
+            {
+                return Ok(w_iter);
             }
             return Ok(obj);
         }
