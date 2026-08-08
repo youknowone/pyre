@@ -50,6 +50,12 @@ class CrateSpec:
     - `excluded_deps`: path-dependency package names dropped from this crate's
       fingerprint because the artefact holds zero references to them; the
       extraction guard re-checks the artefact and fails loud if that drifts.
+      Naming a package drops its EXCLUSIVELY-REACHED SUBTREE too — anything
+      reachable only by going through it. A package some non-excluded parent
+      also reaches is kept, so listing a widely-shared package removes only
+      its own files. The guard checks the NAMED packages; the subtree is
+      covered by inheritance (see `_collect_inputs`), which is why the two
+      are not, and must not be, the same set.
     - `layout_targets`: target triples, besides the extraction host, this
       crate also emits a layout sidecar for (see `layout_sidecar_name`).
       `None` takes the driver's default; `()` opts out. Every listed target
@@ -1416,22 +1422,36 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
         timestamp only approximates.
       * the `excluded_deps` exclusion is not re-asked here, and MOSTLY DOES NOT
         NEED TO BE — do not add a second checker without reading this first.
-        `extract` re-reads the artefact and refuses if a package dropped from
-        the fingerprint is referenced by it; `stamp_path.write_text` is the
+        `extract` re-reads the artefact and refuses if a NAMED excluded
+        package is referenced by it; `stamp_path.write_text` is the
         stamp's ONLY writer and sits immediately after that guard, so a
         violation raises before any stamp exists. A matching stamp is therefore
         the guard's certificate: it could only have been written by an
         extraction the guard passed. The skip path inherits this — it fires on
         `stamp == recorded`, and that recorded stamp had the same provenance.
-        The oracle discriminates rather than being vacuous: the same symbol is
-        present in `pyre-jit.ullbc`, which excludes nothing, and absent from
-        the two artefacts that exclude it.
+        The oracle discriminates rather than being vacuous: `majit_translate`
+        occurs 373 times in `pyre-jit.ullbc`, which excludes nothing, and 0
+        times in `pyre-interpreter.ullbc`, which excludes it.
 
-        Two narrow things the certificate does NOT carry:
+        Three narrow things the certificate does NOT carry:
 
           - it does not distinguish "the guard passed" from "the guard was
             vacuous". A spec with empty `excluded_deps` runs an empty loop and
             writes an indistinguishable stamp.
+          - it does not cover the EXCLUSIVELY-REACHED SUBTREE the exclusion
+            also drops, and ⛔ widening the loop to cover it would be worse
+            than leaving it uncovered, because the guard's power is PER
+            SYMBOL. `majit_charon_reader` — dropped as `majit-translate`'s
+            subtree — occurs 0 times in ALL SIX artefacts this tree builds,
+            `pyre-jit.ullbc` included, so no artefact can serve as its
+            positive control and a widened guard would pass without
+            evidence. What actually certifies the subtree is INHERITANCE:
+            the walk drops a package only when EVERY path to it runs through
+            an excluded one, and the named package's absence is checked
+            here, so a package that cannot appear without it cannot appear.
+            `pyre-object` is NOT a second witness for that absence — it does
+            not depend on `majit-translate` at all, so its exclusion is an
+            inert declaration and its 0 is uninformative.
           - `--force` re-extracts with the skip bypassed, and an excluded
             package's sources changing is BY CONSTRUCTION invisible to
             `source=`. So a forced run can write a violating artefact, raise at
