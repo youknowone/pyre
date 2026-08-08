@@ -68,6 +68,8 @@ except ValueError:
     pass
 except KeyError:
     raise AssertionError("raising __eq__ reported as a missing key")
+else:
+    raise AssertionError("raising __eq__ swallowed on the dict subscript")
 
 # A colliding key that compares unequal without raising is an ordinary miss, so
 # the class attribute answers.
@@ -133,5 +135,7 @@ except ValueError:
     pass
 except AttributeError:
     raise AssertionError("raising __eq__ reported as a missing attribute")
+else:
+    raise AssertionError("raising __eq__ swallowed on a surrogate name")
 
 print("OK")

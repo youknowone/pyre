@@ -88,6 +88,47 @@ def check_function_qualname():
         raise AssertionError("no TypeError")
 
 
+def check_bound_method_repr():
+    class C:
+        def m(self, a):
+            return a
+
+    C.m.__qualname__ = S
+    o = C()
+    assert repr(o.m).startswith("<bound method %s of " % S), ascii(repr(o.m))
+    assert FFFD not in repr(o.m), ascii(repr(o.m))
+
+    try:
+        o.m()
+    except TypeError as e:
+        assert str(e) == S + "() missing 1 required positional argument: 'a'", ascii(str(e))
+    else:
+        raise AssertionError("no TypeError")
+
+
+def check_unhashable_key_wrapper():
+    # The wrapped hash error becomes this exception's own args[0], so the
+    # surrogate is the value it carries -- escaping belongs to the display.
+    class BadHash:
+        def __hash__(self):
+            raise TypeError(S)
+
+    # Only the wrapped hash message is pinned here.  The type is spelled by
+    # __name__ rather than __qualname__, which is a separate divergence from
+    # the one this checks.
+    for build, kind in ((lambda: {}[BadHash()], "dict key"), (lambda: {BadHash()}, "set element")):
+        try:
+            build()
+        except TypeError as e:
+            tail = " as a %s (%s)" % (kind, S)
+            assert str(e).startswith("cannot use '"), ascii(str(e))
+            assert str(e).endswith(tail), ascii(str(e))
+            assert e.args[0] == str(e), ascii(e.args[0])
+            assert FFFD not in str(e), ascii(str(e))
+        else:
+            raise AssertionError("no TypeError")
+
+
 def check_generator_qualname():
     def g():
         yield 1
@@ -114,12 +155,14 @@ def check_contextvars():
         raise AssertionError("no RuntimeError")
 
     # A variable with no default names itself by repr in the LookupError, so
-    # the message carries whatever its own repr does.
-    unset = contextvars.ContextVar(Repr.__name__)
+    # the message carries whatever its own repr does.  The name holds the
+    # surrogate, so a lossy conversion anywhere on that path shows up here.
+    unset = contextvars.ContextVar(S)
     try:
         unset.get()
     except LookupError as e:
         assert str(e) == repr(unset), ascii(str(e))
+        assert FFFD not in str(e), ascii(str(e))
     else:
         raise AssertionError("no LookupError")
 
@@ -145,6 +188,8 @@ def check_base_exception_str():
 
 
 check_function_qualname()
+check_bound_method_repr()
+check_unhashable_key_wrapper()
 check_generator_qualname()
 check_contextvars()
 check_excepthook()

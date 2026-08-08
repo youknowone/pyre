@@ -83,8 +83,24 @@ def check_value_keeps_the_code_point():
         raise AssertionError("no AttributeError")
 
 
+def check_syntaxerror_text_render():
+    # A constructor-supplied `text` is any str, unlike a compiled source line,
+    # so it can hold a lone surrogate.  The offending line is escaped and kept,
+    # with the caret still under the reported column -- not replaced wholesale
+    # by a placeholder.
+    script = 'raise SyntaxError("bad", ("x.py", 1, 1, "\\udcff\\n", 1, 2))'
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True)
+    assert proc.returncode == 1, proc.returncode
+    lines = proc.stderr.splitlines()
+    assert rb'    \udcff' in lines, proc.stderr
+    assert b"    ^" in lines, proc.stderr
+    assert b"<unprintable>" not in proc.stderr, proc.stderr
+    assert lines[-1] == b"SyntaxError: bad", lines[-1]
+
+
 check_uncaught_render()
 check_group_render()
 check_group_str_keeps_the_code_point()
 check_value_keeps_the_code_point()
+check_syntaxerror_text_render()
 print("OK")
