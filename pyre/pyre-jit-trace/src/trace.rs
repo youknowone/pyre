@@ -658,8 +658,8 @@ fn try_commit_entry_carrier_call(
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                 call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
-                 lastblock) — legacy replay kept"
+                 call_py_pc={call_py_pc} (depth mismatch / unresolved local) — \
+                 legacy replay kept"
             );
         }
         return None;
@@ -1132,8 +1132,8 @@ pub fn trace_bytecode<Sym: WalkSym>(
     }
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
     // The snapshot stands in for concrete stepping only; vable-statics
-    // capture must read pointer-valued fields (`debugdata` / `lastblock`)
-    // from the live frame the compiled loop will run on.  See the
+    // capture must read the pointer-valued `debugdata` field from the live
+    // frame the compiled loop will run on. See the
     // `live_vable_frame_addr` field doc (state.rs).  Set before the
     // full-body-walk leg below so the production tracer sees it.
     //
@@ -3847,8 +3847,8 @@ fn run_perfn_walk<Sym: WalkSym>(
     // produces RPython-style reds (`jump_args = [frame, ec]`, len 2 for the
     // portal jitdriver), but pyre's runtime closes loops against the
     // EXPLICIT scalar inputarg vector
-    // `[frame, ec, next_instr, code, valuestackdepth, debugdata, lastblock,
-    //  namespace, locals..., stack...]` (len >= NUM_SCALAR_INPUTARGS).
+    // `[frame, ec, next_instr, code, valuestackdepth, debugdata, namespace,
+    //  locals..., stack...]` (len >= NUM_SCALAR_INPUTARGS).
     // `validate_close_with_jump_args` (state.rs) rejects the reds shape, so
     // rebuild the explicit vector via `close_loop_args_at`, matching
     // `reached_loop_header` (trace_opcode.rs close path). The
@@ -3954,7 +3954,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-end-flush] declined at header_pc={header_pc} (shadow slot \
-                         without concrete / depth / lastblock) — legacy replay kept"
+                         without concrete / depth) — legacy replay kept"
                     );
                 }
             }
@@ -4112,6 +4112,13 @@ fn run_perfn_walk<Sym: WalkSym>(
         {
             crate::jitcode_dispatch::restore_escape_flush_undo();
         }
+        // Measured, so that the next reader does not re-derive it: an "is the
+        // capture still armed here" invariant does NOT gate this leg. On
+        // `getframe_caller_resume_coord_two_call_sites` every walk that
+        // reaches this point reports `armed=false fb=true` — the blackhole
+        // adoption above claims the flushed frame, and the capture is already
+        // consumed. A counter conditioned on the three flags being false would
+        // read 0 both with and without the force arm's deferred restore.
         // The third field marks an abort that may only consume the `Entry`
         // carrier: the `MidBody` carrier is latched exclusively by the first two
         // variants (`inline_call.rs`), so a kept-stack abort matching a MidBody
@@ -4282,7 +4289,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                     (shadow slot without concrete / depth) — legacy replay kept"
                             );
                         }
                     }
@@ -4397,7 +4404,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                     (shadow slot without concrete / depth) — legacy replay kept"
                             );
                         }
                     }
@@ -4484,7 +4491,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
-                         (operand slot without concrete / depth / lastblock) — legacy replay kept"
+                         (operand slot without concrete / depth) — legacy replay kept"
                     );
                 }
             } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -4616,7 +4623,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-branch-flush] declined at resume_py_pc={resume_py_pc} \
-                             (shadow slot without concrete / depth / lastblock) — legacy drop kept"
+                             (shadow slot without concrete / depth) — legacy drop kept"
                     );
                 }
             }
@@ -6160,6 +6167,9 @@ pub mod fbw_diag {
     /// slot, little-endian) followed by one slot of packed counters.  A `u64`
     /// export cannot carry a string, and the outcome set is far too large to
     /// spend a tally slot per variant.
+    ///
+    /// `pyre-wasm-runner` decodes the ring through its OWN copy of this
+    /// constant (`main.rs`); the two have to move together.
     pub const RING_BASE: usize = 14;
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;

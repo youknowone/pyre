@@ -3,58 +3,64 @@
 **Status**: living record, companion to `design.md` (the charter). Where the
 charter states what pyre must be, this states where today's code violates it and
 what is left to do about it. **Findings are deleted as they close** — the history
-of what was once wrong belongs in git, not here. Keep this document small enough
-that it is worth re-reading.
+of what was once wrong belongs in git, not here. The one exception is *Settled*
+below: a closed finding leaves a one-line verdict there only where re-deriving it
+is the live risk. Keep this document small enough that it is worth re-reading.
 
 Original audit: branch `pc-map`, 2026-07-05, against the charter's axioms A1–A7
-and norms N1–N7. Re-measured 2026-08-07 on `ec-wiring`.
+and norms N1–N7. Re-measured 2026-08-08 on `ec-wiring`.
 
 The verdict has not changed shape: **the skeleton is right, the JIT spine is
 where the violations live.** The layer map of charter §1 is real in the tree and
 none of the anti-roadmap (§3.5) items have been rebuilt. What changed is the size
-of the remainder — two of the original five findings are closed and deleted, and
-thirteen of the fifteen tracked issues are closed.
+of the remainder — three of the original five findings are closed and deleted,
+and thirteen of the fifteen tracked issues are closed.
 
 ---
 
 ## Open findings
 
-### F4 — one `_other` catch-all is the whole unlisted-cliff surface
+### F4 — eight unported opcodes; the unlisted surface is gone
 
-**Counted 2026-08-07.** Earlier revisions of this finding reported "~214 matches,
-unchanged in scale" and left it unmeasurable behind a census that was never
-built. Counting *emission sites* rather than mentions changes the picture:
-the 219 textual matches across 20 files are almost all comments. The real surface
-is **23 `emit_abort_permanent!` sites, all in `pyre-jit/src/jit/codewriter.rs`**
-— 22 named-opcode arms plus one catch-all — and every named arm already carries
-its reason inline.
+**Counted 2026-08-07, re-measured 2026-08-08.** Earlier revisions reported "~214
+matches, unchanged in scale" and left the finding unmeasurable behind a census
+that was never built. Counting *emission sites* rather than mentions changed the
+picture: the textual matches across 20 files are almost all comments, and the
+real surface is the `emit_abort_permanent!` sites in
+`pyre-jit/src/jit/codewriter.rs` — now **25**, every one of them named.
 
 | class | n | opcodes |
 |---|---|---|
 | **genuine trace boundaries** — a trace records one continuous execution, so no residual can express the resume | 9 | `YieldValue`, `Send`, `EndSend`, `ReturnGenerator`, `GetYieldFromIter`, `GetAiter`, `GetAnext`, `EndAsyncFor`, `CleanupThrow` |
 | **narrow conditional shapes** inside an otherwise-lowered opcode | 5 | `Call` / `CallKw` (nargs past the backend dispatch ceiling), `LoadFastCheck`, `LoadLocals` (non-portal `is_locals`), `DeleteDeref` (compiler-normalized class-scope case) |
 | **unported opcodes** — the real coverage gap | 8 | `CheckEgMatch`, `BuildInterpolation`, `BuildTemplate`, `CallIntrinsic1`, `CallIntrinsic2`, `LoadSpecial`, `LoadFromDictOrDeref`, `SetupAnnotations` |
-| **catch-all** `_other => emit_abort_permanent!(py_pc)` | 1 | whatever the match does not name |
+| **not emittable by this compiler** — three classified arms where the catch-all was | 108 | 82 adaptive specializations, 21 `Instrumented*`, 5 interpreter/JIT-internal |
 
 **Violates.** A1 ("Rust can't be meta-traced is never a valid excuse") and
 charter §3.1's norm that every fallback is a census-tracked gap, never a silent
 hole.
 
-**Where the violation actually lives.** Not in the 22 — those are listed by
-construction, each beside its reason. It lives in the **`_other` arm**: an opcode
-nobody has looked at declines the whole loop with no record of which opcode it
-was. That single arm is the entire unlisted surface, which is why the finding
-could never be closed by counting matches.
+**What the catch-all turned out to be.** Not "an opcode nobody has looked at" —
+`_other` covered exactly the 108 `Instruction` variants the dispatch never named,
+and all 108 are opcodes this compiler cannot emit: the adaptive specializations a
+quickening interpreter writes in place (pyre's eval loop does not quicken —
+nothing calls `replace_op` outside a corruption test), the `sys.monitoring`
+substitutions, and the tier-2 executor's internal forms. So the unlisted cliff
+was never a live cliff. It was the *silence* that mattered: had one appeared, the
+loop declined with no record of which opcode did it.
 
-**What is left.**
+Deleting `_other` and classifying all 108 makes the match exhaustive, so a
+variant added upstream now fails to compile here instead of vanishing into a
+catch-all — `majit-translate`'s `flowspace/flowcontext.rs` already classifies the
+same three groups, and this brings the walker in line with it. `cargo check -p
+pyre-jit` passes with no catch-all, and dropping a single pattern from the list
+fails as `E0004: non-exhaustive patterns: Instruction::ToBoolBool not covered`,
+which is what makes the coverage claim load-bearing rather than decorative.
 
-1. **Make `_other` name its opcode.** A cliff that says which instruction caused
-   it stops being a silent hole, and the gap list below becomes self-maintaining
-   instead of needing a census run to rediscover.
-2. **Port the 8.** `CALL_INTRINSIC_1 → HLOp` is the template; `CallIntrinsic1`
-   still aborts on the intrinsic kinds that arm does not cover.
-3. **Record the 9 as boundaries, not gaps.** They are correct, and counting them
-   is most of what made the raw number look like a wall.
+**What is left.** **Port the 8.** `CALL_INTRINSIC_1 → HLOp` is the template;
+`CallIntrinsic1` still aborts on the intrinsic kinds that arm does not cover. The
+9 boundaries are correct and counting them is most of what made the raw number
+look like a wall.
 
 **Tracking.** gh#346 (two-phase coverage roadmap) and gh#373 (the cliff symptom)
 are closed; coverage work continues against the #346 line.
@@ -113,42 +119,6 @@ nowhere to go belongs inside an existing kind, not in a new slot.
 runs), and the regrtest harness under moving collection. The real exit test is
 that the oldgen-nonmoving concession becomes deletable.
 
-### F5 — 66 of the 105 live `PYRE_*` gates are undocumented, and nothing stops a 67th
-
-**Measured 2026-08-07**, distinguishing the counts this has been confused between
-before:
-
-| count | value | what it is |
-|---|---|---|
-| distinct names read from the environment | **105** | the gate population |
-| (file, name) read pairs | 127 | read *sites*, not gates |
-| names mentioned in `gate-triage.md` | 90 | of which only 39 are still read |
-| **live gates absent from `gate-triage.md`** | **66** | the debt |
-
-```
-git ls-files '*.rs' | xargs rg --no-filename -o 'env::var[_a-z]*\("(PYRE_[A-Z0-9_]+)"' -r '$1' | sort -u
-```
-
-Earlier revisions of this document reported 119 and then 126 "distinct names".
-Both were the (file, name) pair count: the command as previously written kept
-rg's filename prefix, so `sort -u` counted sites. `--no-filename` is what makes it
-a gate count. Say which of the four a number is.
-
-**Violates.** Charter §3.6: a gate is a staging area, not a home. The triage
-table is a snapshot that is 63% empty, and nothing makes a new gate enter it at
-birth — which is what the hygiene workstream asked for and never got.
-
-**What is left.**
-
-1. **List the 66.** Most are default-OFF diagnostics (`*_DIAG`, `*_AUDIT`,
-   `*_CENSUS`, `*_PROBE`), which `gate-triage.md`'s own polarity rule classifies
-   mechanically from the read expression. The default-ON ones are the removal
-   targets; the rest are book-keeping.
-2. **Add the brake**: a check that fails when a `PYRE_*` env read has no entry in
-   `gate-triage.md`. Without it the table re-rots the moment it is filled, which
-   is how it got to 63% empty.
-3. Retire the 51 documented names that no longer have a read site.
-
 ### Smaller open items
 
 - **One unproven resume coordinate.** `build_state_field_snapshot` stamps
@@ -163,9 +133,6 @@ birth — which is what the hygiene workstream asked for and never got.
   (cross-check the decoded `py_pc` against
   `containing_py_pc_for_jitcode_pc_public(jitcode_index, pc)` over the corpus)
   before it is a finding rather than a suspicion.
-- **A misleading survivor of the resume rework.** `pyjitpl.rs` still calls its
-  `SnapshotFramePcs` local `pc_map`, the name of the deleted translation table.
-  Rename it so the name stops implying a mechanism that no longer exists.
 - **Compilation cliffs** outside F4's census: nested-loop / cross-loop no-token
   walls (gh#152, gh#177) and the recursion / call-frame wall (gh#126, open).
 - **Phase C decision document** (gh#376, open): a C-extension strategy document,
@@ -176,20 +143,21 @@ birth — which is what the hygiene workstream asked for and never got.
 
 ## Sequencing
 
-**F4 > F3 > F5.** The charter's own §5 order, restored — it was inverted in an
-earlier revision because the root-walker registry had a hard failure one
-registration away, and that is gone.
+**F4 > F3.** The charter's own §5 order, restored — it was inverted in an earlier
+revision because the root-walker registry had a hard failure one registration
+away, and that is gone.
 
-- **F4 first**, and it is now small. Naming the opcode in the `_other` arm is a
-  one-site change that converts the only silent hole into a reported one; the
-  eight unported opcodes are then a list somebody can work through, and Phase A's
-  cliff-free exit criterion becomes checkable without any new instrument.
+- **F4 first**, and it is now small: eight unported opcodes, a list somebody can
+  work through. The silent hole is closed, so Phase A's cliff-free exit criterion
+  is checkable without any new instrument — an opcode the walker declines names
+  itself, and one it has never seen fails the build.
 - **F3 next**: the deepest structural work, unblocked by one answerable question
   (the mid-major rescan above) rather than by a taxonomy.
-- **F5 out of order whenever convenient** — it is cheap, it is the only item that
-  gets *worse* while ignored, and its brake is what keeps it closed.
 
-F4 and F3 are parallel-safe: different crates, no shared surface.
+F4 and F3 are parallel-safe, though not for the reason an earlier revision gave:
+both touch `pyre-jit`, so "different crates" was wrong. They share no file and no
+symbol — F4 is confined to `jit/codewriter.rs`, F3 to the root-walker
+registration in `eval.rs` / `call_jit.rs` and `majit-gc/shadow_stack.rs`.
 
 Each item closes by the charter's instruments: N4 gates for every landing, N5
 evidence for every default flip, N7 written rationale for every mechanism deleted
@@ -212,6 +180,20 @@ or replaced. **And then its section here is deleted.**
   is the sole trace-time executor and observes a vable-force through the
   residual-call token protocol, which is the metainterp mechanism, not a second
   leg.
+- *Gates staged in a file nobody swept.* The 66 undocumented gates, the missing
+  brake, the brake's Rust-only reach and the last reader-less entry are all
+  closed: 111 names read (105 from `*.rs`, 6 only from the harness) and the same
+  111 documented live, once the two `PYRE_*` wildcard stems the token scan leaves
+  behind are set aside.
+  `pyre/pyrex/tests/gate_triage_complete.rs` now fails the build in **both**
+  directions — a read with no live entry, and a live entry with no reader. Say
+  which of these a number is: earlier revisions reported 119 and then 126
+  "distinct names" and both were the (file, name) pair count, because the census
+  command kept rg's filename prefix and `sort -u` counted sites.
+  `gate-triage.md` §6 carries the command and the counting rules; the two that
+  cost the most to rediscover are that a retirement row documents nothing
+  wherever it sits, and that a name written only in the file's `_PYRE`,
+  `_PYTHON` run-on shorthand reads as undocumented to any whole-token census.
 
 **Deliberate adaptations, decided — keep.**
 
@@ -232,8 +214,10 @@ or replaced. **And then its section here is deleted.**
 
 ## What falsifies this
 
-- If the F4 census, once built, shows the unlisted set is already empty, F4
-  closes on the spot and only the tracked residue remains.
+- The F4 census is built and the unlisted set is empty: the catch-all held only
+  opcodes this compiler cannot emit, and the match is exhaustive without it. What
+  remains of F4 is the eight unported opcodes, so if a corpus run shows one of
+  those eight never fires either, F4 closes on the spot.
 - If F3's class-(b) absorption measurably regresses minor-collection pause
   (prebuilt scanning cost), the registry survives *for that class only*,
   documented as the deliberate adaptation it currently is not.

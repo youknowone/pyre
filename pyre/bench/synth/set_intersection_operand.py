@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=39
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # An intersection walks the shorter side and keeps that side's objects, so
 # when two equal elements are distinct objects which one survives depends on
 # the operand lengths. The shortest operand seeds the result, measured as

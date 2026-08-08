@@ -1,5 +1,6 @@
-//! Every `PYRE_*` environment gate read anywhere in the workspace must have an
-//! entry in `pyre/gate-triage.md`.
+//! `pyre/gate-triage.md` and the tree's `PYRE_*` environment gates must name the
+//! same set — every gate read from a workspace member's Rust or from this
+//! project's own Python has a live entry, and every live entry has a reader.
 //!
 //! The charter (§3.6) says a gate is a staging area, not a home, and
 //! `gate-triage.md` is the standing list of what to retire and when. That list
@@ -9,6 +10,25 @@
 //!
 //! Adding a gate therefore costs one row. The row is cheap; the alternative is
 //! another hand audit that goes stale the week after it lands.
+//!
+//! Both directions, because they rot differently and only one of them is loud. A
+//! gate with no row is a gate nobody will retire. A row with no reader is the
+//! quieter half: it survives the deletion of the code it describes, and the next
+//! sweep spends its time re-deriving that the name is already gone —
+//! `PYRE_FBW_REC_UNROLL` sat in the config-switch list from 2026-07-06, when
+//! PR#374 deleted `fbw_unroll_bound()`, until this test went looking.
+//!
+//! **Scope.** Rust sources in workspace member crates, and this project's own
+//! Python under `pyre/` and `scripts/`. The harness reads six gates that no Rust
+//! file reads — `check.py`, `check_synthetic.py`, the `extra_tests` runners and
+//! `scripts/llbc_extract.py` — and two of them, `PYRE_SYNTH_PYRE` and
+//! `PYRE_SYNTH_PYTHON`, were undocumented until this scan reached them.
+//!
+//! Shell and YAML are not scanned. Every `PYRE_*` in them is *set* for a child
+//! process whose reader is Rust or Python, so the read side is already covered
+//! here; the one remaining `PYRE_*` name outside both languages,
+//! `PYRE_CLASS_DESCRIPTORS`, is a linkme distributed slice and not an env var at
+//! all (`gate-triage.md` §2).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -54,7 +74,16 @@ fn workspace_member_dirs(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Where this project's own Python lives.
+///
+/// An allow-list rather than a tree walk, for two reasons the Rust side does not
+/// have. The repository vendors the CPython and PyPy sources — `lib-python/`,
+/// `pypy/`, `rpython/`, `lib_pypy/`, some 4600 `.py` files that are upstream's
+/// and not ours — and untracked scratch directories sit at the repository root.
+/// Neither is under these two.
+const PYTHON_ROOTS: [&str; 2] = ["pyre", "scripts"];
+
+fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -63,35 +92,60 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
         if path.is_dir() {
             // A member crate's own `target/` from a standalone build.
             if entry.file_name() != "target" {
-                collect_rs(&path, out);
+                collect_sources(&path, ext, out);
             }
-        } else if path.extension().is_some_and(|e| e == "rs") {
+        } else if path.extension().is_some_and(|e| e == ext) {
             out.push(path);
         }
     }
 }
 
+/// The function names that read an environment variable in this tree.
+///
+/// `env::var` (with its `_os` suffix) is the common one, but a search for it
+/// alone misses the host seam: `host_os::var` on the sandbox path and
+/// `host_seam::ops::getenv`, which takes a *byte* string. `PYRE_STDLIB` is read
+/// through both seam forms in `pyre-interpreter/src/importing.rs` and stays
+/// visible to a `std::env` search only because unrelated `env::var` readers
+/// exist in `pyre-wasm-runner`. A wasm- or sandbox-only gate would have no such
+/// cover and would bypass the brake entirely.
+///
+/// `environ.get` and `getenv` are the Python side. Only these two, because they
+/// read unambiguously: the harness also writes gates into a child's environment
+/// (`env["PYRE_PROBE"] = …`, `env.pop(…)`), and a subscript form cannot be told
+/// from a read without parsing. Writing a gate for a child is not owning it —
+/// the child's read is what this file asks about, and that read is in Rust.
+///
+/// A form belonging to the other language costs nothing: `env::var(` cannot
+/// occur in Python, nor `environ.get(` in Rust.
+const READ_FORMS: [&str; 4] = ["env::var", "host_os::var", "getenv", "environ.get"];
+
 /// Gate names this text reads from the environment.
 ///
-/// Matches the two read forms the tree uses — `env::var("NAME")` and
-/// `env::var_os("NAME")` — rather than every mention of the name, so a gate
+/// Matches the read forms above rather than every mention of the name, so a gate
 /// discussed in a comment or held in a Rust const does not count as live. That
 /// is the same distinction `gate-triage.md` §2 draws by hand.
 fn gates_read_by(text: &str) -> Vec<&str> {
     let mut found = Vec::new();
-    for (at, _) in text.match_indices("env::var") {
-        let rest = &text[at + "env::var".len()..];
-        let rest = rest.strip_prefix("_os").unwrap_or(rest);
-        let Some(rest) = rest.strip_prefix('(') else {
-            continue;
-        };
-        let Some(rest) = rest.trim_start().strip_prefix('"') else {
-            continue;
-        };
-        let Some(end) = rest.find('"') else { continue };
-        let name = &rest[..end];
-        if name.starts_with("PYRE_") {
-            found.push(name);
+    for form in READ_FORMS {
+        for (at, _) in text.match_indices(form) {
+            let rest = &text[at + form.len()..];
+            // `env::var_os` is the same read wearing a suffix.
+            let rest = rest.strip_prefix("_os").unwrap_or(rest);
+            let Some(rest) = rest.strip_prefix('(') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            // `host_seam::ops::getenv` names its gate with a byte string.
+            let rest = rest.strip_prefix('b').unwrap_or(rest);
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = rest.find('"') else { continue };
+            let name = &rest[..end];
+            if name.starts_with("PYRE_") {
+                found.push(name);
+            }
         }
     }
     found
@@ -105,36 +159,168 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
         std::env::var(
             "PYRE_C",
         );
+        host_os::var("PYRE_D").ok();
+        crate::host_seam::ops::getenv(b"PYRE_E");
+        os.environ.get("PYRE_F")
+        os.getenv("PYRE_G")
+        # a gate written into a child's environment is not a read of ours
+        env["PYRE_NOT_A_READ_EITHER"] = "1"
         // PYRE_MENTIONED_IN_A_COMMENT
         const PYRE_CONST: &str = "PYRE_NOT_A_READ";
         other::var("PYRE_NOT_ENV");
         env::var("HOME");
     "#;
-    assert_eq!(gates_read_by(sample), vec!["PYRE_A", "PYRE_B", "PYRE_C"]);
+    let mut got = gates_read_by(sample);
+    // Sorted: the scan groups by read form, so the order carries no meaning.
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![
+            "PYRE_A", "PYRE_B", "PYRE_C", "PYRE_D", "PYRE_E", "PYRE_F", "PYRE_G"
+        ]
+    );
 }
 
-/// Every `PYRE_*` token the triage document mentions.
+/// Does this `##` heading introduce a section that records history?
+///
+/// §1/§1b/§1c list gates whose readers were deleted, §2 lists names that were
+/// never env vars, and §3 lists names with no read site. A name there is the
+/// record of a gate that is *gone*, so it must not satisfy the brake — otherwise
+/// re-introducing a reader for `PYRE_SINGLE_PASS` lands green on the strength of
+/// its own retirement row, with neither its new polarity nor a retirement plan
+/// written down.
+fn is_history_heading(heading: &str) -> bool {
+    let lower = heading.to_ascii_lowercase();
+    // "retired", not "retire": §4 is a *live* section whose heading says when
+    // its gates will go ("retire when the epic closes").
+    lower.contains("retired") || lower.contains("dead") || lower.contains("not gates")
+}
+
+/// The `PYRE_*` names this line spells out, in the order it spells them.
 ///
 /// Tokenized rather than substring-searched: `contains("PYRE_A")` is satisfied
 /// by a documented `PYRE_ANCHOR_STRICT`, so a new gate whose name is a prefix of
 /// a listed one would slip through the brake unnoticed.
-fn gates_documented_in(triage: &str) -> BTreeSet<&str> {
-    let mut found = BTreeSet::new();
-    for (at, _) in triage.match_indices("PYRE_") {
+fn pyre_names_in(line: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    for (at, _) in line.match_indices("PYRE_") {
         // A name preceded by a name character is the tail of a longer token.
-        if triage[..at]
+        if line[..at]
             .chars()
             .next_back()
             .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             continue;
         }
-        let end = triage[at..]
+        let end = line[at..]
             .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
-            .map_or(triage.len(), |off| at + off);
-        found.insert(&triage[at..end]);
+            .map_or(line.len(), |off| at + off);
+        names.push(&line[at..end]);
     }
-    found
+    names
+}
+
+/// Every `PYRE_*` name the triage document lists as a live gate.
+///
+/// Scoped to the live sections for the reason in `is_history_heading` — `###`
+/// subsections inherit their `##` parent, which is what keeps §6a–§6c live under
+/// §6 — and then filtered by what the document records about each name.
+///
+/// **Retirement is a property of the gate, not of the line.** A retirement line
+/// retires its *subject*, and a name stays retired wherever else it is written:
+/// §5's table records `PYRE_CARRIER_EXC_RESUME` retired with its reader deleted,
+/// while §1e's prose — a live section — discusses the seam that gate used to
+/// guard and names it three more times. Counting those mentions as documentation
+/// made a gate with no reader look live.
+///
+/// **Subject, not mention**: only the *first* name on a retirement line is
+/// retired by it. §1c's row for `PYRE_AUTHORITATIVE` ends "`PYRE_PROBE_AUTHORITATIVE`
+/// is separate and remains live" — the whole point of that clause is that the
+/// second name is not the one being retired.
+///
+/// "retired", not "retire": §4 is a live section whose gates are the ones that
+/// "retire when the epic closes".
+fn gates_documented_in(triage: &str) -> BTreeSet<&str> {
+    let mut live_names: BTreeSet<&str> = BTreeSet::new();
+    let mut retired_subjects: BTreeSet<&str> = BTreeSet::new();
+    let mut live = true;
+    for line in triage.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            live = !is_history_heading(heading);
+        }
+        let names = pyre_names_in(line);
+        if line.to_ascii_lowercase().contains("retired") {
+            if let Some(&subject) = names.first() {
+                retired_subjects.insert(subject);
+            }
+        } else if live {
+            live_names.extend(names);
+        }
+    }
+    live_names.retain(|name| !retired_subjects.contains(name));
+    live_names
+}
+
+/// A documented token that is a wildcard's stem rather than a gate.
+///
+/// This file writes `PYRE_*` and `PYRE_FBW_*` when it means a family, and the
+/// token scan stops at the `*`, leaving a name ending in `_`. No gate is named
+/// that way, so the trailing underscore is the whole test.
+fn is_wildcard_stem(name: &str) -> bool {
+    name.ends_with('_')
+}
+
+/// Every source file a gate can be read from.
+fn source_files(root: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    for member in workspace_member_dirs(root) {
+        collect_sources(&member, "rs", &mut sources);
+    }
+    assert!(
+        sources.len() > 100,
+        "found only {} .rs files across the workspace members — the walk is not \
+         reaching the tree",
+        sources.len()
+    );
+
+    let rust_files = sources.len();
+    for py_root in PYTHON_ROOTS {
+        let dir = root.join(py_root);
+        assert!(
+            dir.is_dir(),
+            "PYTHON_ROOTS names {py_root}, which is not a directory under {}",
+            root.display()
+        );
+        collect_sources(&dir, "py", &mut sources);
+    }
+    assert!(
+        sources.len() - rust_files > 100,
+        "found only {} .py files under {PYTHON_ROOTS:?} — the walk is not \
+         reaching the harness",
+        sources.len() - rust_files
+    );
+    sources
+}
+
+/// `(gate name, repo-relative file)` for every environment read in the tree.
+fn read_sites(root: &Path) -> BTreeSet<(String, String)> {
+    // This file's own fixture spells out `env::var("PYRE_A")` and friends, which
+    // are test data rather than gates.
+    let self_path = root.join(file!());
+    let mut sites = BTreeSet::new();
+    for path in source_files(root) {
+        if path == self_path {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for name in gates_read_by(&text) {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            sites.insert((name.to_string(), rel.display().to_string()));
+        }
+    }
+    sites
 }
 
 #[test]
@@ -145,35 +331,36 @@ fn every_live_pyre_gate_has_a_gate_triage_entry() {
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", triage_path.display()));
     let documented = gates_documented_in(&triage);
 
-    let mut sources = Vec::new();
-    for member in workspace_member_dirs(&root) {
-        collect_rs(&member, &mut sources);
-    }
+    // Two anchors on the live/history split, because a heading reword would
+    // otherwise change what this test accepts without failing. One on each side:
+    // a retired name must not count, and a listed live name must.
     assert!(
-        sources.len() > 100,
-        "found only {} .rs files across the workspace members — the walk is not \
-         reaching the tree",
-        sources.len()
+        !documented.contains("PYRE_SINGLE_PASS"),
+        "PYRE_SINGLE_PASS is named only in a retirement section and has no read \
+         site, so it must not count as documented — is_history_heading no longer \
+         matches gate-triage.md's headings"
     );
-    // This file's own fixture spells out `env::var("PYRE_A")` and friends, which
-    // are test data rather than gates.
-    let self_path = root.join(file!());
+    assert!(
+        !documented.contains("PYRE_FBW_VABLE_SCALAR_CA"),
+        "PYRE_FBW_VABLE_SCALAR_CA is marked RETIRED inside §1d, a section whose \
+         heading reads live — the per-row retirement check is no longer catching it"
+    );
+    assert!(
+        !documented.contains("PYRE_CARRIER_EXC_RESUME"),
+        "PYRE_CARRIER_EXC_RESUME is recorded retired in §5 and its reader is gone, \
+         but §1e's live prose names it three times — a retired subject is retired \
+         wherever else it is written, and this check is what enforces that"
+    );
+    assert!(
+        documented.contains("PYRE_JD1"),
+        "PYRE_JD1 is listed live in §6a but did not count as documented — \
+         is_history_heading is excluding a live section"
+    );
 
-    let mut missing: BTreeSet<(String, String)> = BTreeSet::new();
-    for path in &sources {
-        if *path == self_path {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        for name in gates_read_by(&text) {
-            if !documented.contains(name) {
-                let rel = path.strip_prefix(&root).unwrap_or(path);
-                missing.insert((name.to_string(), rel.display().to_string()));
-            }
-        }
-    }
+    let missing: BTreeSet<(String, String)> = read_sites(&root)
+        .into_iter()
+        .filter(|(name, _)| !documented.contains(name.as_str()))
+        .collect();
 
     if !missing.is_empty() {
         let listed = missing
@@ -189,4 +376,36 @@ fn every_live_pyre_gate_has_a_gate_triage_entry() {
             missing.len()
         );
     }
+}
+
+#[test]
+fn every_live_gate_triage_entry_still_has_a_reader() {
+    let root = repo_root();
+    let triage_path = root.join("pyre/gate-triage.md");
+    let triage = std::fs::read_to_string(&triage_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", triage_path.display()));
+
+    let read: BTreeSet<String> = read_sites(&root)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let stale: Vec<&str> = gates_documented_in(&triage)
+        .into_iter()
+        .filter(|name| !is_wildcard_stem(name) && !read.contains(*name))
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "{} name(s) are listed live in pyre/gate-triage.md but nothing in the tree \
+         reads them:\n{}\n\n\
+         Deleting the row loses why the gate existed. Move each to a retirement \
+         section (§1c) naming the change that removed its reader — that is what \
+         stops the next reader of this name from passing on an obituary.",
+        stale.len(),
+        stale
+            .iter()
+            .map(|name| format!("  {name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

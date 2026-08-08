@@ -1872,7 +1872,22 @@ fn harden_duplicate_leaf_metadata(
 ) {
     let mut by_leaf: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for key in struct_fields.fields.keys() {
-        if let Some((_, leaf)) = key.rsplit_once("::") {
+        if let Some((head, leaf)) = key.rsplit_once("::") {
+            // A `{Enum}::{Variant}` key whose variant leaf ALSO names an
+            // enum base is not a peer type-leaf of that base: its bare
+            // alias is withdrawn by the variant-leaf pass below (keyed on
+            // the `Enum::Variant` tail), so admitting it into this
+            // type-leaf bucket lets the variant (`typedef::BytesSubArg::Buffer`,
+            // rows `[__pos_0]`) withdraw the same-named enum type's bare
+            // alias (`buffer::Buffer`, rows `[__discriminant]`) on a
+            // spurious row divergence.  Restricting the skip to a leaf that
+            // is itself an enum base withdraws only the genuine
+            // type-vs-variant name collision, leaving every other
+            // variant-leaf bucket (whose withdrawal the resume numbering
+            // depends on) intact.
+            if struct_fields.is_enum_base(head) && struct_fields.is_enum_base(leaf) {
+                continue;
+            }
             by_leaf.entry(leaf).or_default().push(key);
         }
     }
@@ -2087,6 +2102,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
             || !lo.option_try_sites.is_empty()
+            || !lo.slice_index_rangeto_sites.is_empty()
         {
             // The exception-link transforms run on a simplified graph,
             // as exceptiontransform.py does (graphs reach it after
@@ -2099,6 +2115,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             simplify_lowered_graph(&mut lo.graph, struct_field_attrs);
         }
         let mut tail_forwarded_returns = 0usize;
+        if !lo.slice_index_rangeto_sites.is_empty() {
+            crate::front::slice_index::rewire_slice_index_rangeto_sites(
+                &mut lo.graph,
+                &lo.slice_index_rangeto_sites,
+            );
+        }
         if !lo.result_exc_call_results.is_empty() {
             let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
                 &mut lo.graph,
@@ -2805,6 +2827,10 @@ struct Lowering<'a> {
     /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
     /// the loop (see [`crate::front::range_iter::RangeNewSite`]).
     range_iter_new_sites: Vec<crate::front::range_iter::RangeNewSite>,
+    /// RangeTo aggregates retained as candidates for the slice-index
+    /// recognizer. The end's unsigned coloring is captured from MIR here,
+    /// before the operand can become a block inputarg.
+    slice_index_rangeto_sites: Vec<crate::front::slice_index::SliceIndexRangeToSite>,
     /// `RangeInclusive::contains(&self, &x)` call sites paired with the
     /// `new` sites above by the `front::range_contains` post-pass (see
     /// [`crate::front::range_contains::RangeContainsSite`]).
@@ -3030,6 +3056,7 @@ impl<'a> Lowering<'a> {
             saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
+            slice_index_rangeto_sites: Vec::new(),
             range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
@@ -4457,33 +4484,34 @@ impl<'a> Lowering<'a> {
                 let v = self.resolve_place(mir_bb, place)?;
                 Ok((None, v))
             }
-            // `Repeat(elem, ty, count)` — `[v; N]` literal. Modeled as
-            // a synthetic Call so the IR shape stays uniform; downstream
-            // consumers see a 1-arg array construction call.
+            // `Repeat(elem, ty, count)` — `[v; N]` literal. The decodable
+            // shape follows upstream `transform.py:36-50` and
+            // `rlist.py:346-351`: `newlist(fill)` followed by
+            // `mul(list, count)`, which the transform pass collapses to
+            // `alloc_and_set(count, fill)`.
             //
-            // `__array_repeat` is deliberately unregistered: an array-repeat
-            // graph annotate-fails on it and falls back to the legacy
-            // walker. The transparent `Array` ctor the `Rvalue::Aggregate`
-            // array arm uses is NOT a substitute here — that arm materialises
-            // its elements through an explicit `__pos_N` `FieldWrite` chain,
-            // whereas a `Repeat` carries a count and a single fill and no
-            // per-slot writes, so an `Array` ctor would leave the value with
-            // no element representation and no length. The ctor does not
-            // zero-fill either: a zero-arg `Array` ctor matches no jtransform
-            // arm (only the zero-arg `Tuple` unit collapses to a null ref,
-            // `jtransform.rs`), so it would residualise as an unlowerable
-            // `symbolic_fnaddr` rather than a `new_array_clear`.
-            Rvalue::Repeat(elem, _ty, _count) => {
+            // `__array_repeat` remains deliberately unregistered for the
+            // fallback shape when Charon supplies a const-generic reference
+            // that cannot be decoded. In that case the old 1-arg call is
+            // preserved verbatim and the graph follows its existing legacy
+            // walker path. The transparent `Array` ctor is not equivalent:
+            // `Repeat` carries one fill value and a count, not per-slot
+            // `__pos_N` writes.
+            Rvalue::Repeat(elem, _ty, count) => {
                 let arg = self.resolve_operand(mir_bb, elem)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                let args = match self.emit_constant(mir_bb, &count) {
+                    Ok(count) => vec![arg, count],
+                    Err(_) => vec![arg],
+                };
                 Ok((
                     Some(OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__array_repeat".to_string()],
                         },
-                        args: vec![arg],
+                        args,
                         result_ty: ValueType::Int,
                     }),
                     res,
@@ -4733,17 +4761,19 @@ impl<'a> Lowering<'a> {
                             end: arg_vars[1].clone(),
                         });
                 }
-                // NOTE: RangeFrom and RangeTo capture are DORMANT. Their
-                // rewrites plant `getslice`, which has no blackhole handler.
-                // RangeFrom first exposed this when a graph dropped to the
-                // legacy walker with an uncolored Void stop. Activating
-                // RangeTo later exposed bare `getslice/rii>r` in both
-                // `split_builtin_kwargs` and `do_warn_explicit`: both stops
-                // are `args.len() - 1`, statically unsigned but not constant.
-                // The recognizer's const-nonnegative gate declines them; both
-                // captures remain disabled until the codewriter is guaranteed
-                // to consume the rtyped graph where `rtype_getslice` has
-                // replaced the op.
+                if owner_path.as_slice() == ["core", "ops", "range"]
+                    && ctor_name == "RangeTo"
+                    && arg_vars.len() == 1
+                {
+                    self.slice_index_rangeto_sites.push(
+                        crate::front::slice_index::SliceIndexRangeToSite {
+                            range_result: res.clone(),
+                            end: arg_vars[0].clone(),
+                        },
+                    );
+                }
+                // RangeFrom alone stays dormant: its Void ConstNone stop has
+                // no regalloc coloring on the legacy-walker path.
                 // Surface every operand through a separate FieldWrite so
                 // the field-to-value binding survives into the
                 // codewriter / annotator.  Field names default to
@@ -10938,8 +10968,11 @@ impl<'a> Lowering<'a> {
     /// exact derivation — a `Str`/`Float`/`Ref`/nested-enum payload keys the
     /// suffixed root identically on both sides.  The one deviation is
     /// [`crate::front::checked_arith_uint`], which mints a BARE `Option` root
-    /// for its `Int`/`Unsigned` payload; an integer-payload `Option` therefore
-    /// stays bare here to match it.  A niche `Option<NonNull>` has no aggregate
+    /// for its `Option<usize>`; an UNSIGNED-payload `Option` therefore stays
+    /// bare here to match it.  A SIGNED one must not: the bare root carries a
+    /// single `__pos_0`, so a signed producer joining it unions `int` with
+    /// `r_uint`, which cannot be proved to share a signedness.  A niche
+    /// `Option<NonNull>` has no aggregate
     /// `__discriminant` / `__pos_0` (the arms use a pointer null-test and an
     /// identity payload), so its owners are never read — keep them bare, which
     /// also mirrors [`Self::resolve_bool_then_option_dest`]'s own aggregate
@@ -10949,9 +10982,7 @@ impl<'a> Lowering<'a> {
         recv_ty: &TyRef,
     ) -> Option<(String, String, ValueType)> {
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
-        if matches!(payload_ty, ValueType::Int | ValueType::Unsigned)
-            || self.tyref_is_niche_option_ptr(recv_ty)
-        {
+        if matches!(payload_ty, ValueType::Unsigned) || self.tyref_is_niche_option_ptr(recv_ty) {
             let def_id = self.tyref_adt_def_id(recv_ty)?;
             let td = self.llbc.type_by_id(def_id)?;
             let option_owner = td.item_meta.name_path();
@@ -11452,11 +11483,31 @@ impl<'a> Lowering<'a> {
             | ClosureCombinator::IsSomeAnd => tyref_to_value_type(dest_ty, self.llbc),
         };
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        // `map`/`and_then` BUILD their result `Option<U>`; the other combinators
+        // build none.  `U` is the dest payload, not the receiver's `T`, so the
+        // built variant must key the dest's own classdef — otherwise two `map`s
+        // over the same receiver type with different closure results share one
+        // `__pos_0` slot, the collision `recognize_from_size_align_ok_site`
+        // documents at its own site.  `resolve_option_consumer_owners` is the
+        // derivation every downstream reader of the built value (`unwrap_or`,
+        // `?`, `expect`) uses, so producing anything else payload-erases the
+        // read; a dest that is not a resolvable `Option` declines the whole
+        // rewrite and leaves the residual call.
+        let (result_option_owner, result_some_owner, result_niche) = match kind {
+            ClosureCombinator::Map | ClosureCombinator::AndThen => {
+                let (owner, some, _payload) = self.resolve_option_consumer_owners(dest_ty)?;
+                (owner, some, self.tyref_is_niche_option_ptr(dest_ty))
+            }
+            _ => (option_owner.clone(), some_owner.clone(), niche),
+        };
         Some(crate::front::option_closure_select::ClosureSelectSite {
             kind,
             result_var: result_var.clone(),
             option_owner,
             some_owner,
+            result_option_owner,
+            result_some_owner,
+            result_niche,
             call_once_owner,
             payload_ty,
             call_result_ty,
@@ -11490,7 +11541,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>`,
-    /// `Option<&mut T>`, or `Option<&T>` with a thin (Sized) ADT pointee.
+    /// `Option<fn(..)>`, `Option<&mut T>`, or `Option<&T>` with a thin
+    /// (Sized) ADT pointee.
     /// Rust encodes each in ONE pointer
     /// word (`None` = null, `Some(p)` = the non-null pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
@@ -11550,6 +11602,12 @@ impl<'a> Lowering<'a> {
             return false;
         };
         if type_node_is_mut_ref(payload, self.llbc) {
+            return true;
+        }
+        // A function pointer is one word, and `Option<fn(..)>` represents
+        // `None` as the null pointer.  The payload therefore aliases the
+        // base pointer directly and carries no metadata word.
+        if type_node_is_fn_ptr(payload, self.llbc) {
             return true;
         }
         // A shared reference `&T` is equally a one-word null-pointer niche
@@ -15621,6 +15679,33 @@ fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> 
             .and_then(|arr| arr.get(2))
             .and_then(serde_json::Value::as_str)
             .is_some_and(|kind| kind.to_ascii_lowercase().contains("mut"));
+    }
+    false
+}
+
+/// Whether a Charon type node's top-level constructor is a function pointer,
+/// after following serialization indirections.
+fn type_node_is_fn_ptr<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
+    for _ in 0..24 {
+        let Some(obj) = node.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            let Some(body) = llbc.dedup_body(id) else {
+                return false;
+            };
+            node = body;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return obj.get("FnPtr").is_some();
     }
     false
 }
@@ -23176,56 +23261,6 @@ mod tests {
         );
     }
 
-    /// Real-LLBC anchor for the `usize` stop in
-    /// `split_builtin_kwargs`'s `&args[..args.len() - 1]`. Rust's checked
-    /// MIR represents the subtraction destination as `(usize, bool)`, while
-    /// the graph deliberately collapses its `.0` projection to the scalar
-    /// arithmetic result. That scalar must retain the tuple's `usize`
-    /// element type so annotation learns it is unsigned/non-negative.
-    #[test]
-    #[ignore]
-    fn split_builtin_kwargs_getslice_stop_is_unsigned() {
-        use crate::model::{OpKind, ValueType};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
-        let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "split_builtin_kwargs")
-            .expect("lower split_builtin_kwargs");
-        let stop = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .find_map(|op| match &op.kind {
-                OpKind::GetSlice { args } => args.get(2).cloned(),
-                _ => None,
-            })
-            .expect("RangeTo rewrite must emit getslice stop");
-        let producer = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .find(|op| {
-                op.result
-                    .as_ref()
-                    .is_some_and(|result| result.id() == stop.id())
-            })
-            .expect("getslice stop producer");
-        assert!(
-            matches!(
-                &producer.kind,
-                OpKind::BinOp {
-                    op,
-                    result_ty: ValueType::Unsigned,
-                    ..
-                } if op == "sub"
-            ),
-            "usize stop producer must be an unsigned subtraction, got {:?}",
-            producer.kind
-        );
-    }
-
     /// Real-LLBC anchor for the `Option::is_some_and` closure-select fold:
     /// `is_mmap` is `type(obj).is_some_and(|tp| ptr::eq(tp.as_ptr(),
     /// mmap_type()))`.  After the `option_closure_select` post-pass there must
@@ -23865,6 +23900,50 @@ mod tests {
             null_mut_calls, 0,
             "Option<&Wtf8> is a fat-ref DST option and must not niche-fold to a \
              pointer-null test (no null_mut discriminant)"
+        );
+    }
+
+    /// Array slicing keeps the residual RangeTo path because a general stop has
+    /// no proof that `end <= slice.len()`.  Both halves are asserted — the
+    /// residual call is present AND no `__getslice_rangeto` marker was planted
+    /// — so a lowering change that drops the call for an unrelated reason is a
+    /// failure rather than a pass.
+    #[test]
+    #[ignore]
+    fn call_function_impl_result_keeps_residual_array_index() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "call_function_impl_result")
+            .expect("lower call_function_impl_result");
+        let calls_path = |want: &[&str]| -> usize {
+            let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: crate::model::CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &want
+                    )
+                })
+                .count()
+        };
+        assert!(
+            calls_path(&["core", "array", "<Impl>", "index"]) >= 1,
+            "general RangeTo array index remains residual"
+        );
+        assert_eq!(
+            calls_path(&["__getslice_rangeto"]),
+            0,
+            "no general RangeTo site is rewritten — the fold is declined"
         );
     }
 }

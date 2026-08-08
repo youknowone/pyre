@@ -1249,7 +1249,7 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
 /// Compile-time-constant frame fields of an inlined callee.
 #[derive(Clone, Copy)]
 pub struct InlineCalleeConsts {
-    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 5): the
+    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 4): the
     /// callee function's `__globals__` as a `PyObjectRef`.
     w_globals: usize,
     /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
@@ -1656,6 +1656,19 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// the virtualizable shadow instead of replaying stack effects.  Cleared once
     /// the walk advances past this ceiling (py-pc order is monotonic again).
     pub vstack_reorder_ceiling: u32,
+    /// The `(py_pc, depth, boxes)` the mirror held when `vstack_reorder_ceiling`
+    /// was armed.  A layout excursion that returns to that exact coordinate has
+    /// retired no Python opcode, so the operand stack it left is still the
+    /// operand stack it comes back to and the saved boxes are restored verbatim
+    /// — the shadow reseed cannot reconstruct them, because mid-expression the
+    /// virtualizable's stack region holds the NULLs the in-flight opcode's
+    /// `popvalue_maybe_none` wrote.  `None` outside a region.
+    ///
+    /// There is nothing to snapshot upstream: `pyjitpl.py:1892`
+    /// `MIFrame.run_one_step` steps a live frame whose `registers_r` survive
+    /// the step.  This mirror is instead reconstructed from source pcs, and
+    /// that reconstruction is exactly what an excursion can lose.
+    pub vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>)>,
     /// The py_pc the walk's floor lookup reports while it is inside an
     /// out-of-line exception LANDING block — the unwind bookkeeping the
     /// codewriter emits per catch site, after the whole body, which then jumps
@@ -3338,16 +3351,6 @@ pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usi
     }
 }
 
-/// `PYRE_CARRIER_EXC_RESUME=1` enables the multi-frame (carrier) exception
-/// resume: seed the grabbed guard exception onto the bridge sym and route the
-/// inlined callee's carrier sub-walk into its own `catch_exception` handler
-/// (`finishframe_exception` parity, pyjitpl.py:2530).  Default-off while the
-/// #343/#126 depth-2 exception-resume slice is validated bit-exact.
-pub fn carrier_exc_resume_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_CARRIER_EXC_RESUME").is_some())
-}
-
 /// Mirror of `blackhole.rs BlackholeInterpreter::handle_exception_in_frame`
 /// for the walker: locate the `catch_exception/L` that owns an exception-guard
 /// resume position, forward case first, then the backward scan.
@@ -3798,8 +3801,8 @@ fn write_ref_reg<Sym: WalkSym>(
 /// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
 ///
 /// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
-/// `valuestackdepth(2)`, `debugdata(3)`, `lastblock(4)`, and `w_globals(5)`
-/// (`virtualizable_gen.rs`, `NUM_VABLE_SCALARS = 6`).  They are frame
+/// `valuestackdepth(2)`, `debugdata(3)`, and `w_globals(4)`
+/// (`virtualizable_gen.rs`, `NUM_VABLE_SCALARS = 5`). They are frame
 /// bookkeeping; the Python operand stack lives in the separate
 /// `locals_cells_stack_w` array (`virtualizable_gen.rs`,
 /// `pyre-interpreter/src/pyframe.rs`).  PyPy's `interp_jit.py`
@@ -3945,6 +3948,44 @@ fn concrete_from_recorded_opref<Sym: WalkSym>(
         }
         _ => ConcreteValue::Null,
     }
+}
+
+/// The `operand_offset` of this op's Ref var-list (`R`), for a reader that
+/// holds only the decoded op and must find that list itself.
+///
+/// A dispatcher that decoded the whole op passes the offset it already
+/// computed; anything reached later — an abort leg, a specializer entered
+/// after resolution — has no such value and must not guess one.  `R` sits at
+/// offset 1 for the Ref-only residual shape (`iRd>r`) but NOT for the mixed
+/// one (`iIRd>r`, `riIRd>r`, `iiIRd>r`), whose leading Int list is itself
+/// variable-width: reading offset 1 there lands on the Int list's length byte
+/// and takes its register indices into the Ref bank, yielding unrelated
+/// objects with a plausible length.
+///
+/// Walks the argcode widths of `blackhole.py:112-157`, the same walk
+/// [`decode_op_at`] performs.  `None` — an op declaring no Ref list, or one
+/// whose earlier operands cannot be width-counted — leaves the caller to
+/// decline.
+///
+/// [`decode_op_at`]: crate::jitcode_runtime::decode_op_at
+fn ref_var_list_operand_offset(code: &[u8], op: &DecodedOp) -> Option<usize> {
+    let first_operand_pc = op.pc + 1;
+    let mut cursor = first_operand_pc;
+    let mut chars = op.argcodes.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            'R' => return Some(cursor - first_operand_pc),
+            'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'L' | 'd' | 'j' => cursor += 2,
+            'I' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
+            '>' => {
+                chars.next()?;
+                cursor += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Read concrete shadow values for a Ref-bank variadic operand list.
@@ -4204,6 +4245,16 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut
     // exception state a previous walk left on the sym.  A preseeded sym is
     // kept only when no fresh signal exists — the multi-frame carrier walk
     // re-seeds per frame after the first frame drained the cell.
+    // For the walks that reach here this cell is the delivery path for
+    // `_prepare_exception_resumption`: `call_jit.rs` publishes
+    // `cpu.grab_exc_value`'s result before bridge tracing starts, zeroes it when
+    // the guard carried no exception, and declines the bridge outright in the
+    // third case.  On an exception-guard bridge one of the two arms below always
+    // returns, so a pre-seed placed on the sym in `setup_bridge_sym` could only
+    // rewrite the pointer this read applies anyway.  Scoped to this leg: the
+    // multi-frame carrier walk never runs this function — `trace.rs` routes it
+    // through `drive_bridge_carrier_walk`, whose sub-walk seeds itself off
+    // `root_sym.last_exc_box()` instead.
     let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
     if bh_exc != 0 {
         let exc = bh_exc as pyre_object::PyObjectRef;
@@ -11211,15 +11262,22 @@ fn handle<Sym: WalkSym>(
                     .bridge_info()
                     .map(|b| (b.trace_id, b.fail_index));
                 let has_targets = driver.meta_interp().has_compiled_targets(key);
-                // A close that did not compile is not retried on a later
+                // A close an attempt *rejected* is not retried on a later
                 // crossing of the same header: the attempt runs the optimizer
                 // over the whole trace-so-far, and the decline is deterministic,
                 // so an inner loop crossed N times would pay N optimizer passes
                 // over a growing trace (see
-                // `TraceCtx::declined_cross_loop_closes`).
+                // `TraceCtx::declined_cross_loop_closes`).  Which outcomes count
+                // as rejected is the `classify_compile_outcome` match below.
                 let already_declined = ctx.trace_ctx.cross_loop_close_declined(key);
                 if !has_partial && has_targets {
                     if !already_declined {
+                        // jitdriver.rs:2981-2988 states the rule the latch runs
+                        // under: only latch what an attempt actually rejected.
+                        // The give-up below returns without calling into
+                        // `compile_trace` at all, so it costs no optimizer pass
+                        // and has nothing to report about this header.
+                        let mut attempted = true;
                         let outcome = match bridge_origin {
                             // Guard-origin: existing bridge path.
                             Some(_) => driver.meta_interp_mut().compile_trace(
@@ -11270,31 +11328,57 @@ fn handle<Sym: WalkSym>(
                                 // halves, so this is unreachable from a jd0 walk; only
                                 // `MetaInterp::force_start_tracing` opens a tracer with
                                 // no session envelope.
-                                None => majit_metainterp::CompileOutcome::Cancelled,
+                                None => {
+                                    attempted = false;
+                                    majit_metainterp::CompileOutcome::Cancelled
+                                }
                             },
                         };
-                        if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
-                            if majit_metainterp::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit][walker-reached-loop-header] compile_trace success: \
+                        // pyjitpl.py:2982-2983 `classify_compile_outcome` is
+                        // the shared reading of a close's outcome; the sibling
+                        // close in `jitdriver.rs:2947` already goes through it.
+                        // Reading `Compiled` here and treating every other
+                        // outcome as one declined close collapses three states
+                        // the classifier keeps apart, and latches the one that
+                        // is explicitly retryable.
+                        match driver.meta_interp().classify_compile_outcome(outcome) {
+                            majit_metainterp::BridgeCompileResult::Compiled => {
+                                if majit_metainterp::majit_log_enabled() {
+                                    eprintln!(
+                                        "[jit][walker-reached-loop-header] compile_trace success: \
                                  key={} pc={} bridge={:?}",
-                                    key, next_instr, bridge_origin
-                                );
+                                        key, next_instr, bridge_origin
+                                    );
+                                }
+                                // pyjitpl.py raise_if_successful() — the
+                                // successful compile_trace ends tracing; surface
+                                // the dedicated outcome so the driver maps it to
+                                // `TraceAction::CompileTrace` (no further compile
+                                // or abort on this session).
+                                driver.note_compile_trace_success();
+                                return Ok((
+                                    DispatchOutcome::CompileTracePending {
+                                        loop_header_pc: next_instr,
+                                    },
+                                    op.next_pc,
+                                ));
                             }
-                            // pyjitpl.py raise_if_successful() — the
-                            // successful compile_trace ends tracing; surface
-                            // the dedicated outcome so the driver maps it to
-                            // `TraceAction::CompileTrace` (no further compile
-                            // or abort on this session).
-                            driver.note_compile_trace_success();
-                            return Ok((
-                                DispatchOutcome::CompileTracePending {
-                                    loop_header_pc: next_instr,
-                                },
-                                op.next_pc,
-                            ));
+                            // pyjitpl.py:3000, jitdriver.rs:2967-2974: the
+                            // attempt armed `partial_trace`, so the next visit
+                            // of this header takes the `has_partial` arm of the
+                            // gate above and runs no optimizer pass either way.
+                            // Once the retrace lands, the state this close was
+                            // refused against is gone -- latching it would
+                            // refuse the close forever for a reason that has
+                            // already stopped holding.
+                            majit_metainterp::BridgeCompileResult::RetraceNeeded => {}
+                            majit_metainterp::BridgeCompileResult::Declined
+                            | majit_metainterp::BridgeCompileResult::Failed => {
+                                if attempted {
+                                    ctx.trace_ctx.note_cross_loop_close_declined(key);
+                                }
+                            }
                         }
-                        ctx.trace_ctx.note_cross_loop_close_declined(key);
                     }
                     // The jump did not take (`compile.compile_trace` returns
                     // None when none of the existing loop tokens match). Fall

@@ -1,8 +1,11 @@
-# pyre-check: max-pypy-ratio=110
-# pypy's exec time is pinned to the startup-subtraction floor here, so the
-# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
-# runners observe (54.5x), rounded up.
-N = 1000000
+# pyre-check: max-pypy-ratio=220
+# The trip count puts pypy's execution above the startup-subtraction floor, so
+# this ratio is a measurement. It reads higher than the clamped one it replaces
+# rather than lower: a baseline pinned to the floor over-states pypy's work,
+# so every ratio built on it was an under-estimate. The ceiling is twice the
+# slowest of the three backends observed (109.5x on cranelift) -- the previous
+# 110 sat on top of that reading and would fail on the run-to-run spread.
+N = 38000000
 
 
 # UNARY_NEGATIVE in a hot loop lowers to the `unary_negative(value)` HLOp →

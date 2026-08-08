@@ -16,9 +16,10 @@
 #
 # Guard for what an adopted multi-frame blackhole chain owes its inner levels.
 #
-# An inlined callee assigns a local, the frame then escapes through a residual
-# `sys._getframe()`, and an attribute read POSITIONED AFTER that escape reads the
-# local back.  The read is executed by the blackhole, not by the walk, so the
+# An inlined callee assigns a local, the frame then escapes through the
+# `.f_locals` read added above -- `sys._getframe()` itself folds here -- and an
+# attribute read POSITIONED AFTER that escape reads the local back.  The read is
+# executed by the blackhole, not by the walk, so the
 # shape holds the adopt to two separate obligations and fails differently on
 # each:
 #

@@ -18,7 +18,9 @@
 # guard resumes at depth 1 and the hot loop is the whole trace.  Ordering and
 # the heap-magnitude right operand are both load-bearing for the repro.  Pure
 # arithmetic -> deterministic checksum.
-N = 200000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 13838411
 
 
 def sc_small():

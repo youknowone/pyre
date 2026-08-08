@@ -5,7 +5,9 @@
 # On main, there was no setslice op (Object-only fallback).
 # On this branch, setslice stays in Integer strategy when new items are plain ints.
 #
-N = 500000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 5874966
 
 def main():
     lst = [0] * 10

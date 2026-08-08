@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # bltinmodule.c builtin_print / app_io.py print_ resolve a `file is None`
 # default to the live `sys.stdout` each call, so rebinding `sys.stdout` from
 # Python redirects `print()`. A `None` sys.stdout emits nothing.

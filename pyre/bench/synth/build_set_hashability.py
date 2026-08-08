@@ -4,7 +4,7 @@
 # __hash__ is None / raises / returns a non-int — raises instead of silently
 # building a set, and a user __hash__ is actually invoked.  Only the
 # exception type is printed so the line matches across CPython/PyPy/Pyre.
-N = 50000
+N = 680000
 
 
 class HashRaises:

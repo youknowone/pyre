@@ -76,7 +76,7 @@ enum TokenizerPhase {
 pub struct W_TokenizerIter {
     readline: PyObjectRef,
     extra_tokens: bool,
-    encoding: Option<String>,
+    encoding: Option<rustpython_wtf8::Wtf8Buf>,
     phase: TokenizerPhase,
     source: String,
     tokens: Vec<Token>,
@@ -128,8 +128,16 @@ fn read_line(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
             // Decoding may enter the codec registry.  Do not retain a slice
             // borrowed from a movable bytes object across that call.
             let bytes = pyre_object::bytesobject::bytes_like_data(raw).to_vec();
-            let decoded = crate::typedef::decode_bytes_to_wtf8(&bytes, &encoding, "strict")?;
-            Ok(decoded.to_string_lossy().into_owned())
+            // No registered codec spells its name with a surrogate, so a name
+            // with no `str` form is simply one the registry does not have.
+            let Ok(name) = encoding.as_str() else {
+                let mut msg =
+                    rustpython_wtf8::Wtf8Buf::from_string("unknown encoding: ".to_string());
+                msg.push_wtf8(&encoding);
+                return Err(crate::PyError::new(crate::PyErrorKind::LookupError, msg));
+            };
+            let decoded = crate::typedef::decode_bytes_to_wtf8(&bytes, name, "strict")?;
+            crate::typedef::utf8_strict_w(decoded)
         },
         None => unsafe {
             if !is_str(raw) {
@@ -137,7 +145,7 @@ fn read_line(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
                     "readline() returned a non-string object",
                 ));
             }
-            Ok(w_str_get_wtf8(raw).to_string_lossy().into_owned())
+            crate::typedef::utf8_strict_w(w_str_get_wtf8(raw).to_wtf8_buf())
         },
     }
 }
@@ -220,7 +228,7 @@ impl W_TokenizerIter {
                         type_name_of(value)
                     )));
                 }
-                Some(w_str_get_wtf8(value).to_string_lossy().into_owned())
+                Some(w_str_get_wtf8(value).to_wtf8_buf())
             },
             None => None,
         };

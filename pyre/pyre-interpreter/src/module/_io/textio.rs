@@ -1784,7 +1784,7 @@ impl W_TextIOWrapper {
         }
     }
 
-    fn __repr__(&self) -> Result<String, crate::PyError> {
+    fn __repr__(&self) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
         self.check_init()?;
         let self_obj = self.self_obj();
         let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
@@ -1794,20 +1794,24 @@ impl W_TextIOWrapper {
         };
 
         let typename = crate::type_methods::arg_type_name(self_obj);
-        let mut fields = String::new();
+        let mut fields = rustpython_wtf8::Wtf8Buf::new();
         if self.state != STATE_DETACHED {
             if let Ok(name) = crate::baseobjspace::getattr_str(self.w_buffer, "name") {
                 fields.push_str(" name=");
-                fields.push_str(&unsafe { crate::display::py_repr(name)? });
+                fields.push_wtf8(&unsafe { crate::display::py_repr_wtf8(name)? });
             }
         }
         if let Ok(mode) = crate::baseobjspace::getattr_str(self_obj, "mode") {
             fields.push_str(" mode=");
-            fields.push_str(&unsafe { crate::display::py_repr(mode)? });
+            fields.push_wtf8(&unsafe { crate::display::py_repr_wtf8(mode)? });
         }
         fields.push_str(" encoding=");
-        fields.push_str(&unsafe { crate::display::py_repr(self.w_encoding)? });
-        Ok(format!("<{typename}{fields}>"))
+        fields.push_wtf8(&unsafe { crate::display::py_repr_wtf8(self.w_encoding)? });
+        Ok(crate::display::wtf8_format!(
+            format!("<{typename}"),
+            fields,
+            ">"
+        ))
     }
 }
 

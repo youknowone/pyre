@@ -16,6 +16,7 @@
 //! call into these entry points.
 
 use super::*;
+use rustpython_wtf8::Wtf8;
 
 /// `residual_call` shape `iRd>X` dispatcher. Reads `funcptr (i)`,
 /// R-list args, and `descr`, runs `_build_allboxes` to produce the
@@ -3336,6 +3337,59 @@ pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Fold `LOAD_ATTR` on a type receiver when
+/// [`pyre_interpreter::type_attr_value_fast_path`] proves that
+/// `typeobject.py:811-828` returns the class-MRO value unchanged.  The exact
+/// receiver and its version tag are pinned before the value is written as a
+/// green constant.  [`pyre_interpreter::mutated`] recursively invalidates
+/// subclasses, so the one receiver pin covers reassignment or deletion on any
+/// base class as well.
+///
+/// A name the metatype answers with a data descriptor is refused by the oracle,
+/// so `__name__` never reaches here — [`try_walker_specialize_load_type_name_attr`]
+/// is its fold, and the two cover the disjoint arms of `descr_getattribute`.
+///
+/// The name needs no operand guard: the codewriter baked its `co_names` index
+/// into the residual.  This read-only, present-attribute fold cannot raise, so
+/// unlike the classmethod method-load fold it is safe inside an inlined callee
+/// sub-walk; resuming past it cannot repeat a side effect.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, _version_tag, w_value)) = (unsafe {
+        pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name.as_str()))
+    }) else {
+        return Ok(None);
+    };
+
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(obj, w_type_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+
+    let value_const = ctx.trace_ctx.const_ref(w_value as i64);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value_const)?;
+    Ok(Some(()))
+}
+
 /// Fold the `LOAD_ATTR`-method `getattr` residual for a receiver whose name
 /// resolves to a plain builtin-code function on its type — the `lst.append`
 /// shape [`try_walker_specialize_load_method_attr`] declines because upstream
@@ -4158,9 +4212,11 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// FBW virtualization of the array-backed BUILD_TUPLE, at arity 1 and 3 up.
-/// Sibling of [`try_walker_specialize_newlist`] and
-/// [`try_walker_specialize_newtuple`], which takes the arity-2 plain-int shape.
+/// FBW virtualization of the array-backed BUILD_TUPLE — the arities
+/// `makespecialisedtuple2` does not claim.  Sibling of
+/// [`try_walker_specialize_newtuple`] (arity-2 plain-int `spec_ii`) and
+/// [`try_walker_specialize_newlist`], reached only after the `spec_ii` fold
+/// declines, so that path stays byte-identical.
 ///
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear` +
 /// per-index `setarrayitem_gc` + a `newtuple_from_array` residual.  Re-emit the
@@ -4171,16 +4227,19 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 /// and one that does escape materializes from the same fields the residual
 /// would have written.
 ///
-/// Arity 2 is declined: `makespecialisedtuple2`
-/// (`specialisedtupleobject.py:169-179`) is what the runtime calls there, so a
-/// canonical virtual would be the one shape the interpreter never builds.  The
-/// trace alone stays self-consistent, but a side exit hands a real `Cls_ii` /
-/// `Cls_ff` / `Cls_oo` — inline `value0` / `value1`, no `wrappeditems` block —
-/// to a consumer the trace picked for the canonical layout, and
+/// Arity 2 is `makespecialisedtuple2` territory (`Cls_ii` / `Cls_ff` /
+/// `Cls_oo`, `specialisedtupleobject.py`): the runtime never builds an
+/// array-backed tuple there, so emitting one would diverge from what the
+/// blackhole rebuilds on deopt.  Declined here — the `spec_ii` fold owns the
+/// int-int case and the residual owns the rest.  The empty tuple is declined
+/// too (no element to recover a length from).
+///
+/// Lifting that decline is not a trace-local question: the trace stays
+/// self-consistent, but a side exit hands a real pair — inline `value0` /
+/// `value1`, no `wrappeditems` block — to whatever consumer the trace picked
+/// for the canonical layout, and
 /// [`try_walker_specialize_subscr_specialised_pair`] then reads a field that is
-/// not there.  [`try_walker_specialize_newtuple`] takes the pair shapes it can
-/// build faithfully.  The empty tuple is declined too (no element to recover a
-/// length from).
+/// not there.
 ///
 /// Returns `Ok(Some(()))` when folded; `Ok(None)` falls through to the opaque
 /// residual, which stays correct for any shape — a non-const array length or
@@ -4236,9 +4295,8 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
         concretes.push(obj);
     }
 
-    // Concrete shadow: a fresh array-backed tuple from the element shadows,
-    // built by the same constructor the emit reproduces so the walk's own value
-    // and the traced object agree at every arity.  A new allocation with no
+    // Concrete shadow: a fresh array-backed tuple from the element shadows
+    // (`w_tuple_new` parity for every arity but 2). A new allocation with no
     // heap mutation, safe during the walk like `wrapint`.  Built before the
     // emit so a failure leaves no orphan ops in the trace.
     let result_concrete = pyre_object::w_tuple_new_array_backed(concretes);
@@ -4266,12 +4324,6 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
 /// build keeps no consumer and DCEs.  The partner
 /// [`try_walker_specialize_unpack`] then folds the `value0` / `value1`
 /// reads off the virtual tuple, collapsing build→unpack to a pure-int loop.
-///
-/// Runs only after [`try_walker_specialize_newtuple_object`] declines, which it
-/// does for a pair whose backing-array length never reached the heap-cache as a
-/// constant; the element probing below recovers the arity without it.  UNPACK
-/// is the one consumer that folds off this shape, so the canonical arm is the
-/// preferred one wherever it applies.
 ///
 /// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
 /// `Ok(None)` to fall through to the opaque residual, which stays correct
@@ -6760,6 +6812,122 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Fold plain `getattr(type, name)` when
+/// [`pyre_interpreter::type_attr_value_fast_path`] proves that
+/// `typeobject.py:811-828` returns the class-MRO value unchanged.  The exact
+/// callable, exact receiver, exact name object, and receiver version are pinned
+/// before the value is written as a green constant.  Pinning the callable makes
+/// a rebound `getattr` side-exit instead of continuing to use the folded value.
+/// The operand guards are tautologies when their inputs are already constants
+/// and disappear during optimization.
+/// [`pyre_interpreter::mutated`] recursively invalidates subclasses, so the
+/// receiver's one quasi-immutable version watcher covers base-class mutation
+/// and emits no per-iteration operations.
+///
+/// Like the `len` fold this is safe in an inlined callee sub-walk: the oracle
+/// proves a read-only present attribute, so it cannot raise or introduce a
+/// side effect that resume would repeat.  Every other shape declines before
+/// emitting IR and falls through to the generic residual.
+pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, obj, name)` shape only.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_name),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
+    // prepends as arg0 — not a plain `getattr(type, name)` call.
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || concrete_obj.is_null()
+        || concrete_name.is_null()
+    {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_getattr_function(concrete_callable) {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
+        return Ok(None);
+    }
+    let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+    let Some((w_type, _version_tag, w_value)) =
+        (unsafe { pyre_interpreter::type_attr_value_fast_path(concrete_obj, name) })
+    else {
+        return Ok(None);
+    };
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[callable_op, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+
+    let obj_ref = r_args[2];
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    if !obj_ref.is_constant() {
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[obj_ref, w_type_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(obj_ref, w_type_const);
+    }
+
+    // The baked WTF-8 bytes remain constant only while this exact string is
+    // the name operand.  Constant operands make this guard a removable
+    // tautology, so it costs nothing in the steady loop.
+    let name_ref = r_args[3];
+    let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+    if !name_ref.is_constant() {
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[name_ref, name_const],
+        )?;
+    }
+
+    // typeobject.py `promote(self.version_tag())`: this quasi-immutable watcher
+    // emits no per-iteration op. `mutated` (baseobjspace.rs) recurses through
+    // subclasses, so changing the attribute on any base invalidates this pin.
+    walker_pin_type_version_tag(ctx, op.pc, w_type_const)?;
+
+    let value_const = ctx.trace_ctx.const_ref(w_value as i64);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', value_const)?;
+    Ok(Some(()))
+}
+
 /// `range(stop)` / `range(start, stop)` / `range(start, stop, step)` with
 /// exact canonical machine-word ints: lower the opaque constructor residual
 /// to a virtual `W_Range` and four virtual wrapped-int fields.  This lets the
@@ -7698,16 +7866,26 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // `f.mark_as_escaped()` — vm.py:54.  `escaped` is not one of the six fields
     // `interp_jit.py:25-30` declares, so the store cannot force; it is
     // load-bearing at `executioncontext.py:99-106 leave`, which forces the
-    // leaving frame's own vref only for a frame that escaped.
-    ctx.trace_ctx.call_void_typed_with_effect(
-        pyre_interpreter::module::sys::vm::jit_frame_mark_as_escaped as *const (),
-        &[vable_op],
-        &[majit_ir::Type::Ref],
-        majit_ir::EffectInfo::new(
-            majit_ir::ExtraEffect::CannotRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
+    // leaving frame's own vref only for a frame that escaped.  Upstream traces
+    // it as the ordinary `setfield_gc` on the flag, so it is emitted as the
+    // read/or/store the `tb_frame` fold above already uses — an opaque call
+    // would hide the update from the optimizer and its heap cache.
+    let flags_descr = crate::descr::pyframe_flags_descr();
+    let live_flags =
+        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, vable_op, flags_descr.clone());
+    let escaped_bit = ctx
+        .trace_ctx
+        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_ESCAPED));
+    let new_flags = ctx
+        .trace_ctx
+        .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[vable_op, new_flags],
+        flags_descr.clone(),
     );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(vable_op, flags_descr.index(), new_flags);
     // The walk IS the interpreter running, so the recorded store has to take
     // effect here too — the residual would have applied it before returning.
     unsafe { (*frame).mark_as_escaped() };
@@ -10357,7 +10535,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     // and rooted by the compiled loop's gcref table thereafter.
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(exc);
-    let msg = pyre_object::w_str_new(&err.message);
+    let msg = pyre_object::w_str_from_wtf8(err.message.clone());
     let msg_const = ctx.trace_ctx.const_ref(msg as i64);
     let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &[msg_const]);
     // Stamp the canonical list class exactly as `w_list_new` does (the

@@ -1,9 +1,9 @@
-# pyre-check: max-pypy-ratio=6
-# Lone-surrogate keys survive the builtin dict / type kwargs and class
-# namespace walks instead of crashing on the non-UTF-8 key:
-#  - dict(**{surrogate: v}) and d.update(**{surrogate: v}) store the key
-#  - type(name, bases, {surrogate: v}) puts a surrogate-named class attr
-#  - class C(Base, **{surrogate: v}) forwards it to __init_subclass__
+# pyre-check: max-pypy-ratio=20
+# At the 100 it was recorded with, the loop never reached the JIT --
+# `loops_compiled=0` on every backend -- and pypy's side sat on the
+# execution floor, so the gate compared startup. At 3200 the loop compiles
+# and pypy's own execution is a measurement. The ceiling is four times the
+# slowest observed (5.0x), fitted on one host until the runners report.
 
 S1 = '\udc81'
 S2 = '\udc84'
@@ -12,7 +12,7 @@ S2 = '\udc84'
 # The walks are repeated so the measured body is larger than the process
 # startup floor; only the last round's answers are printed, so the output is
 # identical to a single round.
-REPEAT = 100
+REPEAT = 3200
 
 
 def main():

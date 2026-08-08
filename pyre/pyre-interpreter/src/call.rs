@@ -6,7 +6,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
-use rustpython_wtf8::Wtf8Buf;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 use crate::runtime_ops::{CallableKind, classify_callable};
 use crate::{
@@ -21,9 +21,12 @@ pub(crate) fn frame_into_generator_for_function(
     frame: crate::pyframe::FrameBox,
     function: PyObjectRef,
 ) -> PyResult {
-    let name = unsafe { function_get_name(function) }.to_string();
+    // `__name__` lives in the `Function`'s Rust `str` field, so it is UTF-8 by
+    // construction; `__qualname__` is a Python object and may carry a lone
+    // surrogate, which the generator's own `__qualname__` has to read back.
+    let name = unsafe { function_get_name(function) };
     let qualname = unsafe { function_get_qualname(function) };
-    frame.into_generator_named(Some(&name), Some(&qualname))
+    frame.into_generator_named(Some(Wtf8::new(name)), Some(&qualname))
 }
 
 struct FrameLocalsRoot {
@@ -526,10 +529,12 @@ fn fill_user_function_args(
             )
         };
         let given_str = format!("{} {}", nargs, if nargs != 1 { "were" } else { "was" });
-        return Err(crate::PyError::type_error(format!(
-            "{}() takes {} but {} given",
-            fname, takes_str, given_str
-        )));
+        // `fname` is WTF-8: `format!` would render it through `Display`, which
+        // substitutes U+FFFD for a lone surrogate.
+        let mut msg = Wtf8Buf::new();
+        msg.push_wtf8(&fname);
+        msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
+        return Err(crate::PyError::type_error(msg));
     }
 
     // Lay out filled_args as `[positional[0..nparams], kwonly[0..nkwonly]]`
@@ -643,7 +648,11 @@ fn fill_user_function_args(
 }
 
 /// `argument.py:534-552` ArgErrMissing.getmsg parity.
-fn format_missing_err(fname: &str, missing: &[&str], positional: bool) -> String {
+///
+/// `fname` is the function's `__qualname__`, which may carry a lone surrogate,
+/// and the message becomes the TypeError's `args[0]` -- so the whole line is
+/// assembled as WTF-8 rather than through a `String`.
+fn format_missing_err(fname: &Wtf8, missing: &[&str], positional: bool) -> Wtf8Buf {
     let mut arguments_str = String::new();
     for (i, arg) in missing.iter().enumerate() {
         if i == 0 {
@@ -661,9 +670,10 @@ fn format_missing_err(fname: &str, missing: &[&str], positional: bool) -> String
         arguments_str.push_str(arg);
         arguments_str.push('\'');
     }
-    format!(
-        "{}() missing {} required {} argument{}: {}",
-        fname,
+    let mut msg = Wtf8Buf::new();
+    msg.push_wtf8(fname);
+    msg.push_str(&format!(
+        "() missing {} required {} argument{}: {arguments_str}",
         missing.len(),
         if positional {
             "positional"
@@ -671,36 +681,41 @@ fn format_missing_err(fname: &str, missing: &[&str], positional: bool) -> String
             "keyword-only"
         },
         if missing.len() != 1 { "s" } else { "" },
-        arguments_str
-    )
+    ));
+    msg
 }
 
 /// `argument.py:620-626` ArgErrUnknownKwds.getmsg parity.
-fn format_unknown_kwds_err(fname: &str, unmatched: &[Wtf8Buf]) -> String {
+fn format_unknown_kwds_err(fname: &Wtf8, unmatched: &[Wtf8Buf]) -> Wtf8Buf {
+    let mut msg = Wtf8Buf::new();
+    msg.push_wtf8(fname);
     if unmatched.len() == 1 {
-        format!(
-            "{}() got an unexpected keyword argument '{}'",
-            fname, unmatched[0]
-        )
+        // `argument.py:616` keys this off the keyword's own storage, so a name
+        // with a lone surrogate reaches `e.args[0]` as itself.
+        msg.push_str("() got an unexpected keyword argument '");
+        msg.push_wtf8(&unmatched[0]);
+        msg.push_str("'");
     } else {
-        format!(
-            "{}() got {} unexpected keyword arguments",
-            fname,
+        msg.push_str(&format!(
+            "() got {} unexpected keyword arguments",
             unmatched.len()
-        )
+        ));
     }
+    msg
 }
 
 #[cold]
-fn raise_if_posonly_kwds(posonly_kwds: &[String], fname: &str) -> Result<(), PyError> {
+fn raise_if_posonly_kwds(posonly_kwds: &[String], fname: &Wtf8) -> Result<(), PyError> {
     if posonly_kwds.is_empty() {
         return Ok(());
     }
-    Err(crate::PyError::type_error(format!(
-        "{}() got some positional-only arguments passed as keyword arguments: '{}'",
-        fname,
+    let mut msg = Wtf8Buf::new();
+    msg.push_wtf8(fname);
+    msg.push_str(&format!(
+        "() got some positional-only arguments passed as keyword arguments: '{}'",
         posonly_kwds.join(", ")
-    )))
+    ));
+    Err(crate::PyError::type_error(msg))
 }
 
 /// Materialize a Python call frame without retaining the by-value `PyFrame`
@@ -1960,10 +1975,12 @@ pub(crate) fn resolve_kwargs(
                 }
                 // argument.py:410 — duplicate keyword argument
                 if !result[pi].is_null() {
-                    return Err(crate::PyError::type_error(format!(
-                        "{}() got multiple values for argument '{}'",
-                        fname, param_name
-                    )));
+                    let mut msg = Wtf8Buf::new();
+                    msg.push_wtf8(&fname);
+                    msg.push_str(&format!(
+                        "() got multiple values for argument '{param_name}'"
+                    ));
+                    return Err(crate::PyError::type_error(msg));
                 }
                 result[pi] = kw_value;
                 matched = true;
@@ -2056,10 +2073,10 @@ pub(crate) fn resolve_kwargs(
                 if n_pos != 1 { "were" } else { "was" }
             )
         };
-        return Err(crate::PyError::type_error(format!(
-            "{}() takes {} but {}",
-            fname, takes_str, given_str
-        )));
+        let mut msg = Wtf8Buf::new();
+        msg.push_wtf8(&fname);
+        msg.push_str(&format!("() takes {takes_str} but {given_str}"));
+        return Err(crate::PyError::type_error(msg));
     }
 
     // Fill positional defaults (PyPy: _match_signature defs_w)
@@ -2290,7 +2307,7 @@ pub(crate) fn bind_kwargs_to_signature(
 
     // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the full
     // keyword scan and before ArgErrUnknownKwds.
-    raise_if_posonly_kwds(&posonly_kwds, fname)?;
+    raise_if_posonly_kwds(&posonly_kwds, Wtf8::new(fname))?;
 
     if !unmatched_kw_names.is_empty() {
         // parse_obj (argument.py:377-380) rewrites the unknown-keyword message
@@ -2299,9 +2316,12 @@ pub(crate) fn bind_kwargs_to_signature(
         // call routes through parse_obj (gateway.py funcrun / funcrun_obj), so
         // the rewrite applies at any arity, not just the single-argument form.
         let msg = if !has_varkw && sig.num_kwonlyargnames() == 0 {
-            format!("{}() takes no keyword arguments", fname)
+            let mut msg = Wtf8Buf::new();
+            msg.push_wtf8(Wtf8::new(fname));
+            msg.push_str("() takes no keyword arguments");
+            msg
         } else {
-            format_unknown_kwds_err(fname, &unmatched_kw_names)
+            format_unknown_kwds_err(Wtf8::new(fname), &unmatched_kw_names)
         };
         return Err(crate::PyError::type_error(msg));
     }
@@ -2348,7 +2368,10 @@ pub(crate) fn bind_kwargs_to_signature(
     let varkw_slot = varargs_slot + usize::from(has_varargs);
     if has_varkw {
         roots.pin_root(pyre_object::w_dict_new_kwargs());
-        for (i, (key, _)) in extra_kwargs.iter().enumerate() {
+        // The index loop lowers to direct element loads; iterator adapters are residual calls.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..extra_kwargs.len() {
+            let key = &extra_kwargs[i].0;
             unsafe {
                 // The key allocation runs first: as the second argument it
                 // would be evaluated after the receiver, handing
@@ -2358,9 +2381,11 @@ pub(crate) fn bind_kwargs_to_signature(
             }
         }
     }
-    let mut result: Vec<PyObjectRef> = (0..result.len())
-        .map(|i| roots.get(result_slot + i))
-        .collect();
+    let result_len = result.len();
+    let mut result: Vec<PyObjectRef> = Vec::with_capacity(result_len);
+    for i in 0..result_len {
+        result.push(roots.get(result_slot + i));
+    }
     if has_varargs {
         result.push(roots.get(varargs_slot));
     }
@@ -2694,10 +2719,10 @@ pub fn call_with_kwargs_in_ctx(
                         // argument.py:495 — ArgErrMultipleValues: keyword
                         // duplicates an already-bound positional argument.
                         if !result[pi].is_null() {
-                            return Err(crate::PyError::type_error(format!(
-                                "{}() got multiple values for argument '{}'",
-                                fname, key
-                            )));
+                            let mut msg = Wtf8Buf::new();
+                            msg.push_wtf8(&fname);
+                            msg.push_str(&format!("() got multiple values for argument '{key}'"));
+                            return Err(crate::PyError::type_error(msg));
                         }
                         result[pi] = value;
                         matched = true;
@@ -2756,10 +2781,10 @@ pub fn call_with_kwargs_in_ctx(
                     pos_args.len(),
                     if pos_args.len() != 1 { "were" } else { "was" }
                 );
-                return Err(crate::PyError::type_error(format!(
-                    "{}() takes {} but {} given",
-                    fname, takes_str, given_str
-                )));
+                let mut msg = Wtf8Buf::new();
+                msg.push_wtf8(&fname);
+                msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
+                return Err(crate::PyError::type_error(msg));
             }
 
             // Fill positional defaults from __defaults__ tuple.
@@ -3122,7 +3147,7 @@ pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> Py
     match call_function_impl_result(callable, args) {
         Ok(result) => result,
         Err(e) => {
-            log_call_error(&e.message);
+            log_call_error(&e.message_text());
             set_call_error(e);
             PY_NULL
         }
@@ -3190,12 +3215,14 @@ pub fn call_function_impl_result(
     let mut inline_args = [PY_NULL; INLINE_ARGS];
     let mut wide_args = Vec::new();
     let args = if args.len() <= INLINE_ARGS {
-        for (i, slot) in inline_args[..args.len()].iter_mut().enumerate() {
-            *slot = _roots.get(root_base + 1 + i);
+        // The index loop lowers to `setarrayitem`; iterator adapters are residual calls.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..args.len() {
+            inline_args[i] = _roots.get(root_base + 1 + i);
         }
         &inline_args[..args.len()]
     } else {
-        wide_args.reserve_exact(args.len());
+        wide_args = Vec::with_capacity(args.len());
         for i in 0..args.len() {
             wide_args.push(_roots.get(root_base + 1 + i));
         }
@@ -3294,9 +3321,10 @@ pub fn call_function_impl_result(
             // have been updated to forwarded addresses; reconstruct the
             // argument view before recursively dispatching the bound call.
             let current_callable = pyre_object::gc_roots::shadow_stack_get(root_base);
-            let current_args: Vec<PyObjectRef> = (0..args.len())
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i))
-                .collect();
+            let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+            for i in 0..args.len() {
+                current_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+            }
             if prepend_receiver {
                 let mut call_args = Vec::with_capacity(1 + current_args.len());
                 call_args.push(current_callable);
@@ -4724,17 +4752,21 @@ fn build_class_inner(
             if w_metaclass.is_some() && unsafe { pyre_object::is_type(w_type) } {
                 let cell_value = unsafe { pyre_object::w_cell_get(classcell) };
                 if cell_value.is_null() {
-                    let class_str = unsafe { crate::py_str(w_type) }?;
-                    return Err(PyError::runtime_error(format!(
-                        "__class__ not set defining {name} as {class_str}. \
-                         Was __classcell__ propagated to type.__new__?"
+                    let class_str = unsafe { crate::py_str_wtf8(w_type) }?;
+                    return Err(PyError::runtime_error(crate::display::wtf8_format!(
+                        format!("__class__ not set defining {name} as "),
+                        class_str,
+                        ". Was __classcell__ propagated to type.__new__?",
                     )));
                 }
                 if !std::ptr::eq(cell_value, w_type) {
-                    let cell_str = unsafe { crate::py_str(cell_value) }?;
-                    let class_str = unsafe { crate::py_str(w_type) }?;
-                    return Err(PyError::type_error(format!(
-                        "__class__ set to {cell_str} defining {name} as {class_str}"
+                    let cell_str = unsafe { crate::py_str_wtf8(cell_value) }?;
+                    let class_str = unsafe { crate::py_str_wtf8(w_type) }?;
+                    return Err(PyError::type_error(crate::display::wtf8_format!(
+                        "__class__ set to ",
+                        cell_str,
+                        format!(" defining {name} as "),
+                        class_str,
                     )));
                 }
             } else {

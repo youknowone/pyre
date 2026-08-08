@@ -21,7 +21,9 @@
 # Sized so the pypy leg's startup-subtracted exec sits well above
 # `check.py EXEC_TIME_FLOOR_S`; at 120000 it measured 0.0018s, i.e. the
 # ratio gate was dividing by the floor rather than by real work.
-N = 6000000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 11582132
 M = 997
 
 

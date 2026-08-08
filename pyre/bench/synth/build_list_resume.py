@@ -1,7 +1,12 @@
 # pyre-check: max-pypy-ratio=14
 # pyre-check: skip-cpython
-# cpython 0.25s vs pyre 0.09s (2.8x), and it is not gated on — only pypy is.
-N = 2000000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+# 153183341 puts pypy at 258ms, and the two requirements do not both fit: a
+# count small enough for cpython to finish inside its reference timeout leaves
+# pypy an order of magnitude under the floor. cpython is dropped deliberately
+# rather than by spending the whole timeout to discover the same drop.
+N = 153183341
 
 
 def main():

@@ -1,5 +1,7 @@
 # pyre-check: max-pypy-ratio=11
-N = 400000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 6764311
 
 
 def fib_swap(n):

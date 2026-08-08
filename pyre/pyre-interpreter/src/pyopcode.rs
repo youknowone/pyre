@@ -1598,7 +1598,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 self.typing_intrinsic_1("_intrinsic_subscript_generic")
             }
             IntrinsicFunction1::TypeAlias => self.typing_intrinsic_1("_intrinsic_typealias"),
-            _ => Err(crate::PyError::type_error(&format!(
+            _ => Err(crate::PyError::type_error(format!(
                 "intrinsic function {:?} not implemented",
                 func
             ))
@@ -1635,7 +1635,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             IntrinsicFunction2::SetTypeparamDefault => {
                 self.typing_intrinsic_2("_intrinsic_set_typeparam_default")
             }
-            _ => Err(crate::PyError::type_error(&format!(
+            _ => Err(crate::PyError::type_error(format!(
                 "intrinsic function {:?} not implemented",
                 func
             ))

@@ -13,16 +13,17 @@
 use rustpython_compiler::ast;
 
 use crate::PyError;
+use rustpython_wtf8::Wtf8Buf;
 
 type ValidateResult = Result<(), PyError>;
 
 /// Seen as a ValueError.
-fn validation_error(message: impl Into<String>) -> PyError {
+fn validation_error(message: impl Into<Wtf8Buf>) -> PyError {
     PyError::value_error(message)
 }
 
 /// Seen as a TypeError.
-fn validation_type_error(message: impl Into<String>) -> PyError {
+fn validation_type_error(message: impl Into<Wtf8Buf>) -> PyError {
     PyError::type_error(message)
 }
 
@@ -823,7 +824,7 @@ mod tests {
     }
 
     fn message(result: ValidateResult) -> String {
-        result.unwrap_err().message
+        result.unwrap_err().message_text()
     }
 
     #[test]
@@ -1020,7 +1021,7 @@ mod tests {
         // expression, a ValueError.
         let error = validate(named(constant(1))).unwrap_err();
         assert_eq!(error.kind, crate::error::PyErrorKind::TypeError);
-        assert_eq!(error.message, "NamedExpr target must be a Name");
+        assert_eq!(error.message_text(), "NamedExpr target must be a Name");
 
         // Only the shape is checked here; the context the target carries is
         // not, so a `Store` name passes the walk.

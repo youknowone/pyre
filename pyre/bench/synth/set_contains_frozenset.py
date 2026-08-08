@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=67
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # A set is unhashable, but when one is used to look an element up it stands
 # in for the frozenset holding the same elements, so `in`, discard and remove
 # find it. The element is hashed on the way, so a raising __hash__ propagates

@@ -373,9 +373,12 @@ impl W_BytesIO {
 
     fn getbuffer(&mut self) -> Result<PyObjectRef, crate::PyError> {
         // interp_bytesio.py:149-152. The bytearray exporter owns the release
-        // accounting for the writable view returned here.
+        // accounting, while the BytesIO remains the view's reported owner.
         self.check_closed()?;
-        crate::builtins::w_memoryview_new_with_flags(self.buffer, 0x0001)
+        Ok(crate::builtins::w_memoryview_new_simple_with_owner(
+            self.buffer,
+            self.self_obj(),
+        ))
     }
 
     fn getvalue(&self) -> Result<PyObjectRef, crate::PyError> {

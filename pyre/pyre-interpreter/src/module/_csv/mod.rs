@@ -58,10 +58,11 @@ struct DialectConfig {
 /// Build a `PyError` whose raised object is an instance of `_csv.Error`
 /// (registered by the `exceptions:` block), with `msg` as the single
 /// argument — `interp_csv.py W_Reader.error` / `W_Writer.error`.
-fn csv_error(msg: String) -> PyError {
+fn csv_error(msg: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
+    let msg = msg.into();
     let mut err = PyError::runtime_error(msg.clone());
     if let Some(cls) = crate::builtins::lookup_exc_class("_csv.Error") {
-        let args = [cls, pyre_object::w_str_new(&msg)];
+        let args = [cls, pyre_object::w_str_from_wtf8(msg)];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }
@@ -892,8 +893,11 @@ fn writer_writerow_impl(
     let row = match crate::builtins::collect_iterable(w_fields) {
         Ok(r) => r,
         Err(e) if e.kind == crate::PyErrorKind::TypeError => {
-            let r = unsafe { crate::display::py_repr(w_fields) }.unwrap_or_default();
-            return Err(csv_error(format!("iterable expected, not {r}")));
+            let r = unsafe { crate::display::py_repr_wtf8(w_fields) }.unwrap_or_default();
+            return Err(csv_error(crate::display::wtf8_format!(
+                "iterable expected, not ",
+                r
+            )));
         }
         Err(e) => return Err(e),
     };
@@ -902,15 +906,15 @@ fn writer_writerow_impl(
     let quote_char = cfg.quotechar.and_then(char::from_u32).unwrap_or('"');
     let delim_char = char::from_u32(cfg.delimiter).unwrap_or(',');
     let n = row.len();
-    let mut rec = String::new();
+    let mut rec = rustpython_wtf8::Wtf8Buf::new();
 
     for (i, &w_field) in row.iter().enumerate() {
         let field = if unsafe { pyre_object::is_none(w_field) } {
-            String::new()
+            rustpython_wtf8::Wtf8Buf::new()
         } else if unsafe { pyre_object::is_float(w_field) } {
-            unsafe { crate::display::py_repr(w_field) }?
+            unsafe { crate::display::py_repr_wtf8(w_field) }?
         } else {
-            unsafe { crate::display::py_str(w_field) }?
+            unsafe { crate::display::py_str_wtf8(w_field) }?
         };
 
         let mut quoted = match cfg.quoting {
@@ -918,8 +922,8 @@ fn writer_writerow_impl(
             QUOTE_ALL => true,
             QUOTE_MINIMAL => {
                 let mut q = false;
-                for c in field.chars() {
-                    let cp = c as u32;
+                for c in field.code_points() {
+                    let cp = c.to_u32();
                     if !special.contains(&cp) {
                         continue;
                     }
@@ -966,14 +970,14 @@ fn writer_writerow_impl(
         }
 
         if i > 0 {
-            rec.push(delim_char);
+            rec.push_char(delim_char);
         }
         if quoted {
-            rec.push(quote_char);
+            rec.push_char(quote_char);
         }
 
-        for c in field.chars() {
-            let cp = c as u32;
+        for c in field.code_points() {
+            let cp = c.to_u32();
             if special.contains(&cp) {
                 let want_escape = if cfg.quoting == QUOTE_NONE {
                     true
@@ -981,7 +985,7 @@ fn writer_writerow_impl(
                     let mut we = false;
                     if Some(cp) == cfg.quotechar {
                         if cfg.doublequote {
-                            rec.push(quote_char);
+                            rec.push_char(quote_char);
                         } else {
                             we = true;
                         }
@@ -993,7 +997,7 @@ fn writer_writerow_impl(
                 };
                 if want_escape {
                     match cfg.escapechar.and_then(char::from_u32) {
-                        Some(e) => rec.push(e),
+                        Some(e) => rec.push_char(e),
                         None => {
                             return Err(csv_error(
                                 "need to escape, but no escapechar set".to_string(),
@@ -1006,12 +1010,12 @@ fn writer_writerow_impl(
         }
 
         if quoted {
-            rec.push(quote_char);
+            rec.push_char(quote_char);
         }
     }
 
     rec.push_str(&cfg.lineterminator);
-    crate::call::call_function_impl_result(w_filewrite, &[pyre_object::w_str_new(&rec)])
+    crate::call::call_function_impl_result(w_filewrite, &[pyre_object::w_str_from_wtf8(rec)])
 }
 
 /// `W_Writer.writerows` — serialize a sequence of records.

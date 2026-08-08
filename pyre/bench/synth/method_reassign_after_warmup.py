@@ -14,7 +14,9 @@
 # Second half covers the subclass walk: `mutated()` recurses through
 # `weak_subclasses` (typeobject.py:288-291), so rebinding on a BASE has to
 # revoke a loop warmed on a subclass instance.
-N = 120000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 3557424
 
 
 class P:

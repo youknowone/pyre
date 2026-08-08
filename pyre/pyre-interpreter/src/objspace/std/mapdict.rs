@@ -690,12 +690,16 @@ pub unsafe fn instance_node_getdictvalue_checked(
     ensure_mapdict_initialized(obj);
     let inst = &mut *(obj as *mut pyre_object::W_ObjectObject);
     let map = inst._get_mapdict_map();
-    let w_res = unsafe { node_read_checked(map, inst, name, DICT) };
+    let w = unsafe { node_read_checked(map, inst, name, DICT) }?;
     // mapdict.py:846-847 getdictvalue → read → _direct_read (592-598): lazily
     // migrate to boxed storage when the read attribute is unboxed and its class
-    // has frozen unboxing.
+    // has frozen unboxing.  A raise in `read` unwinds before the migration tail
+    // (846-847 → 58 → 312-313 returns None on the miss path, never reaching
+    // _direct_read), so migration is skipped whenever the read raised;
+    // propagating the read error here mirrors that — and `maybe_migrate_to_boxed`
+    // re-derives the None on the raising path, so it is a no-op there regardless.
     unsafe { maybe_migrate_to_boxed(map, inst, name, DICT) };
-    w_res
+    Ok(w)
 }
 
 /// `deldictvalue` routed to the mapdict node layer (mapdict.py:852-857
@@ -4586,17 +4590,45 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let w_obj = mapdict_strategy_unerase(w_dict);
         let _instance_guard = instance_lock(w_obj);
         ensure_mapdict_initialized(w_obj);
-        let inst = &*(w_obj as *const pyre_object::W_ObjectObject);
-        let curr = node_search(inst._get_mapdict_map(), DICT)?;
+        let inst = &mut *(w_obj as *mut pyre_object::W_ObjectObject);
+        let map = inst._get_mapdict_map();
+        let curr = node_search(map, DICT)?;
         let key = &(*curr).as_plain().name;
         // mapdict.py:1231 reads the value with `getitem_str(w_dict, key)`, but
         // the trait's `getitem_str` takes a `&str` and a node name is WTF-8:
         // `setitem` stores the full name (mapdict.py:1180), so a lone surrogate
-        // is a node here and has no `&str` form. Read the node layer directly.
-        let w_value = instance_node_getdictvalue(w_obj, key)?;
-        let w_key = pyre_object::unicodeobject::box_str_constant(key);
-        self.delitem(w_dict, w_key);
-        Some((w_key, w_value))
+        // is a node here and has no `&str` form. The `node_search` hit makes
+        // the value-present arm explicit: `node_read` would return
+        // `Some(plain_direct_read(curr, inst))` (mapdict.py:55-66).
+        //
+        // Box the key before the read's conversion tail runs: `key` borrows the
+        // map node, and the migration below replaces the instance's map.
+        //
+        // Boxing, the read and the migration all allocate, so each is a point
+        // where a minor collection can forward a nursery address out from under
+        // a Rust local. Pin the carrier and the two results and read them back
+        // from the shadow stack after every such call. `map`, `curr` and `key`
+        // need no pin: map nodes are not GC-allocated.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj]);
+        let key_slot =
+            pyre_object::gc_roots::pin_roots(&[pyre_object::unicodeobject::box_str_constant(key)]);
+        let inst = &mut *(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+            as *mut pyre_object::W_ObjectObject);
+        let value_slot = pyre_object::gc_roots::pin_roots(&[plain_direct_read(curr, &*inst)]);
+        // `plain_direct_read` is only `_prim_direct_read` (mapdict.py:600-601).
+        // The read still owes `_direct_read`'s tail (mapdict.py:592-598): an
+        // unboxed attribute whose terminator has stopped allowing unboxing
+        // converts the whole instance to boxed storage. `getdictvalue` pairs
+        // the two the same way.
+        let inst = &mut *(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+            as *mut pyre_object::W_ObjectObject);
+        maybe_migrate_to_boxed(map, inst, key, DICT);
+        self.delitem(w_dict, pyre_object::gc_roots::shadow_stack_get(key_slot));
+        Some((
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        ))
     }
 
     /// mapdict.py:1237-1253 `copy`.

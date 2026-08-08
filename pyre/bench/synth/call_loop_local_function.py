@@ -24,12 +24,15 @@
 #
 # `N` is sized by the GATE, not by the loop.  The gate compares
 # startup-subtracted times with the baseline floored at 5ms, so below ~11M
-# iterations pypy lands on that floor and the comparison becomes a fixed
-# ~45ms budget for pyre — which is the stable regime, since only pyre's own
-# startup estimate is then left to miss.  Above it the ceiling is CPython:
-# ~195ns/iteration here against pypy's fraction of one, and this fixture must
-# not become the slowest baseline run in the suite.
-N = 10000000
+# iterations pypy lands on that floor.  That used to be the regime this
+# fixture chose deliberately, because a clamped baseline still produced a
+# comparison — a fixed ~45ms budget for pyre.  It no longer does: a clamped
+# baseline now disarms the ratio gate entirely, ceiling and derived floor
+# both, so staying under the floor means being ungated rather than being
+# stably gated.  The trip count is therefore set above it.  The other bound
+# is unchanged — ~195ns/iteration here against pypy's fraction of one, and
+# this fixture must not become the slowest baseline run in the suite.
+N = 72000000
 
 
 def run(n):

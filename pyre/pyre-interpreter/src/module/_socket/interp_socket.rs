@@ -786,9 +786,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                    Ok(pyre_object::w_str_new(&String::from_utf8_lossy(
-                        &buf[..end],
-                    )))
+                    // `interp_func.py:24` is
+                    // `space.fsdecode(space.newbytes(res))` -- the hostname is
+                    // opaque kernel bytes (`sethostname(2)` takes a plain
+                    // `const char*`), so a byte with no UTF-8 spelling has to
+                    // survive as its surrogate escape.
+                    Ok(crate::gateway::fsdecode_filename_bytes(&buf[..end]))
                 },
                 0,
             ),
@@ -1290,12 +1293,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let mut p = head;
                     unsafe {
                         while (*p).if_index != 0 && !(*p).if_name.is_null() {
-                            let name = std::ffi::CStr::from_ptr((*p).if_name)
-                                .to_string_lossy()
-                                .into_owned();
+                            // An interface name is an OS string: `dev_valid_name`
+                            // rejects only NUL, '/', ':', whitespace, '.' and
+                            // '..', so any other octet is legal.  The sibling
+                            // `if_nametoindex` below fsencodes, so decoding
+                            // here any other way breaks the round trip.
+                            let name = crate::gateway::fsdecode_filename_bytes(
+                                std::ffi::CStr::from_ptr((*p).if_name).to_bytes(),
+                            );
                             items.push(pyre_object::w_tuple_new(vec![
                                 pyre_object::w_int_new((*p).if_index as i64),
-                                pyre_object::w_str_new(&name),
+                                name,
                             ]));
                             p = p.add(1);
                         }
@@ -1317,12 +1325,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "if_nametoindex() requires 1 argument",
                         ));
                     }
-                    // An interface name is an OS string.  PyPy has no
-                    // `if_nametoindex`, so there is no `unwrap_spec` to port;
-                    // `socketmodule.c socket_if_nametoindex` reads it with
-                    // `PyUnicode_FSConverter`, which is the same filesystem
-                    // encoding `fsencode_w` applies and accepts the same
-                    // str / bytes / `__fspath__` argument.
+                    // An interface name is an OS string.
+                    // `interp_socket.py:1316` declares `name='text'` and
+                    // compares against `rsocket.if_nameindex()`'s own names;
+                    // `socketmodule.c socket_if_nametoindex` instead reads it
+                    // with `PyUnicode_FSConverter`, the filesystem encoding
+                    // `fsencode_w` applies, and accepts the same
+                    // str / bytes / `__fspath__` argument.  Take the 3.14
+                    // spelling, which is also what makes this round-trip with
+                    // the `if_nameindex` / `if_indextoname` decode above.
                     let name = crate::gateway::fsencode_bytes_w(args[0])?;
                     let c_name = std::ffi::CString::new(name)
                         .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
@@ -1354,7 +1365,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(socket_io_err(std::io::Error::last_os_error()));
                     }
                     let s = unsafe { std::ffi::CStr::from_ptr(p) };
-                    Ok(pyre_object::w_str_new(&s.to_string_lossy()))
+                    Ok(crate::gateway::fsdecode_filename_bytes(s.to_bytes()))
                 },
                 1,
             ),

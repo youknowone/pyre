@@ -10,7 +10,9 @@
 # countable — the innermost callee's list setitem is journaled, so hits[0]
 # counts one bump per iteration exactly and hits[0] != N means the drain
 # doubled.
-N = 120000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 12420652
 hits = [0]
 
 

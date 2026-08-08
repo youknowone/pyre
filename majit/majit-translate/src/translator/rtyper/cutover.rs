@@ -2974,9 +2974,12 @@ fn drive_subject(
     // dont_simplify_again=False)` (rtyper.py:178-189):
     //
     //   1. `if not dont_simplify_again: self.annotator.simplify()`
-    //      — pyre per-subject flow does not run annotator-wide
-    //        simplify; the subject was lifted via the adapter and
-    //        its block list is already in canonical shape.
+    //      — pyre per-subject flow keeps the annotator-wide
+    //        simplification and extra-pass work skipped: the subject was
+    //        lifted via the adapter and its block list is already in
+    //        canonical shape.  `transform_allocate` is applied per block
+    //        immediately before specialization instead (see
+    //        `specialize_block`).
     //   2. `self.exceptiondata.finish(self)` — hoisted into
     //      `PyreCallRegistry::ensure_session` so it runs **once** at
     //      session start (idempotent — `getclassrepr` is cached on
@@ -3746,6 +3749,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flowspace::model::BlockKey;
     use crate::model::{Block, BlockId, LinkArg, ValueType};
     use crate::translator::rtyper::legacy_annotator::setbinding;
 
@@ -4958,6 +4962,159 @@ mod tests {
     }
 
     #[test]
+    fn cutover_repeat_runs_transform_allocate_before_rtype() {
+        let _lock = anchor_lock();
+        let mut graph = LegacyGraph::new("cutover_repeat_alloc_and_set");
+        let vars = mint_vars(&mut graph, 4);
+        let fill = vars[1].clone();
+        let count = vars[2].clone();
+        let result = vars[3].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1, 2]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: vec!["__array_repeat".into()],
+                    },
+                    args: vec![fill.clone(), count.clone()],
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[3]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        setbinding(&fill, ValueType::Int);
+        setbinding(&count, ValueType::Int);
+
+        let registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(
+            Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
+        );
+        let (flow_graph, _, _, _) = drive_subject(&graph, &registry, /* do_rtype = */ false)
+            .expect("repeat subject must annotate and transform");
+        let transformed_ops: Vec<String> = flow_graph
+            .borrow()
+            .iterblocks()
+            .into_iter()
+            .flat_map(|block| block.borrow().operations.clone())
+            .map(|op| op.opname)
+            .collect();
+        eprintln!(
+            "[cutover_repeat_runs_transform_allocate_before_rtype] before={transformed_ops:?}"
+        );
+        assert!(
+            transformed_ops.iter().any(|name| name == "mul"),
+            "cutover must leave mul until per-block specialization, got {transformed_ops:?}"
+        );
+        assert!(
+            transformed_ops.iter().all(|name| name != "alloc_and_set"),
+            "cutover must not run graph transforms during annotation, got {transformed_ops:?}"
+        );
+
+        let (_, rtyper) = registry.ensure_session().expect("session must remain live");
+        let startblock = flow_graph.borrow().startblock.clone();
+        let direct_before = startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[cutover_repeat_runs_transform_allocate_before_rtype] direct_before={direct_before:?}"
+        );
+        assert!(
+            direct_before.iter().any(|name| name == "mul"),
+            "direct specialize_block fixture must start with mul: {direct_before:?}"
+        );
+        rtyper
+            .specialize_block(&startblock)
+            .expect("direct specialize_block must transform and rtype the start block");
+        let direct_after = startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| format!("{op:?}"))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[cutover_repeat_runs_transform_allocate_before_rtype] direct_after={direct_after:?}"
+        );
+        assert!(
+            direct_after.iter().any(|op| op.contains("alloc_and_set")),
+            "direct specialize_block must run transform_allocate before rtyping: {direct_after:?}"
+        );
+        rtyper.mark_already_seen(&startblock);
+        rtyper
+            .specialize_more_blocks()
+            .expect("transformed repeat must rtype");
+        let rtyped_output = flow_graph
+            .borrow()
+            .iterblocks()
+            .into_iter()
+            .flat_map(|block| block.borrow().operations.clone())
+            .map(|op| format!("{op:?}"))
+            .collect::<Vec<_>>();
+        eprintln!("[cutover_repeat_runs_transform_allocate_before_rtype] after={rtyped_output:?}");
+        assert!(
+            rtyped_output.iter().any(|op| op.contains("alloc_and_set")),
+            "rtyped repeat output must retain alloc_and_set identity: {rtyped_output:?}"
+        );
+        assert!(
+            rtyped_output
+                .iter()
+                .all(|op| !op.contains("opname: \"mul\"")),
+            "rtyped repeat output must contain no mul: {rtyped_output:?}"
+        );
+    }
+
+    #[test]
+    fn cutover_blocked_subject_block_is_excluded_from_per_block_transform() {
+        let _lock = anchor_lock();
+        // A blocked block is represented by `annotated[key] = None`, just as
+        // in the subject drive. It must never enter the per-block transform
+        // or rtyper walk; the subject guard aborts before specialization.
+        let blocked = crate::flowspace::model::Block::shared(vec![]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&blocked), None);
+        ann.all_blocks
+            .borrow_mut()
+            .insert(BlockKey::of(&blocked), blocked.clone());
+
+        let raw_subject_blocks = vec![blocked];
+        let annotated = ann.annotated.borrow();
+        let subject_blocks: Vec<_> = raw_subject_blocks
+            .into_iter()
+            .filter(|block| matches!(annotated.get(&BlockKey::of(block)), Some(Some(_))))
+            .collect();
+        drop(annotated);
+        crate::translator::transform::transform_allocate(&ann, &subject_blocks);
+        eprintln!(
+            "[cutover_blocked_subject_block_is_excluded_from_per_block_transform] {:?}",
+            subject_blocks
+                .iter()
+                .map(|block| BlockKey::of(block).as_usize())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn cachedgraph_hit_registers_callee_graph_into_translator_graphs() {
         let _lock = anchor_lock();
         // Keystone linkage: after a real caller -> callee specialize,
@@ -4977,26 +5134,27 @@ mod tests {
         // `translator.graphs`, graphanalyze.rs) instead of falling to
         // `top_result()`.
         let mut graph = LegacyGraph::new("call_resolved");
-        let vars = mint_vars(&mut graph, 3);
-        let inputargs = block_inputargs(&vars, &[1]);
+        let vars = mint_vars(&mut graph, 4);
+        let inputargs = block_inputargs(&vars, &[1, 2]);
         let v1_var = vars[1].clone();
         let v2_var = vars[2].clone();
+        let v3_var = vars[3].clone();
         let startblock = Block {
             id: graph.startblock,
             inputargs,
             operations: vec![crate::model::SpaceOperation {
-                result: Some(v2_var.clone()),
+                result: Some(v3_var.clone()),
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["foo".into()],
                     },
-                    args: vec![v1_var.clone()],
-                    result_ty: ValueType::Int,
+                    args: vec![v1_var.clone(), v2_var.clone()],
+                    result_ty: ValueType::Unknown,
                 },
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(v2_var.clone())],
+                vec![LinkArg::Value(v3_var.clone())],
                 graph.returnblock,
             )],
             dead: false,
@@ -5004,7 +5162,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&vars, &[2]),
+            inputargs: block_inputargs(&vars, &[3]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -5024,16 +5182,27 @@ mod tests {
         // `base.bookkeeper` is the bookkeeper `ensure_session` attaches
         // the annotator to.
         let mut callee_graph = LegacyGraph::new("foo");
-        let callee_vars = mint_vars(&mut callee_graph, 11);
-        let foo_inputargs = block_inputargs(&callee_vars, &[10]);
+        let callee_vars = mint_vars(&mut callee_graph, 13);
+        let foo_inputargs = block_inputargs(&callee_vars, &[10, 11]);
         let foo_v10_var = callee_vars[10].clone();
+        let foo_v11_var = callee_vars[11].clone();
+        let foo_v12_var = callee_vars[12].clone();
         let foo_start = Block {
             id: callee_graph.startblock,
             inputargs: foo_inputargs,
-            operations: vec![],
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(foo_v12_var.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: vec!["__array_repeat".into()],
+                    },
+                    args: vec![foo_v10_var.clone(), foo_v11_var.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+            }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(foo_v10_var.clone())],
+                vec![LinkArg::Value(foo_v12_var.clone())],
                 callee_graph.returnblock,
             )],
             dead: false,
@@ -5041,7 +5210,7 @@ mod tests {
         };
         let foo_return = Block {
             id: callee_graph.returnblock,
-            inputargs: block_inputargs(&callee_vars, &[10]),
+            inputargs: block_inputargs(&callee_vars, &[12]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -5054,9 +5223,14 @@ mod tests {
             std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
         );
         setbinding(&foo_v10_var, ValueType::Int);
+        setbinding(&foo_v11_var, ValueType::Int);
         let pygraph = lift_callee_to_pygraph(
             &callee_graph,
-            crate::flowspace::argument::Signature::new(vec!["x".to_string()], None, None),
+            crate::flowspace::argument::Signature::new(
+                vec!["x".to_string(), "n".to_string()],
+                None,
+                None,
+            ),
             &leaf_registry,
         )
         .expect("leaf callee must lift to PyGraph");
@@ -5081,7 +5255,11 @@ mod tests {
         let callee_graph_ref = pygraph.graph.clone();
         registry.register_callee(
             crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(["foo"]),
-            crate::flowspace::argument::Signature::new(vec!["x".to_string()], None, None),
+            crate::flowspace::argument::Signature::new(
+                vec!["x".to_string(), "n".to_string()],
+                None,
+                None,
+            ),
             pygraph,
         );
 
@@ -5089,6 +5267,23 @@ mod tests {
         setbinding(&v2_var, ValueType::Int);
         specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
             .expect("cache pre-fill must let the leaf Call resolve end-to-end");
+
+        let callee_ops: Vec<String> = callee_graph_ref
+            .borrow()
+            .iterblocks()
+            .into_iter()
+            .flat_map(|block| block.borrow().operations.clone())
+            .map(|op| format!("{op:?}"))
+            .collect();
+        eprintln!("[cachedgraph_hit_registers_callee_graph_into_translator_graphs] {callee_ops:?}");
+        assert!(
+            callee_ops.iter().any(|op| op.contains("alloc_and_set")),
+            "callee-lifted repeat must transform to alloc_and_set: {callee_ops:?}"
+        );
+        assert!(
+            callee_ops.iter().all(|op| !op.contains("opname: \"mul\"")),
+            "callee-lifted repeat must contain no mul: {callee_ops:?}"
+        );
 
         // `ensure_session` ran inside the specialize and wired the
         // annotator backlink onto the registry's shared bookkeeper

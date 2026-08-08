@@ -11375,7 +11375,7 @@ fn build_resumed_frames(
     // Resolve ALL vable fields from resume data.
     // vable_values = [frame_ptr(0), last_instr(1), pycode(2),
     //                  valuestackdepth(3), debugdata(4),
-    //                  lastblock(5), w_globals(6), array...]
+    //                  w_globals(5), array...]
     // RPython reader.load_next_value_of_type reads ALL values sequentially.
     let resolved_vable: Vec<Value> = (0..vable_values.len())
         .map(|i| {
@@ -11468,13 +11468,12 @@ fn build_resumed_frames(
             if !vable_frame_ptr.is_null() {
                 let f = unsafe { &*vable_frame_ptr };
                 eprintln!(
-                    "[jit][resume][vable-sync] frame after write: ni={} vsd={} code={:?} ns={:?} debugdata={:?} lastblock={:?} vable_token={} array_len={}",
+                    "[jit][resume][vable-sync] frame after write: ni={} vsd={} code={:?} ns={:?} debugdata={:?} vable_token={} array_len={}",
                     f.next_instr(),
                     f.valuestackdepth,
                     f.pycode,
                     f.w_globals,
                     f.debugdata,
-                    f.lastblock,
                     f.vable_token,
                     f.locals_w().len(),
                 );
@@ -12937,7 +12936,6 @@ mod tests {
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(1),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-            vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
             vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
         }
     }
@@ -13042,7 +13040,6 @@ mod tests {
             Value::Ref(GcRef(frame.pycode as usize)),    // pycode
             Value::Int(4),                               // valuestackdepth
             Value::Ref(GcRef(0)),                        // debugdata
-            Value::Ref(GcRef(0)),                        // lastblock
             Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
         ];
         for reg in live_regs.iter() {
@@ -13135,7 +13132,6 @@ mod tests {
             vable_pycode: ctx.const_ref(0xdead),
             vable_valuestackdepth: ctx.const_int(111),
             vable_debugdata: ctx.const_ref(0xbeef),
-            vable_lastblock: ctx.const_ref(0xcafe),
             vable_w_globals: ctx.const_ref(0xfeed),
         });
         let ec_ref = ctx.const_ref(frame.execution_context as usize as i64);
@@ -13165,11 +13161,8 @@ mod tests {
             ctx.constants_get_value(fail_args[4]),
             Some(majit_ir::Value::Int(4)),
         );
-        // pycode / debugdata / lastblock / w_globals are JIT-scope
-        // invariant under CPython 3.14 bytecode (`lastblock` is mutated
-        // only by SETUP_*/POP_BLOCK paths the tracer never enters) and
-        // stay bound to the trace-start inputarg OpRefs the fixture
-        // seeded above.
+        // pycode / debugdata / w_globals stay bound to the trace-start
+        // inputarg OpRefs the fixture seeded above.
         assert_eq!(
             ctx.constants_get_value(fail_args[3]),
             Some(majit_ir::Value::Ref(majit_ir::GcRef(0xdead))),
@@ -13180,10 +13173,6 @@ mod tests {
         );
         assert_eq!(
             ctx.constants_get_value(fail_args[6]),
-            Some(majit_ir::Value::Ref(majit_ir::GcRef(0xcafe))),
-        );
-        assert_eq!(
-            ctx.constants_get_value(fail_args[7]),
             Some(majit_ir::Value::Ref(majit_ir::GcRef(0xfeed))),
         );
     }
@@ -13251,7 +13240,6 @@ mod tests {
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
             vable_debugdata: ctx.const_ref(0),
-            vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
         });
         let ec_ref = ctx.const_ref(frame.execution_context as usize as i64);
@@ -13347,7 +13335,6 @@ mod tests {
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
             vable_debugdata: ctx.const_ref(0),
-            vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
@@ -13413,7 +13400,6 @@ mod tests {
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
             vable_debugdata: ctx.const_ref(0),
-            vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
@@ -13531,7 +13517,6 @@ mod tests {
                 vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
                 vable_valuestackdepth: ctx.const_int(7),
                 vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-                vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
                 vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
             });
             trace_state::seed_compiled_trace_jitcode_test_state(
@@ -13680,7 +13665,6 @@ mod tests {
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(7),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-            vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
             vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
         });
         trace_state::seed_compiled_trace_jitcode_test_state(
@@ -13797,7 +13781,6 @@ mod tests {
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(3),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-            vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
             vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, target_pc, target_pc);
@@ -14091,7 +14074,7 @@ while i < 40:
     }
 
     /// rclass.py:1133-1137 `ll_issubclass(subcls, cls)` parity. After
-    /// `set_gc_allocator` runs `freeze_types`, the materialized
+    /// `install_gc_standalone` runs `freeze_types`, the materialized
     /// `(subclassrange_min, subclassrange_max)` for each registered
     /// PyType must satisfy `int_between(cls.min, subcls.min, cls.max)`
     /// for every (cls, subcls) pair where `subcls` Python-inherits from
@@ -14105,7 +14088,7 @@ while i < 40:
     ///      `LIST_TYPE`) are disjoint.
     #[test]
     fn test_subclass_range_preorder_bounds() {
-        // Force JIT_DRIVER initialization so set_gc_allocator runs and
+        // Force JIT_DRIVER initialization so init_gc_subsystem runs and
         // installs the active subclass_range hook.
         let _ = driver_pair();
 

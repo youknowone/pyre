@@ -14,6 +14,41 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
+/// Whether allocation lowering already writes exactly the `w_class` value
+/// represented by this virtual field.
+///
+/// RPython's `AbstractStructPtrInfo._force_elements` only visits
+/// `descr.get_all_fielddescrs()` (info.py:217-225), where `typeptr` is absent,
+/// so upstream never emits this header store from the force path. This is the
+/// same optimizer-layer "value already there" elision as heap.py:88-101.
+fn w_class_store_is_covered_by_alloc(
+    size_descr: &DescrRef,
+    field_descr: &DescrRef,
+    value: &Operand,
+    ctx: &crate::optimizeopt::OptContext,
+) -> bool {
+    let Some(field) = field_descr.as_field_descr().filter(|fd| fd.is_w_class()) else {
+        return false;
+    };
+    let Some(size) = size_descr.as_size_descr() else {
+        return false;
+    };
+    let Some(w_class) = size.w_class_obj().filter(|&w| w != 0) else {
+        return false;
+    };
+    let Some(init_field) = size.gc_fielddescrs().iter().find(|fd| fd.is_w_class()) else {
+        return false;
+    };
+    if init_field.offset() != field.offset() || init_field.field_size() != field.field_size() {
+        return false;
+    }
+    matches!(
+        ctx.resolve_operand_operand_opt(value)
+            .and_then(|resolved| resolved.const_value()),
+        Some(Value::Ref(value)) if value == GcRef(w_class as usize)
+    )
+}
+
 pub use majit_ir::field_entry::{FieldEntry, PreambleOp};
 pub use majit_ir::op_info::{EmptyInfo, FloatConstInfo, OpInfo};
 pub use majit_ir::ptr_info::reasonable_array_index;
@@ -1122,6 +1157,9 @@ fn force_box_impl(
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
+                if w_class_store_is_covered_by_alloc(&vinfo.descr, &descr, &value_ref, ctx) {
+                    continue;
+                }
                 let arg_alloc = ctx.materialize_operand_at(alloc_ref);
                 let arg_value = ctx.resolve_operand_operand(&value_ref);
                 let mut set_op =
@@ -1170,6 +1208,9 @@ fn force_box_impl(
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
+                if w_class_store_is_covered_by_alloc(&vinfo.descr, &descr, &value_ref, ctx) {
+                    continue;
+                }
                 let arg_alloc = ctx.materialize_operand_at(alloc_ref);
                 let arg_value = ctx.resolve_operand_operand(&value_ref);
                 let mut set_op =
@@ -1625,12 +1666,137 @@ pub use majit_ir::ptr_info::{
 mod tests {
     use super::*;
     use crate::optimizeopt::OptContext;
-    use majit_ir::{Descr, OpCode, Value};
+    use majit_ir::{Descr, FieldDescr, OpCode, SizeDescr, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]
     struct TestDescr;
     impl Descr for TestDescr {}
+
+    #[derive(Debug)]
+    struct ForceFieldDescr {
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        name: &'static str,
+    }
+
+    impl Descr for ForceFieldDescr {
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for ForceFieldDescr {
+        fn offset(&self) -> usize {
+            self.offset
+        }
+        fn field_size(&self) -> usize {
+            self.field_size
+        }
+        fn field_type(&self) -> Type {
+            self.field_type
+        }
+        fn is_pointer_field(&self) -> bool {
+            self.field_type == Type::Ref
+        }
+        fn field_name(&self) -> &str {
+            self.name
+        }
+    }
+
+    #[derive(Debug)]
+    struct ForceSizeDescr {
+        all_fields: Vec<Arc<dyn FieldDescr>>,
+        gc_fields: Vec<Arc<dyn FieldDescr>>,
+        w_class: i64,
+    }
+
+    impl Descr for ForceSizeDescr {
+        fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl SizeDescr for ForceSizeDescr {
+        fn size(&self) -> usize {
+            32
+        }
+        fn type_id(&self) -> u32 {
+            7
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+        fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+            &self.all_fields
+        }
+        fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+            &self.gc_fields
+        }
+        fn w_class_obj(&self) -> Option<i64> {
+            Some(self.w_class)
+        }
+    }
+
+    fn force_virtual_with_w_class(
+        stored_w_class: usize,
+        stored_offset: usize,
+        init_offset: usize,
+    ) -> Vec<Op> {
+        let stored_field: Arc<dyn FieldDescr> = Arc::new(ForceFieldDescr {
+            offset: stored_offset,
+            field_size: 8,
+            field_type: Type::Ref,
+            name: "PyObject.w_class",
+        });
+        let other_field: Arc<dyn FieldDescr> = Arc::new(ForceFieldDescr {
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Int,
+            name: "Object.payload",
+        });
+        // Deliberately use an independent descriptor for the allocation-side
+        // lookup: name equality alone must not establish byte identity.
+        let init_field: Arc<dyn FieldDescr> = Arc::new(ForceFieldDescr {
+            offset: init_offset,
+            field_size: 8,
+            field_type: Type::Ref,
+            name: "w_class",
+        });
+        let w_class = 0xCAFEusize;
+        let size_descr: DescrRef = Arc::new(ForceSizeDescr {
+            all_fields: vec![stored_field, other_field],
+            gc_fields: vec![init_field],
+            w_class: w_class as i64,
+        });
+        let mut info = PtrInfo::virtual_obj(size_descr, Some(0xDEAD));
+        info.setfield(
+            0,
+            Operand::const_from_value(Value::Ref(GcRef(stored_w_class))),
+        );
+        info.setfield(1, Operand::const_from_value(Value::Int(42)));
+
+        let mut ctx = OptContext::new(8);
+        ctx.in_final_emission = true;
+        let virtual_box = field_op(Type::Ref, 10);
+        info.force_box(&virtual_box, &mut ctx);
+        ctx.new_operations
+            .iter()
+            .map(|op| op.as_ref().clone())
+            .collect()
+    }
+
+    fn setfield_offsets(ops: &[Op]) -> Vec<usize> {
+        ops.iter()
+            .filter(|op| op.opcode == OpCode::SetfieldGc)
+            .map(|op| {
+                op.getdescr()
+                    .and_then(|descr| descr.as_field_descr().map(|fd| fd.offset()))
+                    .expect("SETFIELD_GC must carry a field descriptor")
+            })
+            .collect()
+    }
 
     /// Bound-producer `Operand` at position `int_op(pos)` / `ref_op(pos)`,
     /// the field-value analog of the old `from_opref` test stand-ins.
@@ -1669,6 +1835,30 @@ mod tests {
 
         let virtual_struct = PtrInfo::virtual_struct(descr);
         assert!(virtual_struct.is_virtual());
+    }
+
+    #[test]
+    fn test_force_box_elides_alloc_covered_w_class_store() {
+        let ops = force_virtual_with_w_class(0xCAFE, 8, 8);
+
+        assert_eq!(ops[0].opcode, OpCode::NewWithVtable);
+        assert_eq!(setfield_offsets(&ops), vec![16]);
+    }
+
+    #[test]
+    fn test_force_box_keeps_reassigned_w_class_store() {
+        let ops = force_virtual_with_w_class(0xBEEF, 8, 8);
+
+        assert_eq!(ops[0].opcode, OpCode::NewWithVtable);
+        assert_eq!(setfield_offsets(&ops), vec![8, 16]);
+    }
+
+    #[test]
+    fn test_force_box_keeps_w_class_store_at_different_offset() {
+        let ops = force_virtual_with_w_class(0xCAFE, 24, 8);
+
+        assert_eq!(ops[0].opcode, OpCode::NewWithVtable);
+        assert_eq!(setfield_offsets(&ops), vec![24, 16]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! `&s[k..]` / `&s[..k]` sub-slice indexes → orthodox `getslice` copies.
 //!
-//! ## Status: RangeTo and RangeFrom dormant
+//! ## Status: RangeFrom dormant
 //!
 //! These recognizers are CAPSTONES, not independently wired primitives. The
 //! RangeFrom arm is built and unit-tested but is not captured or invoked from
@@ -9,19 +9,20 @@
 //! `pyre_interpreter::module::_io::buffered_rwpair::<Impl>::readinto` graph
 //! dropped to the legacy walker.
 //!
-//! RangeTo's primary blocker is semantic: Rust's `&s[..end]` panics when
-//! `end > s.len()`, but `build_ll_listslice_startstop_helper_graph` clamps an
-//! oversized stop to the list length and returns the whole slice
-//! (`translator/rtyper/rlist.rs:3563-3576`). Until lowering can prove
-//! `end <= len`, emitting `getslice(s, 0, end)` would turn an interpreter
-//! failure into success. Its secondary blocker is non-negativity: activating
-//! RangeTo previously emitted bare `getslice/rii>r` from
-//! `split_builtin_kwargs` and `do_warn_explicit`; both stops are
-//! `args.len() - 1`, statically unsigned but not constant. An unsigned gate
-//! would admit those measured failures, while the constant-nonnegative gate
-//! declines them. The upper-bound proof is still missing, so both capture
-//! arms remain dormant and leave the original residual ctor + call chain
-//! untouched.
+//! The `ll_listslice_startstop` clamp (`rpython/rtyper/rlist.py:893-903`)
+//! repairs the oversized result of an unsigned `len - 1` wrap. The MinusOne
+//! shape is admitted because `len - 1 <= len` is proven for this receiver;
+//! a general RangeTo stop has no `end <= len` proof and is declined. The
+//! frontend also strips Rust's own range checks: `TermKind::Assert` branches
+//! unconditionally to success, citing `backendopt/removeassert.py`, because
+//! those checks have no Python-observable meaning.
+//!
+//! The earlier failure was an unwired frontend `getslice` planted before a
+//! graph fell through the legacy walker. The admitted MinusOne path uses an
+//! unregistered synthetic call, expanded only by the rtyper flowspace
+//! adapter, so no frontend `getslice` is planted. RangeFrom alone stays
+//! dormant because its Void `ConstNone` stop has no regalloc coloring on that
+//! path.
 #![allow(dead_code)]
 //!
 //! ## Positioning
@@ -78,7 +79,7 @@
 //! gate that no dropped graph carries a bare `getslice`.
 
 use crate::flowspace::model::Variable;
-use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
+use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `RangeFrom { start }` aggregate feeding a residual
 /// `core::slice::index::<Impl>::index(slice, range)` call, captured during
@@ -129,21 +130,15 @@ pub(crate) fn rewire_slice_index_rangefrom_sites(
     rewritten
 }
 
-/// Rewrite captured `RangeTo { end }` indexes into
-/// `getslice(slice, 0, end)` (`SliceKind::StartStop`). Production capture must
-/// remain dormant until it can prove `end <= slice.len()`; the StartStop
-/// helper clamps instead of preserving Rust's out-of-bounds panic.
+/// Rewrite captured `RangeTo { end }` indexes through the synthetic-call
+/// channel. Only the MinusOne shape has a proven stop bound.
 pub(crate) fn rewire_slice_index_rangeto_sites(
     graph: &mut FunctionGraph,
     sites: &[SliceIndexRangeToSite],
 ) -> usize {
     let mut rewritten = 0;
     for site in sites {
-        match rewire_one_slice_index_site(
-            graph,
-            &site.range_result,
-            SliceIndexBounds::RangeTo { end: &site.end },
-        ) {
+        match rewire_one_slice_index_rangeto_site(graph, site) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
                 // Leave the residual chain intact so legacy keeps its prior
@@ -157,7 +152,35 @@ pub(crate) fn rewire_slice_index_rangeto_sites(
 #[derive(Clone, Copy)]
 enum SliceIndexBounds<'a> {
     RangeFrom { start: &'a Variable },
-    RangeTo { end: &'a Variable },
+    MinusOne { end: &'a Variable },
+}
+
+fn rewire_one_slice_index_rangeto_site(
+    graph: &mut FunctionGraph,
+    site: &SliceIndexRangeToSite,
+) -> Result<(), String> {
+    let range = &site.range_result;
+    let slice = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .find_map(|op| {
+            let OpKind::Call { args, .. } = &op.kind else {
+                return None;
+            };
+            (is_slice_range_index_call(&op.kind) && args.len() == 2 && args[1] == *range)
+                .then(|| args[0].clone())
+        })
+        .ok_or_else(|| format!("{}: no RangeTo index consumer", graph.name))?;
+    let bounds = if minus_one_end_matches(graph, &site.end, &slice) {
+        SliceIndexBounds::MinusOne { end: &site.end }
+    } else {
+        return Err(format!(
+            "{}: RangeTo stop has no proof that end <= slice length — declining",
+            graph.name
+        ));
+    };
+    rewire_one_slice_index_site(graph, range, bounds)
 }
 
 fn rewire_one_slice_index_site(
@@ -172,7 +195,7 @@ fn rewire_one_slice_index_site(
     //    value as its `range` operand (args[1]). Capture its `slice` operand
     //    (args[0]) and result; the position is re-found after the sweeps
     //    below, since removing the ctor / FieldWrite shifts op indices.
-    let (slice, index_result) = graph
+    let (slice, index_result, index_result_ty) = graph
         .blocks
         .iter()
         .find_map(|b| {
@@ -187,7 +210,10 @@ fn rewire_one_slice_index_site(
                     return None;
                 }
                 let result = op.result.as_ref()?;
-                Some((args[0].clone(), result.clone()))
+                let OpKind::Call { result_ty, .. } = &op.kind else {
+                    unreachable!()
+                };
+                Some((args[0].clone(), result.clone(), result_ty.clone()))
             })
         })
         .ok_or_else(|| format!("{name}: no slice::index call consumes the RangeFrom value"))?;
@@ -219,10 +245,9 @@ fn rewire_one_slice_index_site(
     //     `getslice/rii>r` from `split_builtin_kwargs` and
     //     `do_warn_explicit`; both measured ends were `args.len() - 1`,
     //     statically unsigned but not constant, so an unsigned-only gate would
-    //     not decline them. Even a non-negative constant must not be wired in
-    //     production without the primary `end <= slice.len()` proof: the
-    //     StartStop helper clamps an oversized stop (`rlist.rs:3563-3576`),
-    //     whereas Rust indexing panics.
+    //     not decline them. A general RangeTo stop also lacks the primary
+    //     `end <= slice.len()` proof: the StartStop helper clamps an oversized
+    //     stop (`rlist.rs:3563-3576`), whereas Rust indexing panics.
     match bounds {
         SliceIndexBounds::RangeFrom { start } => {
             if !graph_defines(graph, start) {
@@ -236,13 +261,13 @@ fn rewire_one_slice_index_site(
                 ));
             }
         }
-        SliceIndexBounds::RangeTo { end } => {
+        SliceIndexBounds::MinusOne { end } => {
             if !graph_defines(graph, end) {
-                return Err(format!("{name}: RangeTo end is not defined in the graph"));
+                return Err(format!("{name}: MinusOne end is not defined in the graph"));
             }
-            if !bound_is_const_nonneg(graph, end) {
+            if !minus_one_end_matches(graph, end, &slice) {
                 return Err(format!(
-                    "{name}: RangeTo end is not a non-negative constant — declining"
+                    "{name}: RangeTo end is not sub(ArrayLen(slice), 1) — declining"
                 ));
             }
         }
@@ -250,32 +275,31 @@ fn rewire_one_slice_index_site(
 
     // --- All structural validation passed; mutate the graph. ---
 
-    // 4. Remove every `start` `FieldWrite` on the `RangeFrom` value and the
-    //    `SyntheticTransparentCtor` producing it. After the rewrite `range` is
-    //    dead (the gate proved the index call is its only non-construction
-    //    consumer), so a surviving `setattr("start")` or ctor would wall on a
-    //    value nothing reads.
-    for b in &mut graph.blocks {
-        b.operations.retain(|op| {
-            let is_field_write =
-                matches!(&op.kind, OpKind::FieldWrite { base, .. } if base == &range);
-            let is_ctor = op.result.as_ref() == Some(&range)
-                && matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::SyntheticTransparentCtor { .. },
-                        ..
-                    }
-                );
-            !(is_field_write || is_ctor)
-        });
+    // 4. Remove the range construction only for the RangeFrom rewrites.
+    // MinusOne leaves the ctor and its FieldWrite in
+    //    place: the range can be carried by a block link without being read
+    //    by an operation, and sweeping its sole defining ctor would orphan
+    //    that link-carried value.
+    if matches!(bounds, SliceIndexBounds::RangeFrom { .. }) {
+        for b in &mut graph.blocks {
+            b.operations.retain(|op| {
+                let is_field_write =
+                    matches!(&op.kind, OpKind::FieldWrite { base, .. } if base == &range);
+                let is_ctor = op.result.as_ref() == Some(&range)
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { .. },
+                            ..
+                        }
+                    );
+                !(is_field_write || is_ctor)
+            });
+        }
     }
 
     // 5. Replace the residual `slice::index` call (re-located by result
-    //    identity — the sweeps above shifted op indices) with
-    //    `getslice(slice, start, None)`. The `None` stop is a fresh
-    //    `ConstNone` op inserted immediately before the getslice so its result
-    //    Variable is defined in the same block.
+    //    identity — the sweeps above shifted op indices).
     let (rb, ri) = graph
         .blocks
         .iter()
@@ -289,29 +313,73 @@ fn rewire_one_slice_index_site(
                 .map(|oi| (bi, oi))
         })
         .ok_or_else(|| format!("{name}: slice::index op vanished before rewrite"))?;
-    let synthetic_bound = graph.alloc_value_var();
-    let (args, synthetic_kind) = match bounds {
-        SliceIndexBounds::RangeFrom { start } => (
-            vec![slice, start.clone(), synthetic_bound.clone()],
-            OpKind::ConstNone,
-        ),
-        SliceIndexBounds::RangeTo { end } => (
-            vec![slice, synthetic_bound.clone(), end.clone()],
-            OpKind::ConstInt(0),
-        ),
-    };
-    graph.blocks[rb].operations[ri] = SpaceOperation {
-        result: Some(index_result),
-        kind: OpKind::GetSlice { args },
-    };
-    graph.blocks[rb].operations.insert(
-        ri,
-        SpaceOperation {
-            result: Some(synthetic_bound),
-            kind: synthetic_kind,
-        },
-    );
+    match bounds {
+        SliceIndexBounds::MinusOne { .. } => {
+            graph.blocks[rb].operations[ri] = SpaceOperation {
+                result: Some(index_result),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__getslice_minusone".to_string()],
+                    },
+                    args: vec![slice],
+                    result_ty: index_result_ty,
+                },
+            };
+        }
+        SliceIndexBounds::RangeFrom { start } => {
+            let synthetic_bound = graph.alloc_value_var();
+            graph.blocks[rb].operations[ri] = SpaceOperation {
+                result: Some(index_result),
+                kind: OpKind::GetSlice {
+                    args: vec![slice, start.clone(), synthetic_bound.clone()],
+                },
+            };
+            graph.blocks[rb].operations.insert(
+                ri,
+                SpaceOperation {
+                    result: Some(synthetic_bound),
+                    kind: OpKind::ConstNone,
+                },
+            );
+        }
+    }
     Ok(())
+}
+
+/// `end = sub(ArrayLen(slice), 1)` is the only RangeTo shape whose stop is
+/// proven against this receiver's length, and only its unsigned form has the
+/// required wraparound semantics. `ArrayLen` and plain `sub` are the measured
+/// post-lowering forms (`front/mir.rs:14603`).
+fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable) -> bool {
+    let Some((lhs, rhs)) = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .find_map(|op| match (&op.result, &op.kind) {
+            (
+                Some(result),
+                OpKind::BinOp {
+                    op,
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Unsigned,
+                },
+            ) if result == end && op == "sub" => Some((lhs.clone(), rhs.clone())),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    let has_len = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+        op.result.as_ref() == Some(&lhs)
+            && matches!(&op.kind, OpKind::ArrayLen { base, .. } if base == slice)
+    });
+    let has_one = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .any(|op| op.result.as_ref() == Some(&rhs) && matches!(&op.kind, OpKind::ConstInt(1)));
+    has_len && has_one
 }
 
 /// `true` when `kind` is a residual `core::slice::index::<Impl>::index` call —
@@ -334,11 +402,15 @@ fn is_slice_range_index_call(kind: &OpKind) -> bool {
 /// path `core::slice::index::<Impl>::index`.
 fn slice_index_segments_match(segments: &[String]) -> bool {
     let n = segments.len();
-    n >= 3
-        && segments[n - 1] == "index"
-        && segments[n - 2] == "<Impl>"
+    if n < 4 || segments.first().map(String::as_str) != Some("core") {
+        return false;
+    }
+    let slice_impl = n >= 5
+        && segments[n - 4] == "slice"
         && segments[n - 3] == "index"
-        && segments.first().map(String::as_str) == Some("core")
+        && segments[n - 2] == "<Impl>";
+    let array_impl = segments[n - 3] == "array" && segments[n - 2] == "<Impl>";
+    segments[n - 1] == "index" && (slice_impl || array_impl)
 }
 
 /// `true` when the `RangeFrom` value is consumed by EXACTLY its own
@@ -609,14 +681,197 @@ mod tests {
         assert!(stop_is_const_none, "arg2 = ConstNone (StartOnly stop)");
     }
 
+    #[test]
+    fn minus_one_recognizer_requires_same_slice_array_len() {
+        let mut g = FunctionGraph::new("minus_one_recognizer");
+        let b = g.startblock;
+        let slice = g.push_op_var(b, OpKind::ConstInt(0), true).unwrap();
+        let other = g.push_op_var(b, OpKind::ConstInt(0), true).unwrap();
+        let len = g
+            .push_op_var(
+                b,
+                OpKind::ArrayLen {
+                    base: slice.clone(),
+                    array_type_id: None,
+                    nolength: false,
+                },
+                true,
+            )
+            .unwrap();
+        let one = g.push_op_var(b, OpKind::ConstInt(1), true).unwrap();
+        let end = g
+            .push_op_var(
+                b,
+                OpKind::BinOp {
+                    op: "sub".into(),
+                    lhs: len,
+                    rhs: one,
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(minus_one_end_matches(&g, &end, &slice));
+        assert!(!minus_one_end_matches(&g, &end, &other));
+    }
+
+    #[test]
+    fn minus_one_recognizer_requires_unsigned_subtraction() {
+        let mut g = FunctionGraph::new("minus_one_recognizer_signed");
+        let b = g.startblock;
+        let slice = g.push_op_var(b, OpKind::ConstInt(0), true).unwrap();
+        let len = g
+            .push_op_var(
+                b,
+                OpKind::ArrayLen {
+                    base: slice.clone(),
+                    array_type_id: None,
+                    nolength: false,
+                },
+                true,
+            )
+            .unwrap();
+        let one = g.push_op_var(b, OpKind::ConstInt(1), true).unwrap();
+        let end = g
+            .push_op_var(
+                b,
+                OpKind::BinOp {
+                    op: "sub".into(),
+                    lhs: len,
+                    rhs: one,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(!minus_one_end_matches(&g, &end, &slice));
+    }
+
+    #[test]
+    fn rewrite_minusone_keeps_link_carried_range_defined() {
+        let mut g = FunctionGraph::new("test_slice_index_minusone_link");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let len = g
+            .push_op_var(
+                a,
+                OpKind::ArrayLen {
+                    base: slice.clone(),
+                    array_type_id: None,
+                    nolength: false,
+                },
+                true,
+            )
+            .unwrap();
+        let one = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let end = g
+            .push_op_var(
+                a,
+                OpKind::BinOp {
+                    op: "sub".into(),
+                    lhs: len,
+                    rhs: one,
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let range = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: rangeto_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::RangeTo".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(a).operations.push(SpaceOperation {
+            result: None,
+            kind: end_field_write(&range, &end),
+        });
+        let sub = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: slice_index_call_target(),
+                    args: vec![slice, range.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(2);
+        g.set_return(b, None);
+        // The RangeTo value is carried to the successor but never read by an
+        // operation there — precisely the shape that must not orphan it.
+        g.set_goto(a, b, vec![sub, range.clone()]);
+
+        let site = SliceIndexRangeToSite {
+            range_result: range.clone(),
+            end,
+        };
+        assert_eq!(
+            rewire_slice_index_rangeto_sites(&mut g, &[site]),
+            1,
+            "the MinusOne slice::index site is rewritten"
+        );
+        assert!(
+            g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { .. },
+                        ..
+                    }
+                ) && op.result.as_ref() == Some(&range)
+            }),
+            "RangeTo ctor survives MinusOne rewrite"
+        );
+        assert!(
+            g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
+                matches!(&op.kind, OpKind::FieldWrite { base, field, .. }
+                    if base == &range && field.name == "end")
+            }),
+            "RangeTo end FieldWrite survives MinusOne rewrite"
+        );
+
+        for block in &g.blocks {
+            for link in &block.exits {
+                for arg in &link.args {
+                    if let LinkArg::Value(var) = arg {
+                        assert!(
+                            graph_defines(&g, var),
+                            "link arg {var:?} must remain defined after MinusOne rewrite"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// `&s[..k]` uses the existing StartStop contract: a synthetic constant
     /// zero start and the aggregate's real `end` value as stop.
     #[test]
-    fn rewrite_lifts_rangeto_index_to_getslice() {
+    fn rewrite_declines_general_rangeto_without_length_proof() {
         let mut g = FunctionGraph::new("test_slice_index_rangeto");
         let a = g.startblock;
         let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
-        let end = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let end_base = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let end_one = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let end = g
+            .push_op_var(
+                a,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: end_base,
+                    rhs: end_one,
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
         let range = g
             .push_op_var(
                 a,
@@ -653,43 +908,27 @@ mod tests {
             range_result: range.clone(),
             end: end.clone(),
         };
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 1);
-        crate::model::prune_dead_phis(&mut g);
-
-        assert_eq!(g.block(b).inputargs, vec![b_args[0].clone()]);
-        assert_eq!(g.block(a).exits[0].args.len(), 1);
-        assert_ne!(
-            g.block(a).exits[0].args[0].as_variable(),
-            Some(&range),
-            "orphan RangeTo link arg must be removed"
-        );
-
-        let getslice = g
-            .blocks
-            .iter()
-            .flat_map(|blk| &blk.operations)
-            .find_map(|op| match &op.kind {
-                OpKind::GetSlice { args } => Some(args),
-                _ => None,
-            })
-            .expect("RangeTo index becomes getslice");
-        assert_eq!(getslice[0], slice);
-        assert_eq!(getslice[2], end);
-        let start = &getslice[1];
-        assert!(g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
-            op.result.as_ref() == Some(start) && matches!(&op.kind, OpKind::ConstInt(0))
-        }));
+        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
         assert!(
-            !g.blocks
+            g.blocks
                 .iter()
                 .flat_map(|blk| &blk.operations)
-                .any(|op| is_slice_range_index_call(&op.kind))
+                .any(|op| { is_slice_range_index_call(&op.kind) }),
+            "general RangeTo remains residual"
         );
+        for block in &g.blocks {
+            for link in &block.exits {
+                for arg in &link.args {
+                    if let LinkArg::Value(var) = arg {
+                        assert!(graph_defines(&g, var), "dangling link arg {var:?}");
+                    }
+                }
+            }
+        }
     }
 
-    /// A RangeTo whose end is computed at runtime declines even when its Rust
-    /// type is unsigned. The measured `args.len() - 1` sites have this shape
-    /// and produced bare unwired `getslice/rii>r` when admitted.
+    /// A RangeTo whose end is computed at runtime declines. The measured
+    /// `args.len() - 1` sites have this shape and have no length proof.
     #[test]
     fn rewrite_declines_runtime_end() {
         let mut g = FunctionGraph::new("test_slice_index_rangeto_runtime");
@@ -704,7 +943,7 @@ mod tests {
                     op: "sub".into(),
                     lhs: len,
                     rhs: one,
-                    result_ty: ValueType::Unsigned,
+                    result_ty: ValueType::Int,
                 },
                 true,
             )
@@ -762,6 +1001,23 @@ mod tests {
                 .any(|op| matches!(&op.kind, OpKind::GetSlice { .. })),
             "no getslice is planted on decline"
         );
+    }
+
+    #[test]
+    fn range_to_rejects_index_mut_and_accepts_array_index() {
+        assert!(!slice_index_segments_match(&[
+            "core".into(),
+            "slice".into(),
+            "index".into(),
+            "<Impl>".into(),
+            "index_mut".into(),
+        ]));
+        assert!(slice_index_segments_match(&[
+            "core".into(),
+            "array".into(),
+            "<Impl>".into(),
+            "index".into(),
+        ]));
     }
 
     /// A RangeFrom whose start is a RUNTIME value (not a const) declines: a

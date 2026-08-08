@@ -74,11 +74,16 @@ fn arg_data_posonly(
     }
     if let Some(dict) = kwargs {
         for (key, _) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }.iter() {
-            let name = key.to_string_lossy();
-            if name != "__pyre_kw__" && !kwonly.contains(&name.as_ref()) {
-                return Err(crate::PyError::type_error(format!(
-                    "{fn_name}() got an unexpected keyword argument '{name}'"
-                )));
+            // A keyword can be any `str`, so the name is compared and reported
+            // as the WTF-8 it is: `format!` would fold a surrogate to U+FFFD.
+            let named = key.as_str().ok();
+            if named != Some("__pyre_kw__") && !named.is_some_and(|n| kwonly.contains(&n)) {
+                let mut msg = rustpython_wtf8::Wtf8Buf::from_string(format!(
+                    "{fn_name}() got an unexpected keyword argument '"
+                ));
+                msg.push_wtf8(key);
+                msg.push_str("'");
+                return Err(crate::PyError::type_error(msg));
             }
         }
     }

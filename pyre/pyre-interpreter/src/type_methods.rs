@@ -2672,15 +2672,13 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::STR_TYPE) } {
             return Ok(args[0]);
         }
-        // `str(self)` — a str self passes through as WTF-8. Dynamic result:
+        // `str(self)` — passes through as WTF-8 whatever the receiver is.
+        // `py_str` is `py_str_wtf8` plus a lossy UTF-8 encode, so taking it
+        // for a non-`str` receiver only folded that receiver's `__str__`
+        // result to U+FFFD on the way back into a `str`.  Dynamic result:
         // collectable.
-        if unsafe { pyre_object::is_str(args[0]) } {
-            return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
-                crate::display::py_str_wtf8(args[0])?
-            }));
-        }
-        return Ok(pyre_object::w_str_new_managed(&unsafe {
-            crate::py_str(args[0])?
+        return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+            crate::display::py_str_wtf8(args[0])?
         }));
     }
     Ok(pyre_object::w_str_from_wtf8_managed(
@@ -2779,7 +2777,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 && !p.alt_form
                 && !matches!(p.sign, Some('+') | Some(' '))
             {
-                let body = Wtf8Buf::from_string(crate::py_str(val)?);
+                let body = unsafe { crate::display::py_str_wtf8(val)? };
                 return pad_wtf8(&body, p.fill, align, p.width);
             }
             // CPython _PyComplex_FormatAdvancedWriter: component flags
@@ -2857,13 +2855,18 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
         // Reached only for the rare builtin type whose `__format__` is the
         // inherited default yet still routes here with a non-empty spec;
         // format its `str()` through the shared string formatter.
-        let s = crate::py_str(val)?;
-        let parsed = FormatSpec::parse(spec)
-            .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
-        let out = parsed
-            .format_string(&CharLenStr(&s, s.chars().count()))
-            .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
-        Ok(Wtf8Buf::from_string(out))
+        let full = unsafe { crate::display::py_str_wtf8(val)? };
+        if let Ok(s) = full.as_str() {
+            let parsed = FormatSpec::parse(spec)
+                .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
+            let out = parsed
+                .format_string(&CharLenStr(s, s.chars().count()))
+                .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
+            return Ok(Wtf8Buf::from_string(out));
+        }
+        // A body carrying a lone surrogate has no `&str` view for the shared
+        // formatter, so pad it by code point.
+        format_surrogate_str(&full, spec)
     }
 }
 
@@ -5179,36 +5182,46 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// pins that in either of two wordings; the arm below is the one pypy prints,
 /// down to `None` rendering unquoted where a type name is quoted.
 ///
-/// The decode itself is not imported — `ljust`/`rjust` refuse a
-/// bytearray/memoryview/array fill that upstream turns into a fill char, as
-/// they already did before this function grew a per-method message. So the
-/// three arms below reproduce upstream's message for every operand upstream
-/// also refuses, and a buffer operand takes the last arm as the one place the
-/// missing decode still shows.
+/// The decode is strict, so an operand that exports bytes which are not valid
+/// UTF-8 raises from the decode rather than being refused by type.
 ///
-/// A str of the wrong length is a separate refusal, and the one upstream
-/// words per method.
+/// A fill of the wrong length is a separate refusal, and the one upstream words
+/// per method; it applies to the decoded operand, so a multi-byte buffer is
+/// rejected by its code-point count and not by its byte count.
 fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::PyError> {
     if args.len() <= 2 {
         return Ok(CodePoint::from_char(' '));
     }
-    if !unsafe { pyre_object::is_str(args[2]) } {
+    let decoded;
+    let raw = if unsafe { pyre_object::is_str(args[2]) } {
+        unsafe { w_str_get_wtf8(args[2]) }
+    } else {
         let type_name = arg_type_name(args[2]);
-        let message = if method == "center" {
-            format!("expected str, got {type_name} object")
+        if method == "center" {
+            return Err(crate::PyError::type_error(format!(
+                "expected str, got {type_name} object"
+            )));
         } else if unsafe { pyre_object::is_bytes(args[2]) } {
-            format!("Can't convert '{type_name}' object to str implicitly")
+            return Err(crate::PyError::type_error(format!(
+                "Can't convert '{type_name}' object to str implicitly"
+            )));
         } else {
-            let operand = if unsafe { pyre_object::is_none(args[2]) } {
-                "None".to_string()
-            } else {
-                format!("'{type_name}'")
+            let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(args[2])? else {
+                let operand = if unsafe { pyre_object::is_none(args[2]) } {
+                    "None".to_string()
+                } else {
+                    format!("'{type_name}'")
+                };
+                return Err(crate::PyError::type_error(format!(
+                    "decoding to str: a bytes-like object is required, not {operand}"
+                )));
             };
-            format!("decoding to str: a bytes-like object is required, not {operand}")
-        };
-        return Err(crate::PyError::type_error(message));
-    }
-    let raw = unsafe { w_str_get_wtf8(args[2]) };
+            let result = crate::typedef::decode_bytes_to_wtf8(buffer.as_bytes(), "utf-8", "strict");
+            buffer.release();
+            decoded = result?;
+            decoded.as_ref()
+        }
+    };
     let mut iter = raw.code_points();
     let first = iter.next();
     if first.is_none() || iter.next().is_some() {
@@ -6416,7 +6429,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     default.ok_or_else(|| crate::PyError::key_error_with_key(key))
 }
 
-/// `pypy/objspace/std/dictmultiobject.py:1395 W_DictMultiObject.descr_popitem`:
+/// `dictmultiobject.py:257` `W_DictMultiObject.descr_popitem`:
 ///
 /// ```python
 /// def descr_popitem(self, space):
@@ -6427,9 +6440,9 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 ///     return space.newtuple([w_key, w_value])
 /// ```
 ///
-/// In Python 3.7+ `popitem` is LIFO (returns the most recently
-/// inserted pair); pyre's `w_dict_items` preserves insertion order
-/// so popping the last entry matches the spec.
+/// Keep the pre-dispatch empty guard: a receiver whose backing is null, or an
+/// empty mapdict/module strategy, raises before strategy code can initialise or
+/// touch backing storage.
 pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "popitem")?;
     arity_no_args(args, "popitem")?;
@@ -6441,12 +6454,12 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         if pyre_object::w_dict_len(dict) == 0 {
             return Err(crate::PyError::key_error("popitem(): dictionary is empty"));
         }
-        let items = pyre_object::w_dict_items(dict);
-        let (k, v) = items
-            .last()
-            .copied()
+        let (k, v) = pyre_object::dictmultiobject::w_dict_popitem(dict)
             .ok_or_else(|| crate::PyError::key_error("popitem(): dictionary is empty"))?;
-        pyre_object::dictmultiobject::w_dict_delitem(dict, k);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let pair_slot = pyre_object::gc_roots::pin_roots(&[k, v]);
+        let k = pyre_object::gc_roots::shadow_stack_get(pair_slot);
+        let v = pyre_object::gc_roots::shadow_stack_get(pair_slot + 1);
         Ok(pyre_object::w_tuple_new(vec![k, v]))
     }
 }
@@ -6484,7 +6497,7 @@ mod dict_method_tests {
         let err = result.expect_err("operation should reject unhashable dict key");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         assert_eq!(
-            err.message,
+            err.message_text(),
             "cannot use 'list' as a dict key (unhashable type: 'list')"
         );
     }

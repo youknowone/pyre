@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=5
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # set/frozenset methods with a fixed arity raise TypeError on a wrong
 # positional-argument count instead of silently accepting it. The exact message
 # text differs between CPython and PyPy, so only the exception type (which they

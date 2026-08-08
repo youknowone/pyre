@@ -159,7 +159,7 @@ const CANONICAL_IDENTITY_DICT_KEY: &str = "@objects_in_repr_identity_dict";
 /// `interp_magic.py:280-290 write_unraisable` — turn the supplied exception
 /// value back into an OperationError and report it through `sys.unraisablehook`.
 fn write_unraisable(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
-    let where_desc = crate::baseobjspace::str_utf8_w(args[0])?;
+    let where_desc = crate::baseobjspace::text_wtf8_w(args[0])?.to_wtf8_buf();
     // `OperationError(space.type(w_exc), w_exc)` accepts any object, so the
     // exception tag cannot be read unconditionally: it lives past the header
     // of a `W_BaseException`, and a plain instance is smaller than that.

@@ -198,9 +198,9 @@ fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         )));
     }
     if crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(token, "_used")?)? {
-        return Err(crate::PyError::runtime_error(format!(
-            "{} has already been used once",
+        return Err(crate::PyError::runtime_error(crate::display::wtf8_format!(
             token_repr_string(token)?,
+            " has already been used once",
         )));
     }
     let token_var = crate::baseobjspace::getattr_str(token, "_var")?;
@@ -228,31 +228,30 @@ fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_none())
 }
 
-fn context_var_repr_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
+fn context_var_repr_string(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     let Some(_guard) = crate::display::ReprGuard::enter(obj) else {
-        return Ok("...".to_string());
+        return Ok(rustpython_wtf8::Wtf8Buf::from_string("...".to_string()));
     };
     let name = crate::baseobjspace::getattr_str(obj, "_name")?;
-    let name_repr = unsafe { crate::display::py_repr_wtf8(name)? }
-        .to_string_lossy()
-        .into_owned();
+    let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
     let default = match crate::baseobjspace::findattr_result(obj, "_default")? {
-        Some(value) => {
-            let value_repr = unsafe { crate::display::py_repr_wtf8(value)? }
-                .to_string_lossy()
-                .into_owned();
-            format!(" default={value_repr}")
-        }
-        None => String::new(),
+        Some(value) => crate::display::wtf8_format!(" default=", unsafe {
+            crate::display::py_repr_wtf8(value)?
+        }),
+        None => rustpython_wtf8::Wtf8Buf::new(),
     };
-    Ok(format!(
-        "<ContextVar name={name_repr}{default} at 0x{:x}>",
-        obj as usize
+    Ok(crate::display::wtf8_format!(
+        "<ContextVar name=",
+        name_repr,
+        default,
+        format!(" at 0x{:x}>", obj as usize),
     ))
 }
 
 fn context_var_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new(&context_var_repr_string(args[0])?))
+    Ok(pyre_object::w_str_from_wtf8(context_var_repr_string(
+        args[0],
+    )?))
 }
 
 fn token_type() -> PyObjectRef {
@@ -369,22 +368,23 @@ fn token_old_value_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     crate::baseobjspace::getattr_str(args[1], "_old_value")
 }
 
-fn token_repr_string(token: PyObjectRef) -> Result<String, crate::PyError> {
+fn token_repr_string(token: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     let var = crate::baseobjspace::getattr_str(token, "_var")?;
-    let var_repr = unsafe { crate::display::py_repr_wtf8(var)? }
-        .to_string_lossy()
-        .into_owned();
+    let var_repr = unsafe { crate::display::py_repr_wtf8(var)? };
     let used = crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(token, "_used")?)?;
-    Ok(format!(
-        "<Token {}var={} at 0x{:x}>",
-        if used { "used " } else { "" },
+    Ok(crate::display::wtf8_format!(
+        if used {
+            "<Token used var="
+        } else {
+            "<Token var="
+        },
         var_repr,
-        token as usize,
+        format!(" at 0x{:x}>", token as usize),
     ))
 }
 
 fn token_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new(&token_repr_string(args[0])?))
+    Ok(pyre_object::w_str_from_wtf8(token_repr_string(args[0])?))
 }
 
 fn token_enter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

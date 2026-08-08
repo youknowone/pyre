@@ -81,7 +81,12 @@ pub struct SnapshotFrame {
     /// between the two.
     pub pc: u32,
     /// Forward-carried Python instruction PC for this JitCode position.
-    /// `u32::MAX` is the no-snapshot sentinel paired with `pc == -1`.
+    ///
+    /// Unlike the `i32`-typed twins this type carries no no-snapshot sentinel:
+    /// both fields here are `u32`, no writer stamps one, and "no snapshot" is
+    /// the absence of a frame rather than a value inside one. The `-1` sentinel
+    /// belongs to `resume::SnapshotFrame` and `resumedata::RebuiltFrame`, whose
+    /// signed fields can represent it.
     ///
     /// Upstream derives the Python-level position where it needs one; this
     /// carries it, because the resume decoder that reads it back for

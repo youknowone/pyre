@@ -1,4 +1,10 @@
-# pyre-check: max-pypy-ratio=48
+# pyre-check: max-pypy-ratio=160
+# The trip count now puts pypy above the startup-subtraction floor, so this
+# ratio is a measurement rather than pyre divided by the floor constant, and
+# the number it reports is larger than the clamped reading it replaces -- a
+# clamped baseline over-states pypy's work and so under-states the ratio. The
+# ceiling is twice the slowest of the three backends observed unclamped
+# (78.5x on wasm); the previous 48 was fitted against the clamp and fails.
 # `lst.append(x)` on a builtin receiver: the name resolves to a builtin-code
 # function on the type, so LOAD_ATTR's method fast path declines (it only
 # pushes `[descr, self]` for `flag_method_descriptor` types) and `getattr`
@@ -12,7 +18,7 @@
 # call site (class guard), `__`-names that bind through the same shape, and a
 # bound method that outlives its CALL (the virtual must materialize). Output
 # verified against CPython/PyPy.
-N = 20000
+N = 730000
 
 
 def build(n):

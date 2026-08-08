@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # `len()` runs the `__len__` result through `__index__` coercion and the
 # length checks: negative -> ValueError, non-int -> TypeError, and a value
 # too large for a machine word -> OverflowError.

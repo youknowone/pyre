@@ -513,9 +513,7 @@ use crate::descr::{
     float_floatval_descr, int_intval_descr, list_strategy_descr, slice_w_start_descr,
     slice_w_step_descr, slice_w_stop_descr, w_float_size_descr, w_int_size_descr,
 };
-use crate::frame_layout::{
-    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
-};
+use crate::frame_layout::{PYFRAME_DEBUGDATA_OFFSET, PYFRAME_PYCODE_OFFSET};
 
 /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity helper.
 ///
@@ -544,16 +542,13 @@ use crate::frame_layout::{
 /// Pyre matches that single-source model in spirit for the two
 /// per-opcode-advancing fields: `last_instr` / `valuestackdepth` are
 /// rewritten in `s.vable_*` to their pre-opcode value at `orgpc - 1`
-/// before the snapshot is built.  The other four scalars (`pycode`,
-/// `debugdata`, `lastblock`, `w_globals`) keep whatever OpRef
+/// before the snapshot is built. The other three scalars (`pycode`,
+/// `debugdata`, `w_globals`) keep whatever OpRef
 /// `init_vable_indices` seeded at trace start because the tracer
-/// never reaches their mutators under CPython 3.14 bytecode
+/// never reaches their mutators under pyre's 3.14 bytecode
 /// (`pycode` / `w_globals`: only `pyframe.rs::frame_reinit`;
-/// `debugdata`: only `getorcreate_debug_data` on debug paths;
-/// `lastblock`: only `pyopcode.py:1268
-/// SETUP_FINALLY/SETUP_EXCEPT/POP_BLOCK` which CPython 3.14 no
-/// longer emits — try/except/finally goes through the zero-cost
-/// `co_exceptiontable` consulted only on raise).  Convergence to
+/// `debugdata`: only `getorcreate_debug_data` on debug paths).
+/// Convergence to
 /// RPython's pure single-source model requires emitting
 /// `_opimpl_setfield_vable` for those handlers if/when they are
 /// re-introduced, after which the heap remains authoritative through
@@ -573,8 +568,7 @@ use crate::frame_layout::{
 ///
 /// `static_field_name` matches the canonical PyFrame virtualizable
 /// spec at `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`
-/// (`last_instr`, `pycode`, `valuestackdepth`, `debugdata`,
-/// `lastblock`, `w_globals`).
+/// (`last_instr`, `pycode`, `valuestackdepth`, `debugdata`, `w_globals`).
 ///
 /// No-op when the virtualizable shadow is not seeded (non-virtualizable
 /// trace, or before `init_virtualizable_boxes`) and when only its OpRef
@@ -1598,9 +1592,9 @@ impl MIFrame {
     /// Header layout matches `virtualizable_gen.rs:33-35` (frame +
     /// `extra_reds` + `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`):
     /// `[frame:Ref, ec:Ref, last_instr:Int, pycode:Ref,
-    ///   valuestackdepth:Int, debugdata:Ref, lastblock:Ref,
-    ///   w_globals:Ref]` — line-by-line PyPy parity with
-    /// `interp_jit.py:25-31` plus `interp_jit.py:67 reds = ['frame', 'ec']`.
+    ///   valuestackdepth:Int, debugdata:Ref, w_globals:Ref]` — line-by-line
+    /// parity with `interp_jit.py:25-30` plus
+    /// `interp_jit.py:67 reds = ['frame', 'ec']`.
     fn build_fail_arg_types_for_active_boxes(&self, active_boxes: &[OpRef]) -> Vec<Type> {
         let mut types = crate::virtualizable_gen::virt_live_value_types(0);
         for &opref in active_boxes {
@@ -1746,7 +1740,7 @@ impl MIFrame {
         // virtualizable.py:86-93 read_boxes reads statics from the LIVE
         // virtualizable.  The root MIFrame's concrete frame is the
         // trace-stepping snapshot (`snapshot_for_tracing`), whose
-        // `debugdata` / `lastblock` are owned clones freed when tracing
+        // `debugdata` is an owned clone freed when tracing
         // ends — a const captured from the snapshot dangles in the
         // compiled trace's resume data, and the guard-failure vable
         // write (`write_from_resume_data_partial`) then stamps the
@@ -1763,16 +1757,15 @@ impl MIFrame {
                 frame_addr
             }
         };
-        let (code_ptr, debugdata, lastblock) = if statics_addr != 0 {
+        let (code_ptr, debugdata) = if statics_addr != 0 {
             unsafe {
                 (
                     *((statics_addr + PYFRAME_PYCODE_OFFSET) as *const usize),
                     *((statics_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
-                    *((statics_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
                 )
             }
         } else {
-            (0, 0, 0)
+            (0, 0)
         };
         let ns_ptr = self.sym().concrete_namespace as i64;
         // Read from the concrete `PyFrame.valuestackdepth` rather than the
@@ -1798,14 +1791,12 @@ impl MIFrame {
         let pycode_op = ctx.const_ref(code_ptr as i64);
         let vsd_op = ctx.const_int(vsd);
         let debugdata_op = self.sym().vable_debugdata;
-        let lastblock_op = ctx.const_ref(lastblock as i64);
         let w_globals_op = ctx.const_ref(ns_ptr);
         let owns = {
             let s = self.sym_mut();
             s.vable_last_instr = last_instr_op;
             s.vable_pycode = pycode_op;
             s.vable_valuestackdepth = vsd_op;
-            s.vable_lastblock = lastblock_op;
             s.vable_w_globals = w_globals_op;
             s.owns_virtualizable_shadow()
         };
@@ -1828,12 +1819,6 @@ impl MIFrame {
                 "debugdata",
                 debugdata_op,
                 Value::Ref(GcRef(debugdata)),
-            );
-            mirror_vable_static_to_boxes(
-                ctx,
-                "lastblock",
-                lastblock_op,
-                Value::Ref(GcRef(lastblock)),
             );
             mirror_vable_static_to_boxes(
                 ctx,
@@ -1867,14 +1852,13 @@ impl MIFrame {
         // the one at `orgpc`, so the snapshot must encode the pre-opcode
         // state (`last_instr = orgpc - 1`, `valuestackdepth = pre-opcode
         // depth via `pre_opcode_registers_r`).
-        // The other four scalars (`pycode`, `debugdata`, `lastblock`,
-        // `w_globals`) keep the inputarg OpRefs `init_vable_indices`
+        // The other three scalars (`pycode`, `debugdata`, `w_globals`)
+        // keep the inputarg OpRefs `init_vable_indices`
         // seeded at trace start because pyre-jit-trace never enters
-        // their mutators under CPython 3.14 bytecode: `pycode` /
+        // their mutators under pyre's 3.14 bytecode: `pycode` /
         // `w_globals` are set only by `pyframe.rs::frame_reinit`;
-        // `debugdata` only by `getorcreate_debug_data` on debug paths;
-        // `lastblock` only by `pyopcode.py:1268 SETUP_*/POP_BLOCK`,
-        // none of which CPython 3.14 emits.  This matches RPython's
+        // `debugdata` only by `getorcreate_debug_data` on debug paths.
+        // This matches RPython's
         // "boxes carry vable inputargs" model — see
         // `mirror_vable_static_to_boxes` doc for the convergence path
         // when those handlers are re-introduced.
@@ -1956,9 +1940,9 @@ impl MIFrame {
     /// `merge_point_shape_assert_prerequisite_2026_05_03.md`).
     ///
     /// Shape derivation matches `close_loop_args_at`:
-    /// `1 (frame) + extra_reds (ec) + 6 (vable scalars) + target_array_capacity`
+    /// `1 (frame) + extra_reds (ec) + 5 (vable scalars) + target_array_capacity`
     /// where the vable scalars are
-    /// `[next_instr, code, stack_depth, debugdata, lastblock, namespace]`
+    /// `[next_instr, code, stack_depth, debugdata, namespace]`
     /// and `target_array_capacity` is either the virtualizable array
     /// lengths sum (when known) or the fallback `nlocals + stack_only`.
     pub(crate) fn live_args_shape_at(&self, ctx: &TraceCtx) -> usize {
@@ -1978,8 +1962,8 @@ impl MIFrame {
             .map(|lengths| lengths.iter().copied().sum::<usize>())
             .filter(|&len| len >= nlocals)
             .unwrap_or(nlocals + stack_only);
-        // 1 (frame) + extra_reds + 6 (vable_scalars) + target_array_capacity
-        7 + extra_reds + target_array_capacity
+        // 1 (frame) + extra_reds + 5 (vable_scalars) + target_array_capacity
+        6 + extra_reds + target_array_capacity
     }
 
     /// TODO: bundles `pyjitpl.py:2957-2965` `live_arg_boxes`
@@ -2058,11 +2042,10 @@ impl MIFrame {
         //
         // A bytecode offset has exactly one operand-stack depth, so the merge
         // point's depth is available statically from the same liveness table
-        // `maybe_compile_and_run` gates interpreter entry on. Take it when it
-        // exceeds what the frame advertises — never carry fewer slots than the
-        // target header requires. Narrowing is deliberately not done: a close
-        // whose frame is deeper than the header's static depth keeps its
-        // slots, since dropping one would lose a value the JUMP must carry.
+        // `maybe_compile_and_run` gates interpreter entry on. Use that exact
+        // depth in either direction. The full virtualizable array capacity is
+        // still carried below; slots above the header's live depth are dead
+        // capacity and are null-padded rather than counted as live stack.
         self.close_merge_point_vsd = target_pc.and_then(|pc| {
             crate::state::merge_point_stack_depth_to_recover(self.concrete_frame_addr, pc)
         });
@@ -2075,7 +2058,7 @@ impl MIFrame {
             s.nlocals = concrete_nlocals;
             s.valuestackdepth = concrete_vsd;
             let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
-            // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
+            // virtualizable.py:44 + interp_jit.py:25-30: locals_cells_stack_w[*]
             // is a W_Root array → every item is declared Ref. The loop-carried
             // types passed to the JUMP / merge point MUST be Ref for every
             // array slot; tracker-observed Int/Float types are internal to
@@ -2223,7 +2206,6 @@ impl MIFrame {
             code,
             stack_depth,
             debugdata,
-            lastblock,
             namespace,
             nlocals,
             locals,
@@ -2307,7 +2289,6 @@ impl MIFrame {
                 ctx.virtualizable_box_at(2)
                     .unwrap_or(s.vable_valuestackdepth),
                 s.vable_debugdata,
-                s.vable_lastblock,
                 s.vable_w_globals,
                 nlocals,
                 locals_vec,
@@ -2319,14 +2300,7 @@ impl MIFrame {
         let mut args = vec![frame];
         // NUM_EXTRA_REDS == 1 (crate const-assert): `reds = ['frame', 'ec']`.
         args.push(execution_context);
-        args.extend_from_slice(&[
-            next_instr,
-            code,
-            stack_depth,
-            debugdata,
-            lastblock,
-            namespace,
-        ]);
+        args.extend_from_slice(&[next_instr, code, stack_depth, debugdata, namespace]);
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types
                 .get(num_scalars + idx)
@@ -2406,7 +2380,7 @@ impl MIFrame {
         // sharing one `duplicates` dict across both calls. In pyre's flat
         // layout `args = [frame, ni, code, vsd, ns, locals..., stack...]`,
         // that corresponds to every index 0..args.len(). Previously pyre
-        // skipped the 7 scalar header slots (frame + 6 static fields),
+        // skipped the scalar header slots (frame plus the vable statics),
         // which is a line-by-line divergence from RPython.
         // Track slots that the dedup actually mutated so we can mirror the
         // `put_back_list_of_boxes3` mutation below (pyjitpl.py:1578 writes
@@ -2511,8 +2485,7 @@ impl MIFrame {
                             2 => s.vable_pycode = new_opref,
                             3 => s.vable_valuestackdepth = new_opref,
                             4 => s.vable_debugdata = new_opref,
-                            5 => s.vable_lastblock = new_opref,
-                            6 => s.vable_w_globals = new_opref,
+                            5 => s.vable_w_globals = new_opref,
                             _ => {}
                         },
                     }
@@ -2690,8 +2663,8 @@ impl MIFrame {
     /// pyjitpl.py:2586 capture_resumedata: build fail_args for CURRENT
     /// top frame. Returns the scalar header plus active_boxes —
     /// `[frame, (ec)?, last_instr, pycode, valuestackdepth, debugdata,
-    /// lastblock, w_globals, active_boxes...]` — matching
-    /// `interp_jit.py:25-31 PyFrame._virtualizable_` /
+    /// w_globals, active_boxes...]` — matching
+    /// `interp_jit.py:25-30 PyFrame._virtualizable_` /
     /// `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS` line-by-line.
     /// `NUM_EXTRA_REDS` controls whether the ec slot
     /// (interp_jit.py:67 `reds = ['frame', 'ec']`) is present between
@@ -2718,7 +2691,6 @@ impl MIFrame {
             s.vable_pycode,
             s.vable_valuestackdepth,
             s.vable_debugdata,
-            s.vable_lastblock,
             s.vable_w_globals,
         ]);
         fa.extend_from_slice(&active_boxes);
@@ -3123,15 +3095,15 @@ impl MIFrame {
         // opencoder.py:718-726 `_list_of_boxes_virtualizable(boxes)`
         // parity: read from `ctx.virtualizable_boxes` (the canonical
         // analog of RPython's `metainterp.virtualizable_boxes`) for
-        // the four invariant scalars (`pycode`, `debugdata`,
-        // `lastblock`, `w_globals`), and recompute the two
+        // the three invariant scalars (`pycode`, `debugdata`,
+        // `w_globals`), and recompute the two
         // per-opcode-advancing scalars (`last_instr`, `valuestackdepth`)
         // from `self.orgpc` / `pre_opcode_registers_r` so the snapshot encodes
         // the pre-opcode state at `resume_pc` (the PROBE-VABLE-DIV
         // diagnostic confirmed slot 0 / slot 2 are the
         // only divergence sources between the shared shadow and
-        // `s.vable_*` — slots 1/3/4/5 always agree because their
-        // mutators are unreachable under CPython 3.14 bytecode).
+        // `s.vable_*` — slots 1/3/4 always agree because their
+        // mutators are unreachable under pyre's 3.14 bytecode).
         //
         // The slot-0 inline override re-derives `resume_pc - 1`
         // because `flush_to_frame_for_guard` swaps `self.orgpc` to

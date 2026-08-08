@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=13
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # Exceptions raised by `__repr__`/`__str__` overrides propagate out of
 # `repr()`/`str()`/`format`/`%`/f-strings instead of being swallowed,
 # including builtin-leaf subclasses and through container recursion.

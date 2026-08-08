@@ -159,23 +159,18 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
-    // #73: give this promote guard the full multi-frame resume every RPython
-    // guard gets — `_nonstandard_virtualizable` (pyjitpl.py:1120) →
-    // `implement_guard_value(eqbox, pc)` (1916) →
-    // `generate_guard(GUARD_VALUE, resumepc=orgpc)` (2582) →
-    // `capture_resumedata(resumepc)` (2610) walking the WHOLE MIFrame chain
-    // (opencoder.py:819).  When the paused-caller chain covers the full inline
-    // depth (the same gate as the standard multi-frame guard path,
-    // `walker_capture_snapshot_for_last_guard_impl`), publish the callee's OWN
-    // coordinate plus each paused caller instead of the single-frame sentinel
-    // collapse below — whose carried word is `NO_JITCODE_PC`, which
-    // `resolve_resume_pc_with_jitcode_pc` rejects, so the collapse
-    // unconditionally aborts (`GuardResumeCoordinateUnavailable`) every inline
-    // sub-walk emit of this guard.  Stamp the last *guard* op, not the last op:
-    // `emit_force_virtualizable` records GETFIELD_GC / PTR_NE / COND_CALL after
-    // the promote.  A chain that is not full, or a callee/caller frame the
-    // publisher cannot build, falls through to (or aborts the same as) the
-    // sentinel below — never a wrong resume.
+    // Give this promote guard the full inline resume represented by
+    // `_nonstandard_virtualizable` (pyjitpl.py:1120),
+    // `implement_guard_value(eqbox, pc)` (pyjitpl.py:1916),
+    // `generate_guard(GUARD_VALUE, resumepc=orgpc)` (pyjitpl.py:2582),
+    // and `capture_resumedata(resumepc)` (pyjitpl.py:2610) walking the full MIFrame chain
+    // (opencoder.py:819). Publish the callee's own coordinate when the inline
+    // chain is either the single callee frame or is fully covered by paused
+    // callers; both shapes are directly represented by the frame list.  Stamp
+    // the last *guard* op, not the last op: `emit_force_virtualizable` records
+    // GETFIELD_GC / PTR_NE / COND_CALL after the promote.  A chain that skips an
+    // intermediate inline frame still falls through to the sentinel below:
+    // never a wrong resume.
     let (n_parents, n_callees, parent_frames) = {
         let session = ctx.session.borrow();
         (
@@ -192,7 +187,9 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
                 .collect::<Vec<_>>(),
         )
     };
-    if n_parents > 0 && n_parents == n_callees {
+    let publish_inline_frames =
+        (n_parents == 0 && n_callees == 1) || (n_parents > 0 && n_parents == n_callees);
+    if publish_inline_frames {
         return walker_capture_multi_frame_inline_snapshot(
             ctx,
             op_pc,
@@ -1199,8 +1196,7 @@ pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     // The CALL is inside a try-block.  Inline it when its exception handler
     // rejoins a loop (the exc-edge-bridgeable shape): the paused caller frame
     // resumes at the CALL fallthrough on the no-raise path, and on a raise the
-    // caller's `lastblock` (a static box in its virtualizable image) unwinds to
-    // the catch handler in the blackhole — bit-exact — while a hot raise bridges
+    // catch handler runs in the blackhole — bit-exact — while a hot raise bridges
     // into the enclosing loop via the carrier-boundary delivery
     // (`drive_bridge_carrier_walk`'s `finishframe_exception`).
     //
@@ -2275,8 +2271,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // use the same coordinate.
     let callee_jitcode_pc: i32 = match scope.branch_guard_jitcode_pc {
         Some(g) => g as i32,
-        None if after_residual_call => callee_pjc
-            .after_residual_marker_for_jitcode_pc(callee_op_pc)
+        None if after_residual_call => after_residual_guard_marker(&callee_pjc, callee_op_pc, None)
             .or_else(|| {
                 // Fallback only, for the same reason as the single-frame path:
                 // the sticky cursor names this frame's op only while no other
@@ -2510,8 +2505,10 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // Publish the OUTERMOST caller's vable scalars for its resume coordinate so
     // the resume reader restores the caller's `PyFrame` at the CALL return
     // point rather than the stale loop-header seed the walker never crosses
-    // `set_orgpc` to update (mirror of the single-frame path above, 6366-6426).
-    publish_outermost_parent_vable_scalars(ctx, &parent_frames, callee_op_pc)?;
+    // `set_orgpc` to update.
+    if !parent_frames.is_empty() {
+        publish_outermost_parent_vable_scalars(ctx, &parent_frames, callee_op_pc)?;
+    }
 
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
 

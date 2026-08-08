@@ -1085,9 +1085,9 @@ impl W_Deque {
             }
             i += 1;
         }
-        Err(crate::PyError::value_error(format!(
-            "{} is not in deque",
-            unsafe { crate::py_repr(x)? }
+        Err(crate::PyError::value_error(crate::display::wtf8_format!(
+            unsafe { crate::display::py_repr_wtf8(x)? },
+            " is not in deque"
         )))
     }
     fn copy(&self) -> Result<PyObjectRef, crate::PyError> {

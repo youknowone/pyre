@@ -882,6 +882,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     crate::module_ns_store(
         ns,
+        "_override_multi_interp_extensions_check",
+        // Overrides `PyInterpreterConfig.check_multi_interp_extensions` for a
+        // subinterpreter; the main interpreter is refused outright.  pyre runs
+        // one interpreter, so every call takes the refusing arm — the override
+        // has no state to keep.  The int conversion runs first, so a non-int
+        // argument still reports the argument error rather than this one.
+        crate::make_builtin_function_with_arity(
+            "_override_multi_interp_extensions_check",
+            |args| {
+                crate::baseobjspace::gateway_int_w(args[0])?;
+                Err(crate::PyError::runtime_error(
+                    "_imp._override_multi_interp_extensions_check() cannot be used \
+                     in the main interpreter",
+                ))
+            },
+            1,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
         "get_frozen_object",
         // `data` is optional, so there is no fixed natural arity to fast-path
         // on; registering one would declare a call shape the closure does not

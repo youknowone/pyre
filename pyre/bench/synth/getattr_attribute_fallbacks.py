@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6
+# No `max-pypy-ratio`: this fixture has no loop, and its jitstats record
+# `loops_compiled=0` on every backend -- nothing is compiled, so what a
+# ratio would compare is two interpreters' startup. It reads between 1.0x
+# and 12.2x across the runners with no change in what it exercises.
 # descroperation.py _handle_getattribute / objspace.py getattr fast path:
 # an AttributeError raised by a custom __getattribute__ OR by a descriptor
 # __get__ falls back to __getattr__ rather than propagating.

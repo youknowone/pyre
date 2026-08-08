@@ -201,13 +201,18 @@ FLOOR_GATE_MIN_BASELINE_S = 10 * EXEC_TIME_FLOOR_S
 PERF_GATE_FLOOR_RATIO = 1.0
 # Below a ceiling of this many times parity, a floor AT parity would sit inside
 # the band the ceiling itself allows, so the floor drops proportionally instead.
-# The divisor has to clear the span one fixture reads across the CI runners --
-# the ceiling is an allowance set from the slowest of them, and the fastest can
-# read several times lower.  Of the fixtures whose baseline is large enough to
-# arm the floor at all, the widest gap between a ceiling and a ratio a runner
-# reported for it is 6x; those are the fixtures whose pypy time is real work,
-# which is also what earns them a closely fitted ceiling.
-PERF_GATE_FLOOR_DIVISOR = 25
+#
+# The divisor is what lets ONE number bound a fixture at both ends, so it has to
+# clear the span that fixture reads across the runners TWICE OVER: a ceiling is
+# set at twice the slowest runner's ratio, and the derived floor still has to
+# land under the fastest runner's.  Measured over the runner logs, a fixture's
+# own ratio spans as much as 17.8x end to end (`defaults_reassigned_midloop`
+# reads 1.0x and 17.8x), and `class_attrs_methods` and
+# `foriter_inplace_immutable` are barely narrower -- so a ceiling honestly
+# fitted to the slow end sits ~36x above the fast end's reading.  A divisor
+# under that turns raising a ceiling into a floor failure on the fast runner,
+# which is the one way this pair of bounds can fight itself.
+PERF_GATE_FLOOR_DIVISOR = 40
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
 # quantized (see WIN_TIMER_QUANTUM_S above).
@@ -831,7 +836,7 @@ JITSTATS_BADNESS_FIELDS = (
     "fbw_store_journal_rollback_failed",
 )
 
-# The three count-valued counters, and what a move in either direction means:
+# The count-valued counters, and what a move in either direction means:
 #
 # * `guard_failures` counts every guard failure that re-enters the metainterp,
 #   so it is what moves when a compiled loop's guards start failing more often —
@@ -853,6 +858,10 @@ JITSTATS_BADNESS_FIELDS = (
 #   under ordinary tuning", which made a bridge collapse (27 -> 0) invisible for
 #   as long as `guard_failures` stayed inside its band — the whole dead-bridge
 #   class this suite exists to catch.
+# * `retraces_compiled` records that a requested retrace was assembled and
+#   attached. A fall means the retrace path stopped producing an artifact;
+#   without this positive signal, `loops_aborted` can hold at zero and the
+#   accompanying fall in `guard_failures` looks like an improvement.
 # * `fbw_blackhole_adopted_single_frame` and
 #   `fbw_blackhole_adopted_multi_frame` count successful full-body-walk
 #   blackhole adoptions: the walk handed the interpreter a resumable image
@@ -887,6 +896,7 @@ JITSTATS_BADNESS_FIELDS = (
 JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
     "loops_compiled",
     "bridges_compiled",
+    "retraces_compiled",
     "guard_failures",
     "fbw_blackhole_adopted_single_frame",
     "fbw_blackhole_adopted_multi_frame",
@@ -903,11 +913,14 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # `loops_compiled` is inverted against the badness fields: it is the counter
 # that falls when the tracer stops admitting a frame at all, which aborts
 # nothing and *lowers* `guard_failures`, so a fall is the regression and a rise
-# is the gain. The blackhole adoption counters are inverted the same way: a
-# fall means the interpreter stopped receiving an image and went back to replay.
+# is the gain. `retraces_compiled` has the same polarity: a fall means an
+# assembled retrace stopped being attached. The blackhole adoption counters are
+# inverted the same way: a fall means the interpreter stopped receiving an
+# image and went back to replay.
 JITSTATS_REGRESSION_ON_RISE = JITSTATS_BADNESS_FIELDS + ("guard_failures",)
 JITSTATS_REGRESSION_ON_FALL = (
     "loops_compiled",
+    "retraces_compiled",
     "fbw_blackhole_adopted_single_frame",
     "fbw_blackhole_adopted_multi_frame",
 )
@@ -1660,6 +1673,22 @@ class Check:
     # ── build ──
 
     def build_backend(self, backend):
+        # `pyre-jit-trace/build.rs` compares each `build/llbc/*.ullbc` against
+        # what its crate's sources hash to now, and by default reports a
+        # mismatch as a `cargo::warning` — which cargo replays only when it
+        # re-runs the build script, so a run whose crates were cached prints
+        # nothing at all. Every number this script produces is read out of a
+        # binary whose field offsets come from those artefacts, so a stale one
+        # does not fail: it answers, wrongly and quietly. Four measurement runs
+        # on this tree carried the mismatch and none of their logs named it.
+        #
+        # `PYRE_LLBC_STRICT=1` is the promotion build.rs already documents "for
+        # callers that want a gate" — the same finding as `cargo::error`. The
+        # cost is that a rebase which moves the LLBC crates makes the next
+        # check.py stop and ask for a multi-minute re-extraction; the
+        # alternative is a green run that measured the wrong bytes. Set here
+        # rather than per-command so the wasm build gets it too.
+        os.environ["PYRE_LLBC_STRICT"] = "1"
         cfg = CARGO_CONFIG[backend]
         if cfg.get("wasm"):
             return self.build_wasm_backend()
@@ -1682,6 +1711,17 @@ class Check:
                 print(proc.stderr.rstrip())
             print("────────────────────")
             cargo_output = (proc.stderr or "") + (proc.stdout or "")
+            if "LLBC STALE" in cargo_output:
+                # `PYRE_LLBC_STRICT=1` above turned build.rs's staleness
+                # warning into the build failure that got us here. It already
+                # printed the exact `extract-llbc.py` line naming the crates
+                # that moved, so repeat the reason rather than the command.
+                print(red("LLBC artefacts under build/llbc/ are STALE."))
+                print("Field offsets come from them, so a run on this tree "
+                      "would measure the wrong bytes.")
+                print("Re-extract with the command build.rs printed above, "
+                      "then re-run this script.")
+                sys.exit(1)
             llbc_missing = (
                 # translator runtime panic (majit-translate/src/lib.rs)
                 "no LLBC source resolved" in cargo_output

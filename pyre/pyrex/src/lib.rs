@@ -576,7 +576,7 @@ fn real_main(binary_name: &str) {
             // cwd is still the anchor the shadowing check compares module
             // origins against.
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd, "");
+            importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
             let mut argv = vec![std::ffi::OsString::from("-c")];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -589,7 +589,7 @@ fn real_main(binary_name: &str) {
             // `-m`: sys.path[0] is the cwd (runpy resets argv[0] to the
             // module's resolved origin via `_run_module_as_main`).
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd, &cwd.to_string_lossy());
+            importing::init_sys_path(&cwd, cwd.as_os_str());
             let mut argv = vec![std::ffi::OsString::from(&module)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -604,7 +604,11 @@ fn real_main(binary_name: &str) {
             // the same channel module imports use.  The bytes then go through
             // the tokenizer's BOM / PEP 263 decoding in every build.
             let source = match importing::read_source_bytes(Path::new(&path)) {
-                Ok(bytes) => match pyre_interpreter::decode_source_bytes(&bytes, &path, false) {
+                Ok(bytes) => match pyre_interpreter::decode_source_bytes(
+                    &bytes,
+                    rustpython_wtf8::Wtf8::new(path.as_str()),
+                    false,
+                ) {
                     Ok(source) => source,
                     Err(error) => {
                         pyre_interpreter::eprint_exception(&error, false);
@@ -639,7 +643,7 @@ fn real_main(binary_name: &str) {
                 };
                 parent.canonicalize().unwrap_or_else(|_| sys_path_cwd())
             };
-            importing::init_sys_path(&script_dir, &script_dir.to_string_lossy());
+            importing::init_sys_path(&script_dir, script_dir.as_os_str());
             // sys.argv[0] is the script path; remaining values go to argv[1:].
             let mut argv = vec![std::ffi::OsString::from(&path)];
             argv.extend(args);
@@ -664,7 +668,7 @@ fn real_main(binary_name: &str) {
             // (`_PyPathConfig_ComputeSysPath0` on an argv[0] of "" / "-"); the
             // cwd stays the shadowing-check anchor.
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd, "");
+            importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
             // `sys.argv` is `['']` with no script argument and `['-', …]` for
             // an explicit dash.
             let mut argv = vec![std::ffi::OsString::from(argv0)];
@@ -859,10 +863,11 @@ fn maybe_print_jit_stats() {
     );
     let stats = pyre_jit::eval::driver_pair().0.get_stats();
     eprintln!(
-        "[jit-stats] loops_compiled={} bridges_compiled={} loops_aborted={} \
+        "[jit-stats] loops_compiled={} bridges_compiled={} retraces_compiled={} loops_aborted={} \
          guard_failures={} internal_compile_panics={}",
         stats.loops_compiled,
         stats.bridges_compiled,
+        stats.retraces_compiled,
         stats.loops_aborted,
         stats.guard_failures,
         stats.internal_compile_panics,
@@ -1094,7 +1099,7 @@ fn run_atexit_callbacks(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyEx
     if let Err(mut error) = result {
         error.write_unraisable(
             pyre_object::w_none(),
-            "_run_exitfuncs",
+            rustpython_wtf8::Wtf8::new("_run_exitfuncs"),
             pyre_object::w_none(),
         );
     }
@@ -1238,6 +1243,35 @@ fn finalize_system_exit(
     std::process::exit(code);
 }
 
+/// Die by SIGINT for an uncaught KeyboardInterrupt after shutdown has run
+/// (`app_main.py:1133-1153`).
+fn terminate_by_sigint() -> ! {
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        #[cfg(windows)]
+        let signaled = libc::raise(libc::SIGINT);
+        #[cfg(not(windows))]
+        let signaled = libc::kill(libc::getpid(), libc::SIGINT);
+        if signaled != 0 {
+            std::process::exit(1);
+        }
+    }
+    std::process::abort();
+}
+
+fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {
+    let exc = error.exc_object;
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return false;
+    }
+    let Some(raised_type) = pyre_interpreter::typedef::r#type(exc) else {
+        return false;
+    };
+    pyre_interpreter::builtins::lookup_exc_class("KeyboardInterrupt").is_some_and(|target| unsafe {
+        pyre_interpreter::baseobjspace::exception_issubclass_w(raised_type.as_ptr(), target)
+    })
+}
+
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
 /// the `-m` entry point. `vm.run_module` analog.
 fn run_module(module: &str, no_site: bool) {
@@ -1282,6 +1316,7 @@ fn run_module(module: &str, no_site: bool) {
         if e.kind == PyErrorKind::SystemExit {
             finalize_system_exit(e, canonical, ec_ptr);
         }
+        let is_keyboard_interrupt = is_keyboard_interrupt(&e);
         // targetpypystandalone.py:88 `finally: space.finish()` — finalize on
         // every exit path, not only on SystemExit.  Print first: the raw
         // `PyObjectRef` fields of `e` are not GC-visible and `finalize_runtime`
@@ -1289,6 +1324,9 @@ fn run_module(module: &str, no_site: bool) {
         pyre_interpreter::eprint_exception(&e, true);
         finalize_runtime(canonical, ec_ptr);
         maybe_print_jit_stats();
+        if is_keyboard_interrupt {
+            terminate_by_sigint();
+        }
         std::process::exit(1);
     }
     finalize_runtime(canonical, ec_ptr);
@@ -1449,6 +1487,7 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
             if e.kind == PyErrorKind::SystemExit {
                 finalize_system_exit(e, canonical, ec_ptr);
             }
+            let is_keyboard_interrupt = is_keyboard_interrupt(&e);
             // targetpypystandalone.py:88 `finally: space.finish()` — finalize
             // on every exit path, not only on SystemExit.  Print first: the raw
             // `PyObjectRef` fields of `e` are not GC-visible and
@@ -1456,6 +1495,9 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
             pyre_interpreter::eprint_exception(&e, true);
             finalize_runtime(canonical, ec_ptr);
             maybe_print_jit_stats();
+            if is_keyboard_interrupt {
+                terminate_by_sigint();
+            }
             std::process::exit(1);
         }
     }

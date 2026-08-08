@@ -263,10 +263,14 @@ _RESOURCE_DRIVER = (
     "    runpy.run_path({path!r}, run_name='__main__')\n"
 )
 
-# These modules assert fully qualified class/enum names. Running their files
-# as __main__ changes those names even on CPython, so preserve the dotted
-# identity that libregrtest gives them.
-DOTTED_IDENTITY_MODULES = {"test.test_descr", "test.test_enum"}
+# test_descr and test_enum assert fully qualified class/enum names. Running
+# their files as __main__ changes those names even on CPython, so preserve the
+# dotted identity that libregrtest gives them.
+#
+# test_runpy's file as __main__ does not run test_runpy at all — it starts
+# libregrtest over the whole suite (measured: 491 modules on CPython 3.14,
+# 492 here), so script mode can only ever time out on it.
+DOTTED_IDENTITY_MODULES = {"test.test_descr", "test.test_enum", "test.test_runpy"}
 
 # test_datetime's load_tests appends an exhaustive test class for every
 # installed system timezone when test.support.use_resources is left as None.

@@ -771,7 +771,7 @@ impl OptVirtualize {
                         if let Some(err) =
                             field_slot_disagreement(&vinfo.descr, field_idx, field_descr)
                         {
-                            panic!("Virtual {err}");
+                            panic!("Virtual setfield: {err}");
                         }
                         Some(OptimizationResult::Remove)
                     }
@@ -780,7 +780,7 @@ impl OptVirtualize {
                         if let Some(err) =
                             field_slot_disagreement(&vinfo.descr, field_idx, field_descr)
                         {
-                            panic!("VirtualStruct {err}");
+                            panic!("VirtualStruct setfield: {err}");
                         }
                         Some(OptimizationResult::Remove)
                     }
@@ -846,6 +846,34 @@ impl OptVirtualize {
             });
         if (is_raw_op && is_standard_vable_ref) || reads_vable_array_field {
             return OptimizationResult::PassOn;
+        }
+
+        // info.py:212-213 `getfield` opens with the same
+        // `init_fields(fielddescr.get_parent_descr(), fielddescr.get_index())`
+        // that `setfield` does, so upstream's read is what grows `_fields` and
+        // swaps in the more precise descr (info.py:184-188) when the index
+        // belongs to a subclass the allocation's descr does not cover. pyre
+        // keys fields by slot instead of indexing an array, so the read needed
+        // nothing to answer and the call was dropped; `vinfo.descr` then stayed
+        // at whatever the allocation set. That descr is what
+        // `field_slot_disagreement` below reads, so the upgrade has to happen
+        // for the slot it checks to be the slot upstream would have used.
+        //
+        // Only for a virtual: `virtualize.py:185-186` reaches `opinfo.getfield`
+        // under `opinfo.is_virtual()`, and a non-virtual info's descr is
+        // `OptHeap`'s to move (`optimizer.py:484`). The header reads are
+        // excluded for the reason the arms below give -- they do not resolve
+        // through the field list at all.
+        if !is_raw_op && !is_typeptr && !field_descr.is_w_class() {
+            if let (Some(b), Some(parent_descr)) =
+                (struct_box.as_ref(), field_descr.get_parent_descr())
+            {
+                ctx.with_ptr_info_mut(b, |info| {
+                    if info.is_virtual() {
+                        info.init_fields(parent_descr, field_idx as usize);
+                    }
+                });
+            }
         }
 
         if let Some(info) = struct_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
@@ -929,7 +957,64 @@ impl OptVirtualize {
                 // slots by `field_slot_index`, so the two do not meet. Removing
                 // that split is the prerequisite for folding this read at all.
             }
+            // `optimize_setfield_gc` panics on a slot its descr does not
+            // identify, but a spelling that only ever appears on reads never
+            // reaches that check, and this is the side that resolves it.
+            //
+            // It does reach here.  `PYFRAME_VABLE_TOKEN_FIELD_DESCR`
+            // (`pyre-jit-trace descr.rs`) describes `PyFrame.vable_token` at
+            // its byte offset with a placeholder `index_in_parent: 0` and no
+            // parent, because the positional census that assigns the real
+            // indices deliberately does not list the field -- upstream carries
+            // it as `rvirtualizable.py:29`'s appended `('vable_token',
+            // llmemory.GCREF)` and pyre registers it as an extra GC edge so
+            // `clear_gc_fields` zeroes it.  Slot 0 of that layout is
+            // `PyFrame.locals_cells_stack_w`, so `field_idx` addressed the
+            // locals array and `get_field` forwarded a live array pointer as
+            // the frame's token; `emit_force_virtualizable` reads that token
+            // with GETFIELD_GC_R to decide whether the frame is JIT-owned, and
+            // a non-null pointer reads as owned on a frame that has no token.
+            //
+            // A field the positional list does not hold cannot have been
+            // stored under its own identity either, so this is exactly
+            // `virtualize.py:188`'s state: the trace never stored it and the
+            // read answers the zeroed allocation.  Skip the slot lookup and
+            // take the zero fold below -- which for `vable_token` is the
+            // correct value, a virtual frame having never been forced.
+            //
+            // Not gated on `debug_assertions`: the resolution it guards runs in
+            // release, so the guard has to.  `Virtualizable` is not covered --
+            // its fields come from the state-field JIT's own descr set, which
+            // `vstate.descr` does not index.
+            let slot_identifies_field = match &info {
+                PtrInfo::Virtual(vinfo) => {
+                    field_slot_identifies(&vinfo.descr, field_idx, field_descr)
+                }
+                PtrInfo::VirtualStruct(vinfo) => {
+                    field_slot_identifies(&vinfo.descr, field_idx, field_descr)
+                }
+                _ => true,
+            };
+            let slot_resolvable =
+                slot_identifies_field || is_raw_op || is_typeptr || field_descr.is_w_class();
+            if !slot_resolvable && crate::majit_log_enabled() {
+                // What the skip is worth: a populated slot is the value
+                // `get_field` would have forwarded for a field not in it.
+                let populated = match &info {
+                    PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx).is_some(),
+                    PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx).is_some(),
+                    _ => false,
+                };
+                eprintln!(
+                    "[jit][getfield-slot-unlisted] field {:?} at offset {} does not hold slot \
+                     {field_idx} of the virtual's descr (slot populated: {populated}); folding \
+                     to the zeroed allocation",
+                    field_descr.field_name(),
+                    field_descr.offset(),
+                );
+            }
             let field_val = match &info {
+                _ if !slot_resolvable => None,
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::Virtualizable(vstate) => vstate
@@ -982,6 +1067,13 @@ impl OptVirtualize {
             // whose traceback slot is read before it is written
             // (`pytraceback.rs:462`) escapes with its args list and the
             // traceback node behind it.
+            //
+            // Reaching here means `field_val` was `None` and neither header
+            // arm answered.  `virtualstate.py:171-174` tolerates a `None`
+            // fieldstate and `info.py:216-226 _force_elements` emits no
+            // SETFIELD for a `None` field, so upstream itself depends on the
+            // allocation being zeroed -- the fold does not add an assumption
+            // the rest of the optimizer lacks.
             //
             // `w_class` and `typeptr` are excluded: both are header fields
             // resolved from class identity above, and neither is ever zero on
@@ -2410,7 +2502,8 @@ impl Optimization for OptVirtualize {
 /// Returns the disagreement as a message so the caller's panic names both the
 /// slot and the field. Compiled out of release builds: it is a debug assertion,
 /// written as a function only because the message needs the same walk the
-/// predicate does.
+/// predicate does. [`field_slot_identifies`] is the same walk without the
+/// message, for the read side, which has to answer in release too.
 fn field_slot_disagreement(
     descr: &DescrRef,
     field_idx: u32,
@@ -2423,22 +2516,12 @@ fn field_slot_disagreement(
     let Some(slot) = fields.get(field_idx as usize) else {
         return Some(format!(
             "field slot {field_idx} is outside its own descr's field list (len {}, descr \
-             index {}); `set_field` just wrote past the struct this PtrInfo describes",
+             index {}); the slot is past the end of the struct this PtrInfo describes",
             fields.len(),
             descr.index(),
         ));
     };
-    // Both halves must agree. The name is the better key but is not always
-    // carried — the flattened inline aggregates (`ob_header`, an enum's
-    // `__pos_0`) reach here under the documented empty-name fallback — so the
-    // name is compared only when both sides have one, and the offset is
-    // compared always. Neither alone is sufficient: a name can be absent, and a
-    // flattened layout puts an aggregate and its first leaf at one address
-    // (`heaptracker.py:68-69`).
-    let named_apart = !field.field_name().is_empty()
-        && !slot.field_name().is_empty()
-        && slot.field_name() != field.field_name();
-    if named_apart || slot.offset() != field.offset() {
+    if !slot_holds_field(slot.as_ref(), field) {
         return Some(format!(
             "field {:?} at offset {} claims slot {field_idx} of descr index {}, but that \
              slot holds {:?} at offset {}",
@@ -2450,6 +2533,44 @@ fn field_slot_disagreement(
         ));
     }
     None
+}
+
+/// Whether `slot` and `field` name the same field.
+///
+/// Both halves must agree. The name is the better key but is not always
+/// carried — the flattened inline aggregates (`ob_header`, an enum's `__pos_0`)
+/// reach here under the documented empty-name fallback — so the name is
+/// compared only when both sides have one, and the offset is compared always.
+/// Neither alone is sufficient: a name can be absent, and a flattened layout
+/// puts an aggregate and its first leaf at one address
+/// (`heaptracker.py:68-69`).
+fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
+    let named_apart = !field.field_name().is_empty()
+        && !slot.field_name().is_empty()
+        && slot.field_name() != field.field_name();
+    !named_apart && slot.offset() == field.offset()
+}
+
+/// Whether `field_idx` addresses `field` in the struct `descr` describes.
+///
+/// The read side's release-live half of [`field_slot_disagreement`]. The write
+/// side can panic on a disagreement because a wrong store is unrecoverable; a
+/// read has a correct answer available — a field the slot list does not hold
+/// was never stored under its own identity, so `virtualize.py:188`'s zeroed
+/// allocation is what it reads — so it answers that instead of aborting, and
+/// has to be able to answer it in a release build.
+///
+/// A descr that is not a size descr answers `true`: the caller has no field
+/// list to check against, which is the state every pre-existing read was
+/// resolved in and not a disagreement this can see.
+fn field_slot_identifies(descr: &DescrRef, field_idx: u32, field: &dyn FieldDescr) -> bool {
+    let Some(size_descr) = descr.as_size_descr() else {
+        return true;
+    };
+    size_descr
+        .all_fielddescrs()
+        .get(field_idx as usize)
+        .is_some_and(|slot| slot_holds_field(slot.as_ref(), field))
 }
 
 fn set_field(fields: &mut Vec<(u32, Operand)>, field_idx: u32, value: Operand) {

@@ -1,7 +1,11 @@
-# pyre-check: max-pypy-ratio=350
+# pyre-check: max-pypy-ratio=21
 # pypy's exec time is pinned to the startup-subtraction floor here, so the
-# ratio is not a measurement: the ceiling is the one recorded before the
-# tightening, four times the slowest the CI runners observe (84.7x).
+# ratio is not a measurement. The ceiling was 350 before the type-attribute
+# fold: four times the slowest of an unfolded CI band of 21.5x-84.7x. Folded,
+# twelve local readings across the three backends span 3.4x-7.0x, and the
+# ceiling is three times the slowest of them. The unfolded band reached 2.13x
+# the unfolded local reading, which puts a folded CI worst case near 15x, so
+# the ceiling carries roughly 1.4x of headroom over it.
 N = 200000
 
 S = '\udcff'                  # lone low surrogate

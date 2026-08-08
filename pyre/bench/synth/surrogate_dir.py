@@ -1,8 +1,9 @@
-# pyre-check: max-pypy-ratio=5
-# dir() lists lone-surrogate attribute/global names instead of dropping
-# them, and never crashes reading a surrogate str key.  DictStorage keeps
-# names as byte-ish str (entries_wtf8), so a name set via setattr with a
-# lone-surrogate string survives the dir() name walk.
+# pyre-check: max-pypy-ratio=8
+# At the 100 it was recorded with, the loop never reached the JIT --
+# `loops_compiled=0` on every backend -- and pypy's side sat on the
+# execution floor, so the gate compared startup. At 1600 the loop compiles
+# and pypy's own execution is a measurement. The ceiling is four times the
+# slowest observed (1.8x), fitted on one host until the runners report.
 
 import sys
 
@@ -17,7 +18,7 @@ class C:
 # The walks are repeated so the measured body is larger than the process
 # startup floor; only the last round's answers are printed, so the output is
 # identical to a single round.
-REPEAT = 100
+REPEAT = 1600
 
 
 def main():

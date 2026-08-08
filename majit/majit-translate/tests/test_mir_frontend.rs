@@ -660,9 +660,16 @@ fn bool_then_some_lifts_to_short_circuit_diamond() {
 /// `Try::branch(opt)` / `ControlFlow` diamond into a direct switch on
 /// `opt.__discriminant`: `Some` extracts `opt.__pos_0` and continues,
 /// `None` builds a normal `None` return value.
+///
+/// The owners are the per-instantiation `Option<i64>` root, not the bare
+/// template: the fixture's own `Some(v + addend)` writes `__pos_0` under the
+/// suffixed root, so a bare read would take the payload off a different
+/// classdef than the one the producer wrote.
 #[test]
 fn option_question_mark_lifts_to_direct_option_switch() {
     use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
+    const OPTION_ROOT: &str = "core::option::Option<i64>";
+    const SOME_ROOT: &str = "core::option::Option<i64>::Some";
     let llbc = load_corpus();
     let graph = lower_function(llbc, "option_question_mark").expect("lowering");
 
@@ -686,20 +693,20 @@ fn option_question_mark_lifts_to_direct_option_switch() {
                 } if name == "branch" => residual_branch += 1,
                 OpKind::FieldRead { field, .. }
                     if field.name == "__discriminant"
-                        && field.owner_root.as_deref() == Some("core::option::Option") =>
+                        && field.owner_root.as_deref() == Some(OPTION_ROOT) =>
                 {
                     option_disc_read = op.result.clone();
                 }
                 OpKind::FieldRead { field, .. }
                     if field.name == "__pos_0"
-                        && field.owner_root.as_deref() == Some("core::option::Option::Some") =>
+                        && field.owner_root.as_deref() == Some(SOME_ROOT) =>
                 {
                     some_payload_reads += 1;
                 }
                 OpKind::ConstInt(d) => last_disc = Some(*d),
                 OpKind::FieldWrite { field, .. }
                     if field.name == "__discriminant"
-                        && field.owner_root.as_deref() == Some("core::option::Option") =>
+                        && field.owner_root.as_deref() == Some(OPTION_ROOT) =>
                 {
                     if last_disc == Some(0) {
                         none_ctor += 1;

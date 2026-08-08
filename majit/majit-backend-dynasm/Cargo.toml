@@ -21,5 +21,6 @@ indexmap = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
+majit-gc = { workspace = true, features = ["gc_box"] }
 majit-ir = { workspace = true, features = ["test-support"] }
 majit-trace = { workspace = true }

@@ -404,6 +404,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_reorder_saved: None,
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -552,6 +553,19 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 // from, and stash the exception as the FINISH payload.  The
                 // remaining Python frames unwind interpreted, exactly as they
                 // do when the raise surfaces from a residual call.
+                //
+                // The store-back belongs to that same shape and is what makes
+                // the unwind readable: this frame keeps running in the
+                // interpreter, which reads its locals out of
+                // `locals_cells_stack_w`, while the walk held them in the
+                // virtualizable boxes.  `virtualizable.py:101-138 write_boxes`
+                // writes them on every force with no way to decline, and
+                // `record_top_level_application_traceback` above only performs
+                // it concretely, for the recording pass — so without the
+                // emitted store-back the compiled bridge leaves the frame
+                // holding whatever its entry wrote, and a `tb_frame.f_locals`
+                // or `sys._getframe()` on the way out reads every
+                // post-entry local as unbound.
                 if !recording_instruction_is_bare_reraise(&mut wc, position) {
                     record_top_level_application_traceback(
                         &mut wc,
@@ -563,6 +577,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                     );
                 }
                 fbw_publish_exit_last_instr(&mut wc, position);
+                fbw_force_virtualizable_before_return(&mut wc);
                 fbw_terminate_with_raise(seed.exc, seed.exc_concrete);
                 carrier_raise_escapes = true;
                 position
@@ -1249,6 +1264,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_reorder_saved: None,
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,

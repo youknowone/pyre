@@ -50,7 +50,7 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    importing::init_sys_path(&cwd, &cwd.to_string_lossy());
+    importing::init_sys_path(&cwd, cwd.as_os_str());
     // This harness never imports `site`, so perform the post-site `sys.path[0]`
     // insert directly.
     importing::add_sys_path_0();
@@ -79,9 +79,11 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     eval_with_jit(&mut frame).map_err(|e| format!("execution error: {}", e.message))?;
 
     // Non-vacuity: the stable instance allocator hook is installed by the
-    // `JIT_DRIVER` initializer (`driver_pair` -> `set_gc_allocator`). If it is
-    // live now, allocations routed through the managed heap rather than the
-    // leaking Box fallback, so the survival checks were meaningful.
+    // `JIT_DRIVER` initializer (`driver_pair` -> `init_gc_subsystem` ->
+    // `install_gc_standalone`, which registers the hooks against the `gc_sync`
+    // singleton and stores no per-thread box). If it is live now, allocations
+    // routed through the managed heap rather than the leaking Box fallback, so
+    // the survival checks were meaningful.
     let probe = pyre_object::try_gc_alloc_stable(
         pyre_object::W_OBJECT_OBJECT_GC_TYPE_ID,
         pyre_object::W_OBJECT_OBJECT_SIZE,

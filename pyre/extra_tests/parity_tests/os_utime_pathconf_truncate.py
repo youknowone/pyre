@@ -71,9 +71,14 @@ if sys.platform != "win32":
             os.close(fd)
 
 # `times` is the one argument here that may be spelled either way — it sits
-# before the keyword-only marker.
-os.utime(p, times=(-5.0, -6.0))
-check(os.stat(p).st_mtime_ns == -6_000_000_000, "utime(times=...) by keyword")
+# before the keyword-only marker. The pair is one the platform holds: Windows
+# refuses times before the epoch, for the reason given above.
+atime, mtime = (5.0, 6.0) if sys.platform == "win32" else (-5.0, -6.0)
+os.utime(p, times=(atime, mtime))
+check(
+    os.stat(p).st_mtime_ns == int(mtime) * 1_000_000_000,
+    f"utime(times=...) by keyword -> {os.stat(p).st_mtime_ns}",
+)
 raises(lambda: os.utime(p, (1, 2), times=(3, 4)), TypeError)
 
 # Back to a time the rest of the file can be reasoned about.

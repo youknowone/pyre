@@ -27,6 +27,16 @@ gc_stress = []
 # by default so ordinary wasm builds do not abort.
 bh_probe = []
 
+# Per-thread GC box. `install_gc_box` stores a caller-supplied `GcAllocator` in
+# a backend thread-local and every allocation, write-barrier and heap query
+# checks for it first. Only tests install one — production goes through
+# `install_gc_standalone` and allocates from the `gc_sync` singleton — so
+# without this feature `gc_box_installed()` is a constant `false` and the
+# backends' box branches fold away entirely. A crate whose tests install a box
+# must carry `majit-gc = { ..., features = ["gc_box"] }` in `dev-dependencies`;
+# installing one without it panics rather than silently missing every probe.
+gc_box = []
+
 [dependencies]
 indexmap = { workspace = true }
 majit-ir = { workspace = true }

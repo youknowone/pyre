@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # module.py Module.descr_getattribute (PEP 562): after a normal attribute miss
 # the module-level __getattr__ in the module's own dict is consulted, called
 # with just the attribute name.  A present attribute does not trigger it.

@@ -154,7 +154,7 @@ const LLBC_CRATES: &[&str] = &["pyre-object", "pyre-interpreter", "pyre-jit"];
 /// lock (deadlock), and a build script that downloads a toolchain breaks
 /// hermetic / offline / CI builds.
 ///
-/// That ban does not cover the stamp comparison in `warn_if_llbc_stale`:
+/// That ban does not cover the stamp comparison in `fail_if_llbc_stale`:
 /// `scripts/extract-llbc.py --fingerprint` returns before `extract` runs and
 /// only performs a `cargo metadata` walk plus `git ls-files`, so it starts no
 /// nested build and takes no target-directory lock.
@@ -191,7 +191,7 @@ fn preflight_llbc_or_fail() {
         // Present is not the same as current: the artefacts are frozen
         // snapshots (AGENTS.md:48) and nothing above compares them to the
         // sources they were extracted from.
-        warn_if_llbc_stale(&repo_root);
+        fail_if_llbc_stale(&repo_root);
         return;
     }
 
@@ -358,12 +358,16 @@ fn llbc_source_fingerprint(
 /// already skips a crate whose stamp still matches, so this is the comparison
 /// the producer trusts, evaluated by the consumer.
 ///
-/// Warning-only by default: a stale artefact still yields a working build for
-/// everything whose layout did not move, and the remedy is a multi-minute
-/// re-extraction.  `PYRE_LLBC_STRICT=1` promotes the same finding to a hard
-/// failure for callers that want a gate, and
-/// `PYRE_LLBC_SKIP_FINGERPRINT_CHECK` opts out entirely.
-fn warn_if_llbc_stale(repo_root: &std::path::Path) {
+/// A stale artefact fails the build.  It was warning-only, on the argument
+/// that the build still works for everything whose layout did not move; the
+/// measured cost of that leniency is the opposite — a binary built over a
+/// stale artefact reads the *old* layout while the sources say otherwise, so
+/// every measurement taken from it describes code that is not in the tree, and
+/// the warning scrolls past inside `target/*/build/*/output` where nobody
+/// reads it.  `PYRE_LLBC_STRICT=0` demotes it back to a warning for a
+/// deliberately-stale working build, and `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`
+/// skips the comparison entirely.
+fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     println!("cargo::rerun-if-env-changed=PYRE_LLBC_STRICT");
     println!("cargo::rerun-if-env-changed=PYRE_LLBC_SKIP_FINGERPRINT_CHECK");
     if std::env::var_os("PYRE_LLBC_SKIP_FINGERPRINT_CHECK").is_some() {
@@ -400,7 +404,7 @@ fn warn_if_llbc_stale(repo_root: &std::path::Path) {
     // The directive string is the only difference between the two modes, so it
     // is chosen once and the same lines go through it.  `cargo::warning=` and
     // `cargo::error=` each carry a single line with no embedded newline.
-    let strict = std::env::var_os("PYRE_LLBC_STRICT").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let strict = std::env::var_os("PYRE_LLBC_STRICT").as_deref() != Some(std::ffi::OsStr::new("0"));
     let directive = if strict {
         "cargo::error"
     } else {

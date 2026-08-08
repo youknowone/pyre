@@ -28,7 +28,9 @@
 # startup, and the measured ratio settles near 2.2x.  A regression that puts
 # the residuals back is then a twenty-four-million-call blow-up, far outside
 # that margin.
-N = 12000000
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 30430992
 
 
 def same_box_int():

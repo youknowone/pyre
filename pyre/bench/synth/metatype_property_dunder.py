@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=5
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # typeobject.py:811-819 — a metaclass data descriptor (property) named like a
 # hardcoded type attribute wins over the built-in one; an un-overridden dunder
 # still resolves through the built-in path.

@@ -1300,7 +1300,14 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     op: &DecodedOp,
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<Vec<pyre_object::PyObjectRef>> {
-    let fresh = read_ref_var_list_concrete(code, op, 1, ctx);
+    // The Ref list is NOT at a fixed offset: the method-form `CALL` helpers
+    // this leg latches for lower through the mixed `iIRd>r` shape, whose
+    // leading Int list shifts it (`dispatch_residual_call_iIRd_kind` reads it
+    // at `1 + i_width`).  Reading offset 1 there takes the Int list's register
+    // indices into the Ref bank — refs unrelated to the call, of a length that
+    // still passes the flush's depth check.
+    let ref_operand_offset = ref_var_list_operand_offset(code, op)?;
+    let fresh = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
     if fresh.is_empty() {
         return None;
     }
@@ -1804,6 +1811,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         has_closure,
         None,
         None,
+        true,
         false,
         None,
     )
@@ -2024,13 +2032,11 @@ pub(crate) fn walker_ec_leave(
 /// descriptor. The first instruction's arraylen descriptor is deliberately
 /// not interchangeable with the later getarrayitem descriptor.
 pub(super) fn wrapper_args_item_descr_index(code: &[u8]) -> Option<u32> {
-    // Keyword-capable generated wrappers first call
-    // `split_builtin_kwargs(args)` before their arity/unwrap code.  Its
-    // positional-slice result can therefore occupy a register other than the
-    // wrapper input r0, and register colouring can move it again between the
-    // arity check and unwrap.  Generated gateways perform their argument
-    // extraction before entering the typed body, so the first Ref item read
-    // after the first slice-length read is the wrapper-argument descriptor.
+    // Generated gateways perform their argument extraction before entering the
+    // typed body, reading the slice length before any element.  The first Ref
+    // item read after the first slice-length read is therefore the
+    // wrapper-argument descriptor, independent of which register colouring
+    // assigns to the slice.
     let arraylen_pc = crate::jitcode_runtime::decoded_ops(code)
         .find(|decoded| decoded.key == "arraylen_gc/rd>i")
         .map(|decoded| decoded.pc)?;
@@ -2600,6 +2606,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     has_closure: bool,
     exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
     arg_class_guard: Option<ArgClassGuard>,
+    entry_is_call_boundary: bool,
     require_str_result: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -2865,13 +2872,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // body sub-walk reaches its own recursive CALL as a nested residual, which
     // `fbw_abort_nested_unjournaled_residual` declines on the self-recursive
     // hazard arm — an abort storm that folds the whole guard bridge back to
-    // residual.  The native `CALL_ASSEMBLER` self-recursion fold already exempts
-    // that decline via `SELFREC_CA_FOLD_ACTIVE`; the same exemption applies to
-    // this admitted inline, whose recursive residual runs concretely at the
-    // pre-execute site (executed, so no replay double-apply).  Native only: the
-    // wasm always-portal path type-confuses the self-recursive inline
-    // (`setintbound: got Ref`), so it keeps the correct residual-fallback
-    // decline.
+    // residual.  The `CALL_ASSEMBLER` self-recursion fold already exempts that
+    // decline via `SELFREC_CA_FOLD_ACTIVE`; the same exemption applies to this
+    // admitted inline, whose recursive residual runs concretely at the
+    // pre-execute site (executed, so no replay double-apply).
     let mut bridge_rec_root_selfrec = false;
     if ctx.trace_ctx.is_bridge_trace
         && args_all_builtin_integer
@@ -2911,12 +2915,11 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         if !safe_root_bridge {
             return Ok(None);
         }
-        bridge_rec_root_selfrec = cfg!(not(target_arch = "wasm32"))
-            && unsafe {
-                let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject;
-                !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
-            };
+        bridge_rec_root_selfrec = unsafe {
+            let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject;
+            !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
+        };
     }
     // A callee `fbw_abort_nested_unjournaled_residual` already named on its
     // hazard arm residualizes from here on.  The hazard is a static property of
@@ -2962,14 +2965,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             CalleeReplaySafety::Clean => true,
             CalleeReplaySafety::DeferredCall => {
                 // The deferred promise rests on the abort REWINDING to the
-                // enclosing CALL and re-executing it from scratch.  A binop
-                // dunder dispatch (the only entry carrying an
-                // `arg_class_guard`) reaches this lever from a `BINARY_OP`
-                // instead, and that opcode is not a call boundary the rewind
-                // can name: the flush resumes one operand short and the whole
-                // iteration's contribution is dropped, silently.  A `Clean`
-                // body is still admitted from there — it has nothing that can
-                // abort.
+                // enclosing CALL and re-executing it from scratch, so the
+                // entry has to be a boundary the rewind can name.  What
+                // decides that is the entry opcode's stack effect rather than
+                // whether it is spelled CALL: one that merely peeks its
+                // operands re-executes from the stack it already had.  A
+                // `BINARY_OP` or `COMPARE_OP` entry is not: the flush resumes
+                // one operand short and the whole iteration's contribution is
+                // dropped, silently — the subscript inline observed its index
+                // operand replaced by an unrelated live Ref.  Each caller
+                // states this directly in `entry_is_call_boundary`; the older
+                // `arg_class_guard.is_none()` proxy stood for the same
+                // property and rotted, because the `obj[key]` inline enters
+                // from `BINARY_OP` while passing no `arg_class_guard`.  A
+                // `Clean` body is still admitted from there — it has nothing
+                // that can abort.
                 //
                 // The widened method-form surface — an unbound callee whose
                 // body reads `self.attr` — was admitted here only once the
@@ -2992,7 +3002,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // entry or skip the handler cleanup.  Keep handler-bearing
                 // bodies on the residual path unless this scan proves them
                 // clean.
-                foriter_deferred_admit = arg_class_guard.is_none()
+                foriter_deferred_admit = entry_is_call_boundary
                     && !body_facts.owns_loop_header
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !body_facts.has_exception_table
@@ -3509,14 +3519,25 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // `positional_defaults_for_inline` derives that from `len(defs_w)`
         // alone — the length is the only thing that has to be re-checked.
         //
-        // Guard the tuple's identity all the same.  `GuardValue` over an
-        // `arraylen_gc` leaves the guard's only argument dead after it, and a
-        // bridge compiled at that fail index segfaults on entry: reassign
-        // `f.__defaults__` to a different length mid-loop and it is correct up
-        // to ~1000 post-flip iterations and dies past ~2000, with and without
-        // `MAJIT_NO_BRIDGE`.  Identity is stricter than needed but sound, and
-        // it only costs the shape that builds the callee in the caller's own
-        // loop AND omits an argument it has a default for.
+        // Guard the tuple's identity all the same.  Replacing this with
+        // `arraylen_gc` + a length `GuardValue` was implemented and reverted:
+        // it answers correctly on every defaults shape, including the
+        // specialised two-int tuple, but `synth/pickle_terminal_raise_resume`
+        // then segfaults deterministically (EXC_BAD_ACCESS on a null in
+        // compiled code, 5/5), while keeping the added class guard and
+        // restoring this identity `GuardValue` is clean 3/3.  The length guard
+        // is what is unsound here; the class guard is not.
+        //
+        // Identity is stricter than needed and costs nothing measured.  All
+        // three compilers fold an all-constant defaults list into one code
+        // constant — `codegen.py:582-590 _visit_defaults` takes the
+        // `_tuple_of_consts` branch, and pyre's own compiler emits the same
+        // single `LOAD_CONST (None, 7)` — so even a `def` re-executed inside
+        // the caller's loop hands out the same tuple every iteration.  Only a
+        // non-constant default expression (`def f(a=mk())`, which emits
+        // `BUILD_TUPLE`) rebuilds it; no fixture in `bench/` has that shape,
+        // and `make_function_inline`, the one loop-local `def` with a default,
+        // records `guard_failures=1` for its whole run.
         let tuple_expected = ctx.trace_ctx.const_ref(defaults.tuple as i64);
         ctx.trace_ctx
             .record_guard(OpCode::GuardValue, &[defaults_op, tuple_expected], 0);
@@ -4224,6 +4245,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_reorder_saved: None,
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -4983,6 +5005,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         has_closure,
         None,
         None,
+        true,
         // `__init__` bodies are `self.x = ...` stores; the sub-walk folds them
         // to slot writes on the fresh instance exactly as the property-setter
         // route folds its own.
@@ -5138,6 +5161,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         Some((r_args[2], concrete_receiver, w_class, version_tag)),
         None,
         true,
+        true,
         None,
     )?
     else {
@@ -5275,6 +5299,7 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         has_closure,
         Some((r_args[2], concrete_receiver, w_type, version_tag)),
         None,
+        true,
         false,
         None,
     )?
@@ -5460,6 +5485,9 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag)),
         None,
+        // LOAD_ATTR is not a CALL either, but this entry is left admitted
+        // as it was: only the subscript one below has a witness.
+        true,
         // Getter bodies commonly read `self._slot` — a LOAD_ATTR the method-form
         // support gate would otherwise reject; the sub-walk folds it to a slot
         // read (same allowance the exception `__str__`/`__repr__` override uses).
@@ -5566,6 +5594,8 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag)),
         None,
+        // STORE_ATTR, same standing as the getter above.
+        true,
         false,
         None,
     )
@@ -5673,6 +5703,10 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag)),
         None,
+        // `obj[key]` enters from BINARY_OP, which the abort rewind cannot
+        // name.  This is the entry the retired `arg_class_guard.is_none()`
+        // proxy admitted by mistake.
+        false,
         false,
         None,
     )
@@ -5779,10 +5813,12 @@ pub(crate) fn try_walker_specialize_seqiter_getitem_next<Sym: WalkSym>(
     // is what makes that necessary: `RaiseVarargs` classifies as a deferred
     // residual, so a cursor body that ends on one would otherwise never be
     // served.  The deferred promise holds here — a residual the lever cannot
-    // inline aborts before executing and denies the callee — and the one shape
-    // the shared FOR_ITER gate withholds it from, a `BINARY_OP` dunder entry
-    // carrying an `arg_class_guard`, cannot reach this route: the entry is a
-    // FOR_ITER whose only operand is the iterator.
+    // inline aborts before executing and denies the callee.  This route's own
+    // entry is a FOR_ITER, which is not a CALL, and it still passes
+    // `entry_is_call_boundary: true`: `opcode_for_iter` peeks its single
+    // iterator operand where `opcode_binary_op` pops both of its own, so the
+    // rewind re-executes this entry from the stack it already had and the
+    // boundary is nameable.
     if !matches!(
         replay_safety,
         CalleeReplaySafety::Clean | CalleeReplaySafety::DeferredCall
@@ -5864,6 +5900,9 @@ pub(crate) fn try_walker_specialize_seqiter_getitem_next<Sym: WalkSym>(
         has_closure,
         Some((seq_op, seq, w_type, version_tag)),
         None,
+        // FOR_ITER, not a CALL, but a peeking entry the rewind can re-execute —
+        // the replay-safety note above states why that is what the gate asks.
+        true,
         false,
         None,
     );
@@ -6072,6 +6111,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         Some((lhs, concrete_lhs, w_class, version_tag)),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         false,
+        false,
         None,
     )?
     else {
@@ -6226,6 +6266,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
+        false,
         false,
         None,
     )?
@@ -6466,6 +6507,7 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_reorder_saved: None,
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,

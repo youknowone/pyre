@@ -1397,7 +1397,7 @@ pub fn resolve_bridge_walk_entry_at(jitcode_index: i32, carried_jitcode_pc: i32)
 ///
 /// * `scalar_oprefs` — the NUM_VABLE_SCALARS static field OpRefs in
 ///   declaration order (last_instr, pycode, valuestackdepth, debugdata,
-///   lastblock, w_globals). Excludes both the frame-identity slot and
+///   w_globals). Excludes both the frame-identity slot and
 ///   any non-vable extra reds (e.g. `ec`); virtualizable_boxes only
 ///   carries the vable static fields plus array items.
 /// * `array_items` — pre-resolved OpRefs for the heap-side
@@ -2256,8 +2256,8 @@ use crate::descr::{
     w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
-    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-    PYFRAME_PYCODE_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
+    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_PYCODE_OFFSET,
+    PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
 };
 use crate::helpers::emit_box_float_inline;
 
@@ -2391,7 +2391,7 @@ pub struct PyreSym {
     /// by color.
     pub(crate) bridge_registers_r: Option<Vec<OpRef>>,
     /// Bridge-specific override for symbolic_local_types.
-    /// virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
+    /// virtualizable.py:44 + interp_jit.py:25-30: locals_cells_stack_w[*]
     /// is a W_Root array → all items are Type::Ref. setup_bridge_sym
     /// populates this with all-Ref; downstream unboxing happens in
     /// opcode handlers via guard_class + getfield_gc_pure_i/_f, not at
@@ -2412,8 +2412,6 @@ pub struct PyreSym {
     pub(crate) vable_valuestackdepth: OpRef,
     #[vable(inputarg, type = ref)]
     pub(crate) vable_debugdata: OpRef,
-    #[vable(inputarg, type = ref)]
-    pub(crate) vable_lastblock: OpRef,
     #[vable(inputarg, type = ref)]
     pub(crate) vable_w_globals: OpRef,
     #[vable(array_base)]
@@ -2468,10 +2466,10 @@ pub struct PyreSym {
     /// Live (interpreter-owned) virtualizable `PyFrame` behind the tracing
     /// snapshot, or 0 when tracing runs without one (tests).
     /// `concrete_vable_ptr` points at the `snapshot_for_tracing` copy whose
-    /// `debugdata` / `lastblock` are owned clones freed when the snapshot
-    /// drops; vable-statics capture (`flush_to_frame`) reads those
-    /// pointer-valued fields from this frame so the trace's resume data
-    /// never carries snapshot-owned pointers.  RPython has no snapshot —
+    /// `debugdata` is an owned clone freed when the snapshot drops;
+    /// vable-statics capture (`flush_to_frame`) reads that pointer-valued
+    /// field from this frame so the trace's resume data never carries a
+    /// snapshot-owned pointer. RPython has no snapshot —
     /// `read_boxes` (virtualizable.py:86-93) always reads the live
     /// virtualizable, which is what this field restores.
     pub(crate) live_vable_frame_addr: usize,
@@ -2838,7 +2836,6 @@ pub struct TestSymState {
     pub vable_pycode: OpRef,
     pub vable_valuestackdepth: OpRef,
     pub vable_debugdata: OpRef,
-    pub vable_lastblock: OpRef,
     pub vable_w_globals: OpRef,
 }
 
@@ -4399,15 +4396,14 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     Some(nlocals + ncells)
 }
 
-/// Static operand-stack depth at `target_pc`, but only when it exceeds the
-/// depth `frame` still advertises — the depth a closing JUMP must not fall
-/// below when it retargets a merge point at a different bytecode offset.
+/// Static operand-stack depth at `target_pc` when it differs from the depth
+/// `frame` still advertises. A closing JUMP retargeted to a different bytecode
+/// offset must publish the merge point's own live depth.
 ///
 /// `None` means "keep reading the frame": the frame or its code object cannot
 /// answer, the code has no liveness entry for `target_pc`, the depth would
-/// overrun `locals_cells_stack_w`, or the frame already covers the merge
-/// point. Never narrows — see `close_loop_args_at` for why only the widening
-/// direction is a correction.
+/// overrun `locals_cells_stack_w`, or the frame is already at the merge
+/// point's depth.
 pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize) -> Option<usize> {
     let concrete = concrete_stack_depth(frame)?;
     let w_code = unsafe {
@@ -4419,7 +4415,7 @@ pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize)
     if concrete_frame_array_len(frame).is_none_or(|len| depth > len) {
         return None;
     }
-    (depth > concrete).then_some(depth)
+    (depth != concrete).then_some(depth)
 }
 
 /// Return the absolute valuestackdepth.
@@ -4647,7 +4643,7 @@ fn current_quasiimmut_field_value(
     }
 }
 
-/// virtualizable.py:44 + interp_jit.py:25-31 —
+/// virtualizable.py:44 + interp_jit.py:25-30 —
 /// `locals_cells_stack_w[*]` is declared as a W_Root array, so every
 /// item's JIT type is GCREF (Type::Ref). W_IntObject/W_FloatObject are
 /// stored as Ref pointers; unboxing happens inside trace opcode handlers
@@ -4678,12 +4674,8 @@ pub(crate) fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
 /// depth must come from the analysis, not from the frame's entry value.
 ///
 /// All-or-nothing: returns false (frame untouched) when any live slot
-/// lacks a shadow entry, when the depth analysis has no entry for the
-/// merge pc, or when the walked region net-changed the frame's block
-/// chain (`lastblock` — the flush writes only locals/stack/vsd/
-/// last_instr, so a block push/pop inside the walked region would leave
-/// the adopted frame's chain inconsistent with its pc).  The caller then
-/// keeps the legacy replay-from-start behavior.
+/// lacks a shadow entry or when the depth analysis has no entry for the
+/// merge pc. The caller then keeps the legacy replay-from-start behavior.
 pub(crate) fn flush_walk_end_state_to_frame(
     ctx: &TraceCtx,
     frame: usize,
@@ -4812,29 +4804,6 @@ fn flush_walk_end_state_to_frame_inner(
     let end_vsd = nlocals + depth as usize;
     let live = end_vsd.max(nlocals);
     let base = info.num_static_extra_boxes;
-    // Block-chain net-change check: the shadow's `lastblock` static box
-    // still holds the entry chain head iff the walk pushed/popped no
-    // blocks (a balanced push+pop allocates a fresh head and also
-    // declines — conservative).
-    let lastblock_static = info
-        .static_fields
-        .iter()
-        .position(|f| f.name == "lastblock");
-    let Some(lastblock_idx) = lastblock_static else {
-        return decline("no lastblock static field");
-    };
-    let Some((_opref, shadow_lastblock)) = ctx.virtualizable_entry_at(lastblock_idx) else {
-        return decline("no shadow lastblock entry");
-    };
-    let frame_lastblock = unsafe { *(frame_ptr.add(PYFRAME_LASTBLOCK_OFFSET) as *const usize) };
-    match shadow_lastblock {
-        Value::Ref(r) => {
-            if r.0 != frame_lastblock {
-                return decline("lastblock changed during walk");
-            }
-        }
-        _ => return decline("shadow lastblock not a Ref"),
-    }
     // Validation pass first: it allocates nothing, so entry presence
     // cannot change under it.  Commit only when every live slot resolves.
     let stack_override_at = |abs: usize| -> Option<PyObjectRef> {
@@ -5071,29 +5040,6 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
     }
     let end_vsd = nlocals + call_stack.len();
     let base = info.num_static_extra_boxes;
-    // Block-chain net-change check (identical to `flush_walk_end_state_to_frame`):
-    // the flush writes only locals/stack/vsd/last_instr, so a push/pop inside the
-    // walked region would leave the adopted frame's chain inconsistent with its
-    // resumed pc.
-    let Some(lastblock_idx) = info
-        .static_fields
-        .iter()
-        .position(|f| f.name == "lastblock")
-    else {
-        return false;
-    };
-    let Some((_opref, shadow_lastblock)) = ctx.virtualizable_entry_at(lastblock_idx) else {
-        return false;
-    };
-    let frame_lastblock = unsafe { *(frame_ptr.add(PYFRAME_LASTBLOCK_OFFSET) as *const usize) };
-    match shadow_lastblock {
-        Value::Ref(r) => {
-            if r.0 != frame_lastblock {
-                return false;
-            }
-        }
-        _ => return false,
-    }
     // Validation pass first (allocates nothing): every LOCAL slot must resolve
     // in the shadow.  The stack region is supplied by `call_stack`, not the
     // shadow, so it is not validated here.
@@ -5223,21 +5169,6 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
         return false;
     };
     if want_below != below.len() || below.iter().any(|slot| slot.is_null()) {
-        return false;
-    }
-    let Some(lastblock_idx) = info
-        .static_fields
-        .iter()
-        .position(|f| f.name == "lastblock")
-    else {
-        return false;
-    };
-    let Some((_opref, Value::Ref(shadow_lastblock))) = ctx.virtualizable_entry_at(lastblock_idx)
-    else {
-        return false;
-    };
-    let frame_lastblock = unsafe { *(frame_ptr.add(PYFRAME_LASTBLOCK_OFFSET) as *const usize) };
-    if shadow_lastblock.0 != frame_lastblock {
         return false;
     }
     let base = info.num_static_extra_boxes;
@@ -5899,7 +5830,6 @@ impl PyreSym {
             vable_pycode: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
             vable_debugdata: OpRef::NONE,
-            vable_lastblock: OpRef::NONE,
             vable_w_globals: OpRef::NONE,
             vable_array_base: None,
             is_active_vable_owner: false,
@@ -6022,11 +5952,11 @@ impl PyreSym {
     ///      repopulate the shadow from resume data. `is_active_vable_owner`
     ///      is cleared (`clear_active_vable`) because the bridge's
     ///      inputarg layout lacks the `[frame, last_instr, pycode,
-    ///      valuestackdepth, debugdata, lastblock, w_globals]` scalar
+    ///      valuestackdepth, debugdata, w_globals]` scalar
     ///      header that `init_vable_indices` assumes (see
     ///      `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS` for the
-    ///      canonical 6-scalar layout — line-by-line PyPy parity with
-    ///      `interp_jit.py:25-31`); the frame still owns the shadow
+    ///      canonical 5-scalar layout from `interp_jit.py:25-30`); the
+    ///      frame still owns the shadow
     ///      semantically though.
     ///
     /// Callee inline frames (the retired inline-call path allocated a fresh
@@ -6059,8 +5989,8 @@ impl PyreSym {
     /// Demote this frame from active virtualizable owner. Used at bridge
     /// setup (`setup_bridge_sym`) where the bridge's inputarg layout
     /// does not have the `[frame, last_instr, pycode, valuestackdepth,
-    /// debugdata, lastblock, w_globals]` scalar header that the
-    /// loop-portal `init_vable_indices` assumes (canonical 6-scalar
+    /// debugdata, w_globals]` scalar header that the loop-portal
+    /// `init_vable_indices` assumes (canonical 5-scalar
     /// layout in `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`);
     /// subsequent reads consult `bridge_local_oprefs` or fall through
     /// to the heap array via `locals_cells_stack_array_ref`.
@@ -6085,7 +6015,6 @@ impl PyreSym {
         sym.vable_pycode = state.vable_pycode;
         sym.vable_valuestackdepth = state.vable_valuestackdepth;
         sym.vable_debugdata = state.vable_debugdata;
-        sym.vable_lastblock = state.vable_lastblock;
         sym.vable_w_globals = state.vable_w_globals;
         sym
     }
@@ -6526,7 +6455,6 @@ impl PyreJitState {
             self.pycode_as_usize(),
             self.valuestackdepth(),
             self.debugdata_as_usize(),
-            self.lastblock_as_usize(),
             self.w_globals_as_usize(),
             meta.num_locals,
             meta.valuestackdepth,
@@ -7013,16 +6941,6 @@ impl PyreJitState {
     /// pyframe.py:82 debugdata — write to heap frame.
     pub fn set_debugdata(&mut self, value: usize) {
         let _ = self.write_frame_usize(PYFRAME_DEBUGDATA_OFFSET, value);
-    }
-
-    /// pyframe.py:86 lastblock — read from heap frame.
-    pub fn lastblock_as_usize(&self) -> usize {
-        self.read_frame_usize(PYFRAME_LASTBLOCK_OFFSET).unwrap_or(0)
-    }
-
-    /// pyframe.py:86 lastblock — write to heap frame.
-    pub fn set_lastblock(&mut self, value: usize) {
-        let _ = self.write_frame_usize(PYFRAME_LASTBLOCK_OFFSET, value);
     }
 
     /// Validate that the frame pointer is usable (fields readable, array present).
@@ -9424,7 +9342,7 @@ impl JitState for PyreJitState {
             sym.become_active_vable_owner();
             sym.nlocals = _meta.num_locals;
             sym.valuestackdepth = _meta.valuestackdepth;
-            // virtualizable.py:44 + interp_jit.py:25-31: all locals_cells_stack_w
+            // virtualizable.py:44 + interp_jit.py:25-30: all locals_cells_stack_w
             // items are W_Root → Type::Ref. Unboxing happens inside trace opcode
             // handlers (guard_class + getfield_gc_pure_i/_f), not at slot setup.
             sym.symbolic_local_types =
@@ -9555,24 +9473,6 @@ impl JitState for PyreJitState {
             return;
         }
 
-        // pyjitpl.py:3125-3165 `_prepare_exception_resumption` + `execute_ll_raised`:
-        // the exception grabbed at guard failure (`cpu.grab_exc_value`, threaded
-        // via `ctx.bridge_guard_exc`) becomes the bridge's standing exception.
-        // Seed `current_exc_value` here so `seed_bridge_standing_exception_from_current`
-        // below promotes it into `last_exc_value` / `last_exc_box` (the
-        // `dispatch_via_miframe` / carrier exc-edge precondition reads these).
-        // Without this seed the sym only sees `get_current_exception()`, which the
-        // blackhole has already cleared by carrier re-trace time.  Gated while the
-        // #343/#126 depth-2 exception-resume slice is validated.
-        if crate::jitcode_dispatch::carrier_exc_resume_enabled()
-            && ctx.bridge_source_is_exception_guard()
-        {
-            let guard_exc = ctx.bridge_guard_exc();
-            if guard_exc != 0 && sym.current_exc_value.is_null() {
-                sym.current_exc_value = guard_exc as pyre_object::PyObjectRef;
-            }
-        }
-
         // virtualizable.py:139 load_list_of_boxes parity: decode each
         // RebuiltValue in the resume stream into a typed Value. The type
         // is the fixed Box kind the encoder recorded at numbering time
@@ -9596,7 +9496,7 @@ impl JitState for PyreJitState {
         // materialization are always invoked together.
 
         let nlocals = sym.nlocals;
-        // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
+        // virtualizable.py:44 + interp_jit.py:25-30: locals_cells_stack_w[*]
         // items are declared Ref (W_Root array). Bridge resume slots stay
         // Ref at the virtualizable contract; any Int/Float unboxing must
         // happen inside trace opcode handlers, not at the inputarg level.
@@ -9632,7 +9532,7 @@ impl JitState for PyreJitState {
         let mut concrete_values: Vec<majit_ir::Value> = Vec::with_capacity(vvals.len());
         // resume.py:1264 `assert box.type == kind`: the vable payload is
         // NOT uniformly Ref — the static fields carry their declared
-        // kinds (interp_jit.py:25-31: last_instr/valuestackdepth are Int).
+        // kinds (interp_jit.py:25-30: last_instr/valuestackdepth are Int).
         // `virt_live_value_types` yields the full live layout WITH the
         // extra reds ([frame, <NUM_EXTRA_REDS>, <NUM_VABLE_SCALARS>,
         // array...]); the vvals stream omits the extra reds, so strip them
@@ -9688,7 +9588,7 @@ impl JitState for PyreJitState {
             .collect();
         let bridge_valuestackdepth = concrete_values
             // virtualizable_values has no ec red: [vable, last_instr,
-            // pycode, valuestackdepth, debugdata, lastblock, w_globals, ...].
+            // pycode, valuestackdepth, debugdata, w_globals, ...].
             .get(first_vable_scalar_idx + 2)
             .map(value_to_usize)
             .unwrap_or(sym.valuestackdepth)
@@ -10102,7 +10002,7 @@ impl JitState for PyreJitState {
         // stale parent OpRefs in registers_r after we set
         // bridge_local_oprefs here.
         //
-        // virtualizable.py:44 + interp_jit.py:25-31: array item types are
+        // virtualizable.py:44 + interp_jit.py:25-30: array item types are
         // all Ref; RETURN_VALUE / arithmetic paths unbox via
         // `trace_guarded_int_payload` (guard_class + getfield_gc_pure_i),
         // matching the RPython unbox-at-consumer model. The slot-level
@@ -10227,7 +10127,7 @@ impl JitState for PyreJitState {
         // Layout mirrors virtualizable.py:86-98 read_boxes():
         //   boxes[0..NUM_SCALARS-1] = scalar fields 1..NUM_SCALARS
         //     (vable_last_instr, vable_pycode, vable_valuestackdepth,
-        //      vable_debugdata, vable_lastblock, vable_w_globals)
+        //      vable_debugdata, vable_w_globals)
         //   boxes[NUM_SCALARS-1..NUM_SCALARS-1+array_len] = array items
         //     (bridge_locals followed by reserved stack slots)
         //   boxes[-1] = vable identity (sym.frame)
@@ -10271,7 +10171,6 @@ impl JitState for PyreJitState {
             sym.vable_pycode,
             sym.vable_valuestackdepth,
             sym.vable_debugdata,
-            sym.vable_lastblock,
             sym.vable_w_globals,
         ];
         // virtualizable.py:139 load_list_of_boxes parity: the OpRef half of
@@ -12507,7 +12406,6 @@ mod tests {
         sym.vable_pycode = code_ref;
         sym.vable_valuestackdepth = ctx.const_int(3);
         sym.vable_debugdata = ctx.const_ref(0);
-        sym.vable_lastblock = ctx.const_ref(0);
         sym.vable_w_globals = namespace_ref;
         sym.execution_context = ec_ref;
         sym.registers_r = vec![local0, stack0, stack1];
@@ -12536,7 +12434,6 @@ mod tests {
         let live_pycode = ctx.const_ref(0x4000);
         let live_vsd = ctx.const_int(2);
         let live_debugdata = ctx.const_ref(0x5000);
-        let live_lastblock = ctx.const_ref(0x6000);
         let live_globals = ctx.const_ref(0x7000);
         let live_local = ctx.const_ref(0x8000);
         let live_stack = ctx.const_ref(0x9000);
@@ -12552,7 +12449,6 @@ mod tests {
             (live_pycode, Type::Ref),
             (live_vsd, Type::Int),
             (live_debugdata, Type::Ref),
-            (live_lastblock, Type::Ref),
             (live_globals, Type::Ref),
             (live_local, Type::Ref),
             (live_stack, Type::Ref),
@@ -12570,7 +12466,6 @@ mod tests {
                 live_pycode,
                 live_vsd,
                 live_debugdata,
-                live_lastblock,
                 live_globals,
                 live_local,
                 live_stack,
@@ -12605,9 +12500,8 @@ mod tests {
         assert_eq!(sym.vable_pycode, OpRef::input_arg_ref(3));
         assert_eq!(sym.vable_valuestackdepth, OpRef::input_arg_int(4));
         assert_eq!(sym.vable_debugdata, OpRef::input_arg_ref(5));
-        assert_eq!(sym.vable_lastblock, OpRef::input_arg_ref(6));
-        assert_eq!(sym.vable_w_globals, OpRef::input_arg_ref(7));
-        assert_eq!(sym.vable_array_base, Some(8));
+        assert_eq!(sym.vable_w_globals, OpRef::input_arg_ref(6));
+        assert_eq!(sym.vable_array_base, Some(7));
         assert_eq!(sym.symbolic_local_types.len(), 2);
         assert_eq!(sym.symbolic_stack_types.len(), 2);
     }
@@ -12655,7 +12549,6 @@ mod tests {
             Value::Ref(GcRef(frame.pycode as usize)),            // pycode
             Value::Int(4),                                       // valuestackdepth
             Value::Ref(GcRef(0)),                                // debugdata
-            Value::Ref(GcRef(0)),                                // lastblock
             Value::Ref(GcRef(0)),                                // w_globals
             Value::Ref(GcRef(w_int_new(1) as usize)),            // local a
             Value::Ref(GcRef(w_int_new(2) as usize)),            // local b
@@ -13320,7 +13213,6 @@ mod tests {
             Type::Ref, // pycode
             Type::Int, // valuestackdepth
             Type::Ref, // debugdata
-            Type::Ref, // lastblock
             Type::Ref, // w_globals
             Type::Ref, // local0
             Type::Ref, // stack0
@@ -13350,7 +13242,6 @@ mod tests {
             code_ref as i64,
             3,
             0,
-            0,
             globals,
             local0,
             stack0,
@@ -13367,7 +13258,6 @@ mod tests {
             Type::Ref,
             Type::Ref,
             Type::Ref,
-            Type::Ref,
         ];
         let resume_data = majit_metainterp::ResumeDataResult {
             frames: vec![RebuiltFrame {
@@ -13375,9 +13265,9 @@ mod tests {
                 pc: 0,
                 py_pc: 0,
                 values: vec![
+                    RebuiltValue::Box(7, Type::Ref),
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),
-                    RebuiltValue::Box(10, Type::Ref),
                 ],
             }],
             virtualizable_values: vec![
@@ -13390,7 +13280,6 @@ mod tests {
                 RebuiltValue::Box(7, Type::Ref),
                 RebuiltValue::Box(8, Type::Ref),
                 RebuiltValue::Box(9, Type::Ref),
-                RebuiltValue::Box(10, Type::Ref),
             ],
             virtualref_values: Vec::new(),
             storage: None,
@@ -13416,14 +13305,14 @@ mod tests {
         assert_eq!(
             sym.registers_r,
             vec![
+                OpRef::input_arg_ref(7),
                 OpRef::input_arg_ref(8),
-                OpRef::input_arg_ref(9),
-                OpRef::input_arg_ref(10)
+                OpRef::input_arg_ref(9)
             ]
         );
         assert_eq!(sym.symbolic_local_types, vec![Type::Ref]);
         assert_eq!(sym.symbolic_stack_types, vec![Type::Ref, Type::Ref]);
-        assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef::input_arg_ref(8)]));
+        assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef::input_arg_ref(7)]));
     }
 
     #[test]
@@ -13436,7 +13325,6 @@ mod tests {
             Type::Ref, // pycode
             Type::Int, // valuestackdepth
             Type::Ref, // debugdata
-            Type::Ref, // lastblock
             Type::Ref, // w_globals
             Type::Ref, // local0
             Type::Ref, // stack0
@@ -13446,7 +13334,7 @@ mod tests {
 
         // The vable static-field types come from `state.rs:1428-1438`
         // `#[vable(inputarg, type = ...)]` annotations: int/ref/int/ref/
-        // ref/ref. Mint typed `OpRef::input_arg_*` variants matching
+        // ref. Mint typed `OpRef::input_arg_*` variants matching
         // those tags so variant-aware Eq (resoperation.rs:290) lines up
         // with what the production `init_vable_indices` produces.
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
@@ -13457,15 +13345,14 @@ mod tests {
         sym.vable_pycode = OpRef::input_arg_ref(3);
         sym.vable_valuestackdepth = OpRef::input_arg_int(4);
         sym.vable_debugdata = OpRef::input_arg_ref(5);
-        sym.vable_lastblock = OpRef::input_arg_ref(6);
-        sym.vable_w_globals = OpRef::input_arg_ref(7);
+        sym.vable_w_globals = OpRef::input_arg_ref(6);
         // local0 / stack0 / stack1 are Ref-typed per `symbolic_local_types`
         // / `symbolic_stack_types` below — the macro mints the matching
         // `InputArgRef` variant.
         sym.registers_r = vec![
+            OpRef::input_arg_ref(7),
             OpRef::input_arg_ref(8),
             OpRef::input_arg_ref(9),
-            OpRef::input_arg_ref(10),
         ];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
@@ -13498,15 +13385,15 @@ mod tests {
 
         let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
 
-        assert_eq!(jump_args.len(), 11);
+        assert_eq!(jump_args.len(), 10);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
         assert_eq!(jump_args[1], OpRef::input_arg_ref(1));
         assert_eq!(
-            &jump_args[8..],
+            &jump_args[7..],
             &[
+                OpRef::input_arg_ref(7),
                 OpRef::input_arg_ref(8),
-                OpRef::input_arg_ref(9),
-                OpRef::input_arg_ref(10)
+                OpRef::input_arg_ref(9)
             ]
         );
         assert_eq!(state.sym().execution_context, OpRef::input_arg_ref(1));
@@ -13541,7 +13428,6 @@ mod tests {
             Type::Ref, // pycode
             Type::Int, // valuestackdepth
             Type::Ref, // debugdata
-            Type::Ref, // lastblock
             Type::Ref, // w_globals
         ];
         input_types.extend(std::iter::repeat(Type::Ref).take(array_len));
@@ -13560,9 +13446,8 @@ mod tests {
         sym.vable_pycode = OpRef::input_arg_ref(2);
         sym.vable_valuestackdepth = OpRef::input_arg_int(3);
         sym.vable_debugdata = OpRef::input_arg_ref(4);
-        sym.vable_lastblock = OpRef::input_arg_ref(5);
-        sym.vable_w_globals = OpRef::input_arg_ref(6);
-        sym.registers_r = vec![OpRef::input_arg_ref(7)];
+        sym.vable_w_globals = OpRef::input_arg_ref(5);
+        sym.registers_r = vec![OpRef::input_arg_ref(6)];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = Vec::new();
         sym.concrete_vable_ptr = frame_ptr as *mut u8;
@@ -13586,9 +13471,8 @@ mod tests {
                 OpRef::input_arg_int(3),
                 OpRef::input_arg_ref(4),
                 OpRef::input_arg_ref(5),
-                OpRef::input_arg_ref(6),
             ],
-            &[OpRef::input_arg_ref(7)],
+            &[OpRef::input_arg_ref(6)],
             array_len,
             &[],
             std::ptr::null(),
@@ -13632,7 +13516,7 @@ mod tests {
     /// must recover that offset's own depth, or every operand-stack slot the
     /// header binds is force-nulled into the JUMP.
     #[test]
-    fn merge_point_stack_depth_recovers_a_deeper_header_and_never_narrows() {
+    fn merge_point_stack_depth_recovers_the_header_depth() {
         use pyre_interpreter::pyframe::PyFrame;
 
         ensure_test_callbacks();
@@ -13672,10 +13556,13 @@ mod tests {
             None,
         );
 
-        // Frame already deeper than the header's static depth: never narrow —
-        // dropping a slot would lose a value the JUMP must carry.
+        // Stale frame (resumed at a deeper offset), closing on the shallower
+        // header: slots above the header's static depth are dead capacity.
         frame.valuestackdepth = deep_vsd + 1;
-        assert_eq!(merge_point_stack_depth_to_recover(frame_ptr, deep_pc), None);
+        assert_eq!(
+            merge_point_stack_depth_to_recover(frame_ptr, deep_pc),
+            Some(deep_vsd),
+        );
 
         // An offset the code object has no liveness entry for keeps the frame.
         frame.valuestackdepth = base;

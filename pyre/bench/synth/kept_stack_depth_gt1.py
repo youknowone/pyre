@@ -11,7 +11,7 @@
 # arithmetic -> deterministic checksum.  Regression guard for the depth > 1
 # decline removal (`0 < a < b < 9` previously miscompiled 749949 vs 375000,
 # `total + (a + ((i & 1) or 5))` 1837502750500 vs 1275003750000).
-N = 200000
+N = 1500000
 
 
 def chain2():

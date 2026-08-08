@@ -8,9 +8,13 @@ N = 200000
 # type.__setattr__ / type.__delattr__ reject mutation of a non-heap
 # (immutable) builtin type with TypeError before touching the type dict
 # (typeobject.py setdictvalue/deldictvalue heaptype guard).  The raising
-# STORE_ATTR / DELETE_ATTR runs every iteration, so the JIT records a
-# GuardNoException after the residual store and deopts into the blackhole,
-# which must resume at the loop's handler.
+# STORE_ATTR / DELETE_ATTR runs every iteration, and
+# `try_walker_trace_immutable_type_attr_raise` folds it: the receiver is
+# pinned with a GuardValue and the TypeError is emitted as an inline
+# NewWithVtable + SetfieldGc construction routed through SubRaise, so both
+# the raise and its catch are paid inside the compiled loop.  The recorded
+# baselines beside this file read loops_compiled=1, guard_failures=1,
+# bridges_compiled=0 — one bailout for the whole run, not one per iteration.
 def main():
     acc = 0
     i = 0

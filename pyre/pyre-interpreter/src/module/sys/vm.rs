@@ -363,15 +363,21 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
         // `getitem` above ran a lookup that can collect, so the key has to be
         // reread from its slot rather than reused from before the call.
         let key = pyre_object::gc_roots::shadow_stack_get(keys_sp + i);
-        parts.push(format!(
-            "{}={}",
-            unsafe { crate::display::py_str(key)? },
-            unsafe {
-                crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(value_sp))?
-            }
+        parts.push(crate::display::wtf8_format!(
+            unsafe { crate::display::py_str_wtf8(key)? },
+            "=",
+            unsafe { crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(value_sp))? }
         ));
     }
-    Ok(w_str_new(&format!("{name}({})", parts.join(", "))))
+    let mut text = rustpython_wtf8::Wtf8Buf::from_string(format!("{name}("));
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_wtf8(part);
+    }
+    text.push_str(")");
+    Ok(pyre_object::w_str_from_wtf8(text))
 }
 
 /// `_structseq.py:185 SimpleNamespace.__eq__` — structural over `__dict__`
@@ -700,26 +706,6 @@ fn sys_getframe(args: &[PyObjectRef]) -> crate::PyResult {
     getframe(depth)
 }
 
-/// `vm.py:54 f.mark_as_escaped()` as one non-forcing call, for the walker's
-/// constant-depth [`getframe`] arm.
-///
-/// Upstream's traced-through `getframe` emits it as `setfield_gc(p0, 1,
-/// inst_escaped)`; `escaped` is a plain field, not one of the six
-/// `interp_jit.py:25-30` declares, so writing it neither reads nor materialises
-/// the virtualizable.  The frame reaches this helper only to address the flag
-/// byte — nothing under it can call
-/// [`crate::executioncontext::force_frame`], which is what keeps the arm's
-/// whole point (no residual force) intact.
-///
-/// Emitted as a void `CallN`, matching the upstream `setfield_gc`'s lack of a
-/// result: the store is the whole point, so nothing may drop it as dead.
-pub extern "C" fn jit_frame_mark_as_escaped(frame: i64) {
-    let f = frame as *mut crate::PyFrame;
-    if !f.is_null() {
-        unsafe { (*f).mark_as_escaped() };
-    }
-}
-
 /// True iff `callable` is the canonical `sys._getframe` builtin.
 ///
 /// `sys` is an ordinary mutable module, so the JIT walker has to key on
@@ -1014,11 +1000,11 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     let w_tb = crate::baseobjspace::getattr_str(w_hookargs, "exc_traceback")?;
     let w_err_msg = crate::baseobjspace::getattr_str(w_hookargs, "err_msg")?;
     let err_msg = if unsafe { pyre_object::is_none(w_err_msg) } {
-        String::new()
+        rustpython_wtf8::Wtf8Buf::new()
     } else if unsafe { pyre_object::is_str(w_err_msg) } {
-        unsafe { pyre_object::w_str_get_value(w_err_msg) }.to_string()
+        unsafe { pyre_object::w_str_get_wtf8(w_err_msg) }.to_wtf8_buf()
     } else {
-        unsafe { crate::display::py_str(w_err_msg)? }
+        unsafe { crate::display::py_str_wtf8(w_err_msg)? }
     };
     let w_object = crate::baseobjspace::getattr_str(w_hookargs, "object")?;
     crate::PyError::write_unraisable_default(

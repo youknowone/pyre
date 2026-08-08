@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=6
+# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
+# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
+# rather than any generated code, and reads whatever the host's process
+# spawn cost happens to be that run. The jitstats baselines gate it.
 # A user metaclass whose __new__/__init__ takes **kw receives class keywords
 # through the by-name keyword binder (resolve_kwargs).  A lone-surrogate class
 # keyword must survive as a byte-ish name instead of crashing the strict-UTF-8

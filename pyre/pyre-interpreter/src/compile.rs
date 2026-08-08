@@ -150,7 +150,7 @@ fn is_utf8_encoding(name: &str) -> bool {
 /// lossily replaced.
 pub fn decode_source_bytes(
     source: &[u8],
-    filename: &str,
+    filename: &rustpython_wtf8::Wtf8,
     ignore_cookie: bool,
 ) -> Result<String, crate::PyError> {
     let has_bom = source.starts_with(b"\xef\xbb\xbf");
@@ -178,16 +178,27 @@ pub fn decode_source_bytes(
                     .filter(|&&b| b == b'\n')
                     .count()
                     + 1;
-                let (file_context, location_suffix) = if filename == "<string>" {
-                    (String::new(), format!(" ({filename}, line {line})"))
-                } else {
-                    (format!(" in file {filename}"), String::new())
-                };
-                Err(crate::PyError::syntax_error(format!(
-                    "Non-UTF-8 code starting with '\\x{bad_byte:02x}'{file_context} \
-                     on line {line}, but no encoding declared; \
-                     see https://peps.python.org/pep-0263/ for details{location_suffix}"
-                )))
+                // The name may hold the surrogate escape an undecodable path
+                // byte becomes, so the message is assembled as WTF-8;
+                // `format!` would render it through `Display` as U+FFFD.
+                let named_string = filename.as_str() == Ok("<string>");
+                let mut message = rustpython_wtf8::Wtf8Buf::from_string(format!(
+                    "Non-UTF-8 code starting with '\\x{bad_byte:02x}'"
+                ));
+                if !named_string {
+                    message.push_str(" in file ");
+                    message.push_wtf8(filename);
+                }
+                message.push_str(&format!(
+                    " on line {line}, but no encoding declared; \
+                     see https://peps.python.org/pep-0263/ for details"
+                ));
+                if named_string {
+                    message.push_str(" (");
+                    message.push_wtf8(filename);
+                    message.push_str(&format!(", line {line})"));
+                }
+                Err(crate::PyError::syntax_error(message))
             }
         }
     } else {
@@ -205,7 +216,10 @@ pub fn decode_source_bytes(
                 };
                 crate::PyError::syntax_error_located(message, filename, 0, 0, 0, 0, None)
             })?;
-        Ok(decoded.to_string_lossy().into_owned())
+        // `pyparse.py:9-15 recode_to_utf8` re-encodes the decoded text to
+        // UTF-8, so a declared codec that yields a surrogate rejects the
+        // source rather than silently rewriting it.
+        crate::typedef::utf8_strict_w(decoded)
     }
 }
 
