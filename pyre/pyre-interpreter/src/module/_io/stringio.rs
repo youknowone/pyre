@@ -136,9 +136,10 @@ impl W_StringIO {
         if let Some(value) = newline
             && !matches!(value.as_bytes(), b"" | b"\n" | b"\r" | b"\r\n")
         {
-            let shown = unsafe { crate::display::py_repr(w_newline) }?;
-            return Err(crate::PyError::value_error(format!(
-                "illegal newline value: {shown}",
+            let shown = unsafe { crate::display::py_repr_wtf8(w_newline) }?;
+            return Err(crate::PyError::value_error(crate::display::wtf8_format!(
+                "illegal newline value: ",
+                shown
             )));
         }
 

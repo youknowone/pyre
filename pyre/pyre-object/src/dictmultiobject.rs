@@ -3453,12 +3453,21 @@ pub unsafe fn w_dict_getitem_wtf8(
 /// surfaces it, and the caller recovers the concrete exception from the
 /// interpreter-side error slot.
 ///
-/// Routes through [`w_dict_lookup_checked`] rather than draining the flag
-/// after [`w_dict_getitem_wtf8`]: the strategy leaf
-/// (`w_dict_lookup_object_strategy`) is itself
-/// `..._checked(..).unwrap_or(None)`, so it has already taken the flag by the
-/// time the unchecked spelling returns and a post-hoc `take_dict_key_error`
-/// always reads `false`.
+/// Mirrors the unchecked spelling's dispatch so a valid-UTF-8 key keeps the
+/// borrowed-`&str` probe and its `getitem_str` parity — routing every name
+/// through [`w_dict_lookup_checked`] instead would wrap a throwaway
+/// `W_UnicodeObject` per lookup, which is exactly what
+/// `w_dict_getitem_str_object_strategy` exists to avoid.
+///
+/// The two arms need different checked leaves because only one of them
+/// swallows: `w_dict_lookup_object_strategy` (:2668) is
+/// `..._checked(..).unwrap_or(None)`, so draining the flag after the
+/// unchecked `w_dict_lookup` always reads `false`, while
+/// `dict_entries_get_str` (:451) leaves the probe's flag standing for
+/// [`w_dict_getitem_str_checked`] to take.  A raising comparison is reachable
+/// only from a bucket holding a non-string key, i.e. only under the object
+/// strategy — whose `getitem_str` (:6219) is the borrowed probe — so the
+/// `&str` arm loses no error.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
@@ -3466,8 +3475,10 @@ pub unsafe fn w_dict_getitem_wtf8_checked(
     obj: PyObjectRef,
     key: &rustpython_wtf8::Wtf8,
 ) -> Result<Option<PyObjectRef>, DictKeyError> {
-    let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
-    w_dict_lookup_checked(obj, w_key)
+    match key.as_str() {
+        Ok(s) => w_dict_getitem_str_checked(obj, s),
+        Err(_) => w_dict_lookup_checked(obj, crate::w_str_from_wtf8(key.to_wtf8_buf())),
+    }
 }
 
 /// WTF-8 keyed equivalent of `space.setitem_str` — `setitem_str` is itself
@@ -4154,6 +4165,21 @@ pub unsafe fn w_dict_length_object_strategy(obj: PyObjectRef) -> usize {
 pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
     w_dict_get_strategy(obj).items(obj)
+}
+
+/// `dictmultiobject.py:257` `W_DictMultiObject.descr_popitem` delegates to
+/// `W_DictMultiObject.popitem`, which dispatches through the live strategy.
+///
+/// Traced like the other strategy dispatchers: `w_dict_delitem` and
+/// `w_dict_clear` mutate the same `IndexMap` and mapdict storages with no
+/// barrier, and `dictmultiobject.py` carries no `@dont_look_inside` here.
+///
+/// # Safety
+/// `obj` must be a valid PyObjectRef pointing at a `W_DictObject` or
+/// `W_ModuleDictObject`.
+pub unsafe fn w_dict_popitem(obj: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
+    lock_dict_refs!(_dict_guard, obj);
+    w_dict_get_strategy(obj).popitem(obj)
 }
 
 /// `w_dict_get_strategy(obj).nth_item(obj, index)` — single-entry
@@ -6279,6 +6305,15 @@ impl DictStrategy for ObjectDictStrategy {
         crate::dictmultiobject::w_dict_nth_item_object_strategy(w_dict, index)
     }
 
+    /// `dictmultiobject.py:1119-1121 AbstractTypedStrategy.popitem`.
+    unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
+        let dict = &mut *(w_dict as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        let (key, value) = entries.pop()?;
+        dict.keys_version = dict.keys_version.wrapping_add(1);
+        Some((key.obj, value))
+    }
+
     /// `dictmultiobject.py:1227-1228 clear` — `self.unerase
     /// (w_dict.dstorage).clear()`. Direct dstorage truncation +
     /// JIT length-cache reset.
@@ -6437,6 +6472,24 @@ impl DictStrategy for BytesDictStrategy {
         index: usize,
     ) -> Option<(PyObjectRef, PyObjectRef)> {
         crate::dictmultiobject::w_dict_nth_item_bytes_strategy(w_dict, index)
+    }
+
+    /// `dictmultiobject.py:1119-1121 AbstractTypedStrategy.popitem`.
+    unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
+        let (key, value) = {
+            let dict = &mut *(w_dict as *mut W_DictObject);
+            let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>);
+            let (key, value) = entries.pop()?;
+            dict.keys_version = dict.keys_version.wrapping_add(1);
+            (key, value)
+        };
+
+        let _roots = crate::gc_roots::push_roots();
+        let value_slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(value);
+        let w_key = crate::w_bytes_from_bytes(key.as_slice());
+        let value = crate::gc_roots::shadow_stack_get(value_slot);
+        Some((w_key, value))
     }
 
     unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
@@ -6624,6 +6677,15 @@ impl DictStrategy for UnicodeDictStrategy {
         index: usize,
     ) -> Option<(PyObjectRef, PyObjectRef)> {
         crate::dictmultiobject::w_dict_nth_item_object_strategy(w_dict, index)
+    }
+
+    /// `dictmultiobject.py:1119-1121 AbstractTypedStrategy.popitem`.
+    unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
+        let dict = &mut *(w_dict as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        let (key, value) = entries.pop()?;
+        dict.keys_version = dict.keys_version.wrapping_add(1);
+        Some((key.obj, value))
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {
@@ -6822,6 +6884,24 @@ impl DictStrategy for IntDictStrategy {
         index: usize,
     ) -> Option<(PyObjectRef, PyObjectRef)> {
         crate::dictmultiobject::w_dict_nth_item_int_strategy(w_dict, index)
+    }
+
+    /// `dictmultiobject.py:1119-1121 AbstractTypedStrategy.popitem`.
+    unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
+        let (key, value) = {
+            let dict = &mut *(w_dict as *mut W_DictObject);
+            let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>);
+            let (key, value) = entries.pop()?;
+            dict.keys_version = dict.keys_version.wrapping_add(1);
+            (key, value)
+        };
+
+        let _roots = crate::gc_roots::push_roots();
+        let value_slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(value);
+        let w_key = crate::w_int_new(key);
+        let value = crate::gc_roots::shadow_stack_get(value_slot);
+        Some((w_key, value))
     }
 
     unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {

@@ -157,7 +157,7 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
     PyError::type_error(format!(
         "cannot use '{}' as a dict key ({})",
         object_functionstr_type_name(key),
-        err.message,
+        err.message_text(),
     ))
 }
 
@@ -176,7 +176,7 @@ pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
     PyError::type_error(format!(
         "cannot use '{}' as a set element ({})",
         object_functionstr_type_name(item),
-        err.message,
+        err.message_text(),
     ))
 }
 
@@ -2159,9 +2159,9 @@ pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
             if pyre_object::w_range_contains_bigint(obj, &item) {
                 return Ok(pyre_object::w_range_index_of(obj, &item));
             }
-            return Err(PyError::value_error(format!(
-                "{} is not in range",
-                crate::display::py_repr(needle)?
+            return Err(PyError::value_error(crate::display::wtf8_format!(
+                crate::display::py_repr_wtf8(needle)?,
+                " is not in range"
             )));
         }
     }
@@ -5698,13 +5698,29 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 }
             }
         }
-        if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
-
+        // objspace.py:664-670 gates the slot dispatch on `space.type(w_obj)`
+        // with no layout test, so a receiver that is neither a type nor a
+        // module reaches it whatever its representation.  `is_instance` alone
+        // means `W_ObjectObject`, which an exception, a `list` subclass and
+        // every other non-default layout fail, leaving their override
+        // uncalled.  `setattr_str` already resolves the type this way.
+        //
+        // `call_getattr` false is the bare `object.__getattribute__` slot:
+        // `object_getattribute` hands its non-instance, non-type receivers
+        // straight back here, so dispatching the override again would recurse
+        // through every `super().__getattribute__(name)` an override makes.
+        let instance_like_type = if is_instance(obj) {
+            Some(w_instance_get_type(obj))
+        } else if call_getattr && !is_type(obj) && !is_module(obj) {
+            crate::typedef::r#type(obj).map(|p| p.as_ptr())
+        } else {
+            None
+        };
+        if let Some(w_type) = instance_like_type {
             // `pypy/objspace/descroperation.py descr__getattribute__`
             // dispatches through the receiver type's `__getattribute__`
             // slot before running the default descriptor protocol
-            // (objspace.py:663-666).  Users routinely override this to
+            // (objspace.py:664-670).  Users routinely override this to
             // customise *all* attribute access (e.g. lazy proxies,
             // validating wrappers).  `getattribute_if_not_from_object`
             // returns a non-default override or `None`, memoizing the
@@ -5717,6 +5733,25 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // still routes through the type's custom `__getattribute__`, so the
             // slot dispatch runs for every name, including "__getattribute__".
             if let Some(slot) = getattribute_if_not_from_object(w_type) {
+                // `super`, bound `method`, `types.GenericAlias`,
+                // `types.UnionType` and the two weakref proxies each register
+                // a `__getattribute__` of their own, so the identity compare
+                // against `object`'s answers `Some` for them too.  Those
+                // receivers are served by the shims above — the bound-method
+                // one just above forwards to `__func__` — and running their
+                // slot through `get_and_call_function` here would re-enter
+                // it.  Restricting the dispatch to a heap-type owner
+                // admits exactly the app-level overrides, and leaves every
+                // other receiver on the descriptor protocol it already took.
+                // A `W_ObjectObject` receiver reaches this arm only through
+                // its own class, so the check is skipped for it.
+                let owned_by_heap_type = is_instance(obj)
+                    || lookup_where(w_type, "__getattribute__").is_some_and(|(owner, found)| {
+                        std::ptr::eq(found, slot) && pyre_object::w_type_is_heaptype(owner)
+                    });
+                if !owned_by_heap_type {
+                    return object_getattr_miss(obj, name, call_getattr);
+                }
                 let name_obj = w_str_new(name);
                 // objspace.py:666 / descroperation.py:238
                 // `space.get_and_call_function(w_descr, w_obj, w_name)` —
@@ -5729,6 +5764,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                     Err(e) => return Err(e),
                 }
             }
+        }
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
 
             // Step 1: look up in type MRO
             let w_descr = lookup_in_type_where(w_type, name);
@@ -6098,7 +6136,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         if is_module(obj) {
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() {
-                if let Some(v) = pyre_object::w_dict_lookup(w_dict, w_name) {
+                if let Some(v) = finditem(w_dict, w_name)? {
                     if !v.is_null() {
                         return Ok(v);
                     }
@@ -6117,7 +6155,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             let w_descr = if metatype.is_null() {
                 None
             } else {
-                lookup_in_type_wtf8(metatype, name)
+                lookup_in_type_where_wtf8(metatype, name)
             };
             // typeobject.py:814-819: metatype data descriptor, bound as
             // `__get__(self, type(self))`.
@@ -6133,7 +6171,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             // Internally a null receiver distinguishes this class access from
             // attribute access on the actual `None` singleton; `get` converts
             // it back to `w_None` only for a Python-visible `__get__` call.
-            if let Some(w_value) = lookup_in_type_wtf8(obj, name) {
+            if let Some(w_value) = lookup_in_type_where_wtf8(obj, name) {
                 if let Some(result) = get(w_value, PY_NULL, obj)? {
                     return Ok(result);
                 }
@@ -6159,7 +6197,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         let w_descr = if w_type.is_null() {
             None
         } else {
-            lookup_in_type_wtf8(w_type, name)
+            lookup_in_type_wtf8_uncached(w_type, name)
         };
         if let Some(descr) = w_descr {
             if is_data_descr(descr) {
@@ -6168,9 +6206,13 @@ pub(crate) unsafe fn object_getattribute_surrogate(
                 }
             }
         }
+        // `space.finditem`, not the raw lookup: the probe compares the name
+        // against whatever each colliding bucket holds, so a stored non-string
+        // key can run a user `__eq__` that raises, and the swallowing spelling
+        // would read that back as an absent attribute.
         let w_dict = getdict_backing(obj)?;
         if !w_dict.is_null() {
-            if let Some(v) = pyre_object::w_dict_lookup(w_dict, w_name) {
+            if let Some(v) = finditem(w_dict, w_name)? {
                 if !v.is_null() {
                     return Ok(v);
                 }
@@ -6242,7 +6284,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
             crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr())
         };
         if !w_type.is_null() {
-            if let Some(descr) = lookup_in_type_wtf8(w_type, name) {
+            if let Some(descr) = lookup_in_type_wtf8_uncached(w_type, name) {
                 if set(descr, obj, value)? {
                     return Ok(w_none());
                 }
@@ -6336,7 +6378,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
             crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr())
         };
         if !w_type.is_null() {
-            if let Some(descr) = lookup_in_type_wtf8(w_type, name) {
+            if let Some(descr) = lookup_in_type_wtf8_uncached(w_type, name) {
                 if is_data_descr(descr) {
                     delete(descr, obj)?;
                     return Ok(w_none());
@@ -6379,6 +6421,11 @@ pub(crate) unsafe fn object_delattr_surrogate(
 /// the original name object in the formatted AttributeError, so build the
 /// exception argument as WTF-8 instead of reducing it to a Rust string.
 fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
+    // The name goes in verbatim between the quotes. 3.14 keeps the code point
+    // itself, so `getattr(Sub, '\udcfe')` reports `... has no attribute
+    // '\udcfe'` holding the lone surrogate; `descroperation.py:58` renders it
+    // through `%R` and reports the six-character escape text instead. Measured
+    // on both, 2026-08-06 — do not "restore" the repr form.
     let mut message = Wtf8Buf::from_string(format!(
         "{} has no attribute '",
         missing_attribute_subject(obj)
@@ -6598,32 +6645,44 @@ unsafe fn module_getattr_hook_or_err(
         let (origin, is_shadowing, is_shadowing_stdlib) =
             crate::importing::module_shadow_info(w_spec, w_name)?;
         let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+        // The origin is a filename and may hold a surrogate escape, so each
+        // message that names it is assembled as WTF-8; `format!` would render
+        // it through `Display` and substitute U+FFFD.
+        let with_origin = |head: String, tail: String| {
+            let mut msg = Wtf8Buf::from_string(head);
+            msg.push_wtf8(origin.as_deref().unwrap_or(Wtf8::new("")));
+            msg.push_str(&tail);
+            msg
+        };
         if is_shadowing_stdlib {
-            let origin = origin.as_deref().unwrap_or("");
-            format!(
-                "module '{nm}' has no attribute '{name}' (consider renaming \
-                 '{origin}' since it has the same name as the standard library \
-                 module named '{nm}' and prevents importing that standard \
-                 library module)"
+            with_origin(
+                format!("module '{nm}' has no attribute '{name}' (consider renaming '"),
+                format!(
+                    "' since it has the same name as the standard library module \
+                     named '{nm}' and prevents importing that standard library \
+                     module)"
+                ),
             )
         } else if crate::importing::is_spec_initializing(w_spec)? {
             if is_shadowing {
-                let origin = origin.as_deref().unwrap_or("");
-                format!(
-                    "module '{nm}' has no attribute '{name}' (consider renaming \
-                     '{origin}' if it has the same name as a library you \
-                     intended to import)"
+                with_origin(
+                    format!("module '{nm}' has no attribute '{name}' (consider renaming '"),
+                    "' if it has the same name as a library you intended to import)".to_string(),
                 )
-            } else if let Some(origin) = origin.as_deref() {
-                format!(
-                    "partially initialized module '{nm}' from '{origin}' has no \
-                     attribute '{name}' (most likely due to a circular import)"
+            } else if origin.is_some() {
+                with_origin(
+                    format!("partially initialized module '{nm}' from '"),
+                    format!(
+                        "' has no attribute '{name}' (most likely due to a \
+                         circular import)"
+                    ),
                 )
             } else {
                 format!(
                     "partially initialized module '{nm}' has no attribute \
                      '{name}' (most likely due to a circular import)"
                 )
+                .into()
             }
         } else {
             let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
@@ -6632,12 +6691,13 @@ unsafe fn module_getattr_hook_or_err(
                     "cannot access submodule '{name}' of module '{nm}' \
                      (most likely due to a circular import)"
                 )
+                .into()
             } else {
-                format!("module '{nm}' has no attribute '{name}'")
+                format!("module '{nm}' has no attribute '{name}'").into()
             }
         }
     } else {
-        format!("module '{nm}' has no attribute '{name}'")
+        Wtf8Buf::from_string(format!("module '{nm}' has no attribute '{name}'"))
     };
     Err(PyError::new(PyErrorKind::AttributeError, msg))
 }
@@ -8588,7 +8648,7 @@ impl SimpleBufferBytes {
         if let Err(mut error) = crate::builtins::memoryview_release(&[view]) {
             error.write_unraisable(
                 pyre_object::w_none(),
-                "Exception ignored in __release_buffer__:",
+                Wtf8::new("Exception ignored in __release_buffer__:"),
                 view,
             );
         }
@@ -8996,22 +9056,21 @@ pub(crate) unsafe fn lookup_where_pair(
     Some((class, value))
 }
 
-/// WTF-8 keyed MRO attribute lookup — surrogate-safe sibling of
-/// `lookup_in_type` / `lookup_in_type_where`.  A lone-surrogate name
-/// can only live in a class namespace's `DictStorage` (never as a
-/// descriptor or special slot), so this walks the MRO comparing raw
-/// WTF-8 bytes via `DictStorage::get_wtf8`.
+/// WTF-8 keyed `_lookup_where_all_typeobjects` MRO walk, returning the
+/// defining class and descriptor in one pass (typeobject.py:491-501). A
+/// lone-surrogate name can only live in a class namespace's `DictStorage`
+/// (never as a descriptor or special slot), so this compares raw WTF-8 bytes
+/// via `DictStorage::get_wtf8`.
 ///
 /// # Safety
 /// `w_type` must point at a valid `W_TypeObject` (null tolerated).
-pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+pub(crate) unsafe fn lookup_where_wtf8(
+    w_type: PyObjectRef,
+    name: &Wtf8,
+) -> Option<(PyObjectRef, PyObjectRef)> {
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
-    if let Ok(name) = name.as_str() {
-        return lookup_in_type_where(w_type, name);
-    }
-    // MethodCache is keyed on `&str`, so a non-UTF-8 name cannot use it.
     let cached = w_type_get_mro(w_type);
     let mro_owned;
     let mro: &[PyObjectRef] = if !cached.is_null() {
@@ -9025,10 +9084,42 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
             continue;
         }
         if let Some(value) = crate::type_dict_lookup_wtf8(*cls, name) {
-            return Some(value);
+            return Some((*cls, value));
         }
     }
     None
+}
+
+/// One-pass WTF-8 pair walk behind a single residual boundary. As in the
+/// scalar `lookup_where` residuals above, `lookup_where_wtf8` phi-merges its
+/// cached MRO slice with the freshly computed opaque `Vec` borrow
+/// (`<other> ∪ _ptr`); keeping the whole pair residual contains that merge
+/// without reconstructing it with a second MRO walk. Marker
+/// `_jit_look_inside_ = False` (rlib/jit.py:139).
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn lookup_where_pair_wtf8_uncached(
+    w_type: PyObjectRef,
+    name: &Wtf8,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    lookup_where_wtf8(w_type, name)
+}
+
+#[inline]
+pub(crate) unsafe fn lookup_in_type_wtf8_uncached(
+    w_type: PyObjectRef,
+    name: &Wtf8,
+) -> Option<PyObjectRef> {
+    lookup_where_pair_wtf8_uncached(w_type, name).map(|(_src, value)| value)
+}
+
+unsafe fn lookup_where_pair_wtf8(
+    w_type: PyObjectRef,
+    name: &Wtf8,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    match name.as_str() {
+        Ok(s) => lookup_where_pair(w_type, s),
+        Err(_) => lookup_where_pair_wtf8_uncached(w_type, name),
+    }
 }
 
 /// `typeobject.py:76-101 MethodCache` — the per-space method-lookup
@@ -9041,13 +9132,13 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
 /// negative result (`_lookup_where_all_typeobjects` returned
 /// `(None, None)`).
 ///
-/// `names[h]` is the untranslated string stored by upstream
+/// `names[h]` is the untranslated WTF-8 byte view stored by upstream
 /// (`typeobject.py:541` `cache.names[method_hash] == name`). A fill owns one
-/// copy; a hit compares the incoming borrowed string without allocating or
+/// copy; a hit compares the incoming borrowed name without allocating or
 /// entering the Python-string intern table. `None` is an empty slot.
 struct MethodCache {
     versions: Vec<u64>,
-    names: Vec<Option<String>>,
+    names: Vec<Option<Wtf8Buf>>,
     lookup_where: Vec<(PyObjectRef, PyObjectRef)>,
 }
 
@@ -9074,9 +9165,9 @@ static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
 /// version_tag)`; the u64 is its own address-stable surrogate).
 /// `name_hash` only needs to be deterministic — the slot's validity is the
 /// exact `(version, name)` match, not the hash. Upstream's `compute_hash(name)`
-/// is a content hash; use the same FNV-1a content digest as pyre's other
-/// untranslated-name caches.
-fn method_hash(version_tag: u64, name: &str) -> usize {
+/// is a content hash; use the same FNV-1a content digest over the WTF-8 byte
+/// view.
+fn method_hash(version_tag: u64, name: &Wtf8) -> usize {
     let mut name_hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in name.as_bytes() {
         name_hash ^= b as u64;
@@ -9135,13 +9226,13 @@ pub(crate) unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
 ///
 /// `name` arrives on this JIT-only projection as `w_name`, an interned
 /// immortal str object (`box_str_constant`), because the elidable call ABI
-/// cannot pass a `&str`; the body reads the untranslated string back via
-/// `w_str_get_value`. The ordinary interpreter passes its `&str` directly to
-/// [`_cached_lookup_where_name`], matching upstream. The result here is a raw
-/// pointer — null is the cached negative result (`None`), since the call
-/// ABI cannot carry `Option`.  The `is_type` / `version_tag == 0` guards
-/// live in the front door, so this is only ever entered with a valid
-/// promoted `version_tag`.
+/// cannot pass a `&Wtf8`; the body reads the untranslated WTF-8 view back via
+/// `w_str_get_wtf8`. The ordinary interpreter passes its borrowed name directly
+/// to [`_cached_lookup_where_name`], matching upstream. The result here is a
+/// raw pointer — null is the cached negative result (`None`), since the call
+/// ABI cannot carry `Option`.  The `is_type` / `version_tag == 0` guards live in
+/// the front door, so this is only ever entered with a valid promoted
+/// `version_tag`.
 #[majit_macros::elidable]
 pub unsafe fn _pure_lookup_where_with_method_cache(
     w_type: PyObjectRef,
@@ -9187,7 +9278,7 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
 /// _lookup_where_all_typeobjects`) and fills the slot with the
 /// `(w_class, w_value)` pair (`typeobject.py:545-549`).
 ///
-/// `w_name` must be an exact string accepted by `w_str_get_value`; the shared
+/// `w_name` must be an exact string accepted by `w_str_get_wtf8`; the shared
 /// cache itself is content-keyed, exactly like upstream's untranslated name
 /// array.
 unsafe fn _cached_lookup_where(
@@ -9195,17 +9286,17 @@ unsafe fn _cached_lookup_where(
     w_name: PyObjectRef,
     version_tag: u64,
 ) -> (PyObjectRef, PyObjectRef) {
-    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
+    let name = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
     _cached_lookup_where_name(w_type, name, version_tag)
 }
 
-/// Untranslated-string MethodCache probe/fill used by the ordinary
+/// Untranslated-WTF-8 MethodCache probe/fill used by the ordinary
 /// interpreter. This is the direct Rust shape of
 /// `typeobject.py:_pure_lookup_where_with_method_cache(name, version_tag)`;
 /// the `w_name` wrapper above exists only for the JIT residual-call ABI.
 unsafe fn _cached_lookup_where_name(
     w_type: PyObjectRef,
-    name: &str,
+    name: &Wtf8,
     version_tag: u64,
 ) -> (PyObjectRef, PyObjectRef) {
     let h = method_hash(version_tag, name);
@@ -9222,8 +9313,8 @@ unsafe fn _cached_lookup_where_name(
     if let Some(tup) = hit {
         return tup;
     }
-    let tup =
-        lookup_where_pair(w_type, name).unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+    let tup = lookup_where_pair_wtf8(w_type, name)
+        .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
     // Prebuilt-family store: the cache slot is reached only by
     // `walk_method_cache_gc`, skipped on clean minor collections.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
@@ -9287,7 +9378,7 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
         return lookup_where_pair(w_type, name);
     }
     if !majit_metainterp::jit::we_are_jitted() {
-        let (w_class, w_value) = _cached_lookup_where_name(w_type, name, version_tag);
+        let (w_class, w_value) = _cached_lookup_where_name(w_type, Wtf8::new(name), version_tag);
         return if w_value.is_null() {
             None
         } else {
@@ -9319,14 +9410,16 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
 }
 
 /// `lookup` value projection of [`lookup_where_with_method_cache`]
-/// (typeobject.py:476 `lookup` = `self.lookup_where(name)[1]`).  Under
-/// the JIT this routes through the `@elidable`
-/// `_pure_lookup_where_with_method_cache` so the trace records a
-/// `CALL_PURE_R` and folds the `(version_tag, name)`-keyed lookup to a
-/// constant.
-pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+/// (typeobject.py:476 `lookup` = `self.lookup_where(name)[1]`). Under the JIT
+/// this routes through the `@elidable` `_pure_lookup_where_with_method_cache`
+/// as a `CALL_PURE_R`; the surrogate path's measured residual cost is recorded
+/// at the call site below.
+pub(crate) unsafe fn lookup_in_type_where_wtf8(
+    w_type: PyObjectRef,
+    name: &Wtf8,
+) -> Option<PyObjectRef> {
     if w_type.is_null() || !is_type(w_type) {
-        return lookup_in_type_where_uncached(w_type, name);
+        return lookup_in_type_wtf8_uncached(w_type, name);
     }
     // typeobject.py:505 — `promote(self)`.
     let _ = majit_metainterp::jit::promote(w_type);
@@ -9334,7 +9427,7 @@ pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Op
     let version_tag = w_type_version_tag(w_type);
     if version_tag == 0 {
         // typeobject.py:507-509 — no version tag: uncacheable.
-        return lookup_in_type_where_uncached(w_type, name);
+        return lookup_in_type_wtf8_uncached(w_type, name);
     }
     if !majit_metainterp::jit::we_are_jitted() {
         let v = _cached_lookup_where_name(w_type, name, version_tag).1;
@@ -9342,12 +9435,21 @@ pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Op
     }
     // The JIT elidable projection takes an interned, immortal str object
     // (`box_str_constant`: content-keyed, never freed) because its residual
-    // call ABI cannot pass a `&str`. The ordinary interpreter returned through
+    // call ABI cannot pass a `&Wtf8`. The ordinary interpreter returned through
     // `_cached_lookup_where_name` above without materialising this wrapper.
-    let w_name = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
+    // This does not fold away after tracing: each lookup calls
+    // `box_str_constant` (the process-global `STRING_INTERN_TABLE` mutex) and
+    // `_pure_lookup_where_with_method_cache` (the process-global
+    // `METHOD_CACHE` mutex) once per lookup per iteration.
+    let w_name = pyre_object::unicodeobject::box_str_constant(name);
     // typeobject.py:510 — `_pure_lookup_where_with_method_cache(name, version_tag)`.
     let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if v.is_null() { None } else { Some(v) }
+}
+
+#[inline]
+pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    lookup_in_type_where_wtf8(w_type, Wtf8::new(name))
 }
 
 /// `objspace.py:817 getfulltypename` — the type name used by the default
@@ -9642,6 +9744,10 @@ pub unsafe fn type_name_obj_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef
 /// metatype data descriptor, a missing class-MRO value, or any value with a
 /// descriptor protocol declines.
 ///
+/// This is the `:820-822` arm, and [`type_name_obj_fast_path`] is the
+/// `:814-819` one: a name the metatype answers with a data descriptor — which
+/// is what `__name__` is — is refused here and folded there instead.
+///
 /// The value type must additionally be a non-heap builtin type.  Its namespace
 /// cannot be mutated from Python and it cannot be the target of a `__class__`
 /// assignment, so an absent `__get__` remains absent for the life of the trace.
@@ -9673,10 +9779,10 @@ pub unsafe fn type_attr_value_fast_path(
     }
     // typeobject.py:814-823: a metatype data descriptor preempts the class's
     // own MRO, while a non-data metatype entry loses to the class value.
-    if lookup_in_type_wtf8(metatype, name).is_some_and(|descr| is_data_descr(descr)) {
+    if lookup_in_type_where_wtf8(metatype, name).is_some_and(|descr| is_data_descr(descr)) {
         return None;
     }
-    let w_value = lookup_in_type_wtf8(w_type, name)?;
+    let w_value = lookup_in_type_where_wtf8(w_type, name)?;
     // typeobject.py:822 calls `space.get(w_value, w_None, self)`.  Only a
     // value with no descriptor protocol is returned unchanged.
     let value_type = crate::typedef::r#type(w_value)?.as_ptr();
@@ -9998,7 +10104,7 @@ pub unsafe fn super_lookup_binding(
                 continue;
             }
             if is_type(t) {
-                if let Some(raw) = lookup_in_type_wtf8(t, name) {
+                if let Some(raw) = lookup_in_type_wtf8_uncached(t, name) {
                     if is_staticmethod(raw) {
                         return PY_NULL;
                     }
@@ -13625,7 +13731,7 @@ pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<
 /// functions.  Pyre's `Function` does not carry the field directly;
 /// `crate::function::function_get_qualname` reproduces the same
 /// precedence (set-attr override → `code.qualname` → `function.name`).
-pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyError> {
+pub fn object_functionstr(w_function: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // baseobjspace.py:2108-2120 — Function fast path (also covers
     // `FunctionWithFixedCode` and `BuiltinFunction`, both subclasses
     // of `Function` per function.py:783,786).  Pyre's `is_function`
@@ -13634,15 +13740,22 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
         // function.py:2108 `qualname = w_function.qualname` — match
         // PyPy's stored `qualname` field via the helper that walks
         // the stored `qualname` → `code.qualname` → `name`.
+        // The qualname is WTF-8 and this text becomes a TypeError's
+        // `args[0]` prefix, so `format!` (which would render it through
+        // `Display` and substitute U+FFFD) is not usable here.
         let qualname = unsafe { crate::function::function_get_qualname(w_function) };
+        let mut out = Wtf8Buf::new();
         let w_module = unsafe { crate::function::fget___module__(w_function) };
         if !is_w(w_module, w_none()) && unsafe { pyre_object::is_str(w_module) } {
-            let module = unsafe { pyre_object::w_str_get_value(w_module) };
-            if !module.is_empty() && module != "builtins" {
-                return Ok(format!("{module}.{qualname}()"));
+            let module = unsafe { pyre_object::w_str_get_wtf8(w_module) };
+            if !module.is_empty() && module.as_str() != Ok("builtins") {
+                out.push_wtf8(module);
+                out.push_str(".");
             }
         }
-        return Ok(format!("{qualname}()"));
+        out.push_wtf8(&qualname);
+        out.push_str("()");
+        return Ok(out);
     }
     // baseobjspace.py:2121-2122 — `_Method` recursive fast path:
     // unwrap to `w_function.w_function` and recurse.
@@ -13674,10 +13787,17 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
             // try/except OperationError: pass — async findattr suppressed too.
             Err(_) => break 'qualname,
         };
+        // The dotted prefix is optional; the qualname and the trailing `()`
+        // are not, so build the one and prepend the other.
+        let bare = |qualname: &Wtf8Buf| {
+            let mut out = qualname.clone();
+            out.push_str("()");
+            out
+        };
         match w_module {
             // No `__module__` or `__module__ is None`: bare `qualname()`.
-            None => return Ok(format!("{qualname}()")),
-            Some(w_module) if is_w(w_module, w_none()) => return Ok(format!("{qualname}()")),
+            None => return Ok(bare(&qualname)),
+            Some(w_module) if is_w(w_module, w_none()) => return Ok(bare(&qualname)),
             Some(w_module) => {
                 // text_w(w_module) — non-string raises in PyPy → except →
                 // fall through (do NOT return `qualname()` here, which
@@ -13685,11 +13805,15 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
                 let Ok(module) = object_functionstr_text_w(w_module) else {
                     break 'qualname;
                 };
-                if !module.is_empty() && module != "builtins" {
-                    return Ok(format!("{module}.{qualname}()"));
+                if !module.is_empty() && module.as_str() != Ok("builtins") {
+                    let mut out = module;
+                    out.push_str(".");
+                    out.push_wtf8(&qualname);
+                    out.push_str("()");
+                    return Ok(out);
                 }
                 // module empty or 'builtins': bare qualname().
-                return Ok(format!("{qualname}()"));
+                return Ok(bare(&qualname));
             }
         }
     }
@@ -13706,12 +13830,14 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
     if let Ok(w_s) = object_functionstr_str(w_function)
         && unsafe { pyre_object::is_str(w_s) }
     {
-        return Ok(unsafe { pyre_object::w_str_get_value(w_s).to_string() });
+        // `str(w_function)`'s own text: another `w_str_get_value` that would
+        // panic on a lone surrogate rather than answer.
+        return Ok(unsafe { pyre_object::w_str_get_wtf8(w_s).to_wtf8_buf() });
     }
-    Ok(format!(
+    Ok(Wtf8Buf::from_string(format!(
         "{} object",
         object_functionstr_type_name(w_function)
-    ))
+    )))
 }
 
 /// `space.str(w_obj)` — `__str__`-only fast path for
@@ -13779,10 +13905,13 @@ fn object_functionstr_findattr(
 }
 
 /// `space.text_w(w_obj)` for the `object_functionstr` try blocks.
-fn object_functionstr_text_w(w_obj: PyObjectRef) -> Result<String, crate::PyError> {
+fn object_functionstr_text_w(w_obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         if pyre_object::is_str(w_obj) {
-            Ok(pyre_object::w_str_get_value(w_obj).to_string())
+            // `text_w` is the surrogate-preserving spelling upstream, and
+            // `w_str_get_value` would panic outright on a `__qualname__`
+            // carrying a lone surrogate rather than return its text.
+            Ok(pyre_object::w_str_get_wtf8(w_obj).to_wtf8_buf())
         } else {
             Err(crate::PyError::type_error(format!(
                 "expected str, got {} object",
@@ -16633,10 +16762,15 @@ unsafe fn property_no_accessor(
         }
     }
     let msg = if !w_name.is_null() {
-        let name_repr = crate::display::py_repr(w_name).unwrap_or_else(|_| "<name>".to_string());
-        format!("property {name_repr} of '{qualname}' object has no {kind}")
+        let name_repr = crate::display::py_repr_wtf8(w_name)
+            .unwrap_or_else(|_| Wtf8Buf::from_string("<name>".to_string()));
+        crate::display::wtf8_format!(
+            "property ",
+            name_repr,
+            format!(" of '{qualname}' object has no {kind}")
+        )
     } else {
-        format!("property of '{qualname}' object has no {kind}")
+        Wtf8Buf::from_string(format!("property of '{qualname}' object has no {kind}"))
     };
     Ok(crate::PyError::attribute_error(msg))
 }
@@ -17962,7 +18096,11 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
                     return match crate::call::call_function_impl_result(finalizer, &[gen_obj]) {
                         Ok(_) => Ok(w_none()),
                         Err(mut err) => {
-                            err.write_unraisable(w_none(), "async generator finalizer", gen_obj);
+                            err.write_unraisable(
+                                w_none(),
+                                Wtf8::new("async generator finalizer"),
+                                gen_obj,
+                            );
                             Ok(w_none())
                         }
                     };
@@ -18137,6 +18275,48 @@ mod tests {
         }
     }
 
+    /// typeobject.py:303-326 — builtin types and a plain user class that
+    /// inherit object.__getattribute__ answer `None`, so the layout-agnostic
+    /// receiver gate does not route them through an app-level call.
+    #[test]
+    fn getattribute_if_not_from_object_answers_none_for_object_default_types() {
+        crate::typedef::init_typeobjects();
+        let checked = [
+            (
+                "list",
+                crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE),
+            ),
+            (
+                "tuple",
+                crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE),
+            ),
+            (
+                "str",
+                crate::typedef::gettypeobject(&pyre_object::pyobject::STR_TYPE),
+            ),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE),
+            ),
+            (
+                "Exception",
+                crate::typedef::gettypeobject(&pyre_object::interp_exceptions::EXCEPTION_TYPE),
+            ),
+        ];
+        unsafe {
+            for (name, w_type) in checked {
+                assert!(!w_type.is_null(), "{name} type is registered");
+                assert!(
+                    getattribute_if_not_from_object(w_type).is_none(),
+                    "{name} inherits object.__getattribute__"
+                );
+            }
+            let plain = make_user_instance();
+            let plain_type = w_instance_get_type(plain);
+            assert!(getattribute_if_not_from_object(plain_type).is_none());
+        }
+    }
+
     #[test]
     fn test_module_setattr_getattr() {
         crate::test_hooks::install_hash_hook();
@@ -18181,7 +18361,7 @@ mod tests {
         crate::typedef::init_typeobjects();
         let err = super::isinstance(w_int_new(5), w_int_new(6)).unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::TypeError));
-        assert!(err.message.contains("isinstance() arg 2"));
+        assert!(err.message_text().contains("isinstance() arg 2"));
     }
 
     /// abstractinst.py:108-114 + 53-72 — when one tuple element is not a
@@ -18203,7 +18383,7 @@ mod tests {
         let int_type = crate::typedef::r#type(w_int_new(0)).unwrap().as_ptr();
         let err = super::issubclass(w_int_new(5), int_type).unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::TypeError));
-        assert!(err.message.contains("issubclass() arg 1"));
+        assert!(err.message_text().contains("issubclass() arg 1"));
     }
 
     /// abstractinst.py:150-169 — `issubclass(int, 6)` must raise
@@ -18214,7 +18394,7 @@ mod tests {
         let int_type = crate::typedef::r#type(w_int_new(0)).unwrap().as_ptr();
         let err = super::issubclass(int_type, w_int_new(6)).unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::TypeError));
-        assert!(err.message.contains("issubclass() arg 2"));
+        assert!(err.message_text().contains("issubclass() arg 2"));
     }
 
     /// abstractinst.py:127-147 — `p_abstract_issubclass_w` must walk
@@ -18268,7 +18448,7 @@ mod tests {
         let lst = w_list_new(vec![w_int_new(1)]);
         let err = unpackiterable(lst, 3).expect_err("expected ValueError");
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
-        assert!(err.message.contains("not enough values"));
+        assert!(err.message_text().contains("not enough values"));
     }
 
     /// pypy/interpreter/baseobjspace.py:1043-1046 — `too many values
@@ -18279,7 +18459,7 @@ mod tests {
         let lst = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3), w_int_new(4)]);
         let err = unpackiterable(lst, 3).expect_err("expected ValueError");
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
-        assert!(err.message.contains("too many values"));
+        assert!(err.message_text().contains("too many values"));
     }
 
     /// pypy/interpreter/baseobjspace.py:983-994 — expected_length=-1
@@ -18369,7 +18549,7 @@ mod tests {
     fn object_functionstr_scalar_fallback() {
         crate::typedef::init_typeobjects();
         let s = object_functionstr(w_int_new(42)).expect("scalar fallback never propagates async");
-        assert_eq!(s, "42");
+        assert_eq!(s.as_str(), Ok("42"));
     }
 }
 

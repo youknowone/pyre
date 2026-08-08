@@ -143,45 +143,40 @@ fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
 }
 
 #[test]
-fn keyword_builtin_wrapper_finds_colored_argument_slice_item_descr() {
+fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     let wrapper =
         named_jitcode("__pyre_wrap_getrandbits").expect("getrandbits builtin wrapper jitcode");
-    let mut ops = crate::jitcode_runtime::decoded_ops(&wrapper.code);
-    let first = ops.next().expect("wrapper first op");
-    // The result colour is not pinned. `split_builtin_kwargs` returns the
-    // aggregate `(&[PyObjectRef], Option<PyObjectRef>)`; when the codewriter
-    // materializes that pair the entry call yields it by reference
-    // (`inline_call_r_r`), and when it inlines the body far enough to leave
-    // only the leading `args.is_empty()` test at the entry the same call
-    // yields that by value (`inline_call_r_i`). Both start the wrapper by
-    // splitting positional from keyword arguments, which is what this asserts.
+    let first = crate::jitcode_runtime::decoded_ops(&wrapper.code)
+        .next()
+        .expect("wrapper first op");
+    // `getrandbits` registers with a `Signature`, so the call path resolves
+    // keywords into positional PY_NULL-padded slots before the wrapper runs.
+    // There is no `split_builtin_kwargs(args)` peel at the entry, so the
+    // wrapper does not open with the splitter's `inline_call_*`; it reads its
+    // argument array directly.
     assert!(
-        first.opname.starts_with("inline_call_"),
-        "keyword wrapper starts by splitting positional and keyword arguments, got {}",
+        !first.opname.starts_with("inline_call_"),
+        "signature-bound wrapper does not open with a keyword-split call, got {}",
         first.key
     );
 
     let item_descr_index =
         wrapper_args_item_descr_index(&wrapper.code).expect("wrapper item descriptor");
-    // Select by descr identity rather than by position. The inlined splitter
-    // reads `args.len()` off the wrapper's own `r0` before the split, so "the
-    // first `arraylen_gc`" names that read and not the positional slice's once
-    // the body inlines; the item descr names the slice under every inline
-    // depth.
+    // Select by descr identity rather than by position: the length read names
+    // the array itself and the item read names its elements, so the two carry
+    // distinct heap-cache descriptors even though both index the same slice.
     let getitem = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| {
             op.key == "getarrayitem_gc_r/rid>r"
                 && item_pool_descr_index(&wrapper.code, op.pc + 3) == item_descr_index
         })
-        .expect("keyword wrapper argument-slice item read");
+        .expect("wrapper argument-slice item read");
     let slice_reg = wrapper.code[getitem.pc + 1];
-    assert_ne!(
-        slice_reg, 0,
-        "register coloring keeps the argument slice off r0 at extraction"
-    );
+    // With no keyword split the argument slice is the wrapper input itself
+    // (r0); the length read names the same register.
     crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| op.key == "arraylen_gc/rd>i" && wrapper.code[op.pc + 1] == slice_reg)
-        .expect("keyword wrapper reads the argument-slice length off the colored slice");
+        .expect("wrapper reads the argument-slice length off the same slice register");
 }
 
 /// Descr-pool index encoded little-endian at `at`, resolved to its
@@ -441,6 +436,7 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -663,6 +659,7 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -720,6 +717,7 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -795,6 +793,7 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_reorder_saved: None,
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -1047,6 +1046,7 @@ fn drive_int_add_jump_if_ovf(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -1205,6 +1205,7 @@ fn drive_alloc_with_descr(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -1399,6 +1400,7 @@ fn run_hint_step_with_descrs(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -1908,6 +1910,7 @@ fn switch_id_hit_jumps_to_matching_target() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -1966,6 +1969,7 @@ fn switch_id_miss_falls_through() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2023,6 +2027,7 @@ fn switch_id_requires_concrete_int_value() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2089,6 +2094,7 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2147,6 +2153,7 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2204,6 +2211,7 @@ fn goto_if_not_requires_concrete_int_value() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2470,6 +2478,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2639,6 +2648,7 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2756,6 +2766,7 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2868,6 +2879,7 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2969,6 +2981,7 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3066,6 +3079,7 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3145,6 +3159,7 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3203,6 +3218,7 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3257,6 +3273,7 @@ fn step_through_live_opcode_advances_by_offset_size() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3320,6 +3337,7 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3381,6 +3399,7 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3443,6 +3462,7 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3506,6 +3526,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3586,6 +3607,7 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3654,6 +3676,7 @@ fn step_through_void_return_stashes_void_finish_payload() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3723,6 +3746,7 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3780,6 +3804,7 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3840,6 +3865,7 @@ fn step_through_goto_jumps_to_label_target() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3900,6 +3926,7 @@ fn step_through_goto_handles_high_byte_of_label() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4008,6 +4035,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4063,6 +4091,7 @@ fn step_through_catch_exception_advances_past_label_operand() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4132,6 +4161,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4215,6 +4245,7 @@ fn top_level_raise_settles_the_vable_token() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4322,6 +4353,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4423,6 +4455,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4501,6 +4534,7 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4556,6 +4590,7 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4675,6 +4710,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4797,6 +4833,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4867,6 +4904,7 @@ fn step_through_int_copy_advances_past_operand_bytes() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4934,6 +4972,7 @@ fn int_copy_writes_src_value_into_dst_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4992,6 +5031,7 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5049,6 +5089,7 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5126,6 +5167,7 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5191,6 +5233,7 @@ fn ref_copy_writes_src_value_into_dst_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5247,6 +5290,7 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5302,6 +5346,7 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5368,6 +5413,7 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5594,6 +5640,7 @@ fn drive_int_between(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5732,6 +5779,7 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5823,6 +5871,7 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5902,6 +5951,7 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6001,6 +6051,7 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6173,6 +6224,7 @@ fn run_float_step(
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6368,6 +6420,7 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6424,6 +6477,7 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6482,6 +6536,7 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6548,6 +6603,7 @@ fn unsupported_opname_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6605,6 +6661,7 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6755,6 +6812,7 @@ fn abort_result_r_is_pure_pc_advance() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6822,6 +6880,7 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6907,6 +6966,7 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6993,6 +7053,7 @@ fn ref_guard_value_on_const_records_nothing() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7089,6 +7150,7 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7259,6 +7321,7 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7346,6 +7409,7 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7405,6 +7469,7 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7478,6 +7543,7 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7581,6 +7647,7 @@ fn may_force_with_active_vable_executes_and_clears_token() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7683,6 +7750,7 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7760,6 +7828,7 @@ fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7824,6 +7893,7 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7882,6 +7952,7 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7952,6 +8023,7 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8024,6 +8096,7 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8116,6 +8189,7 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8197,6 +8271,7 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8277,6 +8352,7 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8337,6 +8413,7 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8435,6 +8512,7 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8532,6 +8610,7 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8637,6 +8716,7 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8774,6 +8854,7 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8847,6 +8928,7 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8906,6 +8988,7 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8989,6 +9072,7 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9103,6 +9187,7 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9232,6 +9317,7 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_ceiling: u32::MAX,
+            vstack_reorder_saved: None,
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -9322,6 +9408,7 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9425,6 +9512,7 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9507,6 +9595,7 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9592,6 +9681,7 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9675,6 +9765,7 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9763,6 +9854,7 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9849,6 +9941,7 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9924,6 +10017,7 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10020,6 +10114,7 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10094,6 +10189,7 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10156,6 +10252,7 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10230,6 +10327,7 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10324,6 +10422,7 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10408,6 +10507,7 @@ fn setfield_gc_i_redundant_write_skips_recording() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10470,6 +10570,7 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10558,6 +10659,7 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10629,6 +10731,7 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10774,6 +10877,7 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10852,6 +10956,7 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10922,6 +11027,7 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11241,6 +11347,7 @@ fn walk_undecodable_byte_surfaces_typed_error() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11320,6 +11427,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11409,6 +11517,7 @@ fn loop_header_stamps_seen_flag() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11477,6 +11586,7 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11541,6 +11651,7 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11883,6 +11994,7 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12078,6 +12190,7 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12178,6 +12291,7 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
         vstack_valid: false,
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12275,4 +12389,51 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
         vec![5, 4, 1],
         "a committed walk keeps its nodes"
     );
+}
+
+#[test]
+fn ref_var_list_offset_follows_the_argcodes_not_a_fixed_byte() {
+    // The Ref-only residual shape puts its `R` list right after the funcptr
+    // register, so offset 1 answers it; the mixed shape does not, because the
+    // Int list between them is variable-width.  A reader that assumes 1 for
+    // both takes the Int list's length byte as the Ref list's, and its
+    // register indices into the Ref bank — a list of unrelated objects whose
+    // LENGTH still looks plausible, which is what let the wrong operand stack
+    // through the abort flush's depth check.
+    let ref_only = *insns_opname_to_byte()
+        .get("residual_call_r_r/iRd>r")
+        .expect("residual_call_r_r/iRd>r must be in insns table");
+    // opcode, i=funcptr, R: len=2 + 2 regs, d=0x0001, >r dst
+    let code = [ref_only, 0x07, 0x02, 0x04, 0x05, 0x01, 0x00, 0x09];
+    let op = crate::jitcode_runtime::decode_op_at(&code, 0).expect("must decode");
+    assert_eq!(op.argcodes, "iRd>r");
+    assert_eq!(ref_var_list_operand_offset(&code, &op), Some(1));
+
+    let mixed = *insns_opname_to_byte()
+        .get("residual_call_ir_r/iIRd>r")
+        .expect("residual_call_ir_r/iIRd>r must be in insns table");
+    // opcode, i=funcptr, I: len=3 + 3 regs, R: len=2 + 2 regs, d, >r dst
+    let code = [
+        mixed, 0x07, //  i
+        0x03, 0x00, 0x01, 0x02, // I: len=3
+        0x02, 0x04, 0x05, // R: len=2
+        0x01, 0x00, // d
+        0x09, // >r
+    ];
+    let op = crate::jitcode_runtime::decode_op_at(&code, 0).expect("must decode");
+    assert_eq!(op.argcodes, "iIRd>r");
+    assert_eq!(
+        ref_var_list_operand_offset(&code, &op),
+        Some(5),
+        "the R list starts past the 4-byte I list, not at offset 1",
+    );
+
+    // An op with no Ref list at all has no offset to answer with, and the
+    // caller must decline rather than read whatever sits at a guessed one.
+    let int_only = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("int_add/ii>i must be in insns table");
+    let code = [int_only, 0x01, 0x02, 0x03];
+    let op = crate::jitcode_runtime::decode_op_at(&code, 0).expect("must decode");
+    assert_eq!(ref_var_list_operand_offset(&code, &op), None);
 }

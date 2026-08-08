@@ -1048,7 +1048,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
                 crate::executioncontext::report_error(
                     unsafe { (*ec).space },
                     &error,
-                    "weakref callback ",
+                    rustpython_wtf8::Wtf8::new("weakref callback "),
                     current_callable(),
                 );
             }
@@ -1514,7 +1514,9 @@ pub fn proxy_trunc(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 pub fn proxy_str(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    Ok(pyre_object::w_str_new(&unsafe { crate::py_str(w_obj0)? }))
+    Ok(pyre_object::w_str_from_wtf8(unsafe {
+        crate::display::py_str_wtf8(w_obj0)?
+    }))
 }
 
 pub fn proxy_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
@@ -2255,7 +2257,10 @@ mod tests {
         write_attr(proxy, ATTR_W_OBJ_WEAK, pyre_object::w_none());
         let err = force(proxy).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::ReferenceError);
-        assert_eq!(err.message, "weakly referenced object no longer exists");
+        assert_eq!(
+            err.message_text(),
+            "weakly referenced object no longer exists"
+        );
     }
 
     /// `len(proxy)` must dispatch through `proxy_typedef_dict["__len__"]`,

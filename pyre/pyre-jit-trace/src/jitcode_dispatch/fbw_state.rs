@@ -1357,10 +1357,9 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 ///   the iterator (the two `foriter_exempt_*` witnesses).
 /// * **Self-recursive** — the callee calls itself.  A hot self-recursion
 ///   forms a `CALL_ASSEMBLER` bridge whose moving-nursery callee frame cannot
-///   survive the residual trampoline retaining a pre-call frame pointer; on
-///   the wasm always-portal path the inlined body also type-confuses the
-///   optimizer (`setintbound: got Ref`, the `wasm_ca_trampoline_decline`
-///   witness).  Detected both dynamically (the same `w_code` already nested in
+///   survive the residual trampoline retaining a pre-call frame pointer (the
+///   `wasm_ca_trampoline_decline` witness).  Detected both dynamically (the
+///   same `w_code` already nested in
 ///   the framestack — mutual/deep recursion) and statically
 ///   (`code_is_self_recursive`), since the recursive call residualizes to a
 ///   `CALL_ASSEMBLER` rather than nesting the framestack, so it is already a
@@ -1426,7 +1425,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // [`fbw_inline_callee_hazardous`]: a LOOP-BEARING callee (the FOR_ITER
     // Option-C refused-delivery double-advance, the `foriter_exempt_*`
     // witnesses) and a SELF-RECURSIVE callee (the hot `CALL_ASSEMBLER`
-    // recursion-bridge / wasm always-portal `setintbound` type-confusion, the
+    // recursion-bridge frame the residual trampoline cannot retain, the
     // `wasm_ca_trampoline_decline` witness).  Both are properties of the
     // framestack knowable at the residual decline point, so the whole trace
     // aborts before the hazardous body is committed.  Every other nested
@@ -1992,6 +1991,24 @@ pub(crate) enum CalleeReplaySafety {
     Clean,
     /// Clean apart from Python-level CALL residuals, whose callee is resolved
     /// only at walk time.
+    ///
+    /// This variant and the deferred arm of the nested-residual abort are ONE
+    /// contract, not two independent gates: the admission is sound only
+    /// because a residual the lever could not inline aborts BEFORE executing
+    /// and rewinds to the enclosing CALL (see the enforcer above, which states
+    /// the same promise from the other side).  Retiring the abort on its own
+    /// leaves the admission standing on a promise nothing enforces.
+    ///
+    /// The axis is the EXECUTED-EFFECT delta, not raising — the rewind leg is
+    /// gated on `fbw_executed_effect_count() == entry_executed_effects`.  A
+    /// narrowing keyed on "can this body raise" would admit a `list.append`
+    /// residual, which raises nothing and is exactly what the arm must catch,
+    /// so `EffectInfo::check_can_raise` is not the predicate for this decision.
+    ///
+    /// There is no upstream counterpart to defer against: `look_inside_graph`
+    /// (`codewriter/policy.py:48`) and `can_inline_callable`
+    /// (`warmstate.py:669`) decide statically before tracing and turn a "no"
+    /// into a residual call.
     DeferredCall,
     /// Carries a live-heap effect a replay would double.
     Dirty,

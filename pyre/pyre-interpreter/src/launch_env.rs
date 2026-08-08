@@ -131,18 +131,11 @@ fn read(name: &str) -> Option<String> {
 }
 
 /// Environment bytes in the host's own spelling. The seam hands back what the
-/// platform stores: bytes on unix, where any byte is legal, and the UTF-8 form
-/// of the wide value on Windows, where the host has already validated it.
+/// platform stores: bytes on unix, where any byte is legal, and the WTF-8 form
+/// of the wide value on Windows, whose unpaired surrogates re-encode to the
+/// code units they came from.
 fn os_string_from_bytes(value: &[u8]) -> std::ffi::OsString {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        std::ffi::OsString::from_vec(value.to_vec())
-    }
-    #[cfg(not(unix))]
-    {
-        std::ffi::OsString::from(String::from_utf8_lossy(value).into_owned())
-    }
+    crate::gateway::os_string_from_fs_bytes(value)
 }
 
 /// Presence of a variable, without decoding it. `_Py_GetEnv` tests the raw

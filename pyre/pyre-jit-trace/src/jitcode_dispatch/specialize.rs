@@ -3289,6 +3289,16 @@ pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
     else {
         return Ok(None);
     };
+    // The metaclass guard below reads the raw `w_class` slot, while the fast
+    // path answers through `typedef::type`, which falls back to
+    // `gettypefor(ob_type)` when that slot is null.  A receiver reached through
+    // that fallback would be guarded against a value its field never holds, and
+    // nothing writes the slot afterwards, so the guard would fail on every
+    // execution forever — one bridge per `trace_eagerness` bucket, without ever
+    // converging.  Fold only what the guard can discharge.
+    if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, metatype) {
+        return Ok(None);
+    }
 
     // guard_class(obj, ob_type): the `W_TypeObject` layout both field reads
     // below index into.  `is_type` is this check.
@@ -3334,6 +3344,10 @@ pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
 /// green constant.  [`pyre_interpreter::mutated`] recursively invalidates
 /// subclasses, so the one receiver pin covers reassignment or deletion on any
 /// base class as well.
+///
+/// A name the metatype answers with a data descriptor is refused by the oracle,
+/// so `__name__` never reaches here — [`try_walker_specialize_load_type_name_attr`]
+/// is its fold, and the two cover the disjoint arms of `descr_getattribute`.
 ///
 /// The name needs no operand guard: the codewriter baked its `co_names` index
 /// into the residual.  This read-only, present-attribute fold cannot raise, so
@@ -7852,16 +7866,26 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // `f.mark_as_escaped()` — vm.py:54.  `escaped` is not one of the six fields
     // `interp_jit.py:25-30` declares, so the store cannot force; it is
     // load-bearing at `executioncontext.py:99-106 leave`, which forces the
-    // leaving frame's own vref only for a frame that escaped.
-    ctx.trace_ctx.call_void_typed_with_effect(
-        pyre_interpreter::module::sys::vm::jit_frame_mark_as_escaped as *const (),
-        &[vable_op],
-        &[majit_ir::Type::Ref],
-        majit_ir::EffectInfo::new(
-            majit_ir::ExtraEffect::CannotRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
+    // leaving frame's own vref only for a frame that escaped.  Upstream traces
+    // it as the ordinary `setfield_gc` on the flag, so it is emitted as the
+    // read/or/store the `tb_frame` fold above already uses — an opaque call
+    // would hide the update from the optimizer and its heap cache.
+    let flags_descr = crate::descr::pyframe_flags_descr();
+    let live_flags =
+        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, vable_op, flags_descr.clone());
+    let escaped_bit = ctx
+        .trace_ctx
+        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_ESCAPED));
+    let new_flags = ctx
+        .trace_ctx
+        .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[vable_op, new_flags],
+        flags_descr.clone(),
     );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(vable_op, flags_descr.index(), new_flags);
     // The walk IS the interpreter running, so the recorded store has to take
     // effect here too — the residual would have applied it before returning.
     unsafe { (*frame).mark_as_escaped() };
@@ -10511,7 +10535,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     // and rooted by the compiled loop's gcref table thereafter.
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(exc);
-    let msg = pyre_object::w_str_new(&err.message);
+    let msg = pyre_object::w_str_from_wtf8(err.message.clone());
     let msg_const = ctx.trace_ctx.const_ref(msg as i64);
     let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &[msg_const]);
     // Stamp the canonical list class exactly as `w_list_new` does (the

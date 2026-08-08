@@ -40,7 +40,7 @@ pub(crate) struct VirtualizableMacroInput {
     /// Frame pointer field name in the state struct (e.g., `frame`).
     frame_field: Option<Ident>,
     /// Vable scalar fields (= RPython `_virtualizable_` static fields,
-    /// `interp_jit.py:25-31`). Read/written via getfield_vable on the
+    /// `interp_jit.py:25-30`). Read/written via getfield_vable on the
     /// vable heap object; included in extract_live / jump_args.
     inputargs: Vec<InputArgField>,
     /// Extra red inputargs that are NOT vable scalar fields (= RPython
@@ -486,7 +486,7 @@ fn generate_layout_helpers(
         ///
         /// TODO: codegen-time constant equivalent to
         /// `len(VABLEINFO.static_field_descrs) + 1` (frame ptr + N
-        /// `_virtualizable_` scalars from `interp_jit.py:25-31`). RPython
+        /// `_virtualizable_` scalars from `interp_jit.py:25-30`). RPython
         /// derives the count dynamically by iterating
         /// `range(len(self.static_field_descrs))` (`virtualizable.py:86`);
         /// pyre crystallises it at proc-macro expansion time so the flat

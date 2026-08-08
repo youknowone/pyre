@@ -1000,7 +1000,7 @@ impl W_BufferedRandom {
         super::call_method_result(self.w_raw, "_dealloc_warn", &[w_source])
     }
 
-    fn __repr__(&self) -> Result<String, crate::PyError> {
+    fn __repr__(&self) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
         let self_obj = self.self_obj();
         let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
             return Err(crate::PyError::runtime_error(
@@ -1009,10 +1009,14 @@ impl W_BufferedRandom {
         };
         let typename = crate::type_methods::arg_type_name(self_obj);
         match crate::baseobjspace::getattr_str(self_obj, "name") {
-            Ok(name) => Ok(format!("<{typename} name={}>", unsafe {
-                crate::display::py_repr(name)?
-            })),
-            Err(_) => Ok(format!("<{typename}>")),
+            Ok(name) => Ok(crate::display::wtf8_format!(
+                format!("<{typename} name="),
+                unsafe { crate::display::py_repr_wtf8(name)? },
+                ">"
+            )),
+            Err(_) => Ok(rustpython_wtf8::Wtf8Buf::from_string(format!(
+                "<{typename}>"
+            ))),
         }
     }
 }

@@ -815,6 +815,24 @@ fn is_vec_ctor_segments(segments: &[String]) -> bool {
         && (segments[2] == "with_capacity" || segments[2] == "new")
 }
 
+/// `alloc::vec::from_elem(elem, count)` (Rust MIR `vec![elem; count]`) —
+/// the repeated resizable-list constructor.  Routed in [`translate_op`] to
+/// `newlist(elem)` + `mul(list, count)`, the same `[a] * b` shape that
+/// `transform_allocate` (`transform.py:36-50`) collapses to
+/// `alloc_and_set` and `rtype_alloc_and_set` (`rlist.py:346-351`) lowers
+/// through `ll_alloc_and_set` (`rlist.py:487`).
+///
+/// Charon emits this call as `alloc::vec::from_elem`, while the constructor
+/// recognizer above omits the foreign crate prefix. Match the trailing
+/// `vec::from_elem` spelling defensively, but require the exact two-argument
+/// `(elem, count)` shape.
+fn is_vec_from_elem_segments(segments: &[String], arg_count: usize) -> bool {
+    segments.len() >= 2
+        && segments[segments.len() - 2] == "vec"
+        && segments[segments.len() - 1] == "from_elem"
+        && arg_count == 2
+}
+
 /// `Vec::push(l, item)` (Rust MIR `vec::Vec::push`) — the resizable-list
 /// append. Routed to the resized `ListRepr.rtype_method("append")`
 /// (`rlist.py:185`) via the `getattr(recv, "append") + simple_call` method
@@ -934,8 +952,11 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // Matched before the general `Call` arm.
         OpKind::Call {
             target: crate::model::CallTarget::FunctionPath { segments },
+            args,
             ..
-        } if is_vec_ctor_segments(segments) => false,
+        } if is_vec_ctor_segments(segments) || is_vec_from_elem_segments(segments, args.len()) => {
+            false
+        }
         // `[__iter_next]` (`front::iter_next`) lowers to the raising
         // flowspace `next` op (`operation.rs` `OpKind::Next.can_only_throw
         // = [StopIteration, RuntimeError]`).  Matched before the general
@@ -1567,6 +1588,83 @@ pub fn translate_op(
                     if let Some(opname) = nonraising_core_bridge_opname(segments, arg_hls.len()) {
                         return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
                     }
+                    // `slice[..slice.len() - 1]` is emitted by
+                    // `front::slice_index` as an unregistered marker rather
+                    // than frontend `getslice`/`ConstInt` ops.  The marker is
+                    // expanded here, after annotation, to the upstream
+                    // `getslice(slice, 0, -1)` contract.  This mirrors the
+                    // frontend/adapter split used by `__array_repeat`: an
+                    // untyped graph falling to the legacy walker retains an
+                    // ordinary residual call and cannot carry an unwired
+                    // `getslice` op to the assembler.
+                    //
+                    // Upstream: `decompose_slice_args` (`rtyper.rs:2798`)
+                    // selects `SliceKind::MinusOne` for annotated constants
+                    // `0` and `-1`, then `rlist.py:906-911` calls
+                    // `ll_listslice_minusone` (asserting, not clamping).
+                    if segments.as_slice() == ["__getslice_minusone"] && arg_hls.len() == 1 {
+                        let slice = arg_hls.into_iter().next().expect("slice arg");
+                        return Ok(vec![FlowspaceOp::new(
+                            "getslice",
+                            vec![
+                                slice,
+                                Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+                                Hlvalue::Constant(Constant::new(ConstValue::Int(-1))),
+                            ],
+                            result,
+                        )]);
+                    }
+                    if segments.as_slice() == ["__getslice_rangeto"] && arg_hls.len() == 2 {
+                        // slice, end -> getslice(slice, 0, end)
+                        let mut args = arg_hls.into_iter();
+                        let slice = args.next().expect("slice arg");
+                        let end = args.next().expect("RangeTo end arg");
+                        return Ok(vec![FlowspaceOp::new(
+                            "getslice",
+                            vec![
+                                slice,
+                                Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+                                end,
+                            ],
+                            result,
+                        )]);
+                    }
+                    // `[v; N]` array literal.  `front::mir` lowers
+                    // `Rvalue::Repeat` to the `__array_repeat` synthetic
+                    // carrying `(fill, count)` whenever the count decodes.
+                    // Expand it into the `[a] * b` shape upstream builds —
+                    // `newlist(a)` then `mul(list, b)` — which
+                    // `transform_allocate` (transform.py:36-50) collapses
+                    // into `alloc_and_set(b, a)`, the operation
+                    // `rtype_alloc_and_set` (rlist.py:346-351) lowers
+                    // through `ll_alloc_and_set` (rlist.py:487) to
+                    // `_ll_alloc_and_clear` / `_ll_alloc_and_set_nonnull`.
+                    //
+                    // The list must be `mul`'s arg 0: `transform_allocate`
+                    // matches on `op.args[0] in length1_lists` and reads the
+                    // count back out of `op.args[1]`, which is the order
+                    // `rtype_alloc_and_set` then consumes as
+                    // `hop.inputargs(Signed, r_list.item_repr)`.  Upstream's
+                    // `pairtype(SomeInteger, SomeList).mul` (binaryop.py:657)
+                    // exists but `transform_allocate` does not match it.
+                    // Both ops go out together so they share a block, which
+                    // is the scope `transform_allocate` scans.
+                    //
+                    // Emitting here rather than in `front::mir` is
+                    // deliberate: this adapter is only reached on the way to
+                    // the rtyper, so neither op can survive on a graph that
+                    // fell back to the legacy walker.
+                    if segments.len() == 1 && segments[0] == "__array_repeat" && arg_hls.len() == 2
+                    {
+                        let mut iter = arg_hls.into_iter();
+                        let fill = iter.next().expect("array repeat fill arg");
+                        let count = iter.next().expect("array repeat count arg");
+                        let list = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new("newlist", vec![fill], list.clone()),
+                            FlowspaceOp::new("mul", vec![list, count], result),
+                        ]);
+                    }
                     // `[__iter_next]` (`front::iter_next`) → the raising
                     // flowspace `next` op (`operation.rs` `OpKind::Next`,
                     // `can_only_throw = [StopIteration, RuntimeError]`).  The
@@ -1821,6 +1919,22 @@ pub fn translate_op(
                     // dropped — see [`is_vec_ctor_segments`].
                     if is_vec_ctor_segments(segments) {
                         return Ok(vec![FlowspaceOp::new("newlist", vec![], result)]);
+                    }
+                    // `vec![elem; count]` lowers (in Rust MIR) to a call to
+                    // `alloc::vec::from_elem(elem, count)`. Emit the same
+                    // `newlist(elem)` + `mul(list, count)` shape as the
+                    // `__array_repeat` synthetic above; see
+                    // [`is_vec_from_elem_segments`] for the upstream
+                    // `transform_allocate` / `rtype_alloc_and_set` path.
+                    if is_vec_from_elem_segments(segments, arg_hls.len()) {
+                        let mut iter = arg_hls.into_iter();
+                        let fill = iter.next().expect("from_elem fill arg");
+                        let count = iter.next().expect("from_elem count arg");
+                        let list = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new("newlist", vec![fill], list.clone()),
+                            FlowspaceOp::new("mul", vec![list, count], result),
+                        ]);
                     }
                     // `Vec::push(recv, item)` lowers (in Rust MIR) to a call
                     // to `vec::Vec::push`. Emit the *method* shape
@@ -4620,6 +4734,164 @@ mod tests {
         // `__name__`, mirroring upstream `func.__name__` (the leaf
         // identifier, not the dotted module path).
         assert_eq!(host.qualname(), "b");
+    }
+
+    #[test]
+    fn translate_op_array_repeat_expands_to_newlist_then_mul() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_array_repeat_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        let fill = Hlvalue::Variable(Variable::new());
+        let count = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), fill.clone());
+        value_map.insert(vars[2].clone(), count.clone());
+        value_map.insert(vars[3].clone(), result.clone());
+
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__array_repeat".into()],
+                },
+                args: vec![vars[1].clone(), vars[2].clone()],
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("two-arg __array_repeat must lower");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "newlist");
+        assert_eq!(translated[0].args, vec![fill.clone()]);
+        assert_eq!(translated[1].opname, "mul");
+        assert_eq!(translated[1].args[0], translated[0].result);
+        assert_eq!(translated[1].args[1], count);
+        assert_eq!(translated[1].result, result);
+    }
+
+    /// The frontend cannot see the adapter's expansion: `lower_function`
+    /// still contains the raw `alloc::vec::from_elem` call, while the
+    /// flowspace graph must carry `newlist` + `mul` instead.  This real-LLBC
+    /// anchor therefore runs both stages and checks the adapter output.
+    #[test]
+    #[ignore]
+    fn bind_kwargs_to_signature_has_no_residual_vec_from_elem_after_adaptation() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = majit_charon_reader::Llbc::load(path).expect("load real LLBC");
+        let legacy = crate::front::mir::lower_function(&llbc, "bind_kwargs_to_signature")
+            .expect("lower bind_kwargs_to_signature");
+        let raw_from_elem = legacy
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath { segments },
+                        ..
+                    } if is_vec_from_elem_segments(segments, 2)
+                )
+            })
+            .count();
+        assert!(raw_from_elem > 0, "fixture must contain vec::from_elem");
+
+        let var_map = build_value_to_variable_map(&legacy);
+        let value_map = build_value_to_hlvalue_map(&legacy, &var_map);
+        let registry = empty_call_registry();
+        let expansions = legacy
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath { segments },
+                        ..
+                    } if is_vec_from_elem_segments(segments, 2)
+                )
+            })
+            .map(|op| translate_op(op, &value_map, &registry).expect("adapt from_elem"))
+            .collect::<Vec<_>>();
+        assert!(!expansions.is_empty());
+        for translated in expansions {
+            assert_eq!(translated.len(), 2);
+            assert_eq!(translated[0].opname, "newlist");
+            assert_eq!(translated[1].opname, "mul");
+        }
+    }
+
+    #[test]
+    fn translate_op_getslice_minusone_expands_after_annotation() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_getslice_minusone_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let slice = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), slice.clone());
+        value_map.insert(vars[1].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__getslice_minusone".into()],
+                },
+                args: vec![vars[0].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("minus-one marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getslice");
+        assert_eq!(translated[0].args[0], slice);
+        assert_eq!(
+            translated[0].args[1],
+            Hlvalue::Constant(Constant::new(ConstValue::Int(0)))
+        );
+        assert_eq!(
+            translated[0].args[2],
+            Hlvalue::Constant(Constant::new(ConstValue::Int(-1)))
+        );
+        assert_eq!(translated[0].result, result);
+    }
+
+    #[test]
+    fn translate_op_getslice_rangeto_expands_after_annotation() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_getslice_rangeto_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let slice = Hlvalue::Variable(Variable::new());
+        let end = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), slice.clone());
+        value_map.insert(vars[1].clone(), end.clone());
+        value_map.insert(vars[2].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__getslice_rangeto".into()],
+                },
+                args: vec![vars[0].clone(), vars[1].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("RangeTo marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getslice");
+        assert_eq!(translated[0].args[0], slice);
+        assert_eq!(
+            translated[0].args[1],
+            Hlvalue::Constant(Constant::new(ConstValue::Int(0)))
+        );
+        assert_eq!(translated[0].args[2], end);
+        assert_eq!(translated[0].result, result);
     }
 
     #[test]

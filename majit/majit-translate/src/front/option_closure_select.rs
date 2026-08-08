@@ -71,12 +71,24 @@ pub(crate) struct ClosureSelectSite {
     pub kind: ClosureCombinator,
     /// The combinator call result — locates block A.
     pub result_var: Variable,
-    /// The `Option` enum root `name_path` — the `__discriminant` field owner
-    /// (both the receiver read and any built `Some`/`None`).
+    /// The receiver `Option` enum root `name_path` — the `__discriminant` field
+    /// owner for the receiver read.
     pub option_owner: String,
-    /// The `Option::Some` variant `name_path` — the `__pos_0` payload field
-    /// owner (the receiver read and any built `Some`).
+    /// The receiver `Option::Some` variant `name_path` — the `__pos_0` payload
+    /// field owner for the receiver read.
     pub some_owner: String,
+    /// The `Option` enum root `name_path` of the result the rewrite BUILDS —
+    /// `map`'s `Some(U)` and `map`/`and_then`'s `None`.  `map`'s result is
+    /// `Option<U>` for a closure `T -> U`, so it keys a different classdef than
+    /// the receiver's `Option<T>`: sharing one would put two closures' results
+    /// in one `__pos_0` slot.
+    pub result_option_owner: String,
+    /// The `Option::Some` variant `name_path` of the built result — the
+    /// `__pos_0` payload field owner of `map`'s `Some(U)`.
+    pub result_some_owner: String,
+    /// True when the BUILT result is a niche `Option` — `Some(x)` is then `x`
+    /// itself and `None` is null, the produce-side mirror of `niche`.
+    pub result_niche: bool,
     /// The closure env ADT `name_path` — the `call_once` inherent-method owner.
     pub call_once_owner: String,
     /// The receiver `Option`'s payload `T` projected to a [`ValueType`] — the
@@ -253,14 +265,26 @@ fn rewire_one_closure_select_site(
                 &site.args_tuple_suffix,
             );
             match site.kind {
-                // `map` wraps the closure result back into `Some(U)`.
-                ClosureCombinator::Map => emit_option_variant(
-                    graph,
-                    then_bb,
-                    &site.option_owner,
-                    1,
-                    Some((&site.some_owner, call_result, site.call_result_ty.clone())),
-                ),
+                // `map` wraps the closure result back into `Some(U)` — except
+                // that a niche `Option` is a one-word pointer with no aggregate
+                // `__discriminant` / `__pos_0`, where `Some(x)` is `x` itself.
+                ClosureCombinator::Map => {
+                    if site.result_niche {
+                        call_result
+                    } else {
+                        emit_option_variant(
+                            graph,
+                            then_bb,
+                            &site.result_option_owner,
+                            1,
+                            Some((
+                                &site.result_some_owner,
+                                call_result,
+                                site.call_result_ty.clone(),
+                            )),
+                        )
+                    }
+                }
                 // `and_then`'s closure already returns `Option<U>`;
                 // `is_some_and`'s already returns the `bool`.
                 _ => call_result,
@@ -282,7 +306,13 @@ fn rewire_one_closure_select_site(
     let else_value = match site.kind {
         // `map`/`and_then` build a fresh `None`.
         ClosureCombinator::Map | ClosureCombinator::AndThen => {
-            emit_option_variant(graph, else_bb, &site.option_owner, 0, None)
+            // A niche `Option` is a one-word pointer with no aggregate
+            // `__discriminant` / `__pos_0`: `None` is null.
+            if site.result_niche {
+                graph.push_null_mut_ptr(else_bb)
+            } else {
+                emit_option_variant(graph, else_bb, &site.result_option_owner, 0, None)
+            }
         }
         // `is_some_and` yields the constant `false` — no closure, no `Option`.
         ClosureCombinator::IsSomeAnd => {
@@ -456,17 +486,37 @@ fn emit_call_once(
 mod tests {
     use super::*;
 
+    /// The receiver's `Option<T>` and the result's `Option<U>` are separate
+    /// instantiations with separate owner roots.  The fixture keeps them
+    /// distinct so an assertion on a constructed variant's `owner_root` fails
+    /// if the rewriter builds the result under the receiver's owners.
+    const RECV_OPTION: &str = "test::recv::Option";
+    const RECV_SOME: &str = "test::recv::Option::Some";
+    const RESULT_OPTION: &str = "test::result::Option";
+    const RESULT_SOME: &str = "test::result::Option::Some";
+
     fn site(kind: ClosureCombinator, result_var: Variable) -> ClosureSelectSite {
+        site_with_result_niche(kind, result_var, false)
+    }
+
+    fn site_with_result_niche(
+        kind: ClosureCombinator,
+        result_var: Variable,
+        result_niche: bool,
+    ) -> ClosureSelectSite {
         ClosureSelectSite {
             kind,
             result_var,
-            option_owner: "core::option::Option".into(),
-            some_owner: "core::option::Option::Some".into(),
+            option_owner: RECV_OPTION.into(),
+            some_owner: RECV_SOME.into(),
             call_once_owner: "test::closure".into(),
             payload_ty: ValueType::Int,
             call_result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
+            result_option_owner: RESULT_OPTION.into(),
+            result_some_owner: RESULT_SOME.into(),
+            result_niche,
         }
     }
 
@@ -481,7 +531,7 @@ mod tests {
             .push_op_var(
                 a,
                 OpKind::Call {
-                    target: CallTarget::method(method, Some("core::option::Option".into())),
+                    target: CallTarget::method(method, Some(RECV_OPTION.into())),
                     args: vec![opt, env],
                     result_ty: ValueType::Int,
                 },
@@ -511,6 +561,40 @@ mod tests {
         ) == 0
     }
 
+    /// The distinct `owner_root`s of every `FieldWrite` naming `field_name`,
+    /// sorted.  A built variant is spelled by its writes, so this is what tells
+    /// the result's owners apart from the receiver's.
+    fn field_write_owners(g: &FunctionGraph, field_name: &str) -> Vec<String> {
+        let mut owners: Vec<String> = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } if field.name == field_name => {
+                    Some(field.owner_root.clone().unwrap_or_default())
+                }
+                _ => None,
+            })
+            .collect();
+        owners.sort();
+        owners.dedup();
+        owners
+    }
+
+    fn count_ctors(g: &FunctionGraph) -> usize {
+        count_calls(
+            g,
+            |t| matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option"),
+        )
+    }
+
+    fn count_null_mut(g: &FunctionGraph) -> usize {
+        count_calls(g, |t| {
+            matches!(t, CallTarget::FunctionPath { segments }
+                if segments == &["core", "ptr", "null_mut"].map(str::to_string))
+        })
+    }
+
     #[test]
     fn map_selects_some_call_wrapped_and_none() {
         let (g, a) = build_and_rewrite(ClosureCombinator::Map, "map");
@@ -525,11 +609,21 @@ mod tests {
         );
         assert_eq!(g.blocks[a].exits.len(), 2, "A branches to Some/None arms");
         // Two `Option` ctors: Some(f(x)) in the then arm, None in the else arm.
-        let ctors = count_calls(
-            &g,
-            |t| matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option"),
+        assert_eq!(count_ctors(&g), 2, "map builds Some(U) and None");
+        // Both built variants are keyed to the RESULT roots, never the
+        // receiver's: `map`'s `Option<U>` is a different instantiation.
+        assert_eq!(
+            field_write_owners(&g, "__discriminant"),
+            vec![RESULT_OPTION],
+            "both built variants key the result enum root, not the receiver's"
         );
-        assert_eq!(ctors, 2, "map builds Some(U) and None");
+        // The other `__pos_0` write is the closure's `(x,)` Args tuple, which is
+        // a real `Tuple` and unrelated to either `Option` instantiation.
+        assert_eq!(
+            field_write_owners(&g, "__pos_0"),
+            vec!["Tuple".to_string(), RESULT_SOME.to_string()],
+            "the Some(U) payload keys the result Some variant"
+        );
     }
 
     #[test]
@@ -548,12 +642,88 @@ mod tests {
             "the Some arm calls the closure once"
         );
         // Only the None arm builds an Option; the Some arm forwards the call.
-        let ctors = count_calls(
-            &g,
-            |t| matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option"),
+        assert_eq!(count_ctors(&g), 1, "and_then builds only None");
+        assert_eq!(
+            field_write_owners(&g, "__discriminant"),
+            vec![RESULT_OPTION],
+            "the built None keys the result enum root, not the receiver's"
         );
-        assert_eq!(ctors, 1, "and_then builds only None");
         assert_eq!(g.blocks[a].exits.len(), 2);
+    }
+
+    /// A niche result `Option` is a one-word pointer: `Some(x)` is `x` and
+    /// `None` is null, so neither arm may build an aggregate.
+    fn build_and_rewrite_niche_result(kind: ClosureCombinator, method: &str) -> FunctionGraph {
+        let mut g = FunctionGraph::new("test_closure_select_niche_result");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method(method, Some(RECV_OPTION.into())),
+                    args: vec![opt, env],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+        let rewritten =
+            rewire_closure_select_call_sites(&mut g, &[site_with_result_niche(kind, result, true)]);
+        assert_eq!(
+            rewritten, 1,
+            "the niche-result {method} site must be rewritten"
+        );
+        g
+    }
+
+    #[test]
+    fn map_with_niche_result_builds_no_aggregate() {
+        let g = build_and_rewrite_niche_result(ClosureCombinator::Map, "map");
+        assert!(residual_gone(&g, "map"), "residual map call removed");
+        assert_eq!(
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")
+            ),
+            1,
+            "the Some arm still calls the closure once"
+        );
+        assert_eq!(
+            count_ctors(&g),
+            0,
+            "a niche Some(f(x)) is f(x) itself — no Option aggregate"
+        );
+        assert_eq!(
+            field_write_owners(&g, "__discriminant"),
+            Vec::<String>::new(),
+            "a niche Option has no discriminant field to write"
+        );
+        assert_eq!(count_null_mut(&g), 1, "the None arm is the null pointer");
+    }
+
+    #[test]
+    fn and_then_with_niche_result_builds_no_aggregate() {
+        let g = build_and_rewrite_niche_result(ClosureCombinator::AndThen, "and_then");
+        assert!(
+            residual_gone(&g, "and_then"),
+            "residual and_then call removed"
+        );
+        assert_eq!(
+            count_ctors(&g),
+            0,
+            "the Some arm forwards the closure's own Option — no aggregate"
+        );
+        assert_eq!(
+            field_write_owners(&g, "__discriminant"),
+            Vec::<String>::new(),
+            "a niche Option has no discriminant field to write"
+        );
+        assert_eq!(count_null_mut(&g), 1, "the None arm is the null pointer");
     }
 
     #[test]
@@ -680,7 +850,7 @@ mod tests {
             .push_op_var(
                 a,
                 OpKind::Call {
-                    target: CallTarget::method("map", Some("core::option::Option".into())),
+                    target: CallTarget::method("map", Some(RECV_OPTION.into())),
                     args: vec![opt, env],
                     result_ty: ValueType::Int,
                 },

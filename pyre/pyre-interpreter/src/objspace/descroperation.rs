@@ -6056,12 +6056,12 @@ mod tests {
         let huge = BigInt::one().lshift(2000).unwrap();
         let error = pow(w_long_new(huge), w_int_new(-1)).unwrap_err();
         assert_eq!(error.kind, PyErrorKind::OverflowError);
-        assert_eq!(error.message, "int too large to convert to float");
+        assert_eq!(error.message_text(), "int too large to convert to float");
 
         let huge_negative_exponent = BigInt::one().lshift(2000).unwrap().neg();
         let error = pow(w_int_new(1), w_long_new(huge_negative_exponent)).unwrap_err();
         assert_eq!(error.kind, PyErrorKind::OverflowError);
-        assert_eq!(error.message, "int too large to convert to float");
+        assert_eq!(error.message_text(), "int too large to convert to float");
     }
 
     #[test]

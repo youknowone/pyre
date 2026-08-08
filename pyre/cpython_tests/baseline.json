@@ -169,7 +169,7 @@
       "reason": "implementation detail"
     },
     "test.test_code_module": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codeccallbacks": {
       "dynasm": "IMPORTERROR"
@@ -596,10 +596,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_import": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_importlib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_index": {
       "cranelift": "PASS",
@@ -727,7 +727,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_modulefinder": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_monitoring": {
       "dynasm": "IMPORTERROR"
@@ -958,7 +958,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_runpy": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_sax": {
       "dynasm": "IMPORTERROR"

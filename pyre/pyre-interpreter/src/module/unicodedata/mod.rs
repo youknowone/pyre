@@ -20,7 +20,7 @@
 
 use pyre_object::*;
 use rustpython_unicode::{self as ucd_core, NormalizeForm};
-use rustpython_wtf8::{CodePoint, Wtf8};
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 use crate::{PyError, PyErrorKind};
 
@@ -232,10 +232,10 @@ fn lookup(args: &[PyObjectRef]) -> PyResult {
         buf.push(ch);
         return Ok(w_str_new(&buf));
     }
-    Err(PyError::key_error(format!(
-        "undefined character name '{}'",
-        name.to_string_lossy()
-    )))
+    let mut msg = Wtf8Buf::from_string("undefined character name '".to_string());
+    msg.push_wtf8(name);
+    msg.push_str("'");
+    Err(PyError::key_error(msg))
 }
 
 /// Parse the normalization-form argument (`NFC`/`NFKC`/`NFD`/`NFKD`).

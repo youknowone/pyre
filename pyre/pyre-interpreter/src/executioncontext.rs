@@ -818,14 +818,13 @@ impl ExecutionContext {
         }
     }
 
-    /// CPython 3.14 `gen_clear_frame` / `_PyFrame_ClearExceptCode` releases
-    /// the cleared frame's references synchronously, so an otherwise-dead
-    /// object with `__del__` is finalized before `generator.close()` or
-    /// `frame.clear()` returns (gh-142766).  Pyre's user instances are
-    /// non-moving old-generation objects, so a non-moving major pass is the
-    /// tracing-GC equivalent of those decrefs.  Keep this at the two explicit
-    /// frame-clearing call sites; normal generator exhaustion follows PyPy's
-    /// deferred finalizer scheduling and must not collect on every return.
+    /// gh-142766 compatibility for `generator.close()`: once the close path
+    /// clears a generator frame, an otherwise-dead local with `__del__` must
+    /// finalize before `close()` returns. Pyre's user instances are non-moving
+    /// old-generation objects, so a non-moving major pass stands in for those
+    /// synchronous releases. Keep this on the `generator.py:243` close path;
+    /// normal generator exhaustion follows deferred finalizer scheduling and
+    /// must not collect on every return.
     pub fn finalize_explicitly_cleared_frame_references(&mut self) {
         pyre_object::gc_hook::try_gc_collect_oldgen();
         self._run_finalizers_now();
@@ -2331,7 +2330,12 @@ impl UserDelAction {
                 return;
             }
             if let Err(error) = crate::baseobjspace::generator_finalize(current()) {
-                report_error(self.base.space, &error, "", current());
+                report_error(
+                    self.base.space,
+                    &error,
+                    rustpython_wtf8::Wtf8::new(""),
+                    current(),
+                );
             }
             return;
         }
@@ -2357,7 +2361,12 @@ impl UserDelAction {
         if let Err(error) = unsafe {
             crate::baseobjspace::get_and_call_function(del(), current(), w_type.as_ptr(), &[])
         } {
-            report_error(self.base.space, &error, "", del());
+            report_error(
+                self.base.space,
+                &error,
+                rustpython_wtf8::Wtf8::new(""),
+                del(),
+            );
         }
     }
 }
@@ -2387,7 +2396,7 @@ impl AsyncActionOps for UserDelAction {
 pub fn report_error(
     space: PyObjectRef,
     error: &crate::PyError,
-    where_desc: &str,
+    where_desc: &rustpython_wtf8::Wtf8,
     w_obj: PyObjectRef,
 ) {
     let mut error = error.clone();

@@ -268,6 +268,9 @@ pub struct Transformer<'a> {
     /// RPython: DependencyTracker — caches transitive analysis results.
     /// Shared across all getcalldescr() calls within this transform pass.
     analysis_cache: crate::call::AnalysisCache,
+    /// Results consumed as explicit arguments by a direct or indirect call in
+    /// the graph before call lowering rewrites those operations.
+    call_argument_vars: Vec<crate::flowspace::model::Variable>,
 }
 
 /// RPython: jtransform.py vable_flags values
@@ -625,6 +628,7 @@ impl<'a> Transformer<'a> {
             vable_rewrites: 0,
             calls_classified: 0,
             analysis_cache: crate::call::AnalysisCache::default(),
+            call_argument_vars: Vec::new(),
         }
     }
 
@@ -686,6 +690,18 @@ impl<'a> Transformer<'a> {
         // post-annotation, pre-rewrite — keeping the un-annotatable
         // `SpecTag` out of the annotator.
         fold_we_are_jitted_calls(&mut rewritten);
+
+        self.call_argument_vars = rewritten
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { args, .. } | OpKind::IndirectCall { args, .. } => Some(args),
+                _ => None,
+            })
+            .flatten()
+            .cloned()
+            .collect();
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
@@ -2512,6 +2528,38 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        let inline_substruct_offset = self
+            .callcontrol
+            .as_deref()
+            .and_then(|cc| crate::assembler::inline_substruct_field_offset(cc, field));
+        if let Some(0) = inline_substruct_offset {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            return RewriteResult::Identity(base.clone());
+        }
+        if inline_substruct_offset.is_some()
+            && op
+                .result
+                .as_ref()
+                .is_some_and(|result| self.call_argument_vars.contains(result))
+        {
+            // `jtransform.py:945-946 rewrite_op_getsubstruct` refuses GC
+            // substructures during translation. Pyre must still resolve the
+            // portal graph, so defer the same refusal to a result-less runtime
+            // abort; the enclosing call then remains residual.
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::RawAddr,
+                        },
+                    },
+                },
+                op.clone(),
+            ]);
+        }
         let typed_ty = op
             .result
             .as_ref()

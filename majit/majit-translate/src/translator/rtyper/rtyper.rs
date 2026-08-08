@@ -1692,6 +1692,23 @@ impl RPythonTyper {
     /// annrpython) skips the fixed_graphs update to match upstream's
     /// defensive behavior when `graph.getreturnvar()` would crash.
     pub fn specialize_block(self: &Rc<Self>, block: &BlockRef) -> Result<(), TyperError> {
+        // RPython `transform.py:36-50` applies `transform_allocate`
+        // as part of `default_extra_passes` (`transform.py:246-251`)
+        // after whole-program annotation.  Pyre's cutover annotates
+        // incrementally, so the whole-program `transform_graph`
+        // cannot be applied to a partial block subset here.  This
+        // pass is the only extra pass required by the rtyper for
+        // correctness (`rtype_alloc_and_set`, `rlist.py:346-351`,
+        // consumes its output); it is a local, idempotent block
+        // rewrite and is therefore safe immediately before
+        // specialization.  The remaining three extra passes are
+        // optimizations and remain unavailable on this path.
+        let ann = self
+            .annotator
+            .upgrade()
+            .expect("RPythonTyper.annotator weak reference dropped");
+        crate::translator::transform::transform_allocate(&ann, std::slice::from_ref(block));
+
         let graph: GraphRef = {
             let ann = self
                 .annotator

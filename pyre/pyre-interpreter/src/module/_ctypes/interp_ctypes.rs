@@ -76,11 +76,15 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     let h = rustpython_host_env::ctypes::insert_raw_library_handle(ptr);
                     return Ok(pyre_object::w_int_new(h as i64));
                 }
+                // A library name is a path, so it reaches `dlopen` in the
+                // filesystem's own units: a byte with no UTF-8 spelling names
+                // a real file and must not be replaced with U+FFFD.
                 if pyre_object::is_bytes(args[0]) {
-                    String::from_utf8_lossy(pyre_object::bytesobject::w_bytes_data(args[0]))
-                        .into_owned()
+                    crate::gateway::os_string_from_fs_bytes(
+                        pyre_object::bytesobject::w_bytes_data(args[0]),
+                    )
                 } else if pyre_object::is_str(args[0]) {
-                    crate::baseobjspace::str_utf8_w(args[0])?.to_string()
+                    crate::gateway::os_string_from_fs_bytes(&crate::gateway::fsencode(args[0])?)
                 } else {
                     return Err(crate::PyError::type_error(
                         "dlopen: name must be a string, bytes or None",
@@ -93,8 +97,12 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 None
             };
             let mode = host_ctypes::dlopen_mode(load_flags);
-            let h = rustpython_host_env::ctypes::open_library_with_mode(&name, mode)
-                .map_err(|e| crate::PyError::os_error(format!("dlopen({name}): {e}")))?;
+            let h = rustpython_host_env::ctypes::open_library_with_mode(&name, mode).map_err(|e| {
+                let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
+                msg.push_wtf8(&crate::gateway::fsdecode_os_str_wtf8(&name));
+                msg.push_str(&format!("): {e}"));
+                crate::PyError::os_error(msg)
+            })?;
             Ok(pyre_object::w_int_new(h as i64))
         }),
     );
@@ -533,8 +541,8 @@ fn carg_type() -> pyre_object::PyObjectRef {
                     let d = crate::baseobjspace::getdict_native(args[0]);
                     let value = unsafe { pyre_object::w_dict_getitem_str(d, "_obj") }
                         .unwrap_or_else(pyre_object::w_none);
-                    let rendered = unsafe { crate::display::py_repr(value) }?;
-                    Ok(pyre_object::w_str_new(&format!("<cparam {rendered}>")))
+                    let rendered = unsafe { crate::display::py_repr_wtf8(value) }?;
+                    Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!("<cparam ", rendered, ">")))
                 }),
             );
         });

@@ -237,7 +237,7 @@ program point is not a safepoint, and the same bench is clean under the real
 allocation-driven stress.  Force collections through the GC's own stress hook,
 never at a hand-picked instruction.
 
-## §1c — Retired since the 2026-07-05 audit (10): reader already deleted by a closed epic
+## §1c — Retired since the 2026-07-05 audit (11): reader already deleted by a closed epic
 
 Book-keeping only: these OFF-paths were deleted in source by the cited epics
 after the 2026-07-05 audit; this pass removes their stale registry rows. The
@@ -255,6 +255,7 @@ after the 2026-07-05 audit; this pass removes their stale registry rows. The
 | PYRE_P2_FS_COMPILE | PR#374 (`9a97c47f6e9`) | stale §5 deferred entry removed |
 | PYRE_P2_AUTHORITATIVE | reader gone; attribution #374 per re-audit | stale §5 deferred entry removed |
 | PYRE_SAME_GREENKEY | PR#390 (`802b79ff8db`); follow-up `111bdb4eeb8` dropped the gate | stale §1b deferred mention and §5 list entry removed |
+| PYRE_FBW_REC_UNROLL | PR#374 (`9a97c47f6e9`) deleted `fbw_unroll_bound()` | stale §5 config-switch entry removed 2026-08-08. The successor knob `PYRE_FBW_REC_UNROLL_DEPTH` was never listed here and its reader `fbw_max_rec_unroll_depth()` is gone too (PR#887, `e5546b2ed36`) — both names read from nothing |
 
 ## §1d — Parity verdicts for the default-OFF `PYRE_FBW_*` seams (2026-07-25)
 
@@ -770,7 +771,7 @@ residual level under the walked frame and an inlined level under that, so the
 force has to reach two frames up.  Per-frame vable binding, outer-locals
 materialization, and the `jit.virtual_ref` emit are therefore validatable now.
 
-## §2 — Not gates (11): Rust identifiers, not env vars
+## §2 — Not gates (12): Rust identifiers, not env vars
 
 The audit regex matched non-env identifiers. These are real code; **do not
 delete, do not count as gates.**
@@ -778,6 +779,9 @@ delete, do not count as gates.**
 - `PYRE_STR_DESCR`, `PYRE_STR_BYTE_LEN_DESCR`, `PYRE_UNICODE_DESCR`,
   `PYRE_UNICODE_LEN_DESCR` — field-descriptor `const`s (`pyre-jit-trace/src/pyre_cpu.rs`)
 - `PYRE_CLASS_DESCRIPTOR` — macro-built identifier `W_{}_PYRE_CLASS_DESCRIPTOR` (`pyre-macros`)
+- `PYRE_CLASS_DESCRIPTORS` — the whole-program `linkme` distributed slice the
+  macro registers into (`pyre-object/src/lltype.rs`); the only `PYRE_*` name that
+  appears outside Rust and Python source, and it is not an env var
 - `PYRE_PARAM_NAMES`, `PYRE_PARAM_REQUIRED` — macro `const __PYRE_PARAM_*` (`pyre-macros`)
 - `PYRE_JIT_GRAPH_MODULES` — compile-time `const &[&str]` module manifest (`generated.rs`)
 - `PYRE_REF_OPAQUE` — `OpaqueType::gc("PYRE_REF_OPAQUE")` type label (`annotator/builtin.rs`)
@@ -875,12 +879,12 @@ Kept as-is; listed for completeness.
   the mirror is seeded and then read by nobody.  Definition of done before
   re-evaluating: make the maintenance sites read the ACTIVE callee jitcode
   metadata (what the gate doc already asks for), then land a consumer.
-- **Config / value / master switches (~18)** — tuning, paths, modes; keep:
-  `PYRE_FBW_REC_UNROLL`, `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
+- **Config / value / master switches (~17)** — tuning, paths, modes; keep:
+  `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
   `PYRE_GC_INTERP`, `PYRE_JIT`, `PYRE_NO_JIT`, `PYRE_STDLIB`,
   `PYRE_CHECK_PYPY3`, `PYRE_CHECK_PYTHON3`, `PYRE_SANDBOX_NO_SECCOMP`,
-  `PYRE_SHARED_BUILD`, `PYRE_SYNTH_PYPY`, `_PYRE`, `_PYTHON`.
+  `PYRE_SHARED_BUILD`, `PYRE_SYNTH_PYPY`, `PYRE_SYNTH_PYRE`, `PYRE_SYNTH_PYTHON`.
 - **Test harness (1)**: `PYRE_MIR_STRESS_LLBC`.
 
 ## §6 — The 66 gates the audits never listed (2026-08-07)
@@ -893,22 +897,54 @@ with no entry here fails `cargo test`. The counts to quote, distinguished:
 
 | count | value |
 |---|---|
-| distinct names read from the environment | **105** |
-| (file, name) read pairs | 128 |
+| distinct names read from the environment | **111** |
+| — of those, read from Rust | 105 |
+| — read only from the harness Python | 6 |
+| (file, name) read pairs | 137 |
 | **live gates that were absent from this file** | **66** |
-| names here with no read site left (retire) | 51 |
+| names still listed live with no read site left (retire) | 0 |
 
 ```sh
-git ls-files '*.rs' | xargs rg --no-filename -o \
-  '(env::var[_a-z]*|host_os::var|getenv)\(b?"(PYRE_[A-Z0-9_]+)"' -r '$2' | sort -u
+{ git ls-files '*.rs'; git ls-files 'pyre/**/*.py' 'scripts/*.py'; } \
+  | xargs rg --no-filename -o \
+      '(env::var[_a-z]*|host_os::var|getenv|environ\.get)\(b?"(PYRE_[A-Z0-9_]+)"' \
+      -r '$2' | sort -u
 ```
 
 `--no-filename` is what makes this count gates: without it rg prefixes each hit
-and `sort -u` counts (file, name) pairs instead. The two seam forms matter for
-the same reason — `host_os::var` and `host_seam::ops::getenv` (a *byte* string)
-are how `importing.rs` reads `PYRE_STDLIB`, and a `std::env` search alone would
-miss a sandbox- or wasm-only gate entirely. Neither seam form adds a name here;
-both are `PYRE_STDLIB`, already read through `env::var` in `pyre-wasm-runner`.
+and `sort -u` counts (file, name) pairs instead. Each read form is here because
+something was hiding behind it:
+
+- `host_os::var` and `host_seam::ops::getenv` (a **byte** string) are how
+  `importing.rs` reads `PYRE_STDLIB`. Neither adds a name — that gate is also
+  read through `env::var` in `pyre-wasm-runner` — but a sandbox- or wasm-only
+  gate would have had no such cover.
+- `environ.get` and `getenv` are the harness. Six gates are read from
+  `check.py`, `check_synthetic.py`, the `extra_tests` runners and
+  `scripts/llbc_extract.py` and from no Rust file at all, so every `*.rs`
+  census — including this section's first draft — missed all six.
+
+Only unambiguous reads count. The harness also *writes* into a child's
+environment (`env[…] = …`, `env.pop(…)`), and writing a gate for a child is not
+owning it: the child's read is what this file is about. A subscript cannot be
+told from a read without parsing, and naming a fixture variable here would enter
+it in the census as a documented gate — which is why the example above has no
+name in it.
+
+**Spell every name in full at least once.** This file abbreviates runs of related
+gates (`PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`), and the brake matches whole
+tokens, so a name appearing *only* in that shorthand reads as undocumented.
+`PYRE_SYNTH_PYRE` and `PYRE_SYNTH_PYTHON` were written `_PYRE`, `_PYTHON`, and
+were the only two the widened census reported missing — they had been documented
+all along. The shorthand is fine beside a full spelling; it is not fine alone.
+
+**A retirement row documents nothing, wherever it sits.** §1/§1b/§1c/§2/§3 are
+history sections and no name in them counts. But §1d's heading reads *Parity
+verdicts*, so that section reads live while its table marks
+`PYRE_FBW_VABLE_SCALAR_CA` **RETIRED** — a mixed section, which section
+granularity cannot express. So any row that says "retired" is skipped too, and
+re-introducing a reader for a retired gate fails the brake rather than passing on
+the strength of its own obituary.
 
 Polarity below follows this file's rule, with one correction it needed: an
 `is_none()` whose value *is* the enable flag means default **ON**, but an
@@ -962,11 +998,11 @@ already-ON criterion. They are listed so they cannot be missed again.
 
 | bucket | count |
 |---|---|
-| retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 10 + 1 |
-| not gates (identifiers) | 11 |
+| retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 11 + 1 |
+| not gates (identifiers) | 12 |
 | dead (no read site) | 10 |
 | live default-ON, kept until epic closes | 9 (+ `PYRE_GC_INTERP`, wasm32-only) |
 | diagnostics (OFF) | ~34 |
 | default-OFF experiments (all keep — adoption targets) | 3 |
-| config / value / master | ~18 |
+| config / value / master | ~17 |
 | test harness | 1 |

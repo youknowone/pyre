@@ -1689,24 +1689,37 @@ fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// match=R>` with `R` the repr of the whole match truncated to 50
 /// characters.  Positions are character offsets for a `str` subject and
 /// byte offsets for a bytes-like subject (the sre-engine driver's units).
-pub(crate) fn sre_match_repr_str(m: PyObjectRef) -> Result<String, crate::PyError> {
+pub(crate) fn sre_match_repr_str(
+    m: PyObjectRef,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     let mp = m as *const W_SRE_Match;
     let span = unsafe { w_sre_match_get_span(m, 0) }.unwrap_or((-1, -1));
     let (start, end) = span;
     let subj = unsafe { subject_of((*mp).w_string, (*mp).w_buffer) };
     let w_match_str = slice_subject(subj, span, w_none());
-    let matchrepr: String = unsafe { crate::py_repr(w_match_str) }?
-        .chars()
-        .take(50)
-        .collect();
-    Ok(format!(
-        "<re.Match object; span=({start}, {end}), match={matchrepr}>"
+    let matchrepr = truncate_code_points(unsafe { crate::display::py_repr_wtf8(w_match_str) }?, 50);
+    Ok(crate::display::wtf8_format!(
+        format!("<re.Match object; span=({start}, {end}), match="),
+        matchrepr,
+        ">",
     ))
+}
+
+/// The first `limit` code points of `text`, for the repr truncations that
+/// `str[:limit]` performs on a subject that may hold a lone surrogate.
+fn truncate_code_points(text: rustpython_wtf8::Wtf8Buf, limit: usize) -> rustpython_wtf8::Wtf8Buf {
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    for cp in text.code_points().take(limit) {
+        out.push(cp);
+    }
+    out
 }
 
 fn sre_match_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
-    Ok(w_str_new(&sre_match_repr_str(m as PyObjectRef)?))
+    Ok(pyre_object::w_str_from_wtf8(sre_match_repr_str(
+        m as PyObjectRef,
+    )?))
 }
 
 /// `copy_identity_w` (interp_sre.py:701-702) — match results are
@@ -1747,10 +1760,12 @@ const SRE_FLAG_NAMES: [&str; 9] = [
 /// with the pattern repr truncated to 200 characters and the flag bits
 /// decoded into their `re.*` names (the implicit `re.UNICODE` on a known
 /// unicode pattern is suppressed, :160-165).
-pub(crate) fn sre_pattern_repr_str(pat: PyObjectRef) -> Result<String, crate::PyError> {
+pub(crate) fn sre_pattern_repr_str(
+    pat: PyObjectRef,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     let pp = pat as *const W_SRE_Pattern;
     let w_pattern = unsafe { (*pp).w_pattern };
-    let u: String = unsafe { crate::py_repr(w_pattern) }?.chars().take(200).collect();
+    let u = truncate_code_points(unsafe { crate::display::py_repr_wtf8(w_pattern) }?, 200);
 
     let mut flags = unsafe { (*pp).flags };
     let is_known_unicode = unsafe { is_str(w_pattern) };
@@ -1769,16 +1784,19 @@ pub(crate) fn sre_pattern_repr_str(pat: PyObjectRef) -> Result<String, crate::Py
     if flags != 0 {
         flag_items.push(format!("0x{flags:x}"));
     }
-    if flag_items.is_empty() {
-        Ok(format!("re.compile({u})"))
+    let tail = if flag_items.is_empty() {
+        ")".to_owned()
     } else {
-        Ok(format!("re.compile({u}, {})", flag_items.join("|")))
-    }
+        format!(", {})", flag_items.join("|"))
+    };
+    Ok(crate::display::wtf8_format!("re.compile(", u, tail))
 }
 
 fn sre_pattern_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let pat = sre_pattern_self(args)?;
-    Ok(w_str_new(&sre_pattern_repr_str(pat as PyObjectRef)?))
+    Ok(pyre_object::w_str_from_wtf8(sre_pattern_repr_str(
+        pat as PyObjectRef,
+    )?))
 }
 
 /// `descr_eq` (interp_sre.py:180-190): compare flags, compiled code, and

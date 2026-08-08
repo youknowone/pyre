@@ -7,6 +7,7 @@
 //! the globals pointer (no clone).
 
 use pyre_object::pyobject::*;
+use rustpython_wtf8::Wtf8Buf;
 
 /// Type descriptor for user-defined functions.
 pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("function");
@@ -1005,7 +1006,7 @@ pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult
             pyre_object::w_tuple_new(vec![w_self, name]),
         ]));
     }
-    Ok(pyre_object::w_str_new(&unsafe {
+    Ok(pyre_object::w_str_from_wtf8(unsafe {
         function_get_qualname(obj)
     }))
 }
@@ -1243,12 +1244,13 @@ pub unsafe fn fget_func_qualname(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// Attribute access itself uses [`fget_func_qualname`] so it returns the
 /// function-owned Python object rather than a re-wrapped copy.
-pub unsafe fn function_get_qualname(obj: PyObjectRef) -> String {
-    unsafe {
-        pyre_object::w_str_get_wtf8(fget_func_qualname(obj))
-            .to_string_lossy()
-            .into_owned()
-    }
+/// `function.py:479` reads the name with `space.realutf8_w`, the
+/// surrogate-preserving spelling, and `:283` interpolates it into the repr
+/// verbatim; `argument.py` builds its TypeErrors from the same string. So the
+/// text a lone surrogate is set into has to come back out of here intact --
+/// every consumer either mints a `str` from it or puts it in `e.args[0]`.
+pub unsafe fn function_get_qualname(obj: PyObjectRef) -> Wtf8Buf {
+    unsafe { pyre_object::w_str_get_wtf8(fget_func_qualname(obj)).to_wtf8_buf() }
 }
 
 /// Return the application-level `__qualname__` object.
@@ -2812,9 +2814,11 @@ pub unsafe fn descr_method_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::
         .filter(|&value| unsafe { pyre_object::is_str(value) })
         .and_then(|value| unsafe { pyre_object::w_str_get_value_opt(value) })
         .unwrap_or("?");
-    let instance_repr = unsafe { crate::display::py_repr(instance)? };
-    Ok(pyre_object::w_str_new(&format!(
-        "<bound method {name} of {instance_repr}>"
+    let instance_repr = unsafe { crate::display::py_repr_wtf8(instance)? };
+    Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
+        format!("<bound method {name} of "),
+        instance_repr,
+        ">"
     )))
 }
 

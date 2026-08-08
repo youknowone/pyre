@@ -33,6 +33,7 @@ dynasm = ["majit-metainterp/dynasm"]
 cranelift = ["majit-metainterp/cranelift"]
 
 [dev-dependencies]
+majit-gc = { workspace = true, features = ["gc_box"] }
 majit-ir = { workspace = true, features = ["test-support"] }
 majit-metainterp = { workspace = true }
 smallvec = { workspace = true }

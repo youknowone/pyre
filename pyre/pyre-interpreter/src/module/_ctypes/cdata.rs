@@ -327,9 +327,11 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             cdata_bytes(obj).unwrap_or(&[]),
         ))
     };
-    let rendered = unsafe { crate::display::py_repr(value) }?;
+    let rendered = unsafe { crate::display::py_repr_wtf8(value) }?;
     let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
-    Ok(pyre_object::w_str_new(&format!("{name}({rendered})")))
+    Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
+        name, "(", rendered, ")"
+    )))
 }
 
 /// `_SimpleCData.from_param(cls, value)` — identity stub (see caller note).

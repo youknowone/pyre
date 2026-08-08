@@ -3177,11 +3177,14 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
     if std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_array_descr(0)) {
         return Operand::descr_vable_array(0);
     }
-    // VableStaticField: pyre's PyFrame _virtualizable_ has 6 static
-    // fields (interp_jit.py:25-31, idx 0..=5).  Probe each idx in
-    // turn and Arc::ptr_eq against the per-idx singleton.  Mirrors
-    // the `array_field_descrs[i]` enumeration above.
-    for idx in 0u16..6 {
+    // VableStaticField: probe each declared scalar index in turn and
+    // Arc::ptr_eq against the per-idx singleton.  Mirrors the
+    // `array_field_descrs[i]` enumeration above.  The bound is
+    // `NUM_VABLE_SCALARS` rather than a literal so it follows
+    // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`; a literal here
+    // outlives the table it describes and asks
+    // `vable_static_field_descr` for an index it no longer reserves.
+    for idx in 0u16..pyre_jit_trace::virtualizable_gen::NUM_VABLE_SCALARS as u16 {
         if std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_static_field_descr(idx)) {
             return Operand::descr_vable_static_field(idx);
         }

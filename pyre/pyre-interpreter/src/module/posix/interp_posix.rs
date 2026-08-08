@@ -231,7 +231,11 @@ fn run_fork_callbacks(kind: &str) {
         let Some(callback) = callback else { continue };
         if let Err(mut error) = crate::call::call_function_impl_result(callback as PyObjectRef, &[])
         {
-            error.write_unraisable(pyre_object::w_none(), "fork hook", callback as PyObjectRef);
+            error.write_unraisable(
+                pyre_object::w_none(),
+                rustpython_wtf8::Wtf8::new("fork hook"),
+                callback as PyObjectRef,
+            );
         }
     }
 }
@@ -444,26 +448,43 @@ fn times_result_seq_type() -> PyObjectRef {
 /// ending in `:` is drive-relative, anything else is a plain relative part.
 ///
 /// Both separators count, so the tests are taken on a copy with `/` rewritten
-/// to `\`; that rewrite is character-for-character, so an offset into it
-/// addresses the same character of the original. The offsets are per
-/// character rather than per byte, which is what makes `"ä:\x"` take the
-/// drive branch — at byte 1 it would be a continuation byte and take none.
+/// to `\`; that rewrite is code-point-for-code-point, so an offset into it
+/// addresses the same code point of the original. The offsets are per code
+/// point rather than per byte, which is what makes `"ä:\x"` take the drive
+/// branch — at byte 1 it would be a continuation byte and take none.
 ///
 /// Compiled everywhere so the tests run on every platform; only the Windows
 /// build has a caller.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn split_root(path: &str) -> (&str, &str) {
-    const SEP: char = '\\';
+fn split_root(path: &rustpython_wtf8::Wtf8) -> (&rustpython_wtf8::Wtf8, &rustpython_wtf8::Wtf8) {
+    use rustpython_wtf8::Wtf8;
+
+    const SEP: u32 = '\\' as u32;
+    const COLON: u32 = ':' as u32;
     const UNC_PREFIX: &str = "\\\\?\\UNC\\";
 
-    let norm: Vec<char> = path
-        .chars()
-        .map(|c| if c == '/' { SEP } else { c })
+    // A path is a sequence of code points, and one of them may be a lone
+    // surrogate that `str` cannot hold; the separators the split looks for are
+    // all ASCII, so the scan runs over the code-point values.
+    let norm: Vec<u32> = path
+        .code_points()
+        .map(|c| if c.to_u32() == '/' as u32 { SEP } else { c.to_u32() })
         .collect();
     let byte_at = |index: usize| {
-        path.char_indices()
+        path.code_point_indices()
             .nth(index)
             .map_or(path.len(), |(offset, _)| offset)
+    };
+    let split_at = |offset: usize| {
+        let bytes = path.as_bytes();
+        // The offset comes from `code_point_indices`, so both halves are
+        // code-point aligned and stay well-formed WTF-8.
+        unsafe {
+            (
+                Wtf8::from_bytes_unchecked(&bytes[..offset]),
+                Wtf8::from_bytes_unchecked(&bytes[offset..]),
+            )
+        }
     };
     let sep_from = |start: usize| {
         norm.get(start..)
@@ -472,17 +493,17 @@ fn split_root(path: &str) -> (&str, &str) {
     };
 
     if norm.first() != Some(&SEP) {
-        if norm.get(1) == Some(&':') {
+        if norm.get(1) == Some(&COLON) {
             // `X:\Windows` keeps the separator in the root; `X:Windows` names
             // a location on the drive's own cursor and has no root at all.
             let split = if norm.get(2) == Some(&SEP) { 3 } else { 2 };
-            return path.split_at(byte_at(split));
+            return split_at(byte_at(split));
         }
-        return ("", path);
+        return (Wtf8::new(""), path);
     }
     if norm.get(1) != Some(&SEP) {
         // A path rooted on the current drive, e.g. `\Windows`.
-        return path.split_at(byte_at(1));
+        return split_at(byte_at(1));
     }
     // A UNC share (`\\server\share`, `\\?\UNC\server\share`) or a device
     // (`\\.\device`): the root runs to the separator after the share name,
@@ -490,12 +511,15 @@ fn split_root(path: &str) -> (&str, &str) {
     let unc = norm.len() >= 8
         && norm[..8]
             .iter()
-            .map(|c| c.to_ascii_uppercase())
-            .eq(UNC_PREFIX.chars());
+            .map(|&c| match u8::try_from(c) {
+                Ok(b) => u32::from(b.to_ascii_uppercase()),
+                Err(_) => c,
+            })
+            .eq(UNC_PREFIX.chars().map(u32::from));
     let start = if unc { 8 } else { 2 };
     match sep_from(start).and_then(|index| sep_from(index + 1)) {
-        Some(index) => path.split_at(byte_at(index + 1)),
-        None => (path, ""),
+        Some(index) => split_at(byte_at(index + 1)),
+        None => (path, Wtf8::new("")),
     }
 }
 
@@ -543,7 +567,8 @@ mod win_nt {
     fn arg_path(
         args: &[PyObjectRef],
         func: &str,
-    ) -> Result<(String, bool, crate::gateway::FsEncodedPath), crate::PyError> {
+    ) -> Result<(std::ffi::OsString, bool, crate::gateway::FsEncodedPath), crate::PyError> {
+        use std::os::windows::ffi::OsStringExt;
         let Some(&arg) = args.first() else {
             return Err(crate::PyError::type_error(format!(
                 "{func}() missing required argument 'path'"
@@ -551,18 +576,26 @@ mod win_nt {
         };
         let resolved = crate::gateway::fsencode_path_w(arg)?;
         let as_bytes = unsafe { resolved.is_bytes() };
-        // Windows names files in UTF-16, so there is no byte spelling to keep
-        // here the way there is on a unix path; the host API takes text.
-        let path = String::from_utf8_lossy(&resolved.as_bytes).into_owned();
-        Ok((path, as_bytes, resolved))
+        // Windows names files in UTF-16, so the path reaches the host API as
+        // code units rather than bytes. Going through a Rust `String` on the
+        // way would replace an undecodable byte with U+FFFD, and the call
+        // would then address a different file than the caller named --
+        // `interp_posix.py:866-884` keeps the syscall spelling intact for the
+        // same reason.
+        let wide: Vec<u16> = crate::gateway::fsdecode_filename_wtf8(&resolved.as_bytes)
+            .encode_wide()
+            .collect();
+        Ok((std::ffi::OsString::from_wide(&wide), as_bytes, resolved))
     }
 
     fn wrap_path(s: &std::ffi::OsStr, as_bytes: bool) -> PyObjectRef {
-        let text = s.to_string_lossy();
+        // One decode feeds both arms: the bytes form is the filesystem
+        // encoding of the same text, not the UTF-8 of a lossy rendering of it.
+        let text = crate::gateway::fsdecode_os_str_wtf8(s);
         if as_bytes {
             pyre_object::w_bytes_from_bytes(text.as_bytes())
         } else {
-            pyre_object::w_str_new(&text)
+            pyre_object::w_str_from_wtf8(text)
         }
     }
 
@@ -580,7 +613,7 @@ mod win_nt {
     /// backup-semantics handle so directories open too.
     pub fn _getfinalpathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, as_bytes, resolved) = arg_path(args, "_getfinalpathname")?;
-        if path.contains('\0') {
+        if path.as_encoded_bytes().contains(&0) {
             return Err(crate::PyError::value_error("embedded null character"));
         }
         match host_nt::getfinalpathname(Path::new(&path)) {
@@ -619,7 +652,7 @@ mod win_nt {
     /// (ERROR_DIRECTORY).
     pub fn _getdiskusage(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, _, resolved) = arg_path(args, "_getdiskusage")?;
-        if path.contains('\0') {
+        if path.as_encoded_bytes().contains(&0) {
             return Err(crate::PyError::value_error("embedded null character"));
         }
         match host_nt::getdiskusage(Path::new(&path)) {
@@ -666,9 +699,13 @@ mod win_nt {
     /// DLL_DIRECTORY_COOKIE pointer is returned as an int instead. host_env has
     /// no AddDllDirectory wrapper, so call windows-sys directly.
     pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
         let (path, _, resolved) = arg_path(args, "_add_dll_directory")?;
-        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        // `encode_wide` re-emits the code units `arg_path` decoded the path
+        // into; going back through a `str` would have no spelling for a lone
+        // surrogate and would address a different directory.
+        let wide: Vec<u16> = path.encode_wide().chain(std::iter::once(0)).collect();
         let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
         if cookie.is_null() {
             return Err(io_err_with_filename(
@@ -770,10 +807,15 @@ fn create_environ() -> pyre_object::PyObjectRef {
         // _create_environ_mapping demands str keys/values and upper-cases the
         // keys itself. (_convertenviron: `space.newtext(key), newtext(value)`.)
         for (key, value) in host_os::vars_os() {
+            // `_convertenviron`'s Windows arm reads `rwin32._wenviron_items()`,
+            // the wide-char environment, and keeps those code units.
+            // `fsdecode_os_str` carries them across with `from_wide`; a lossy
+            // decode would fold an unpaired one to U+FFFD and stop
+            // `os.environ` round-tripping.
             store(
                 dict_slot,
-                || pyre_object::w_str_new(&key.to_string_lossy()),
-                || pyre_object::w_str_new(&value.to_string_lossy()),
+                || crate::gateway::fsdecode_os_str(&key),
+                || crate::gateway::fsdecode_os_str(&value),
             );
         }
     }
@@ -2620,11 +2662,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // Splitting a drive or UNC prefix is a text operation on a
                 // Windows path, and both halves are handed back as `str`, so
                 // this one stays in the text domain rather than the byte one.
-                let path = String::from_utf8_lossy(&path);
+                let path = crate::gateway::fsdecode_filename_wtf8(&path);
                 let (root, tail) = split_root(&path);
                 Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_str_new(root),
-                    pyre_object::w_str_new(tail),
+                    pyre_object::w_str_from_wtf8(root.to_wtf8_buf()),
+                    pyre_object::w_str_from_wtf8(tail.to_wtf8_buf()),
                 ]))
             },
             1,
@@ -4336,7 +4378,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // `EBADF`.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
-            use std::os::windows::io::{AsRawHandle, FromRawHandle};
             let invalid_handle = || {
                 crate::PyError::os_error_win32_syscall2(
                     windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32,
@@ -4345,13 +4386,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 )
             };
             let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
-            let handle =
-                rustpython_host_env::crt_fd::as_handle(borrowed).map_err(|_| invalid_handle())?;
-            let file = unsafe { std::fs::File::from_raw_handle(handle.as_raw_handle()) };
-            let meta = file.metadata();
-            let _ = std::mem::ManuallyDrop::new(file); // don't close
-            match meta {
-                Ok(m) => Ok(make_stat_result(&m, 0)),
+            // Same `StatStruct` the path forms take, for the reason
+            // [`win_stat_fields`] states: `std::fs::Metadata` carries no file
+            // index or volume serial, so answering from it would report a
+            // different identity for the very file `os.stat(path)` just named.
+            // It also answers a character device or pipe with the format bits
+            // `GetFileType` reports rather than a disk file's.
+            match rustpython_host_env::fileutils::fstat(borrowed) {
+                Ok(st) => Ok(stat_result_from_fields(
+                    &stat_fields_from_statstruct(&st),
+                    0,
+                )),
                 Err(e) => Err(match e.raw_os_error() {
                     Some(winerror) => crate::PyError::os_error_win32_syscall2(
                         winerror,
@@ -4393,10 +4438,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "getcwd",
             |_| {
-                // interp_posix.py:906 `space.fsdecode(getcwdb(space))`. A
-                // lossy decode would answer U+FFFD for a byte the surrogate
-                // escape represents, and the name would no longer name the
-                // directory it came from.
+                // `interp_posix.py:906-908` is `space.fsdecode(getcwdb(space))`,
+                // so the directory's bytes reach Python through the filesystem
+                // decoder and a byte with no UTF-8 spelling survives as its
+                // surrogate escape. A lossy decode would fold it to U+FFFD,
+                // which breaks the `os.fsencode(os.getcwd())` round trip and
+                // makes two different directories compare equal.
                 #[cfg(feature = "sandbox")]
                 {
                     let cwd = crate::host_seam::ops::getcwd()
@@ -4714,7 +4761,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     {
                         let msg = crate::host_seam::ops::strerror(code)
                             .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                        return Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&msg)));
+                        // The text comes from the C library in the current
+                        // locale, so a byte with no UTF-8 spelling takes the
+                        // surrogateescape rather than U+FFFD.
+                        return Ok(crate::typedef::charp2uni(&msg));
                     }
                     #[cfg(not(feature = "sandbox"))]
                     Ok(pyre_object::w_str_new(
@@ -4804,7 +4854,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "getlogin",
                 |_| match host_posix::getlogin() {
-                    Some(name) => Ok(pyre_object::w_str_new(name.to_string_lossy().as_ref())),
+                    // A login name is an OS string; decode it the way every
+                    // other one is so an undecodable byte keeps its escape.
+                    Some(name) => Ok(crate::gateway::fsdecode_filename_bytes(name.as_bytes())),
                     None => Err(crate::PyError::os_error_with_errno(
                         crate::builtins::io_error_posix_errno(&std::io::Error::last_os_error(), 0),
                         "getlogin",
@@ -7055,7 +7107,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let bfd = fd_borrow(fd)?;
                     let name = host_posix::ttyname(bfd).map_err(|e| io_err(e, ""))?;
-                    Ok(pyre_object::w_str_new(&name.to_string_lossy()))
+                    Ok(crate::gateway::fsdecode_os_str(name.as_os_str()))
                 },
                 1,
             ),
@@ -8613,6 +8665,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 #[cfg(test)]
 mod split_root_tests {
     use super::split_root;
+    use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
     /// Expectations taken from `ntpath.splitroot`, whose three-way split
     /// joins drive and root into the root this returns.
@@ -8655,12 +8708,30 @@ mod split_root_tests {
             ),
         ];
         for &(path, root, tail) in cases {
-            assert_eq!(split_root(path), (root, tail), "split_root({path:?})");
+            let (got_root, got_tail) = split_root(Wtf8::new(path));
+            assert_eq!(
+                (got_root.as_str(), got_tail.as_str()),
+                (Ok(root), Ok(tail)),
+                "split_root({path:?})"
+            );
             assert_eq!(
                 format!("{root}{tail}"),
                 path,
                 "split_root({path:?}) lost characters"
             );
         }
+    }
+
+    /// A path carrying a lone surrogate — what `fsdecode` produces for an
+    /// undecodable name — splits on the same boundary and keeps the code point.
+    #[test]
+    fn keeps_a_lone_surrogate() {
+        let mut path = Wtf8Buf::from_string("C:\\".to_string());
+        path.push(CodePoint::from_u32(0xdcff).unwrap());
+        path.push_str("x");
+        let (root, tail) = split_root(&path);
+        assert_eq!(root.as_str(), Ok("C:\\"));
+        assert_eq!(tail.code_points().next().map(|c| c.to_u32()), Some(0xdcff));
+        assert_eq!(tail.len(), path.len() - root.len());
     }
 }

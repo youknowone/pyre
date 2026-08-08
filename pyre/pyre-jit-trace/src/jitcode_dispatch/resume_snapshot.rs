@@ -1196,8 +1196,7 @@ pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     // The CALL is inside a try-block.  Inline it when its exception handler
     // rejoins a loop (the exc-edge-bridgeable shape): the paused caller frame
     // resumes at the CALL fallthrough on the no-raise path, and on a raise the
-    // caller's `lastblock` (a static box in its virtualizable image) unwinds to
-    // the catch handler in the blackhole — bit-exact — while a hot raise bridges
+    // catch handler runs in the blackhole — bit-exact — while a hot raise bridges
     // into the enclosing loop via the carrier-boundary delivery
     // (`drive_bridge_carrier_walk`'s `finishframe_exception`).
     //

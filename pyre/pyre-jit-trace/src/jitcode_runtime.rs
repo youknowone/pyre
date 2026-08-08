@@ -1189,7 +1189,7 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
     // blackhole.py:58-59 order: setup_insns, then setup_descrs.
     builder.setup_insns(insns_opname_to_byte());
-    builder.setup_descrs(all_descrs().to_vec());
+    builder.setup_descrs(all_descrs());
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
     let unwired: Vec<String> = builder
         .unwired_opnames()
@@ -2057,6 +2057,22 @@ mod tests {
                  (for forward key {key:?})",
             );
         }
+    }
+
+    #[test]
+    fn build_default_bh_builder_shares_descr_table() {
+        let (mut builder, _) = build_default_bh_builder_with_unwired_report();
+        assert!(!builder.descrs.is_empty(), "shared table must not be empty");
+        assert_eq!(builder.descrs.len(), all_descrs().len());
+        assert!(
+            std::ptr::eq(builder.descrs.as_ptr(), all_descrs().as_ptr()),
+            "builder must ALIAS the process table, not copy it"
+        );
+        let bh = builder.acquire_interp();
+        assert!(
+            std::ptr::eq(bh.descrs.as_ptr(), all_descrs().as_ptr()),
+            "acquire_interp must alias, not copy (blackhole.py:288)"
+        );
     }
 
     /// Coverage of the *production* builder, which is not the default one.

@@ -246,6 +246,65 @@ pub fn offset2lineno(code: &HostCode, stopat: i64) -> u32 {
     line
 }
 
+/// Upstream falls back to `['no source!']` when a graph carries no Python
+/// source, which is every MIR-built pyre graph — so the listing that upstream
+/// prints around the failing operation is always empty here.  Print the
+/// block's inputargs and operations instead: without them a record names the
+/// failing op but never the op that PRODUCED its receiver, which is the one
+/// piece of context a classdef-less / blocked-block diagnosis needs.
+fn no_source_lines(
+    g: &std::cell::Ref<'_, crate::flowspace::model::FunctionGraph>,
+    block: Option<&BlockRef>,
+    operindex: Option<usize>,
+) -> Vec<String> {
+    /// Bound the listing: a blocked op's producer is normally a few ops away,
+    /// and an unbounded dump would multiply the size of every record.
+    const MAX_OPS: usize = 40;
+    let mut out = vec!["no source!".to_string()];
+    if let Some(b) = block {
+        let b = b.borrow();
+        out.push(format!(
+            "  block inputargs: [{}]",
+            b.inputargs
+                .iter()
+                .map(|v| format!("{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        // The window ENDS at the failing op, so a block whose failure sits past
+        // `MAX_OPS` still shows that op and the ops that produced its operands.
+        // Listing from 0 would drop both, which is the whole point of the dump.
+        let end = operindex
+            .map_or(b.operations.len(), |i| i.saturating_add(1))
+            .min(b.operations.len());
+        let start = end.saturating_sub(MAX_OPS);
+        if start > 0 {
+            out.push(format!("  … {start} earlier operation(s)"));
+        }
+        for (i, op) in b.operations[start..end].iter().enumerate() {
+            let i = start + i;
+            out.push(format!("  op[{i}] {op}"));
+        }
+        if end < b.operations.len() {
+            out.push(format!(
+                "  … {} more operation(s)",
+                b.operations.len() - end
+            ));
+        }
+    }
+    out.push(format!(
+        "  startblock inputargs: [{}]",
+        g.startblock
+            .borrow()
+            .inputargs
+            .iter()
+            .map(|v| format!("{v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    out
+}
+
 /// RPython `source_lines1(graph, block, operindex, offset=None,
 ///                          long=False, show_lines_of_code=SHOW_DEFAULT_LINES_OF_CODE)`
 /// (error.py:18-61).
@@ -310,23 +369,23 @@ pub fn source_lines1(
     // upstream: `source = graph.source`; attribute absent → ['no source!'].
     let source = match g.source() {
         Ok(s) => s,
-        Err(_) => return vec!["no source!".into()],
+        Err(_) => return no_source_lines(&g, block, operindex),
     };
     let filename = match g.filename() {
         Ok(s) => s,
-        Err(_) => return vec!["no source!".into()],
+        Err(_) => return no_source_lines(&g, block, operindex),
     };
     let startline = match g.startline() {
         Ok(n) => n,
-        Err(_) => return vec!["no source!".into()],
+        Err(_) => return no_source_lines(&g, block, operindex),
     };
     let func = match &g.func {
         Some(f) => f,
-        None => return vec!["no source!".into()],
+        None => return no_source_lines(&g, block, operindex),
     };
     let code = match func.code.as_deref() {
         Some(c) => c,
-        None => return vec!["no source!".into()],
+        None => return no_source_lines(&g, block, operindex),
     };
     let graph_lines: Vec<&str> = source.split('\n').collect();
 
@@ -773,6 +832,54 @@ mod tests {
         assert!(
             msg.iter()
                 .any(|line| line.contains("function callee <<callee.py>, line 42> returning"))
+        );
+    }
+
+    /// A graph with no Python source falls back to the operation dump.  The
+    /// window must END at the failing op: listing from index 0 would show the
+    /// first `MAX_OPS` ops and drop both the failing op and its producer, which
+    /// is the only context the dump exists to supply.
+    #[test]
+    fn no_source_lines_window_ends_at_the_failing_operation() {
+        let startblock = Block::shared(Vec::new());
+        {
+            let mut b = startblock.borrow_mut();
+            for _ in 0..60 {
+                b.operations
+                    .push(crate::flowspace::model::SpaceOperation::new(
+                        "newtuple",
+                        Vec::new(),
+                        Hlvalue::Variable(Variable::new()),
+                    ));
+            }
+        }
+        // `graph.func` is None, so every accessor errors and `source_lines1`
+        // takes the `no_source_lines` fallback.
+        let graph = FunctionGraph::new("f", startblock.clone());
+        let graph_ref: GraphRef = Rc::new(RefCell::new(graph));
+        let out = source_lines1(&graph_ref, Some(&startblock), Some(55), None, false, 0);
+        let listed: Vec<&String> = out.iter().filter(|l| l.contains("op[")).collect();
+
+        assert!(
+            out.iter().any(|l| l.starts_with("  op[55] ")),
+            "the failing op is listed: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("  op[54] ")),
+            "its producer context is listed: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("  op[56] ")),
+            "the window stops at the failing op: {out:?}"
+        );
+        assert_eq!(listed.len(), 40, "the listing stays bounded: {out:?}");
+        assert!(
+            out.iter().any(|l| l == "  … 16 earlier operation(s)"),
+            "the elided head is reported: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "  … 4 more operation(s)"),
+            "the elided tail is reported: {out:?}"
         );
     }
 

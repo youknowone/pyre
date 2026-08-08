@@ -1673,6 +1673,22 @@ class Check:
     # ── build ──
 
     def build_backend(self, backend):
+        # `pyre-jit-trace/build.rs` compares each `build/llbc/*.ullbc` against
+        # what its crate's sources hash to now, and by default reports a
+        # mismatch as a `cargo::warning` — which cargo replays only when it
+        # re-runs the build script, so a run whose crates were cached prints
+        # nothing at all. Every number this script produces is read out of a
+        # binary whose field offsets come from those artefacts, so a stale one
+        # does not fail: it answers, wrongly and quietly. Four measurement runs
+        # on this tree carried the mismatch and none of their logs named it.
+        #
+        # `PYRE_LLBC_STRICT=1` is the promotion build.rs already documents "for
+        # callers that want a gate" — the same finding as `cargo::error`. The
+        # cost is that a rebase which moves the LLBC crates makes the next
+        # check.py stop and ask for a multi-minute re-extraction; the
+        # alternative is a green run that measured the wrong bytes. Set here
+        # rather than per-command so the wasm build gets it too.
+        os.environ["PYRE_LLBC_STRICT"] = "1"
         cfg = CARGO_CONFIG[backend]
         if cfg.get("wasm"):
             return self.build_wasm_backend()
@@ -1695,6 +1711,17 @@ class Check:
                 print(proc.stderr.rstrip())
             print("────────────────────")
             cargo_output = (proc.stderr or "") + (proc.stdout or "")
+            if "LLBC STALE" in cargo_output:
+                # `PYRE_LLBC_STRICT=1` above turned build.rs's staleness
+                # warning into the build failure that got us here. It already
+                # printed the exact `extract-llbc.py` line naming the crates
+                # that moved, so repeat the reason rather than the command.
+                print(red("LLBC artefacts under build/llbc/ are STALE."))
+                print("Field offsets come from them, so a run on this tree "
+                      "would measure the wrong bytes.")
+                print("Re-extract with the command build.rs printed above, "
+                      "then re-run this script.")
+                sys.exit(1)
             llbc_missing = (
                 # translator runtime panic (majit-translate/src/lib.rs)
                 "no LLBC source resolved" in cargo_output

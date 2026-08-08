@@ -2362,6 +2362,7 @@ version = "0.0.2"
 dependencies = [
  "dirs",
  "lexopt",
+ "libc",
  "majit-gc",
  "majit-metainterp",
  "mimalloc",
@@ -2370,6 +2371,7 @@ dependencies = [
  "pyre-object",
  "pyre-sandbox",
  "rustpython-compiler",
+ "rustpython-wtf8",
  "rustyline 17.0.2",
 ]
 

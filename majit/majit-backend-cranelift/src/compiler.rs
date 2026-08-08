@@ -1417,32 +1417,141 @@ fn cranelift_type_for(tp: &Type) -> cranelift_codegen::ir::Type {
 }
 
 thread_local! {
-    /// `llmodel.py:58` `self.gc_ll_descr = get_ll_description(...)` — owned
-    /// by the active cranelift backend on this thread. Stored as a
-    /// thread-local so the backend-agnostic `majit_gc::ActiveGcGuardHooks`
-    /// shims and trampoline-baked C addresses can reach the live allocator
-    /// without taking a cranelift dependency. Mirrors
-    /// `majit-backend-dynasm/src/runner.rs:46 DYNASM_ACTIVE_GC`.
-    static CRANELIFT_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> =
-        const { RefCell::new(None) };
-    static CRANELIFT_ACTIVE_GC_RAW: Cell<Option<*mut dyn GcAllocator>> =
-        const { Cell::new(None) };
     /// JITFRAME `Type` id of the active GC runtime. Lazy-registered when
     /// the GC sees its first JITFRAME, cleared when the active GC is
     /// replaced or torn down.
     static CRANELIFT_JITFRAME_TYPE_ID: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-fn with_cranelift_gc<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
-    if majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
-        return CRANELIFT_ACTIVE_GC.with(|cell| {
+/// The per-thread GC box, and the accessors every trampoline reaches it through.
+///
+/// `gc.py:30` `GcLLDescription.__init__` holds `self.gcdescr` as a plain field
+/// on the backend descriptor — there is no per-thread allocator upstream — so
+/// this cell is scaffolding, not a ported structure. Only `install_gc_box`
+/// fills it and only tests reach that; the production build goes through
+/// `install_gc_standalone` and allocates from the `gc_sync` singleton.
+///
+/// Every accessor opens with `majit_gc::gc_box_installed()`, which without
+/// `majit-gc/gc_box` is a constant `false` — so in a production build each one
+/// folds to `None`, the thread-local becomes unreachable, and the trampolines
+/// call `gc_sync` directly. The gate lives in `majit-gc` because a Cargo
+/// feature is per-crate: this crate cannot `#[cfg]` on a feature of its
+/// dependency, so the box is eliminated by the optimizer rather than by
+/// conditional compilation. Mirrors `majit-backend-dynasm/src/runner.rs`'s
+/// `gc_box`.
+mod gc_box {
+    use super::{Cell, GcAllocator, RefCell};
+
+    thread_local! {
+        /// `llmodel.py:58` `self.gc_ll_descr = get_ll_description(...)` — owned
+        /// by the active cranelift backend on this thread. Stored as a
+        /// thread-local so the backend-agnostic `majit_gc::ActiveGcGuardHooks`
+        /// shims and trampoline-baked C addresses can reach the live allocator
+        /// without taking a cranelift dependency.
+        static CRANELIFT_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> =
+            const { RefCell::new(None) };
+        /// Read-only mirror of the box address, for the queries that can fire
+        /// while an in-progress allocation already holds the mutable borrow.
+        static CRANELIFT_ACTIVE_GC_RAW: Cell<Option<*mut dyn GcAllocator>> =
+            const { Cell::new(None) };
+    }
+
+    /// `&mut` access to this thread's GC box, for allocation and write
+    /// barriers. `None` means there is no box, and the caller runs its
+    /// `gc_sync` path instead.
+    pub(super) fn with_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
+        if !majit_gc::gc_box_installed() {
+            return None;
+        }
+        CRANELIFT_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
             // SAFETY: `guard` holds the borrow for the whole `f` call and
-            // these are non-reentrant top-level trampolines, so the
-            // reborrow is exclusive and outlives `f`.
+            // these are non-reentrant top-level trampolines, so the reborrow
+            // is exclusive and outlives `f`.
             Some(f(unsafe { &mut *raw }))
+        })
+    }
+
+    /// Read-only access that tolerates being reached from inside a collection.
+    ///
+    /// Structural adaptation: RPython's GC descriptor is a normal object
+    /// reference, so `gc_current_object_address` can query ownership while a
+    /// collection is already walking extra roots. Here the box sits behind a
+    /// `RefCell` whose mutable borrow an allocation slowpath may hold, so that
+    /// case reads the same allocator through the raw mirror rather than
+    /// panicking across the extern slowpath.
+    pub(super) fn with_reentrant_ref<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
+        if !majit_gc::gc_box_installed() {
+            return None;
+        }
+        CRANELIFT_ACTIVE_GC.with(|cell| match cell.try_borrow() {
+            Ok(guard) => guard.as_deref().map(f),
+            // SAFETY: the mirror is published and cleared under the same
+            // borrow as the box itself, so a non-null value points at the
+            // live allocator, and this query only reads it.
+            Err(_) => CRANELIFT_ACTIVE_GC_RAW.with(|raw| raw.get().map(|p| f(unsafe { &*p }))),
+        })
+    }
+
+    /// `&mut` access for a top-level, never-reentrant op that has a defined
+    /// answer when the box is busy: a borrow already held by an in-progress
+    /// allocation yields `busy` rather than falling through to `gc_sync`.
+    pub(super) fn with_mut_or_busy<R>(
+        busy: R,
+        f: impl FnOnce(&mut dyn GcAllocator) -> R,
+    ) -> Option<R> {
+        if !majit_gc::gc_box_installed() {
+            return None;
+        }
+        CRANELIFT_ACTIVE_GC.with(|cell| {
+            let mut guard = match cell.try_borrow_mut() {
+                Ok(guard) => guard,
+                Err(_) => return Some(busy),
+            };
+            let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
+            // SAFETY: as in [`with_mut`].
+            Some(f(unsafe { &mut *raw }))
+        })
+    }
+
+    /// Whether this thread holds a box at all.
+    pub(super) fn present() -> bool {
+        majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some())
+    }
+
+    /// Install or drop this thread's box, keeping the raw mirror in step.
+    pub(super) fn store(gc: Option<Box<dyn GcAllocator>>) {
+        CRANELIFT_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            // Drop the previous allocator first so reentrant
+            // `is_managed_heap_object` queries from its drop body still
+            // resolve old-heap addresses through the raw mirror — it keeps
+            // pointing at the live old box throughout the drop body.
+            // Publishing the new raw pointer before the drop would route
+            // those queries to the new allocator, which does not know about
+            // old-heap addresses and would report them as unmanaged. After
+            // the drop returns no further reentry is possible on this thread
+            // before the raw mirror is republished synchronously below.
+            *guard = gc;
+            let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+            CRANELIFT_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
         });
+    }
+
+    /// Backend-teardown counterpart of [`store`], tolerant of a thread whose
+    /// thread-locals are already being destroyed.
+    pub(super) fn clear_on_teardown() {
+        let _ = CRANELIFT_ACTIVE_GC.try_with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        let _ = CRANELIFT_ACTIVE_GC_RAW.try_with(|raw_cell| raw_cell.set(None));
+    }
+}
+
+fn with_cranelift_gc<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
+    if gc_box::present() {
+        return gc_box::with_mut(f);
     }
     if majit_gc::gc_sync::is_initialized() {
         return Some(majit_gc::gc_sync::gc_op(|gc| f(gc)));
@@ -1458,22 +1567,7 @@ fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
     if gc.is_some() {
         majit_gc::note_gc_box_installed();
     }
-    CRANELIFT_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        // Drop the previous allocator first so reentrant
-        // `is_managed_heap_object` queries from its drop body still
-        // resolve old-heap addresses through the raw mirror — it keeps
-        // pointing at the live old box throughout the drop body.
-        // Publishing the new raw pointer before the drop would route
-        // those queries to the new allocator, which does not know
-        // about old-heap addresses and would report them as
-        // unmanaged. After the drop returns no further reentry is
-        // possible on this thread before the raw mirror is republished
-        // synchronously below.
-        *guard = gc;
-        let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
-        CRANELIFT_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
-    });
+    gc_box::store(gc);
 }
 
 fn cranelift_jitframe_type_id() -> Option<u32> {
@@ -1485,8 +1579,7 @@ fn set_cranelift_jitframe_type_id(type_id: Option<u32>) {
 }
 
 fn cranelift_gc_active() -> bool {
-    (majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()))
-        || majit_gc::gc_sync::is_initialized()
+    gc_box::present() || majit_gc::gc_sync::is_initialized()
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`. Dispatches
@@ -1641,7 +1734,7 @@ fn get_objects_via_active_runtime(generation: i8, visitor: majit_gc::GetObjectsV
 /// leaving the collector to answer about a forwarding stub.
 fn get_referents_via_active_runtime(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
-    if majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+    if gc_box::present() {
         with_cranelift_gc(|gc| gc.get_referents(obj, &mut visit));
     } else if majit_gc::gc_sync::is_initialized() {
         majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_referents(obj, &mut visit));
@@ -1649,7 +1742,7 @@ fn get_referents_via_active_runtime(obj: GcRef, visitor: majit_gc::GetObjectsVis
 }
 
 fn is_tracked_via_active_runtime(obj: GcRef) -> bool {
-    if majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+    if gc_box::present() {
         return with_cranelift_gc(|gc| gc.is_tracked(obj)).unwrap_or(false);
     }
     if majit_gc::gc_sync::is_initialized() {
@@ -1708,7 +1801,7 @@ fn gc_remove_root_via_active_runtime(slot: *mut GcRef) {
 /// Host-side write-barrier trampoline for GC-managed objects updated
 /// outside compiled code.
 fn gc_write_barrier_via_active_runtime(obj: GcRef) {
-    if majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+    if gc_box::present() {
         with_cranelift_gc(|gc| gc.write_barrier(obj));
     } else if majit_gc::gc_sync::is_initialized() {
         majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.write_barrier(obj));
@@ -1720,16 +1813,10 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
 /// fallback blocks during the L1/L2 stepping-stone window.
 fn id_or_identityhash_via_active_runtime(addr: usize) -> usize {
-    let via_box = majit_gc::gc_box_installed().then(|| {
-        CRANELIFT_ACTIVE_GC.with(|cell| {
-            let mut guard = match cell.try_borrow_mut() {
-                Ok(guard) => guard,
-                Err(_) => return Some(addr),
-            };
-            guard.as_deref_mut().map(|gc| gc.id_or_identityhash(addr))
-        })
-    });
-    if let Some(Some(r)) = via_box {
+    // A box whose borrow is already held by an in-progress alloc answers with
+    // the raw `addr`, not with the singleton's id: this is a top-level op, so
+    // the busy borrow means the box is mid-allocation, not that it is absent.
+    if let Some(r) = gc_box::with_mut_or_busy(addr, |gc| gc.id_or_identityhash(addr)) {
         return r;
     }
     if majit_gc::gc_sync::is_initialized() {
@@ -1739,62 +1826,22 @@ fn id_or_identityhash_via_active_runtime(addr: usize) -> usize {
 }
 
 fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
-    // Structural adaptation: RPython's GC descriptor can be queried
-    // reentrantly while a collection is walking extra roots. Pyre stores
-    // the active cranelift GC in a Rust `RefCell`; allocation slowpaths
-    // hold the mutable borrow while those root walkers may call
-    // `gc_current_object_address`. Use the raw pointer / reentrant
-    // `gc_sync` read only for this immutable ownership query, matching the
-    // read-only nature of RPython's descriptor call, instead of panicking
-    // across the extern slowpath.
-    if !majit_gc::gc_box_installed() {
-        return majit_gc::gc_sync::is_initialized()
-            && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr));
+    // This query can fire reentrantly from an extra-root walker mid-collection,
+    // so both arms are read-only: `with_reentrant_ref` for the box, and the
+    // reentrant singleton read for everything else.
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.is_managed_heap_object(addr)) {
+        return r;
     }
-    match CRANELIFT_ACTIVE_GC.with(|cell| {
-        cell.try_borrow()
-            .map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr)))
-    }) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            if majit_gc::gc_sync::is_initialized() {
-                majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
-            } else {
-                false
-            }
-        }
-        Err(_) => CRANELIFT_ACTIVE_GC_RAW.with(|raw| match raw.get() {
-            Some(ptr) => unsafe { (&*ptr).is_managed_heap_object(addr) },
-            None => {
-                if majit_gc::gc_sync::is_initialized() {
-                    majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
-                } else {
-                    false
-                }
-            }
-        }),
-    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
 }
 
 fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
-    let via_box = majit_gc::gc_box_installed()
-        .then(|| {
-            CRANELIFT_ACTIVE_GC.with(|cell| match cell.try_borrow() {
-                Ok(guard) => guard.as_deref().map(|gc| gc.is_nursery_object(addr)),
-                Err(_) => CRANELIFT_ACTIVE_GC_RAW.with(|raw| {
-                    raw.get()
-                        .map(|ptr| unsafe { (&*ptr).is_nursery_object(addr) })
-                }),
-            })
-        })
-        .flatten();
-    via_box.unwrap_or_else(|| {
-        if majit_gc::gc_sync::is_initialized() {
-            majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))
-        } else {
-            false
-        }
-    })
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.is_nursery_object(addr)) {
+        return r;
+    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))
 }
 
 /// Returns true when the active GC was present and roots were
@@ -4698,6 +4745,25 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> IndexSet<u32> {
     known
 }
 
+fn build_used_vars_set(ops: &[Op]) -> IndexSet<u32> {
+    let mut used = IndexSet::new();
+    for op in ops {
+        for arg in op.getarglist() {
+            if !arg.is_none() && !arg.is_constant() {
+                used.insert(arg.to_opref().raw());
+            }
+        }
+        if let Some(fail_args) = op.getfailargs() {
+            for arg in fail_args {
+                if !arg.is_none() && !arg.is_constant() {
+                    used.insert(arg.to_opref().raw());
+                }
+            }
+        }
+    }
+    used
+}
+
 fn build_force_token_set(_inputargs: &[InputArg], _ops: &[Op]) -> IndexSet<u32> {
     // FORCE_TOKEN is a GCREF to the active JITFRAME
     // (`virtualizable.py:315-318`, `resoperation.py:1090`). Keep its in-frame
@@ -5346,7 +5412,8 @@ fn resolve_failarg_opref(
 fn resolve_local_jump_arg(
     builder: &mut FunctionBuilder,
     constants: &indexmap::IndexMap<u32, i64>,
-    jf_ptr: CValue,
+    ptr_type: cl_types::Type,
+    cached_jf_ptr: &mut Option<CValue>,
     demoted_failarg_slots: &IndexMap<u32, i32>,
     opref: OpRef,
 ) -> CValue {
@@ -5354,6 +5421,7 @@ fn resolve_local_jump_arg(
         && !opref.is_constant()
         && let Some(offset) = demoted_failarg_offset(demoted_failarg_slots, opref.raw())
     {
+        let jf_ptr = cached_pinned_reg(builder, ptr_type, cached_jf_ptr);
         return builder
             .ins()
             .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
@@ -5701,7 +5769,8 @@ fn reload_ref_roots(
 
 fn sync_ref_root_var(
     builder: &mut FunctionBuilder,
-    jf_ptr: CValue,
+    ptr_type: cl_types::Type,
+    cached_jf_ptr: &mut Option<CValue>,
     ref_root_slots: &[(u32, usize)],
     var_idx: u32,
     value: CValue,
@@ -5710,8 +5779,23 @@ fn sync_ref_root_var(
 ) {
     if let Some((_, slot)) = ref_root_slots.iter().find(|(idx, _)| *idx == var_idx) {
         let offset = ref_root_base_ofs + (*slot as i32) * 8;
+        let jf_ptr = cached_pinned_reg(builder, ptr_type, cached_jf_ptr);
         builder.ins().store(MemFlags::new(), value, jf_ptr, offset);
         synced_ref_vars.insert(var_idx);
+    }
+}
+
+fn cached_pinned_reg(
+    builder: &mut FunctionBuilder,
+    ptr_type: cl_types::Type,
+    cached_jf_ptr: &mut Option<CValue>,
+) -> CValue {
+    if let Some(jf_ptr) = *cached_jf_ptr {
+        jf_ptr
+    } else {
+        let jf_ptr = builder.ins().get_pinned_reg(ptr_type);
+        *cached_jf_ptr = Some(jf_ptr);
+        jf_ptr
     }
 }
 
@@ -8706,6 +8790,7 @@ impl CraneliftBackend {
 
         let num_inputs = inputargs.len();
         let known_values = build_known_values_set(inputargs, ops);
+        let used_vars = build_used_vars_set(ops);
         let type_index = OpTypeIndex::new(inputargs, ops);
         let (type_overrides, _op_def_positions) = build_type_overrides(ops, &type_index);
         let ref_root_slots =
@@ -9321,6 +9406,7 @@ impl CraneliftBackend {
         // loader paths reach a LABEL block that re-syncs its carried roots with
         // no GC in between.
         let mut deferred_entry_root_syncs: Vec<(u32, CValue)> = Vec::new();
+        let mut entry_sync_jf_ptr = None;
         let has_labels = !label_indices.is_empty();
         for (i, val) in entry_input_vals.iter().copied().enumerate() {
             let slot = inputargs[i].index;
@@ -9330,7 +9416,8 @@ impl CraneliftBackend {
             } else {
                 sync_ref_root_var(
                     &mut builder,
-                    jf_ptr,
+                    ptr_type,
+                    &mut entry_sync_jf_ptr,
                     &ref_root_slots,
                     slot,
                     val,
@@ -9547,11 +9634,12 @@ impl CraneliftBackend {
             // the br_table — see the deferral note at the entry-block sync. The
             // loaders read the dense carried-value slots, which can overlap this
             // root region, so the sync must not precede the dispatch.
-            let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+            let mut deferred_sync_jf_ptr = None;
             for &(slot, val) in &deferred_entry_root_syncs {
                 sync_ref_root_var(
                     &mut builder,
-                    cur_jf,
+                    ptr_type,
+                    &mut deferred_sync_jf_ptr,
                     &ref_root_slots,
                     slot,
                     val,
@@ -9573,13 +9661,14 @@ impl CraneliftBackend {
             let args = block_args_to(&mut builder, loop_block, &vals);
             builder.ins().jump(loop_block, &args);
             builder.switch_to_block(loop_block);
+            let mut loop_param_sync_jf_ptr = None;
             for i in 0..loop_param_count {
                 let param = builder.block_params(loop_block)[i];
                 builder.def_var(var(i as u32), param);
-                let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                 sync_ref_root_var(
                     &mut builder,
-                    cur_jf,
+                    ptr_type,
+                    &mut loop_param_sync_jf_ptr,
                     &ref_root_slots,
                     i as u32,
                     param,
@@ -9672,6 +9761,7 @@ impl CraneliftBackend {
                     // must not reload it every iteration.  Its home is seeded on
                     // the fall-through/loader edges and read directly by guards.
                     let mut param_idx = 0usize;
+                    let mut label_param_sync_jf_ptr = None;
                     for (i, arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
                         if loop_phi_keep.is_some_and(|keep| !keep[i]) {
                             // Frame-resident: no block param or per-iteration
@@ -9690,10 +9780,10 @@ impl CraneliftBackend {
                             && !constants.contains_key(&arg_ref.to_opref().raw())
                         {
                             builder.def_var(var(arg_ref.to_opref().raw()), param);
-                            let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                             sync_ref_root_var(
                                 &mut builder,
-                                cur_jf,
+                                ptr_type,
+                                &mut label_param_sync_jf_ptr,
                                 &ref_root_slots,
                                 arg_ref.to_opref().raw(),
                                 param,
@@ -9711,14 +9801,33 @@ impl CraneliftBackend {
             let op = &ops[op_idx];
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
 
-            // RPython parity: ebp is the live register at every instruction
-            // boundary. Refresh the cached jf_ptr CValue from
-            // the Cranelift Variable so the FunctionBuilder threads the
-            // correct value through any merge blocks introduced by the
-            // previous opcode (LABEL, brif, etc.). Without this, opcode
-            // handlers that emit IR directly using the cached locals can
-            // reference an SSA value defined in a non-dominating block.
-            jf_ptr = builder.ins().get_pinned_reg(ptr_type);
+            let needs_jf_ptr = matches!(
+                op.opcode,
+                OpCode::GuardNotForced
+                    | OpCode::CallI
+                    | OpCode::CallR
+                    | OpCode::CallF
+                    | OpCode::CallN
+                    | OpCode::CallPureI
+                    | OpCode::CallPureR
+                    | OpCode::CallPureF
+                    | OpCode::CallPureN
+                    | OpCode::CallLoopinvariantI
+                    | OpCode::CallLoopinvariantR
+                    | OpCode::CallLoopinvariantF
+                    | OpCode::CallLoopinvariantN
+                    | OpCode::CallMallocNurseryHeaderless
+                    | OpCode::CallMallocNursery
+                    | OpCode::CallMallocNurseryVarsize
+                    | OpCode::CallMallocNurseryVarsizeFrame
+                    | OpCode::NewArray
+                    | OpCode::NewArrayClear
+                    | OpCode::Newstr
+                    | OpCode::Newunicode
+            );
+            if needs_jf_ptr {
+                jf_ptr = builder.ins().get_pinned_reg(ptr_type);
+            }
 
             // regalloc.py:1089-1106 get_gcmap: per-call-site gcmap
             // marking only alive ref root slots at this position.
@@ -9944,10 +10053,10 @@ impl CraneliftBackend {
                     let a = coerce_ty(&mut builder, a, want);
                     builder.def_var(var(vi), a);
                     if op.opcode == OpCode::SameAsR {
-                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         sync_ref_root_var(
                             &mut builder,
-                            cur_jf,
+                            ptr_type,
+                            &mut None,
                             &ref_root_slots,
                             vi,
                             a,
@@ -11005,7 +11114,8 @@ impl CraneliftBackend {
                         if op.result_type() == Type::Ref && !force_tokens.contains(&vi) {
                             sync_ref_root_var(
                                 &mut builder,
-                                jf_ptr,
+                                ptr_type,
+                                &mut None,
                                 &ref_root_slots,
                                 vi,
                                 result,
@@ -11451,10 +11561,10 @@ impl CraneliftBackend {
                     if op.result_type() != Type::Void {
                         builder.def_var(var(vi), merged_result);
                         if op.result_type() == Type::Ref && !force_tokens.contains(&vi) {
-                            let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                             sync_ref_root_var(
                                 &mut builder,
-                                cur_jf,
+                                ptr_type,
+                                &mut None,
                                 &ref_root_slots,
                                 vi,
                                 merged_result,
@@ -11521,6 +11631,7 @@ impl CraneliftBackend {
                     if info.gcmap != 0 {
                         emit_jitframe_write_barrier(&mut builder, ptr_type, call_conv, cur_jf);
                     }
+                    let call_jf = builder.ins().get_pinned_reg(ptr_type);
 
                     // x86/assembler.py:2236: self._genop_call(op, arglocs, result_loc)
                     let descr = op.getdescr().expect("call op must have a descriptor");
@@ -11539,7 +11650,7 @@ impl CraneliftBackend {
                         call_descr,
                         call_conv,
                         ptr_type,
-                        jf_ptr,
+                        call_jf,
                         &ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
@@ -11600,6 +11711,7 @@ impl CraneliftBackend {
                     if info.gcmap != 0 {
                         emit_jitframe_write_barrier(&mut builder, ptr_type, call_conv, cur_jf);
                     }
+                    let call_jf = builder.ins().get_pinned_reg(ptr_type);
 
                     let descr = op
                         .getdescr()
@@ -11611,14 +11723,14 @@ impl CraneliftBackend {
                     // Spill GC roots before the call
                     spill_ref_roots(
                         &mut builder,
-                        jf_ptr,
+                        call_jf,
                         &ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );
-                    emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                    emit_push_gcmap(&mut builder, call_jf, per_call_gcmap);
 
                     // Release GIL (call the pre-hook)
                     let _ = emit_host_call(
@@ -11743,6 +11855,7 @@ impl CraneliftBackend {
 
                     if let Some(descr) = op.getdescr() {
                         if let Some(call_descr) = descr.as_call_descr() {
+                            let call_jf = builder.ins().get_pinned_reg(ptr_type);
                             let _ = emit_indirect_call_from_parts(
                                 &mut builder,
                                 &constants,
@@ -11754,7 +11867,7 @@ impl CraneliftBackend {
                                 call_descr,
                                 call_conv,
                                 ptr_type,
-                                jf_ptr,
+                                call_jf,
                                 &ref_root_slots,
                                 &defined_ref_vars,
                                 &stale_ref_vars,
@@ -11802,6 +11915,7 @@ impl CraneliftBackend {
                     let mut call_result = cond; // fallback
                     if let Some(descr) = op.getdescr() {
                         if let Some(call_descr) = descr.as_call_descr() {
+                            let call_jf = builder.ins().get_pinned_reg(ptr_type);
                             if let Some(result) = emit_indirect_call_from_parts(
                                 &mut builder,
                                 &constants,
@@ -11813,7 +11927,7 @@ impl CraneliftBackend {
                                 call_descr,
                                 call_conv,
                                 ptr_type,
-                                jf_ptr,
+                                call_jf,
                                 &ref_root_slots,
                                 &defined_ref_vars,
                                 &stale_ref_vars,
@@ -12525,10 +12639,10 @@ impl CraneliftBackend {
                     )?;
                     builder.def_var(var(vi), result);
                     if value_type == Type::Ref {
-                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         sync_ref_root_var(
                             &mut builder,
-                            cur_jf,
+                            ptr_type,
+                            &mut None,
                             &ref_root_slots,
                             vi,
                             result,
@@ -12583,10 +12697,10 @@ impl CraneliftBackend {
                     )?;
                     builder.def_var(var(vi), result);
                     if value_type == Type::Ref {
-                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         sync_ref_root_var(
                             &mut builder,
-                            cur_jf,
+                            ptr_type,
+                            &mut None,
                             &ref_root_slots,
                             vi,
                             result,
@@ -13264,6 +13378,7 @@ impl CraneliftBackend {
                             .iter()
                             .find(|(_, block)| *block == target_block)
                             .and_then(|(label_idx, _)| loop_phi_keep_by_label.get(label_idx));
+                        let mut jump_jf_ptr = None;
                         let vals: Vec<CValue> = op
                             .getarglist()
                             .iter()
@@ -13273,7 +13388,8 @@ impl CraneliftBackend {
                                 resolve_local_jump_arg(
                                     &mut builder,
                                     &constants,
-                                    jf_ptr,
+                                    ptr_type,
+                                    &mut jump_jf_ptr,
                                     &demoted_failarg_slots,
                                     r.to_opref(),
                                 )
@@ -13429,8 +13545,10 @@ impl CraneliftBackend {
                     // x86/assembler.py genop_force_token: mov resloc, ebp
                     // FORCE_TOKEN returns the JitFrame pointer itself.
                     // resoperation.py:1090: "returns the jitframe"
-                    let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-                    builder.def_var(var(vi), cur_jf);
+                    if used_vars.contains(&vi) {
+                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+                        builder.def_var(var(vi), cur_jf);
+                    }
                 }
 
                 // ── VirtualRef operations ──
@@ -13441,10 +13559,10 @@ impl CraneliftBackend {
                     let obj = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     builder.def_var(var(vi), obj);
                     if op.opcode == OpCode::VirtualRefR {
-                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         sync_ref_root_var(
                             &mut builder,
-                            cur_jf,
+                            ptr_type,
+                            &mut None,
                             &ref_root_slots,
                             vi,
                             obj,
@@ -14061,7 +14179,8 @@ impl CraneliftBackend {
                         builder.def_var(var(vi), result);
                         sync_ref_root_var(
                             &mut builder,
-                            jf_ptr,
+                            ptr_type,
+                            &mut None,
                             &ref_root_slots,
                             vi,
                             result,
@@ -14095,7 +14214,8 @@ impl CraneliftBackend {
                         builder.def_var(var(vi), result);
                         sync_ref_root_var(
                             &mut builder,
-                            jf_ptr,
+                            ptr_type,
+                            &mut None,
                             &ref_root_slots,
                             vi,
                             result,
@@ -14148,7 +14268,8 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), result);
                     sync_ref_root_var(
                         &mut builder,
-                        jf_ptr,
+                        ptr_type,
+                        &mut None,
                         &ref_root_slots,
                         vi,
                         result,
@@ -14218,7 +14339,8 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), result);
                     sync_ref_root_var(
                         &mut builder,
-                        jf_ptr,
+                        ptr_type,
+                        &mut None,
                         &ref_root_slots,
                         vi,
                         result,
@@ -14244,7 +14366,8 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), result);
                     sync_ref_root_var(
                         &mut builder,
-                        jf_ptr,
+                        ptr_type,
+                        &mut None,
                         &ref_root_slots,
                         vi,
                         result,
@@ -14331,7 +14454,8 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), result);
                     sync_ref_root_var(
                         &mut builder,
-                        jf_ptr,
+                        ptr_type,
+                        &mut None,
                         &ref_root_slots,
                         vi,
                         result,
@@ -14622,14 +14746,7 @@ impl Drop for CraneliftBackend {
         // active allocator so a subsequent backend is free to install
         // its own; matching dynasm's
         // `runner.rs DYNASM_ACTIVE_GC` reset on backend teardown.
-        // Drop the boxed allocator first so reentrant
-        // `gc_owns_object_via_active_runtime` queries from its drop
-        // body still resolve old-heap addresses through the raw
-        // mirror, then clear the raw mirror.
-        let _ = CRANELIFT_ACTIVE_GC.try_with(|cell| {
-            *cell.borrow_mut() = None;
-        });
-        let _ = CRANELIFT_ACTIVE_GC_RAW.try_with(|raw_cell| raw_cell.set(None));
+        gc_box::clear_on_teardown();
         let _ = CRANELIFT_JITFRAME_TYPE_ID.try_with(|c| c.set(None));
     }
 }

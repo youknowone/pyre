@@ -1020,7 +1020,6 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
 /// RPython: FieldDescr.offset is resolved at rtyper time. In pyre, Rust struct
 /// layout determines field offsets. This resolver maps (owner_type, field_name)
 /// to byte offsets for BhDescr::Field resolution in the blackhole.
-/// Called by `bh.resolve_field_offsets()` after `setposition()`.
 fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
     use pyre_interpreter::pyframe::PyFrame;
     match field_name {

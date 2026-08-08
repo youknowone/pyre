@@ -55,8 +55,10 @@ majit-metainterp = { workspace = true }
 majit-gc = { workspace = true }
 lexopt = { workspace = true }
 rustpython-compiler = { workspace = true }
+rustpython-wtf8 = { workspace = true }
 dirs = { workspace = true }
 rustyline = { workspace = true }
+libc = { workspace = true }
 mimalloc = { version = "0.1", optional = true }
 
 # The sandbox controller (`pyre interact`) and the seccomp backstop are

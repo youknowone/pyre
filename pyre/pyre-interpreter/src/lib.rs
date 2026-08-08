@@ -50,12 +50,13 @@ pub mod host_seam;
 // every target.
 #[cfg(not(unix))]
 pub mod host_seam {
-    /// Read a process environment value. Numeric `PYTHONHASHSEED` values are
-    /// ASCII; lossily encoding any other platform string still makes the seed
-    /// parser reject it instead of treating it as absent.
+    /// Read a process environment value, in the same filesystem-bytes spelling
+    /// the unix seam hands back. A Windows value holding an unpaired surrogate
+    /// keeps it as its WTF-8 encoding, so the caller that turns the bytes back
+    /// into a platform string recovers the code units the host stored.
     pub fn getenv(name: &[u8]) -> Result<Option<Vec<u8>>, ()> {
         let name = std::str::from_utf8(name).map_err(|_| ())?;
-        Ok(std::env::var_os(name).map(|value| value.to_string_lossy().into_owned().into_bytes()))
+        Ok(std::env::var_os(name).map(|value| crate::gateway::fsencode_os_str(&value)))
     }
 
     /// Emit bytes to the interpreter's stdout (fd 1).

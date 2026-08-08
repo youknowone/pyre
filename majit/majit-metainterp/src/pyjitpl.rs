@@ -514,7 +514,10 @@ fn snapshot_map_from_trace_snapshots(
     let mut size_map = Vec::new();
     let mut vable_map = Vec::new();
     let mut vref_map = Vec::new();
-    let mut pc_map = Vec::new();
+    // Not `pc_map`: that name belongs to the `-live-` marker table keyed by
+    // Python pc (`pc_map[py_pc]`, `pyre-jit/src/jit/codewriter.rs`). This is
+    // keyed by snapshot id and holds one `(jitcode_index, pc, py_pc)` per frame.
+    let mut frame_pcs_map = Vec::new();
     // opencoder.py:603 _encode: trace snapshot recorder only emits Box
     // (live deadframe slot) and Const (compile-time pool) payloads.
     // TAGVIRTUAL belongs to resume numbering (resume.py:_number_boxes)
@@ -575,9 +578,9 @@ fn snapshot_map_from_trace_snapshots(
         snapshot_insert(&mut size_map, id, frame_sizes);
         snapshot_insert(&mut vable_map, id, vable_boxes);
         snapshot_insert(&mut vref_map, id, vref_boxes);
-        snapshot_insert(&mut pc_map, id, frame_pcs);
+        snapshot_insert(&mut frame_pcs_map, id, frame_pcs);
     }
-    (box_map, size_map, vable_map, vref_map, pc_map)
+    (box_map, size_map, vable_map, vref_map, frame_pcs_map)
 }
 
 struct PreparedBridgeTrace {
@@ -4431,8 +4434,8 @@ impl<M: Clone> MetaInterp<M> {
             return input_types;
         };
         // `extract_live_values()` still emits the expanded
-        // `[frame, last_instr, pycode, valuestackdepth, debugdata, lastblock,
-        //  w_globals, locals..., stack...]` shape, so the trace's inputarg
+        // `[frame, last_instr, pycode, valuestackdepth, debugdata, w_globals,
+        //  locals..., stack...]` shape, so the trace's inputarg
         // types do NOT carry the reds in the leading `num_reds` slots —
         // truncating to `num_reds` here would register a bogus
         // `[Ref(frame), Int(last_instr)]` ABI when reds is `[frame, ec]`.
@@ -5207,18 +5210,22 @@ impl<M: Clone> MetaInterp<M> {
         let outermost_merge_key = ctx.current_merge_points_first_greenkey();
         // pyjitpl.py:2793: find_biggest_function — if an inlined function
         // caused the bloat, disable just that function.
-        let huge_fn_key = self.find_biggest_function();
+        let huge_fn = self.find_biggest_function();
         // pyjitpl.py:2795: `self.portal_trace_positions = None` marks the
         // abort boundary so post-abort consumers (e.g. test inspections
         // at pyjitpl.py:3547) can detect a terminated trace session.
         self.portal_trace_positions = None;
-        if let Some(huge_fn_key) = huge_fn_key {
+        if let Some((huge_fn_jd_no, huge_fn_key)) = huge_fn {
+            // pyjitpl.py:2822 disables through `jd_sd.warmstate`, the warmstate
+            // of the driver that owns the oversized frame.  Pyre keeps one
+            // `WarmEnterState` on the MetaInterp rather than one per
+            // `JitDriverStaticData`, so the disable lands on that single state;
+            // the owning index is still carried through below.
             self.warm_state.disable_noninlinable_function(huge_fn_key);
             // pyjitpl.py:2799-2800: stash the aborted jd_sd + greenkey so
             // `aborted_tracing(reason)` can fire `on_trace_too_long` when
-            // the hook is ported.  Pyre only registers a single jitdriver
-            // so jd_sd.index is always 0.
-            self.aborted_tracing_jitdriver = Some(0);
+            // the hook is ported.
+            self.aborted_tracing_jitdriver = Some(huge_fn_jd_no);
             self.aborted_tracing_greenkey = Some(huge_fn_key);
             // pyjitpl.py:2801-2804: only boost retrace for the outermost
             // loop (when `current_merge_points` is non-empty).  Bridge
@@ -6021,7 +6028,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_pc_map,
+            snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         // history.py:220/261/307 — `Const{Int,Float,Ptr}.type` is an
         // intrinsic attribute on the Box itself, so no raw-u32 type
@@ -6031,7 +6038,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
-        unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
+        unroll_opt.snapshot_frame_pcs = snapshot_frame_pcs.clone();
         // The original snapshot maps are re-cloned into `simple_opt` on the
         // InvalidLoop retry below, so they must stay rooted across the WHOLE
         // unroll. Each phase's `replace_compile_snapshot_roots` overwrites the
@@ -6165,7 +6172,7 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map;
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map;
                         simple_opt.snapshot_vref_boxes = snapshot_vref_map;
-                        simple_opt.snapshot_frame_pcs = snapshot_pc_map;
+                        simple_opt.snapshot_frame_pcs = snapshot_frame_pcs;
                         simple_opt.call_pure_results = call_pure_results.clone();
                         // Forward the recorder's operand pool — the retry path
                         // uses the same upstream `Rc<Box>` allocations from
@@ -8557,7 +8564,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_pc_map,
+            snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
@@ -8576,7 +8583,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
-        optimizer.snapshot_frame_pcs = snapshot_pc_map;
+        optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
 
         // InvalidLoop during optimization should abort the trace, not crash
         // the process. Matches compile_loop.
@@ -8999,7 +9006,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_pc_map,
+            snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
@@ -9010,7 +9017,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
-        optimizer.snapshot_frame_pcs = snapshot_pc_map;
+        optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
 
         let optimize_start = Instant::now();
         let optimize_result = optimizer.optimize_with_constants_and_inputs_oprc(
@@ -11079,7 +11086,7 @@ impl<M: Clone> MetaInterp<M> {
     /// bridge (`close_bridge`) and the interp-origin entry bridge
     /// (`compile_trace_from_interp`) alike, since `retrace_after_bridge` is armed
     /// inside the shared compile path rather than per origin.
-    pub(crate) fn classify_compile_outcome(&self, outcome: CompileOutcome) -> BridgeCompileResult {
+    pub fn classify_compile_outcome(&self, outcome: CompileOutcome) -> BridgeCompileResult {
         match outcome {
             CompileOutcome::Compiled { .. } => BridgeCompileResult::Compiled,
             _ if self.retrace_after_bridge => {
@@ -14212,41 +14219,50 @@ impl<M: Clone> MetaInterp<M> {
     /// `size` is the distance between two `TracePosition::_pos` cursors, the
     /// `pos[0]` upstream subtracts (opencoder.py:475).
     ///
-    /// Returns the green key of the largest frame, or `None` when the log
+    /// Returns the owning jitdriver's index and the green key of the largest
+    /// frame — `max_jdsd, max_key` upstream, which the caller needs both of
+    /// (`pyjitpl.py:2821-2824` disables through the frame's OWN driver and
+    /// stashes that driver in `aborted_tracing_jitdriver`). `None` when the log
     /// holds no closed or open portal frame — the root frame is created by
     /// `initialize_state_from_start` without a greenkey and never enters the
     /// log, so a trace that inlined nothing answers `None` and the caller
     /// falls through to `prepare_trace_segmenting`.
-    pub fn find_biggest_function(&self) -> Option<u64> {
+    pub fn find_biggest_function(&self) -> Option<(usize, u64)> {
         let positions = self.portal_trace_positions.as_ref()?;
-        let mut start_stack: Vec<(u64, usize)> = Vec::new();
+        let mut start_stack: Vec<(usize, u64, usize)> = Vec::new();
         let mut max_size = 0usize;
         let mut max_key = None;
-        for &(_jd_no, key, pos) in positions {
+        for &(jd_no, key, pos) in positions {
             match key {
                 // pyjitpl.py:3547-3548 `if key is not None: start_stack.append`.
-                Some(key) => start_stack.push((key, pos._pos)),
+                Some(key) => start_stack.push((jd_no, key, pos._pos)),
                 // pyjitpl.py:3549-3559 the closing entry sizes the frame it
                 // closes. An unmatched close cannot happen while `newframe` /
                 // `popframe` are the only writers, so it is left to `pop`'s
                 // `None` rather than given a recovery path.
                 None => {
-                    if let Some((green_key, start_pos)) = start_stack.pop() {
+                    if let Some((jd_no, green_key, start_pos)) = start_stack.pop() {
                         let size = pos._pos.saturating_sub(start_pos);
                         if size > max_size {
                             max_size = size;
-                            max_key = Some(green_key);
+                            max_key = Some((jd_no, green_key));
                         }
                     }
                 }
             }
         }
         // pyjitpl.py:3560-3570 `if start_stack:` — one frame, the outermost,
-        // measured against where the trace stopped.
-        if let Some(&(green_key, start_pos)) = start_stack.first() {
-            let current = self.tracing.as_ref()?.get_trace_position()._pos;
+        // measured against where the trace stopped.  Upstream reads
+        // `self.history` there unconditionally; pyre's recorder is an `Option`,
+        // and a `?` on it would return `None` for the whole function and throw
+        // away a `max_key` the closed frames above already produced.  Only the
+        // open frame is unmeasurable without a recorder, so only it is skipped.
+        if let Some(&(jd_no, green_key, start_pos)) = start_stack.first()
+            && let Some(tracing) = self.tracing.as_ref()
+        {
+            let current = tracing.get_trace_position()._pos;
             if current.saturating_sub(start_pos) > max_size {
-                max_key = Some(green_key);
+                max_key = Some((jd_no, green_key));
             }
         }
         max_key
@@ -20482,7 +20498,7 @@ mod metainterp_static_data_tests {
 
         assert_eq!(
             meta.find_biggest_function(),
-            Some(0xa11),
+            Some((0, 0xa11)),
             "the larger frame wins even though both have returned"
         );
     }
@@ -20502,7 +20518,32 @@ mod metainterp_static_data_tests {
         meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
         record_ops(&mut meta, 5);
 
-        assert_eq!(meta.find_biggest_function(), Some(0xb22));
+        assert_eq!(meta.find_biggest_function(), Some((0, 0xb22)));
+    }
+
+    #[test]
+    fn find_biggest_function_keeps_a_closed_frame_when_the_recorder_is_gone() {
+        // pyjitpl.py:3560-3570 reads `self.history` unconditionally, so a
+        // closed frame's size always survives to the return. pyre's recorder is
+        // an `Option`: an unmatched open entry plus `tracing = None` must skip
+        // only the open frame's measurement, not discard `max_key`.
+        let (mut meta, jc) = meta_with_recursive_portal();
+        start_tracing(&mut meta);
+
+        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        record_ops(&mut meta, 5);
+        meta.popframe(true);
+
+        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        record_ops(&mut meta, 1);
+        // Left open, and the recorder retired under it.
+        meta.tracing = None;
+
+        assert_eq!(
+            meta.find_biggest_function(),
+            Some((0, 0xa11)),
+            "the closed frame's size survives a missing recorder"
+        );
     }
 
     #[test]

@@ -550,12 +550,14 @@ fn encode_float(
 /// Attach the PEP 678 context notes emitted by Python 3.14's
 /// `json.encoder._make_iterencode`.  The original exception remains
 /// authoritative if a pathological `add_note` override itself fails.
-fn add_json_note(mut err: PyError, note: String) -> PyError {
+fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
     let _roots = gc_roots::push_roots();
     let exc = err.to_exc_object();
     let exc_slot = gc_roots::shadow_stack_len();
     gc_roots::pin_root(exc);
-    let note = pyre_object::w_str_new(&note);
+    // The note quotes a key the caller supplied, which may hold a lone
+    // surrogate, so it is carried as the WTF-8 it is.
+    let note = pyre_object::w_str_from_wtf8(note.into());
     let note_slot = gc_roots::shadow_stack_len();
     gc_roots::pin_root(note);
     if let Ok(add_note) =
@@ -889,11 +891,14 @@ fn encode_dict(
         )
         .map_err(|err| {
             let key_repr =
-                unsafe { crate::display::py_repr(gc_roots::shadow_stack_get(pair_slot + 2)) }
-                    .unwrap_or_else(|_| "<?>".to_owned());
+                unsafe { crate::display::py_repr_wtf8(gc_roots::shadow_stack_get(pair_slot + 2)) }
+                    .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
             add_json_note(
                 err,
-                format!("when serializing {} item {key_repr}", short_type_name(obj)),
+                crate::display::wtf8_format!(
+                    format!("when serializing {} item ", short_type_name(obj)),
+                    key_repr
+                ),
             )
         })?;
         out.push_wtf8(&encoded);

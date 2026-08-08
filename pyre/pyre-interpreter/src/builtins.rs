@@ -360,6 +360,37 @@ unsafe fn w_memoryview_new_plain(
     }
 }
 
+/// Build the `BytesIOView` returned by `W_BytesIO.getbuffer_w`
+/// (`interp_bytesio.py:149-152`): its `BytesIOBuffer` reads the bytearray
+/// backing, while `BytesIOView.__init__` reports the `W_BytesIO` as `.obj`
+/// (`interp_bytesio.py:52-62`).
+pub(crate) fn w_memoryview_new_simple_with_owner(
+    w_backing: PyObjectRef,
+    w_obj: PyObjectRef,
+) -> PyObjectRef {
+    use pyre_object::bufferview::BufferView;
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_backing);
+        pyre_object::gc_roots::pin_root(w_obj);
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
+        let r_backing = pyre_object::gc_roots::shadow_stack_get(sp);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        pyre_object::bytearrayobject::w_bytearray_exports_incref(r_backing);
+        let length = pyre_object::bytearrayobject::w_bytearray_len(r_backing) as i64;
+        let backing = memoryview_backing_buffer(r_backing);
+        let view = BufferView::Simple {
+            backing,
+            w_obj: r_obj,
+            length,
+        };
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
+    }
+}
+
 /// Build the `W_MMap.readbuf_w`/`writebuf_w` view: one contiguous external
 /// byte window whose owner remains the mmap object.
 #[cfg(all(unix, not(feature = "sandbox")))]
@@ -678,7 +709,7 @@ fn w_memoryview_new_with_flags_impl(
                 let tname = crate::typedef::r#type(w_obj)
                     .map(|t| pyre_object::w_type_get_name(t.as_ptr()))
                     .unwrap_or("object");
-                return Err(crate::PyError::type_error(&format!(
+                return Err(crate::PyError::type_error(format!(
                     "memoryview: a bytes-like object is required, not '{tname}'"
                 )));
             }
@@ -1784,9 +1815,12 @@ unsafe fn memoryview_call_python_release_unraisable(
             let r_exporter = pyre_object::gc_roots::shadow_stack_get(sp);
             error.write_unraisable(
                 w_none(),
-                &format!(
-                    "Exception ignored in __release_buffer__ of {}:",
-                    crate::baseobjspace::object_functionstr_type_name(r_exporter)
+                rustpython_wtf8::Wtf8::new(
+                    format!(
+                        "Exception ignored in __release_buffer__ of {}:",
+                        crate::baseobjspace::object_functionstr_type_name(r_exporter)
+                    )
+                    .as_str(),
                 ),
                 r_exporter,
             );
@@ -3948,8 +3982,13 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         if stderr.is_null() || unsafe { pyre_object::is_none(stderr) } {
             return Ok(w_none());
         }
-        let text = String::from_utf8_lossy(&rendered).into_owned();
-        let w_text = pyre_object::w_str_new(&text);
+        // The render is assembled from text the printer already escaped, so it
+        // is well-formed WTF-8; a decode failure would mean a byte no writer
+        // put there, and the lossy read is the last resort for it.
+        let w_text = match rustpython_wtf8::Wtf8::from_bytes(&rendered) {
+            Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
+            None => pyre_object::w_str_new(&String::from_utf8_lossy(&rendered)),
+        };
         let result = crate::baseobjspace::call_method(stderr, "write", &[w_text]);
         if result.is_null() {
             let _ = crate::call::take_call_error();
@@ -3957,7 +3996,7 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             return Ok(w_none());
         }
     }
-    crate::host_seam::emit_stderr(&rendered);
+    crate::error::emit_report_to_host_stderr(&rendered);
     Ok(w_none())
 }
 
@@ -4274,6 +4313,23 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
     (args, None)
 }
 
+/// Length of the leading non-null run of `args`.
+///
+/// `bind_kwargs_to_signature` pads the flat argument slice out to the full
+/// parameter count with PY_NULL for keyword-only slots and absent optionals,
+/// so the true positional count is the prefix before the first PY_NULL.
+/// A single named function keeps the count off the annotator's shared
+/// iterator-adapter graph: a `take_while` closure inlined per wrapper gives
+/// every `__pyre_wrap_*` shim its own closure type, and merging those
+/// distinct types on one `TakeWhile` graph's input has no common base class.
+pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> usize {
+    let mut count = 0;
+    while count < args.len() && !args[count].is_null() {
+        count += 1;
+    }
+    count
+}
+
 /// Cold dictionary-strategy half of the flat builtin-keyword ABI.
 ///
 /// The caller first proves `last` is a dict.  Keeping the strategy dispatch
@@ -4518,7 +4574,10 @@ pub(crate) fn bind_builtin_kwargs(
     )?;
     let mut scope: Vec<PyObjectRef> = vec![PY_NULL; names.len()];
     let mut filled: Vec<bool> = vec![false; names.len()];
-    let mut unknown: Option<String> = None;
+    // `argument.py:616` keys the message off `space.text_w(keyword_names_w[i])`,
+    // the keyword's own storage, so a name carrying a lone surrogate reaches
+    // `e.args[0]` intact. Keep the WTF-8 rather than a lossy `String`.
+    let mut unknown: Option<Wtf8Buf> = None;
     for (i, &v) in positional.iter().enumerate() {
         scope[i] = v;
         filled[i] = true;
@@ -4545,7 +4604,7 @@ pub(crate) fn bind_builtin_kwargs(
                 // so a call that misses a required argument is reported
                 // against that argument even when it also passed a keyword
                 // the function does not know.
-                None => unknown = Some(key.to_string_lossy().into_owned()),
+                None => unknown = Some(key.to_wtf8_buf()),
             }
         }
     }
@@ -4559,9 +4618,11 @@ pub(crate) fn bind_builtin_kwargs(
         }
     }
     if let Some(key) = unknown {
-        return Err(crate::PyError::type_error(format!(
-            "{fn_name}() got an unexpected keyword argument '{key}'"
-        )));
+        let mut msg =
+            Wtf8Buf::from_string(format!("{fn_name}() got an unexpected keyword argument '"));
+        msg.push_wtf8(&key);
+        msg.push_str("'");
+        return Err(crate::PyError::type_error(msg));
     }
     Ok(scope)
 }
@@ -5980,21 +6041,25 @@ fn os_error_build(
         let w = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
         interp_exceptions::w_exception_new_wtf8(kind, w)
     } else {
-        let msg: String = if args.is_empty() {
-            String::new()
+        let msg: rustpython_wtf8::Wtf8Buf = if args.is_empty() {
+            rustpython_wtf8::Wtf8Buf::new()
         } else if args.len() == 1 {
             // exception construction is non-raising machinery, per the F7
             // display policy; a raising __str__/__repr__ on the args degrades
             // to the empty string rather than propagating.
-            unsafe { crate::display::py_str(args[0]) }.unwrap_or_default()
+            unsafe { crate::display::py_str_wtf8(args[0]) }.unwrap_or_default()
         } else {
-            let parts: Vec<String> = args
-                .iter()
-                .map(|&a| unsafe { crate::display::py_repr(a) }.unwrap_or_default())
-                .collect();
-            format!("({})", parts.join(", "))
+            let mut parts = rustpython_wtf8::Wtf8Buf::from_string("(".to_string());
+            for (index, &a) in args.iter().enumerate() {
+                if index > 0 {
+                    parts.push_str(", ");
+                }
+                parts.push_wtf8(&unsafe { crate::display::py_repr_wtf8(a) }.unwrap_or_default());
+            }
+            parts.push_str(")");
+            parts
         };
-        interp_exceptions::w_exception_new(kind, &msg)
+        interp_exceptions::w_exception_new_wtf8(kind, &msg)
     };
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
     // slot fill) still reports the empty tuple until `__init__` runs.
@@ -7279,9 +7344,8 @@ fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
 /// runs even when `exc`'s own class registers a `descr_str` override.
 fn base_exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = args[0];
-    Ok(pyre_object::w_str_new(&unsafe {
-        crate::display::base_exception_str(obj)?
-    }))
+    let text = unsafe { crate::display::base_exception_str_wtf8(obj)? };
+    Ok(pyre_object::w_str_from_wtf8(text))
 }
 
 /// The `descr_str` of the class that registers one, falling back to
@@ -8170,8 +8234,8 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let repr_slot = if is_list_or_tuple {
         None
     } else {
-        let rendered = pyre_object::w_str_new(&unsafe {
-            crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(base + 2))?
+        let rendered = pyre_object::w_str_from_wtf8(unsafe {
+            crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 2))?
         });
         pyre_object::gc_roots::pin_root(rendered);
         Some(pyre_object::gc_roots::shadow_stack_len() - 1)
@@ -8651,10 +8715,15 @@ fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let message = unsafe { pyre_object::w_str_get_wtf8(message) };
     let count = unsafe { pyre_object::w_tuple_len(exceptions) };
     let suffix = if count == 1 { "" } else { "s" };
-    Ok(pyre_object::w_str_new(&format!(
-        "{} ({count} sub-exception{suffix})",
-        message.to_string_lossy()
-    )))
+    // `app_group.py:88-90` interpolates `self.message` into the result, and a
+    // `str` carrying an unpaired surrogate interpolates as itself.  Building
+    // the result through `to_string_lossy` instead turned that surrogate into
+    // U+FFFD, so `str(group)` answered a different string than `group.message`
+    // held -- a loss visible from Python, not only on the way to stderr.
+    let mut rendered = Wtf8Buf::with_capacity(message.len() + 32);
+    rendered.push_wtf8(message);
+    rendered.push_str(&format!(" ({count} sub-exception{suffix})"));
+    Ok(pyre_object::w_str_from_wtf8(rendered))
 }
 
 fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -8662,11 +8731,16 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let (message, exceptions) = exception_group_fields(w_self)?;
     let cls = crate::typedef::r#type(w_self).unwrap();
     let name = unsafe { pyre_object::w_type_get_name(cls.as_ptr()) };
-    let message_repr = unsafe { crate::display::py_repr(message)? };
+    let message_repr = unsafe { crate::display::py_repr_wtf8(message)? };
     let saved =
         unsafe { pyre_object::interp_exceptions::w_exception_get_group_exceptions_repr(w_self) };
+    // `app_group.py:92-93` interpolates the two `!r` results into the result
+    // verbatim, so a `__repr__` that answers a lone surrogate carries it
+    // through.  Every piece here is WTF-8 for that reason: `w_str_get_value`
+    // on the saved spelling would panic outright on such a surrogate, and the
+    // `py_repr` spelling of the fallbacks would fold it to U+FFFD.
     let exceptions_repr = if !saved.is_null() {
-        unsafe { pyre_object::w_str_get_value(saved) }.to_string()
+        unsafe { pyre_object::w_str_get_wtf8(saved) }.to_wtf8_buf()
     } else {
         // Fallback for a group whose constructor never recorded the spelling:
         // render the immutable internal tuple, but as a list when `args` shows
@@ -8683,14 +8757,20 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         };
         if original_was_list {
             let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
-            unsafe { crate::display::py_repr(pyre_object::w_list_new(items))? }
+            unsafe { crate::display::py_repr_wtf8(pyre_object::w_list_new(items))? }
         } else {
-            unsafe { crate::display::py_repr(exceptions)? }
+            unsafe { crate::display::py_repr_wtf8(exceptions)? }
         }
     };
-    Ok(pyre_object::w_str_new(&format!(
-        "{name}({message_repr}, {exceptions_repr})"
-    )))
+    let mut rendered =
+        Wtf8Buf::with_capacity(name.len() + message_repr.len() + exceptions_repr.len() + 4);
+    rendered.push_str(name);
+    rendered.push_str("(");
+    rendered.push_wtf8(&message_repr);
+    rendered.push_str(", ");
+    rendered.push_wtf8(&exceptions_repr);
+    rendered.push_str(")");
+    Ok(pyre_object::w_str_from_wtf8(rendered))
 }
 
 fn make_exception_group_type(
@@ -9413,10 +9493,11 @@ fn unicode_to_decimal_w(
 /// source object, not the whitespace-trimmed or Unicode-normalized buffer the
 /// number parser consumes internally.
 fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
-    let source_repr = unsafe { crate::display::py_repr(w_source) }
-        .unwrap_or_else(|_| "<unprintable>".to_string());
-    crate::PyError::value_error(format!(
-        "invalid literal for int() with base {base}: {source_repr}"
+    let source_repr = unsafe { crate::display::py_repr_wtf8(w_source) }
+        .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<unprintable>".to_string()));
+    crate::PyError::value_error(crate::display::wtf8_format!(
+        format!("invalid literal for int() with base {base}: "),
+        source_repr
     ))
 }
 
@@ -9718,9 +9799,10 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         }
         // floatobject.py `_string_to_float`: `%R` uses the original source's
         // repr, preserving quotes and escaping controls/NUL/non-ASCII text.
-        let source_repr = unsafe { crate::py_repr(obj)? };
-        return Err(crate::PyError::value_error(format!(
-            "could not convert string to float: {source_repr}"
+        let source_repr = unsafe { crate::display::py_repr_wtf8(obj)? };
+        return Err(crate::PyError::value_error(crate::display::wtf8_format!(
+            "could not convert string to float: ",
+            source_repr
         )));
     }
     // floatobject.py:247-255 — a readable buffer (`charbuf_w`: bytes /
@@ -9734,9 +9816,10 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 return Ok(floatobject::w_float_new(v));
             }
         }
-        let r = unsafe { crate::py_repr(obj)? };
-        return Err(crate::PyError::value_error(format!(
-            "could not convert string to float: {r}"
+        let r = unsafe { crate::display::py_repr_wtf8(obj)? };
+        return Err(crate::PyError::value_error(crate::display::wtf8_format!(
+            "could not convert string to float: ",
+            r
         )));
     }
     // The message uses the modern "real number" wording (3.14) rather than
@@ -10501,6 +10584,25 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             ParseErrorType::DuplicateKeywordArgumentError(name) => {
                 format!("keyword argument repeated: {name}")
             }
+            // The parser spells every unlexable character the same way. Split
+            // it the way `pytokenizer.py:130-140` does — non-printable
+            // characters name only their code point, printable ones are quoted
+            // — with the hex uppercase and padded to at least four digits, so
+            // an astral character widens instead of truncating.
+            //
+            // A printable ASCII character reports plain `invalid syntax`:
+            // `test_syntax.py:1459` asserts that for `1 $ 2`, and keeps
+            // `invalid character` for the non-ASCII case (`:2238`).
+            ParseErrorType::Lexical(LexicalErrorType::UnrecognizedToken { tok }) => {
+                let code = *tok as u32;
+                if !rustpython_unicode::classify::is_printable(*tok) {
+                    format!("invalid non-printable character U+{code:04X}")
+                } else if tok.is_ascii() {
+                    "invalid syntax".to_string()
+                } else {
+                    format!("invalid character '{tok}' (U+{code:04X})")
+                }
+            }
             _ => e.to_string(),
         }
     } else {
@@ -10527,7 +10629,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         };
         crate::PyError::syntax_error_located(
             msg,
-            &filename,
+            rustpython_wtf8::Wtf8::new(filename.as_str()),
             lineno as i64,
             offset as i64,
             end_lineno as i64,
@@ -10800,7 +10902,7 @@ fn source_as_str(
     source: PyObjectRef,
     funcname: &str,
     what: &str,
-    filename: &str,
+    filename: &rustpython_wtf8::Wtf8,
     flags: &mut i64,
 ) -> Result<String, crate::PyError> {
     unsafe {
@@ -10893,6 +10995,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // spelling, and reporting it at the first `co_filename` read instead would
     // blame whoever came to look at the code object.
     crate::gateway::fsdecode_filename_checked(&filename_bytes)?;
+    let filename_text = crate::gateway::fsdecode_filename_wtf8(&filename_bytes);
     let (filename, filename_bytes) = crate::pycode::split_code_filename_bytes(filename_bytes, None);
     let mode = crate::baseobjspace::text_w(mode_obj)?;
     // flags / dont_inherit / optimize are positional-or-keyword ints
@@ -10982,7 +11085,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 source,
                 "compile",
                 "string, bytes or AST",
-                &filename,
+                &filename_text,
                 &mut flags,
             )
             .map_err(|error| {
@@ -11132,7 +11235,7 @@ fn exec_or_eval(
                 source,
                 if is_eval { "eval" } else { "exec" },
                 "string, bytes or code",
-                "<string>",
+                rustpython_wtf8::Wtf8::new("<string>"),
                 &mut flags,
             )?;
             if is_eval {
@@ -12039,7 +12142,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                     }
                 }
             }
-            return Err(crate::PyError::type_error(&format!(
+            return Err(crate::PyError::type_error(format!(
                 "unhashable type: '{}'",
                 name
             )));
@@ -13940,16 +14043,22 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         })
         .unwrap_or_default();
     let body = if let Ok(name) = crate::baseobjspace::getattr_str(self_obj, "name") {
-        format!("name={} mode='{mode}' closefd={closefd}", unsafe {
-            crate::display::py_repr(name)?
-        })
+        crate::display::wtf8_format!(
+            "name=",
+            unsafe { crate::display::py_repr_wtf8(name)? },
+            format!(" mode='{mode}' closefd={closefd}")
+        )
     } else {
-        format!(
+        rustpython_wtf8::Wtf8Buf::from_string(format!(
             "fd={} mode='{mode}' closefd={closefd}",
             file_get_fd(self_obj).unwrap_or(-1)
-        )
+        ))
     };
-    Ok(w_str_new(&format!("<{repr_type} {body}>")))
+    Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
+        format!("<{repr_type} "),
+        body,
+        ">"
+    )))
 }
 
 /// `_io.FileIO.__init__` — PyPy `W_FileIO.descr_init`.
@@ -16844,7 +16953,7 @@ mod tests {
         let err = parse_int_from_str(source, &text, 10).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
         assert_eq!(
-            err.message,
+            err.message_text(),
             "Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; use sys.set_int_max_str_digits() to increase the limit"
         );
     }
@@ -17114,6 +17223,9 @@ mod tests {
         // 2 and 4 share a factor, so 2 has no inverse modulo 4.
         let err = builtin_pow(&[w_int_new(2), w_int_new(-1), w_int_new(4)]).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
-        assert_eq!(err.message, "base is not invertible for the given modulus");
+        assert_eq!(
+            err.message_text(),
+            "base is not invertible for the given modulus"
+        );
     }
 }

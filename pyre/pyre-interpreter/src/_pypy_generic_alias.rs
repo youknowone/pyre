@@ -215,7 +215,7 @@ fn self_alias(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `GenericAlias.__repr__` (`_pypy_generic_alias.py:57`).
 fn ga_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
-    Ok(w_str_new(&unsafe { repr(self_)? }))
+    Ok(pyre_object::w_str_from_wtf8(unsafe { repr(self_)? }))
 }
 
 /// `GenericAlias.__hash__` (`_pypy_generic_alias.py:82`).
@@ -455,9 +455,10 @@ pub(crate) fn subs_parameters(
     let current_params = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
     let nparams = unsafe { w_tuple_len(current_params()) };
     if nparams == 0 {
-        let repr = unsafe { crate::display::py_repr(current_self())? };
-        return Err(crate::PyError::type_error(format!(
-            "{repr} is not a generic class"
+        let repr = unsafe { crate::display::py_repr_wtf8(current_self())? };
+        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            repr,
+            " is not a generic class"
         )));
     }
     // Substitution runs arbitrary Python — `__typing_prepare_subst__`,
@@ -524,8 +525,9 @@ pub(crate) fn subs_parameters(
     };
     if nparams != nitems {
         let direction = if nitems > nparams { "many" } else { "few" };
-        let s =
-            unsafe { crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(self_slot))? };
+        let s = unsafe {
+            crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(self_slot))?
+        };
         if nitems < nparams {
             // A parameter carrying a default need not be supplied, so the
             // shortfall is measured against the required count rather than
@@ -1193,7 +1195,8 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
 ///
 /// # Safety
 /// `obj` must point to a valid `GenericAlias`.
-pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
+pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+    use rustpython_wtf8::Wtf8Buf;
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -1214,13 +1217,13 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         let result = w_tuple_getitem(current_args(), (n - 1) as i64).unwrap();
         let result_repr = repr_item(result)?;
         if n == 1 {
-            format!("[], {result_repr}")
+            crate::display::wtf8_format!("[], ", result_repr)
         } else {
             let first = w_tuple_getitem(current_args(), 0).unwrap();
             if is_ellipsis(first) {
-                format!("..., {result_repr}")
+                crate::display::wtf8_format!("..., ", result_repr)
             } else if n == 2 && (is_param_spec(first)? || is_typing_generic_alias(first)?) {
-                format!("{}, {result_repr}", repr_item(first)?)
+                crate::display::wtf8_format!(repr_item(first)?, ", ", result_repr)
             } else {
                 let mut params = Vec::with_capacity(n - 1);
                 for i in 0..n - 1 {
@@ -1228,11 +1231,11 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                         params.push(repr_item(item)?);
                     }
                 }
-                format!("[{}], {result_repr}", params.join(", "))
+                crate::display::wtf8_format!("[", join_wtf8(&params, ", "), "], ", result_repr)
             }
         }
     } else if n == 0 {
-        "()".to_string()
+        Wtf8Buf::from_string("()".to_string())
     } else {
         let mut parts = Vec::with_capacity(n);
         for i in 0..n {
@@ -1244,24 +1247,40 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 });
             }
         }
-        parts.join(", ")
+        join_wtf8(&parts, ", ")
     };
     let star = if w_generic_alias_get_unpacked(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
         "*"
     } else {
         ""
     };
-    Ok(format!(
-        "{star}{}[{inner}]",
-        repr_item(pyre_object::gc_roots::shadow_stack_get(origin_slot))?
+    Ok(crate::display::wtf8_format!(
+        star,
+        repr_item(pyre_object::gc_roots::shadow_stack_get(origin_slot))?,
+        "[",
+        inner,
+        "]"
     ))
+}
+
+/// `", ".join(parts)` for pieces that may hold a lone surrogate, which
+/// `[Wtf8Buf]` has no `join` for.
+fn join_wtf8(parts: &[rustpython_wtf8::Wtf8Buf], sep: &str) -> rustpython_wtf8::Wtf8Buf {
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            out.push_str(sep);
+        }
+        out.push_wtf8(part);
+    }
+    out
 }
 
 /// CPython 3.14 `ga_repr_items_list` — ParamSpec substitutions retain a
 /// list, whose type items use typing-style rendering.  Fetch each element
 /// after its predecessor's repr so mutation during a callback raises
 /// `IndexError` rather than reading stale storage.
-unsafe fn repr_items_list(list: PyObjectRef) -> Result<String, crate::PyError> {
+unsafe fn repr_items_list(list: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     let n = w_list_len(list);
     let mut parts = Vec::with_capacity(n);
     for i in 0..n {
@@ -1269,19 +1288,25 @@ unsafe fn repr_items_list(list: PyObjectRef) -> Result<String, crate::PyError> {
             .ok_or_else(|| crate::PyError::index_error("list index out of range"))?;
         parts.push(repr_item(item)?);
     }
-    Ok(format!("[{}]", parts.join(", ")))
+    Ok(crate::display::wtf8_format!(
+        "[",
+        join_wtf8(&parts, ", "),
+        "]"
+    ))
 }
 
 /// `_repr_item(it)` (`_pypy_generic_alias.py:124`) — a class renders as its
 /// qualname (prefixed with the module when it is not `builtins`); anything
 /// else falls back to `repr`.
-pub(crate) unsafe fn repr_item(it: PyObjectRef) -> Result<String, crate::PyError> {
+pub(crate) unsafe fn repr_item(
+    it: PyObjectRef,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(it);
     let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let current_item = || pyre_object::gc_roots::shadow_stack_get(item_slot);
     if is_ellipsis(current_item()) {
-        return Ok("...".to_string());
+        return Ok(rustpython_wtf8::Wtf8Buf::from_string("...".to_string()));
     }
     if is_generic_alias(current_item()) {
         return repr(current_item());
@@ -1291,7 +1316,7 @@ pub(crate) unsafe fn repr_item(it: PyObjectRef) -> Result<String, crate::PyError
     // `__qualname__`; otherwise aliases such as
     // `typing.Concatenate[int, P]` collapse to `typing.Concatenate`.
     if is_typing_generic_alias(current_item())? {
-        return crate::display::py_repr(current_item());
+        return unsafe { crate::display::py_repr_wtf8(current_item()) };
     }
     // `getattr(it, "__qualname__")` / `getattr(it, "__module__")`.
     if let Ok(w_qualname) = crate::baseobjspace::getattr_str(current_item(), "__qualname__") {
@@ -1300,13 +1325,13 @@ pub(crate) unsafe fn repr_item(it: PyObjectRef) -> Result<String, crate::PyError
             let module = crate::baseobjspace::getattr_str(current_item(), "__module__")
                 .ok()
                 .and_then(|w| crate::baseobjspace::text_w(w).ok().map(str::to_string));
-            return Ok(match module {
+            return Ok(rustpython_wtf8::Wtf8Buf::from_string(match module {
                 Some(m) if m != "builtins" => format!("{m}.{qualname}"),
                 _ => qualname,
-            });
+            }));
         }
     }
-    crate::display::py_repr(current_item())
+    unsafe { crate::display::py_repr_wtf8(current_item()) }
 }
 
 fn is_collections_abc_callable(origin: PyObjectRef) -> Result<bool, crate::PyError> {

@@ -133,11 +133,8 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             // optionals would otherwise be counted as positional.  PY_NULL is
             // never a real argument, so the leading non-null run is the true
             // positional count on both the bound and the raw path.
-            let __pyre_positional_count = crate::builtins::split_builtin_kwargs(args)
-                .0
-                .iter()
-                .take_while(|slot| !slot.is_null())
-                .count();
+            let __pyre_positional_count =
+                crate::builtins::leading_non_null_count(crate::builtins::split_builtin_kwargs(args).0);
             const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
             const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
             let __pyre_bound_args;
@@ -933,6 +930,10 @@ fn wrap_value_expr(
                 "f64" => return Ok(quote! { ::pyre_object::w_float_new(#value) }),
                 "bool" => return Ok(quote! { ::pyre_object::w_bool_from(#value) }),
                 "String" => return Ok(quote! { ::pyre_object::w_str_new(&#value) }),
+                // A method whose text may hold a lone surrogate — a `__repr__`
+                // naming a filename, say — returns the WTF-8 buffer itself
+                // rather than a `String` it cannot spell.
+                "Wtf8Buf" => return Ok(quote! { ::pyre_object::w_str_from_wtf8(#value) }),
                 _ => {}
             }
             // `Vec<T>` — bytes / list-of-X.
@@ -1896,9 +1897,15 @@ fn expand_pyre_methods(
         let mut param_names = Vec::<String>::new();
         let mut param_required = Vec::<bool>::new();
         let mut param_positional = Vec::<bool>::new();
+        // `SignatureBuilder` statements mirroring `#[pyre_function]`
+        // (see `expand_pyre_function`): each parameter appends its name, a
+        // `#[kwonly]` param emits `marker_kwonly()` at the tail's start, and a
+        // `#[kwargs]` param records the `**kwargs` name instead of appending.
+        let mut sig_stmts = Vec::<proc_macro2::TokenStream>::new();
         let mut has_varargs = false;
         let mut kwonly_tail = false;
         let mut kwonly_start = None;
+        let mut kwonly_marked = false;
         for (offset, arg) in inputs.enumerate() {
             let FnArg::Typed(pt) = arg else {
                 return Err(syn::Error::new(
@@ -1919,7 +1926,22 @@ fn expand_pyre_methods(
                     kwonly_start = Some(offset);
                 }
             }
-            param_names.push(param_name(offset, pt));
+            let pname = param_name(offset, pt);
+            // A bare `&[PyObjectRef]` (raw whole-args passthrough) suppresses
+            // the signature entirely (`method_sig_body` below), so it
+            // contributes no builder statement.
+            if !is_varargs_param(&pt.ty) {
+                if is_kwargs {
+                    sig_stmts.push(quote! { __b.kwargname = ::std::option::Option::Some(#pname); });
+                } else {
+                    if is_kwonly && !kwonly_marked {
+                        sig_stmts.push(quote! { __b.marker_kwonly(); });
+                        kwonly_marked = true;
+                    }
+                    sig_stmts.push(quote! { __b.append(#pname); });
+                }
+            }
+            param_names.push(pname);
             // Optional iff it has a `#[default(...)]` or is `Option<T>`.
             param_required.push(arg_default(pt)?.is_none() && option_inner(&pt.ty).is_none());
             param_positional.push(!kwonly_tail && !is_kwargs);
@@ -1967,45 +1989,16 @@ fn expand_pyre_methods(
                     let __pyre_positional_count = args.len();
                 }
             } else {
-                let mut all_names: Vec<String> = Vec::new();
-                let mut all_required: Vec<bool> = Vec::new();
-                if matches!(kind, MethodKind::Instance) {
-                    all_names.push("self".to_string());
-                    all_required.push(true);
-                }
-                all_names.extend(param_names.iter().cloned());
-                all_required.extend(param_required.iter().copied());
-                let name_lits = all_names.iter().map(|n| quote! { #n });
-                let req_lits = all_required.iter().map(|b| quote! { #b });
-                let fn_name_str = mname.to_string();
                 quote! {
-                    let __pyre_has_kwargs = crate::builtins::has_builtin_kwargs(args);
-                    // `bind_kwargs_to_signature` pads `args` out to the
-                    // full parameter count with PY_NULL, so keyword-only
-                    // slots and absent optionals would otherwise be counted
-                    // as positional.  PY_NULL is never a real argument, so
-                    // the leading non-null run is the true positional count
-                    // on both the bound and the raw path.
-                    let __pyre_positional_count = crate::builtins::split_builtin_kwargs(args)
-                        .0
-                        .iter()
-                        .take_while(|slot| !slot.is_null())
-                        .count();
-                    const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
-                    const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
-                    let __pyre_bound_args;
-                    let args: &[::pyre_object::PyObjectRef] =
-                        if __pyre_has_kwargs {
-                            __pyre_bound_args = crate::builtins::bind_builtin_kwargs(
-                                args,
-                                __PYRE_PARAM_NAMES,
-                                __PYRE_PARAM_REQUIRED,
-                                #fn_name_str,
-                            )?;
-                            &__pyre_bound_args
-                        } else {
-                            args
-                        };
+                    // Every `#[pyre_methods]` shim registers with a
+                    // `Signature` (see `method_sig` below), so the call path
+                    // (`call::bind_kwargs_to_signature`) has already resolved
+                    // keywords into positional PY_NULL-padded slots before the
+                    // wrapper runs — there is no trailing `__pyre_kw__` marker
+                    // dict to peel.  PY_NULL is never a real argument, so the
+                    // leading non-null run is the true positional count on both
+                    // the keyword-bound and the raw positional path.
+                    let __pyre_positional_count = crate::builtins::leading_non_null_count(args);
                 }
             }
         };
@@ -2177,39 +2170,41 @@ fn expand_pyre_methods(
                     func: #wrapper_name,
                 };
         });
+        // The argument `Signature` this method binds keywords against.  An
+        // instance method prepends `self` as a positional-only slot (filled by
+        // the receiver, never by keyword), mirroring interp2app's `self`
+        // handling (`UnwrapSpec_Check.visit__W_Root`, gateway.py:227-236); a
+        // raw whole-args slice has no by-name binding and carries `None`.
+        // `#[staticmethod]` / `#[classmethod]` name every slot (including
+        // `cls`) as a typed parameter, so they append no synthetic receiver.
+        let sig_receiver = if matches!(kind, MethodKind::Instance) {
+            quote! {
+                __b.append("self");
+                __b.marker_posonly();
+            }
+        } else {
+            quote! {}
+        };
+        let method_sig_body = if has_varargs {
+            quote! { ::std::option::Option::None }
+        } else {
+            quote! {
+                let mut __b = crate::SignatureBuilder::default();
+                #sig_receiver
+                #(#sig_stmts)*
+                ::std::option::Option::Some(__b.signature())
+            }
+        };
+        let method_sig = quote! {{ #method_sig_body }};
+
         // gateway.py:1146-1211 `_generate_text_signature`: a regular
         // interp2app instance method whose arguments are all required and
         // non-variadic has a lossless generated signature. Defaults need
         // their Python repr, so those continue to require an explicit
         // declaration rather than guessing from Rust tokens.
-        let raw_fn = if let Some(kwonly_start) = kwonly_start {
-            let names = param_names.iter().map(|name| name.as_str());
-            let receiver = if matches!(kind, MethodKind::Instance) {
-                quote! {
-                    __b.append("self");
-                    __b.marker_posonly();
-                }
-            } else {
-                quote! {}
-            };
-            let before_kwonly = names.clone().take(kwonly_start);
-            let after_kwonly = names.skip(kwonly_start);
-            quote! {
-                crate::make_builtin_function_maybe_sig(
-                    #py_name,
-                    #wrapper_name,
-                    {
-                        let mut __b = crate::SignatureBuilder::default();
-                        #receiver
-                        #(__b.append(#before_kwonly);)*
-                        __b.marker_kwonly();
-                        #(__b.append(#after_kwonly);)*
-                        ::std::option::Option::Some(__b.signature())
-                    },
-                )
-            }
-        } else if matches!(kind, MethodKind::Instance)
+        let raw_fn = if matches!(kind, MethodKind::Instance)
             && !has_varargs
+            && kwonly_start.is_none()
             && param_required.iter().all(|required| *required)
         {
             let mut parts = vec!["$self".to_string()];
@@ -2217,22 +2212,21 @@ fn expand_pyre_methods(
             parts.push("/".to_string());
             let text_signature = format!("({})", parts.join(", "));
             quote! {
-                crate::gateway::make_builtin_function_with_text_signature(
+                crate::gateway::make_builtin_function_with_text_signature_and_sig(
                     #py_name,
                     #wrapper_name,
                     #text_signature,
+                    #method_sig,
                 )
             }
-        } else if is_new {
-            // A `tp_new` wrapper is `builtin_function_or_method`, the type
-            // `make_new_descr` hands to every by-hand `__new__`.  `inspect`
-            // decides whether a class has a user-defined `__new__` by testing
-            // for that type, so leaving this one a plain `function` routes the
-            // class down the bound-method path instead of reading its
-            // `__text_signature__`.
-            quote! { crate::gateway::make_builtin_function_as_builtin(#py_name, #wrapper_name) }
         } else {
-            quote! { crate::make_builtin_function(#py_name, #wrapper_name) }
+            quote! {
+                crate::make_builtin_function_maybe_sig(
+                    #py_name,
+                    #wrapper_name,
+                    #method_sig,
+                )
+            }
         };
         match &kind {
             MethodKind::Instance => {
@@ -2247,7 +2241,7 @@ fn expand_pyre_methods(
             MethodKind::Static if py_name == "__new__" => {
                 registrations.push(quote! {
                     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
-                        crate::typedef::make_new_descr(#wrapper_name)) };
+                        crate::typedef::make_new_descr_maybe_sig(#wrapper_name, #method_sig)) };
                 });
             }
             MethodKind::Static => {

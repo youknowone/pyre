@@ -1351,7 +1351,23 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 if let Some(py_pc) = portal_py_pc {
                     COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
                 }
-            } else if !crate::state::flush_locals_region_to_frame(ctx, expected) {
+            } else if crate::state::flush_locals_region_to_frame(ctx, expected) {
+                // The locals write landed but claimed no resume pc, so nothing
+                // will consume `COMMITTED_FRAME_ESCAPE_PC` and the walk-end
+                // block gated on it is skipped entirely -- including its own
+                // restore.  Arm the deferred one here, or the undo stays armed
+                // for a leg that never runs and the frame keeps the EXECUTING
+                // pc `LiveLastInstrGuard` published (it declines to restore
+                // while a capture is live) over an operand stack no flush ever
+                // wrote.  The legacy replay then re-enters one opcode late on
+                // an empty stack: `value-stack underflow`.
+                //
+                // Where the walk goes on to adopt a blackhole image the
+                // deferred restore is skipped by its own guard and this only
+                // consumes the request: the adoption claims the flushed frame,
+                // and rolling it back underneath would be the opposite defect.
+                mark_escape_flush_undo_pending();
+            } else {
                 // All-or-nothing decline: nothing was written, nothing to undo.
                 discard_escape_flush_undo();
             }

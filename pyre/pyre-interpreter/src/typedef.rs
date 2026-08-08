@@ -1543,7 +1543,16 @@ pub fn init_typeobjects() {
             .get()
             .map(|v| *v as PyObjectRef)
             .unwrap_or(PY_NULL);
-        for &w_typeobject_addr in reg.values() {
+        // `new_builtin_typeobject` stamps every type built once this loop has
+        // published `type`. The ones built before that read `PY_NULL` there
+        // and are filled here: the registry's own entries, plus
+        // `getset_descriptor`, whose factory the loop uses to build the other
+        // typedefs' descriptors and which therefore never enters `reg`.
+        for w_typeobject_addr in reg
+            .values()
+            .copied()
+            .chain(GETSET_DESCRIPTOR_TYPE.get().copied())
+        {
             let w_typeobj = w_typeobject_addr as PyObjectRef;
             unsafe {
                 if (*w_typeobj).w_class.is_null() {
@@ -2072,8 +2081,16 @@ unsafe fn retag_classmethod_descriptors(type_obj: PyObjectRef) {
 /// it those carry no owner and report their errors under the bare method name,
 /// where the namespace entry for the same method reports `type.name`.
 ///
+/// `dont_look_inside`: reads the prebuilt `method_owner` table's per-type
+/// `static OWNER` — a field-bearing frozen instance carrying a `fn` pointer,
+/// which the annotator cannot model as a prebuilt constant.  Making this a
+/// residual-call boundary keeps the receiver-owner setup opaque to the JIT
+/// so a lifting caller (`getattr_str_impl`'s bound-method assembly) is not
+/// dragged into the unmodellable static read.
+///
 /// # Safety
 /// `func` must be a valid, live function object.
+#[majit_macros::dont_look_inside]
 pub(crate) unsafe fn stamp_builtin_owner(func: PyObjectRef, type_name: &str) {
     let Some(owner) = method_owner(type_name) else {
         return;
@@ -2219,6 +2236,30 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
     }
 }
 
+/// Build a builtin type object with its metatype stamped.
+///
+/// `baseobjspace.py getclass()` — a type object's class is its metatype, so
+/// every builtin type object carries `w_class = type`. The `TYPEOBJECT_CACHE`
+/// sweep stamps the types it registers, but the lazily built ones never enter
+/// that registry: `getset_descriptor` (built inside the init loop as a
+/// descriptor factory for the other typedefs), every exception class,
+/// `posix.DirEntry`, and the `py_class_typed!` / `#[pyre_class]` natives.
+/// Stamping at the single construction point covers all of them.
+///
+/// The roots built before the `type` typeobject is published read `PY_NULL`
+/// here; the sweep still fills them. A type whose metatype is not `type`
+/// (`_ctypes`' metaclasses) overwrites the slot after construction.
+fn new_builtin_typeobject(
+    name: &str,
+    bases: PyObjectRef,
+    dict_ptr: *mut u8,
+    layout_pytype: *const PyType,
+) -> PyObjectRef {
+    let type_obj = w_type_new_builtin(name, bases, dict_ptr, layout_pytype);
+    unsafe { (*type_obj).w_class = w_type() };
+    type_obj
+}
+
 /// Create the root `object` type. MRO = [object].
 fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
@@ -2235,7 +2276,7 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
         unsafe { stamp_method_owners(ns, owner) };
     }
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    let type_obj = w_type_new_builtin(
+    let type_obj = new_builtin_typeobject(
         name,
         PY_NULL,
         ns as *mut u8,
@@ -2307,7 +2348,7 @@ fn new_typeobject_with_base_and_layout(
     }
     let bases = w_tuple_new(vec![base]);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    let type_obj = w_type_new_builtin(name, bases, ns as *mut u8, layout_pytype);
+    let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype);
 
     // typeobject.py:1273-1280 setup_builtin_type:
     //   parent_layout = w_bestbase.layout
@@ -2398,7 +2439,7 @@ pub fn make_builtin_type_with_bases(
     init(ns);
     let bases_tuple = w_tuple_new(bases.to_vec());
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    let type_obj = w_type_new_builtin(name, bases_tuple, ns as *mut u8, layout_pytype);
+    let type_obj = new_builtin_typeobject(name, bases_tuple, ns as *mut u8, layout_pytype);
 
     unsafe {
         let parent_layout = pyre_object::w_type_get_layout_ptr(base);
@@ -2598,6 +2639,19 @@ pub(crate) fn make_new_descr_with_signature(
     crate::make_builtin_function_as_builtin_with_signature("__new__", func, signature)
 }
 
+/// [`make_new_descr`] optionally carrying a `Signature`: `Some` binds keyword
+/// arguments by name before the constructor runs; `None` (a variadic
+/// whole-args `__new__`) keeps the positional-only carrier.
+pub(crate) fn make_new_descr_maybe_sig(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    signature: Option<crate::gateway::Signature>,
+) -> PyObjectRef {
+    match signature {
+        Some(signature) => make_new_descr_with_signature(func, signature),
+        None => make_new_descr(func),
+    }
+}
+
 /// `typeobject.c tp_new_wrapper` — `__new__` takes the class to instantiate
 /// as its first argument, so a call without one is rejected before the body
 /// reads the value positionals behind it.
@@ -2734,7 +2788,9 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// precedence shared by CPython 3.14.
 fn module_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
-    Ok(pyre_object::w_str_new_managed(&module_repr_string(module)?))
+    Ok(pyre_object::w_str_from_wtf8_managed(module_repr_string(
+        module,
+    )?))
 }
 
 fn module_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
@@ -2746,13 +2802,14 @@ fn module_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::Py
     Ok(obj)
 }
 
-pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<String, crate::PyError> {
+pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+    use crate::display::wtf8_format;
     let importlib = crate::importing::get_sys_module("_frozen_importlib")
         .or_else(|| crate::importing::get_sys_module("importlib._bootstrap"));
     if let Some(importlib) = importlib {
         let repr_fn = crate::baseobjspace::getattr_str(importlib, "_module_repr")?;
         let result = crate::call::call_function_impl_result(repr_fn, &[module])?;
-        return Ok(crate::baseobjspace::text_w(result)?.to_string());
+        return Ok(crate::baseobjspace::text_wtf8_w(result)?.to_wtf8_buf());
     }
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let loader = crate::baseobjspace::finditem_str(w_dict, "__loader__")?;
@@ -2768,48 +2825,45 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<String, crate::P
             let origin = crate::baseobjspace::getattr_str(spec, "origin")?;
             if unsafe { pyre_object::is_none(origin) } {
                 let spec_loader = crate::baseobjspace::getattr_str(spec, "loader")?;
+                let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
                 if unsafe { pyre_object::is_none(spec_loader) } {
-                    return Ok(format!("<module {}>", unsafe {
-                        crate::display::py_repr(name)?
-                    }));
+                    return Ok(wtf8_format!("<module ", name_repr, ">"));
                 }
-                return Ok(format!(
-                    "<module {} ({})>",
-                    unsafe { crate::display::py_repr(name)? },
-                    unsafe { crate::display::py_repr(spec_loader)? }
-                ));
+                let loader_repr = unsafe { crate::display::py_repr_wtf8(spec_loader)? };
+                return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
             }
+            let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
             let has_location = crate::baseobjspace::getattr_str(spec, "has_location")?;
             if crate::baseobjspace::is_true(has_location)? {
-                return Ok(format!(
-                    "<module {} from {}>",
-                    unsafe { crate::display::py_repr(name)? },
-                    unsafe { crate::display::py_repr(origin)? }
+                let origin_repr = unsafe { crate::display::py_repr_wtf8(origin)? };
+                return Ok(wtf8_format!(
+                    "<module ",
+                    name_repr,
+                    " from ",
+                    origin_repr,
+                    ">"
                 ));
             }
-            return Ok(format!(
-                "<module {} ({})>",
-                unsafe { crate::display::py_repr(name)? },
-                unsafe { crate::display::py_str(origin)? }
-            ));
+            let origin_str = unsafe { crate::display::py_str_wtf8(origin)? };
+            return Ok(wtf8_format!("<module ", name_repr, " (", origin_str, ")>"));
         }
     }
     let name = crate::baseobjspace::finditem_str(w_dict, "__name__")?
         .unwrap_or_else(|| pyre_object::w_str_new("?"));
-    let name_repr = unsafe { crate::display::py_repr(name)? };
+    let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
     if let Some(filename) = crate::baseobjspace::finditem_str(w_dict, "__file__")? {
-        return Ok(format!("<module {name_repr} from {}>", unsafe {
-            crate::display::py_repr(filename)?
-        }));
+        let file_repr = unsafe { crate::display::py_repr_wtf8(filename)? };
+        return Ok(wtf8_format!(
+            "<module ", name_repr, " from ", file_repr, ">"
+        ));
     }
     if let Some(loader) = loader {
         if !loader.is_null() && !unsafe { pyre_object::is_none(loader) } {
-            return Ok(format!("<module {name_repr} ({})>", unsafe {
-                crate::display::py_repr(loader)?
-            }));
+            let loader_repr = unsafe { crate::display::py_repr_wtf8(loader)? };
+            return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
         }
     }
-    Ok(format!("<module {name_repr}>"))
+    Ok(wtf8_format!("<module ", name_repr, ">"))
 }
 
 /// module.py:130-160 `Module.descr_getattribute`. The object-space module
@@ -2842,9 +2896,9 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 crate::baseobjspace::isinstance_w(w_dict, dict_type.as_ptr())
             }))
     {
-        return Err(crate::PyError::type_error(format!(
-            "{}.__dict__ is not a dictionary",
-            unsafe { crate::display::py_repr(module)? }
+        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            unsafe { crate::display::py_repr_wtf8(module)? },
+            ".__dict__ is not a dictionary"
         )));
     }
     if let Some(w_dir) = crate::baseobjspace::finditem_str(w_dict, "__dir__")? {
@@ -7471,11 +7525,6 @@ fn init_frame_type(ns: PyObjectRef) {
                     let f = frame_ptr(args[0]);
                     if !f.is_null() {
                         unsafe { &mut *f }.descr_clear()?;
-                        let ec = crate::call::getexecutioncontext()
-                            as *mut crate::executioncontext::ExecutionContext;
-                        if !ec.is_null() {
-                            unsafe { (*ec).finalize_explicitly_cleared_frame_references() };
-                        }
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -7968,9 +8017,9 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     return Ok(pyre_object::w_str_new(""));
                 }
                 unsafe {
-                    Ok(pyre_object::w_str_new_managed(&crate::display::py_str(
-                        args[0],
-                    )?))
+                    Ok(pyre_object::w_str_from_wtf8_managed(
+                        crate::display::py_str_wtf8(args[0])?,
+                    ))
                 }
             }),
         )
@@ -9075,9 +9124,10 @@ fn union_mro_entries_method(args: &[PyObjectRef]) -> crate::PyResult {
             "descriptor '__mro_entries__' requires a 'types.UnionType' object",
         ));
     }
-    let rendered = unsafe { crate::display::py_repr(self_)? };
-    Err(crate::PyError::type_error(format!(
-        "Cannot subclass {rendered}"
+    let rendered = unsafe { crate::display::py_repr_wtf8(self_)? };
+    Err(crate::PyError::type_error(crate::display::wtf8_format!(
+        "Cannot subclass ",
+        rendered
     )))
 }
 
@@ -9334,12 +9384,13 @@ fn init_union_type(ns: PyObjectRef) {
                 |args| {
                     let self_ = args.first().copied().unwrap_or(PY_NULL);
                     let rendered = if self_.is_null() {
-                        "typing.Union".to_string()
+                        Wtf8Buf::from_string("typing.Union".to_string())
                     } else {
-                        unsafe { crate::py_repr(self_) }?
+                        unsafe { crate::display::py_repr_wtf8(self_) }?
                     };
-                    Err(crate::PyError::type_error(format!(
-                        "Cannot subclass {rendered}"
+                    Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                        "Cannot subclass ",
+                        rendered
                     )))
                 },
                 2,
@@ -12655,10 +12706,12 @@ fn init_function_type(ns: PyObjectRef) {
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         "__repr__",
                     )?;
-                    let qualname = unsafe { crate::function::function_get_qualname(function) };
-                    Ok(pyre_object::w_str_new(&format!(
-                        "<function {qualname} at {function:p}>"
-                    )))
+                    // `format!` renders the WTF-8 qualname through `Display`,
+                    // which substitutes U+FFFD for a lone surrogate.
+                    let mut repr = Wtf8Buf::from_string("<function ".to_string());
+                    repr.push_wtf8(&unsafe { crate::function::function_get_qualname(function) });
+                    repr.push_str(&format!(" at {function:p}>"));
+                    Ok(pyre_object::w_str_from_wtf8(repr))
                 },
                 1,
             ),
@@ -12916,23 +12969,29 @@ fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
         // (`stamp_method_owners`), which is also what `bool.from_bytes`
         // reporting `int.from_bytes` requires.
         if unsafe { pyre_object::is_type(instance) } {
-            return Ok(pyre_object::w_str_new(&unsafe {
+            return Ok(pyre_object::w_str_from_wtf8(unsafe {
                 crate::function::function_get_qualname(descr)
             }));
         }
         let actual_type =
             crate::typedef::r#type(instance).map_or(pyre_object::PY_NULL, |tp| tp.as_ptr());
         let type_qualname = crate::baseobjspace::getattr_str(actual_type, "__qualname__")?;
-        let Some(type_qualname) = (unsafe { pyre_object::w_str_get_value_opt(type_qualname) })
-        else {
+        if !unsafe { pyre_object::is_str(type_qualname) } {
             return Err(crate::PyError::type_error(
                 "<method>.__class__.__qualname__ is not a unicode object",
             ));
-        };
+        }
+        // A class named through `type()` may carry a lone surrogate in its
+        // qualname, which is a `str` the read has to keep rather than reject.
+        let type_qualname = unsafe { pyre_object::w_str_get_wtf8(type_qualname) };
         let name = unsafe { crate::function::function_get_name(descr) };
-        Ok(pyre_object::w_str_new(&format!("{type_qualname}.{name}")))
+        Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
+            type_qualname,
+            ".",
+            name,
+        )))
     } else {
-        Ok(pyre_object::w_str_new(&unsafe {
+        Ok(pyre_object::w_str_from_wtf8(unsafe {
             crate::function::function_get_qualname(obj)
         }))
     }
@@ -15298,11 +15357,15 @@ fn staticmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let sm = staticmethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
     let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
     let repr = if function.is_null() {
-        "<NULL>".to_string()
+        Wtf8Buf::from_string("<NULL>".to_string())
     } else {
-        unsafe { crate::display::py_repr(function)? }
+        unsafe { crate::display::py_repr_wtf8(function)? }
     };
-    Ok(w_str_new_managed(&format!("<staticmethod({repr})>")))
+    Ok(w_str_from_wtf8_managed(crate::display::wtf8_format!(
+        "<staticmethod(",
+        repr,
+        ")>"
+    )))
 }
 
 /// function.py:708-709 `StaticMethod.descr_reduce_ex`.
@@ -15575,11 +15638,15 @@ fn classmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let cm = classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
     let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
     let repr = if function.is_null() {
-        "<NULL>".to_string()
+        Wtf8Buf::from_string("<NULL>".to_string())
     } else {
-        unsafe { crate::display::py_repr(function)? }
+        unsafe { crate::display::py_repr_wtf8(function)? }
     };
-    Ok(w_str_new_managed(&format!("<classmethod({repr})>")))
+    Ok(w_str_from_wtf8_managed(crate::display::wtf8_format!(
+        "<classmethod(",
+        repr,
+        ")>"
+    )))
 }
 
 /// function.py:763-764 `ClassMethod.descr_reduce_ex`.
@@ -18553,12 +18620,14 @@ fn init_object_type(ns: PyObjectRef) {
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__init__", object_init)
     };
-    // PyPy: objectobject.py — default comparison/hash/repr for all objects
+    // objectobject.py:187-189 hard-codes explicit text signatures for object
+    // descriptors whose generated spelling would otherwise follow RPython
+    // parameter names.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__eq__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__eq__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
@@ -18571,6 +18640,7 @@ fn init_object_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "($self, value, /)",
             ),
         )
     };
@@ -18582,7 +18652,7 @@ fn init_object_type(ns: PyObjectRef) {
             // negates the (virtually dispatched) `__eq__` result, so a
             // subclass that overrides only `__eq__` still gets a consistent
             // `!=`.  `__eq__` itself falls back to identity here.
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__ne__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
@@ -18613,6 +18683,7 @@ fn init_object_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)?))
                 },
                 2,
+                "($self, value, /)",
             ),
         )
     };
@@ -18624,13 +18695,14 @@ fn init_object_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
                     name,
                     |args| {
                         crate::type_methods::arity_slot(args, 1)?;
                         Ok(pyre_object::w_not_implemented())
                     },
                     2,
+                    "($self, value, /)",
                 ),
             )
         };
@@ -18639,7 +18711,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__hash__",
                 |args| {
                     // The fixed arity above is only a fast-dispatch hint; the
@@ -18659,6 +18731,7 @@ fn init_object_type(ns: PyObjectRef) {
                     Ok(default_identity_hash(pyre_object::PY_NULL, args[0]))
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18666,8 +18739,8 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            // PyPy: objectobject.py descr___repr__ — base __repr__ for all objects
-            make_builtin_function_with_arity(
+            // objectobject.py:184 descr___repr__ — base __repr__ for all objects
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__repr__",
                 |args| {
                     if args.is_empty() {
@@ -18693,6 +18766,7 @@ fn init_object_type(ns: PyObjectRef) {
                     )))
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18700,7 +18774,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__str__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__str__",
                 |args| {
                     if args.is_empty() {
@@ -18716,15 +18790,16 @@ fn init_object_type(ns: PyObjectRef) {
                     }))
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
-    // PyPy: objectobject.py descr___format__
+    // objectobject.py:435-436 descr___format__
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__format__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__format__",
                 |args| {
                     if args.is_empty() {
@@ -18745,11 +18820,12 @@ fn init_object_type(ns: PyObjectRef) {
                             crate::type_methods::arg_type_name(args[0])
                         )));
                     }
-                    Ok(pyre_object::w_str_new_managed(&unsafe {
-                        crate::py_str(args[0])?
+                    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+                        crate::display::py_str_wtf8(args[0])?
                     }))
                 },
                 2,
+                "($self, format_spec, /)",
             ),
         )
     };
@@ -18758,7 +18834,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__reduce__",
                 |args| {
                     if args.is_empty() {
@@ -18770,6 +18846,7 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::reduce_protocol::descr_reduce(args[0])
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18777,7 +18854,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce_ex__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__reduce_ex__",
                 |args| {
                     if args.is_empty() {
@@ -18790,6 +18867,7 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::reduce_protocol::descr_reduce_ex(args[0], proto)
                 },
                 2,
+                "($self, protocol, /)",
             ),
         )
     };
@@ -18797,7 +18875,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getstate__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__getstate__",
                 |args| {
                     if args.is_empty() {
@@ -18809,6 +18887,7 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::reduce_protocol::object_getstate_default(args[0])
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18816,7 +18895,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__dir__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__dir__",
                 |args| {
                     if args.is_empty() {
@@ -18828,6 +18907,7 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::builtins::object_dir_default(args[0])
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
@@ -18835,7 +18915,7 @@ fn init_object_type(ns: PyObjectRef) {
     // keywords; class-definition keywords reaching it via the builtin
     // kwargs ABI are an error, not silently dropped.
     unsafe {
-        let init_subclass = pyre_object::function::w_classmethod_new(make_builtin_function(
+        let init_subclass_func = crate::gateway::make_builtin_function_with_text_signature(
             "__init_subclass__",
             |args| {
                 let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -18854,7 +18934,9 @@ fn init_object_type(ns: PyObjectRef) {
                 }
                 Ok(pyre_object::w_none())
             },
-        ));
+            "($type, /)",
+        );
+        let init_subclass = pyre_object::function::w_classmethod_new(init_subclass_func);
         // Read the wrapped callable back out of the classmethod: allocating it
         // can move the function, and the qualname lookup compares addresses.
         crate::function::register_object_class_method(
@@ -18871,10 +18953,12 @@ fn init_object_type(ns: PyObjectRef) {
         // objectobject.py:413 `interp2app(descr___subclasshook__,
         // as_classmethod=True)` — the hook receives the class it is
         // consulted for, so a read off any type binds to that type.
-        let subclasshook = pyre_object::function::w_classmethod_new(make_builtin_function(
+        let subclasshook_func = crate::gateway::make_builtin_function_with_text_signature(
             "__subclasshook__",
             |_| Ok(pyre_object::w_not_implemented()),
-        ));
+            "($type, object, /)",
+        );
+        let subclasshook = pyre_object::function::w_classmethod_new(subclasshook_func);
         crate::function::register_object_class_method(
             "__subclasshook__",
             pyre_object::function::w_classmethod_get_func(subclasshook),
@@ -18885,13 +18969,13 @@ fn init_object_type(ns: PyObjectRef) {
             subclasshook,
         )
     };
-    // PyPy: objectobject.py descr___setattr__
+    // objectobject.py:420-421 descr___setattr__
     // object.__setattr__(self, name, value) → setattr dispatch
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__setattr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__setattr__",
                 |args| {
                     if args.len() < 3 {
@@ -18926,15 +19010,16 @@ fn init_object_type(ns: PyObjectRef) {
                     }
                 },
                 3,
+                "($self, name, value, /)",
             ),
         )
     };
-    // PyPy: objectobject.py descr___delattr__
+    // objectobject.py:422-423 descr___delattr__
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__delattr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__delattr__",
                 |args| {
                     if args.len() < 2 {
@@ -18960,15 +19045,16 @@ fn init_object_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "($self, name, /)",
             ),
         )
     };
-    // PyPy: objectobject.py descr___getattribute__
+    // objectobject.py:416-417 descr___getattribute__
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getattribute__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__getattribute__",
                 |args| {
                     if args.len() < 2 {
@@ -18990,6 +19076,7 @@ fn init_object_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "($self, name, /)",
             ),
         )
     };
@@ -19090,7 +19177,7 @@ fn bytearray_descr_init_value(
     // pos[0] is the class; `bytearray(source, encoding, errors)` accepts at
     // most three further positional arguments.
     if pos.len() > 4 {
-        return Err(crate::PyError::type_error(&format!(
+        return Err(crate::PyError::type_error(format!(
             "bytearray() takes at most 3 arguments ({} given)",
             pos.len() - 1
         )));
@@ -21633,6 +21720,30 @@ fn unicode_encode_error_msg(
     }
 }
 
+/// `str.encode('utf-8')` under the default error handler, for a consumer that
+/// can only hold a Rust `str` — the compiler's source text, the tokenizer's
+/// input line.
+///
+/// `pyparse.py:9-15 recode_to_utf8` takes this same encode, and it is strict:
+/// a lone surrogate has no UTF-8 spelling, so the text is reported rather than
+/// silently rewritten with U+FFFD.
+pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
+    if let Ok(s) = text.as_str() {
+        return Ok(s.to_owned());
+    }
+    let position = text
+        .code_points()
+        .position(|c| c.to_char().is_none())
+        .unwrap_or(0);
+    Err(unicode_encode_error(
+        "utf-8",
+        pyre_object::w_str_from_wtf8(text),
+        position,
+        position + 1,
+        "surrogates not allowed",
+    ))
+}
+
 /// unicodehelper.py encode_error_handler — raises a structured
 /// UnicodeEncodeError, mirroring `OperationError(space.w_UnicodeEncodeError,
 /// space.newtuple([encoding, w_obj, start, end, msg]))`.  Populates the
@@ -22291,7 +22402,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // pos[0] is the class; `bytes(source, encoding, errors)` accepts at most
     // three further positional arguments.
     if pos.len() > 4 {
-        return Err(crate::PyError::type_error(&format!(
+        return Err(crate::PyError::type_error(format!(
             "bytes() takes at most 3 arguments ({} given)",
             pos.len() - 1
         )));
@@ -26414,14 +26525,14 @@ fn count_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let cls_name = full_name.rsplit('.').next().unwrap_or(full_name);
     let w_c = unsafe { pyre_object::interp_itertools::w_count_get_c(obj) };
     let w_step = unsafe { pyre_object::interp_itertools::w_count_get_step(obj) };
-    let c = unsafe { crate::display::py_repr(w_c)? };
+    let c = unsafe { crate::display::py_repr_wtf8(w_c)? };
     let text = if count_single_argument(w_step)? {
-        format!("{cls_name}({c})")
+        crate::display::wtf8_format!(cls_name, "(", c, ")")
     } else {
-        let step = unsafe { crate::display::py_repr(w_step)? };
-        format!("{cls_name}({c}, {step})")
+        let step = unsafe { crate::display::py_repr_wtf8(w_step)? };
+        crate::display::wtf8_format!(cls_name, "(", c, ", ", step, ")")
     };
-    Ok(w_str_new(&text))
+    Ok(w_str_from_wtf8(text))
 }
 
 fn init_count_type(ns: PyObjectRef) {
@@ -26490,14 +26601,14 @@ fn repeat_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let full_name = unsafe { pyre_object::w_type_get_name(cls) };
     let cls_name = full_name.rsplit('.').next().unwrap_or(full_name);
     let w_obj = unsafe { pyre_object::interp_itertools::w_repeat_get_obj(obj) };
-    let objrepr = unsafe { crate::display::py_repr(w_obj)? };
+    let objrepr = unsafe { crate::display::py_repr_wtf8(w_obj)? };
     let text = if unsafe { pyre_object::interp_itertools::w_repeat_get_counting(obj) } {
         let count = unsafe { pyre_object::interp_itertools::w_repeat_get_count(obj) };
-        format!("{cls_name}({objrepr}, {count})")
+        crate::display::wtf8_format!(cls_name, "(", objrepr, format!(", {count})"))
     } else {
-        format!("{cls_name}({objrepr})")
+        crate::display::wtf8_format!(cls_name, "(", objrepr, ")")
     };
-    Ok(w_str_new(&text))
+    Ok(w_str_from_wtf8(text))
 }
 
 fn init_repeat_type(ns: PyObjectRef) {
@@ -28651,6 +28762,6 @@ mod tests {
         assert!(repr.contains(": int object at 0x"));
         let err = crate::builtins::try_hash_value(one).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert_eq!(err.message, "unhashable type: 'cell'");
+        assert_eq!(err.message_text(), "unhashable type: 'cell'");
     }
 }

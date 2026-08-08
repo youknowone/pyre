@@ -63,8 +63,8 @@ pub fn register_pkg(ns: pyre_object::PyObjectRef) {
     // because the full-name builtin check precedes the __path__ disk search.
     #[cfg(feature = "host_env")]
     let path_items = match crate::importing::detect_stdlib_path() {
-        Some(dir) => vec![pyre_object::w_str_new(
-            &dir.join("importlib").to_string_lossy(),
+        Some(dir) => vec![crate::gateway::fsdecode_os_str(
+            dir.join("importlib").as_os_str(),
         )],
         None => vec![],
     };

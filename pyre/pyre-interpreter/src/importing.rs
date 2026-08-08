@@ -413,7 +413,7 @@ static SYS_PATH: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec
 /// `sys.path` mutations.  PyPy records this on interpreter/import state, not
 /// on an OS thread: import shadowing decisions made by free-threaded workers
 /// must observe the startup path captured by the launcher.
-static SYS_PATH_0: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static SYS_PATH_0: LazyLock<Mutex<Option<Wtf8Buf>>> = LazyLock::new(|| Mutex::new(None));
 /// The literal `sys.path[0]` entry staged by `init_sys_path` and prepended
 /// by `add_sys_path_0` once `site` has run (`pymain_sys_path_add_path0`):
 /// `""` for `-c` / stdin / the REPL, the cwd for `-m`, the script's
@@ -421,7 +421,8 @@ static SYS_PATH_0: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new
 /// the `-i` REPL-after-script path does not prepend it twice.  Process-global
 /// for the same reason as `SYS_PATH_0`: the launcher stages it and whichever
 /// thread runs the insert must observe that staging.
-static SYS_PATH_0_PENDING: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static SYS_PATH_0_PENDING: LazyLock<Mutex<Option<std::ffi::OsString>>> =
+    LazyLock::new(|| Mutex::new(None));
 pub(crate) static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinModuleDef>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1030,10 +1031,9 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     Some(module)
 }
 
-/// The builtin-module half of `load_part`: build the module, bind it in
-/// `sys.modules`, then run its `startup` hook. `_imp.create_builtin` performs
-/// the same three steps a native `import` does, so the two entry points leave
-/// a builtin module in the same state.
+/// Build a builtin module for `_imp.create_builtin`, then run its `startup`
+/// hook. App-level `module_from_spec` stamps import metadata afterwards
+/// (`_bootstrap.py:822`), so this entry point must not pre-fill it.
 pub(crate) fn create_builtin_module(
     name: &str,
     execution_context: *const PyExecutionContext,
@@ -1044,11 +1044,11 @@ pub(crate) fn create_builtin_module(
     // exception hierarchy, and overwrote the name→class registry. The
     // process-global get-or-mint registry now prevents that identity
     // clobbering even on another fresh-dictionary path, while this guard still
-    // preserves the builtins Module identity. `load_part` routes the name this
-    // way; the `_imp.create_builtin` entry point must too.
+    // preserves the builtins Module identity.
     if name == "builtins" && !execution_context.is_null() {
         let module = unsafe { (*execution_context).get_builtin() };
         set_sys_module(name, module);
+        seed_create_builtin_attrs(module);
         return Ok(Some(module));
     }
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1059,8 +1059,17 @@ pub(crate) fn create_builtin_module(
     pyre_object::gc_roots::pin_root(module);
     set_sys_module(name, pyre_object::gc_roots::shadow_stack_get(module_slot));
     let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
-    startup_builtin_module(name, module, execution_context)?;
+    startup_builtin_module_impl(name, module, execution_context, false)?;
+    seed_create_builtin_attrs(pyre_object::gc_roots::shadow_stack_get(module_slot));
     Ok(Some(pyre_object::gc_roots::shadow_stack_get(module_slot)))
+}
+
+fn seed_create_builtin_attrs(module: PyObjectRef) {
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    if !w_dict.is_null() {
+        crate::module_ns_store(w_dict, "__loader__", pyre_object::w_none());
+        crate::module_ns_store(w_dict, "__spec__", pyre_object::w_none());
+    }
 }
 
 /// Set a builtin module's `__spec__`/`__loader__`/`__package__` from the
@@ -1145,7 +1154,7 @@ fn set_builtin_module_spec(_name: &str, _module: PyObjectRef) -> Result<(), crat
 #[cfg(feature = "host_env")]
 fn fix_up_source_module_spec(
     ns: PyObjectRef,
-    pathname: &str,
+    pathname: &rustpython_wtf8::Wtf8,
     cpathname: Option<&str>,
 ) -> Result<bool, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
@@ -1164,7 +1173,7 @@ fn fix_up_source_module_spec(
     pin_root(w_name);
     let ext_slot = shadow_stack_len();
     pin_root(ext);
-    let w_path = pyre_object::w_str_new(pathname);
+    let w_path = pyre_object::w_str_from_wtf8(pathname.to_wtf8_buf());
     let path_slot = shadow_stack_len();
     pin_root(w_path);
     let w_cpath = match cpathname {
@@ -1203,7 +1212,7 @@ fn fix_up_source_module_spec(
 #[cfg(not(feature = "host_env"))]
 fn fix_up_source_module_spec(
     _ns: PyObjectRef,
-    _pathname: &str,
+    _pathname: &rustpython_wtf8::Wtf8,
     _cpathname: Option<&str>,
 ) -> Result<bool, crate::PyError> {
     Ok(false)
@@ -1213,6 +1222,15 @@ fn startup_builtin_module(
     name: &str,
     module: PyObjectRef,
     execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    startup_builtin_module_impl(name, module, execution_context, true)
+}
+
+fn startup_builtin_module_impl(
+    name: &str,
+    module: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+    stamp_spec: bool,
 ) -> Result<(), crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
@@ -1228,7 +1246,9 @@ fn startup_builtin_module(
     if let Some(startup) = startup {
         startup(shadow_stack_get(mod_slot), execution_context)?;
     }
-    set_builtin_module_spec(name, shadow_stack_get(mod_slot))?;
+    if stamp_spec {
+        set_builtin_module_spec(name, shadow_stack_get(mod_slot))?;
+    }
     Ok(())
 }
 
@@ -1241,23 +1261,20 @@ fn startup_builtin_module(
 /// shadowing check to compare against absolute module origins.  Under the
 /// sandbox the path is left as given (a virtual path the controller mediates);
 /// `canonicalize` would issue raw host syscalls past the seccomp lockdown.
-fn canonical_startup_dir(dir: &Path) -> String {
+fn canonical_startup_dir(dir: &Path) -> Wtf8Buf {
     #[cfg(not(feature = "sandbox"))]
     if let Ok(abs) = std::path::absolute(dir) {
-        return abs
-            .canonicalize()
-            .unwrap_or(abs)
-            .to_string_lossy()
-            .into_owned();
+        let abs = abs.canonicalize().unwrap_or(abs);
+        return crate::gateway::fsdecode_os_str_wtf8(abs.as_os_str());
     }
-    dir.to_string_lossy().into_owned()
+    crate::gateway::fsdecode_os_str_wtf8(dir.as_os_str())
 }
 
 /// `script_dir` is the shadowing-check anchor (`config->sys_path_0`'s
 /// directory); `path0` is the literal entry `add_sys_path_0` later prepends to
 /// `sys.path` — `""` for `-c` / stdin / the REPL, the cwd for `-m`, the
 /// script's directory for a script.
-pub fn init_sys_path(script_dir: &Path, path0: &str) {
+pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
     // Register builtin modules (PyPy: make_builtins / setup_builtin_modules)
     install_builtin_modules();
 
@@ -1271,7 +1288,7 @@ pub fn init_sys_path(script_dir: &Path, path0: &str) {
     // `site.removeduppaths()` never absolutizes the `-c` / REPL empty entry into
     // the cwd.  Stage the entry here; `add_sys_path_0` performs the insert.
     // `-P` (safe_path) suppresses it entirely.
-    *SYS_PATH_0_PENDING.lock().unwrap() = (!safe_path_flag()).then(|| path0.to_string());
+    *SYS_PATH_0_PENDING.lock().unwrap() = (!safe_path_flag()).then(|| path0.to_os_string());
 
     {
         let mut path = SYS_PATH.lock().unwrap();
@@ -1388,7 +1405,7 @@ pub(crate) fn detect_stdlib_path() -> Option<PathBuf> {
 pub fn add_sys_path(dir: &Path) {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let entry = dir.to_string_lossy();
+    let entry = crate::gateway::fsdecode_os_str_wtf8(dir.as_os_str());
     if get_sys_module("sys").is_none() {
         {
             let mut path = SYS_PATH.lock().unwrap();
@@ -1404,7 +1421,7 @@ pub fn add_sys_path(dir: &Path) {
     // path is allocation-free until the pinned entry reaches `w_list_append`.
     let _roots = push_roots();
     let slot = shadow_stack_len();
-    pin_root(pyre_object::w_str_new(entry.as_ref()));
+    pin_root(pyre_object::w_str_from_wtf8(entry.clone()));
     let Some(sys_mod) = get_sys_module("sys") else {
         return;
     };
@@ -1421,11 +1438,10 @@ pub fn add_sys_path(dir: &Path) {
     let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
     for i in 0..n {
         if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) } {
-            // A `sys.path` entry read back from the filesystem can hold a
-            // surrogate escape and so have no `&str` spelling; it simply is
-            // not equal to this ASCII startup entry.
+            // Both spellings can hold a surrogate escape, so the two are
+            // compared as the WTF-8 they are rather than through `&str`.
             if unsafe { pyre_object::is_str(item) }
-                && unsafe { pyre_object::w_str_get_value_opt(item) } == Some(entry.as_ref())
+                && unsafe { pyre_object::w_str_get_wtf8(item) }.as_bytes() == entry.as_bytes()
             {
                 return;
             }
@@ -1448,14 +1464,14 @@ pub fn add_sys_path_0() {
     // No `sys` yet (an embedder that never imports `site`): stage at the front
     // of the seed instead, which `create_sys_path_list` flushes in order.
     if get_sys_module("sys").is_none() {
-        SYS_PATH.lock().unwrap().insert(0, PathBuf::from(&entry));
+        SYS_PATH.lock().unwrap().insert(0, PathBuf::from(entry));
         return;
     }
     // Pin the new entry before any further allocation (`get_sys_module` and the
     // dict lookup allocate) can relocate it — `add_sys_path` parity.
     let _roots = push_roots();
     let slot = shadow_stack_len();
-    pin_root(pyre_object::w_str_new(&entry));
+    pin_root(crate::gateway::fsdecode_os_str(&entry));
     let Some(sys_mod) = get_sys_module("sys") else {
         return;
     };
@@ -2150,7 +2166,7 @@ pub(crate) fn create_sys_path_list() -> PyObjectRef {
         .lock()
         .unwrap()
         .iter()
-        .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
+        .map(|d| crate::gateway::fsdecode_os_str(d.as_os_str()))
         .collect();
     pyre_object::w_list_new(items)
 }
@@ -2223,7 +2239,7 @@ fn exec_code_module(
     w_code: PyObjectRef,
     w_globals: pyre_object::PyObjectRef,
     execution_context: *const PyExecutionContext,
-    pathname: Option<&str>,
+    pathname: Option<&rustpython_wtf8::Wtf8>,
     cpathname: Option<&str>,
 ) -> Result<PyObjectRef, crate::PyError> {
     // importing.py:272-274 — setdefault('__builtins__', space.builtin).
@@ -2246,7 +2262,7 @@ fn exec_code_module(
     // `write_paths=False` shape (REPL, builtin bootstrap).
     if let Some(p) = pathname {
         // importing.py:284 setitem('__file__', w_pathname).
-        let w_pathname = pyre_object::w_str_new(p);
+        let w_pathname = pyre_object::w_str_from_wtf8(p.to_wtf8_buf());
         unsafe {
             pyre_object::w_dict_setitem_str(w_globals, "__file__", w_pathname);
         }
@@ -2385,17 +2401,25 @@ fn load_source_module(
     package_dir: Option<&Path>,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // The name reaches the module as `__file__` and the code object as
+    // `co_filename`, so it is carried in the two spellings `pycode.py:431
+    // filename='fsencode'` keeps apart: the filesystem bytes it was named
+    // with, and the UTF-8 spelling the compiler's own `source_path` is limited
+    // to. `path_text` is the first, decoded, and is what application level
+    // sees.
+    let path_bytes = crate::gateway::fsencode_os_str(pathname.as_os_str());
+    let path_text = crate::gateway::fsdecode_filename_wtf8(&path_bytes);
     let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
-        crate::PyError::new(
-            crate::PyErrorKind::ImportError,
-            format!("cannot read '{}': {e}", pathname.display()),
-        )
+        let mut message = rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
+        message.push_wtf8(&path_text);
+        message.push_str(&format!("': {e}"));
+        crate::PyError::new(crate::PyErrorKind::ImportError, message)
     })?;
 
-    let pathname_str = pathname.to_string_lossy();
+    let (pathname_str, filename_bytes) = crate::pycode::split_code_filename_bytes(path_bytes, None);
     // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
     // bad declaration is the tokenizer's SyntaxError, not an ImportError.
-    let source = crate::compile::decode_source_bytes(&bytes, &pathname_str, false)?;
+    let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
 
     let _root = pyre_object::gc_roots::push_roots();
     // The two importlib bootstrap sources are imported by the native importer
@@ -2413,10 +2437,11 @@ fn load_source_module(
         Some(w_code) => (w_code, false),
         None => {
             let code = parse_source_module(&pathname_str, &source).map_err(|e| {
-                crate::PyError::new(
-                    crate::PyErrorKind::ImportError,
-                    format!("cannot compile '{}': {e}", pathname.display()),
-                )
+                let mut message =
+                    rustpython_wtf8::Wtf8Buf::from_string("cannot compile '".to_string());
+                message.push_wtf8(&path_text);
+                message.push_str(&format!("': {e}"));
+                crate::PyError::new(crate::PyErrorKind::ImportError, message)
             })?;
             (
                 crate::w_code_new(Box::into_raw(Box::new(code)) as *const ()),
@@ -2424,6 +2449,9 @@ fn load_source_module(
             )
         }
     };
+    // The whole unit was named by this path, so the nested constants still
+    // held unrealized take the same spelling when they are boxed.
+    unsafe { crate::pycode::set_compilation_unit_filename_bytes(w_code, filename_bytes) };
     // Root before any allocation (fresh_module_globals, the cache write) can
     // collect the freshly boxed code out from under us.
     pyre_object::gc_roots::pin_root(w_code);
@@ -2470,7 +2498,7 @@ fn load_source_module(
     // `exec_module`; setting it afterwards lets those imports fall through to
     // sys.path and pick up a same-leaf module from an unrelated package.
     if let Some(dir) = package_dir {
-        let path_str = pyre_object::w_str_new(&dir.to_string_lossy());
+        let path_str = crate::gateway::fsdecode_os_str(dir.as_os_str());
         unsafe {
             pyre_object::w_dict_setitem_str(
                 w_globals,
@@ -2512,13 +2540,7 @@ fn load_source_module(
     // On exec failure drop the pre-registered module from sys.modules
     // (`_bootstrap._load`) so a retried import re-runs the body instead of
     // observing a half-built module.
-    if let Err(e) = exec_code_module(
-        w_code,
-        w_globals,
-        execution_context,
-        Some(&pathname_str),
-        None,
-    ) {
+    if let Err(e) = exec_code_module(w_code, w_globals, execution_context, Some(&path_text), None) {
         remove_sys_module(modulename);
         return Err(e);
     }
@@ -2781,7 +2803,7 @@ fn load_namespace_package(
 
     let path_items: Vec<PyObjectRef> = dirs
         .iter()
-        .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
+        .map(|d| crate::gateway::fsdecode_os_str(d.as_os_str()))
         .collect();
     unsafe {
         pyre_object::w_dict_setitem_str(w_globals, "__path__", pyre_object::w_list_new(path_items));
@@ -3554,9 +3576,10 @@ fn relative_import_head(
     if let Some(w_found) = found {
         return Ok(w_found);
     }
-    let head_repr = unsafe { crate::display::py_repr(shadow_stack_get(head_slot)) }?;
-    Err(crate::PyError::key_error(format!(
-        "{head_repr} not in sys.modules as expected"
+    let head_repr = unsafe { crate::display::py_repr_wtf8(shadow_stack_get(head_slot)) }?;
+    Err(crate::PyError::key_error(crate::display::wtf8_format!(
+        head_repr,
+        " not in sys.modules as expected"
     )))
 }
 
@@ -3807,29 +3830,32 @@ pub(crate) fn spec_file_origin(w_spec: PyObjectRef) -> Result<Option<PyObjectRef
 /// be shadowing a same-named module later on the search path.  True when `-P`
 /// is off and the file's directory equals the startup `sys.path[0]`; a package
 /// `__init__.py` compares its parent directory instead.
-pub(crate) fn is_possibly_shadowing(origin: &str) -> bool {
+pub(crate) fn is_possibly_shadowing(origin: &rustpython_wtf8::Wtf8) -> bool {
     if safe_path_flag() {
         return false;
     }
     let Some(sys_path_0) = SYS_PATH_0.lock().unwrap().clone() else {
         return false;
     };
-    let sep = std::path::MAIN_SEPARATOR;
+    let sep = std::path::MAIN_SEPARATOR as u8;
+    // The separator and `__init__.py` are ASCII, and an ASCII byte never
+    // occurs inside a multi-byte WTF-8 sequence, so the scan runs on bytes
+    // while the name itself may hold a surrogate escape.
     // root = os.path.dirname(origin.removesuffix(os.sep + "__init__.py"))
-    let mut root = origin.to_string();
-    let Some(idx) = root.rfind(sep) else {
+    let mut root = origin.as_bytes();
+    let Some(idx) = root.iter().rposition(|&b| b == sep) else {
         return false;
     };
-    if root[idx + 1..] == *"__init__.py" {
-        root.truncate(idx);
-        let Some(idx2) = root.rfind(sep) else {
+    if &root[idx + 1..] == b"__init__.py" {
+        root = &root[..idx];
+        let Some(idx2) = root.iter().rposition(|&b| b == sep) else {
             return false;
         };
-        root.truncate(idx2);
+        root = &root[..idx2];
     } else {
-        root.truncate(idx);
+        root = &root[..idx];
     }
-    root == sys_path_0
+    root == sys_path_0.as_bytes()
 }
 
 /// The shadowing classification for a module: its spec file origin (a path
@@ -3840,9 +3866,11 @@ pub(crate) fn is_possibly_shadowing(origin: &str) -> bool {
 pub(crate) fn module_shadow_info(
     w_spec: PyObjectRef,
     w_name: PyObjectRef,
-) -> Result<(Option<String>, bool, bool), crate::PyError> {
+) -> Result<(Option<Wtf8Buf>, bool, bool), crate::PyError> {
     let origin = match spec_file_origin(w_spec)? {
-        Some(o) => unsafe { pyre_object::w_str_get_value(o) }.to_string(),
+        // A `spec.origin` is a filename, so it can hold the surrogate escape
+        // an undecodable path byte decodes to and has no `&str` spelling.
+        Some(o) => unsafe { pyre_object::w_str_get_wtf8(o) }.to_wtf8_buf(),
         None => return Ok((None, false, false)),
     };
     if !is_possibly_shadowing(&origin) {
@@ -3927,7 +3955,9 @@ pub fn import_from(
                             // rather than be masked (`_handle_fromlist`).
                             let absent_submodule = e.kind
                                 == crate::PyErrorKind::ModuleNotFoundError
-                                && e.message.contains(&format!("'{fullname}'"));
+                                && e.message.contains(&rustpython_wtf8::Wtf8Buf::from_string(
+                                    format!("'{fullname}'"),
+                                ));
                             if !absent_submodule {
                                 return Err(e);
                             }
@@ -4002,34 +4032,43 @@ pub fn import_from(
     let uninit_submodule = !initializing && is_spec_uninitialized_submodule(w_spec, &pkgname)?;
     let pkgpath =
         crate::baseobjspace::utf8_w(pyre_object::gc_roots::shadow_stack_get(pkgpath_slot))?;
-    let origin = origin.as_deref().unwrap_or("");
-    let msg = if is_shadowing_stdlib {
-        format!(
-            "cannot import name '{name}' from '{pkgname}' (consider renaming \
-             '{origin}' since it has the same name as the standard library \
-             module named '{pkgname}' and prevents importing that standard \
-             library module)"
-        )
+    let origin = origin.unwrap_or_default();
+    // The origin is a filename and may hold a surrogate escape, so the two
+    // messages that name it are assembled as WTF-8; `format!` would render it
+    // through `Display` and substitute U+FFFD.
+    let renaming_hint = |tail: String| {
+        let mut msg = Wtf8Buf::from_string(format!(
+            "cannot import name '{name}' from '{pkgname}' (consider renaming '"
+        ));
+        msg.push_wtf8(&origin);
+        msg.push_str(&tail);
+        msg
+    };
+    let msg: Wtf8Buf = if is_shadowing_stdlib {
+        renaming_hint(format!(
+            "' since it has the same name as the standard library module named \
+             '{pkgname}' and prevents importing that standard library module)"
+        ))
     } else if initializing {
         if is_shadowing {
-            format!(
-                "cannot import name '{name}' from '{pkgname}' (consider renaming \
-                 '{origin}' if it has the same name as a library you intended \
-                 to import)"
+            renaming_hint(
+                "' if it has the same name as a library you intended to import)".to_string(),
             )
         } else {
             format!(
                 "cannot import name '{name}' from partially initialized module \
                  '{pkgname}' (most likely due to a circular import) ({pkgpath})"
             )
+            .into()
         }
     } else if uninit_submodule {
         format!(
             "cannot access submodule '{pkgname}' of module '{name}' \
              (most likely due to a circular import)"
         )
+        .into()
     } else {
-        format!("cannot import name '{name}' from '{pkgname}' ({pkgpath})")
+        format!("cannot import name '{name}' from '{pkgname}' ({pkgpath})").into()
     };
     let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
     let w_pkgpath = pyre_object::gc_roots::shadow_stack_get(pkgpath_slot);
@@ -4186,11 +4225,11 @@ mod tests {
         crate::test_hooks::install_hash_hook();
         let empty = importhook("", PY_NULL, PY_NULL, 0, std::ptr::null()).unwrap_err();
         assert_eq!(empty.kind, crate::PyErrorKind::ValueError);
-        assert_eq!(empty.message, "Empty module name");
+        assert_eq!(empty.message_text(), "Empty module name");
 
         let negative = importhook("sys", PY_NULL, PY_NULL, -1, std::ptr::null()).unwrap_err();
         assert_eq!(negative.kind, crate::PyErrorKind::ValueError);
-        assert_eq!(negative.message, "level must be >= 0");
+        assert_eq!(negative.message_text(), "level must be >= 0");
 
         let globals = pyre_object::w_dict_new();
         unsafe {
@@ -4199,7 +4238,7 @@ mod tests {
         let no_parent = importhook("", globals, PY_NULL, 1, std::ptr::null()).unwrap_err();
         assert_eq!(no_parent.kind, crate::PyErrorKind::ImportError);
         assert_eq!(
-            no_parent.message,
+            no_parent.message_text(),
             "attempted relative import with no known parent package"
         );
     }

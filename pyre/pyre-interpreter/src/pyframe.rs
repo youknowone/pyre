@@ -248,8 +248,8 @@ pub mod frame_locals_proxy {
             crate::baseobjspace::eq_w(self.mapping()?, other)
         }
 
-        fn __repr__(&self) -> Result<String, crate::PyError> {
-            unsafe { crate::display::py_repr(self.mapping()?) }
+        fn __repr__(&self) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+            unsafe { crate::display::py_repr_wtf8(self.mapping()?) }
         }
     }
 
@@ -782,10 +782,13 @@ impl FrameBox {
     /// `pyframe.py:259 initialize_as_generator(name, qualname)` — function
     /// calls pass the function's current writable metadata so each newly
     /// created generator freezes it independently of the code object.
+    /// `__name__` / `__qualname__` are the function's own strings, which may
+    /// carry a lone surrogate, and they are read back as values -- so they
+    /// arrive as WTF-8 rather than through a lossy `&str`.
     pub fn into_generator_named(
         mut self,
-        name: Option<&str>,
-        qualname: Option<&str>,
+        name: Option<&rustpython_wtf8::Wtf8>,
+        qualname: Option<&rustpython_wtf8::Wtf8>,
     ) -> crate::PyResult {
         self.fix_array_ptrs();
         let register_final = code_yields_inside_try(self.code());
@@ -849,11 +852,11 @@ impl FrameBox {
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(generator);
         if let Some(name) = name {
-            let w_name = pyre_object::w_str_new(name);
+            let w_name = pyre_object::w_str_from_wtf8(name.to_wtf8_buf());
             unsafe { pyre_object::generator::w_generator_set_name(generator, w_name) };
         }
         if let Some(qualname) = qualname {
-            let w_qualname = pyre_object::w_str_new(qualname);
+            let w_qualname = pyre_object::w_str_from_wtf8(qualname.to_wtf8_buf());
             unsafe { pyre_object::generator::w_generator_set_qualname(generator, w_qualname) };
         }
         unsafe {
