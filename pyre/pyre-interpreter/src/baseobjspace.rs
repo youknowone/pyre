@@ -17566,9 +17566,20 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             let w_exc = e.to_exc_object();
             let _roots = pyre_object::gc_roots::push_roots();
             pyre_object::gc_roots::pin_root(w_exc);
-            getattr_str(w_exc, "value").or_else(|_| Ok(w_none()))
+            let value = getattr_str(w_exc, "value").or_else(|_| Ok(w_none()));
+            // The StopIteration has been consumed at this Rust-level catch;
+            // unlike a Python handler, no PUSH_EXC_INFO will clear the
+            // temporary propagation root for us.
+            crate::eval::set_in_flight_exception(PY_NULL);
+            value
         }
-        Err(e) if e.kind == PyErrorKind::GeneratorExit => Ok(w_none()),
+        Err(e) if e.kind == PyErrorKind::GeneratorExit => {
+            // generator.py:265 `except OperationError as e` consumes the
+            // GeneratorExit after matching it.  Mirror PUSH_EXC_INFO's
+            // ownership transfer by ending pyre's propagation root here.
+            crate::eval::set_in_flight_exception(PY_NULL);
+            Ok(w_none())
+        }
         Err(e) => Err(e),
     };
     unsafe {
