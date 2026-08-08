@@ -4358,7 +4358,30 @@ impl OpcodeStepExecutor for PyFrame {
     // ── yield from / send ──
     fn get_yield_from_iter(&mut self) -> Result<(), PyError> {
         let iterable = self.pop();
-        let iter = crate::baseobjspace::iter(iterable)?;
+        // CPython 3.14 `GET_YIELD_FROM_ITER` / PyPy's coroutine-aware
+        // `YIELD_FROM`: exact generators already are their iterator.  A
+        // native coroutine is also sent to directly, but only when the
+        // current frame is itself a coroutine or was marked by
+        // `types.coroutine` with CO_ITERABLE_COROUTINE.  Calling ordinary
+        // `iter()` here loses both halves of that distinction because native
+        // coroutine objects intentionally expose no public `__iter__`.
+        let iter = unsafe {
+            if pyre_object::generator::is_coroutine(iterable) {
+                let flags = self.code().flags;
+                if !flags
+                    .intersects(crate::CodeFlags::COROUTINE | crate::CodeFlags::ITERABLE_COROUTINE)
+                {
+                    return Err(PyError::type_error(
+                        "cannot 'yield from' a coroutine object in a non-coroutine generator",
+                    ));
+                }
+                iterable
+            } else if pyre_object::generator::is_generator(iterable) {
+                iterable
+            } else {
+                crate::baseobjspace::iter(iterable)?
+            }
+        };
         self.push(iter);
         Ok(())
     }

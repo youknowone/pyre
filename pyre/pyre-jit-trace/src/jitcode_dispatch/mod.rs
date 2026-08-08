@@ -2749,6 +2749,12 @@ pub fn step<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
+    // The walker mixes translated vable operations (which update the shadow)
+    // with concrete interpreter steps (which update the heap PyFrame).  Pull
+    // those concrete writes into `virtualizable_boxes` before any handler can
+    // read or synchronize it, matching the invariant documented by
+    // `TraceCtx::refresh_virtualizable_shadow_from_heap`.
+    ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
     if ctx.is_top_level {
         ctx.session.borrow_mut().recording_opcode_position = op.pc;
     }

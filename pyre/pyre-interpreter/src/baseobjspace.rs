@@ -16966,10 +16966,16 @@ fn generator_send_ex(
     w_arg: PyObjectRef,
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
+    closing: bool,
 ) -> PyResult {
     use pyre_object::generator::*;
     unsafe {
         if w_generator_is_exhausted(gen_obj) {
+            if is_coroutine(gen_obj) && !closing {
+                return Err(PyError::runtime_error(
+                    "cannot reuse already awaited coroutine",
+                ));
+            }
             if let Some(err) = operr {
                 return Err(err);
             }
@@ -16983,6 +16989,11 @@ fn generator_send_ex(
         let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
         if frame_ptr.is_null() {
             w_generator_set_exhausted(gen_obj);
+            if is_coroutine(gen_obj) && !closing {
+                return Err(PyError::runtime_error(
+                    "cannot reuse already awaited coroutine",
+                ));
+            }
             if let Some(err) = operr {
                 return Err(err);
             }
@@ -17057,7 +17068,7 @@ pub(crate) fn resume_yield_from(
         Some(err) => throw_yield_from(w_yf, err, throw_args),
         None if unsafe { pyre_object::is_none(w_arg) } => {
             if unsafe { pyre_object::generator::is_generator_or_coroutine(w_yf) } {
-                generator_send_ex(w_yf, w_none(), None, None)
+                generator_send_ex(w_yf, w_none(), None, None, false)
             } else {
                 next(w_yf)
             }
@@ -17104,7 +17115,7 @@ fn throw_yield_from(
 ) -> PyResult {
     unsafe {
         if pyre_object::generator::is_generator_or_coroutine(w_yf) {
-            return generator_send_ex(w_yf, w_none(), Some(err), throw_args);
+            return generator_send_ex(w_yf, w_none(), Some(err), throw_args, false);
         }
     }
     let throw = match getattr_str(w_yf, "throw") {
@@ -17128,7 +17139,7 @@ fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
     unsafe {
         if pyre_object::generator::is_generator_or_coroutine(w_yf) {
             let exit = PyError::new(PyErrorKind::GeneratorExit, String::new());
-            return match generator_send_ex(w_yf, w_none(), Some(exit), None) {
+            return match generator_send_ex(w_yf, w_none(), Some(exit), None, true) {
                 Ok(_) => Err(PyError::runtime_error(format!(
                     "{} ignored GeneratorExit",
                     generator_kind(w_yf)
@@ -17248,7 +17259,7 @@ unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
 
 /// PyPy: GeneratorIterator.next() — equivalent to __next__
 fn generator_next(gen_obj: PyObjectRef) -> PyResult {
-    generator_send_ex(gen_obj, w_none(), None, None)
+    generator_send_ex(gen_obj, w_none(), None, None, false)
 }
 
 /// __next__ method wrapper
@@ -17408,7 +17419,7 @@ pub(crate) fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     let value = if args.len() > 1 { args[1] } else { w_none() };
-    generator_send_ex(gen_obj, value, None, None)
+    generator_send_ex(gen_obj, value, None, None, false)
 }
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
@@ -17486,6 +17497,7 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
                 w_none(),
                 Some(err),
                 Some(([w_type, w_val, w_tb], argc)),
+                false,
             );
         }
     };
@@ -17494,6 +17506,7 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
         w_none(),
         Some(err),
         Some(([w_type, w_val, w_tb], argc)),
+        false,
     )
 }
 
@@ -17525,7 +17538,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
         }
     }
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
-    let mut result = match generator_send_ex(gen_obj, w_none(), Some(err), None) {
+    let mut result = match generator_send_ex(gen_obj, w_none(), Some(err), None, true) {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError.
             // generator.py:267-268 `"%s ignored GeneratorExit" % self.KIND`.
@@ -17579,14 +17592,14 @@ pub(crate) fn coroutine_await_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn coroutine_wrapper_next_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
-    generator_send_ex(coroutine, w_none(), None, None)
+    generator_send_ex(coroutine, w_none(), None, None, false)
 }
 
 pub(crate) fn coroutine_wrapper_send_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
     let value = crate::type_methods::arg_or_none(args, 1);
-    generator_send_ex(coroutine, value, None, None)
+    generator_send_ex(coroutine, value, None, None, false)
 }
 
 pub(crate) fn coroutine_wrapper_throw_method(args: &[PyObjectRef]) -> PyResult {
@@ -17730,7 +17743,7 @@ fn async_gen_asend_do_send(awaitable: PyObjectRef, mut arg: PyObjectRef) -> PyRe
         }
         unsafe { w_async_generator_set_running(async_gen, true) };
     }
-    let result = generator_send_ex(async_gen, arg, None, None)
+    let result = generator_send_ex(async_gen, arg, None, None, false)
         .and_then(|value| async_gen_unwrap_value(async_gen, value));
     if result.is_err() {
         unsafe { w_async_generator_set_running(async_gen, false) };
@@ -17770,6 +17783,7 @@ pub(crate) fn async_gen_asend_close_method(args: &[PyObjectRef]) -> PyResult {
         w_none(),
         Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
         None,
+        true,
     );
     unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
     match result {
@@ -17907,6 +17921,7 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
                 w_none(),
                 Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
                 None,
+                true,
             )
         } else {
             // `AsyncGenerator.athrow` already warned from the caller-visible
@@ -17915,7 +17930,7 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
             generator_throw_impl(&[async_gen, exc_type, exc_value, exc_tb], false)
         }
     } else {
-        generator_send_ex(async_gen, arg, None, None)
+        generator_send_ex(async_gen, arg, None, None, false)
     };
     let result = match result {
         Ok(value) => {
@@ -17968,6 +17983,7 @@ pub(crate) fn async_gen_athrow_close_method(args: &[PyObjectRef]) -> PyResult {
         w_none(),
         Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
         None,
+        true,
     );
     unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
     match result {
