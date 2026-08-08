@@ -221,6 +221,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         if let FnArg::Typed(pt) = arg {
             pt.attrs.retain(|a| {
                 !a.path().is_ident("default")
+                    && !a.path().is_ident("posonly")
                     && !a.path().is_ident("kwonly")
                     && !a.path().is_ident("kwargs")
             });
@@ -256,6 +257,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     // `Signature` (`None`) and keeps the raw positional fast path.
     let sig_fn_name = format_ident!("{}_pyre_sig", user_name);
     let mut sig_stmts = Vec::<proc_macro2::TokenStream>::new();
+    let mut posonly_marked = false;
     let mut kwonly_marked = false;
     let mut raw_slice = false;
     for arg in user_sig.inputs.iter() {
@@ -281,6 +283,10 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         if is_slice {
             raw_slice = true;
             continue;
+        }
+        if !posonly_marked && pt.attrs.iter().any(|a| a.path().is_ident("posonly")) {
+            sig_stmts.push(quote! { __b.marker_posonly(); });
+            posonly_marked = true;
         }
         if !kwonly_marked && pt.attrs.iter().any(|a| a.path().is_ident("kwonly")) {
             sig_stmts.push(quote! { __b.marker_kwonly(); });

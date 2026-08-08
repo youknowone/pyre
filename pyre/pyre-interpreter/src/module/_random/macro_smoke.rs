@@ -109,6 +109,20 @@ fn _kwonly_bound_probe(
     value + adjustment
 }
 
+/// A `#[posonly]` marker on the first non-positional-only parameter ends the
+/// positional-only run before it: `base` is positional-only, so the derived
+/// `Signature` carries `posonlyargcount == 1` and a keyword named `base` is
+/// rejected by `raise_if_posonly_kwds`.
+#[crate::pyre_function]
+fn _posonly_bound_probe(
+    base: i64,
+    #[posonly]
+    #[default(0i64)]
+    offset: i64,
+) -> i64 {
+    base + offset
+}
+
 crate::py_module! {
     "_pyre_smoke",
     interpleveldefs: {
@@ -182,6 +196,36 @@ mod tests {
         .expect("signature binding");
         let result = _kwonly_bound_probe(&bound).expect("bound keyword-only scope");
         assert_eq!(unsafe { w_int_get_value(result) }, 42);
+    }
+
+    #[test]
+    fn posonly_marker_makes_leading_param_positional_only() {
+        crate::typedef::init_typeobjects();
+        let signature = _posonly_bound_probe_pyre_sig().expect("derived signature");
+        assert_eq!(signature.posonlyargcount, 1);
+        assert_eq!(signature.argnames, vec!["base", "offset"]);
+
+        // The positional-only `base` binds fine by position, and `offset`
+        // still binds by keyword.
+        let bound = crate::call::bind_kwargs_to_signature(
+            &signature,
+            "_posonly_bound_probe",
+            &[w_int_new(40)],
+            &[(rustpython_wtf8::Wtf8Buf::from("offset"), w_int_new(2))],
+        )
+        .expect("signature binding");
+        let result = _posonly_bound_probe(&bound).expect("bound positional-only scope");
+        assert_eq!(unsafe { w_int_get_value(result) }, 42);
+
+        // Passing the positional-only `base` as a keyword is a TypeError.
+        let err = crate::call::bind_kwargs_to_signature(
+            &signature,
+            "_posonly_bound_probe",
+            &[],
+            &[(rustpython_wtf8::Wtf8Buf::from("base"), w_int_new(40))],
+        )
+        .expect_err("positional-only name as keyword must error");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
     }
 
     /// `Vec<i64>` return auto-wraps to a list.
