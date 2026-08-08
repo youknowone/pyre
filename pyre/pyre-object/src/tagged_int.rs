@@ -9,11 +9,13 @@
 //! real pointer; `None`/`True`/`False` are even-aligned statics and are
 //! never tagged.
 //!
-//! The tag path is live behind [`CAN_BE_TAGGED`] (#22 enablement): the
+//! The tag path is gated behind [`CAN_BE_TAGGED`], which is `false` and
+//! has never been turned on (#22 tracks enablement). Once it is: the
 //! maker (`intobject::w_int_new`) returns small ints as immediates, the
 //! readers/dispatch chokepoints `& 1`-precheck before any `ob_type`
 //! deref, and the GC collector skips tagged immediates
-//! (`taggedpointers`, wired through `pyre-jit`'s `build_gc`).
+//! (`taggedpointers`, wired through `pyre-jit`'s `build_gc`). While it
+//! is `false` none of that is reachable.
 //!
 //! The bit layout mirrors the already-ported rtyper helper
 //! `majit/majit-translate/src/translator/rtyper/lltypesystem/rtagged.rs`
@@ -23,13 +25,22 @@
 use crate::pyobject::PyObjectRef;
 
 /// `rpython/rtyper/lltypesystem/rtagged.py:64-96` static `can_be_tagged`
-/// gate, collapsed to the single runtime `int` class. Enabled (#22),
-/// mirroring `rpython/config/translationoption.py:185 taggedpointers`
-/// turned on, so every consumer chokepoint takes the `& 1` tag precheck
-/// and the maker emits small ints as immediates. `rerased.py:1-3`: the
-/// point is to avoid putting `& 1` tag checks on every object — they are
-/// gated on this static, which is kept in lockstep with the GC
-/// `taggedpointers` config (`pyre-jit` `build_gc`).
+/// gate, collapsed to the single runtime `int` class. Off, mirroring
+/// `rpython/config/translationoption.py:185 taggedpointers` left off;
+/// #22 tracks turning it on, at which point every consumer chokepoint
+/// takes the `& 1` tag precheck and the maker emits small ints as
+/// immediates. `rerased.py:1-3`: the point is to avoid putting `& 1` tag
+/// checks on every object — they are gated on this static, which is kept
+/// in lockstep with the GC `taggedpointers` config (`pyre-jit`
+/// `build_gc`).
+///
+/// While this is `false` no tagged value can exist at runtime. The sole
+/// production caller of [`tag_int`] is `intobject::w_int_new`, behind
+/// this same gate, so the maker arm is compile-time dead and every
+/// consumer's `& 1` precheck is inert. So do not read an odd, small bit
+/// pattern found in a live `PyObjectRef` as a tagged immediate: nothing
+/// can mint one, and such a value is corruption that happens to match
+/// the encoding.
 pub const CAN_BE_TAGGED: bool = false;
 
 /// `value` fits the tagged immediate range, i.e. the payload survives
