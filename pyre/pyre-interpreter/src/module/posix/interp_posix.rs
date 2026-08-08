@@ -6227,53 +6227,73 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
 
         // os.dup2(fd, fd2, inheritable=True) -> fd2
+        //
+        // Carries a `Signature`, so `inheritable` binds by name.  Registered
+        // raw it did not: the trailing `__pyre_kw__` marker dict was never
+        // split off the argument slice, so it landed in the third positional
+        // slot and read truthy, and `dup2(fd, fd2, inheritable=False)`
+        // returned an *inheritable* descriptor that an exec would carry.
+        //
+        // The arguments stay `PyObjectRef` and are unwrapped in the body: the
+        // macro's bare `i32` binding is a raw `w_int_get_value` cast, which
+        // would read a non-int argument's payload instead of reporting it.
+        #[cfg(not(feature = "sandbox"))]
+        #[crate::pyre_function]
+        fn dup2(
+            fd: pyre_object::PyObjectRef,
+            fd2: pyre_object::PyObjectRef,
+            inheritable: Option<pyre_object::PyObjectRef>,
+        ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+            // interp_posix.py:733 `@unwrap_spec(fd=c_int, fd2=c_int, inheritable=bool)`.
+            let fd = crate::baseobjspace::c_int_w(fd)?;
+            let fd2 = crate::baseobjspace::c_int_w(fd2)?;
+            let inheritable = match inheritable {
+                Some(w) => crate::baseobjspace::is_true(w)?,
+                None => true,
+            };
+            // `os_dup2_impl` asks for a non-inheritable duplicate through
+            // `dup3` where it exists, so no window opens in which the new
+            // descriptor is inheritable and an exec could carry it.  The
+            // inheritable case keeps plain `dup2`, which is also the one
+            // that tolerates `fd == fd2`.
+            let n = if inheritable {
+                crate::builtins::crt_call!(libc::dup2(fd, fd2))
+            } else {
+                #[cfg(any(target_os = "android", target_os = "linux", target_os = "freebsd"))]
+                {
+                    crate::builtins::crt_call!(libc::dup3(fd, fd2, libc::O_CLOEXEC))
+                }
+                #[cfg(not(any(
+                    target_os = "android",
+                    target_os = "linux",
+                    target_os = "freebsd"
+                )))]
+                {
+                    let n = crate::builtins::crt_call!(libc::dup2(fd, fd2));
+                    if n >= 0 {
+                        use std::os::fd::BorrowedFd;
+                        let bfd = unsafe { BorrowedFd::borrow_raw(n) };
+                        host_posix::set_inheritable(bfd, false).map_err(|e| io_err(e, ""))?;
+                    }
+                    n
+                }
+            };
+            if n < 0 {
+                return Err(errno_err(crate::builtins::crt_errno(), ""));
+            }
+            Ok(pyre_object::w_int_new(n as i64))
+        }
+
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
             "dup2",
-            crate::make_builtin_function("dup2", |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("dup2() requires 2 arguments"));
-                }
-                // interp_posix.py:733 `@unwrap_spec(fd=c_int, fd2=c_int, inheritable=bool)`.
-                let fd = crate::baseobjspace::c_int_w(args[0])?;
-                let fd2 = crate::baseobjspace::c_int_w(args[1])?;
-                let inheritable = match args.get(2) {
-                    Some(&w) => crate::baseobjspace::is_true(w)?,
-                    None => true,
-                };
-                // `os_dup2_impl` asks for a non-inheritable duplicate through
-                // `dup3` where it exists, so no window opens in which the new
-                // descriptor is inheritable and an exec could carry it.  The
-                // inheritable case keeps plain `dup2`, which is also the one
-                // that tolerates `fd == fd2`.
-                let n = if inheritable {
-                    crate::builtins::crt_call!(libc::dup2(fd, fd2))
-                } else {
-                    #[cfg(any(target_os = "android", target_os = "linux", target_os = "freebsd"))]
-                    {
-                        crate::builtins::crt_call!(libc::dup3(fd, fd2, libc::O_CLOEXEC))
-                    }
-                    #[cfg(not(any(
-                        target_os = "android",
-                        target_os = "linux",
-                        target_os = "freebsd"
-                    )))]
-                    {
-                        let n = crate::builtins::crt_call!(libc::dup2(fd, fd2));
-                        if n >= 0 {
-                            use std::os::fd::BorrowedFd;
-                            let bfd = unsafe { BorrowedFd::borrow_raw(n) };
-                            host_posix::set_inheritable(bfd, false).map_err(|e| io_err(e, ""))?;
-                        }
-                        n
-                    }
-                };
-                if n < 0 {
-                    return Err(errno_err(crate::builtins::crt_errno(), ""));
-                }
-                Ok(pyre_object::w_int_new(n as i64))
-            }),
+            crate::make_builtin_function_with_arity_and_maybe_sig(
+                "dup2",
+                dup2,
+                dup2_pyre_arity(),
+                dup2_pyre_sig(),
+            ),
         );
 
         // os.fsync(fd)
@@ -8628,25 +8648,36 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
-        // os.dup2(fd, fd2, inheritable=True) -> fd2
+        // os.dup2(fd, fd2, inheritable=True) -> fd2 — the `Signature`-bearing
+        // twin of the unix registration, and defective in the same way while
+        // it was registered raw.
+        #[crate::pyre_function]
+        fn dup2(
+            fd: pyre_object::PyObjectRef,
+            fd2: pyre_object::PyObjectRef,
+            inheritable: Option<pyre_object::PyObjectRef>,
+        ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+            let fd = crate::baseobjspace::c_int_w(fd)?;
+            let fd2 = crate::baseobjspace::c_int_w(fd2)?;
+            let inheritable = match inheritable {
+                Some(w) => crate::baseobjspace::is_true(w)?,
+                None => true,
+            };
+            match host_nt::dup2(fd, fd2, inheritable) {
+                Ok(n) => Ok(pyre_object::w_int_new(n as i64)),
+                Err(e) => Err(errno_err(crt_errno_of(&e), "")),
+            }
+        }
+
         crate::module_ns_store(
             ns,
             "dup2",
-            crate::make_builtin_function("dup2", |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("dup2() requires 2 arguments"));
-                }
-                let fd = crate::baseobjspace::c_int_w(args[0])?;
-                let fd2 = crate::baseobjspace::c_int_w(args[1])?;
-                let inheritable = match args.get(2) {
-                    Some(&w) => crate::baseobjspace::is_true(w)?,
-                    None => true,
-                };
-                match host_nt::dup2(fd, fd2, inheritable) {
-                    Ok(n) => Ok(pyre_object::w_int_new(n as i64)),
-                    Err(e) => Err(errno_err(crt_errno_of(&e), "")),
-                }
-            }),
+            crate::make_builtin_function_with_arity_and_maybe_sig(
+                "dup2",
+                dup2,
+                dup2_pyre_arity(),
+                dup2_pyre_sig(),
+            ),
         );
 
         // os.fsync(fd) — `_commit`, the runtime's flush-to-disk.
