@@ -1179,6 +1179,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
 
     dest_dir = llbc_dest(eng.out_dir, eng.root)
     charon_stamp = charon_version(charon_dest)
+    unstamped: list[str] = []
     env = os.environ.copy()
     prepend_msvc_link(env)
 
@@ -1346,10 +1347,34 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     f" — its source now affects this artefact, so the artefact"
                     f" must re-extract when it changes."
                 )
+        # `stamp` was computed at the top of this iteration, BEFORE the charon
+        # build that has just run for minutes. If the tree moved in between it
+        # names a source hash this artefact was not built from, and the wrong
+        # direction is a RETURN to the stamped state — a reverted edit, a branch
+        # switched back — where `check` then reports FRESH over an artefact
+        # built from other sources. Re-stamping with the post-build value would
+        # be equally untrue: the artefact straddles both trees and belongs to
+        # neither, and a stamp that looks authoritative is worse than none.
+        if source_fingerprint(eng, [crate], cargo_features) != parse_stamp(stamp)["source"]:
+            stamp_path.unlink(missing_ok=True)
+            unstamped.append(crate)
+            print(
+                f"    REFUSING to stamp {dest.name}: the tree moved during its"
+                f" build, so no source hash describes this artefact. Left"
+                f" unstamped — reported as freshness UNKNOWN, not as fresh."
+            )
+            continue
         stamp_path.write_text(stamp + "\n")
         print(f"    wrote {dest} ({dest.stat().st_size} bytes)")
 
     print()
+    if unstamped:
+        raise SystemExit(
+            "extract-llbc.py: the tree moved while extracting "
+            + ", ".join(unstamped)
+            + ".\n  Those artefacts are written but deliberately unstamped."
+            "\n  Re-run with --force once the tree is quiet."
+        )
     print(f"all extractions complete. artefacts under: {dest_dir}")
 
 
