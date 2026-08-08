@@ -156,6 +156,34 @@ def last_stderr_line(err: str) -> str:
     return ""
 
 
+def failure_digest(out: str, err: str) -> str:
+    """Which cases unittest reported against, and its closing verdict.
+
+    A FAIL's tail is not its cause: this runner sets `MAJIT_STATS`, so the last
+    thing every process writes is the JIT summary, and `last_stderr_line` reads
+    back `Compilation time: 8.1ms` for a module whose real answer is two named
+    assertions several hundred lines above it. Every FAIL in the suite recorded
+    that same line, which named no test at all.
+
+    unittest writes `FAIL: <case>` / `ERROR: <case>` headers and one closing
+    `FAILED (...)`; those are the runner's own account of what went wrong, and
+    they are what a CI log needs to carry.
+    """
+    lines = f"{out}\n{err}".splitlines()
+    cases: list[str] = []
+    verdict = ""
+    for line in lines:
+        line = line.strip()
+        if line.startswith(("FAIL: ", "ERROR: ")) and line not in cases:
+            cases.append(line)
+        elif line.startswith("FAILED ("):
+            verdict = line
+    shown = cases[:4]
+    if len(cases) > len(shown):
+        shown.append(f"(+{len(cases) - len(shown)} more)")
+    return " | ".join(part for part in (verdict, *shown) if part)
+
+
 def death_signal(rc: int) -> str:
     """`SIGBUS` for a run killed by a signal, else a bare return code.
 
@@ -199,8 +227,11 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
     # skips it too, so it is honestly SKIP, not an interpreter gap.
     if not ran and "SkipTest" in err:
         return "SKIP", f"rc={rc} {last}"[:120]
-    status = "FAIL" if ran else "IMPORTERROR"
-    return status, f"rc={rc} {last}"[:120]
+    if ran:
+        # An IMPORTERROR never reached unittest, so its tail is all there is;
+        # a FAIL has unittest's own account, and only that names a test.
+        return "FAIL", f"rc={rc} {failure_digest(out, err) or last}"[:300]
+    return "IMPORTERROR", f"rc={rc} {last}"[:120]
 
 
 # ── discovery ────────────────────────────────────────────────────────
@@ -324,8 +355,17 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
                 cmd, cwd=cwd, env=module_env, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=timeout,
             )
-        except subprocess.TimeoutExpired:
-            return "TIMEOUT", f"timeout {timeout}s"
+        except subprocess.TimeoutExpired as expired:
+            # A bare "timeout 120s" says only that the module is slow, never
+            # which case it stopped in — and unittest's progress dots, the one
+            # record of how far it got, were being thrown away here. `text=True`
+            # decodes what `communicate()` returns; the timeout path raises with
+            # the raw chunks it had joined, which is bytes on POSIX and str on
+            # Windows, so both spellings have to be accepted.
+            partial = expired.stderr or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", "replace")
+            return "TIMEOUT", f"timeout {timeout}s {last_stderr_line(partial)}"[:300]
     return classify(proc.returncode, proc.stdout or "", proc.stderr or "")
 
 
@@ -389,6 +429,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    # The report is box-drawn and the module names it echoes come from the
+    # stdlib, so a console whose codepage cannot spell one of those characters
+    # used to kill the run with a `UnicodeEncodeError` before it reached a
+    # single test — the header alone does it on cp949.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
     binary = Path(args.binary) if args.binary else TARGET_RELEASE / f"{BIN_NAME[args.backend]}{EXE}"
     binary = binary.resolve()
