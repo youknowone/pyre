@@ -2714,10 +2714,8 @@ impl PyFrame {
         // (PyPy `main.py:45 / Module.__init__` parity) into a proxy-less
         // celldict.  Just set `__name__` on top.
         let w_globals = execution_context.fresh_module_globals();
-        // Root the fresh globals across the `__name__` store, code/object
-        // allocations, and frame construction; `createframe_obj` stores
-        // `w_globals` into the frame (and `w_code_set_w_globals` into the
-        // code), both of which root it once they return.
+        // Root the fresh globals across the `__name__` store; the frame
+        // construction below roots them again for its own span.
         let _root = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(w_globals);
         unsafe {
@@ -2727,6 +2725,26 @@ impl PyFrame {
                 pyre_object::w_str_new("__main__"),
             );
         }
+        Self::new_with_context_and_globals(code, execution_context, w_globals)
+    }
+
+    /// `new_with_context` over a globals dict the caller already owns.
+    ///
+    /// A run that has to consult `sys.path_hooks` before it knows whether it
+    /// is executing a source file at all needs `__main__`'s namespace — and
+    /// the importlib bootstrap that runs in it — to exist before any code
+    /// object does, so the namespace cannot come from the frame.
+    pub fn new_with_context_and_globals(
+        code: CodeObject,
+        execution_context: Rc<PyExecutionContext>,
+        w_globals: PyObjectRef,
+    ) -> Result<FrameBox, crate::PyError> {
+        // Root the globals across the code/object allocations and the frame
+        // construction; `createframe_obj` stores `w_globals` into the frame
+        // (and `w_code_set_w_globals` into the code), both of which root it
+        // once they return.
+        let _root = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_globals);
         let code_ptr = Box::into_raw(Box::new(code));
         let w_code = crate::w_code_new(code_ptr as *const ());
         unsafe {

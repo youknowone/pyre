@@ -1385,6 +1385,14 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
     }
 }
 
+/// Replace the pending startup `sys.path[0]` entry for an accepted directory
+/// or zipfile run.  `app_main.py:1054` suppresses the ordinary script
+/// directory under safe-path modes, but the package-run branch still prepends
+/// the accepted run target so `runpy` can find `__main__`.
+pub fn restage_sys_path_0(path0: &std::ffi::OsStr) {
+    *SYS_PATH_0_PENDING.lock().unwrap() = Some(path0.to_os_string());
+}
+
 /// Locate the vendored stdlib (`lib-python/3`) by walking up the running
 /// executable's ancestor directories.
 ///

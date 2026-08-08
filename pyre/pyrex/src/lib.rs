@@ -1,6 +1,6 @@
 //! pyre — A Rust meta-tracing JIT Python interpreter.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -622,79 +622,14 @@ fn real_main(binary_name: &str) {
             }
         }
         RunMode::Script(path) => {
-            // Initialize sys.path with the script's directory. Under sandbox,
-            // `canonicalize()` issues raw host-FS syscalls (realpath) past the
-            // seccomp lockdown and resolves against the real filesystem, not the
-            // controller VFS; use the virtual path as given instead.
-            #[cfg(feature = "sandbox")]
-            let script_dir = Path::new(&path)
-                .parent()
-                .unwrap_or(Path::new("."))
-                .to_path_buf();
-            #[cfg(not(feature = "sandbox"))]
-            let script_dir = {
-                // `parent()` of a bare `x.py` is the empty path;
-                // `_PyPathConfig_ComputeSysPath0` absolutizes the script's
-                // directory, so resolve the empty case against the cwd rather
-                // than leaving a relative `.` on `sys.path`.
-                let parent = Path::new(&path).parent().unwrap_or(Path::new("."));
-                let parent = if parent.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    parent
-                };
-                parent.canonicalize().unwrap_or_else(|_| sys_path_cwd())
-            };
+            let script_dir = script_startup_dir(&path);
             importing::init_sys_path(&script_dir, script_dir.as_os_str());
             // sys.argv[0] is the script path; remaining values go to argv[1:].
             let mut argv = vec![std::ffi::OsString::from(&path)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            // A declared non-UTF-8 source codec is resolved through the Python
-            // codec registry, whose first lookup imports `encodings`.  PyPy's
-            // app_main reaches that import with the thread's ExecutionContext
-            // already installed; use the same context for decoding, compiling,
-            // and executing rather than collapsing startup onto a null EC or
-            // creating a second frame owner after decoding.
-            let execution_context = setup_exec_context();
-            // The script is read through the import machinery's source
-            // provider, so under sandbox the controller VFS mediates it over
-            // the same channel module imports use.  The bytes then go through
-            // the tokenizer's BOM / PEP 263 decoding in every build.
-            let source = match importing::read_source_bytes(Path::new(&path)) {
-                Ok(bytes) => match pyre_interpreter::decode_source_bytes(
-                    &bytes,
-                    rustpython_wtf8::Wtf8::new(path.as_str()),
-                    false,
-                ) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        pyre_interpreter::eprint_exception(&error, false);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("{binary_name}: cannot open '{path}': {e}");
-                    std::process::exit(1);
-                }
-            };
-            // CPython compiles a script with the same absolute path exposed
-            // as `__main__.__file__`; warnings use `code.co_filename`, so the
-            // two must not diverge when argv[0] was relative.
-            #[cfg(not(feature = "sandbox"))]
-            let compile_path = std::path::absolute(Path::new(&path))
-                .unwrap_or_else(|_| Path::new(&path).to_path_buf())
-                .to_string_lossy()
-                .into_owned();
-            #[cfg(feature = "sandbox")]
-            let compile_path = path.clone();
-            run_source_with_context(
-                &source,
-                Mode::Exec,
-                &compile_path,
-                no_site,
-                execution_context,
-            );
+            let compile_path = script_compile_path(&path);
+            run_script_path(&path, &compile_path, no_site, binary_name);
             if inspect {
                 repl::run_repl(true, no_site);
             }
@@ -1404,7 +1339,9 @@ fn terminate_by_sigint() -> ! {
     }
 }
 
-fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {
+/// Whether the raised exception is an instance of the named builtin exception
+/// class or of a subclass of it.
+fn raised_is_instance_of(error: &pyre_interpreter::PyError, class_name: &str) -> bool {
     let exc = error.exc_object;
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return false;
@@ -1412,9 +1349,13 @@ fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {
     let Some(raised_type) = pyre_interpreter::typedef::r#type(exc) else {
         return false;
     };
-    pyre_interpreter::builtins::lookup_exc_class("KeyboardInterrupt").is_some_and(|target| unsafe {
+    pyre_interpreter::builtins::lookup_exc_class(class_name).is_some_and(|target| unsafe {
         pyre_interpreter::baseobjspace::exception_issubclass_w(raised_type.as_ptr(), target)
     })
+}
+
+fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {
+    raised_is_instance_of(error, "KeyboardInterrupt")
 }
 
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
@@ -1441,19 +1382,7 @@ fn run_module(module: &str, no_site: bool) {
     let result = (|| -> Result<(), pyre_interpreter::PyError> {
         init_importlib_bootstrap(canonical, ec_ptr)?;
         import_site(no_site, canonical, ec_ptr);
-        let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
-        let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
-        let res = pyre_interpreter::call_function(func, &[pyre_object::w_str_new(module)]);
-        if res.is_null() {
-            return Err(
-                pyre_interpreter::call::take_call_error().unwrap_or_else(|| {
-                    pyre_interpreter::PyError::new(
-                        pyre_interpreter::PyErrorKind::RuntimeError,
-                        "runpy._run_module_as_main returned NULL without an exception",
-                    )
-                }),
-            );
-        }
+        runpy_run_module_as_main(canonical, ec_ptr, module, true)?;
         Ok(())
     })();
 
@@ -1506,23 +1435,183 @@ fn absolute_script_path(filename: &str) -> Option<String> {
     })
 }
 
-fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
-    run_source_with_context(source, mode, filename, no_site, setup_exec_context());
+fn script_startup_dir(path: &str) -> PathBuf {
+    // Initialize sys.path with the script's directory. Under sandbox,
+    // `canonicalize()` issues raw host-FS syscalls (realpath) past the
+    // seccomp lockdown and resolves against the real filesystem, not the
+    // controller VFS; use the virtual path as given instead.
+    #[cfg(feature = "sandbox")]
+    {
+        Path::new(path)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        // `parent()` of a bare `x.py` is the empty path;
+        // `_PyPathConfig_ComputeSysPath0` absolutizes the script's
+        // directory, so resolve the empty case against the cwd rather
+        // than leaving a relative `.` on `sys.path`.
+        let parent = Path::new(path).parent().unwrap_or(Path::new("."));
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        parent.canonicalize().unwrap_or_else(|_| sys_path_cwd())
+    }
 }
 
-fn run_source_with_context(
+fn script_compile_path(path: &str) -> String {
+    // A script is compiled with the same absolute path exposed as
+    // `__main__.__file__`; warnings use `code.co_filename`, so the two must
+    // not diverge when argv[0] was relative.
+    #[cfg(not(feature = "sandbox"))]
+    {
+        std::path::absolute(Path::new(path))
+            .unwrap_or_else(|_| Path::new(path).to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(feature = "sandbox")]
+    {
+        path.to_string()
+    }
+}
+
+/// `app_main.py:1057` treats only `ImportError` as "this hook does not handle
+/// the path" and lets anything else propagate.  `zipimport.ZipImportError` is
+/// a subclass, so a hook that rejects an ordinary file lands here too.  The
+/// kind test comes first because a natively-raised error carries its class in
+/// `kind` and may have no exception object yet.
+fn is_import_error(error: &pyre_interpreter::PyError) -> bool {
+    matches!(
+        error.kind,
+        PyErrorKind::ImportError | PyErrorKind::ModuleNotFoundError
+    ) || raised_is_instance_of(error, "ImportError")
+}
+
+fn path_hook_accepts(
+    filename: &str,
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+) -> Result<bool, pyre_interpreter::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let sys = importing::importhook("sys", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
+    let path_hooks = pyre_interpreter::baseobjspace::getattr_str(sys, "path_hooks")?;
+    if !unsafe { pyre_object::is_list(path_hooks) } {
+        return Ok(false);
+    }
+
+    let _roots = push_roots();
+    let filename_slot = shadow_stack_len();
+    pin_root(pyre_object::w_str_new(filename));
+    let len = unsafe { pyre_object::listobject::w_list_len(path_hooks) };
+    for i in 0..len {
+        let Some(hook) = (unsafe { pyre_object::listobject::w_list_getitem(path_hooks, i as i64) })
+        else {
+            continue;
+        };
+        match pyre_interpreter::call::call_function_impl_result(
+            hook,
+            &[shadow_stack_get(filename_slot)],
+        ) {
+            Ok(_) => return Ok(true),
+            Err(error) if is_import_error(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn runpy_run_module_as_main(
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+    module: &str,
+    alter_argv: bool,
+) -> Result<(), pyre_interpreter::PyError> {
+    let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
+    let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
+    let args = if alter_argv {
+        vec![pyre_object::w_str_new(module)]
+    } else {
+        vec![
+            pyre_object::w_str_new(module),
+            pyre_object::w_bool_from(false),
+        ]
+    };
+    let res = pyre_interpreter::call_function(func, &args);
+    if res.is_null() {
+        return Err(
+            pyre_interpreter::call::take_call_error().unwrap_or_else(|| {
+                pyre_interpreter::PyError::new(
+                    pyre_interpreter::PyErrorKind::RuntimeError,
+                    "runpy._run_module_as_main returned NULL without an exception",
+                )
+            }),
+        );
+    }
+    Ok(())
+}
+
+fn prepare_main_module(
+    execution_context: &Rc<PyExecutionContext>,
+) -> (pyre_object::PyObjectRef, pyre_object::PyObjectRef) {
+    let w_globals = execution_context.fresh_module_globals();
+    let _root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_globals);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            w_globals,
+            "__name__",
+            pyre_object::w_str_new("__main__"),
+        )
+    };
+    let canonical = w_globals;
+    let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
+    importing::set_sys_module("__main__", main_module);
+    (canonical, main_module)
+}
+
+fn handle_main_error(
+    e: pyre_interpreter::PyError,
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+) -> ! {
+    if e.kind == PyErrorKind::SystemExit {
+        finalize_system_exit(e, canonical, ec_ptr);
+    }
+    let is_keyboard_interrupt = is_keyboard_interrupt(&e);
+    // targetpypystandalone.py:88 `finally: space.finish()` — finalize
+    // on every exit path, not only on SystemExit.  Print first: the raw
+    // `PyObjectRef` fields of `e` are not GC-visible and
+    // `finalize_runtime` collects.
+    pyre_interpreter::eprint_exception(&e, true);
+    finalize_runtime(canonical, ec_ptr);
+    maybe_print_jit_stats();
+    if is_keyboard_interrupt {
+        terminate_by_sigint();
+    }
+    std::process::exit(1);
+}
+
+fn finish_main(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionContext) {
+    finalize_runtime(canonical, ec_ptr);
+    maybe_print_jit_stats();
+}
+
+fn eval_source_in_main(
     source: &str,
     mode: Mode,
     filename: &str,
-    no_site: bool,
+    main_file: Option<&str>,
     execution_context: Rc<PyExecutionContext>,
+    canonical: pyre_object::PyObjectRef,
+    main_module: pyre_object::PyObjectRef,
+    no_site: bool,
 ) {
-    // `config_run_filename_abspath` absolutizes the run filename before the
-    // module is compiled, so `co_filename` — and with it every `File "…"` line
-    // a traceback prints — carries the absolute path, not the literal argv
-    // spelling.  `sys.argv[0]` keeps the spelling and is set elsewhere.
-    let main_file = absolute_script_path(filename);
-    let filename = main_file.as_deref().unwrap_or(filename);
     let code = match compile_source_with_filename(source, mode, filename) {
         Ok(code) => code,
         Err(e) => {
@@ -1535,7 +1624,8 @@ fn run_source_with_context(
     };
 
     let ec_ptr = Rc::as_ptr(&execution_context);
-    let mut frame = match PyFrame::new_with_context(code, execution_context) {
+    let mut frame = match PyFrame::new_with_context_and_globals(code, execution_context, canonical)
+    {
         Ok(frame) => frame,
         Err(e) => {
             pyre_interpreter::eprint_exception(&e, true);
@@ -1545,25 +1635,12 @@ fn run_source_with_context(
     // The frame is a GC object, and the only root that reaches one is the
     // `CURRENT_FRAME` / `f_backref` chain the frame walker follows — which it
     // joins when `eval_with_jit` below installs it.  Everything between here
-    // and that call runs Python (`sys`, the importlib bootstrap, `site`) and
-    // can therefore drive a collection that would reclaim the frame and hand
-    // its storage to the next frame allocation.  RPython keeps a local holding
-    // a GC object alive through the translated shadow stack; publish it
-    // explicitly for the same span.
+    // and that call runs Python (`site`) and can therefore drive a collection
+    // that would reclaim the frame and hand its storage to the next frame
+    // allocation.  RPython keeps a local holding a GC object alive through the
+    // translated shadow stack; publish it explicitly for the same span.
     let _main_frame_root = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(&*frame as *const PyFrame as pyre_object::PyObjectRef);
-
-    // Register __main__ module in sys.modules — PyPy: app_main sets
-    // sys.modules['__main__'] before executing user code so that
-    // enum.global_enum and similar introspection works.
-    //
-    // Reuse the frame's canonical globals dict so the module's `w_dict`
-    // shares one identity with `globals()` /
-    // `function.__globals__` (PyPy `module.py:77 Module.getdict()`
-    // parity).
-    let canonical = frame.get_w_globals();
-    let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
-    importing::set_sys_module("__main__", main_module);
 
     // Seed the module-identity attributes every `__main__` namespace carries
     // (pythonrun.c seeds these; `runpy` does the `-m` case). Without them a
@@ -1588,13 +1665,12 @@ fn run_source_with_context(
         );
     }
 
-    // A script run by path gets `__file__` / `__cached__` in `__main__`
-    // (pythonrun.c `_PyRun_SimpleFileObject`); the `-c "<string>"` command
-    // path does not. `__file__` is absolutized (os.path.abspath, 3.9+) while
-    // `sys.argv[0]` keeps the literal command-line path. A stdin run records
-    // the literal `<stdin>`: there is no path to absolutize and no file to
-    // bind a `SourceFileLoader` to.
-    if let Some(file) = main_file.as_deref() {
+    // A script run by path gets `__file__` / `__cached__` in `__main__`;
+    // the `-c "<string>"` command path does not. `__file__` is absolutized
+    // while `sys.argv[0]` keeps the literal command-line path. A stdin run
+    // records the literal `<stdin>`: there is no path to absolutize and no
+    // file to bind a `SourceFileLoader` to.
+    if let Some(file) = main_file {
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,
             "__file__",
@@ -1606,13 +1682,105 @@ fn run_source_with_context(
             pyre_object::w_none(),
         );
     }
-    // Only a real file gets a `SourceFileLoader`; `-c` and stdin keep the
-    // `BuiltinImporter` `seed_main_loader` installs for a `None` path.
     let script_file = if filename == "<stdin>" {
         None
     } else {
-        main_file.as_deref()
+        main_file
     };
+    seed_main_loader(canonical, script_file, ec_ptr);
+    import_site(no_site, canonical, ec_ptr);
+
+    match eval_with_jit(&mut frame) {
+        Ok(result) => {
+            if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
+                println!("{}", PyDisplay(result));
+            }
+        }
+        Err(e) => handle_main_error(e, canonical, ec_ptr),
+    }
+    finish_main(canonical, ec_ptr);
+}
+
+fn read_script_source(path: &str, binary_name: &str) -> String {
+    // The script is read through the import machinery's source provider, so
+    // under sandbox the controller VFS mediates it over the same channel
+    // module imports use.  The bytes then go through the tokenizer's BOM /
+    // PEP 263 decoding in every build.
+    match importing::read_source_bytes(Path::new(path)) {
+        Ok(bytes) => match pyre_interpreter::decode_source_bytes(
+            &bytes,
+            rustpython_wtf8::Wtf8::new(path),
+            false,
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                pyre_interpreter::eprint_exception(&error, false);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("{binary_name}: cannot open '{path}': {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_script_path(path: &str, filename: &str, no_site: bool, binary_name: &str) {
+    let execution_context = setup_exec_context();
+    let ec_ptr = Rc::as_ptr(&execution_context);
+    let (canonical, main_module) = prepare_main_module(&execution_context);
+
+    let result = (|| -> Result<bool, pyre_interpreter::PyError> {
+        // Import `sys` up front so its creation flushes the native search-path
+        // seed into `sys.path` before `site` and user code read it.
+        let _ = importing::importhook("sys", canonical, pyre_object::PY_NULL, 0, ec_ptr);
+        // pylifecycle.c init_importlib before site: install the importlib
+        // bootstrap so `sys.meta_path` / `sys.path_hooks` are populated before
+        // the run target is chosen.
+        if let Err(e) = init_importlib_bootstrap(canonical, ec_ptr) {
+            eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
+        }
+        path_hook_accepts(filename, canonical, ec_ptr)
+    })();
+
+    match result {
+        Ok(true) => {
+            importing::restage_sys_path_0(std::ffi::OsStr::new(filename));
+            import_site(no_site, canonical, ec_ptr);
+            if let Err(e) = runpy_run_module_as_main(canonical, ec_ptr, "__main__", false) {
+                handle_main_error(e, canonical, ec_ptr);
+            }
+            finish_main(canonical, ec_ptr);
+        }
+        Ok(false) => {
+            let source = read_script_source(path, binary_name);
+            let main_file = absolute_script_path(filename);
+            let filename = main_file.as_deref().unwrap_or(filename);
+            eval_source_in_main(
+                &source,
+                Mode::Exec,
+                filename,
+                main_file.as_deref(),
+                execution_context,
+                canonical,
+                main_module,
+                no_site,
+            );
+        }
+        Err(e) => handle_main_error(e, canonical, ec_ptr),
+    }
+}
+
+fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
+    // `config_run_filename_abspath` absolutizes the run filename before the
+    // module is compiled, so `co_filename` — and with it every `File "…"` line
+    // a traceback prints — carries the absolute path, not the literal argv
+    // spelling.  `sys.argv[0]` keeps the spelling and is set elsewhere.
+    let main_file = absolute_script_path(filename);
+    let filename = main_file.as_deref().unwrap_or(filename);
+    let execution_context = setup_exec_context();
+    let ec_ptr = Rc::as_ptr(&execution_context);
+    let (canonical, main_module) = prepare_main_module(&execution_context);
 
     // Import `sys` up front so its creation flushes the native search-path seed
     // into `sys.path` before `site` and user code read it.
@@ -1627,36 +1795,16 @@ fn run_source_with_context(
         eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
     }
 
-    seed_main_loader(canonical, script_file, ec_ptr);
-
-    import_site(no_site, canonical, ec_ptr);
-
-    match eval_with_jit(&mut frame) {
-        Ok(result) => {
-            if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
-                println!("{}", PyDisplay(result));
-            }
-        }
-        Err(e) => {
-            if e.kind == PyErrorKind::SystemExit {
-                finalize_system_exit(e, canonical, ec_ptr);
-            }
-            let is_keyboard_interrupt = is_keyboard_interrupt(&e);
-            // targetpypystandalone.py:88 `finally: space.finish()` — finalize
-            // on every exit path, not only on SystemExit.  Print first: the raw
-            // `PyObjectRef` fields of `e` are not GC-visible and
-            // `finalize_runtime` collects.
-            pyre_interpreter::eprint_exception(&e, true);
-            finalize_runtime(canonical, ec_ptr);
-            maybe_print_jit_stats();
-            if is_keyboard_interrupt {
-                terminate_by_sigint();
-            }
-            std::process::exit(1);
-        }
-    }
-    finalize_runtime(canonical, ec_ptr);
-    maybe_print_jit_stats();
+    eval_source_in_main(
+        source,
+        mode,
+        filename,
+        main_file.as_deref(),
+        execution_context,
+        canonical,
+        main_module,
+        no_site,
+    );
 }
 
 #[cfg(test)]
