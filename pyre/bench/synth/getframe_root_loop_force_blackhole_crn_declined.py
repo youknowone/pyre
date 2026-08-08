@@ -4,10 +4,14 @@
 # covered now that its own call site folds.
 #
 # `try_walker_specialize_sys_getframe` (jitcode_dispatch/specialize.rs) takes
-# only depth 0 at the top walk level, where `getframe`'s answer IS the portal
-# virtualizable and no force is needed.
-# `sys._getframe(1)` names a frame BELOW the portal, which the walk holds no
-# OpRef for, so it stays the opaque forcing residual this file's shape needs.
+# depth 0 at the top walk level, where `getframe`'s answer IS the portal
+# virtualizable and no force is needed, so the CALL folds here as well. The
+# force this file needs comes from the `.f_locals` getset on the folded
+# result: it reads the virtualizable's own fields, so it routes through
+# `force_frame_before_locals_read` on the portal and escapes it.
+#
+# A nonzero depth does NOT serve. `getframe` forces only the frame it RETURNS,
+# and one below the portal is not the traced virtualizable, so nothing escapes.
 #
 # The counters recorded for this file are the ones its original
 # carried before the fold; a diff against them is a real change in the escape
@@ -53,8 +57,8 @@ def main():
     total = 0
     names = set()
     for i in range(20000):
-        fr = sys._getframe(1)
-        names.add(fr.f_code.co_name)
+        fr = sys._getframe(0)
+        names.add(len(fr.f_locals))
         total += i
     print(total, sorted(names))
 

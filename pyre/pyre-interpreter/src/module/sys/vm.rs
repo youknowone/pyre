@@ -607,11 +607,10 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// a stub, so `frame.f_globals is globals()` holds and `f_back` chains lazily
 /// through `pyframe.py:767 GetSetProperty(PyFrame.fget_f_back)`.
 ///
-/// DEVIATION — the two VIRTUALIZABLE forces. The distinction matters: the vref
-/// force is common to both worlds and is not optional
-/// (`ExecutionContext::gettopframe_raw`), so `gettopframe_nohidden` is not
-/// "force-free" — it is free of the *virtualizable* force that
-/// `gettopframe` adds. Upstream takes neither of those, because
+/// DEVIATION — the VIRTUALIZABLE force on `current`. The vref force is common
+/// to both worlds and is not optional (`ExecutionContext::gettopframe_raw`), so
+/// `gettopframe_nohidden` is not "force-free" — it is free of the
+/// *virtualizable* force. Upstream takes neither, because
 /// `look_inside_iff(isconstant(depth))` traces a constant `depth` THROUGH, so
 /// the walk never becomes a residual call — and the frame it hands to app level
 /// materialises through the force `rvirtualizable.py:49-53 hook_access_field`
@@ -619,43 +618,51 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// `jtransform.py:2164-2172 rewrite_op_jit_force_virtualizable` deletes only in
 /// the graphs the codewriter looks inside.  Pyre has no such injection —
 /// `rclass.rs buildinstancerepr` declines a virtualizable `InstanceRepr`
-/// outright — so these two calls ARE that mechanism, relocated to one consumer.
-/// Pyre calls this residually, so both forces are load-bearing here:
-/// `gettopframe()` because a JIT-inlined callee has no frame of its own until a
-/// force materialises one — an unforced walk would start at the caller and then
-/// read `f_back` off a frame that never existed — and `force_frame` because app
-/// code is about to read `f_lineno` / `f_locals` off a frame whose
-/// virtualizable fields the JIT may still be holding.
+/// outright — so the `force_frame` below IS that mechanism, relocated to one
+/// consumer.
 ///
-/// The price is that each call trips `vable_after_residual_call` and aborts the
-/// trace, against `abort: vable escape: 0` and `forcings: 0` on the same
-/// fixtures under real pypy3.
+/// It is relocated onto the frame the injection would have fired for: the one
+/// this call RETURNS, whose `f_lineno` / `f_locals` app code is about to read.
+/// The walk itself needs no such force. It reads `hide()` (`pycode`, written at
+/// construction) and `f_backref` (not a virtualizable field at all), and a level
+/// the JIT kept virtual is materialised by the vref force
+/// `gettopframe_nohidden` already takes.
+///
+/// Which frame carries the force decides whether the caller's loop survives.
+/// `force_pyframe` (`pyre-jit/src/eval.rs`) clears the traced virtualizable's
+/// `TOKEN_TRACING_RESCALL` only for a frame `flush_active_frame_escape` matches
+/// — the portal itself, or the concrete frame an inline sub-walk published — and
+/// that clear is what `tracing_after_residual_call` reads as
+/// `VableEscapedDuringResidualCall`. Forcing the top of the stack regardless of
+/// `depth` therefore escaped the portal on every call, including the ones whose
+/// answer lies BELOW it; upstream escapes nothing there, because
+/// `pyjitpl.py:2159-2161 _do_jit_force_virtual` answers `topframeref` with
+/// `virtualizable_boxes[-1]` and never forces it. Measured over the `getframe_*`
+/// corpus: five fixtures that had never compiled a loop now compile one, and the
+/// two bridge fixtures read `guard_failures` 4114 → 201.
 ///
 /// `try_walker_specialize_sys_getframe`
 /// (`pyre-jit-trace/src/jitcode_dispatch/specialize.rs`) reproduces upstream's
 /// traced-through form for the one level it can resolve — depth 0 at the top
 /// walk level, where the answer IS the portal virtualizable — so those call
-/// sites reach neither this function nor its forces. Over the `getframe_*`
+/// sites reach neither this function nor its force. Over the `getframe_*`
 /// corpus that took `loops_aborted` 155 → 71 and `loops_compiled` 6 → 22.
 ///
-/// Every other shape still arrives here, and both forces stay load-bearing for
+/// Every other shape still arrives here, and the force stays load-bearing for
 /// it. A call site inside an INLINED callee is the one the arm must keep
 /// declining: that frame carries `last_instr = -1`
 /// (`pyre-jit-trace/src/helpers.rs`) with nothing updating it through the body,
 /// so folding it would compile a `_getframe().f_lineno` reporting the `def`
 /// line where the residual's force answers correctly today. The `*_declined`
-/// fixtures under `pyre/bench/synth` hold each folded shape's escape at a
-/// depth the arm refuses, so the machinery behind these forces keeps its
-/// coverage.
+/// fixtures under `pyre/bench/synth` hold each folded shape's escape at a read
+/// the arm does not cover — `_getframe(0).f_locals`, whose getset forces the
+/// portal on its own — so the machinery behind this force keeps its coverage.
 pub fn getframe(depth: i64) -> crate::PyResult {
     let ec = current_execution_context();
     let mut current = if ec.is_null() {
         std::ptr::null_mut()
     } else {
-        unsafe {
-            (*ec).gettopframe();
-            (*ec).gettopframe_nohidden()
-        }
+        unsafe { (*ec).gettopframe_nohidden() }
     };
     let mut remaining = depth;
     loop {
@@ -1236,10 +1243,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if ec.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            // Force the frame `topframeref` names before walking, for the same
-            // reason `sys._getframe` above does: a JIT-inlined callee has no
-            // frame until the force materialises one, so an unforced walk would
-            // start at the caller and report the caller's module.
+            // Force the frame `topframeref` names before walking.  Kept where
+            // [`getframe`] no longer has it: this walk takes no force on the
+            // frame it ENDS at and then reads that frame's `w_globals`, so
+            // whether the force belongs here at all is a separate question from
+            // the one settled above.
             let mut current = unsafe {
                 (*ec).gettopframe();
                 (*ec).gettopframe_nohidden()

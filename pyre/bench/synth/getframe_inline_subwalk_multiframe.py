@@ -17,12 +17,19 @@
 # the concrete frame it owns, the chain is adopted rather than replayed. This fixture pins the
 # result across that adopt.
 #
-# One `sys._getframe(1)` level does NOT reach the build: the chain needs a
-# residual level under the walked frame and an inlined level under that, so
-# the force has to reach two frames up. No other fixture in the corpus gets
-# here -- in the historical gate-enabled sweep with `PYRE_FBW_DEBUG_ABORT=1`,
-# 0 of 310 reached `BUILT multi-frame`, so without this one the path has no
-# repro at all.
+# The build wants an escape whose forced frame is the one the inline sub-walk
+# PUBLISHED, so the chain has a residual level under the walked frame and an
+# inlined level under that. `sys._getframe(0).f_locals` in `leaf` is that
+# escape: the depth-0 call names `leaf`'s own frame, the arm declines inside a
+# sub-walk, and the getset forces the published frame.
+#
+# The `sys._getframe(2)` read below is the OUTPUT guard and is not what reaches
+# the build -- `getframe` forces only the frame it returns, and two levels up is
+# `main`'s, i.e. the portal, which escapes on the ordinary portal path. Without
+# the depth-0 line the file still answers correctly and stops building a
+# multi-frame image at all (measured: `fbw_blackhole_adopted_multi_frame` 5 ->
+# 0). In the historical gate-enabled sweep with `PYRE_FBW_DEBUG_ABORT=1`, 0 of
+# 310 fixtures reached `BUILT multi-frame`.
 #
 # The multi-frame image is built unconditionally when the latch conditions hold,
 # so this is both an output guard and build-path coverage: 5 builds, 5 adopts,
@@ -47,6 +54,7 @@ import sys
 
 
 def leaf(x):
+    sys._getframe(0).f_locals
     return sys._getframe(2).f_locals["base"] + x
 
 

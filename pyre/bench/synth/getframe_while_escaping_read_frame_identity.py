@@ -30,6 +30,13 @@
 # replay that stood in for it. Note the read has to be the ESCAPING call: once
 # the escape has happened, a `sys._getframe(1)` executed inside the blackhole was
 # always correct, because the chain publishes each level's frame as it runs.
+#
+# Both reads still escape — `_gf()` names `leaf_a`'s published frame and
+# `_gf(1)` names `part_b`'s portal — but only once per call now that
+# `sys._getframe` forces the frame it RETURNS and not also the top of the stack.
+# The multi-frame adopts this file exists for are unmoved at 10; what the
+# duplicate escape carried was the single-frame count, 5 -> 0, alongside
+# `part_a`'s loop compiling.
 import sys
 
 _gf = sys._getframe

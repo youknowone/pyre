@@ -36,6 +36,13 @@
 #
 # Neither read goes through `.f_locals`: that getset forces the frame on its
 # own, and a forcing read would mask exactly the staleness under test.
+#
+# `sys._getframe` forces only the frame it RETURNS, so this file takes one
+# escape per call rather than the two it took when the walk also forced the top
+# of the stack. That is the whole of its recorded
+# `fbw_blackhole_adopted_single_frame` 5 -> 0 / `loops_aborted` 10 -> 5, and
+# `outer`'s loop compiles now — which makes the assertion above stricter, not
+# weaker, since the coordinate it reads comes out of a compiled activation.
 import sys
 
 N = 30000

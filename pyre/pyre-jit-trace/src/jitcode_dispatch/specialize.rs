@@ -7681,16 +7681,19 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 ///
 /// Pyre residualizes the same walk as one opaque `bh_call_fn(_getframe,
 /// PY_NULL, depth)` `CallMayForce`, and [`pyre_interpreter::module::sys::vm::getframe`]'s
-/// two explicit `force_frame`s — the stand-in for the injection
+/// `force_frame` on the frame it returns — the stand-in for the injection
 /// `rvirtualizable.py:49-53 hook_access_field` performs and pyre's rtyper
-/// cannot build — then clear `TOKEN_TRACING_RESCALL` inside that call, which
-/// `tracing_after_residual_call` reads as an escape
-/// (`VableEscapedDuringResidualCall`).  Removing the residual removes both
-/// forces with it, and nothing has to replace them: `last_instr` is published
-/// onto the portal frame at every may-force boundary (`LiveLastInstrGuard`),
-/// and every getset that reads a virtualizable field off the handed-out frame
-/// (`f_locals`, and `f_lasti` / `f_lineno` through their own `jit_getattr`
-/// residual) is itself such a boundary.
+/// cannot build — clears `TOKEN_TRACING_RESCALL` inside that call whenever the
+/// returned frame is the traced one, which `tracing_after_residual_call` reads
+/// as an escape (`VableEscapedDuringResidualCall`).  At depth 0 the returned
+/// frame is always the portal, so the residual always escapes.  Removing it
+/// removes the force with it, and nothing has to replace it: `last_instr` is
+/// published onto the portal frame at every may-force boundary
+/// (`LiveLastInstrGuard`), and every getset that reads a virtualizable field
+/// off the handed-out frame (`f_locals`, and `f_lasti` / `f_lineno` through
+/// their own `jit_getattr` residual) is itself such a boundary.  Of those only
+/// `f_locals` also FORCES: measured against this fold, swapping a fixture's
+/// forcing read for `f_lasti` or `f_lineno` leaves `loops_aborted` at 0.
 ///
 /// Emitted shape, following `getframe`'s body line by line:
 /// `guard_value(callable)`; `guard_class` + exact-class + `getfield_gc_i` on

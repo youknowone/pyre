@@ -24,6 +24,11 @@
 # `max-pypy-ratio` for the same reason `exception_reused_object_tb_not_doubled`
 # has none — this is a shape oracle, not a workload.
 #
+# `sys._getframe` forces only the frame it RETURNS, so `raiser`'s `_getframe(1)`
+# escapes the portal once per call instead of twice; that halving is this file's
+# recorded `fbw_blackhole_adopted_single_frame` 10 -> 5, with `loops_aborted`
+# unmoved.
+#
 # Expected output: (20000, 20000, 20000)
 import sys
 
