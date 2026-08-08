@@ -2550,15 +2550,25 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = new_descr_class(args, "complex")?;
+    // complexobject.py descr__new__(space, w_complextype, w_real, w_imag=None)
+    // with `@unwrap_spec(w_real=WrappedDefault(0.0))` — one to three positionals
+    // counting the class.  The gateway rejects a surplus before any subtype
+    // __init__ can absorb it, so this check is unconditional.
+    let (value_positional, _) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    if value_positional.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "complex.__new__() takes from 1 to 3 positional arguments but {} were given",
+            value_positional.len() + 1
+        )));
+    }
     let value = crate::builtins::builtin_complex(&args[1..])?;
-    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
-        return Ok(value);
-    }
-    let complex_typeobj = gettypefor(&pyre_object::COMPLEX_TYPE);
-    if complex_typeobj.map_or(false, |t| std::ptr::eq(cls, t.as_ptr())) {
-        return Ok(value);
-    }
-    // Subclass path — retag a fresh W_ComplexObject with the subclass.
+    // tp_new_wrapper (subclass_to_tag) rejects a non-type or non-subtype cls and
+    // returns None for base `complex`; a strict subclass retags a fresh
+    // W_ComplexObject so the tag never lands on a foreign layout.
+    let sub = match subclass_to_tag(cls, &pyre_object::COMPLEX_TYPE)? {
+        Some(sub) => sub,
+        None => return Ok(value),
+    };
     let (re, im) = unsafe {
         (
             pyre_object::w_complex_get_real(value),
@@ -2566,7 +2576,7 @@ fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         )
     };
     let obj = pyre_object::complexobject::w_complex_subclass_new(re, im);
-    Ok(tag_subclass_instance(obj, cls))
+    Ok(tag_subclass_instance(obj, sub))
 }
 
 /// Build a builtin type's `__new__` entry.
@@ -3586,7 +3596,8 @@ fn subclass_to_tag(
     if !unsafe { pyre_object::is_type(cls) } {
         let base_name = unsafe { pyre_object::w_type_get_name(base_obj) };
         return Err(crate::PyError::type_error(format!(
-            "{base_name}.__new__(X): X is not a type object"
+            "{base_name}.__new__(X): X is not a type object ({})",
+            crate::type_methods::arg_type_name(cls)
         )));
     }
     if !unsafe { crate::baseobjspace::issubtype_w(cls, base_obj) } {

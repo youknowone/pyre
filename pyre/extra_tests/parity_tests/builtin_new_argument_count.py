@@ -1,4 +1,4 @@
-"""`type.__new__` and `bool.__new__` decide on the argument count.
+"""`type.__new__`, `bool.__new__` and `complex.__new__` decide on the argument count.
 
 `typeobject.py:886-911 descr__new__` receives the metatype as its own gateway
 parameter and the rest as `__args__`, so the one-versus-three form is settled by
@@ -7,6 +7,14 @@ parameter and the rest as `__args__`, so the one-versus-three form is settled by
 that survives `_calculate_metaclass` still has to pass
 `W_TypeObject.check_user_subclass` (`typeobject.py:555-567`) on the way through
 `allocate_instance`.
+
+`complexobject.py:325-327 descr__new__` is a gateway of
+`(space, w_complextype, w_real, w_imag=None)` with
+`@unwrap_spec(w_real=WrappedDefault(0.0))`, so one to three positionals counting
+the class are accepted and the surplus is refused before any subtype `__init__`
+sees it.  The class then goes through the same `tp_new_wrapper` check every
+builtin `__new__` uses, which is what keeps a complex payload from being stamped
+with a type of a different layout.
 
 The wordings differ between implementations, so only the exception type is
 asserted here; each refusal below is one the reference raises too.
@@ -21,6 +29,14 @@ def raises_type_error(label, fn):
     except TypeError:
         return
     raise AssertionError(f"{label} returned {result!r} instead of raising TypeError")
+
+
+def message(fn):
+    try:
+        fn()
+    except TypeError as exc:
+        return str(exc)
+    raise AssertionError("expected TypeError")
 
 
 # A non-type metatype is refused, not used to build a class.
@@ -89,17 +105,49 @@ raises_type_error("bool(x=1)", lambda: bool(x=1))
 assert bool() is False
 assert bool(1) is True
 
+# `complex.__new__` counts the class argument along with `real` and `imag`.
+raises_type_error("complex(1, 2, 3)", lambda: complex(1, 2, 3))
+raises_type_error("complex(1, 2, 3, 4)", lambda: complex(1, 2, 3, 4))
+raises_type_error("complex.__new__(complex, 1, 2, 3)", lambda: complex.__new__(complex, 1, 2, 3))
+assert complex() == 0j
+assert complex(1) == 1 + 0j
+assert complex(1, 2) == 1 + 2j
+assert complex(imag=2) == 2j
+
+
+class ComplexInit(complex):
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+# The count is settled in `__new__`, so an `__init__` that would swallow the
+# surplus never gets the chance.
+raises_type_error("ComplexInit(1, 2, 3)", lambda: ComplexInit(1, 2, 3))
+assert ComplexInit(1, 2) == 1 + 2j
+assert type(ComplexInit(1, 2)) is ComplexInit
+
+# A class argument that is not a type, or not a subtype of `complex`, is refused
+# rather than stamped onto the fresh complex.
+raises_type_error("complex.__new__(1)", lambda: complex.__new__(1))
+raises_type_error("complex.__new__(int)", lambda: complex.__new__(int))
+raises_type_error("complex.__new__(object)", lambda: complex.__new__(object))
+assert complex.__new__(complex, 1, 2) == 1 + 2j
+assert type(complex.__new__(ComplexInit, 1, 2)) is ComplexInit
+
+# The subtype refusal is worded identically by both references.
+assert (
+    message(lambda: complex.__new__(int))
+    == "complex.__new__(int): int is not a subtype of complex"
+)
+assert (
+    message(lambda: complex.__new__(object))
+    == "complex.__new__(object): object is not a subtype of complex"
+)
+
 if sys.implementation.name != "cpython":
     # `descr__new__` names both accepted counts for `type` itself and only the
     # three-argument form for any other metatype, and `_precheck_for_new` runs
     # after that decision, so an unvalidated metatype reaches `%N`.
-    def message(fn):
-        try:
-            fn()
-        except TypeError as exc:
-            return str(exc)
-        raise AssertionError("expected TypeError")
-
     assert message(lambda: type.__new__(type)) == "type.__new__() takes 1 or 3 arguments"
     assert (
         message(lambda: type.__new__(42, "A", ()))
@@ -113,6 +161,22 @@ if sys.implementation.name != "cpython":
     assert (
         message(lambda: bool(1, 2))
         == "bool.__new__() takes from 1 to 2 positional arguments but 3 were given"
+    )
+    assert (
+        message(lambda: complex(1, 2, 3))
+        == "complex.__new__() takes from 1 to 3 positional arguments but 4 were given"
+    )
+
+if sys.implementation.name != "pypy":
+    # `tp_new_wrapper` names the class it rejected; the other reference reports
+    # it from the gateway's own unwrap instead and never reaches this check.
+    assert (
+        message(lambda: complex.__new__(1))
+        == "complex.__new__(X): X is not a type object (int)"
+    )
+    assert (
+        message(lambda: float.__new__(1))
+        == "float.__new__(X): X is not a type object (int)"
     )
 
 print("OK")
