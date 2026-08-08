@@ -26,6 +26,7 @@
       "dynasm": "PASS"
     },
     "test.test_abc": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_abstract_numbers": {
@@ -97,6 +98,7 @@
       "dynasm": "PASS"
     },
     "test.test_bisect": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_bool": {
@@ -169,6 +171,7 @@
       "reason": "implementation detail"
     },
     "test.test_code_module": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_codeccallbacks": {
@@ -214,6 +217,7 @@
       "dynasm": "FAIL"
     },
     "test.test_collections": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_colorsys": {
@@ -256,6 +260,7 @@
       "dynasm": "PASS"
     },
     "test.test_contextlib": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_contextlib_async": {
@@ -263,6 +268,7 @@
       "dynasm": "PASS"
     },
     "test.test_copy": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_copyreg": {
@@ -292,6 +298,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_dataclasses": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_datetime": {
@@ -385,9 +392,11 @@
       "dynasm": "PASS"
     },
     "test.test_enum": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_enumerate": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_eof": {
@@ -492,6 +501,7 @@
       "dynasm": "PASS"
     },
     "test.test_functools": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_future_stmt": {
@@ -565,6 +575,7 @@
       "dynasm": "PASS"
     },
     "test.test_heapq": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_hmac": {
@@ -597,9 +608,11 @@
       "dynasm": "PASS"
     },
     "test.test_import": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_importlib": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_index": {
@@ -607,6 +620,7 @@
       "dynasm": "PASS"
     },
     "test.test_inspect": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_int": {
@@ -728,6 +742,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_modulefinder": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_monitoring": {
@@ -780,6 +795,7 @@
       "dynasm": "PASS"
     },
     "test.test_operator": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_optimizer": {
@@ -829,9 +845,11 @@
       "dynasm": "PASS"
     },
     "test.test_picklebuffer": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_pickletools": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_pkg": {
@@ -839,6 +857,7 @@
       "dynasm": "PASS"
     },
     "test.test_pkgutil": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_platform": {
@@ -881,6 +900,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_property": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_pstats": {
@@ -959,6 +979,7 @@
       "dynasm": "PASS"
     },
     "test.test_runpy": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_sax": {
@@ -1154,6 +1175,7 @@
       "dynasm": "PASS"
     },
     "test.test_time": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_timeit": {
@@ -1397,10 +1419,10 @@
       "reason": "demands too many resources"
     },
     "test.test_zipimport": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_zipimport_support": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_zlib": {
       "dynasm": "IMPORTERROR"
