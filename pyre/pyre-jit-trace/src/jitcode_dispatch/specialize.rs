@@ -3345,6 +3345,10 @@ pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
 /// subclasses, so the one receiver pin covers reassignment or deletion on any
 /// base class as well.
 ///
+/// A name the metatype answers with a data descriptor is refused by the oracle,
+/// so `__name__` never reaches here — [`try_walker_specialize_load_type_name_attr`]
+/// is its fold, and the two cover the disjoint arms of `descr_getattribute`.
+///
 /// The name needs no operand guard: the codewriter baked its `co_names` index
 /// into the residual.  This read-only, present-attribute fold cannot raise, so
 /// unlike the classmethod method-load fold it is safe inside an inlined callee

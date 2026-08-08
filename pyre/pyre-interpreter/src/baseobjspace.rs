@@ -9697,6 +9697,10 @@ pub unsafe fn type_name_obj_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef
 /// metatype data descriptor, a missing class-MRO value, or any value with a
 /// descriptor protocol declines.
 ///
+/// This is the `:820-822` arm, and [`type_name_obj_fast_path`] is the
+/// `:814-819` one: a name the metatype answers with a data descriptor — which
+/// is what `__name__` is — is refused here and folded there instead.
+///
 /// The value type must additionally be a non-heap builtin type.  Its namespace
 /// cannot be mutated from Python and it cannot be the target of a `__class__`
 /// assignment, so an absent `__get__` remains absent for the life of the trace.
