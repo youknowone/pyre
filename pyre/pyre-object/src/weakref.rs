@@ -12,6 +12,14 @@
 use crate::gc_hook::try_gc_alloc;
 use crate::pyobject::*;
 
+/// Interpreter-level layout tag shared by PyPy's `W_Weakref` and
+/// `W_AbstractProxy` families.  The current host representation still uses
+/// `W_ObjectObject` storage, but the type's `Layout.typedef` must remain
+/// distinct from plain `object`: user subclasses inherit the weak-reference
+/// prefix before their own slots, and CPython 3.14 exposes that prefix through
+/// `type.__basicsize__`.
+pub static WEAKREF_LAYOUT_TYPE: PyType = new_pytype("W_WeakrefBase");
+
 /// GC type id for the WEAKREF GcStruct. Registered by
 /// `pyre-jit::eval::init` after `W_INT_MUTABLE_CELL` and before the
 /// per-exception kind loop. A `debug_assert_eq!` in the registration

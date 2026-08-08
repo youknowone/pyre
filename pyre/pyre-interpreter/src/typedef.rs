@@ -10334,6 +10334,12 @@ fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
         (6 * word, 0)
     } else if is(&pyre_object::functional::ENUMERATE_TYPE) {
         (7 * word, 0)
+    } else if is(&pyre_object::weakref::WEAKREF_LAYOUT_TYPE) {
+        // CPython 3.14 `PyWeakReference`: object header, doubly-linked
+        // weakref list, callback, hash/cache word and vectorcall slot.
+        // PyPy likewise gives W_WeakrefBase/W_Weakref their own typedef;
+        // subclasses append their declared slots to this prefix.
+        (8 * word, 0)
     } else {
         return None;
     };
@@ -29111,6 +29117,19 @@ mod tests {
         crate::typedef::init_typeobjects();
         let object_type = crate::typedef::w_object();
         assert!(crate::type_dict_contains(object_type, "__class__"));
+    }
+
+    #[test]
+    fn weakref_types_have_cpython_314_layout_metadata() {
+        crate::typedef::init_typeobjects();
+        let word = std::mem::size_of::<usize>() as i64;
+        for w_type in [
+            crate::module::_weakref::interp__weakref::weakref_type(),
+            crate::module::_weakref::interp__weakref::proxy_type(),
+            crate::module::_weakref::interp__weakref::callable_proxy_type(),
+        ] {
+            assert_eq!(super::cpython_type_layout(w_type), Some((8 * word, 0)));
+        }
     }
 
     #[test]
