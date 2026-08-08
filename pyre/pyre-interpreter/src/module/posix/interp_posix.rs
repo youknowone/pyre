@@ -1021,13 +1021,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
     // _have_functions — list of HAVE_* macro names that were defined at
     // build time. os.py uses this to populate the supports_* capability sets
-    // (supports_dir_fd / supports_fd / supports_follow_symlinks), which
-    // callers like shutil.rmtree consult to choose between fd-relative and
-    // path-based implementations. Only the macros whose functionality is
-    // actually implemented may be listed: of the `*at` family that is
-    // HAVE_FSTATAT, HAVE_FCHOWNAT and HAVE_UTIMENSAT, the three calls that
-    // resolve a dir_fd-relative name. HAVE_LSTAT remains so os.stat is reported
-    // in supports_follow_symlinks (follow_symlinks=False works).
+    // (supports_dir_fd / supports_effective_ids / supports_fd /
+    // supports_follow_symlinks), which callers like shutil.rmtree consult to
+    // choose between fd-relative and path-based implementations. Only the
+    // macros whose functionality is actually implemented may be listed — the
+    // entry beside each one below names the claim os.py reads out of it, so a
+    // bit whose call is still missing has no entry at all rather than a
+    // qualified one.
     //
     // Each bit is the same constant the entry point itself branches on, so the
     // advertisement cannot drift from the behaviour: a build where `chdir`
@@ -1036,6 +1036,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // probes/mutators are raising stubs, and on the hosts that carry no
     // `host_env::posix` at all.
     let have_functions: &[(&str, bool)] = &[
+        // os.py:117,137,158 reads this as `access` honouring all three of its
+        // modifiers, which is the one `faccessat` its body makes.
+        ("HAVE_FACCESSAT", HAVE_FACCESSAT),
         ("HAVE_FCHDIR", HAVE_FCHDIR),
         ("HAVE_FCHMOD", HAVE_FCHMOD),
         ("HAVE_FCHOWN", HAVE_FCHOWN),
@@ -3958,6 +3961,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// descriptor. `os.py:140-155` reads them into `supports_fd`, so a bit set
     /// where the call still rejects an integer hands the caller a capability it
     /// cannot use.
+    /// `rposix.HAVE_FACCESSAT` — what `access` types its `dir_fd` as
+    /// (`interp_posix.py:745`) and what its two flag modifiers are tested
+    /// against (`:771-775`). All three of `access`'s modifiers are the one
+    /// `faccessat` call, so the same bit carries them: `os.py:117,137,158` read
+    /// it into `supports_dir_fd`, `supports_effective_ids` and
+    /// `supports_follow_symlinks` alike, and it is the only bit any of those
+    /// three reads for `access`.
+    const HAVE_FACCESSAT: bool = HOST_POSIX;
     const HAVE_FCHDIR: bool = HOST_POSIX;
     const HAVE_FCHMOD: bool = HOST_POSIX;
     const HAVE_FCHOWN: bool = HOST_POSIX;
@@ -4057,6 +4068,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `dir_fd_unavailable` reports it.
     fn dir_fd_unavailable() -> crate::PyError {
         crate::PyError::not_implemented("dir_fd unavailable on this platform")
+    }
+
+    /// `argument_unavailable` (`interp_posix.py:298-301`) — a modifier this
+    /// platform has no call to apply, named together with the entry point that
+    /// was asked to apply it.
+    #[cfg(all(unix, feature = "host_env"))]
+    fn argument_unavailable(funcname: &str, arg: &str) -> crate::PyError {
+        crate::PyError::not_implemented(format!("{funcname}: {arg} unavailable on this platform"))
     }
 
     /// `os.link` takes its two names positionally and everything else by
@@ -7189,9 +7208,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if !follow_symlinks {
                     let errno = crate::builtins::io_error_posix_errno(&err, 0);
                     if errno == libc::ENOTSUP || errno == libc::EOPNOTSUPP {
-                        return Err(crate::PyError::not_implemented(format!(
-                            "{name}: follow_symlinks unavailable on this platform"
-                        )));
+                        return Err(argument_unavailable(name, "follow_symlinks"));
                     }
                 }
                 return Err(io_err_with_filename(err, path.w_path()));
@@ -7470,25 +7487,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
-        // os.access(path, mode) -> bool
+        // os.access(path, mode, *, dir_fd=None, effective_ids=False,
+        //           follow_symlinks=True) -> bool
         crate::module_ns_store(
             ns,
             "access",
             crate::make_builtin_function("access", |args| {
                 // `access` names three keyword-only modifiers, so a third
-                // positional is an error rather than a `dir_fd`. None of the
-                // three is implemented here — the body calls `access(2)`, not
-                // `faccessat(2)` — and `os.supports_dir_fd`,
-                // `os.supports_effective_ids` and `os.supports_follow_symlinks`
-                // all omit `access` to say so. Binding them is what makes an
-                // unknown keyword an error; answering them is a separate gap.
-                let (bound, _kwargs) = bind_path_args(
+                // positional is an error rather than a `dir_fd`.
+                let (bound, kwargs) = bind_path_args(
                     args,
                     "access",
                     &["path", "mode"],
                     2,
                     &["dir_fd", "effective_ids", "follow_symlinks"],
                 )?;
+                // The parameters convert in declaration order, and every one of
+                // them can raise, so the order is observable: `path` reports
+                // before `mode`, `mode` before `dir_fd`, and both before either
+                // flag's `__bool__` is called at all.
                 let path = crate::gateway::fsencode_path_named_w(
                     bound[0].expect("path is required"),
                     "access",
@@ -7497,25 +7514,73 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 .as_bytes;
                 // interp_posix.py:744 `@unwrap_spec(mode=c_int, ...)`.
                 let mode = crate::baseobjspace::c_int_w(bound[1].expect("mode is required"))?;
+                // interp_posix.py:745 types `dir_fd` as
+                // `DirFD(rposix.HAVE_FACCESSAT)`, so a host with no `faccessat`
+                // turns the descriptor away instead of resolving the name
+                // against the working directory as though none had been given.
+                let dir_fd = dir_fd_kwarg(kwargs, HAVE_FACCESSAT)?;
+                let effective_ids = match crate::builtins::kwarg_get(kwargs, "effective_ids") {
+                    Some(v) => crate::baseobjspace::is_true(v)?,
+                    None => false,
+                };
+                let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                    Some(v) => crate::baseobjspace::is_true(v)?,
+                    None => true,
+                };
+                // interp_posix.py:771-775 — the two flag modifiers have no other
+                // call to reach, so without `faccessat` they are refused rather
+                // than answered as though they had been applied.
+                if !HAVE_FACCESSAT {
+                    if !follow_symlinks {
+                        return Err(argument_unavailable("access", "follow_symlinks"));
+                    }
+                    if effective_ids {
+                        return Err(argument_unavailable("access", "effective_ids"));
+                    }
+                }
                 #[cfg(feature = "sandbox")]
                 {
+                    // `HAVE_FACCESSAT` is false here, so the three modifiers
+                    // have already been turned away and only the plain form is
+                    // left to serve.
+                    let _ = dir_fd;
                     return Ok(pyre_object::w_bool_from(
                         crate::host_seam::ops::access(&path, mode).unwrap_or(false),
                     ));
                 }
                 #[cfg(not(feature = "sandbox"))]
                 {
-                    // `check_access` takes the mask as a `u8` and rejects any
-                    // bit outside `R_OK | W_OK | X_OK`. Narrowing before that
-                    // check would fold a mode like 256 onto `F_OK` and answer
-                    // "exists" for a mode `access(2)` rejects with EINVAL.
-                    let Ok(mode) = u8::try_from(mode) else {
-                        return Ok(pyre_object::w_bool_from(false));
+                    let c_path = std::ffi::CString::new(path.as_slice())
+                        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+                    // interp_posix.py:778-786 keeps the plain `access` for the
+                    // unmodified call and reaches for `faccessat` only where the
+                    // name resolves against a descriptor, the final symlink must
+                    // not be followed, or the effective ids are the ones to ask
+                    // about. `rposix.py:2551-2560` is the flag mapping.
+                    let ret = if dir_fd.is_some() || !follow_symlinks || effective_ids {
+                        let mut flags = 0;
+                        if !follow_symlinks {
+                            flags |= libc::AT_SYMLINK_NOFOLLOW;
+                        }
+                        if effective_ids {
+                            flags |= libc::AT_EACCESS;
+                        }
+                        unsafe {
+                            libc::faccessat(
+                                dir_fd.unwrap_or(libc::AT_FDCWD),
+                                c_path.as_ptr(),
+                                mode,
+                                flags,
+                            )
+                        }
+                    } else {
+                        unsafe { libc::access(c_path.as_ptr(), mode) }
                     };
-                    match host_posix::check_access(path_from_bytes(&path).as_ref(), mode) {
-                        Ok(ok) => Ok(pyre_object::w_bool_from(ok)),
-                        Err(_) => Ok(pyre_object::w_bool_from(false)),
-                    }
+                    // `rposix.access` and `rposix.faccessat` both answer
+                    // `error == 0` without `handle_posix_error`, so a refused
+                    // call is False and not an `OSError` — including the EINVAL
+                    // a mode outside `R_OK | W_OK | X_OK` can draw.
+                    return Ok(pyre_object::w_bool_from(ret == 0));
                 }
             }),
         );
