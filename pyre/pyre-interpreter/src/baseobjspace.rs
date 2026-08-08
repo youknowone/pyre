@@ -13180,6 +13180,32 @@ pub fn len_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
 /// strict subclass-of-int results into a fresh `W_IntObject` /
 /// `W_LongObject`.  Pyre's `int`/`long` are leaf types so the wrap is a
 /// no-op; the body below is `_index` line-for-line.
+/// `W_AbstractIntObject.int(space)` — the base wrapper an int-valued result is
+/// handed back as.  A `bool` or a strict int/long subclass is rewrapped around
+/// the same payload; an exact receiver is returned unchanged.
+///
+/// # Safety
+/// `obj` must be a valid bool, int or long.
+pub(crate) unsafe fn int_as_base(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        if pyre_object::is_bool(obj) {
+            return pyre_object::w_int_new(pyre_object::w_bool_get_value(obj) as i64);
+        }
+        if pyre_object::is_int(obj) {
+            if pyre_object::is_exact_type(obj, &pyre_object::INT_TYPE) {
+                return obj;
+            }
+            return pyre_object::w_int_new(pyre_object::w_int_get_value(obj));
+        }
+        if pyre_object::is_exact_type(obj, &pyre_object::LONG_TYPE) {
+            return obj;
+        }
+        // W_LongObject.int/newlong strips the strict subclass by creating a
+        // base wrapper around the same immutable rbigint payload.
+        pyre_object::longobject::w_long_from_raw(pyre_object::longobject::w_long_get_raw_value(obj))
+    }
+}
+
 pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if obj.is_null() {
         return Err(PyError::type_error("space.index: null object"));
@@ -13209,23 +13235,7 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         ))?;
         // descroperation.py:622-627 `space.index` — return a base int,
         // never the strict subclass supplied by `__index__`.
-        unsafe {
-            if pyre_object::is_bool(w_result) {
-                return Ok(pyre_object::w_int_new(
-                    pyre_object::w_bool_get_value(w_result) as i64,
-                ));
-            }
-            if pyre_object::is_int(w_result) {
-                return Ok(pyre_object::w_int_new(pyre_object::w_int_get_value(
-                    w_result,
-                )));
-            }
-            // W_LongObject.int/newlong strips the strict subclass by creating
-            // a base wrapper around the same immutable rbigint payload.
-            return Ok(pyre_object::longobject::w_long_from_raw(
-                pyre_object::longobject::w_long_get_raw_value(w_result),
-            ));
-        }
+        return Ok(unsafe { int_as_base(w_result) });
     }
     Err(PyError::type_error(format!(
         "__index__ returned non-int (type {})",

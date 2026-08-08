@@ -10137,12 +10137,24 @@ fn init_type_type(ns: PyObjectRef) {
     // `is_w(w_obj, w_type)` (`descroperation.py:362`).  The wiring lives in
     // `baseobjspace::getitem_type`, so `hasattr(type, "__class_getitem__")`
     // stays False to match.
-    // type.__init__ — no-op for now
+    // `typeobject.py:1028-1031 descr__init__` reads nothing; the class was
+    // already built by `__new__`.  All it does is settle the count, and it
+    // counts only the arguments behind the receiver, which is its own gateway
+    // parameter — so keywords never enter the total.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
+            make_builtin_function("__init__", |args| {
+                let (positional, _) = crate::builtins::split_builtin_kwargs(args);
+                let behind_receiver = positional.len().saturating_sub(1);
+                if behind_receiver != 1 && behind_receiver != 3 {
+                    return Err(crate::PyError::type_error(
+                        "type.__init__() takes 1 or 3 arguments",
+                    ));
+                }
+                Ok(pyre_object::w_none())
+            }),
         )
     };
     // CPython 3.14 typeobject.c slotdefs: type has its own native

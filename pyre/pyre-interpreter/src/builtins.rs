@@ -11113,6 +11113,17 @@ pub(crate) fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             "exec() takes at least 1 positional argument (0 given)",
         ));
     }
+    if pos.len() > 3 {
+        // A fourth positional is refused for landing on the keyword-only
+        // `closure`; past that the count exceeds the four parameters the
+        // signature has at all, and the total is what gets reported.
+        let message = if pos.len() == 4 {
+            "exec() takes at most 3 positional arguments (4 given)".to_string()
+        } else {
+            format!("exec() takes at most 4 arguments ({} given)", pos.len())
+        };
+        return Err(crate::PyError::type_error(message));
+    }
     kwarg_reject_unknown(kwargs, &["globals", "locals", "closure"], "exec")?;
     let source = pos[0];
     let globals_arg =
@@ -11139,6 +11150,12 @@ fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Err(crate::PyError::type_error(
             "eval() takes at least 1 positional argument (0 given)",
         ));
+    }
+    if pos.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "eval() takes at most 3 arguments ({} given)",
+            pos.len()
+        )));
     }
     kwarg_reject_unknown(kwargs, &["globals", "locals"], "eval")?;
     let source = pos[0];
@@ -12043,26 +12060,17 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
         }
     }
     unsafe {
-        let kind = if pyre_object::is_dict(obj) {
-            Some("dict")
-        } else if pyre_object::is_list(obj) {
-            Some("list")
-        } else if pyre_object::is_set(obj) {
-            // `frozenset` is hashable per setobject.py _hash_frozenset.
-            Some("set")
-        } else if pyre_object::is_bytearray(obj) {
-            Some("bytearray")
-        } else if pyre_object::dictmultiobject::is_dict_view_keys(obj) {
-            // `dictmultiobject.py:1626 _is_set_like` — only the keys and items
-            // views are set-like: they define `__eq__` and so are unhashable.
-            // The values view keeps `object.__hash__`.
-            Some("dict_keys")
-        } else if pyre_object::dictmultiobject::is_dict_view_items(obj) {
-            Some("dict_items")
-        } else {
-            None
-        };
-        if let Some(name) = kind {
+        // `frozenset` is hashable per setobject.py _hash_frozenset.
+        // `dictmultiobject.py:1626 _is_set_like` — only the keys and items
+        // views are set-like: they define `__eq__` and so are unhashable.  The
+        // values view keeps `object.__hash__`.
+        let unhashable_kind = pyre_object::is_dict(obj)
+            || pyre_object::is_list(obj)
+            || pyre_object::is_set(obj)
+            || pyre_object::is_bytearray(obj)
+            || pyre_object::dictmultiobject::is_dict_view_keys(obj)
+            || pyre_object::dictmultiobject::is_dict_view_items(obj);
+        if unhashable_kind {
             // The concrete builtin advertises `__hash__ = None`, but a user
             // subclass may replace that slot.  PyPy's normal special-method
             // lookup reaches the subclass entry before the inherited typedef
@@ -12077,10 +12085,10 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                     }
                 }
             }
-            return Err(crate::PyError::type_error(format!(
-                "unhashable type: '{}'",
-                name
-            )));
+            // The concrete kind decides that the object is unhashable; the
+            // refusal names the receiver's own type, which for a subclass is
+            // not the builtin base.
+            return Err(unhashable_type_error(obj));
         }
         if pyre_object::sliceobject::is_slice(obj) {
             return slice_hash_value(obj);
@@ -16018,6 +16026,34 @@ fn float_round_ndigits(v: f64, ndigits: i64) -> f64 {
     }
 }
 
+/// Whether the receiver's `__round__` is still one of the two the builtin
+/// numeric types install, which is what makes the structural rounding below
+/// correct for it.  `int` covers the bigint representation and `bool`, neither
+/// of which registers its own.
+///
+/// # Safety
+/// `obj` must point to a valid object whose header is readable.
+unsafe fn round_uses_builtin(obj: PyObjectRef) -> bool {
+    let w_class = unsafe { (*obj).w_class };
+    if w_class.is_null() {
+        return true;
+    }
+    // An exact receiver cannot carry a replacement, so the common call spends
+    // a pointer compare rather than a lookup.
+    for tp in [&pyre_object::INT_TYPE, &pyre_object::FLOAT_TYPE] {
+        if std::ptr::eq(w_class, pyre_object::get_instantiate(tp)) {
+            return true;
+        }
+    }
+    let Some((src, _)) = (unsafe { crate::baseobjspace::lookup_where_pair(w_class, "__round__") })
+    else {
+        return true;
+    };
+    [&pyre_object::INT_TYPE, &pyre_object::FLOAT_TYPE]
+        .into_iter()
+        .any(|tp| std::ptr::eq(src, pyre_object::get_instantiate(tp)))
+}
+
 pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `round(number, ndigits=None)`: both positional-or-keyword; at most two.
     let (pos, kwargs) = split_builtin_kwargs(args);
@@ -16034,7 +16070,12 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let ndigits_arg = bind_pos_or_kw(pos, kwargs, 1, "ndigits", "round", 2)?;
     let ndigits = ndigits_arg.as_ref();
     unsafe {
-        if is_float(obj) {
+        // `operation.py:97` reaches `__round__` through the type, so a subtype
+        // that replaced the builtin one — `__round__ = None` included — is
+        // dispatched by the lookup at the end of this function rather than
+        // rounded structurally here.
+        let structural = round_uses_builtin(obj);
+        if structural && is_float(obj) {
             let v = floatobject::w_float_get_value(obj);
             return match ndigits {
                 // `floatobject.py:966-967 _round_float`: nan/inf round to
@@ -16069,18 +16110,21 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 ),
             };
         }
-        if is_int(obj) || is_long(obj) {
+        if structural && (is_int(obj) || is_long(obj)) {
             // intobject.py:144-175 `descr_round`: keep ndigits as an rbigint
             // obtained through `space.index`, then compute
             // `10 ** -ndigits` and divmod-near.  Converting ndigits to an
             // index-sized Rust word or formatting the operand merely to count
             // decimal digits both diverge from that consumer shape.
+            // `intobject.py:167,174` answers both the absent-ndigits and the
+            // non-negative-ndigits case with `self.int(space)`, so a subclass
+            // receiver (`bool` included) is rounded to its base type.
             let nd = match ndigits {
                 Some(nd) if !pyre_object::is_none(*nd) => index_to_bigint(*nd)?,
-                _ => return Ok(obj),
+                _ => return Ok(crate::baseobjspace::int_as_base(obj)),
             };
             if nd.get_sign() >= 0 {
-                return Ok(obj);
+                return Ok(crate::baseobjspace::int_as_base(obj));
             }
             let owned_a;
             let a = if is_long(obj) {
