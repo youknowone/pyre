@@ -1933,6 +1933,68 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
     }
 
+    /// Bind an entry point whose positional parameters all sit before the
+    /// clinic `/`. None of them binds by name, so the count is over
+    /// positionals alone.
+    ///
+    /// `kwonly` decides which parser reports a bad count, and the two word it
+    /// differently. With no keyword-capable parameter at all the call is
+    /// parsed by `_PyArg_CheckPositional`, whose wording carries neither the
+    /// trailing `()` nor a parenthesised count, and every keyword is refused
+    /// against the module-qualified name. A keyword-only tail puts the call
+    /// back on `_PyArg_UnpackKeywords`, which reports the positional count in
+    /// the parenthesised form and accepts the named modifiers.
+    fn bind_posonly_args(
+        args: &[pyre_object::PyObjectRef],
+        name: &str,
+        qualname: &str,
+        total: usize,
+        required: usize,
+        kwonly: &[&'static str],
+    ) -> Result<
+        (
+            Vec<Option<pyre_object::PyObjectRef>>,
+            Option<pyre_object::PyObjectRef>,
+        ),
+        crate::PyError,
+    > {
+        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        if kwonly.is_empty() && crate::builtins::real_kwarg_count(kwargs) > 0 {
+            return Err(crate::PyError::type_error(format!(
+                "{qualname}() takes no keyword arguments"
+            )));
+        }
+        // The count is checked before the keyword names: a call that supplies
+        // neither the positionals nor a recognised keyword is reported against
+        // the positionals.
+        if pos.len() < required || pos.len() > total {
+            let plural = if total == 1 { "" } else { "s" };
+            let text = if !kwonly.is_empty() {
+                let limit = if required == total { "exactly" } else { "at most" };
+                format!(
+                    "{name}() takes {limit} {total} positional argument{plural} ({} given)",
+                    pos.len()
+                )
+            } else if required == total {
+                format!("{name} expected {total} argument{plural}, got {}", pos.len())
+            } else {
+                let bound = if pos.len() > total { total } else { required };
+                let plural = if bound == 1 { "" } else { "s" };
+                let at = if pos.len() > total { "at most" } else { "at least" };
+                format!(
+                    "{name} expected {at} {bound} argument{plural}, got {}",
+                    pos.len()
+                )
+            };
+            return Err(crate::PyError::type_error(text));
+        }
+        crate::builtins::kwarg_reject_unknown(kwargs, kwonly, name)?;
+        Ok((
+            (0..total).map(|index| pos.get(index).copied()).collect(),
+            kwargs,
+        ))
+    }
+
     /// Bind the positional-or-keyword prefix of a path-taking entry point.
     /// `params` names that prefix in order, `path` first, and the leading
     /// `required` of them carry no default; the rest are reported absent as
@@ -2390,11 +2452,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "readlink",
         crate::make_builtin_function("readlink", |args| {
-            let arg = args
-                .first()
-                .copied()
-                .ok_or_else(|| crate::PyError::type_error("readlink() requires 1 argument"))?;
-            let path = crate::gateway::fsencode_path_named_w(arg, "readlink", "path")?;
+            let (bound, kwargs) = bind_path_args(args, "readlink", &["path"], 1, &["dir_fd"])?;
+            // `readlink` types `dir_fd` as `DirFD(rposix.HAVE_READLINKAT)`.
+            // This build resolves the name through `std::fs::read_link`, which
+            // has no at-variant, so a descriptor is refused rather than
+            // silently resolved against the working directory — matching what
+            // `os.supports_dir_fd` advertises.
+            let _dir_fd = dir_fd_kwarg(kwargs, false)?;
+            let path = crate::gateway::fsencode_path_named_w(
+                bound[0].expect("path is required"),
+                "readlink",
+                "path",
+            )?;
             let bytes_mode = unsafe { path.is_bytes() };
             match std::fs::read_link(path_from_bytes(&path.as_bytes).as_ref()) {
                 Ok(target) => {
@@ -3125,10 +3194,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "listdir",
         crate::make_builtin_function("listdir", |args| {
+            let (bound, _kwargs) = bind_path_args(args, "listdir", &["path"], 0, &[])?;
             // One resolution yields both the path and its bytes-ness, so
             // `__fspath__` runs exactly once. The omitted argument is the same
             // `None` the signature names, which resolves to `"."` there.
-            let arg = args.first().copied().unwrap_or(pyre_object::w_none());
+            let arg = bound[0].unwrap_or(pyre_object::w_none());
             let resolved = crate::gateway::fsencode_path_or_fd_nullable_w(
                 arg,
                 "listdir",
@@ -3258,8 +3328,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "get_terminal_size",
         crate::make_builtin_function("get_terminal_size", |args| {
-            let fd = match args.first() {
-                Some(&w) => crate::baseobjspace::c_int_w(w)?,
+            // `($module, fd=<unrepresentable>, /)` — the descriptor is
+            // positional-only, so `fd=1` is a keyword this entry point does
+            // not take rather than a binding.
+            let (bound, _kwargs) = bind_posonly_args(
+                args,
+                "get_terminal_size",
+                "posix.get_terminal_size",
+                1,
+                0,
+                &[],
+            )?;
+            let fd = match bound[0] {
+                Some(w) => crate::baseobjspace::c_int_w(w)?,
                 None => 1,
             };
             #[cfg(unix)]
@@ -4632,10 +4713,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         unsafe { pyre_object::w_list_append(list, obj) };
     }
     fn scandir_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (bound, _kwargs) = bind_path_args(args, "scandir", &["path"], 0, &[])?;
         // One resolution yields both the path and its bytes-ness, so
         // `__fspath__` runs exactly once. The omitted argument is the same
         // `None` the signature names, which resolves to `"."` there.
-        let arg = args.first().copied().unwrap_or(pyre_object::w_none());
+        let arg = bound[0].unwrap_or(pyre_object::w_none());
         let resolved =
             crate::gateway::fsencode_path_or_fd_nullable_w(arg, "scandir", HAVE_FDOPENDIR)?;
         let bytes_mode = unsafe { resolved.is_bytes() };
@@ -6889,11 +6971,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ns,
             "symlink",
             crate::make_builtin_function("symlink", |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("symlink() requires 2 arguments"));
-                }
-                let src = crate::gateway::fsencode_path_named_w(args[0], "symlink", "src")?;
-                let dst = crate::gateway::fsencode_path_named_w(args[1], "symlink", "dst")?;
+                let (bound, kwargs) = bind_path_args(
+                    args,
+                    "symlink",
+                    &["src", "dst", "target_is_directory"],
+                    2,
+                    &["dir_fd"],
+                )?;
+                // `target_is_directory` selects between the two Windows link
+                // kinds and is ignored everywhere else (`os_symlink_impl`).
+                // Bound rather than dropped so a fourth positional is the
+                // `dir_fd` error it is, not a silently created link.
+                let _target_is_directory = match bound[2] {
+                    Some(value) => crate::baseobjspace::is_true(value)?,
+                    None => false,
+                };
+                // `symlink` types `dir_fd` as `DirFD(rposix.HAVE_SYMLINKAT)`;
+                // the body below calls `libc::symlink`, which has no
+                // descriptor arm.
+                let _dir_fd = dir_fd_kwarg(kwargs, false)?;
+                let src = crate::gateway::fsencode_path_named_w(
+                    bound[0].expect("src is required"),
+                    "symlink",
+                    "src",
+                )?;
+                let dst = crate::gateway::fsencode_path_named_w(
+                    bound[1].expect("dst is required"),
+                    "symlink",
+                    "dst",
+                )?;
                 let c_src = std::ffi::CString::new(src.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
                 let c_dst = std::ffi::CString::new(dst.as_bytes.as_slice())
@@ -7369,13 +7475,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ns,
             "access",
             crate::make_builtin_function("access", |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("access() requires 2 arguments"));
-                }
-                let path = crate::gateway::fsencode_path_named_w(args[0], "access", "path")?
-                    .as_bytes;
+                // `access` names three keyword-only modifiers, so a third
+                // positional is an error rather than a `dir_fd`. None of the
+                // three is implemented here — the body calls `access(2)`, not
+                // `faccessat(2)` — and `os.supports_dir_fd`,
+                // `os.supports_effective_ids` and `os.supports_follow_symlinks`
+                // all omit `access` to say so. Binding them is what makes an
+                // unknown keyword an error; answering them is a separate gap.
+                let (bound, _kwargs) = bind_path_args(
+                    args,
+                    "access",
+                    &["path", "mode"],
+                    2,
+                    &["dir_fd", "effective_ids", "follow_symlinks"],
+                )?;
+                let path = crate::gateway::fsencode_path_named_w(
+                    bound[0].expect("path is required"),
+                    "access",
+                    "path",
+                )?
+                .as_bytes;
                 // interp_posix.py:744 `@unwrap_spec(mode=c_int, ...)`.
-                let mode = crate::baseobjspace::c_int_w(args[1])?;
+                let mode = crate::baseobjspace::c_int_w(bound[1].expect("mode is required"))?;
                 #[cfg(feature = "sandbox")]
                 {
                     return Ok(pyre_object::w_bool_from(
@@ -7551,19 +7672,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "sendfile",
             crate::make_builtin_function("sendfile", |args| {
                 use std::os::fd::BorrowedFd;
-                if args.len() < 4 {
-                    return Err(crate::PyError::type_error(
-                        "sendfile() requires 4 arguments",
-                    ));
-                }
+                // Every parameter is positional-or-keyword. `headers`,
+                // `trailers` and `flags` are the BSD `sendfile(2)` tail, which
+                // neither arm below passes on; they are named here so a
+                // caller that supplies them is bound rather than truncated,
+                // and so an unknown keyword is an error.
+                let (bound, _kwargs) = bind_path_args(
+                    args,
+                    "sendfile",
+                    &[
+                        "out_fd", "in_fd", "offset", "count", "headers", "trailers", "flags",
+                    ],
+                    4,
+                    &[],
+                )?;
                 // interp_posix.py:2946 `@unwrap_spec(out_fd=c_int, count=int)`,
                 // with `in_ = space.c_int_w(w_in_fd)` in the body (:2955). The
                 // spec runs in the gateway, so the count is converted before
                 // the descriptor argument that follows it here.
-                let out_fd = crate::baseobjspace::c_int_w(args[0])?;
-                let count_raw = crate::baseobjspace::int_w(args[3])?;
-                let in_fd = crate::baseobjspace::c_int_w(args[1])?;
-                let w_offset = args[2];
+                let out_fd = crate::baseobjspace::c_int_w(bound[0].expect("out_fd is required"))?;
+                let count_raw = crate::baseobjspace::int_w(bound[3].expect("count is required"))?;
+                let in_fd = crate::baseobjspace::c_int_w(bound[1].expect("in_fd is required"))?;
+                let w_offset = bound[2].expect("offset is required");
                 if unsafe { pyre_object::is_none(w_offset) } {
                     // linux-only no-offset path; non-linux raises TypeError
                     // matching interp_posix.py:2946.
@@ -7674,16 +7804,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 args: &[pyre_object::PyObjectRef],
                 spawnp: bool,
             ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                if positional.len() < 3 {
-                    return Err(crate::PyError::type_error(
-                        "posix_spawn() requires path, argv, env",
-                    ));
-                }
                 // The two entry points share this body and have an argument
                 // clinic declaration each, so the one the caller reached is the
                 // name its rejected path reports.
                 let func = if spawnp { "posix_spawnp" } else { "posix_spawn" };
+                // `(path, argv, env, /, *, file_actions=(), ...)` — the three
+                // names are positional-only and everything else is
+                // keyword-only, so there is no positional-or-keyword slot at
+                // all.
+                let (bound, kwargs) = bind_posonly_args(
+                    args,
+                    func,
+                    func,
+                    3,
+                    3,
+                    &[
+                        "file_actions",
+                        "setpgroup",
+                        "resetids",
+                        "setsid",
+                        "setsigmask",
+                        "setsigdef",
+                        "scheduler",
+                    ],
+                )?;
+                let positional = [
+                    bound[0].expect("path is required"),
+                    bound[1].expect("argv is required"),
+                    bound[2].expect("env is required"),
+                ];
                 let path = crate::gateway::fsencode_path_named_w(positional[0], func, "path")?;
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice()).map_err(|_| {
                     crate::PyError::value_error("posix_spawn: embedded null in path")
