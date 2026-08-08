@@ -8265,6 +8265,22 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     if expected_typeobj.is_null() || ctx.trace_ctx.heap_cache().is_unescaped(obj) {
         return Ok(());
     }
+    // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
+    // `is_plain_int1`, [`walker_exact_builtin_class`] — treats a null `w_class` as a
+    // second spelling of "exact builtin", while the guard below reads the slot and
+    // pins a single value.  Pinning the canonical against an operand that carries
+    // the null spelling emits a guard the recorded operand itself fails, and nothing
+    // writes the slot afterwards, so it fails on every execution without ever
+    // converging — one bridge per `trace_eagerness` bucket.  Establishing that the
+    // operand carries what is pinned is the caller's, which is what this checks.
+    debug_assert!(
+        walker_concrete_ref_object(ctx, obj).is_none_or(|concrete| {
+            (pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(concrete))
+                || std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
+        }),
+        "guard_exact_w_class at pc={op_pc} would pin a `w_class` its recorded operand does not carry",
+    );
     let actual =
         crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
     let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
