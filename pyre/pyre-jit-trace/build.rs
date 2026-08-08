@@ -1,5 +1,7 @@
 #[path = "src/call_spec.rs"]
 mod call_spec;
+#[path = "src/llbc_fingerprint.rs"]
+mod llbc_fingerprint;
 #[path = "src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
@@ -374,16 +376,11 @@ fn preflight_llbc_or_fail() {
     std::process::exit(1);
 }
 
-/// Read one `key=value` line out of a `.fingerprint` stamp.
-///
-/// `scripts/llbc_extract.py:449-476` (`stamp_for`) writes the stamp as one
-/// `key=value` per line, so a prefix match is the whole parse.  `key` includes
-/// the `=`.
-fn stamp_field(stamp: &str, key: &str) -> Option<String> {
-    stamp
-        .lines()
-        .find_map(|line| line.strip_prefix(key).map(str::to_string))
-}
+// The stamp and the `--fingerprint` stdout are the same `key=value` format
+// written by the same producer, so both are parsed by `llbc_fingerprint`
+// rather than once per reader here.  `tests/llbc_fingerprint_format_test.rs`
+// pins that module against the driver's real output.
+use llbc_fingerprint::{freshness_policy, parse_fingerprint_stdout, stamp_field, FreshnessMode};
 
 /// Wait for the fingerprint oracle with a deadline.
 ///
@@ -404,19 +401,19 @@ fn llbc_fingerprint_output(child: std::process::Child) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    // A bare lowercase sha256 and nothing else; anything else means the driver
-    // printed something this code does not model.
-    let is_hash = value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit());
-    is_hash.then_some(value)
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_fingerprint_stdout(&stdout)
 }
 
 /// Ask the extraction driver what the current sources hash to.
 ///
-/// `scripts/llbc_extract.py:815-817` prints exactly the value the stamp's
-/// `source=` line holds — same `source_fingerprint()` call, same single-crate
-/// list as `stamp_for` at `:474` — so there is one implementation of the
-/// digest and it is not this one.
+/// `scripts/llbc_extract.py` prints the same `key=value` lines it writes into
+/// the stamp, and its `source=` field is the same `source_fingerprint()` call
+/// `stamp_for` records — so there is one implementation of the digest and it
+/// is not this one.  Parsed by `llbc_fingerprint::parse_fingerprint_stdout`,
+/// which reads the field by name; the driver adds fields (`external=` did,
+/// in `2f0e44cde70`) and a reader that models the output as one bare value
+/// stops answering the moment it does.
 ///
 /// `CARGO_FEATURES` and `LLBC_LAYOUT_TARGETS` are replayed out of the stamp:
 /// `fingerprint_inputs` (`scripts/llbc_extract.py:255-360`) walks the
@@ -474,6 +471,12 @@ fn llbc_source_fingerprint(
 /// deliberately-stale working build, and `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`
 /// skips the comparison entirely.
 ///
+/// `PYRE_LLBC_SKIP_FINGERPRINT_CHECK=1` opts out entirely — announcing that it
+/// did, so opting out and passing stay distinguishable.  Both take exactly
+/// `1`, any other value is reported rather than ignored, and setting both is
+/// refused; see `llbc_fingerprint::freshness_policy` for why that is a
+/// contradiction and not a precedence question.
+///
 /// Three outcomes per crate, on two channels: **fresh** is silent, **stale**
 /// errors (or warns with strict mode disabled), and **unknown** — unreadable stamp, or an
 /// oracle that did not answer — warns without ever being promoted.  Keeping
@@ -484,8 +487,24 @@ fn llbc_source_fingerprint(
 fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     println!("cargo::rerun-if-env-changed=PYRE_LLBC_STRICT");
     println!("cargo::rerun-if-env-changed=PYRE_LLBC_SKIP_FINGERPRINT_CHECK");
-    if std::env::var_os("PYRE_LLBC_SKIP_FINGERPRINT_CHECK").is_some() {
-        return;
+    // A non-UTF8 value is not `1`, so lossy conversion lands it in the
+    // unrecognised arm and it is reported rather than read as unset.
+    let env_switch = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    let strict_var = env_switch("PYRE_LLBC_STRICT");
+    let skip_var = env_switch("PYRE_LLBC_SKIP_FINGERPRINT_CHECK");
+    let policy = freshness_policy(strict_var.as_deref(), skip_var.as_deref());
+    let policy_directive = match policy.mode {
+        FreshnessMode::Refuse => "cargo::error",
+        _ => "cargo::warning",
+    };
+    for line in &policy.diagnostics {
+        println!("{policy_directive}={line}");
+    }
+    match policy.mode {
+        // Both switches set. Refuse rather than pick one: see `freshness_policy`.
+        FreshnessMode::Refuse => std::process::exit(1),
+        FreshnessMode::Skip => return,
+        FreshnessMode::Warn | FreshnessMode::Strict => {}
     }
     let driver = repo_root.join("scripts").join("extract-llbc.py");
     if !driver.is_file() {
@@ -544,7 +563,7 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     // The directive string is the only difference between the two modes, so it
     // is chosen once and the same lines go through it.  `cargo::warning=` and
     // `cargo::error=` each carry a single line with no embedded newline.
-    let strict = std::env::var_os("PYRE_LLBC_STRICT").as_deref() != Some(std::ffi::OsStr::new("0"));
+    let strict = policy.mode == FreshnessMode::Strict;
     let directive = if strict {
         "cargo::error"
     } else {
