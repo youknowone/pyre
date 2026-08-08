@@ -1374,17 +1374,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         pyre_object::PY_NULL,
                     )
                 })?;
-                let cls = crate::_structseq::make_struct_seq_with_extra(
-                    "sys.getwindowsversion",
-                    &["major", "minor", "build", "platform", "service_pack"],
-                    &[
-                        "service_pack_major",
-                        "service_pack_minor",
-                        "suite_mask",
-                        "product_type",
-                        "platform_version",
-                    ],
-                );
+                // Built once, like [`stat_result_seq_type`]: the type is the
+                // answer's identity, so making a fresh one per call would leave
+                // `type(sys.getwindowsversion())` a different class each time.
+                static SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let cls = *SEQ_TYPE.get_or_init(|| {
+                    crate::_structseq::make_struct_seq_with_extra(
+                        "sys.getwindowsversion",
+                        &["major", "minor", "build", "platform", "service_pack"],
+                        &[
+                            "service_pack_major",
+                            "service_pack_minor",
+                            "suite_mask",
+                            "product_type",
+                            "platform_version",
+                        ],
+                    ) as usize
+                }) as PyObjectRef;
                 Ok(crate::_structseq::new_instance_with_extra(
                     cls,
                     vec![

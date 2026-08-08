@@ -147,7 +147,14 @@ def _run(
             env=None if env is None else {**os.environ, **env},
         )
     except subprocess.TimeoutExpired as expired:
+        # `text=True` decodes what `communicate()` RETURNS; the timeout path
+        # raises with the raw chunks it had joined so far, so what arrives here
+        # is bytes on POSIX and str on Windows. Reporting the bytes would print
+        # one `b'...\n...'` line, which is the unreadable shape this report
+        # exists to avoid.
         partial = expired.stderr or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", "replace")
         return False, f"timed out after {TIMEOUT}s", partial
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
     last = lines[-1] if lines else ""

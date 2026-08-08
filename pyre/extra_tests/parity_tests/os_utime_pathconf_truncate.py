@@ -29,6 +29,19 @@ def raises(call, exc):
     raise AssertionError(f"{exc.__name__} was not raised")
 
 
+# A Windows FILETIME counts 100ns ticks, so a nanosecond that is not a multiple
+# of 100 is not a time that filesystem can hold; ext4 and APFS both store the
+# nanosecond itself. The negative range is not what differs — only how finely
+# it is kept — so the checks below round to what the host can hold rather than
+# skipping a platform.
+GRANULARITY_NS = 100 if sys.platform == "win32" else 1
+
+
+def storable(ns):
+    """`ns` as the filesystem under this test reads it back."""
+    return ns // GRANULARITY_NS * GRANULARITY_NS
+
+
 d = tempfile.mkdtemp()
 atexit.register(shutil.rmtree, d, ignore_errors=True)
 p = os.path.join(d, "f")
@@ -39,14 +52,11 @@ with open(p, "wb") as f:
 # The seconds are the floor of the value and the nanoseconds are what is left
 # above it, so -1ns is the last nanosecond of 1969 rather than a value with no
 # representation.
-#
-# A Windows FILETIME counts 100ns ticks, so only the nanoseconds that are a
-# multiple of 100 are times that filesystem can hold: -1ns reads back as -100
-# there, and the exact-nanosecond checks are the ones left out rather than the
-# negative range itself.
 os.utime(p, ns=(-1, -1))
-tick = -100 if sys.platform == "win32" else -1
-check(os.stat(p).st_mtime_ns == tick, f"utime(ns=(-1,-1)) -> {os.stat(p).st_mtime_ns}")
+check(
+    os.stat(p).st_mtime_ns == storable(-1),
+    f"utime(ns=(-1,-1)) -> {os.stat(p).st_mtime_ns}",
+)
 os.utime(p, ns=(-2_500_000_000, -2_500_000_000))
 check(os.stat(p).st_mtime_ns == -2_500_000_000, "utime(ns) lost a negative second")
 
@@ -98,12 +108,28 @@ check(str(e) == "utime: 'ns' must be a tuple of two ints", str(e))
 # `ns` is split with divmod before anything is narrowed, so a nanosecond count
 # too wide for a `time_t` is only refused when the SECOND it names is.
 os.utime(p, ns=(2**62, 2**62))
-check(os.stat(p).st_mtime_ns == 4611686018427387900, os.stat(p).st_mtime_ns)
+check(os.stat(p).st_mtime_ns == storable(2**62), os.stat(p).st_mtime_ns)
 
 # Nanoseconds run out of an `int64` in 2262, and a file may carry a later time
 # than that — `st_mtime_ns` is the number it is rather than a wrap.
-os.utime(p, (8.8e11, 8.8e11))
-check(os.stat(p).st_mtime_ns == 880_000_000_000_000_000_000, os.stat(p).st_mtime_ns)
+#
+# Only a filesystem that reaches such a date can be asked about it, and by
+# construction that cannot be every one: an APFS timestamp IS an int64 of
+# nanoseconds, so 2262 is its ceiling too, and ext4 stores a 34-bit second and
+# stops in 2446. Both clamp what they are handed (some hosts refuse it), where
+# NTFS counts 100ns ticks to the year 30828. So the identity — the seconds in
+# nanoseconds, whatever second was stored — is what every platform is held to,
+# and the exact value only where the second survived the round trip.
+FAR = 8.8e11
+try:
+    os.utime(p, (FAR, FAR))
+except OSError:
+    pass
+else:
+    st = os.stat(p)
+    check(st.st_mtime_ns == int(st.st_mtime) * 1_000_000_000, st.st_mtime_ns)
+    if st.st_mtime == FAR:
+        check(st.st_mtime_ns == 880_000_000_000_000_000_000, st.st_mtime_ns)
 
 # Back to a time the rest of the file can be reasoned about.
 os.utime(p, ns=(1_000_000_000, 2_000_000_000))
