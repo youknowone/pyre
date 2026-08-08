@@ -121,7 +121,10 @@ fn c_locale_conv() -> LocaleConvData {
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     // Locale category constants sourced from libc so the values match
     // the host (Linux: LC_CTYPE=0; macOS: LC_ALL=0, LC_CTYPE=2; ...).
-    #[cfg(unix)]
+    // Windows has a C runtime too, and its numbering is a third one again
+    // (LC_ALL=0, LC_COLLATE=1, LC_CTYPE=2); a POSIX value passed to it names
+    // a different category, so it must come from libc there as well.
+    #[cfg(any(unix, windows))]
     {
         crate::module_ns_store(
             ns,
@@ -144,14 +147,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "LC_MONETARY",
             pyre_object::w_int_new(libc::LC_MONETARY as i64),
         );
-        crate::module_ns_store(
-            ns,
-            "LC_MESSAGES",
-            pyre_object::w_int_new(libc::LC_MESSAGES as i64),
-        );
         crate::module_ns_store(ns, "LC_ALL", pyre_object::w_int_new(libc::LC_ALL as i64));
     }
-    #[cfg(not(unix))]
+    // `LC_MESSAGES` is a POSIX category the MSVC CRT has no counterpart for.
+    // `locale.py:1984-1989` appends it to `__all__` only if the name survived
+    // its `from _locale import *`, so publishing it here on Windows puts a
+    // category into `from locale import *` that no call can be made with.
+    #[cfg(unix)]
+    crate::module_ns_store(
+        ns,
+        "LC_MESSAGES",
+        pyre_object::w_int_new(libc::LC_MESSAGES as i64),
+    );
+    #[cfg(not(any(unix, windows)))]
     {
         crate::module_ns_store(ns, "LC_CTYPE", pyre_object::w_int_new(0));
         crate::module_ns_store(ns, "LC_NUMERIC", pyre_object::w_int_new(1));
@@ -286,7 +294,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 } else {
                     None
                 };
-            #[cfg(all(unix, feature = "host_env"))]
+            #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
                 let cat = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let c_locale = match locale_str.as_ref() {
@@ -302,7 +310,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     None => Err(locale_error("unsupported locale setting")),
                 }
             }
-            #[cfg(not(all(unix, feature = "host_env")))]
+            #[cfg(not(all(any(unix, windows), feature = "host_env")))]
             {
                 // No libc available — every valid call resolves to the
                 // POSIX "C" locale.  `locale_str` is dropped on purpose.
