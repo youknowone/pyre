@@ -172,11 +172,26 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
         })
         .expect("wrapper argument-slice item read");
     let slice_reg = wrapper.code[getitem.pc + 1];
-    // With no keyword split the argument slice is the wrapper input itself
-    // (r0); the length read names the same register.
+    // The slice's colour is not pinned either, for the same reason the entry
+    // call's form is not: it is an allocation outcome, not a property of the
+    // wrapper.  Whichever register holds the slice, the bound check governing
+    // an extraction is the nearest `arraylen_gc` on that register *before* the
+    // read, so select it that way.
+    //
+    // Taking the nearest preceding one is what keeps this honest when the
+    // splitter inlines far enough to read `args.len()` off the wrapper input
+    // before the split: that read can share the slice's register once the
+    // wrapper input is dead, and the first `arraylen_gc` in the code would
+    // then name it rather than the slice's.  `wrapper_args_item_descr_index`
+    // anchors on that first read for the same reason.
     crate::jitcode_runtime::decoded_ops(&wrapper.code)
-        .find(|op| op.key == "arraylen_gc/rd>i" && wrapper.code[op.pc + 1] == slice_reg)
-        .expect("wrapper reads the argument-slice length off the same slice register");
+        .filter(|op| {
+            op.key == "arraylen_gc/rd>i"
+                && op.pc < getitem.pc
+                && wrapper.code[op.pc + 1] == slice_reg
+        })
+        .last()
+        .expect("wrapper reads the argument-slice length before extracting from it");
 }
 
 /// Descr-pool index encoded little-endian at `at`, resolved to its
