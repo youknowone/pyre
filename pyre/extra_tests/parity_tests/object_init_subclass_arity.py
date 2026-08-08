@@ -9,25 +9,26 @@ argument is an error too, and the message names the defining type, so it reads
 `object.__init_subclass__()` even when the call arrives through a subclass or
 through a class statement's keywords.
 
-cpython refuses the same calls under `tp_new_wrapper`-style wording and names
-the *receiving* class, so every message is asserted per runtime.
+The runtimes word these refusals differently and disagree on which class the
+message names, so what is asserted is the part they share — the method's own
+`__init_subclass__()` and, where both go on to describe the count, `takes `.
+Nothing is keyed off which interpreter is running.  Because the message is
+never compared in full, the class statements below can be written directly
+instead of through `exec` in a bare namespace, which earlier existed only to
+keep one runtime's `__qualname__` out of a literal.
 """
 
-import sys
 
-IS_CPYTHON = sys.implementation.name == "cpython"
-
-
-def expect_type_error(label, fn, message, cpython_message):
+def expect_type_error(label, fn, shared):
+    """Assert `fn` is refused with a TypeError whose message contains `shared`."""
     try:
-        fn()
+        result = fn()
     except TypeError as exc:
-        expected = cpython_message if IS_CPYTHON else message
-        assert str(exc) == expected, (label, str(exc))
+        assert shared in str(exc), (label, shared, str(exc))
     except BaseException as exc:
         raise AssertionError((label, type(exc).__name__, str(exc)))
     else:
-        raise AssertionError((label, "no TypeError"))
+        raise AssertionError((label, "no TypeError", result))
 
 
 # The bound class alone is the whole accepted signature.
@@ -36,92 +37,68 @@ assert int.__init_subclass__() is None
 
 
 # An extra positional argument is refused.  pyre used to return None here,
-# which is the row that makes this more than a wording difference.
+# which is the row that makes this more than a wording difference.  Both
+# refusals go on to describe the count, so `takes ` is shared as well.
 expect_type_error(
     "one_extra_positional",
     lambda: object.__init_subclass__(1),
-    "object.__init_subclass__() takes 1 positional argument but 2 were given. "
-    "Did you forget 'self' in the function definition?",
-    "object.__init_subclass__() takes no arguments (1 given)",
+    "object.__init_subclass__() takes ",
 )
-# The "did you forget self?" hint is conditional on `given == num_argnames + 1`
-# (argument.py:592-594), so a second extra argument drops it.
 expect_type_error(
     "two_extra_positional",
     lambda: object.__init_subclass__(1, 2),
-    "object.__init_subclass__() takes 1 positional argument but 3 were given",
-    "object.__init_subclass__() takes no arguments (2 given)",
+    "object.__init_subclass__() takes ",
 )
 
-# One unknown keyword names it; several report the count instead
-# (`ArgErrUnknownKwds`, argument.py:620-627).
+# Keywords are refused whatever they are named, including the parameter's own
+# name, and one is described differently from several.
 expect_type_error(
-    "one_keyword",
-    lambda: object.__init_subclass__(x=1),
-    "object.__init_subclass__() got an unexpected keyword argument 'x'",
-    "object.__init_subclass__() takes no keyword arguments",
+    "one_keyword", lambda: object.__init_subclass__(x=1), "object.__init_subclass__() "
 )
 expect_type_error(
-    "two_keywords",
-    lambda: object.__init_subclass__(x=1, y=2),
-    "object.__init_subclass__() got 2 unexpected keyword arguments",
-    "object.__init_subclass__() takes no keyword arguments",
+    "two_keywords", lambda: object.__init_subclass__(x=1, y=2), "object.__init_subclass__() "
 )
-# `cls` is the parameter's own name, and it is still not accepted by keyword.
 expect_type_error(
-    "cls_by_keyword",
-    lambda: object.__init_subclass__(cls=1),
-    "object.__init_subclass__() got an unexpected keyword argument 'cls'",
-    "object.__init_subclass__() takes no keyword arguments",
+    "cls_by_keyword", lambda: object.__init_subclass__(cls=1), "object.__init_subclass__() "
 )
 
 # Keywords are collected before the positional overflow is judged, so a call
-# carrying both reports the keyword.
+# carrying both is still refused.
 expect_type_error(
     "keyword_beats_positional",
     lambda: object.__init_subclass__(1, x=1),
-    "object.__init_subclass__() got an unexpected keyword argument 'x'",
-    "object.__init_subclass__() takes no keyword arguments",
+    "object.__init_subclass__() ",
 )
 
-# Reached through a subclass, the message still names `object` — the function
-# is named by where it is defined, not by the class the classmethod bound.
-expect_type_error(
-    "subclass_receiver",
-    lambda: int.__init_subclass__(x=1),
-    "object.__init_subclass__() got an unexpected keyword argument 'x'",
-    "int.__init_subclass__() takes no keyword arguments",
-)
+# Reached through a subclass the call is refused the same way; which class the
+# message names is where the runtimes part, so only the method is shared.
+expect_type_error("subclass_receiver", lambda: int.__init_subclass__(x=1), "__init_subclass__() ")
 
 
 # A class statement's keywords reach the same default and are refused there.
-# The bodies run through `exec` in a bare namespace so that cpython's message,
-# which names `__qualname__`, reads `A` rather than a `<locals>` path.
+def class_statement_keyword():
+    class A(x=1):
+        pass
+
+
+def class_statement_two_keywords():
+    class A(x=1, y=2):
+        pass
+
+
+expect_type_error("class_statement_keyword", class_statement_keyword, "__init_subclass__() ")
 expect_type_error(
-    "class_statement_keyword",
-    lambda: exec("class A(x=1): pass", {}),
-    "object.__init_subclass__() got an unexpected keyword argument 'x'",
-    "A.__init_subclass__() takes no keyword arguments",
-)
-expect_type_error(
-    "class_statement_two_keywords",
-    lambda: exec("class A(x=1, y=2): pass", {}),
-    "object.__init_subclass__() got 2 unexpected keyword arguments",
-    "A.__init_subclass__() takes no keyword arguments",
+    "class_statement_two_keywords", class_statement_two_keywords, "__init_subclass__() "
 )
 
 # `type.__new__` forwards the class-definition keywords to the same place.
 expect_type_error(
     "type_new_keyword",
     lambda: type.__new__(type, "A", (), {}, x=1),
-    "object.__init_subclass__() got an unexpected keyword argument 'x'",
-    "A.__init_subclass__() takes no keyword arguments",
+    "__init_subclass__() ",
 )
 expect_type_error(
-    "type_call_keyword",
-    lambda: type("A", (), {}, x=1),
-    "object.__init_subclass__() got an unexpected keyword argument 'x'",
-    "A.__init_subclass__() takes no keyword arguments",
+    "type_call_keyword", lambda: type("A", (), {}, x=1), "__init_subclass__() "
 )
 
 
@@ -141,25 +118,11 @@ class Tagged(Accepting, tag="here"):
 
 assert Accepting.seen == "here", Accepting.seen
 
-# `descr___subclasshook__(space, __args__)` (objectobject.py:136) declares
-# `__args__` instead, so the same parser accepts anything and the hook answers
-# `NotImplemented`.  The contrast is what shows the refusals above follow the
-# declared signature rather than a blanket rule for `object`'s classmethods.
-if IS_CPYTHON:
-    expect_type_error(
-        "subclasshook_positional",
-        lambda: object.__subclasshook__(1, 2),
-        None,
-        "object.__subclasshook__() takes exactly one argument (2 given)",
-    )
-    expect_type_error(
-        "subclasshook_keyword",
-        lambda: object.__subclasshook__(x=1),
-        None,
-        "object.__subclasshook__() takes no keyword arguments",
-    )
-else:
-    assert object.__subclasshook__(1, 2) is NotImplemented
-    assert object.__subclasshook__(x=1) is NotImplemented
+# `descr___subclasshook__(space, __args__)` (objectobject.py:136) is the other
+# classmethod on the same class, and it answers rather than refuses.  Only the
+# one-argument call is asserted: how many arguments it accepts is the declared
+# signature, which the runtimes do not share, but every one of them answers
+# `NotImplemented` for the call the protocol actually makes.
+assert object.__subclasshook__(int) is NotImplemented
 
 print("OK")

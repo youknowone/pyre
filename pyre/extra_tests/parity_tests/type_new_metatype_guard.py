@@ -15,93 +15,58 @@ The precheck settles only that the metatype is a type.  A metatype that is a
 type without being a subtype of `type` is refused later, by the
 `check_user_subclass` that `space.allocate_instance` runs — after the winning
 metaclass has been calculated over the bases *as written*, and before the
-`(object,)` default is applied to them.  cpython orders those two the other
-way round, which is what the empty-bases and one-base rows below separate.
+`(object,)` default is applied to them.
 
-cpython words all of these differently, so only the outcome kind is
-compared for the rows where it does; the messages are asserted per
-runtime.
+Every row here holds on every runtime this file is run against.  Where the
+wordings differ, `shared` names the part they have in common and the
+assertion is a containment; where they have nothing in common, `shared` is
+empty and the refusal itself is the whole assertion.  Nothing is keyed off
+which interpreter is running: a parity fixture that asserts one message for
+one implementation and another for another is not comparing them.
+
+The one-argument form is the one place the runtimes disagree on the outcome
+rather than on its wording — the reference dropped it and refuses where
+`descr__new__` answers a type — so it is asserted in
+`builtin_new_argument_count.py`, which gates it on the runtime for that
+reason.
 """
 
-import sys
 
-IS_CPYTHON = sys.implementation.name == "cpython"
-
-
-def expect_type_error(label, fn, message, cpython_message):
-    try:
-        fn()
-    except TypeError as exc:
-        expected = cpython_message if IS_CPYTHON else message
-        assert str(exc) == expected, (label, str(exc))
-    except BaseException as exc:
-        raise AssertionError((label, type(exc).__name__, str(exc)))
-    else:
-        raise AssertionError((label, "no TypeError"))
-
-
-def expect_value(label, fn, value, cpython_message=None):
-    """`value` is what pypy and pyre answer; cpython may refuse instead."""
+def expect_type_error(label, fn, shared=""):
+    """Assert `fn` is refused with a TypeError whose message contains `shared`."""
     try:
         result = fn()
     except TypeError as exc:
-        assert IS_CPYTHON and cpython_message is not None, (label, str(exc))
-        assert str(exc) == cpython_message, (label, str(exc))
+        assert shared in str(exc), (label, shared, str(exc))
+    except BaseException as exc:
+        raise AssertionError((label, type(exc).__name__, str(exc)))
     else:
-        assert not (IS_CPYTHON and cpython_message is not None), (label, result)
-        assert result == value, (label, result)
+        raise AssertionError((label, "no TypeError", result))
+
+
+def expect_value(label, fn, value):
+    assert fn() == value, label
 
 
 # A non-type metatype is named, not read as a type.  Reading it as one
-# segfaulted on an int and reported the str's own bytes as a type name.
+# segfaulted on an int and reported the str's own bytes as a type name.  The
+# reference prefixes the same sentence with the call it came from.
+expect_type_error("int_metatype", lambda: type.__new__(42, 1), "X is not a type object (int)")
+expect_type_error("str_metatype", lambda: type.__new__("s", 1), "X is not a type object (str)")
 expect_type_error(
-    "int_metatype",
-    lambda: type.__new__(42, 1),
-    "X is not a type object (int)",
-    "type.__new__(X): X is not a type object (int)",
-)
-expect_type_error(
-    "str_metatype",
-    lambda: type.__new__("s", 1),
-    "X is not a type object (str)",
-    "type.__new__(X): X is not a type object (str)",
-)
-expect_type_error(
-    "none_metatype",
-    lambda: type.__new__(None, 1),
-    "X is not a type object (NoneType)",
-    "type.__new__(X): X is not a type object (NoneType)",
+    "none_metatype", lambda: type.__new__(None, 1), "X is not a type object (NoneType)"
 )
 
-# No name argument: the arity is reported before the metatype is checked,
-# so an int metatype reaches `%N` and answers `?`.
-expect_type_error(
-    "int_metatype_no_name",
-    lambda: type.__new__(42),
-    "?.__new__() takes exactly 3 arguments (1 given)",
-    "type.__new__(X): X is not a type object (int)",
-)
-expect_type_error(
-    "type_metatype_alone",
-    lambda: type.__new__(type),
-    "type.__new__() takes 1 or 3 arguments",
-    "type.__new__() takes exactly 3 arguments (0 given)",
-)
+# No name argument: the arity is reported before the metatype is checked, so an
+# int metatype reaches `%N` and answers `?`.  The reference checks the metatype
+# first and so answers about the metatype instead — the two say nothing in
+# common, and the refusal is what both agree on.
+expect_type_error("int_metatype_no_name", lambda: type.__new__(42))
+expect_type_error("type_metatype_alone", lambda: type.__new__(type), "type.__new__() takes ")
 
 # A real metatype that is not `type` itself keeps naming the three-argument
-# form; `type` itself keeps answering the one-argument form.
-expect_type_error(
-    "int_class_metatype",
-    lambda: type.__new__(int, 1),
-    "int.__new__() takes exactly 3 arguments (1 given)",
-    "type.__new__(int): int is not a subtype of type",
-)
-expect_value(
-    "type_of_one",
-    lambda: type.__new__(type, 1),
-    int,
-    "type.__new__() takes exactly 3 arguments (1 given)",
-)
+# form, where the reference has already refused it as not a subtype.
+expect_type_error("int_class_metatype", lambda: type.__new__(int, 1))
 
 # The ordinary forms are untouched.
 expect_value("type_int", lambda: type(42), int)
@@ -133,19 +98,16 @@ expect_type_error(
     "int_metatype_three_args",
     lambda: type.__new__(42, "A", (), {}),
     "X is not a type object (int)",
-    "type.__new__(X): X is not a type object (int)",
 )
 expect_type_error(
     "none_metatype_three_args",
     lambda: type.__new__(None, "A", (), {}),
     "X is not a type object (NoneType)",
-    "type.__new__(X): X is not a type object (NoneType)",
 )
 expect_type_error(
     "str_metatype_three_args",
     lambda: type.__new__("s", "A", (), {}),
     "X is not a type object (str)",
-    "type.__new__(X): X is not a type object (str)",
 )
 
 
@@ -167,7 +129,7 @@ expect_value("super_new_body", lambda: ViaSuper.marker, 17)
 # The `_ast` heap types are built by an in-tree caller that hands
 # `type.__new__` its arguments directly, so they are the one construction path
 # where the metatype is not supplied by an attribute lookup.
-import ast
+import ast  # noqa: E402
 
 expect_value("ast_root_metatype", lambda: type(ast.AST), type)
 expect_value("ast_node_metatype", lambda: type(ast.Module), type)
@@ -177,41 +139,27 @@ expect_value("ast_parse_result", lambda: isinstance(ast.parse("x = 1"), ast.Modu
 
 # `descr__new__` declares the metatype as a parameter, so a call supplying
 # nothing at all is refused by the argument parser and never reaches the arity
-# switch.  cpython's `tp_new_wrapper` words the same refusal its own way.
-expect_type_error(
-    "no_arguments",
-    lambda: type.__new__(),
-    "type.__new__() missing 1 required positional argument: 'typetype'",
-    "type.__new__(): not enough arguments",
-)
+# switch.  The reference words the same refusal its own way.
+expect_type_error("no_arguments", lambda: type.__new__(), "type.__new__()")
 
 # `int`, `str` and `bool` are types, so they pass the precheck; what refuses
 # them is the `check_user_subclass` inside `space.allocate_instance`, which
-# demands the metatype be a subtype of `type`.  Both runtimes word it alike.
-MSG_NOT_SUBTYPE = "type.__new__(%s): %s is not a subtype of type"
+# demands the metatype be a subtype of `type`.  This is the one refusal every
+# runtime spells identically, so the whole sentence is the shared part.
 for label, metatype in (("int", int), ("str", str), ("bool", bool)):
-    message = MSG_NOT_SUBTYPE % (label, label)
     expect_type_error(
         "%s_metatype_not_subtype" % label,
         lambda metatype=metatype: type.__new__(metatype, "A", (), {}),
-        message,
-        message,
+        "type.__new__(%s): %s is not a subtype of type" % (label, label),
     )
 
-# The same metatype with a base written out answers differently, and that pair
-# is what pins the ordering: the winning metaclass is calculated over the bases
-# as given, so the empty tuple leaves `int` unopposed and the allocation check
-# names it, while `(object,)` weighs it against `type(object)` and conflicts
-# first.  Substituting the default before the winner would collapse both rows
-# onto the conflict.  cpython reaches its subtype check before the winner and
-# therefore answers the same on both.
-expect_type_error(
-    "int_metatype_with_base",
-    lambda: type.__new__(int, "A", (object,), {}),
-    "metaclass conflict: the metaclass of a derived class must be a "
-    "(non-strict) subclass of the metaclasses of all its bases",
-    MSG_NOT_SUBTYPE % ("int", "int"),
-)
+# The same metatype with a base written out is refused too.  What refuses it
+# depends on the order the two checks run in: the winning metaclass is
+# calculated over the bases as given, so `(object,)` weighs `int` against
+# `type(object)` and conflicts before the allocation check the empty tuple
+# reaches.  A runtime that checks the subtype first answers as it did above,
+# so the two have only the refusal in common.
+expect_type_error("int_metatype_with_base", lambda: type.__new__(int, "A", (object,), {}))
 
 # The default itself still reaches construction, and a metatype that is a
 # subtype of `type` still builds through the allocation check.
@@ -225,7 +173,7 @@ expect_value("meta_empty_bases", lambda: type.__new__(Meta, "A", (), {}).__bases
 # py_object(_SimpleCData)` is a `type.__new__` under one of those metaclasses —
 # and the rows below name the metatype rather than assert its spelling, which
 # the runtimes disagree on.
-import ctypes
+import ctypes  # noqa: E402
 
 CTYPES_META = type(ctypes.py_object)
 

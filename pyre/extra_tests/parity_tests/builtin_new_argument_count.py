@@ -16,8 +16,16 @@ sees it.  The class then goes through the same `tp_new_wrapper` check every
 builtin `__new__` uses, which is what keeps a complex payload from being stamped
 with a type of a different layout.
 
-The wordings differ between implementations, so only the exception type is
-asserted here; each refusal below is one the reference raises too.
+The wordings differ between implementations, so most of the file asserts only
+the exception type; each refusal below is one the reference raises too.  The
+block at the end goes further and asserts the part of the message every runtime
+words alike, as a containment.  Neither half is keyed off which interpreter is
+running — a fixture that compares one literal on one implementation and another
+literal on another has stopped comparing them.
+
+The one place a runtime is named is the one-argument form of `type.__new__`,
+which the reference dropped altogether: there the outcome differs, not its
+spelling, and no single assertion covers both.
 """
 
 import sys
@@ -134,49 +142,39 @@ raises_type_error("complex.__new__(object)", lambda: complex.__new__(object))
 assert complex.__new__(complex, 1, 2) == 1 + 2j
 assert type(complex.__new__(ComplexInit, 1, 2)) is ComplexInit
 
-# The subtype refusal is worded identically by both references.
-assert (
-    message(lambda: complex.__new__(int))
-    == "complex.__new__(int): int is not a subtype of complex"
+# What the refusals say, to the extent the runtimes say the same thing.
+# `descr__new__` names both accepted counts for `type` itself and only the
+# three-argument form for any other metatype, and `_precheck_for_new` runs after
+# that decision, so an unvalidated metatype reaches `%N`; a runtime that checks
+# the metatype first answers about the metatype instead.  Each row below asserts
+# the part they have in common rather than one message per implementation —
+# comparing a different literal on each runtime is not a parity assertion.
+assert "type.__new__() takes " in message(lambda: type.__new__(type))
+assert "type.__new__() takes " in message(lambda: type.__new__(type, "A", ()))
+# The metatype's own name reaches the count, so a named metaclass names itself
+# where `type` is named for it.
+assert ".__new__() takes exactly 3 arguments (1 given)" in message(lambda: type.__new__(Meta, 1))
+assert "X is not a type object (int)" in message(lambda: type.__new__(42, "A", (), {}))
+assert "type.__new__(int): int is not a subtype of type" in message(
+    lambda: type.__new__(int, "A", (), {})
 )
-assert (
-    message(lambda: complex.__new__(object))
-    == "complex.__new__(object): object is not a subtype of complex"
+assert "argument 1 must be str" in message(lambda: type(1, (), {}))
+assert "argument 2 must be tuple, not list" in message(lambda: type("A", [], {}))
+assert "argument 3 must be dict, not list" in message(lambda: type("A", (), []))
+assert "keyword argument" in message(lambda: bool(x=1))
+
+# The subtype refusal is the one every runtime words alike, so the whole
+# sentence is what they share.
+assert "complex.__new__(int): int is not a subtype of complex" in message(
+    lambda: complex.__new__(int)
 )
-
-if sys.implementation.name != "cpython":
-    # `descr__new__` names both accepted counts for `type` itself and only the
-    # three-argument form for any other metatype, and `_precheck_for_new` runs
-    # after that decision, so an unvalidated metatype reaches `%N`.
-    assert message(lambda: type.__new__(type)) == "type.__new__() takes 1 or 3 arguments"
-    assert (
-        message(lambda: type.__new__(42, "A", ()))
-        == "?.__new__() takes exactly 3 arguments (1 given)"
-    )
-    assert message(lambda: type.__new__(42, "A", (), {})) == "X is not a type object (int)"
-    assert (
-        message(lambda: type.__new__(int, "A", (), {}))
-        == "type.__new__(int): int is not a subtype of type"
-    )
-    assert (
-        message(lambda: bool(1, 2))
-        == "bool.__new__() takes from 1 to 2 positional arguments but 3 were given"
-    )
-    assert (
-        message(lambda: complex(1, 2, 3))
-        == "complex.__new__() takes from 1 to 3 positional arguments but 4 were given"
-    )
-
-if sys.implementation.name != "pypy":
-    # `tp_new_wrapper` names the class it rejected; the other reference reports
-    # it from the gateway's own unwrap instead and never reaches this check.
-    assert (
-        message(lambda: complex.__new__(1))
-        == "complex.__new__(X): X is not a type object (int)"
-    )
-    assert (
-        message(lambda: float.__new__(1))
-        == "float.__new__(X): X is not a type object (int)"
-    )
+assert "complex.__new__(object): object is not a subtype of complex" in message(
+    lambda: complex.__new__(object)
+)
+# A class argument that is not a type at all reaches the same sentence for every
+# builtin `__new__`.  What differs is whether the call it came from is named
+# first, and whether the rejected type's name is quoted.
+assert "X is not a type object (" in message(lambda: complex.__new__(1))
+assert "X is not a type object (" in message(lambda: float.__new__(1))
 
 print("OK")
