@@ -3292,6 +3292,17 @@ impl PyFrame {
                     ));
                 }
                 crate::baseobjspace::generator_finalize(w_gen)?;
+                // CPython 3.14 `frame_clear_impl` finishes a never-started
+                // generator after `_PyGen_Finalize`, then clears the owned
+                // interpreter frame.  The suspended case was rejected above,
+                // so this is the same completion path used by close() and
+                // normal generator return, including severing `gi_frame`.
+                unsafe { crate::baseobjspace::generator_frame_is_finished(w_gen, self) };
+                let ec = crate::call::getexecutioncontext()
+                    as *mut crate::executioncontext::ExecutionContext;
+                if !ec.is_null() {
+                    unsafe { (*ec).finalize_explicitly_cleared_frame_references() };
+                }
                 return Ok(());
             }
             // pyframe.py:815-820: a dead `f_generator_wref` simply skips the

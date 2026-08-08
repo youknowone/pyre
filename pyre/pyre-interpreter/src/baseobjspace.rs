@@ -16886,7 +16886,10 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 /// generator.py:313-315 `frame_is_finished` plus Python 3.14's eager frame
 /// clearing on `close()`.  Dropping the generator's frame edge releases all
 /// suspended locals; an escaped `gi_frame` remains a valid, cleared frame.
-unsafe fn generator_frame_is_finished(gen_obj: PyObjectRef, frame: &mut crate::pyframe::PyFrame) {
+pub(crate) unsafe fn generator_frame_is_finished(
+    gen_obj: PyObjectRef,
+    frame: &mut crate::pyframe::PyFrame,
+) {
     use pyre_object::generator::*;
     unsafe { w_generator_set_exhausted(gen_obj) };
     frame.set_frame_finished_execution(true);
