@@ -187,6 +187,37 @@ check(
     "ParserCreate rejected a str subclass encoding",
 )
 
+
+# ── an omitted `intern` is not the same as an explicit None ───────────────
+# Omitting it asks for a fresh dictionary; passing None asks for no interning
+# at all.  A default of `None` cannot tell the two apart, and the parser then
+# interns names the caller asked it not to.
+def interned(parser):
+    """The number of names `parser` interned while parsing, or None."""
+    parser.StartElementHandler = lambda name, attrs: None
+    parser.Parse("<a><b/></a>", True)
+    return None if parser.intern is None else len(parser.intern)
+
+
+check(
+    isinstance(pyexpat.ParserCreate().intern, dict),
+    "an omitted intern did not produce a dictionary",
+)
+check(interned(pyexpat.ParserCreate()) == 2, "an omitted intern interned nothing")
+check(
+    pyexpat.ParserCreate(None, None, None).intern is None,
+    "an explicit intern=None was replaced with a dictionary",
+)
+check(
+    interned(pyexpat.ParserCreate(None, None, None)) is None,
+    "an explicit intern=None still interned names",
+)
+# A dictionary of the caller's own is used as given.
+own = {}
+p = pyexpat.ParserCreate(None, None, own)
+check(p.intern is own, "a supplied intern dictionary was not the one used")
+check(interned(p) == 2 and len(own) == 2, "the supplied dictionary was not filled")
+
 # ── ctypes.CDLL: the library name reaches dlopen in filesystem units ──────
 # Filed alongside the two above as a third disagreement, and already correct:
 # `_ctypes.dlopen` takes the name through `fsencode`, so a surrogate escape

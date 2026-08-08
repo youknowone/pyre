@@ -1752,7 +1752,7 @@ fn parser_create_not_str(param: &str, obj: PyObjectRef) -> crate::PyError {
     ))
 }
 
-/// `ParserCreate(encoding=None, namespace_separator=None, intern=None)`.
+/// `ParserCreate(encoding=None, namespace_separator=None[, intern])`.
 fn parser_create3(
     encoding: PyObjectRef,
     namespace_separator: PyObjectRef,
@@ -1789,7 +1789,12 @@ fn parser_create3(
             namespace_separator,
         ));
     }
-    if unsafe { !is_none(intern) } {
+    // interp_pyexpat.py:948-952 — "Explicitly passing None means no interning
+    // is desired. Not passing anything means that a new dictionary is used."
+    // `init_parser_slots` installed that new dictionary already, so an omitted
+    // argument has nothing to write and the two named cases write themselves;
+    // `intern_string` reads `None` back as "do not intern".
+    if !intern.is_null() {
         crate::baseobjspace::setdictvalue_native(parser, "intern", intern);
     }
     Ok(parser)
@@ -1944,7 +1949,10 @@ crate::py_module! {
         fn ParserCreate(
             #[default(w_none())] encoding: PyObjectRef,
             #[default(w_none())] namespace_separator: PyObjectRef,
-            #[default(w_none())] intern: PyObjectRef,
+            // Omitted has to be distinguishable from an explicit `None` here —
+            // they mean different things (`parser_create3`) — so the default is
+            // the absent marker and not the value.
+            #[default(pyre_object::PY_NULL)] intern: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             parser_create3(encoding, namespace_separator, intern)
         }
