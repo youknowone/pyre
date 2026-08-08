@@ -9305,6 +9305,23 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if *NO_JIT_FN.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
+    // A compiled trace normally polls the action flag at its loop header
+    // (`interp_jit.py:101-120 jump_absolute`).  A recursive Python call can,
+    // however, repeatedly enter a compiled function without executing a
+    // Python back-edge at all.  In that shape the portal entry is the only
+    // checkpoint between activations.  Do not enter assembler while an async
+    // action is armed: returning to `eval_loop_jit` runs the ordinary
+    // `ExecutionContext::bytecode_trace`, which owns signal and async-exception
+    // delivery just as it does on the non-JIT path.  In particular this keeps
+    // `_thread.interrupt_main()` observable in recursion which continually
+    // catches `RecursionError` (CPython gh-102056).
+    //
+    // This is deliberately a process-global breaker read, not TLS state.  The
+    // producer is another thread and `signalstate::signal_pushback` publishes
+    // into the same word that compiled loop-header guards already poll.
+    if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
+        return None;
+    }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     // The other caller, `portal_runner_dispatch`, does not imply a frame that
     // already passed `eval_with_jit_inner`'s classification: the portal entry
@@ -9371,6 +9388,36 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // when a runnable compiled loop (frontend meta present, not a bare
         // tmp callback) exists for this green_key.
         // warmstate.py:503-511: procedure_token → enter unconditionally.
+        //
+        // `interp_jit.py:106-115 jump_absolute` charges the action ticker at
+        // every compiled back-edge when `gil_ready` is true.  A recursive
+        // portal call is also a cycle through compiled Python, but contains no
+        // bytecode back-edge of its own.  Charge that cycle here so
+        // `GILReleaseAction` can hand the GIL to another thread; otherwise a
+        // recursive trace which continually catches `RecursionError` can run
+        // compiled entries forever and starve the thread that is meant to call
+        // `_thread.interrupt_main()` (CPython gh-102056).
+        //
+        // Run the same action dispatcher as `bytecode_trace`, rather than a
+        // JIT-local yield or signal shortcut.  The ExecutionContext remains
+        // the owner of periodic actions, and FrameRoot keeps the live frame
+        // recoverable across the collection-point call.
+        if pyre_interpreter::module::thread::gil::threads_initialized() {
+            let ec = frame_root.frame().execution_context as *mut PyExecutionContext;
+            if !ec.is_null() {
+                let ticker = unsafe {
+                    (*ec).actionflag.decrement_ticker(
+                        pyre_interpreter::executioncontext::TICK_COUNTER_STEP as isize,
+                    )
+                };
+                if ticker < 0 {
+                    let frame_ptr = frame_root.frame() as *mut PyFrame;
+                    if let Err(err) = unsafe { (*ec).perform_actions(frame_ptr) } {
+                        return Some(Err(err));
+                    }
+                }
+            }
+        }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][func-entry] run compiled frame=0x{:x} locals=0x{:x} key={} arg0={:?} depth={} raw_finish_known={}",

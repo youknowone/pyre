@@ -5933,6 +5933,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             // inherited Python objects may be mid-lifecycle,
                             // and PyPy only runs app-level finalizers at their
                             // ordinary safe points after the child resumes.
+                            //
+                            // What a collection here would buy is the stale
+                            // `_MainThread` that `threading._after_fork` drops
+                            // on return: a refcounting collector clears its
+                            // `_dangling` weakref before `os.fork()` returns, a
+                            // tracing one does not.  That is not a defect to
+                            // repair — pypy3 7.3.20 prints the same two
+                            // `MainThread` entries this arm leaves behind, so
+                            // `test_main_thread_after_fork_from_foreign_thread`
+                            // and its dummy-thread twin fail there too.
                             drop(fork_serial);
                             Ok(pyre_object::w_int_new(0))
                         }

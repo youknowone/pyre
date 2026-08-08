@@ -1134,7 +1134,7 @@
       "dynasm": "PASS"
     },
     "test.test_thread": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_thread_local_bytecode": {
       "dynasm": "IMPORTERROR"
@@ -1144,7 +1144,7 @@
       "dynasm": "PASS"
     },
     "test.test_threading": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_threading_local": {
       "dynasm": "IMPORTERROR"
