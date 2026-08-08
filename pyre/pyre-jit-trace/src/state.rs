@@ -3184,25 +3184,31 @@ pub(crate) fn note_root_trace_too_long(
     merge_key: Option<u64>,
     source_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
 ) {
-    let (driver, _) = crate::driver::driver_pair();
-    let meta = driver.meta_interp_mut();
-    // pyjitpl.py:2821 `jd_sd, greenkey_of_huge_function = self.find_biggest_function()`.
-    let huge_fn = meta.find_biggest_function();
-    // pyjitpl.py:2823 `self.portal_trace_positions = None` — the log's `_pos`
-    // cursors index the recorder this abort is discarding.
-    meta.portal_trace_positions = None;
-    if let Some((jd_no, huge_key)) = huge_fn {
-        // pyjitpl.py:2825-2826.
-        meta.warm_state_mut().disable_noninlinable_function(huge_key);
-        // pyjitpl.py:2827-2828, read by `aborted_tracing`'s `on_trace_abort`.
-        meta.aborted_tracing_jitdriver = Some(jd_no);
-        meta.aborted_tracing_greenkey = Some(huge_key);
-        // pyjitpl.py:2829-2831 — the root is asked to retrace and nothing else.
-        if let Some(merge_key) = merge_key {
-            meta.warm_state_mut().trace_next_iteration(merge_key);
-        }
-    } else {
-        if let Some(merge_key) = merge_key {
+    // `try_driver_pair`, not `driver_pair`: a skeleton walk drives
+    // `jitcode_dispatch` with no eval behind it, so there is no `MetaInterp` to
+    // read `find_biggest_function` off or to mark.  It then names no huge
+    // callee — the same answer the empty `portal_trace_positions` log gives —
+    // and the token half below is reached, which is all a driverless walk could
+    // ever do here.
+    let huge_fn = crate::driver::try_driver_pair().and_then(|(driver, _)| {
+        let meta = driver.meta_interp_mut();
+        // pyjitpl.py:2821 `jd_sd, greenkey_of_huge_function = self.find_biggest_function()`.
+        let huge_fn = meta.find_biggest_function();
+        // pyjitpl.py:2823 `self.portal_trace_positions = None` — the log's `_pos`
+        // cursors index the recorder this abort is discarding.
+        meta.portal_trace_positions = None;
+        if let Some((jd_no, huge_key)) = huge_fn {
+            // pyjitpl.py:2825-2826.
+            meta.warm_state_mut()
+                .disable_noninlinable_function(huge_key);
+            // pyjitpl.py:2827-2828, read by `aborted_tracing`'s `on_trace_abort`.
+            meta.aborted_tracing_jitdriver = Some(jd_no);
+            meta.aborted_tracing_greenkey = Some(huge_key);
+            // pyjitpl.py:2829-2831 — the root is asked to retrace and nothing else.
+            if let Some(merge_key) = merge_key {
+                meta.warm_state_mut().trace_next_iteration(merge_key);
+            }
+        } else if let Some(merge_key) = merge_key {
             let warm_state = meta.warm_state_mut();
             // pyjitpl.py:2843-2844.
             warm_state.trace_next_iteration(merge_key);
@@ -3214,13 +3220,16 @@ pub(crate) fn note_root_trace_too_long(
             // overflowed.
             warm_state.disable_noninlinable_function(merge_key);
         }
-        if let Some(source_jct) = source_token.as_ref() {
-            // pyjitpl.py:2857 `loop_token.retraced_count |= FORCE_BRIDGE_SEGMENTING`.
-            let cur = source_jct.retraced_count.get();
-            source_jct
-                .retraced_count
-                .set(cur | majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING);
-        }
+        huge_fn
+    });
+    if huge_fn.is_none()
+        && let Some(source_jct) = source_token.as_ref()
+    {
+        // pyjitpl.py:2857 `loop_token.retraced_count |= FORCE_BRIDGE_SEGMENTING`.
+        let cur = source_jct.retraced_count.get();
+        source_jct
+            .retraced_count
+            .set(cur | majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING);
     }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -3269,7 +3278,10 @@ pub(crate) fn note_inline_subwalk_start(
 }
 
 /// pyjitpl.py:2470-2472 — close the entry [`note_inline_subwalk_start`] opened.
-pub(crate) fn note_inline_subwalk_end(jd_no: usize, pos: majit_metainterp::recorder::TracePosition) {
+pub(crate) fn note_inline_subwalk_end(
+    jd_no: usize,
+    pos: majit_metainterp::recorder::TracePosition,
+) {
     majit_metainterp::mc_diag_bump(59);
     let Some((driver, _)) = crate::driver::try_driver_pair() else {
         return;
