@@ -1977,9 +1977,25 @@ class Check:
         # ``pyre <= baseline * limit`` needs 2q on the left and 2q*limit on the
         # right.  Adding one tick to every raw sample cannot model this: those
         # additions cancel during startup subtraction.
+        #
+        # The right-hand ``baseline * limit`` amplifies the baseline's own
+        # measurement error by `limit`, and off Windows that term was missing:
+        # the buffer carried only the left-hand `BENCH_COMPARE_BUFFER_S` and no
+        # allowance for a noisy denominator.  A baseline near EXEC_TIME_FLOOR_S
+        # is a difference of two medians each granular to about one floor, so its
+        # residual run-to-run error is ~EXEC_TIME_FLOOR_S, and the budget it sets
+        # swings by `limit * EXEC_TIME_FLOOR_S`.  This makes the effective
+        # ceiling `limit * (1 + EXEC_TIME_FLOOR_S / baseline)`: the grace is
+        # `floor / baseline`, real only when the baseline is close to the floor
+        # -- exactly where the denominator cannot be trusted -- and vanishing
+        # for a baseline that is real work.  `exception_traceback_loop_forms`
+        # read 35.6x on one runner and 37.1x on another against an unchanged
+        # ~2.3s exec, a 0.06s baseline wobbling +-0.004s across the 36x line.
         compare_buffer = BENCH_COMPARE_BUFFER_S
         if sys.platform == "win32":
             compare_buffer += 2 * WIN_TIMER_QUANTUM_S * (1 + limit)
+        else:
+            compare_buffer += limit * EXEC_TIME_FLOOR_S
 
         def failed_bound(measured, baseline_value):
             exec_measured = self._exec_time(backend, measured)
