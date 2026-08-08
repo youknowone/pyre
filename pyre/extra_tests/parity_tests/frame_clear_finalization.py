@@ -1,6 +1,6 @@
 import gc
-import resource
 import sys
+import time
 import traceback
 import weakref
 
@@ -124,11 +124,14 @@ def assert_assert_raises_shape_stays_cheap():
 
     check = Check()
     count = 200
-    before = resource.getrusage(resource.RUSAGE_SELF)
+    # `process_time` rather than `resource.getrusage`: the CPU this process has
+    # spent is the measurement, and `resource` is a POSIX module, so importing
+    # it would take the five checks above off Windows along with this one.
+    before = time.process_time()
     for _ in range(count):
         check.assertRaises(Expected, raises)
-    after = resource.getrusage(resource.RUSAGE_SELF)
-    per_op_ms = (after.ru_utime - before.ru_utime) * 1000.0 / count
+    after = time.process_time()
+    per_op_ms = (after - before) * 1000.0 / count
     assert per_op_ms < 1.0, per_op_ms
 
 

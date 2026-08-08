@@ -1246,17 +1246,26 @@ fn finalize_system_exit(
 /// Die by SIGINT for an uncaught KeyboardInterrupt after shutdown has run
 /// (`app_main.py:1133-1153`).
 fn terminate_by_sigint() -> ! {
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-        #[cfg(windows)]
-        let signaled = libc::raise(libc::SIGINT);
-        #[cfg(not(windows))]
-        let signaled = libc::kill(libc::getpid(), libc::SIGINT);
-        if signaled != 0 {
-            std::process::exit(1);
-        }
+    // A Win32 process has no SIGINT to die of: restoring `SIG_DFL` and calling
+    // `raise(SIGINT)` runs the CRT's default action, which returns and ends the
+    // process with status 3 rather than the interrupt a shell reads. The status
+    // that reads as one is `STATUS_CONTROL_C_EXIT`, so it is exited with
+    // directly. Both callers have already finalized and flushed.
+    #[cfg(windows)]
+    {
+        const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
+        std::process::exit(STATUS_CONTROL_C_EXIT as i32);
     }
-    std::process::abort();
+    #[cfg(not(windows))]
+    {
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            if libc::kill(libc::getpid(), libc::SIGINT) != 0 {
+                std::process::exit(1);
+            }
+        }
+        std::process::abort();
+    }
 }
 
 fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {

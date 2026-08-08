@@ -827,14 +827,33 @@ fn init_string_module(ns: PyObjectRef) {
     );
 }
 
-/// `_sysconfig` stub — exposes `config_vars()` returning an empty dict. On
-/// POSIX `sysconfig` only consults this for the build variables that pyre does
-/// not generate; importing it is enough to satisfy `test_sysconfig`.
+/// `_sysconfig` — `config_vars()`, the build variables that come from the
+/// running binary rather than from a generated `_sysconfigdata_*` module.
+///
+/// `sysconfig._init_non_posix` SUBSCRIPTS `Py_GIL_DISABLED` and `Py_DEBUG` to
+/// spell `ABIFLAGS`, so on Windows a missing key is a `KeyError` out of the
+/// first `get_config_var` call rather than the `None` the `.get()` readers
+/// take. Both are 0 here — pyre is neither build, which is what an empty
+/// `sys.abiflags` already says. The other two keys `config_vars` carries,
+/// `EXT_SUFFIX` and `SOABI`, name an extension ABI; `_imp.extension_suffixes()`
+/// is empty, so there is none to name and they stay absent for `.get()`.
 fn init_sysconfig_stub(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "config_vars",
-        crate::make_builtin_function("config_vars", |_| Ok(pyre_object::w_dict_new())),
+        crate::make_builtin_function("config_vars", |_| {
+            let vars = pyre_object::w_dict_new();
+            unsafe {
+                for name in ["Py_DEBUG", "Py_GIL_DISABLED"] {
+                    pyre_object::w_dict_store(
+                        vars,
+                        pyre_object::w_str_new(name),
+                        pyre_object::w_int_new(0),
+                    );
+                }
+            }
+            Ok(vars)
+        }),
     );
 }
 

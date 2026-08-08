@@ -1124,6 +1124,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // reads it to build USER_SITE.
     #[cfg(windows)]
     module_ns_store(ns, "winver", w_str_new("3.14"));
+    // sys._vpath — the build's relative path from the executable's directory to
+    // the prefix. `sysconfig._init_config_vars` subscripts it under `os.name ==
+    // 'nt'`, so it is an AttributeError out of the first `get_config_var` call
+    // when absent; it is stored into `_CONFIG_VARS['VPATH']` and read nowhere
+    // else, `sys._stdlib_dir` being what locates the stdlib here.
+    #[cfg(windows)]
+    module_ns_store(ns, "_vpath", w_str_new(r"..\.."));
     module_ns_store(
         ns,
         "byteorder",
@@ -1336,6 +1343,75 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "getdefaultencoding",
         make_builtin_function_with_arity("getdefaultencoding", |_| Ok(w_str_new("utf-8")), 0),
+    );
+    // sys.getwindowsversion — a five-field sequence over `OSVERSIONINFOEXW`
+    // with five named-only fields beyond it, the same shape `os.stat_result`
+    // carries its `st_*_ns` extras in. `test.support.os_helper` reads
+    // `.platform` at import, so every `test.support` consumer needs it.
+    //
+    // `major`/`minor`/`build` are kernel32's own file version rather than
+    // `GetVersionEx`'s answer: that call reports the version an unmanifested
+    // binary is shimmed to, and only an application manifest declaring
+    // compatibility makes it report the running one. `platform_version` — the
+    // field that exists because of exactly that shimming — therefore agrees
+    // with them here instead of correcting them.
+    #[cfg(windows)]
+    module_ns_store(
+        ns,
+        "getwindowsversion",
+        make_builtin_function_with_arity(
+            "getwindowsversion",
+            |args| {
+                if !args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "getwindowsversion() takes no arguments",
+                    ));
+                }
+                let info = rustpython_host_env::windows::get_windows_version().map_err(|e| {
+                    crate::PyError::os_error_win32_syscall2(
+                        e.raw_os_error().unwrap_or(0),
+                        pyre_object::PY_NULL,
+                        pyre_object::PY_NULL,
+                    )
+                })?;
+                let cls = crate::_structseq::make_struct_seq_with_extra(
+                    "sys.getwindowsversion",
+                    &["major", "minor", "build", "platform", "service_pack"],
+                    &[
+                        "service_pack_major",
+                        "service_pack_minor",
+                        "suite_mask",
+                        "product_type",
+                        "platform_version",
+                    ],
+                );
+                Ok(crate::_structseq::new_instance_with_extra(
+                    cls,
+                    vec![
+                        w_int_new(info.major as i64),
+                        w_int_new(info.minor as i64),
+                        w_int_new(info.build as i64),
+                        w_int_new(info.platform as i64),
+                        w_str_new(&info.service_pack),
+                    ],
+                    vec![
+                        ("service_pack_major", w_int_new(info.service_pack_major as i64)),
+                        ("service_pack_minor", w_int_new(info.service_pack_minor as i64)),
+                        ("suite_mask", w_int_new(info.suite_mask as i64)),
+                        ("product_type", w_int_new(info.product_type as i64)),
+                        (
+                            "platform_version",
+                            pyre_object::w_tuple_new(vec![
+                                w_int_new(info.major as i64),
+                                w_int_new(info.minor as i64),
+                                w_int_new(info.build as i64),
+                            ]),
+                        ),
+                    ],
+                ))
+            },
+            0,
+        ),
     );
     // sys.getrecursionlimit / setrecursionlimit — pypy/module/sys/vm.py:45.
     // The runtime stack budget lives in `crate::stack_check`; both
