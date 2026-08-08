@@ -25443,7 +25443,15 @@ fn coroutine_get_suspended(args: &[PyObjectRef]) -> crate::PyResult {
     coroutine_getter(args, 1)
 }
 fn coroutine_get_frame(args: &[PyObjectRef]) -> crate::PyResult {
-    coroutine_getter(args, 2)
+    let frame = coroutine_getter(args, 2)?;
+    // CPython 3.14 releases a temporary coroutine immediately after
+    // `f().cr_frame`; schedule pyre's tracing-GC equivalent for the next
+    // opcode, when the getter receiver is no longer rooted by LOAD_ATTR.
+    let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
+    if !ec.is_null() {
+        unsafe { (*ec).finalize_discarded_coroutine_after_frame_get() };
+    }
+    Ok(frame)
 }
 fn coroutine_get_code(args: &[PyObjectRef]) -> crate::PyResult {
     coroutine_getter(args, 3)

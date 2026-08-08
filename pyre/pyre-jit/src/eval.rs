@@ -1112,8 +1112,10 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///     items in place: barrier-less interpreter stores require that at minors,
 ///     and it is harmless duplicate marking at majors. A stationary
 ///     `std::alloc` block always forwards its items in place.
-///   - `f_generator_nowref`, `w_yielding_from`, `w_builtin`, `w_globals`
-///     — the ref-bearing statics.
+///   - `w_yielding_from`, `w_builtin`, `w_globals` — the ref-bearing statics.
+///     `f_generator_nowref` is excluded: it is the raw counterpart of PyPy's
+///     translated `f_generator_wref` (pyframe.py:75-76/276-279), hence a
+///     non-owning back-reference rather than a GC edge.
 ///   - `debugdata` / `lastblock` — managed field slots are forwarded.
 ///   - `debugdata->{w_locals, w_f_trace, hidden_operationerr}` — null-guarded.
 ///
@@ -1186,7 +1188,6 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
         }
     }
 
-    f(&mut frame.f_generator_nowref as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.w_yielding_from as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.w_builtin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.w_globals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);

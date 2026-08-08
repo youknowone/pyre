@@ -16883,9 +16883,11 @@ unsafe fn generator_frame_is_finished(gen_obj: PyObjectRef, frame: &mut crate::p
     unsafe { w_generator_set_exhausted(gen_obj) };
     frame.set_frame_finished_execution(true);
     frame.w_yielding_from = PY_NULL;
-    // The exhausted flag makes `descr_clear` take its permitted finalized
-    // branch.  It has no semantic failure path after that state transition.
-    let _ = frame.descr_clear();
+    // Internal generator completion clears the owned frame directly.  Public
+    // `frame.clear()` instead calls the generator finalizer first; routing
+    // completion through it would report a normally closed coroutine as
+    // never awaited.
+    frame.clear_references();
     frame.f_backref = std::ptr::null_mut();
     frame.f_generator_nowref = PY_NULL;
     unsafe { w_generator_set_frame(gen_obj, std::ptr::null_mut()) };
@@ -18052,6 +18054,51 @@ pub(crate) fn async_gen_athrow_throw_method(args: &[PyObjectRef]) -> PyResult {
 /// is collected. If the suspended frame is still live and its current instruction is
 /// covered by an exception-table handler (a `finally`/`except`/`with` cleanup), raise
 /// GeneratorExit into it so the cleanup runs.
+fn warn_unawaited_coroutine(gen_obj: PyObjectRef) {
+    // CPython 3.14 `_PyErr_WarnUnawaitedCoroutine`: the public `warnings`
+    // module owns the overridable formatting hook.  A hook failure is
+    // unraisable from finalizer context, and only a RuntimeWarning raised by
+    // the warning filter counts as already warned; every other failure gets a
+    // direct warning fallback as well.
+    let repr = unsafe { crate::display::py_repr_wtf8(gen_obj) }
+        .unwrap_or_else(|_| Wtf8Buf::from_string("<coroutine object>".to_string()));
+    let where_desc =
+        crate::display::wtf8_format!("Exception ignored while finalizing coroutine ", repr);
+
+    let hook_result = crate::importing::get_sys_module("warnings").and_then(|warnings| {
+        match findattr_result(warnings, "_warn_unawaited_coroutine") {
+            Ok(Some(hook)) => Some(crate::call::call_function_impl_result(hook, &[gen_obj])),
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
+        }
+    });
+    let warned = match hook_result {
+        Some(Ok(_)) => true,
+        Some(Err(mut err)) => {
+            let exc = err.to_exc_object();
+            let is_runtime_warning = crate::builtins::lookup_exc_class("RuntimeWarning")
+                .is_some_and(|cls| unsafe { isinstance_w(exc, cls) });
+            err.write_unraisable(w_none(), &where_desc, gen_obj);
+            is_runtime_warning
+        }
+        None => false,
+    };
+
+    if !warned {
+        let qualname = unsafe { pyre_object::generator::w_generator_get_qualname(gen_obj) };
+        let qualname = if qualname.is_null() {
+            Wtf8Buf::from_string("<unknown>".to_string())
+        } else {
+            unsafe { pyre_object::w_str_get_wtf8(qualname) }.to_wtf8_buf()
+        };
+        let message = crate::display::wtf8_format!("coroutine '", qualname, "' was never awaited");
+        let w_message = pyre_object::w_str_from_wtf8(message);
+        if let Err(mut err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
+            err.write_unraisable(w_none(), &where_desc, gen_obj);
+        }
+    }
+}
+
 pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
     unsafe {
         use pyre_object::generator::*;
@@ -18071,20 +18118,8 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         {
             w_coroutine_set_warned_unawaited(gen_obj);
             let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(gen_obj);
-            let w_mod = crate::importing::get_sys_module("_warnings")
-                .ok_or_else(|| PyError::runtime_error("_warnings is not initialized"))?;
-            pyre_object::gc_roots::pin_root(w_mod);
-            let w_f = getattr_str(
-                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
-                "_warn_unawaited_coroutine",
-            )?;
-            pyre_object::gc_roots::pin_root(w_f);
-            crate::call::call_function_impl_result(
-                pyre_object::gc_roots::shadow_stack_get(root_base + 2),
-                &[pyre_object::gc_roots::shadow_stack_get(root_base)],
-            )?;
+            warn_unawaited_coroutine(gen_obj);
         }
         if last_instr < 0 {
             return Ok(w_none()); // not started — cannot be inside a handler

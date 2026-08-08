@@ -1032,8 +1032,12 @@ pub unsafe fn walk_pyframe_roots_area(
                 let locals_slot =
                     &mut (*(frame)).locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray;
                 visitor(&mut *(locals_slot as *mut majit_ir::GcRef));
-                let gen_slot = &mut (*(frame)).f_generator_nowref as *mut PyObjectRef;
-                visitor(&mut *(gen_slot as *mut majit_ir::GcRef));
+                // pyframe.py:75-76/276-279: translated PyPy stores the
+                // generator owner in `f_generator_wref`; the `_nowref`
+                // fallback exists only when translation has no weakrefs.
+                // This field is therefore a non-owning back-reference in
+                // pyre and must not keep the generator alive through an
+                // escaped `cr_frame`/`gi_frame`.
                 let yielding_slot = &mut (*(frame)).w_yielding_from as *mut PyObjectRef;
                 visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
                 // pyframe.py:115-116 `self.builtin = ...` — the picked
@@ -1382,8 +1386,10 @@ pub fn walk_suspended_generator_frame(
             }
         }
 
-        let gen_slot = &mut (*frame).f_generator_nowref as *mut PyObjectRef;
-        visitor(&mut *(gen_slot as *mut majit_ir::GcRef));
+        // `f_generator_nowref` is the raw counterpart of PyPy's translated
+        // `f_generator_wref`, not a frame-owned GC edge (pyframe.py:75-76,
+        // 276-279).  The generator owns this suspended frame in the other
+        // direction.
         let yielding_slot = &mut (*frame).w_yielding_from as *mut PyObjectRef;
         visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
 
