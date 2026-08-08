@@ -196,49 +196,69 @@ fn is_history_heading(heading: &str) -> bool {
     lower.contains("retired") || lower.contains("dead") || lower.contains("not gates")
 }
 
-/// Every `PYRE_*` token the triage document lists as a live gate.
+/// The `PYRE_*` names this line spells out, in the order it spells them.
 ///
 /// Tokenized rather than substring-searched: `contains("PYRE_A")` is satisfied
 /// by a documented `PYRE_ANCHOR_STRICT`, so a new gate whose name is a prefix of
-/// a listed one would slip through the brake unnoticed. Scoped to the live
-/// sections for the reason in `is_history_heading`, and within them to the rows
-/// that are not themselves retirement records. `###` subsections inherit their
-/// `##` parent, which is what keeps §6a–§6c live under §6.
+/// a listed one would slip through the brake unnoticed.
+fn pyre_names_in(line: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    for (at, _) in line.match_indices("PYRE_") {
+        // A name preceded by a name character is the tail of a longer token.
+        if line[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let end = line[at..]
+            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .map_or(line.len(), |off| at + off);
+        names.push(&line[at..end]);
+    }
+    names
+}
+
+/// Every `PYRE_*` name the triage document lists as a live gate.
+///
+/// Scoped to the live sections for the reason in `is_history_heading` — `###`
+/// subsections inherit their `##` parent, which is what keeps §6a–§6c live under
+/// §6 — and then filtered by what the document records about each name.
+///
+/// **Retirement is a property of the gate, not of the line.** A retirement line
+/// retires its *subject*, and a name stays retired wherever else it is written:
+/// §5's table records `PYRE_CARRIER_EXC_RESUME` retired with its reader deleted,
+/// while §1e's prose — a live section — discusses the seam that gate used to
+/// guard and names it three more times. Counting those mentions as documentation
+/// made a gate with no reader look live.
+///
+/// **Subject, not mention**: only the *first* name on a retirement line is
+/// retired by it. §1c's row for `PYRE_AUTHORITATIVE` ends "`PYRE_PROBE_AUTHORITATIVE`
+/// is separate and remains live" — the whole point of that clause is that the
+/// second name is not the one being retired.
+///
+/// "retired", not "retire": §4 is a live section whose gates are the ones that
+/// "retire when the epic closes".
 fn gates_documented_in(triage: &str) -> BTreeSet<&str> {
-    let mut found = BTreeSet::new();
+    let mut live_names: BTreeSet<&str> = BTreeSet::new();
+    let mut retired_subjects: BTreeSet<&str> = BTreeSet::new();
     let mut live = true;
     for line in triage.lines() {
         if let Some(heading) = line.strip_prefix("## ") {
             live = !is_history_heading(heading);
         }
-        if !live {
-            continue;
-        }
-        // A row inside a live section can still be a retirement record. §1d's
-        // heading says "Parity verdicts", so the section is live, yet its table
-        // marks `PYRE_FBW_VABLE_SCALAR_CA` **RETIRED** — section granularity
-        // cannot express a mixed section. A row that says "retired" documents
-        // nothing either. "retired", not "retire": §4's live gates are the ones
-        // that "retire when the epic closes".
+        let names = pyre_names_in(line);
         if line.to_ascii_lowercase().contains("retired") {
-            continue;
-        }
-        for (at, _) in line.match_indices("PYRE_") {
-            // A name preceded by a name character is the tail of a longer token.
-            if line[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                continue;
+            if let Some(&subject) = names.first() {
+                retired_subjects.insert(subject);
             }
-            let end = line[at..]
-                .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
-                .map_or(line.len(), |off| at + off);
-            found.insert(&line[at..end]);
+        } else if live {
+            live_names.extend(names);
         }
     }
-    found
+    live_names.retain(|name| !retired_subjects.contains(name));
+    live_names
 }
 
 /// A documented token that is a wildcard's stem rather than a gate.
@@ -324,6 +344,12 @@ fn every_live_pyre_gate_has_a_gate_triage_entry() {
         !documented.contains("PYRE_FBW_VABLE_SCALAR_CA"),
         "PYRE_FBW_VABLE_SCALAR_CA is marked RETIRED inside §1d, a section whose \
          heading reads live — the per-row retirement check is no longer catching it"
+    );
+    assert!(
+        !documented.contains("PYRE_CARRIER_EXC_RESUME"),
+        "PYRE_CARRIER_EXC_RESUME is recorded retired in §5 and its reader is gone, \
+         but §1e's live prose names it three times — a retired subject is retired \
+         wherever else it is written, and this check is what enforces that"
     );
     assert!(
         documented.contains("PYRE_JD1"),
