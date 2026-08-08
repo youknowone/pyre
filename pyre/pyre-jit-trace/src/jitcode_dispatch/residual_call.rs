@@ -5016,6 +5016,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Range FOR_ITER is a C-level iterator advance.  Re-emit its field
     // updates so the opaque ForIterNext residual cannot invalidate optheap;
     // other iterator families retain the residual and its Python semantics.
+    // In particular, a generic W_SeqIterObject must stay residual: its PyPy
+    // `W_SeqIterObject.descr_next` frame catches IndexError from `__getitem__`
+    // and turns it into iterator exhaustion.  Inlining only `__getitem__`
+    // drops that catch frame, so GUARD_NO_EXCEPTION leaks IndexError on deopt.
     // The specialization supplies the same Ref result that the residual would,
     // including NULL for exhaustion, so the codewriter's trailing
     // GuardNonnull remains the only loop-exit guard.
@@ -5025,11 +5029,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
-        if let Some(outcome) = try_walker_specialize_seqiter_getitem_next(
-            ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
-        )? {
-            return Ok(outcome);
         }
     }
 
