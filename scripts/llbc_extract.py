@@ -500,6 +500,83 @@ def refuse_inert_pathspecs(eng: Engine) -> None:
     raise SystemExit("\n".join(lines))
 
 
+def _package_closure(
+    target_ids: list[str],
+    by_id: dict,
+    resolve_nodes: dict,
+    exclude: set[str],
+) -> list[dict]:
+    """Path-dependency packages reachable from `target_ids` avoiding `exclude`.
+
+    Pure graph reachability over cargo-metadata shapes: `by_id` maps package id
+    to package, `resolve_nodes` maps package id to its resolve node. Kept
+    separate from `_collect_inputs` so `--self-test` can drive it on a synthetic
+    graph — the property below is about the WALK, and on a real tree it is
+    invisible, because a fingerprint that silently includes four extra files
+    still hashes to something and still compares equal to itself.
+
+    ⭐ The exclusion is applied HERE, in the walk, and not in the emission loop
+    in `_collect_inputs` — excluding a package drops its whole EXCLUSIVELY-
+    REACHED SUBTREE, not just its own files.
+
+    This used to filter only at emission, which dropped the named package's
+    sources and then walked through it anyway, so every dependency reachable
+    ONLY through it stayed in the fingerprint. Measured on this tree:
+    `pyre-interpreter` excludes `majit-translate`, and `majit-charon-reader` —
+    whose sole dependent-of-record IS `majit-translate` — rode in behind it, 4
+    files that no artefact references and that moved the fingerprint 3 times in
+    30 days.
+
+    `continue` before appending is what makes it a subtree drop: the node is
+    neither emitted nor traversed. A package a NON-excluded parent also reaches
+    is still pushed from that parent, so this computes "reachable by a path
+    avoiding every excluded package" — which is the property the safety
+    argument below needs, and it holds regardless of pop order. Both halves are
+    load-bearing and `--self-test`'s diamond case checks them together: drop
+    what only the excluded package reaches, keep what something else does.
+
+    ⛔ Do NOT ALSO widen `extract`'s artefact guard to the packages dropped
+    here. That guard's evidence is a substring search for the package's
+    underscored name, and its power is PER SYMBOL: `majit_translate` occurs 373
+    times in `pyre-jit.ullbc` (which excludes nothing), so the guard is
+    demonstrably able to fail for it. `majit_charon_reader` occurs 0 times in
+    ALL SIX artefacts this tree builds, `pyre-jit.ullbc` included — there is no
+    artefact that can serve as its positive control, so a widened guard would
+    pass for a reason unrelated to safety and read as verification.
+
+    The transitive drop is certified by INHERITANCE instead, and that is a
+    stronger argument than the substring test: the parent's guard establishes
+    the artefact holds zero references to the excluded package, and a package
+    reachable only through it cannot appear without it. The guard runs on every
+    extraction, so the certificate stays live — if the artefact ever does
+    reference the parent, the parent's guard fires and the exclusion (subtree
+    included) has to go.
+    """
+    seen: set[str] = set()
+    stack = list(target_ids)
+    closure = []
+    while stack:
+        package_id = stack.pop()
+        if package_id in seen:
+            continue
+        seen.add(package_id)
+        package = by_id[package_id]
+        if package["name"] in exclude:
+            continue
+        closure.append(package)
+
+        for dep in resolve_nodes.get(package_id, {}).get("deps", []):
+            dep_kinds = dep.get("dep_kinds", [])
+            # An empty `dep_kinds` is a normal (non-dev) edge; only drop deps
+            # whose every listed kind is `dev`.
+            if dep_kinds and all(kind.get("kind") == "dev" for kind in dep_kinds):
+                continue
+            dep_package = by_id.get(dep["pkg"])
+            if dep_package is not None and dep_package.get("source") is None:
+                stack.append(dep_package["id"])
+    return closure
+
+
 def _collect_inputs(
     eng: Engine, crates: list[str], cargo_features: str
 ) -> tuple[list[str], list[Path]]:
@@ -594,37 +671,12 @@ def _collect_inputs(
                     "extract-llbc.py: unknown crate(s): " + ", ".join(sorted(missing))
                 )
 
-            seen: set[str] = set()
-            stack = [by_name[name]["id"] for name in target_names]
-            closure = []
-            while stack:
-                package_id = stack.pop()
-                if package_id in seen:
-                    continue
-                seen.add(package_id)
-                package = by_id[package_id]
-                # Apply the exclusion in the walk, not after it. This drops a
-                # package's exclusively-reached subtree as well as the named
-                # package. A node also reachable from a non-excluded parent is
-                # still pushed along that path and therefore remains present.
-                # The extracted artefact guard certifies the named package's
-                # absence; a subtree that has no path avoiding that package
-                # cannot occur without it.
-                if package["name"] in exclude:
-                    continue
-                closure.append(package)
-
-                for dep in resolve_nodes.get(package_id, {}).get("deps", []):
-                    dep_kinds = dep.get("dep_kinds", [])
-                    # An empty `dep_kinds` is a normal (non-dev) edge; only
-                    # drop deps whose every listed kind is `dev`.
-                    if dep_kinds and all(
-                        kind.get("kind") == "dev" for kind in dep_kinds
-                    ):
-                        continue
-                    dep_package = by_id.get(dep["pkg"])
-                    if dep_package is not None and dep_package.get("source") is None:
-                        stack.append(dep_package["id"])
+            closure = _package_closure(
+                [by_name[name]["id"] for name in target_names],
+                by_id,
+                resolve_nodes,
+                exclude,
+            )
 
             for package in closure:
                 package_dir = Path(package["manifest_path"]).resolve().parent
@@ -1647,6 +1699,107 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
     raise SystemExit(1)
 
 
+def self_test_exclusion_diamond() -> None:
+    """Drive `_package_closure` on a synthetic diamond; check BOTH its halves.
+
+    `excluded_deps` has to do two opposite things at once, and a real tree
+    cannot demonstrate either. Excluding a package must drop what only that
+    package reaches, and must NOT drop what something else also reaches — and a
+    fingerprint that gets this wrong still hashes to something, still compares
+    equal to itself, and still passes `--check`. The pre-fix engine filtered at
+    emission and carried four unreferenced files for 30 days without a single
+    red run. So the property is checked here on a graph built for it.
+
+    The graph, with `excluded` excluded:
+
+        root ──► keep_via_both ──► shared
+          └────► excluded ──┬────► shared           (also reached from above)
+                            └────► behind_excluded  (reached ONLY via excluded)
+
+    Two-sided, and neither side alone is sufficient:
+
+    * `behind_excluded` must be ABSENT. An engine that filters at emission
+      keeps it — that is the #152 defect, and this is the only assertion that
+      sees it.
+    * `shared` must be PRESENT. An engine that prunes by ancestry instead
+      (dropping everything downstream of an excluded node) also passes the
+      first assertion, and drops a package the tree genuinely depends on. That
+      is a wrong answer in the unsafe direction — an under-fingerprinted crate
+      whose artefact goes stale silently.
+
+    The unexcluded control runs first and is not a formality: it establishes
+    that both nodes are reachable AT ALL. Without it, "absent" and "present"
+    are being read off a graph that might reach neither, and the excluded run
+    would pass for a reason unrelated to exclusion.
+
+    ⚠ Not covered here: the `dep_kinds`/dev-edge filter in the same walk. It is
+    a different property with a different failure mode and no fixture yet.
+    """
+    def pkg(name, source=None):
+        return {"id": f"{name} 0.0.0", "name": name, "source": source}
+
+    def node(name, *deps):
+        return (
+            f"{name} 0.0.0",
+            {"deps": [{"pkg": f"{d} 0.0.0", "dep_kinds": []} for d in deps]},
+        )
+
+    names = ["root", "keep_via_both", "excluded", "shared", "behind_excluded"]
+    by_id = {p["id"]: p for p in (pkg(n) for n in names)}
+    resolve_nodes = dict(
+        [
+            node("root", "keep_via_both", "excluded"),
+            node("keep_via_both", "shared"),
+            node("excluded", "shared", "behind_excluded"),
+            node("shared"),
+            node("behind_excluded"),
+        ]
+    )
+    root_ids = ["root 0.0.0"]
+
+    def walk(exclude):
+        return sorted(
+            p["name"] for p in _package_closure(root_ids, by_id, resolve_nodes, exclude)
+        )
+
+    control = walk(set())
+    excluded = walk({"excluded"})
+    print("  exclusion diamond")
+    print(f"    exclude {{}}            {control}")
+    print(f"    exclude {{excluded}}    {excluded}")
+
+    failures = []
+    # The control first: an unreachable node proves nothing by being absent.
+    for name in ("shared", "behind_excluded"):
+        if name not in control:
+            failures.append(
+                f"control walk does not reach {name!r} — the fixture graph is "
+                f"broken, and every verdict below it is vacuous"
+            )
+    if not failures:
+        if "behind_excluded" in excluded:
+            failures.append(
+                "'behind_excluded' survived the exclusion — the exclusion is "
+                "being applied at emission rather than in the walk, so a "
+                "package reachable ONLY through an excluded one still moves "
+                "the fingerprint (the #152 defect)"
+            )
+        if "shared" not in excluded:
+            failures.append(
+                "'shared' was dropped by the exclusion — the walk is pruning "
+                "by ancestry rather than by reachability-avoiding-the-excluded, "
+                "so a package the tree still depends on left the fingerprint "
+                "and its artefact can go stale unnoticed"
+            )
+        if "excluded" in excluded:
+            failures.append("the excluded package itself is in the closure")
+    if failures:
+        sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
+        for line in failures:
+            print(f"self-test FAILED: {line}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
     """A/B/A the fingerprint against a new untracked `.rs` under a covered path.
 
@@ -1796,6 +1949,13 @@ def run_cli(
         print(f"external={external_fingerprint(eng, crates, cargo_features)}")
         return
     if args.self_test:
+        # The diamond runs first because it mutates nothing: on a shared
+        # worktree, a broken input-set computation should be reported without
+        # writing a probe file into the tree to find it out. It is also the
+        # case `self_test` structurally cannot cover — that one compares the
+        # fingerprint against itself, so it stays green over an input set that
+        # is silently wrong.
+        self_test_exclusion_diamond()
         self_test(eng, crates, cargo_features)
         return
     if args.check:
