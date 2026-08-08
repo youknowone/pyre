@@ -235,6 +235,10 @@ jobs:
       with:
         name: charon-${{ runner.os }}-${{ runner.arch }}
         path: .pyre-build/charon
+    - name: Restore Charon executable permissions (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
     - name: Download LLBC artifact
       # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache,
       # an artifact is exempt from the repo-wide 10 GB cache budget and its
@@ -361,6 +365,10 @@ jobs:
       with:
         name: charon-${{ runner.os }}-${{ runner.arch }}
         path: .pyre-build/charon
+    - name: Restore Charon executable permissions (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
     - name: Download LLBC artifact
       # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache,
       # an artifact is exempt from the repo-wide 10 GB cache budget and its
@@ -556,6 +564,10 @@ jobs:
       with:
         name: charon-${{ runner.os }}-${{ runner.arch }}
         path: .pyre-build/charon
+    - name: Restore Charon executable permissions (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
     - name: Download LLBC artifact
       # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache,
       # an artifact is exempt from the repo-wide 10 GB cache budget and its
@@ -607,6 +619,10 @@ jobs:
       with:
         name: charon-${{ runner.os }}-${{ runner.arch }}
         path: .pyre-build/charon
+    - name: Restore Charon executable permissions (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
     - name: Download LLBC artifact
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
