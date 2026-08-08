@@ -1244,13 +1244,15 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// `celldict.py:207-216 copy` — produce a fresh W_DictObject that
     /// owns unwrapped cell values keyed by str objects.
     ///
-    /// PyPy's destination strategy is `UnicodeDictStrategy`; pyre
-    /// still allocates the destination through `w_dict_new()` (which
-    /// installs `OBJECT_DICT_STRATEGY`) — line-by-line parity for the
-    /// destination strategy lands when typed strategy storage is in
-    /// place.
+    /// The destination is born on `UnicodeDictStrategy` over that
+    /// strategy's own empty storage, matching `:208-209`'s
+    /// `fromcache(UnicodeDictStrategy)` / `get_empty_storage()` pair rather
+    /// than starting the copy on the object strategy.  Every key below is a
+    /// str, so the fill stays on the strategy it was born with.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
-        let new_dict = crate::dictmultiobject::w_dict_new();
+        let strategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
+        let new_dict =
+            crate::dictmultiobject::w_dict_new_with(strategy, strategy.get_empty_storage());
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
             for (k, &v) in entries.iter() {
                 crate::dictmultiobject::w_dict_store(new_dict, k.obj, v);
