@@ -2397,11 +2397,22 @@ impl UserDelAction {
         if let Err(error) = unsafe {
             crate::baseobjspace::get_and_call_function(del(), current(), w_type.as_ptr(), &[])
         } {
+            // PyPy executioncontext.py:680-690 passes an empty `where` and
+            // the `__del__` descriptor to `write_unraisable`.  Python 3.14's
+            // `_PyErr_FormatUnraisable` gives this finalizer case a more
+            // specific hook message; 3.14 is pyre's compatibility target
+            // when its observable result differs from PyPy's.
+            let del_repr = unsafe { crate::display::py_repr_wtf8(del()) }
+                .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_string()));
+            let where_desc = crate::display::wtf8_format!(
+                "Exception ignored while calling deallocator ",
+                del_repr
+            );
             report_error(
                 self.base.space,
                 &error,
-                rustpython_wtf8::Wtf8::new(""),
-                del(),
+                &where_desc,
+                pyre_object::w_none(),
             );
         }
     }
