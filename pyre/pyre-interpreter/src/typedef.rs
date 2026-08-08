@@ -18943,26 +18943,64 @@ fn init_object_type(ns: PyObjectRef) {
             ),
         )
     };
-    // typeobject.py descr___init_subclass__ — the default accepts no
-    // keywords; class-definition keywords reaching it via the builtin
-    // kwargs ABI are an error, not silently dropped.
+    // objectobject.py:139 `descr___init_subclass__(space, w_cls)` — the
+    // default declares one parameter and no `__args__`, so anything beyond the
+    // bound class is refused by the argument parser rather than by the body.
+    // Report it through the same `ArgErr` shapes the parser builds
+    // (argument.py:529-627), under the defining type's name: the message reads
+    // `object.__init_subclass__()` even when the call arrives through a
+    // subclass or a class statement's keywords.
     unsafe {
         let init_subclass_func = crate::gateway::make_builtin_function_with_text_signature(
             "__init_subclass__",
             |args| {
-                let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                if let Some(kw) = kwargs {
-                    let has_real_kw = unsafe {
-                        pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
-                            pyre_object::is_str(k)
-                                && pyre_object::w_str_get_wtf8(k).as_str() != Ok("__pyre_kw__")
-                        })
-                    };
-                    if has_real_kw {
-                        return Err(crate::PyError::type_error(
-                            "__init_subclass__() takes no keyword arguments",
-                        ));
-                    }
+                let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                let refuse = |err: crate::argument::ArgErr| {
+                    Err(crate::PyError::type_error(format!(
+                        "object.__init_subclass__() {}",
+                        err.getmsg()
+                    )))
+                };
+                // argument.py:250-287 collects the keywords before the
+                // positional overflow is judged, so `__init_subclass__(1, x=1)`
+                // names the keyword.
+                let unknown: Vec<String> = match kwargs {
+                    Some(kw) => unsafe {
+                        pyre_object::w_dict_items(kw)
+                            .into_iter()
+                            .filter(|(k, _)| pyre_object::is_str(*k))
+                            .filter_map(|(k, _)| {
+                                pyre_object::w_str_get_wtf8(k)
+                                    .as_str()
+                                    .ok()
+                                    .map(str::to_string)
+                            })
+                            .filter(|name| name != "__pyre_kw__")
+                            .collect()
+                    },
+                    None => Vec::new(),
+                };
+                if let Some(first) = unknown.first() {
+                    return refuse(crate::argument::ArgErr::UnknownKwds {
+                        num_kwds: unknown.len(),
+                        kwd_name: first.clone(),
+                    });
+                }
+                // `pos[0]` is the class the classmethod bound, so an argument
+                // of its own puts the count at two.
+                if pos.len() > 1 {
+                    return refuse(crate::argument::ArgErr::TooManyMethod {
+                        signature: crate::gateway::Signature::new(vec!["cls"], None, None, 0, 0),
+                        num_defaults: 0,
+                        given: pos.len(),
+                        kwonly_given: 0,
+                    });
+                }
+                if pos.is_empty() {
+                    return refuse(crate::argument::ArgErr::Missing {
+                        missing: vec!["cls".to_string()],
+                        positional: true,
+                    });
                 }
                 Ok(pyre_object::w_none())
             },
