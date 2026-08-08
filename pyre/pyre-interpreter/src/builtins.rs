@@ -15119,6 +15119,10 @@ fn open_flags_for_mode(mode: &str) -> i32 {
     if exclusive {
         flags |= libc::O_CREAT | libc::O_EXCL;
     }
+    // PyPy `W_FileIO.descr_init`: every pathname/opener call receives
+    // `O_CLOEXEC` when the platform provides it.  The explicit fcntl below
+    // remains necessary for an opener that ignores the supplied flag.
+    flags |= libc::O_CLOEXEC;
     flags
 }
 #[cfg(not(unix))]
@@ -15145,6 +15149,23 @@ fn fileio_validate_fd(
 #[cfg(unix)]
 fn fileio_close_owned_fd(fd: i32) {
     let _ = crate::host_seam::ops::close(fd);
+}
+
+/// PyPy `_open_inhcache.set_non_inheritable(fd)` / `rposix.set_inheritable`.
+/// A caller-supplied integer descriptor is deliberately excluded: FileIO must
+/// preserve that descriptor's existing inheritance flag.
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    let current = crt_call!(libc::fcntl(fd, libc::F_GETFD));
+    if current < 0 {
+        return Err(crate::PyError::os_error_syscall(crt_errno(), w_name));
+    }
+    if current & libc::FD_CLOEXEC == 0
+        && crt_call!(libc::fcntl(fd, libc::F_SETFD, current | libc::FD_CLOEXEC)) < 0
+    {
+        return Err(crate::PyError::os_error_syscall(crt_errno(), w_name));
+    }
+    Ok(())
 }
 
 /// `open()` — PyPy `pypy/module/_io/interp_io.py:open`.
@@ -15517,6 +15538,11 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if fd < 0 {
                 return Err(crate::PyError::value_error(format!("opener returned {fd}")));
             }
+            #[cfg(all(unix, not(feature = "sandbox")))]
+            if let Err(error) = fileio_set_non_inheritable(fd, resolved_path.w_path()) {
+                fileio_close_owned_fd(fd);
+                return Err(error);
+            }
             #[cfg(unix)]
             if let Err(error) = fileio_validate_fd(fd, resolved_path.w_path()) {
                 fileio_close_owned_fd(fd);
@@ -15578,6 +15604,10 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // wrapper from which it came.
         let fd = crate::host_seam::ops::open(path_bytes, flags, 0o666)
             .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, resolved_path.w_path()))?;
+        if let Err(error) = fileio_set_non_inheritable(fd, resolved_path.w_path()) {
+            fileio_close_owned_fd(fd);
+            return Err(error);
+        }
         if let Err(error) = fileio_validate_fd(fd, resolved_path.w_path()) {
             fileio_close_owned_fd(fd);
             return Err(error);
