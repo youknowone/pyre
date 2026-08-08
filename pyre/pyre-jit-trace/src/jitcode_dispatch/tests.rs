@@ -2298,6 +2298,7 @@ fn append_journal_rollback_rewinds_length() {
     // (the only shape the arm specializes).
     unsafe { w_list_append(list, w_int_new(40)) };
     let len_before = unsafe { w_list_len(list) };
+    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
     assert_eq!(len_before, 4);
     assert!(
         unsafe { w_list_can_append_without_realloc(list) },
@@ -2307,7 +2308,7 @@ fn append_journal_rollback_rewinds_length() {
     // Rollback path: journal push + eager append (production order, see
     // try_walker_orthodox_list_append), then a non-commit exit rewinds
     // the length.
-    super::fbw_list_journal_push_append(list, len_before);
+    super::fbw_list_journal_push_append(list, len_before, allocated_before);
     unsafe { w_list_append(list, w_int_new(50)) };
     assert_eq!(unsafe { w_list_len(list) }, 5);
     super::fbw_store_journal_rollback();
@@ -2316,9 +2317,14 @@ fn append_journal_rollback_rewinds_length() {
         len_before,
         "non-commit walk must rewind the eager append's length"
     );
+    assert_eq!(
+        unsafe { pyre_object::listobject::w_list_allocated(list) },
+        allocated_before,
+        "non-commit walk must restore the logical allocation"
+    );
 
     // Commit path: the eager append stands; the log is dropped.
-    super::fbw_list_journal_push_append(list, len_before);
+    super::fbw_list_journal_push_append(list, len_before, allocated_before);
     unsafe { w_list_append(list, w_int_new(60)) };
     super::fbw_store_journal_commit();
     assert_eq!(
@@ -2438,13 +2444,14 @@ fn append_journal_rollback_rewinds_object_length() {
     // (the only shape the journal records).
     unsafe { w_list_append(list, w_none()) };
     let len_before = unsafe { w_list_len(list) };
+    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
     assert_eq!(len_before, 4);
     assert!(
         unsafe { w_list_can_append_without_realloc(list) },
         "post-grow object list must have spare capacity for the in-place append"
     );
 
-    super::fbw_list_journal_push_append(list, len_before);
+    super::fbw_list_journal_push_append(list, len_before, allocated_before);
     unsafe { w_list_append(list, w_none()) };
     assert_eq!(unsafe { w_list_len(list) }, 5);
     super::fbw_store_journal_rollback();

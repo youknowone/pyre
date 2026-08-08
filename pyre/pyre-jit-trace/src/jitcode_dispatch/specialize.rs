@@ -9414,6 +9414,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     value: pyre_object::PyObjectRef,
     len_before: usize,
 ) -> Result<(), DispatchError> {
+    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(inner_self) };
     // `w_list_append` unboxes its `value` inside an inline sub-walk.  A
     // virtual range item must be materialized at that call boundary: otherwise
     // the sub-walk's snapshot exports its raw payload as a loop-carried scalar,
@@ -9717,7 +9718,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // iterations, a traceback name list with its last frame doubled).
     // Re-read the length instead of assuming which side ran: it is the
     // receiver's own state, so it answers for both.
-    fbw_list_journal_push_append(inner_self, len_before);
+    fbw_list_journal_push_append(inner_self, len_before, allocated_before);
     if unsafe { pyre_object::w_list_len(inner_self) } == len_before {
         unsafe { pyre_object::w_list_append(inner_self, value) };
     }

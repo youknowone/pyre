@@ -19078,6 +19078,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 // Extended-slice delete: gather the selected indices, then
                 // pop them in descending order so earlier removals do not
                 // shift the positions of later targets.
+                let old_allocated = w_list_allocated(obj);
                 let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
                 let mut i = start;
                 for n in 0..slicelength {
@@ -19093,6 +19094,13 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                     if idx >= 0 && idx < w_list_len(obj) as i64 {
                         w_list_pop(obj, idx);
                     }
+                }
+                if slicelength > 0 {
+                    pyre_object::listobject::w_list_finish_batch_resize(
+                        obj,
+                        len as usize,
+                        old_allocated,
+                    );
                 }
                 return Ok(());
             }

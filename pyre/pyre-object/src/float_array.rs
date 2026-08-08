@@ -21,7 +21,7 @@ pub struct FloatArray {
     /// `Ptr(GcArray(Float))` — the backing block (`l.items`). Always non-null.
     pub block: *mut TypedItemsBlock,
     /// Live length (rlist.py:116 `("length", Signed)`).
-    len: usize,
+    pub(crate) len: usize,
 }
 
 pub const FLOAT_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(FloatArray, block);

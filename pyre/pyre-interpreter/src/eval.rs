@@ -8274,6 +8274,115 @@ result = (
     }
 
     #[test]
+    fn test_list_cpython_allocation_and_sizeof() {
+        let source = "\
+def allocation(value):
+    return (value.__sizeof__() - type(value).__basicsize__) // 8
+
+value = []
+append_allocations = []
+for item in range(20):
+    value.append(item)
+    append_allocations.append(allocation(value))
+
+sources = (
+    list([1, 2, 3, 4, 5]),
+    list((1, 2, 3, 4, 5)),
+    list(range(5)),
+    list(item for item in range(5)),
+    list(dict.fromkeys(range(5))),
+    list(set(range(5))),
+    list(dict.fromkeys(range(5)).keys()),
+    list(dict.fromkeys(range(5)).values()),
+    list(dict.fromkeys(range(5)).items()),
+)
+
+class HintTwenty:
+    def __iter__(self):
+        return iter(range(3))
+    def __len__(self):
+        return 20
+
+sorted_value = [3, 2, 1]
+sort_seen = []
+def sort_key(item):
+    sort_seen.append((len(sorted_value), sorted_value.__sizeof__()))
+    return item
+sorted_value.sort(key=sort_key)
+
+noop_sorted = [3, 2, 1]
+def noop_key(item):
+    noop_sorted.clear()
+    del noop_sorted[:]
+    noop_sorted[:] = []
+    return item
+noop_sorted.sort(key=noop_key)
+
+mucked_sorted = [3, 2, 1]
+def mucked_key(item):
+    if item == 3:
+        mucked_sorted.append(9)
+        mucked_sorted.pop()
+    return item
+try:
+    mucked_sorted.sort(key=mucked_key)
+except ValueError as exc:
+    mucked_detected = str(exc) == 'list modified during sort'
+else:
+    mucked_detected = False
+
+class Sub(list):
+    pass
+sub = Sub(range(3))
+
+class HugeHint:
+    def __iter__(self):
+        return self
+    def __next__(self):
+        raise StopIteration
+    def __length_hint__(self):
+        return (1 << 63) - 1
+
+nonempty = [1]
+try:
+    nonempty.extend(HugeHint())
+except MemoryError:
+    ignored_overflowing_hint = False
+else:
+    ignored_overflowing_hint = nonempty == [1]
+try:
+    list(HugeHint())
+except MemoryError:
+    empty_huge_hint_fails = True
+else:
+    empty_huge_hint_fails = False
+
+result = (
+    append_allocations == [4, 4, 4, 4, 8, 8, 8, 8,
+                           16, 16, 16, 16, 16, 16, 16, 16,
+                           24, 24, 24, 24]
+    and [allocation(item) for item in sources] == [6, 6, 6, 8, 8, 8, 8, 8, 8]
+    and allocation(list(HintTwenty())) == 8
+    and sort_seen == [(0, 32), (0, 32), (0, 32)]
+    and sorted_value == [1, 2, 3]
+    and allocation(sorted_value) == 4
+    and noop_sorted == [1, 2, 3]
+    and mucked_sorted == [1, 2, 3]
+    and mucked_detected
+    and ignored_overflowing_hint
+    and empty_huge_hint_fails
+    and sub.__sizeof__() == Sub.__basicsize__ + 4 * 8
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("CPython list allocation metadata failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
     fn test_percent_c_uses_fully_qualified_type_name() {
         let source = "\
 class Qualified:

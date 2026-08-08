@@ -4797,6 +4797,25 @@ fn arg_type_name(obj: PyObjectRef) -> String {
     }
 }
 
+fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 0)?;
+    let list = crate::type_methods::require_list_receiver(args, "__sizeof__", false)?;
+    // CPython 3.14 `list___sizeof___impl`: dynamic `tp_basicsize` plus one
+    // pointer-sized word for every logically allocated item slot.
+    let w_type = crate::typedef::r#type(list)
+        .map(|tp| tp.as_ptr())
+        .unwrap_or_else(|| gettypeobject(&pyre_object::LIST_TYPE));
+    let basicsize = cpython_type_layout(w_type)
+        .expect("list and its subclasses have CPython layout metadata")
+        .0;
+    let allocated = unsafe { pyre_object::listobject::w_list_allocated(list) };
+    // `list_sort_impl` temporarily writes -1. CPython performs this expression
+    // in `size_t`, so the unsigned wrap makes an exact base list report 32.
+    let size = (basicsize as usize)
+        .wrapping_add((allocated as usize).wrapping_mul(std::mem::size_of::<PyObjectRef>()));
+    Ok(w_int_new(size as i64))
+}
+
 fn init_list_type(ns: PyObjectRef) {
     // listobject.py W_ListObject.typedef, kept in source order.
     unsafe {
@@ -4839,6 +4858,18 @@ fn init_list_type(ns: PyObjectRef) {
         )
     };
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none()) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                list_descr_sizeof,
+                1,
+                "($self, /)",
+            ),
+        )
+    };
     // listobject.py:2486 __class_getitem__ = interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {

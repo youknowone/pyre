@@ -10006,34 +10006,19 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     if args.is_empty() {
         return Ok(w_list_new(vec![]));
     }
-    let obj = args[0];
-    unsafe {
-        // The raw-storage copy fast paths apply only to EXACT tuple/list
-        // instances; a subclass may override `__iter__`, so it must go
-        // through `collect_iterable` (`iter(obj)`).
-        if is_exact_list(obj) {
-            // Copy the list
-            let n = w_list_len(obj);
-            let items: Vec<_> = (0..n)
-                .filter_map(|i| w_list_getitem(obj, i as i64))
-                .collect();
-            return Ok(w_list_new(items));
-        }
-        if is_exact_tuple(obj) {
-            let n = w_tuple_len(obj);
-            let items: Vec<_> = (0..n)
-                .filter_map(|i| w_tuple_getitem(obj, i as i64))
-                .collect();
-            return Ok(w_list_new(items));
-        }
-    }
-    // listobject.py:1049-1053 `_extend_from_iterable` asks for the source's
-    // length hint before obtaining/consuming its iterator.  The hint is only a
-    // preallocation aid, but RuntimeError and other non-TypeError failures
-    // from `__len__` / `__length_hint__` are observable and must propagate.
-    let _ = crate::baseobjspace::length_hint(obj, 0)?;
-    // Consume iterator — PyPy: listobject.py W_ListObject(iterable)
-    Ok(w_list_new(collect_iterable(obj)?))
+    // CPython `list_vectorcall_impl` allocates an empty list then delegates to
+    // the same `list_extend` machinery as `list.__init__`. Keep both the source
+    // and result rooted across that allocation and the iterator callbacks.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let list = w_list_new(vec![]);
+    pyre_object::gc_roots::pin_root(list);
+    crate::type_methods::list_method_extend(&[
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+    ])?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(root_base + 1))
 }
 
 /// The message-less `MemoryError` an unsatisfiable reservation raises.
@@ -13290,7 +13275,7 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // `sorted_lst.sort(key=key, reverse=reverse)`, so the built list picks its
     // storage strategy first and the sort runs through the same body
     // `list.sort` uses.
-    let w_list = w_list_new(collect_iterable(iterable)?);
+    let w_list = builtin_list_ctor(&[iterable])?;
     let _roots = pyre_object::gc_roots::push_roots();
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_list);
@@ -13329,6 +13314,7 @@ pub(crate) fn sort_list_in_place(
         // for the whole operation, so user code cannot alter this sorting
         // slice through the visible list.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        let saved_allocated = pyre_object::listobject::w_list_allocated(list);
         let saved = pyre_object::listobject::w_list_items_copy_as_vec(list);
         let _roots = pyre_object::gc_roots::push_roots();
         let item_base = pyre_object::gc_roots::shadow_stack_len();
@@ -13337,13 +13323,14 @@ pub(crate) fn sort_list_in_place(
         }
         let saved_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
         pyre_object::listobject::w_list_clear(list);
+        // CPython 3.14 list_sort_impl detaches ob_item and marks `allocated`
+        // as -1. Any resizing mutation replaces the sentinel with a normal
+        // allocation, which is how the final modification check works.
+        pyre_object::listobject::w_list_set_allocated(list, -1);
 
         let (order, sorted) = sort_rooted_items(item_base, saved_len, key_fn, reverse);
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
-        // Whether the user mucked with the list during the sort: any mutation
-        // switches the emptied receiver away from the Empty strategy, and a
-        // list never switches back, so a net-zero append+pop is caught too.
-        let mucked = !pyre_object::listobject::w_list_is_empty_strategy(list);
+        let mucked = pyre_object::listobject::w_list_allocated(list) != -1;
 
         // `descr_sort`'s `finally` puts the items back unconditionally,
         // discarding whatever the user stored into the receiver meanwhile.
@@ -13352,6 +13339,7 @@ pub(crate) fn sort_list_in_place(
             .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
             .collect();
         pyre_object::listobject::w_list_init_items(list, restored);
+        pyre_object::listobject::w_list_set_allocated(list, saved_allocated);
         sorted?;
         if mucked {
             return Err(crate::PyError::new(

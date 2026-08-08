@@ -460,11 +460,16 @@ pub(crate) fn fbw_store_journal_push(
 /// append's gate), so the rewind is allocation-free.
 // Consumed by the #171 `list.append` orthodox descent
 // (`try_walker_orthodox_list_append`).
-pub(crate) fn fbw_list_journal_push_append(list: pyre_object::PyObjectRef, length_before: usize) {
+pub(crate) fn fbw_list_journal_push_append(
+    list: pyre_object::PyObjectRef,
+    length_before: usize,
+    allocated_before: isize,
+) {
     FBW_LIST_EFFECT_JOURNAL.with(|j| {
         j.borrow_mut().push(FbwListEffect::Append {
             list,
             length_before,
+            allocated_before,
         })
     });
     // gh#467: see `fbw_store_journal_push`.
@@ -972,11 +977,12 @@ pub(crate) fn fbw_store_journal_rollback() {
         let mut entries = j.borrow_mut();
         while let Some(entry) = entries.pop() {
             unsafe {
-                let (list, length_before) = match entry {
+                let (list, length_before, allocated_before) = match entry {
                     FbwListEffect::Append {
                         list,
                         length_before,
-                    } => (list, length_before),
+                        allocated_before,
+                    } => (list, length_before, allocated_before),
                     FbwListEffect::PopEnd {
                         list,
                         length_before,
@@ -1053,6 +1059,7 @@ pub(crate) fn fbw_store_journal_rollback() {
                     // fold path records it); nothing to rewind.
                     pyre_object::listobject::ListStrategy::Empty => {}
                 }
+                pyre_object::listobject::w_list_set_allocated(list, allocated_before);
             }
         }
     });
