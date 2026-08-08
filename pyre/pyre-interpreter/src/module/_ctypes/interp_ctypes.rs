@@ -517,7 +517,11 @@ fn ctypes_resize(
     }
     let size = requested as usize;
     if let Some(ba) = cdata::cdata_buffer(obj) {
-        unsafe { pyre_object::w_bytearray_vec_mut(ba).resize(size, 0) };
+        unsafe {
+            let old_size = pyre_object::w_bytearray_len(ba);
+            pyre_object::w_bytearray_vec_mut(ba).resize(size, 0);
+            pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+        };
     }
     Ok(pyre_object::w_none())
 }

@@ -2214,6 +2214,7 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
     }
     if count == 0 {
         pyre_object::bytearrayobject::w_bytearray_vec_mut(ba).clear();
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
         return Ok(());
     }
     if len == 0 {
@@ -2226,6 +2227,7 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
     for _ in 1..count {
         vec.extend_from_slice(&snapshot);
     }
+    pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
     Ok(())
 }
 

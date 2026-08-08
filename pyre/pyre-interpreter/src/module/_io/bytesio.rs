@@ -156,9 +156,11 @@ impl W_BytesIO {
         }
         if self.pos == AT_END {
             let vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
+            let old_len = vec.len();
             vec.try_reserve_exact(data.len())
                 .map_err(|_| crate::PyError::memory_error(""))?;
             vec.extend_from_slice(data);
+            unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(self.buffer, old_len) };
             return Ok(data.len() as i64);
         }
 
@@ -180,6 +182,7 @@ impl W_BytesIO {
                 vec.resize(p, 0);
             }
             vec.resize(end, 0);
+            unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(self.buffer, old_len) };
         }
         vec[p..end].copy_from_slice(data);
         self.pos = if end > old_len { AT_END } else { end as i64 };
@@ -190,9 +193,11 @@ impl W_BytesIO {
         // rpython/rlib/rStringIO.py:178-200 never enlarges and always seeks
         // to the resulting end using the AT_END sentinel.
         let vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
+        let old_len = vec.len();
         if size < vec.len() as i64 {
             vec.truncate(size as usize);
         }
+        unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(self.buffer, old_len) };
         self.pos = AT_END;
     }
 

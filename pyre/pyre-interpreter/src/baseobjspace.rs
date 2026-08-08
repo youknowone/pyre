@@ -4025,11 +4025,19 @@ unsafe fn setitem_bytearray_slice(
         crate::builtins::bytearray_check_exports(obj)?;
     }
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+    let old_size = vec.len();
     if step == 1 {
         let cur = vec.len();
         let s = (start.max(0) as usize).min(cur);
         let e = (stop.max(start) as usize).min(cur).max(s);
+        if s == 0 && sequence2.len() < e - s {
+            pyre_object::bytearrayobject::w_bytearray_advance_logical_start(
+                obj,
+                e - s - sequence2.len(),
+            );
+        }
         vec.splice(s..e, sequence2.iter().copied());
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
         return Ok(w_none());
     }
     // Extended slice: `descr_setitem` forbids resizing — the source length
@@ -19133,10 +19141,15 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 let (start, stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
                 let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+                let old_size = vec.len();
                 if step == 1 {
                     let s = start.max(0) as usize;
                     let e = stop.max(start).min(vec.len() as i64) as usize;
+                    if s == 0 {
+                        pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, e - s);
+                    }
                     vec.drain(s..e);
+                    pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
                     return Ok(());
                 }
                 let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
@@ -19156,13 +19169,18 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                         vec.remove(idx as usize);
                     }
                 }
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
                 return Ok(());
             }
             let i = subscript_index_w("bytearray", index)?;
             let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
             let idx = if i < 0 { len + i } else { i };
             if idx >= 0 && idx < len {
+                if idx == 0 {
+                    pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, 1);
+                }
                 pyre_object::bytearrayobject::w_bytearray_vec_mut(obj).remove(idx as usize);
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, len as usize);
                 return Ok(());
             }
             return Err(PyError::new(

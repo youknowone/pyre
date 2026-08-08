@@ -19644,7 +19644,10 @@ fn bytearray_descr_init_value(
                 Ok(item) => {
                     let byte = crate::baseobjspace::byte_w(item, "byte")?;
                     crate::builtins::bytearray_check_exports(target)?;
-                    pyre_object::bytearrayobject::w_bytearray_vec_mut(target).push(byte);
+                    let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(target);
+                    let old_size = vec.len();
+                    vec.push(byte);
+                    pyre_object::bytearrayobject::w_bytearray_sync_alloc(target, old_size);
                 }
                 Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
                 Err(e) => return Err(e),
@@ -22937,6 +22940,7 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     unsafe {
         crate::builtins::bytearray_check_exports(ba)?;
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        let old_size = vec.len();
         if count <= 0 {
             vec.clear();
         } else if count != 1 && !vec.is_empty() {
@@ -22951,6 +22955,7 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 vec.extend_from_slice(&orig);
             }
         }
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
     }
     Ok(ba)
 }
@@ -22960,7 +22965,12 @@ fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     crate::type_methods::arity_exact(args, "append", 1)?;
     unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let b = bytearray_byte_arg(args[1])?;
-    unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).push(b) };
+    unsafe {
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        let old_size = vec.len();
+        vec.push(b);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], old_size);
+    };
     Ok(pyre_object::w_none())
 }
 
@@ -23015,7 +23025,10 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         }
     };
     unsafe {
-        pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).extend_from_slice(&appended)
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        let old_size = vec.len();
+        vec.extend_from_slice(&appended);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], old_size);
     };
     Ok(pyre_object::w_none())
 }
@@ -23029,9 +23042,11 @@ fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let b = bytearray_byte_arg(args[2])?;
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        let old_size = vec.len();
         let len = vec.len() as i64;
         let i = if index < 0 { index + len } else { index };
         vec.insert(i.clamp(0, len) as usize, b);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], old_size);
     }
     Ok(pyre_object::w_none())
 }
@@ -23045,7 +23060,11 @@ fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
         match vec.iter().position(|&x| x == b) {
-            Some(pos) => vec.remove(pos),
+            Some(pos) => {
+                let old_size = vec.len();
+                vec.remove(pos);
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], old_size);
+            }
             None => {
                 return Err(crate::PyError::value_error("value not found in bytearray"));
             }
@@ -23084,7 +23103,9 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 "pop index out of range",
             ));
         }
-        Ok(pyre_object::w_int_new(vec.remove(i as usize) as i64))
+        let value = vec.remove(i as usize);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], len as usize);
+        Ok(pyre_object::w_int_new(value as i64))
     }
 }
 
@@ -23102,7 +23123,10 @@ fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     crate::type_methods::arity_no_args(args, "clear")?;
     unsafe {
         crate::builtins::bytearray_check_exports(args[0])?;
-        pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear();
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        let old_size = vec.len();
+        vec.clear();
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], old_size);
     };
     Ok(pyre_object::w_none())
 }
@@ -23128,9 +23152,11 @@ fn bytearray_method_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, 
 fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "__init__")?;
     unsafe {
-        if !pyre_object::bytesobject::bytes_like_data(args[0]).is_empty() {
+        let old_size = pyre_object::bytearrayobject::w_bytearray_len(args[0]);
+        if old_size != 0 {
             crate::builtins::bytearray_check_exports(args[0])?;
             pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear();
+            pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], old_size);
         }
     }
     let fresh = bytearray_descr_init_value(args, args[0])?;
@@ -23139,7 +23165,9 @@ fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         if !data.is_empty() {
             unsafe {
                 crate::builtins::bytearray_check_exports(args[0])?;
+                let old_size = pyre_object::bytearrayobject::w_bytearray_len(args[0]);
                 *pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]) = data;
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], old_size);
             }
         }
     }
@@ -23193,13 +23221,22 @@ fn bytearray_descr_reduce_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 fn bytearray_descr_alloc(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 0)?;
     let capacity = unsafe { pyre_object::bytearrayobject::w_bytearray_capacity(args[0]) };
-    // PyPy's resizable list includes its trailing NUL. CPython 3.14 exposes
-    // the same convention: empty has alloc 0, otherwise payload capacity + 1.
-    Ok(w_int_new(if capacity == 0 {
-        0
-    } else {
-        (capacity + 1) as i64
-    }))
+    Ok(w_int_new(capacity as i64))
+}
+
+fn bytearray_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 0)?;
+    // CPython 3.14 `bytearray_sizeof_impl`: `_PyObject_SIZE(Py_TYPE(self))`
+    // plus the exposed `ob_alloc` byte count.
+    let basicsize = cpython_type_layout(
+        crate::typedef::r#type(args[0])
+            .map(|tp| tp.as_ptr())
+            .unwrap_or_else(|| gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)),
+    )
+    .expect("bytearray and its subclasses have CPython layout metadata")
+    .0;
+    let alloc = unsafe { pyre_object::bytearrayobject::w_bytearray_capacity(args[0]) };
+    Ok(w_int_new(basicsize + alloc as i64))
 }
 
 fn bytearray_descr_resize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -23220,11 +23257,13 @@ fn bytearray_descr_resize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             crate::builtins::bytearray_check_exports(args[0])?;
         }
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        let previous_size = vec.len();
         if new_size > old_size {
             vec.try_reserve_exact(new_size - old_size)
                 .map_err(|_| crate::PyError::memory_error(""))?;
         }
         vec.resize(new_size, 0);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], previous_size);
     }
     Ok(w_none())
 }
@@ -23263,6 +23302,18 @@ fn init_bytearray_type(ns: PyObjectRef) {
             ns,
             "__init__",
             make_builtin_function("__init__", bytearray_descr_init),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                bytearray_descr_sizeof,
+                1,
+                "($self, /)",
+            ),
         )
     };
     for (name, function, arity) in [
