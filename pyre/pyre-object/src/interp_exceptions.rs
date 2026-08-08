@@ -382,6 +382,11 @@ pub struct W_BaseException {
     /// `interp_exceptions.py:527 W_OSError.w_filename2` /
     /// `:742 readwrite_attrproperty_w('w_filename2', W_OSError)`.
     pub w_filename2: PyObjectRef,
+    /// `interp_exceptions.py:528 W_OSError.written = -1` — the independent
+    /// integer slot exposed by the `characters_written` GetSetProperty.
+    /// A numeric third argument on an exact BlockingIOError stamps it; later
+    /// descriptor writes and deletes mutate this slot without changing args.
+    pub written: i64,
     /// `interp_exceptions.py:990 W_SystemExit.w_code` /
     /// `:1006 readwrite_attrproperty_w('w_code', W_SystemExit)`.
     /// `PY_NULL` is the class default `None`; the `code` getattr arm
@@ -699,6 +704,8 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         w_strerror: PY_NULL,
         w_filename: PY_NULL,
         w_filename2: PY_NULL,
+        // `interp_exceptions.py:528` W_OSError class default.
+        written: -1,
         // `interp_exceptions.py:990` W_SystemExit class default
         // `w_code = None`.
         w_code: PY_NULL,
@@ -1362,6 +1369,25 @@ pub unsafe fn w_exception_set_filename2(obj: PyObjectRef, value: PyObjectRef) {
         (*(obj as *mut W_BaseException)).w_filename2 = value;
         exception_write_barrier(obj);
     }
+}
+
+/// `interp_exceptions.py:704-715 W_OSError.descr_{get,set,del}_written`.
+/// `-1` is the unset sentinel; the descriptor converts values before storing.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException`.
+#[inline]
+pub unsafe fn w_exception_get_written(obj: PyObjectRef) -> i64 {
+    unsafe { (*(obj as *const W_BaseException)).written }
+}
+
+/// Store the `W_OSError.written` integer slot.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException`.
+#[inline]
+pub unsafe fn w_exception_set_written(obj: PyObjectRef, value: i64) {
+    unsafe { (*(obj as *mut W_BaseException)).written = value };
 }
 
 /// `interp_exceptions.py:1006 readwrite_attrproperty_w('w_code', ...)`

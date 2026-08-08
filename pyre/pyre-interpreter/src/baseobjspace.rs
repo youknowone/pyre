@@ -438,8 +438,9 @@ pub fn exception_getclass(w_obj: PyObjectRef) -> PyObjectRef {
 /// True when `obj` is a `BlockingIOError` whose constructor took the numeric
 /// third argument as `characters_written` — recognised by `args_w[2]` still
 /// being an int (every other 2..=5-argument form trims `args_w` to two
-/// elements).  Gates the `characters_written` reader and suppresses the
-/// `filename` derivation for that argument (`interp_exceptions.py` `_init_error`).
+/// elements).  Suppresses `filename` derivation for that constructor argument
+/// even after the independent `written` slot is later deleted
+/// (`interp_exceptions.py` `_init_error`).
 fn exc_blocking_written(obj: PyObjectRef) -> bool {
     let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
     let n = unsafe { pyre_object::w_tuple_len(args) };
@@ -7246,10 +7247,16 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
         // `BlockingIOError` constructed with a numeric third argument keeps
         // it in `args_w[2]` as `characters_written`; otherwise the slot is
         // unset (`written == -1`) and the attribute raises `AttributeError`.
-        "characters_written" if exc_blocking_written(obj) => {
-            let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-            if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 2) } {
-                return Ok(v);
+        "characters_written" => {
+            if crate::builtins::lookup_exc_class("OSError")
+                .is_some_and(|os_error| unsafe { isinstance_w(obj, os_error) })
+            {
+                let written = unsafe {
+                    pyre_object::interp_exceptions::w_exception_get_written(obj)
+                };
+                if written != -1 {
+                    return Ok(pyre_object::w_int_new(written));
+                }
             }
         }
         // `interp_exceptions.py:409-411 W_ImportError` exposes
@@ -11413,6 +11420,22 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
                 return Ok(w_none());
             }
         }
+        // `interp_exceptions.py:709-711 W_OSError.descr_set_written` — the
+        // descriptor is declared on OSError (and therefore applies to every
+        // subclass), converts through `space.int_w`, and stores independently
+        // from the constructor args tuple.
+        "characters_written" => {
+            let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
+                return Ok(pyre_object::PY_NULL);
+            };
+            if unsafe { isinstance_w(obj, os_error) } {
+                let written = int_w(value)?;
+                unsafe {
+                    pyre_object::interp_exceptions::w_exception_set_written(obj, written)
+                };
+                return Ok(w_none());
+            }
+        }
         // `interp_exceptions.py:723-728`: the `winerror` descriptor is
         // installed only where the platform has Windows error codes, so
         // elsewhere the name falls through to the ordinary instance dict.
@@ -12323,6 +12346,25 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
             ) =>
         {
             return Err(PyError::type_error("can't delete numeric/char attribute"));
+        }
+        // `interp_exceptions.py:713-715 W_OSError.descr_del_written` — an
+        // already-unset slot raises; otherwise deletion restores `-1`.
+        "characters_written" => {
+            let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
+                return Ok(pyre_object::PY_NULL);
+            };
+            if unsafe { isinstance_w(obj, os_error) } {
+                let written = unsafe {
+                    pyre_object::interp_exceptions::w_exception_get_written(obj)
+                };
+                if written == -1 {
+                    return Err(PyError::attribute_error("characters_written"));
+                }
+                unsafe {
+                    pyre_object::interp_exceptions::w_exception_set_written(obj, -1)
+                };
+                return Ok(w_none());
+            }
         }
         _ if unsafe { exception_deletable_slot(obj, name) } => {
             return object_setattr(obj, name, w_none());

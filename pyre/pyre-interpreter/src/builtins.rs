@@ -6042,8 +6042,7 @@ fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bo
 /// A 2..=5 positional-argument call fills the `errno` / `strerror` /
 /// `filename` / `filename2` slots; when a filename is present it is
 /// dropped from `args_w` (`self.args_w = [w_errno, w_strerror]`, line
-/// 652) for pickle / repr compatibility.  The `BlockingIOError.written`
-/// special-case is not modelled.  `kind` is `OSError` for the base type and
+/// 652) for pickle / repr compatibility.  `kind` is `OSError` for the base type and
 /// `FileNotFoundError` for that dedicated kind; every other OSError subclass
 /// routes here as `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
 fn os_error_build(
@@ -6248,8 +6247,14 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
             // `_init_error` line 636-643: for an exact `BlockingIOError`, a
             // numeric third argument is `characters_written`, not a filename —
             // it stays in `args_w` and the tuple is not trimmed.
-            let written = |f| exc_is_blocking_io_error(exc) && pyre_object::is_int(f);
-            if let Some(fname) = w_filename.filter(|&f| !written(f)) {
+            let written = |f| {
+                exc_is_blocking_io_error(exc)
+                    .then(|| crate::baseobjspace::int_w(f).ok())
+                    .flatten()
+            };
+            if let Some(value) = w_filename.and_then(written) {
+                interp_exceptions::w_exception_set_written(exc, value);
+            } else if let Some(fname) = w_filename {
                 interp_exceptions::w_exception_set_filename(exc, fname);
                 if let Some(f2) = args.get(4).copied().filter(|&f| !pyre_object::is_none(f)) {
                     interp_exceptions::w_exception_set_filename2(exc, f2);
