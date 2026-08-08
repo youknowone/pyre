@@ -11,6 +11,24 @@ use crate::{
     builtin_code_name, function_get_name, function_get_qualname,
 };
 
+/// The address a repr quotes, spelled the way `PyUnicode_FromFormat`'s `%p`
+/// spells it.
+///
+/// That conversion hands the pointer to the platform's own `printf` and
+/// normalizes only the prefix — "guaranteed to start with the literal `0x`
+/// regardless of what the platform's `printf` yields". The platforms disagree
+/// about the rest: the MSVC runtime pads to the pointer width and uppercases,
+/// glibc does neither. So `<function f at 0x000001B7AF7FFCC0>` and
+/// `<function f at 0x1b7af7ffcc0>` are the same repr, each on its own platform,
+/// and Rust's `{:p}` is only ever the second one.
+pub(crate) fn repr_addr(addr: usize) -> String {
+    if cfg!(windows) {
+        format!("0x{addr:0width$X}", width = size_of::<usize>() * 2)
+    } else {
+        format!("0x{addr:x}")
+    }
+}
+
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance,
 /// returning the raw result object when it is a `str`.
 pub(crate) unsafe fn try_call_dunder_obj(
@@ -755,7 +773,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // which substitutes U+FFFD for a lone surrogate.
             let mut repr = Wtf8Buf::from_string("<function ".to_string());
             repr.push_wtf8(&function_get_qualname(obj));
-            repr.push_str(&format!(" at {obj:p}>"));
+            repr.push_str(&format!(" at {}>", crate::display::repr_addr(obj as usize)));
             return Ok(repr);
         } else if unsafe { pyre_object::is_exception(obj) } {
             // A user subclass that overrides `__repr__` shadows the builtin
@@ -956,7 +974,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             } else {
                 "memory"
             };
-            format!("<{label} at {obj:?}>")
+            format!("<{label} at {}>", repr_addr(obj as usize))
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
             // Try __repr__ first, then __str__
             if let Some(w) = try_call_dunder_wtf8(obj, "__repr__")? {
@@ -966,7 +984,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 return Ok(w);
             }
             let name = crate::baseobjspace::getfulltypename(obj);
-            format!("<{name} object at {obj:?}>")
+            format!("<{name} object at {}>", repr_addr(obj as usize))
         } else {
             // A builtin type carrying its own `__repr__` dict entry (e.g.
             // `_struct.Struct`) — dispatch it before the generic
@@ -987,7 +1005,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 }
             }
             let name = crate::baseobjspace::getfulltypename(obj);
-            format!("<{name} object at {obj:?}>")
+            format!("<{name} object at {}>", repr_addr(obj as usize))
         };
         Ok(Wtf8Buf::from_string(formatted))
     }

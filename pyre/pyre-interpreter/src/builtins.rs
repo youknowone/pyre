@@ -1723,7 +1723,10 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } else {
         "memory"
     };
-    Ok(w_str_new(&format!("<{label} at {mv:?}>")))
+    Ok(w_str_new(&format!(
+        "<{label} at {}>",
+        crate::display::repr_addr(mv as usize)
+    )))
 }
 
 /// Drop an mmap-backed view's export directly, bypassing any Python-callable

@@ -19,6 +19,19 @@ S = "q\udcffn"
 FFFD = "�"
 
 
+def at(obj):
+    """The address a repr quotes, in the spelling this platform's repr uses.
+
+    `PyUnicode_FromFormat`'s `%p` hands the pointer to the platform's own
+    `printf` and normalizes only the prefix, so the MSVC runtime's padding and
+    upper case are part of the repr there and glibc's bare lower case is part
+    of it everywhere else.
+    """
+    if sys.platform == "win32":
+        return "0x%0*X" % (2 * (8 if sys.maxsize > 2**32 else 4), id(obj))
+    return "0x%x" % id(obj)
+
+
 class Repr:
     def __repr__(self):
         return S
@@ -29,7 +42,7 @@ def check_function_qualname():
         return a
 
     f.__qualname__ = S
-    assert repr(f) == "<function %s at 0x%x>" % (S, id(f)), ascii(repr(f))
+    assert repr(f) == "<function %s at %s>" % (S, at(f)), ascii(repr(f))
 
     try:
         f(1, 2)
@@ -86,13 +99,13 @@ def check_generator_qualname():
 def check_contextvars():
     var = contextvars.ContextVar("n", default=Repr())
     var_repr = repr(var)
-    assert var_repr == "<ContextVar name='n' default=%s at 0x%x>" % (S, id(var)), ascii(var_repr)
+    assert var_repr == "<ContextVar name='n' default=%s at %s>" % (S, at(var)), ascii(var_repr)
 
     token = var.set("x")
-    assert repr(token) == "<Token var=%s at 0x%x>" % (var_repr, id(token)), ascii(repr(token))
+    assert repr(token) == "<Token var=%s at %s>" % (var_repr, at(token)), ascii(repr(token))
     var.reset(token)
     used_repr = repr(token)
-    assert used_repr == "<Token used var=%s at 0x%x>" % (var_repr, id(token)), ascii(used_repr)
+    assert used_repr == "<Token used var=%s at %s>" % (var_repr, at(token)), ascii(used_repr)
     try:
         var.reset(token)
     except RuntimeError as e:

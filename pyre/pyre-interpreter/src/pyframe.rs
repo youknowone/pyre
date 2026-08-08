@@ -3212,8 +3212,8 @@ impl PyFrame {
     pub fn descr_repr(&self) -> rustpython_wtf8::Wtf8Buf {
         let code = self.code();
         let mut out = rustpython_wtf8::Wtf8Buf::from_string(format!(
-            "<frame at {:p}, file '",
-            self as *const PyFrame
+            "<frame at {}, file '",
+            crate::display::repr_addr(self as *const PyFrame as usize)
         ));
         let filename = crate::gateway::fsdecode_filename_wtf8(&unsafe {
             crate::pycode::code_filename_bytes(self.pycode as pyre_object::PyObjectRef)

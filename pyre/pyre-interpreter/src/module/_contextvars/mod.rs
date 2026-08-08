@@ -244,7 +244,7 @@ fn context_var_repr_string(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf,
         "<ContextVar name=",
         name_repr,
         default,
-        format!(" at 0x{:x}>", obj as usize),
+        format!(" at {}>", crate::display::repr_addr(obj as usize)),
     ))
 }
 
@@ -379,7 +379,7 @@ fn token_repr_string(token: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, cra
             "<Token var="
         },
         var_repr,
-        format!(" at 0x{:x}>", token as usize),
+        format!(" at {}>", crate::display::repr_addr(token as usize)),
     ))
 }
 

@@ -12733,7 +12733,10 @@ fn init_function_type(ns: PyObjectRef) {
                     // which substitutes U+FFFD for a lone surrogate.
                     let mut repr = Wtf8Buf::from_string("<function ".to_string());
                     repr.push_wtf8(&unsafe { crate::function::function_get_qualname(function) });
-                    repr.push_str(&format!(" at {function:p}>"));
+                    repr.push_str(&format!(
+                        " at {}>",
+                        crate::display::repr_addr(function as usize)
+                    ));
                     Ok(pyre_object::w_str_from_wtf8(repr))
                 },
                 1,
@@ -13929,7 +13932,8 @@ fn init_method_wrapper_type(ns: PyObjectRef) {
                         .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
                         .unwrap_or("object");
                     Ok(pyre_object::w_str_new(&format!(
-                        "<method-wrapper '{name}' of {type_name} object at {w_self:p}>"
+                        "<method-wrapper '{name}' of {type_name} object at {}>",
+                        crate::display::repr_addr(w_self as usize)
                     )))
                 },
                 1,
@@ -15060,15 +15064,19 @@ fn cell_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     }
     let value = unsafe { pyre_object::w_cell_get(cell) };
     let text = if value.is_null() {
-        format!("<cell at 0x{:x}: empty>", cell as usize)
+        format!(
+            "<cell at {}: empty>",
+            crate::display::repr_addr(cell as usize)
+        )
     } else {
         let type_name = crate::typedef::r#type(value)
             .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
             .unwrap_or_else(|| unsafe { (*(*value).ob_type).name });
         let type_name: String = type_name.chars().take(80).collect();
         format!(
-            "<cell at 0x{:x}: {type_name} object at 0x{:x}>",
-            cell as usize, value as usize
+            "<cell at {}: {type_name} object at {}>",
+            crate::display::repr_addr(cell as usize),
+            crate::display::repr_addr(value as usize)
         )
     };
     Ok(w_str_new(&text))
@@ -18778,14 +18786,15 @@ fn init_object_type(ns: PyObjectRef) {
                             // `w_obj.getrepr(space, '%s object' % fulltypename)`.
                             let name = crate::baseobjspace::getfulltypename(obj);
                             return Ok(pyre_object::w_str_new_managed(&format!(
-                                "<{name} object at {obj:?}>"
+                                "<{name} object at {}>",
+                                crate::display::repr_addr(obj as usize)
                             )));
                         }
                     }
                     // For non-instances, delegate to display
                     Ok(pyre_object::w_str_new_managed(&format!(
-                        "<object at {:?}>",
-                        obj
+                        "<object at {}>",
+                        crate::display::repr_addr(obj as usize)
                     )))
                 },
                 1,
@@ -25232,27 +25241,27 @@ fn generator_frame(obj: PyObjectRef) -> *mut crate::pyframe::PyFrame {
 fn generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
     Ok(w_str_new(&format!(
-        "<generator object {} at {:p}>",
+        "<generator object {} at {}>",
         unsafe { pyre_object::w_str_get_value(name) },
-        args[0]
+        crate::display::repr_addr(args[0] as usize)
     )))
 }
 
 fn coroutine_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
     Ok(w_str_new(&format!(
-        "<coroutine object {} at {:p}>",
+        "<coroutine object {} at {}>",
         unsafe { pyre_object::w_str_get_value(name) },
-        args[0]
+        crate::display::repr_addr(args[0] as usize)
     )))
 }
 
 fn async_generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
     Ok(w_str_new(&format!(
-        "<async_generator object {} at {:p}>",
+        "<async_generator object {} at {}>",
         unsafe { pyre_object::w_str_get_value(name) },
-        args[0]
+        crate::display::repr_addr(args[0] as usize)
     )))
 }
 

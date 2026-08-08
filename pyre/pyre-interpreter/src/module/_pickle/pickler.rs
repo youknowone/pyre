@@ -1140,9 +1140,9 @@ fn fast_save_enter(ctx: &mut PickleCtx, obj_slot: usize) -> Result<Option<usize>
     if is_cycle {
         ctx.fast_nesting -= 1;
         return Err(PyError::value_error(format!(
-            "fast mode: can't pickle cyclic objects including object type {} at {:p}",
+            "fast mode: can't pickle cyclic objects including object type {} at {}",
             crate::baseobjspace::object_functionstr_type_name(w_cur),
-            w_cur as *const u8,
+            crate::display::repr_addr(w_cur as usize),
         )));
     }
     ctx.fast_memo.entry(h).or_default().push(obj_slot);

@@ -721,8 +721,10 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     };
     let addr = w_self as usize;
     Ok(pyre_object::w_str_new(&format!(
-        "<{} at 0x{:x}{}>",
-        type_name, addr, state
+        "<{} at {}{}>",
+        type_name,
+        crate::display::repr_addr(addr),
+        state
     )))
 }
 

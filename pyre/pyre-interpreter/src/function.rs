@@ -989,7 +989,10 @@ pub unsafe fn builtin_function_repr_text(name: &str, w_self: PyObjectRef) -> Str
     let type_name = crate::typedef::r#type(w_self)
         .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
         .unwrap_or("object");
-    format!("<built-in method {name} of {type_name} object at {w_self:p}>")
+    format!(
+        "<built-in method {name} of {type_name} object at {}>",
+        crate::display::repr_addr(w_self as usize)
+    )
 }
 
 /// CPython 3.14 `meth_reduce`: type-bound builtins reconstruct through

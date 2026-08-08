@@ -311,7 +311,8 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     if !direct {
         let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
         return Ok(pyre_object::w_str_new(&format!(
-            "<{name} object at {obj:?}>"
+            "<{name} object at {}>",
+            crate::display::repr_addr(obj as usize)
         )));
     }
     let tc = type_code_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;

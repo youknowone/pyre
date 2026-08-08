@@ -678,7 +678,10 @@ mod lock_class {
 
         fn __repr__(&self) -> String {
             let state = if self.locked() { "locked" } else { "unlocked" };
-            format!("<{state} _thread.lock object at {:p}>", self)
+            format!(
+                "<{state} _thread.lock object at {}>",
+                crate::display::repr_addr(self as *const Self as usize)
+            )
         }
 
         fn _at_fork_reinit(&self) {
@@ -907,8 +910,10 @@ mod rlock_class {
                 "locked"
             };
             format!(
-                "<{locked} _thread.RLock object owner={} count={} at {:p}>",
-                state.owner, state.count, self
+                "<{locked} _thread.RLock object owner={} count={} at {}>",
+                state.owner,
+                state.count,
+                crate::display::repr_addr(self as *const Self as usize)
             )
         }
 

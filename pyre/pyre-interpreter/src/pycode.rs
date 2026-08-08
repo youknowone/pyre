@@ -1180,8 +1180,9 @@ pub unsafe fn code_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
     let raw_line = (*(obj as *const PyCode)).co_firstlineno_raw as i64;
     let line = if raw_line == 0 { -1 } else { raw_line };
     let mut repr = rustpython_wtf8::Wtf8Buf::from_string(format!(
-        "<code object {} at {obj:p}, file \"",
+        "<code object {} at {}, file \"",
         code.obj_name,
+        crate::display::repr_addr(obj as usize),
     ));
     let filename = crate::gateway::fsdecode_filename_wtf8(&unsafe { code_filename_bytes(obj) });
     repr.push_wtf8(&filename);
