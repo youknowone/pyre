@@ -888,13 +888,16 @@ pub fn fbw_foriter_inflight_take(
     // but an inline sub-walk's consumed item belongs to its own JitCode. Keep
     // that per-frame code identity for the census; a legacy Python-pc entry,
     // and an unresolvable identity (a negative index), fall back to the live
-    // frame's code.
+    // frame's code. The resolution borrows the metainterp state, so it runs
+    // only while the census that consumes the key is collecting.
     let code_ptr = match stash.body {
-        InflightForiterBody::Jit { jitcode_index, .. } => {
+        InflightForiterBody::Jit { jitcode_index, .. }
+            if super::foriter_inflight_census_enabled() =>
+        {
             crate::state::raw_code_for_jitcode_index(jitcode_index)
                 .map_or(fallback_code_ptr, |code| code as usize)
         }
-        InflightForiterBody::Py(_) => fallback_code_ptr,
+        _ => fallback_code_ptr,
     };
     let store_len = fbw_store_journal_len();
     let append_len = FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len());

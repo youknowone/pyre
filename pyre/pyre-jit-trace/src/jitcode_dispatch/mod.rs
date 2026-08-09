@@ -2658,15 +2658,22 @@ thread_local! {
     > = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
+/// Whether the in-flight FOR_ITER delivery census collects. Callers that must
+/// compute a census key before recording share this gate, so resolving the key
+/// costs nothing when the diagnostic is off.
+pub(crate) fn foriter_inflight_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PYRE_FORITER_INFLIGHT_CENSUS").is_some()
+            || std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some()
+    })
+}
+
 /// Record one legacy in-flight FOR_ITER delivery decision. Like
 /// [`census_record_for_iter_gate_decline`], the collection gate precedes the
 /// thread-local lookup, so the census costs nothing when diagnostics are off.
 fn census_record_foriter_inflight(code_ptr: usize, body_pc: usize, delivered: bool) {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| {
-        std::env::var_os("PYRE_FORITER_INFLIGHT_CENSUS").is_some()
-            || std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some()
-    }) {
+    if !foriter_inflight_census_enabled() {
         return;
     }
     FORITER_INFLIGHT_CENSUS.with(|c| {
