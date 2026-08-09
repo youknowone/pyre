@@ -2,6 +2,8 @@ from __pypy__ import reversed_dict, move_to_end, objects_in_repr
 from _collections_abc import KeysView, ItemsView, ValuesView
 from _operator import eq as _eq
 
+_missing = object()
+
 
 class OrderedDict(dict):
     '''Dictionary that remembers insertion order.
@@ -59,6 +61,26 @@ class OrderedDict(dict):
             self[key] = value
     __update = update
 
+    @classmethod
+    def fromkeys(cls, iterable, value=None):
+        # PyPy inherits this from its app-level dict gateway, which accepts
+        # keywords.  CPython 3.14's OrderedDict keeps that public contract even
+        # though the base dict method itself rejects keywords.
+        self = cls()
+        for key in iterable:
+            self[key] = value
+        return self
+
+    def pop(self, key, default=_missing):
+        # Spell these two inherited operations at app level so their Python
+        # signatures retain PyPy's keyword acceptance on the 3.14 dict base.
+        if default is _missing:
+            return dict.pop(self, key)
+        return dict.pop(self, key, default)
+
+    def setdefault(self, key, default=None):
+        return dict.setdefault(self, key, default)
+
     def __reversed__(self):
         return reversed_dict(self)
 
@@ -95,7 +117,10 @@ class OrderedDict(dict):
             return '...'
         currently_in_repr[self] = 1
         try:
-            return '%s(%r)' % (self.__class__.__name__, list(self.items()))
+            # Python 3.14 changed OrderedDict's display to the ordinary
+            # insertion-ordered dict spelling.  The temporary dict also keeps
+            # the surrounding recursion marker effective for self-values.
+            return '%s(%r)' % (self.__class__.__name__, dict(self))
         finally:
             try:
                 del currently_in_repr[self]
@@ -151,15 +176,28 @@ class OrderedDict(dict):
         return _OrderedDictValuesView(self)
 
 class _OrderedDictKeysView(KeysView):
+    def __iter__(self):
+        # PyPy subclasses the native dict view types here, so iteration is a
+        # picklable dict iterator.  Python 3.14 makes those types unacceptable
+        # as bases; preserve the upstream iterator shape by delegating to the
+        # native view explicitly from the ABC-compatible wrapper.
+        return iter(dict.keys(self._mapping))
+
     def __reversed__(self):
         yield from reversed_dict(self._mapping)
 
 class _OrderedDictItemsView(ItemsView):
+    def __iter__(self):
+        return iter(dict.items(self._mapping))
+
     def __reversed__(self):
         for key in reversed_dict(self._mapping):
             yield (key, self._mapping[key])
 
 class _OrderedDictValuesView(ValuesView):
+    def __iter__(self):
+        return iter(dict.values(self._mapping))
+
     def __reversed__(self):
         for key in reversed_dict(self._mapping):
             yield self._mapping[key]
