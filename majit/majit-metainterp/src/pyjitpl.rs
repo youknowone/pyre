@@ -5914,6 +5914,12 @@ impl<M: Clone> MetaInterp<M> {
             // fallback here: everything downstream of a live merge point is
             // built for the cut namespace and entry contract, so cancel this
             // compilation and let the interpreter run the loop instead.
+            //
+            // `compile.py:269` cannot reach this: `trace.cut_trace_from` builds
+            // a lazy view and is total.  The cancellation is not a new exit
+            // though — it lands on the outcome the `except InvalidLoop` arm
+            // just below it already defines, "this trace produced no loop",
+            // reached one step earlier because pyre's cut is materialized.
             let Some(cut) = trace.cut_trace_from_with_consts(
                 start,
                 original_boxes,

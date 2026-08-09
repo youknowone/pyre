@@ -708,8 +708,9 @@ impl TreeLoop {
     /// become the new inputargs; any OpRef referenced after the cut but
     /// defined before it (and not in `original_boxes`) is re-emitted as a
     /// prefix operation (transitive closure of dependencies).
-    /// `None` when the cut cannot be taken without losing a live value; see
-    /// [`Self::cut_trace_from_with_consts`].  The caller keeps the uncut trace.
+    /// `None` when the cut cannot be taken without losing a live value; the
+    /// caller must cancel the compilation — see
+    /// [`Self::cut_trace_from_with_consts`].
     pub fn cut_trace_from(
         &self,
         start: TreeLoopCutPosition,
@@ -815,25 +816,36 @@ impl TreeLoop {
         // frame's operand slot was written NULL — the argument of a live call
         // arriving unbound.
         //
-        // Prefix re-emission RE-EXECUTES the definition at the cut point, so it
-        // reconstructs faithfully only where nothing it drags along carries a
-        // side effect. The BFS below pulls in the whole transitive definition
-        // cone, so the condition is on the CONE, not the root: an allocation
-        // whose field feeds from a residual call would re-issue that call. Walk
-        // the pre-cut dependencies and admit only an entirely side-effect-free
-        // cone. Allocation (`NewWithVtable`) IS re-emitted: resume already hands
-        // a virtual a fresh object, and the boxed operands this recovers are
-        // compared by value.
+        // Prefix re-emission RE-EXECUTES the definition at the cut point, so a
+        // definition is admissible only if re-running it there yields the value
+        // the snapshot recorded. That is `is_always_pure`: a function of its own
+        // arguments alone. `has_no_side_effect` is a strictly weaker property
+        // and does NOT imply it — an op can be free of effects while still
+        // OBSERVING them:
         //
-        // A cone that is NOT re-emittable (a `CallMayForceR` feeding a snapshot
-        // slot) leaves the value with no representation in the cut namespace at
-        // all: the operand stack it lives on is in the virtualizable, not in
-        // `original_boxes`, so it is neither an inputarg nor re-derivable. Both
-        // remaining options are worse than not cutting — mapping the slot to
-        // `OpRef::NONE` writes a NULL into the resumed frame (a live call
-        // argument arriving unbound), and re-emitting issues an extra observable
-        // call. Decline; the caller cancels the compilation and the loop runs in
-        // the interpreter.
+        //   - the loads between `ALWAYS_PURE_LAST` and `NOSIDEEFFECT_LAST`
+        //     (`GcLoad*`, `Getfield*`, `Getarrayitem*`, `RawLoad*`,
+        //     `ThreadlocalrefGet`, ...) read memory. A pre-cut store between the
+        //     load and the cut is itself side-effecting, so it is never in the
+        //     cone; replaying the load at cut entry then returns the NEW value,
+        //     not the one the snapshot named.
+        //   - allocations (`New*`) get their contents from separate `SetfieldGc`
+        //     stores, which are likewise side-effecting and outside the argument
+        //     cone. Re-emitting the allocation alone yields a BLANK object.
+        //   - `ForceToken` / `VirtualRef*` mint identity; a replay mints a
+        //     different one.
+        //
+        // The condition is on the CONE, not the root, since the BFS below pulls
+        // in the whole transitive definition set.
+        //
+        // A cone that is NOT re-emittable leaves the value with no
+        // representation in the cut namespace at all. Promoting it to an extra
+        // inputarg is not available either: inputargs are re-bound from
+        // `original_boxes` on every entry, and an op-defined value has no box
+        // there. That leaves only mapping the slot to `OpRef::NONE`, which
+        // writes a NULL into the resumed frame (a live call argument arriving
+        // unbound), or re-emitting anyway and recovering the wrong value. Both
+        // are worse than not compiling: decline, and the caller cancels.
         //
         // A pre-cut ORIGINAL inputarg has no definition to re-execute, so it is
         // a leaf — but only phase 4's pool-constant arm can actually deliver
@@ -842,10 +854,11 @@ impl TreeLoop {
         // exactly the red args followed by the virtualizable's static fields and
         // array items, asserting it (`compile.py:458`). A snapshot's frame boxes
         // ARE the frame's locals, so seeding from snapshots reaches original
-        // inputargs constantly where operand seeding reached them rarely. Test
-        // the same predicate phase 4 branches on, and decline when the constant
-        // is absent: a widened entry contract crashes the compile, which is
-        // worse still than the NULL slot it would repair.
+        // inputargs constantly where operand seeding reached them rarely. Purity
+        // does not cover this — an `IntAdd` cone is replay-safe and still
+        // undeliverable — so test the same predicate phase 4 branches on and
+        // decline when the constant is absent: `test.test_collections` and
+        // `test.test_urlparse` crashed on that assert with `18 != 19`.
         let snapshot_cone_is_reemittable = |root: &OpRef| -> bool {
             let mut seen: IndexSet<OpRef> = IndexSet::new();
             let mut stack: Vec<OpRef> = vec![*root];
@@ -862,7 +875,7 @@ impl TreeLoop {
                 let Some(op) = self.ops.get((r.raw() - num_original_inputargs) as usize) else {
                     return false;
                 };
-                if !op.opcode.has_no_side_effect() {
+                if !op.opcode.is_always_pure() {
                     return false;
                 }
                 for arg in op.getarglist().iter() {
@@ -894,9 +907,15 @@ impl TreeLoop {
                     }
                     if !snapshot_cone_is_reemittable(r) {
                         if crate::majit_log_enabled() {
+                            let root = r
+                                .raw()
+                                .checked_sub(num_original_inputargs)
+                                .and_then(|i| self.ops.get(i as usize))
+                                .map(|op| op.opcode);
                             eprintln!(
-                                "[jit][cut-decline] snapshot-only ref {r:?} has a \
-                                 side-effecting definition cone; keeping the uncut trace",
+                                "[jit][cut-decline] snapshot-only ref {r:?} (root {root:?}) \
+                                 has a definition cone that is not replay-safe; \
+                                 cancelling this compilation",
                             );
                         }
                         return None;
@@ -2100,7 +2119,7 @@ mod tests {
         // op is not admitted. The value then has no representation in the cut
         // namespace at all, and mapping the slot to `OpRef::NONE` would write a
         // NULL into the resumed frame — so the cut is declined outright and the
-        // caller keeps the uncut trace, which still holds the definition.
+        // caller cancels the compilation.
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
         let mut op0 = Op::new(OpCode::CallMayForceR, &[iarg_box(0)]);
@@ -2172,6 +2191,45 @@ mod tests {
             cut.map(|c| c.inputargs.len()),
             original_boxes.len(),
         );
+    }
+
+    #[test]
+    fn test_cut_trace_from_declines_on_an_effect_observing_snapshot_ref() {
+        // The boundary that matters is `is_always_pure`, not
+        // `has_no_side_effect`: a load causes no effect but OBSERVES one. A
+        // pre-cut store between the load and the cut is itself side-effecting,
+        // so it never joins the cone; re-emitting the load at cut entry would
+        // read the value written AFTER the snapshot named it. Pin the gap
+        // between the two predicates so widening it back is a test failure.
+        for opcode in [OpCode::GetfieldGcR, OpCode::GcLoadR, OpCode::NewWithVtable] {
+            assert!(
+                opcode.has_no_side_effect() && !opcode.is_always_pure(),
+                "{opcode:?} no longer sits between the two predicates, so this \
+                 test cannot tell them apart",
+            );
+
+            let inputargs = vec![InputArg::new_int(0)];
+            let mut op0 = Op::new(opcode, &[iarg_box(0)]);
+            op0.pos.set(OpRef::ref_op(1));
+            let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+            op1.pos.set(vop(2));
+            op1.rd_resume_position.set(0);
+            let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+            op2.pos.set(vop(3));
+            let snapshots = vec![snapshot_with_vable(vec![
+                crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
+            ])];
+            let trace = TreeLoop::with_snapshots(inputargs, vec![op0, op1, op2], snapshots);
+
+            let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+            let cut = trace.cut_trace_from(TreeLoopCutPosition::new(1), &original_boxes);
+
+            assert!(
+                cut.is_none(),
+                "{opcode:?} was admitted for re-emission; snapshot slot is {:?}",
+                cut.map(|c| c.snapshots[0].vable_boxes[0]),
+            );
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════

@@ -1084,6 +1084,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // box nor an edge-move entry has no per-slot source; the gate that
             // admitted this guard assumed the recovery covered it, so decline
             // rather than encode the stale merge-color read.
+            //
+            // `get_list_of_active_boxes` (`pyjitpl.py:225`) has no such case:
+            // it reads `self.registers_r[index]`, and the register bank IS the
+            // source, so every live index resolves by construction.  Pyre's
+            // operand stack lives in the virtualizable and is rebuilt from a
+            // mirror plus the branch trampoline's ref moves, so a slot can
+            // genuinely resolve to nothing.
             let mut unsourced_kept: Option<u32> = None;
             let active = collect_outer_active_boxes(
                 sym,
