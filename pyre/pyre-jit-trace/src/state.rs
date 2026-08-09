@@ -3283,10 +3283,14 @@ pub(crate) fn note_inline_subwalk_end(
     jd_no: usize,
     pos: majit_metainterp::recorder::TracePosition,
 ) {
-    majit_metainterp::mc_diag_bump(59);
+    // Below the driver lookup, matching where `note_inline_subwalk_start`
+    // bumps 58: both counters then measure an APPENDED ENTRY, so an unclosed
+    // entry left by a driverless call shows up as `ptp_push != ptp_pop` rather
+    // than hiding behind equal counts.
     let Some((driver, _)) = crate::driver::try_driver_pair() else {
         return;
     };
+    majit_metainterp::mc_diag_bump(59);
     driver
         .meta_interp_mut()
         .push_portal_trace_position(jd_no, None, pos);
