@@ -117,9 +117,12 @@ check(os.stat(p).st_mtime_ns == storable(2**62), os.stat(p).st_mtime_ns)
 # construction that cannot be every one: an APFS timestamp IS an int64 of
 # nanoseconds, so 2262 is its ceiling too, and ext4 stores a 34-bit second and
 # stops in 2446. Both clamp what they are handed (some hosts refuse it), where
-# NTFS counts 100ns ticks to the year 30828. So the identity — the seconds in
-# nanoseconds, whatever second was stored — is what every platform is held to,
-# and the exact value only where the second survived the round trip.
+# NTFS counts 100ns ticks to the year 30828. A clamp stops at the last instant
+# the store can name, and that need not fall on a whole second: APFS stops at
+# `2**63 - 1` nanoseconds, whose remainder is 854775807ns. So what every
+# platform is held to is that the count neither wrapped nor names a later
+# instant than the one asked for, and that the two fields read back the same
+# time; the exact value only where the second survived the round trip.
 FAR = 8.8e11
 try:
     os.utime(p, (FAR, FAR))
@@ -127,7 +130,9 @@ except OSError:
     pass
 else:
     st = os.stat(p)
-    check(st.st_mtime_ns == int(st.st_mtime) * 1_000_000_000, st.st_mtime_ns)
+    check(0 < st.st_mtime_ns <= int(FAR) * 1_000_000_000, st.st_mtime_ns)
+    second, nanosecond = divmod(st.st_mtime_ns, 1_000_000_000)
+    check(st.st_mtime == second + 1e-9 * nanosecond, (st.st_mtime, st.st_mtime_ns))
     if st.st_mtime == FAR:
         check(st.st_mtime_ns == 880_000_000_000_000_000_000, st.st_mtime_ns)
 
