@@ -442,6 +442,15 @@ jobs:
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py
+    - name: Run the vendored root extra_tests
+      # PyPy's own `extra_tests/` tree, run in place through a driver that
+      # supplies the pytest names those files use. Only `run.py`'s ENABLED list
+      # runs; the rest of the tree needs pytest surface, third-party packages,
+      # or PyPy modules that are not here. Windows selects nothing today and
+      # the runner exits 0 saying so.
+      env:
+        PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/upstream/run.py
     - name: JIT structural stats vs committed baseline (Linux, informational)
       # Diff each benchmark's [jit-stats] counters against the committed
       # pyre/bench/<name>.<backend>.jitstats baselines. The counters are decided
