@@ -2310,6 +2310,16 @@ pub enum DispatchError {
     /// interpreter fallback (correct, untraced) instead of compiling a trace
     /// whose guard-failure path corrupts the frame.
     BranchGuardKeptStackUnsupported { pc: usize },
+    /// A branch guard's snapshot has a live Ref color whose operand-stack slot
+    /// has no per-slot source: the walk mirror holds `OpRef::NONE` there and
+    /// the decoded edge-move recovery carries no entry for that color.
+    /// The remaining fallback reads
+    /// the resume merge color out of the guard-pc register file, where it is
+    /// unwritten at the guard point or reused by the regalloc — the #424
+    /// merge-color staleness the per-slot mirror replaced.  The gate that lets
+    /// a valid mirror through justified itself by that recovery, so where the
+    /// recovery does not in fact cover the slot the capture declines instead.
+    BranchGuardKeptSlotUnsourced { pc: usize },
     /// A kept-stack branch guard's not-taken (resume) arm READS a regular
     /// Ref register (`< num_regs_r`) that is neither snapshot-live nor
     /// produced inside the arm, so the blackhole resumes it as NULL and
@@ -2425,6 +2435,7 @@ impl DispatchError {
             Self::LoopHeaderJdIndexUnresolved { .. } => "LoopHeaderJdIndexUnresolved",
             Self::SubWalkClosedLoop { .. } => "SubWalkClosedLoop",
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
+            Self::BranchGuardKeptSlotUnsourced { .. } => "BranchGuardKeptSlotUnsourced",
             Self::ForceQuasiImmutable { .. } => "ForceQuasiImmutable",
             Self::LoopBearingCalleeInlineUnsupported { .. } => "LoopBearingCalleeInlineUnsupported",
             Self::FieldDescrMissingParentDescr { .. } => "FieldDescrMissingParentDescr",
@@ -2492,6 +2503,7 @@ impl DispatchError {
             | Self::LoopHeaderJdIndexUnresolved { pc, .. }
             | Self::SubWalkClosedLoop { pc, .. }
             | Self::BranchGuardKeptStackUnsupported { pc, .. }
+            | Self::BranchGuardKeptSlotUnsourced { pc, .. }
             | Self::ForceQuasiImmutable { pc, .. }
             | Self::LoopBearingCalleeInlineUnsupported { pc, .. }
             | Self::FieldDescrMissingParentDescr { pc, .. }
@@ -4923,6 +4935,11 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     entry_caller: &'static str,
     vstack: Option<&[OpRef]>,
     kept_recovered: &[(u16, OpRef)],
+    // Set to the first live Ref color whose operand-stack slot has NO per-slot
+    // source (mirror hole + no edge-move recovery), so the branch-guard caller
+    // can decline instead of encoding the stale merge-color read.  `None` for
+    // the callers that are not reconstructing a branch guard.
+    mut unrecovered_kept: Option<&mut Option<u32>>,
 ) -> Vec<OpRef> {
     // `#124` Approach B: resolve the base live-box set through the carried
     // JitCode coordinate so the encoder's color set matches the decoder's
@@ -5142,10 +5159,42 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 color,
             ) {
                 if sem >= nlocals {
-                    if let Some(&m) = mirror.get(sem - nlocals) {
-                        if m != OpRef::NONE && !opref_is_null_const_ptr(m) {
-                            active.push(m);
-                            continue;
+                    let m = mirror.get(sem - nlocals).copied().unwrap_or(OpRef::NONE);
+                    if m != OpRef::NONE && !opref_is_null_const_ptr(m) {
+                        active.push(m);
+                        continue;
+                    }
+                    // The mirror did not supply this operand-stack slot, so the
+                    // decoded edge-move recovery below is the only other
+                    // per-slot source.  Without an entry for this color the
+                    // fallback reads the resume merge color out of the guard-pc
+                    // register file, where it is unwritten at the guard point or
+                    // reused by the regalloc — the #424 staleness the per-slot
+                    // mirror was introduced to replace.  The kept-stack gate
+                    // admits a valid mirror on the stated grounds that this
+                    // recovery covers such a slot; report the case where that is
+                    // false so the caller declines rather than encode the stale
+                    // read.
+                    //
+                    // Restricted to a NONE hole, where there is demonstrably no
+                    // source at all.  A NULL const-ptr is NOT declined, and that
+                    // is a measured decision rather than an oversight: a census
+                    // over `test_re`, `test_strftime` and all 393 synth programs
+                    // found 3 mirror-missed slots, every one a NULL const-ptr
+                    // with `recovered=false` — so the gate's justification is
+                    // indeed false there — but all 3 are in one PASSING program
+                    // (`synth/list_append_write_barrier_gc`), and declining them
+                    // regressed it (loops 12→11, bridges 5→3, aborts 1→4) with
+                    // no demonstration that the value encoded today is wrong.
+                    // Whether that NULL is the slot's real value (a `PUSH_NULL`
+                    // sentinel) cannot be settled here: the mirror has several
+                    // writers and only `reseed_vstack_from_shadow` gates a NULL
+                    // behind the live-NULL marker, while the per-op reconcile
+                    // and the vable write-through store one directly.  Settling
+                    // that is what closes the remaining case.
+                    if m == OpRef::NONE && !kept_recovered.contains_key(&idx) {
+                        if let Some(first) = unrecovered_kept.as_deref_mut() {
+                            first.get_or_insert(idx);
                         }
                     }
                 }
@@ -9024,7 +9073,12 @@ fn guarded_branch_core<Sym: WalkSym>(
         // for an unrestorable-Ref arm (Hazard 1) or an INVALID mirror
         // (undermodeled walk); a VALID mirror with a NONE hole (an
         // edge-materialized merge temp) compiles, its slot sourced from
-        // the decoded trampoline recovery (`resolved_recovered`).
+        // the decoded trampoline recovery (`resolved_recovered`).  That
+        // last claim is not assumed: an uncovered slot with no recovery
+        // entry has no per-slot source at all, and
+        // `collect_outer_active_boxes` reports it so the snapshot capture
+        // declines (`BranchGuardKeptSlotUnsourced`) rather than falling
+        // through to the stale merge-color read.
         let mirror_covers_kept = ctx.vstack_valid
             && resume_depth.is_some_and(|d| {
                 (0..d).all(|s| {

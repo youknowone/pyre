@@ -1080,6 +1080,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     ),
                 }
             };
+            // A branch guard whose kept operand-stack slot has neither a mirror
+            // box nor an edge-move entry has no per-slot source; the gate that
+            // admitted this guard assumed the recovery covered it, so decline
+            // rather than encode the stale merge-color read.
+            let mut unsourced_kept: Option<u32> = None;
             let active = collect_outer_active_boxes(
                 sym,
                 ctx.trace_ctx,
@@ -1094,7 +1099,18 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 entry_caller,
                 ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
                 scope.branch_guard_kept_recovered,
+                has_branch_guard.then_some(&mut unsourced_kept),
             );
+            if let Some(color) = unsourced_kept {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[decline-why] KEPT-SLOT-UNSOURCED pc={op_pc} color={color} \
+                         vstack_valid={}",
+                        ctx.vstack_valid,
+                    );
+                }
+                return Err(DispatchError::BranchGuardKeptSlotUnsourced { pc: op_pc });
+            }
             let pc_word = resolved_offset as u32;
             let forward_py_pc = forward_snapshot_py_pc(jitcode_index, pc_word)?;
             ctx.trace_ctx
@@ -1768,6 +1784,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         "inline_caller",
         None,
         &[],
+        None,
     );
     if let (Some(result_color), Some(saved)) = (
         result_color.filter(|&color| color < ctx.registers_r.len()),

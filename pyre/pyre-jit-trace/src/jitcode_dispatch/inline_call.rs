@@ -2262,6 +2262,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             "builtin_wrapper_call_site",
             None,
             &[],
+            None,
         )
     };
 
@@ -4176,6 +4177,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     "call_site_capture",
                     None,
                     &[],
+                    None,
                 );
                 (
                     boxes,
