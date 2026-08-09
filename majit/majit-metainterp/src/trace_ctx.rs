@@ -5359,6 +5359,160 @@ mod tests {
         }
     }
 
+    /// A concrete static shadow value is written to its heap field without
+    /// disturbing the other static fields.
+    #[test]
+    fn synchronize_virtualizable_static_writes_one_static_field() {
+        const NEW_PC: i64 = 0x1234_5678;
+        const OLD_SP: i64 = 0x5566_7788;
+
+        let info = make_test_vable_info();
+        let mut heap = [0i64, 0, OLD_SP, 0];
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_sp = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_virtualizable_heap_ptr(heap.as_mut_ptr().cast());
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_sp],
+            &[ph(Type::Int), Value::Int(OLD_SP)],
+            &[],
+        );
+
+        ctx.set_virtualizable_entry_at(0, box_pc, Value::Int(NEW_PC));
+        ctx.synchronize_virtualizable_static(0);
+
+        assert_eq!(heap[1], NEW_PC);
+        assert_eq!(heap[2], OLD_SP);
+    }
+
+    /// Synchronizing without an installed heap pointer or virtualizable
+    /// shadow is inert.
+    #[test]
+    fn synchronize_virtualizable_static_without_state_is_inert() {
+        let ctx = TraceCtx::for_test(0);
+        ctx.synchronize_virtualizable_static(0);
+    }
+
+    /// A static index outside `num_static_extra_boxes` does not write to the
+    /// heap buffer.
+    #[test]
+    fn synchronize_virtualizable_static_out_of_bounds_is_inert() {
+        let info = make_test_vable_info();
+        let mut heap = [11i64, 22, 33, 44];
+        let before = heap;
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_sp = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_virtualizable_heap_ptr(heap.as_mut_ptr().cast());
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_sp],
+            &[Value::Int(22), Value::Int(33)],
+            &[],
+        );
+
+        ctx.synchronize_virtualizable_static(info.num_static_extra_boxes);
+
+        assert_eq!(heap, before);
+    }
+
+    /// A RustVec-backed virtualizable array makes static synchronization
+    /// decline the heap write.
+    #[test]
+    fn synchronize_virtualizable_static_with_rust_vec_array_is_inert() {
+        fn data_ptr(_vable: *mut u8) -> *mut i64 {
+            std::ptr::null_mut()
+        }
+        fn len(_vable: *const u8) -> usize {
+            0
+        }
+
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_rust_vec_array_field(
+            "locals",
+            Type::Int,
+            24,
+            data_ptr,
+            len,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(0));
+        let mut heap = [11i64, 22, 33, 44];
+        let before = heap;
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_virtualizable_heap_ptr(heap.as_mut_ptr().cast());
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc],
+            &[Value::Int(22)],
+            &[0],
+        );
+        ctx.set_virtualizable_entry_at(0, box_pc, Value::Int(99));
+
+        ctx.synchronize_virtualizable_static(0);
+
+        assert_eq!(heap, before);
+    }
+
+    /// A `NO_CONCRETE` reference in the shadow declines synchronization and
+    /// leaves the heap buffer unchanged.
+    #[test]
+    fn synchronize_virtualizable_static_no_concrete_is_inert() {
+        let info = make_test_vable_info();
+        let mut heap = [11i64, 22, 33, 44];
+        let before = heap;
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_sp = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_virtualizable_heap_ptr(heap.as_mut_ptr().cast());
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_sp],
+            &[Value::Int(22), Value::Int(33)],
+            &[],
+        );
+        ctx.set_virtualizable_entry_at(0, box_pc, Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+
+        ctx.synchronize_virtualizable_static(0);
+
+        assert_eq!(heap, before);
+    }
+
     #[test]
     fn standard_vable_getfield_reads_from_boxes() {
         let info = make_test_vable_info();
