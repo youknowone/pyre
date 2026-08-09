@@ -726,7 +726,16 @@ pub fn getframe(depth: i64) -> crate::PyResult {
     // force is what makes those reads see the JIT's live virtualizable fields —
     // upstream gets that ordering from the `hook_access_field` injection at
     // each field read, which pyre has relocated to this one call site.
-    audit("sys._getframe", &[current as PyObjectRef])?;
+    if audit_hooks_armed() {
+        // The wrap of the event name and the hooks themselves are both
+        // collection points, and the frame this is about to return reaches them
+        // only as a copied pointer, which the collector does not rewrite.  Root
+        // it across the emit and read the answer back out of its slot.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let frame_slot = pyre_object::gc_roots::pin_roots(&[current as PyObjectRef]);
+        audit("sys._getframe", &[current as PyObjectRef])?;
+        current = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::PyFrame;
+    }
     Ok(current as PyObjectRef)
 }
 
@@ -2641,23 +2650,36 @@ fn trigger_audit_events(
     w_event: pyre_object::PyObjectRef,
     args_w: &[pyre_object::PyObjectRef],
 ) -> Result<(), crate::PyError> {
-    let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_event);
-    // Before the tuple is built, not after: its allocation can collect, and the
-    // caller's arguments are reachable only through the borrowed slice.
-    for &w_arg in args_w {
-        pyre_object::gc_roots::pin_root(w_arg);
-    }
-    let w_args = pyre_object::tupleobject::w_tuple_new(args_w.to_vec());
-    pyre_object::gc_roots::pin_root(w_args);
+    // `pin_root` copies the pointer into a shadow-stack slot and the collector
+    // rewrites THAT slot, never the local it was copied from.  So every value
+    // still needed after one of the app-level calls below is reached through
+    // its slot index, the way `baseobjspace::isinstance` does it.
+    //
+    // The event, the arguments and the hook set are one livevar set spanning
+    // three slices, so they are published together and normalized once
+    // (`gc_roots::pin_roots`): a per-value pin queries the collector after the
+    // first write, which would let a foreign collection run while the values
+    // behind it were still invisible to it.
+    //
     // A hook may install another hook, and upstream's list is replaced rather
     // than appended to, so an in-flight trigger keeps iterating the set it
-    // started with.  Snapshotting into pinned roots reproduces that and keeps
-    // every callable forwarded across the calls below.
-    let hooks_w = holder.hooks_w.clone();
-    for &w_hook in &hooks_w {
-        pyre_object::gc_roots::pin_root(w_hook);
-    }
+    // started with.  The published slots ARE that snapshot — they keep every
+    // callable forwarded across the calls below and are unaffected by a
+    // replacement of `holder.hooks_w`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let event_slot = pyre_object::gc_roots::publish_roots(&[w_event]);
+    let args_slot = pyre_object::gc_roots::publish_roots(args_w);
+    let hooks_slot = pyre_object::gc_roots::publish_roots(&holder.hooks_w);
+    let hook_count = holder.hooks_w.len();
+    pyre_object::gc_roots::normalize_roots(event_slot, 1 + args_w.len() + hook_count);
+
+    // From the published slots, not from the caller's slice: the tuple's own
+    // allocation can collect, and so can everything reached before it.
+    let items = (0..args_w.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(args_slot + i))
+        .collect();
+    let args_tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::tupleobject::w_tuple_new(items));
 
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
     // don't trace audithooks by default
@@ -2665,8 +2687,23 @@ fn trigger_audit_events(
         unsafe { (*ec).is_tracing += 1 };
     }
     let mut result = Ok(());
-    for &w_hook in &hooks_w {
-        let cantrace = match crate::baseobjspace::findattr(w_hook, "__cantrace__") {
+    for i in 0..hook_count {
+        let w_hook = pyre_object::gc_roots::shadow_stack_get(hooks_slot + i);
+        // `space.findattr` (`baseobjspace.py:881-888`) answers `None` for ANY
+        // non-async error out of the lookup, so a hook whose `__cantrace__`
+        // descriptor raises is simply treated as not having one.  The bare
+        // `findattr` panics on those instead, and this argument is app code, so
+        // it is the async arm alone (`error.py:62-65`; pyre carries SystemExit
+        // of that pair today) that may travel out of here.
+        let w_cantrace = match crate::baseobjspace::findattr_result(w_hook, "__cantrace__") {
+            Ok(found) => found,
+            Err(err) if err.kind == crate::PyErrorKind::SystemExit => {
+                result = Err(err);
+                break;
+            }
+            Err(_) => None,
+        };
+        let cantrace = match w_cantrace {
             None => false,
             Some(w_cantrace) => match crate::baseobjspace::is_true(w_cantrace) {
                 Ok(cantrace) => cantrace,
@@ -2679,7 +2716,13 @@ fn trigger_audit_events(
         if cantrace && !ec.is_null() {
             unsafe { (*ec).is_tracing -= 1 };
         }
-        let w_result = crate::baseobjspace::call_function(w_hook, &[w_event, w_args]);
+        let w_result = crate::baseobjspace::call_function(
+            pyre_object::gc_roots::shadow_stack_get(hooks_slot + i),
+            &[
+                pyre_object::gc_roots::shadow_stack_get(event_slot),
+                pyre_object::gc_roots::shadow_stack_get(args_tuple_slot),
+            ],
+        );
         if cantrace && !ec.is_null() {
             unsafe { (*ec).is_tracing += 1 };
         }
@@ -2715,7 +2758,17 @@ pub fn audit(event: &str, args_w: &[pyre_object::PyObjectRef]) -> Result<(), cra
     if !audit_hooks_armed() {
         return Ok(());
     }
-    audit_w(w_str_new(event), args_w)
+    // The wrap is a collection point and the arguments reach it only as copied
+    // pointers — `call_function_impl_result` reloads its own from the shadow
+    // stack for exactly that reason — so they are rooted in front of it and the
+    // emit runs off the reloaded values.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_slot = pyre_object::gc_roots::pin_roots(args_w);
+    let w_event = w_str_new(event);
+    let args_w: Vec<pyre_object::PyObjectRef> = (0..args_w.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(args_slot + i))
+        .collect();
+    audit_w(w_event, &args_w)
 }
 
 /// `vm.py:481 holder.hooks_w is None`, negated.  A JIT fold that answers a call
@@ -2763,9 +2816,18 @@ fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     }
     // The `@unwrap_spec` round trip is observable: the hooks are handed the
     // `str` the unwrapped name is re-wrapped as, so a `str` subclass reaches
-    // them flattened to a plain one.
-    let event = crate::baseobjspace::str_utf8_w(w_event)?;
-    audit_w(w_str_new(event), &positional[1..])?;
+    // them flattened to a plain one.  The owned copy comes first so no borrow
+    // of `w_event` is live across the rooting below, and the arguments behind
+    // the event are rooted in front of the re-wrap because they reach it only
+    // as copied pointers — the same bracket [`audit`] takes around its own.
+    let event = crate::baseobjspace::str_utf8_w(w_event)?.to_string();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_slot = pyre_object::gc_roots::pin_roots(&positional[1..]);
+    let w_text = w_str_new(&event);
+    let args_w: Vec<pyre_object::PyObjectRef> = (0..positional.len() - 1)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(args_slot + i))
+        .collect();
+    audit_w(w_text, &args_w)?;
     Ok(w_none())
 }
 
@@ -2780,23 +2842,33 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
             "addaudithook() missing 1 required positional argument",
         ));
     };
+    // The event below runs the already-installed hooks, which is app code and
+    // can collect, so the pin has to precede it — and the value stored after it
+    // has to come back out of the slot, since a relocation rewrites the slot
+    // and not this local.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_hook);
     if let Err(err) = audit("sys.addaudithook", &[]) {
         if !error_is_exception(&err) {
             return Err(err);
         }
         return Ok(w_none());
     }
-    let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_hook);
     let holder = audit_holder();
     unsafe {
         // `holder.hooks_w = holder.hooks_w + [w_hook]` — a fresh list, so a
         // `trigger_audit_events` already iterating the old one keeps the set it
-        // started with.
-        let old = &(*holder).hooks_w;
-        let mut next = Vec::with_capacity(old.len() + 1);
-        next.extend_from_slice(old);
-        next.push(w_hook);
+        // started with.  The new slice is complete before the notification, so
+        // no borrow of `holder.hooks_w` is live across it.
+        let mut next = {
+            let old: &[pyre_object::PyObjectRef] = &(*holder).hooks_w;
+            let mut next = Vec::with_capacity(old.len() + 1);
+            next.extend_from_slice(old);
+            next
+        };
+        next.push(pyre_object::gc_roots::shadow_stack_get(hook_slot));
+        let next = next.into_boxed_slice();
         // Notification precedes the store, as `rclass.py:1010-1012
         // hook_setfield` emits `jit_force_quasi_immutable` before `setfield`.
         // The `is_installed()` fast path is `quasiimmut.py:38-41 invalidation`'s
@@ -2804,7 +2876,7 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         if (*holder).hooks_watchers.is_installed() {
             pyre_object::quasiimmut::sweep_quasi_immut_field(&(*holder).hooks_watchers);
         }
-        (*holder).hooks_w = next.into_boxed_slice();
+        (*holder).hooks_w = next;
         (*holder).hooks_armed.set(true);
     }
     Ok(w_none())
