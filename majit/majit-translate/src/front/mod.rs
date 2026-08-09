@@ -69,6 +69,7 @@ pub(crate) mod bool_then;
 pub(crate) mod checked_arith;
 pub(crate) mod checked_arith_uint;
 pub(crate) mod from_size_align;
+#[cfg(test)]
 pub(crate) mod graph_body;
 pub(crate) mod iter_next;
 pub mod llbc_hints;

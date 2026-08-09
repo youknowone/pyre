@@ -7331,7 +7331,7 @@ pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
         exception_repr_method as crate::gateway::BuiltinCodeFn,
     ]
     .iter()
-    .any(|&target| std::ptr::fn_addr_eq(f, target))
+    .any(|&target| crate::gateway::builtin_code_fn_eq(f, target))
 }
 
 /// `interp_exceptions.py:993-998 W_SystemExit.descr_init` — a lone argument

@@ -2046,6 +2046,7 @@ pub fn lower_fun_decl_with_static_addrs(
 
 /// The `struct_field_attrs` projection of [`derive_program_metadata`] —
 /// the map the whole-program loop lowers this LLBC's decls with.
+#[cfg(test)]
 pub(crate) fn struct_field_attrs_of(
     llbc: &Llbc,
 ) -> std::collections::HashMap<String, Vec<(String, ValueType)>> {

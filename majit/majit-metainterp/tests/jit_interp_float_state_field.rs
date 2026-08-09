@@ -254,7 +254,7 @@ mod scalar_f32 {
     fn f32_scalar_minimal(program: &Bytecode, threshold: u32) -> i64 {
         let mut driver: JitDriver<F32State> = JitDriver::new(threshold);
         let mut pc: usize = 0;
-        let mut state = F32State { a: 0, f: 0.0 };
+        let state = F32State { a: 0, f: 0.0 };
         {
             use majit_metainterp::JitState as _;
             state
