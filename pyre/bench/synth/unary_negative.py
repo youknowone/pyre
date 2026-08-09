@@ -25,9 +25,9 @@ def main():
 
 # UNARY_NEGATIVE on INT_MIN: -INT_MIN overflows the machine-int range, so
 # descr_neg (intobject.py:628) takes the long branch and returns 2**63 as a
-# W_LongObject.  generated_unary_int_value declines the int fast path at the
-# concrete INT_MIN operand and traces the residual long-neg, so the compiled
-# loop must agree with the long result rather than wrapping back to INT_MIN.
+# W_LongObject.  The walker fold pins the operand with GUARD_VALUE and takes
+# the _make_ovf2long tail, so the compiled loop must agree with the long result
+# rather than wrapping back to INT_MIN.
 def main_int_min():
     m = -9223372036854775807 - 1  # INT_MIN as a machine int
     acc = 0

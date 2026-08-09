@@ -661,22 +661,27 @@ pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> i64 {
     unsafe { alloc_bigint_nursery_collecting(&*a ^ &*b) as i64 }
 }
 
-/// `rbigint` comparison payload for `W_LongObject` — returns the sign of
-/// `a <=> b` as `-1` / `0` / `1`. RPython exposes the comparison as six methods
-/// (`lt`/`le`/`eq`/`ne`/`gt`/`ge`, the latter built as `other.lt(self)`
-/// wrappers, `rbigint.py:573/664`); Rust's total `Ord::cmp` collapses them into
-/// one three-way result, and the caller recovers each relation with a plain
-/// `int_<cmp>(sign, 0)` (e.g. `a < b` ⟺ `sign < 0`, `a == b` ⟺ `sign == 0`).
-/// A comparison neither allocates nor raises, so this is
-/// `EF_ELIDABLE_CANNOT_RAISE` and the fast path records `CallPure*` with NO
-/// trailing guard.
+/// `rbigint` comparison — returns the sign of `a <=> b` as `-1` / `0` / `1`.
+/// RPython exposes the comparison as six methods (`lt`/`le`/`eq`/`ne`/`gt`/`ge`,
+/// the latter built as `other.lt(self)` wrappers, `rbigint.py:573/664`); Rust's
+/// total `Ord::cmp` collapses them into one three-way result, and the caller
+/// recovers each relation with a plain `int_<cmp>(sign, 0)` (e.g. `a < b` ⟺
+/// `sign < 0`, `a == b` ⟺ `sign == 0`).  A comparison neither allocates nor
+/// raises, so this is `EF_ELIDABLE_CANNOT_RAISE` and the fast path records
+/// `CallPure*` with NO trailing guard.
+///
+/// The arguments are the bare payloads, not the `W_LongObject` boxes:
+/// `_make_descr_cmp` (longobject.py:383-391) compares `self.num` against
+/// `w_other.num`, so the two field reads belong in the trace and not inside the
+/// callee.  With them spelled out, a `W_LongObject` the same trace has just
+/// built is read back through the heap cache and can stay virtual instead of
+/// being forced into a real allocation just to be handed to a comparison.
 #[majit_macros::elidable_cannot_raise]
-pub extern "C" fn jit_w_long_cmp(a: i64, b: i64) -> i64 {
+pub extern "C" fn jit_bigint_cmp(a: i64, b: i64) -> i64 {
     use core::cmp::Ordering;
-    let a = a as PyObjectRef;
-    let b = b as PyObjectRef;
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
-        match w_long_get_value(a).cmp(w_long_get_value(b)) {
+        match (*a).cmp(&*b) {
             Ordering::Less => -1,
             Ordering::Equal => 0,
             Ordering::Greater => 1,
