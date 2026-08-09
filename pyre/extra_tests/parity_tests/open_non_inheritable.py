@@ -1,5 +1,15 @@
 import os
-import tempfile
+
+
+# The implementation exercised here is the POSIX `fcntl(FD_CLOEXEC)` port.
+# Windows pyre currently uses the non-fd pathname-backed FileIO carrier, so it
+# has no descriptor whose inheritance flag this fixture could inspect.
+if os.name != "posix":
+    print("OK")
+    raise SystemExit
+
+
+import tempfile  # noqa: E402
 
 
 fd, path = tempfile.mkstemp()
