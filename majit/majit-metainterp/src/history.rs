@@ -2136,7 +2136,10 @@ mod tests {
         let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
             panic!("unexpected snapshot slot shape: {slot:?}");
         };
-        assert!(r.is_none(), "expected the unmapped NONE fallback, got {r:?}");
+        assert!(
+            r.is_none(),
+            "expected the unmapped NONE fallback, got {r:?}"
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════
