@@ -5842,13 +5842,18 @@ pub(crate) fn try_walker_specialize_seqiter_getitem_next<Sym: WalkSym>(
     // `DeferredCall` is admitted alongside `Clean`, and the terminating `raise`
     // is what makes that necessary: `RaiseVarargs` classifies as a deferred
     // residual, so a cursor body that ends on one would otherwise never be
-    // served.  The deferred promise holds here — a residual the lever cannot
-    // inline aborts before executing and denies the callee.  This route's own
-    // entry is a FOR_ITER, which is not a CALL, and it still passes
-    // `entry_is_call_boundary: true`: `opcode_for_iter` peeks its single
-    // iterator operand where `opcode_binary_op` pops both of its own, so the
-    // rewind re-executes this entry from the stack it already had and the
-    // boundary is nameable.
+    // served — which is why this route passes `entry_is_call_boundary: true`
+    // below.  The deferred promise holds here: a residual the lever cannot
+    // inline aborts before executing and denies the callee.
+    //
+    // What the shared FOR_ITER gate withholds admission from is an entry
+    // reached from an operator opcode, because those opcodes POP their
+    // operands: a rewind that re-executes `BINARY_OP` or `COMPARE_OP` needs
+    // operands the flush cannot re-materialize and resumes one short.
+    // `FOR_ITER` only PEEKS, and its single operand is the iterator the walk
+    // already holds, so re-executing it needs nothing the stack lost.  The
+    // cursor bump below runs only after the callee returns, so the re-executed
+    // step reads the same index.
     if !matches!(
         replay_safety,
         CalleeReplaySafety::Clean | CalleeReplaySafety::DeferredCall

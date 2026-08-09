@@ -9283,6 +9283,38 @@ fn guarded_branch_core<Sym: WalkSym>(
                 && gate_frame.as_ref().is_some_and(|f| {
                     kept_stack_has_boxed_int_hazard(f, other_target, ctx.concrete_registers_r)
                 });
+            // Hazard (4): a VALID mirror holds a kept operand-stack slot as
+            // the NULL `ConstPtr`, and the not-taken edge decodes no
+            // `ref_copy` trampoline.  Hazards (1)-(3) admit an uncovered
+            // slot on the premise that it is an edge-materialized merge temp
+            // whose value `resolved_recovered` supplies; with no moves
+            // decoded there is no such source, and a NULL `ConstPtr` is the
+            // one uncovered state with no fallback either — the encoding is
+            // both a genuine null operand and what an unset vable shadow
+            // slot decodes to, so nothing downstream can tell the snapshot
+            // which it is.  The resume then rebuilds a kept slot NULL, and
+            // when the arm's pending CALL binds that null `match_signature`
+            // renders it as a missing positional parameter:
+            // `re/_parser.py` `_parse_sub` evaluates
+            // `not nested and not items` inside `_parse`'s argument list, so
+            // both calls' `PUSH_NULL` slots are kept across the
+            // short-circuit guard and `nested + 1` arrives NULL.  This is
+            // strictly narrower than "the mirror does not cover": a mirror
+            // shorter than the resume depth, and a `NONE` hole, both still
+            // resume through the shadow and must keep compiling — declining
+            // for those instead loses every bridge in
+            // `bench/synth/attr_cache_invalidation` and turns its 1002 guard
+            // failures into 4 million.  `bhimpl_goto_if_not` has no
+            // analogue: `consume_boxes` (resume.py) restores every register
+            // bank by color, which is why suppressing bridge recording
+            // (`MAJIT_NO_BRIDGE`) makes the same guard correct.
+            let kept_null_const_slot = ctx.vstack_valid
+                && gate_frame.as_ref().is_some_and(|f| {
+                    kept_stack_has_null_const_slot(f, other_target, &ctx.vstack_boxes)
+                })
+                && resolved_recovered
+                    .as_deref()
+                    .is_none_or(|moves| moves.is_empty());
             // A not-taken arm resuming at an exception-handler-protected
             // PC carries the kept exception operand (`PUSH_EXC_INFO`'s
             // Ref) on its operand stack; the handler-entry mirror reseed
@@ -9290,7 +9322,7 @@ fn guarded_branch_core<Sym: WalkSym>(
             // whole block out), and where the mirror still does not cover,
             // that kept Ref always also trips Hazard (1)/(2)/(3) — so the
             // exc-region case needs no decline of its own.
-            if reads_null_ref || uses_edge_recovery || kept_boxed_int {
+            if reads_null_ref || uses_edge_recovery || kept_boxed_int || kept_null_const_slot {
                 // Attribute the kept-stack decline to the hazard that
                 // fired and the mirror state behind it, so a corpus run
                 // (`PYRE_FBW_DEBUG_ABORT`) can separate the distinct
@@ -9304,7 +9336,8 @@ fn guarded_branch_core<Sym: WalkSym>(
                         "[decline-why] PERMANENT pc={} other_target={} vstack_valid={} \
                          subwalk={} mirror_covers_kept={} depth_gt_1={} kept_stack={} \
                          kept_stack_any_leg={} reads_null_ref={} uses_edge_recovery={} \
-                         kept_boxed_int={} kept_recovered_nonempty={}",
+                         kept_boxed_int={} kept_null_const_slot={} \
+                         kept_recovered_nonempty={}",
                         op.pc,
                         other_target,
                         ctx.vstack_valid,
@@ -9316,6 +9349,7 @@ fn guarded_branch_core<Sym: WalkSym>(
                         reads_null_ref,
                         uses_edge_recovery,
                         kept_boxed_int,
+                        kept_null_const_slot,
                         kept_recovered.as_deref().is_some_and(|m| !m.is_empty()),
                     );
                 }
