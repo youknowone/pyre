@@ -961,6 +961,20 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_alloc_stable_raw",
         pyre_object::gc_hook::try_gc_alloc_stable_raw as *const (),
     );
+    // `w_int_gc_alloc` is the collector-heap arm of `w_int_new`, reached from
+    // inside a descended body whenever a fold boxes an int. Bind the
+    // macro-emitted trampoline rather than the raw fn, for the reason
+    // `prepare_list_ref_store` documents: the raw `(i64) -> *mut PyObject` is
+    // `(i64) -> i32` on wasm32, while the wasm backend types the residual's
+    // `call_indirect` `(i64) -> i64` from the descr alone.
+    let w_int_gc_alloc: extern "C" fn(i64) -> i64 =
+        pyre_object::intobject::__majit_call_target_w_int_gc_alloc;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::intobject::w_int_gc_alloc",
+        "pyre_object::w_int_gc_alloc",
+        w_int_gc_alloc as *const (),
+    );
     // `w_type_set_abstract` stores the runtime-mutable `flag_abstract` atomic — a
     // side effect on per-type state, not a build-time constant, so it carries
     // `#[dont_look_inside]` and binds its `()`-returning `fn` directly by
@@ -1047,11 +1061,19 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // a `jit_static_pytype_addrs` / `jit_static_ref_addrs` row: those carry
     // the address of a value fixed at build time, and folding a
     // runtime-stamped id that way would bake `TypeIdCell::UNASSIGNED`.
+    //
+    // `enabled` binds the trampoline instead: it gates the GC allocation route
+    // of every boxing constructor, so a descended body reaches it, and a raw
+    // `-> bool` is `() -> i32` on wasm32 against the descr-derived
+    // `() -> i64`.  The two type-id readers keep the direct binding — no
+    // descended body reaches them yet — but they are the same latent shape.
+    let gc_interp_enabled: extern "C" fn() -> i64 =
+        pyre_object::gc_interp::__majit_call_target_enabled;
     push_alias_pair(
         &mut entries,
         "pyre_object::gc_interp::enabled",
         "pyre_object::enabled",
-        pyre_object::gc_interp::enabled as *const (),
+        gc_interp_enabled as *const (),
     );
     push_alias_pair(
         &mut entries,
