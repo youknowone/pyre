@@ -2388,7 +2388,9 @@ fn pop_end_journal_rollback_after_strategy_switch() {
 
 #[test]
 fn interleaved_append_pop_journal_rollback_restores_original() {
-    use pyre_object::listobject::{W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new};
+    use pyre_object::listobject::{
+        W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len, w_list_new,
+    };
     use pyre_object::{w_int_new, w_list_append, w_list_pop_end};
 
     super::fbw_store_journal_reset();
@@ -6875,6 +6877,27 @@ fn cast_int_to_float_folds_a_const_int_without_recording() {
         regs_f[0].inline_const_to_value(),
         Some(majit_ir::Value::Float(42.0)),
         "dst must hold the folded ConstFloat",
+    );
+}
+
+#[test]
+fn cast_float_to_int_folds_a_const_float_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("cast_float_to_int/f>i")
+        .expect("`cast_float_to_int/f>i` must be in insns table");
+    let code = [byte, 0x00, 0x00]; // `f>i`: f-src=0, i-dst=0
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_float((42.75f64).to_bits() as i64);
+    let mut regs_f = [operand];
+    let mut regs_i = [OpRef::None];
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut regs_i)
+        .expect("cast_float_to_int on a const float must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(tc.num_ops(), 0, "a const operand folds without recording");
+    assert_eq!(
+        regs_i[0].inline_const_to_value(),
+        Some(majit_ir::Value::Int(42)),
+        "dst must hold the folded ConstInt",
     );
 }
 

@@ -7251,6 +7251,37 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
+        // compile.py:1006-1017 `ResumeFromInterpDescr.compile_and_attach`
+        // passes `orig_inputargs` through to `send_loop_to_backend`, which
+        // reads the concrete virtualizable before patching the expanded loop
+        // entry.  Capture both pieces while the originating TraceCtx is still
+        // live; after this method returns to `compile_entry_bridge`, an
+        // ambient `active_jitdriver_sd` / `vable_ptr` can belong to an inlined
+        // callee and is not an admissible substitute for this frame.
+        let entry_driver_descriptor = ctx.driver_descriptor().cloned();
+        let entry_orig_vable_ptr = if entry_bridge.is_some() {
+            let from_initial_args = entry_driver_descriptor
+                .as_ref()
+                .and_then(|driver| driver.virtualizable_arg_index())
+                .and_then(|idx| ctx.initial_inputarg_consts.get(idx))
+                .and_then(|value| match value {
+                    OpRef::ConstPtr(reference) if !reference.is_null() => {
+                        Some(reference.0 as *const u8)
+                    }
+                    _ => None,
+                });
+            from_initial_args
+                .or_else(|| match ctx.standard_virtualizable_concrete() {
+                    Some(Value::Ref(reference)) if !reference.is_null() => {
+                        Some(reference.as_usize() as *const u8)
+                    }
+                    _ => None,
+                })
+                .or_else(|| ctx.virtualizable_heap_ptr())
+                .unwrap_or(std::ptr::null())
+        } else {
+            std::ptr::null()
+        };
         // The recorder carries Const values inline on the OpRef variants
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to snapshot — this typed-constant map starts fresh.
@@ -7378,6 +7409,8 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     original_green_key,
                     entry_meta,
+                    entry_driver_descriptor,
+                    entry_orig_vable_ptr,
                     &bridge_ops,
                     &bridge_inputargs,
                     bridge_constants,
@@ -11386,6 +11419,8 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         original_green_key: u64,
         meta: M,
+        driver_descriptor: Option<crate::jitdriver::JitDriverStaticData>,
+        orig_vable_ptr_entry: *const u8,
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
         bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
@@ -11593,6 +11628,23 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let mut entry_inputargs: Vec<InputArg> = bridge_inputargs
+            .iter()
+            .map(InputArg::fresh_value_copy)
+            .collect();
+        // compile.py:1014-1017 -> send_loop_to_backend(..., orig_inputargs):
+        // entry bridges are loops installed as an interpreter front door, so
+        // they require the same virtualizable-field reload preamble and
+        // reds-only input contract as ordinary root loops.  Compiling the
+        // optimizer's expanded input list directly makes execute_token pass
+        // two red values to a loop expecting dozens of frame-field slots.
+        self.patch_new_loop_to_load_virtualizable_fields(
+            &mut entry_inputargs,
+            &mut optimized_ops,
+            &mut constants,
+            driver_descriptor.as_ref(),
+            orig_vable_ptr_entry,
+        );
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
@@ -11601,7 +11653,7 @@ impl<M: Clone> MetaInterp<M> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][entry-bridge] original_key={} target_key={} inputs={:?}",
-                original_green_key, green_key, bridge_inputargs
+                original_green_key, green_key, entry_inputargs
             );
             for (i, op) in optimized_ops.iter().enumerate() {
                 eprintln!(
@@ -11628,10 +11680,18 @@ impl<M: Clone> MetaInterp<M> {
         self.backend
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
-        let token = make_jitcell_token(self.warm_state.alloc_token_number(), None);
+        let token = make_jitcell_token(
+            self.warm_state.alloc_token_number(),
+            driver_descriptor.as_ref().and_then(|driver| driver.index),
+        );
         // `green_key` is interior-mutable, so it is written through the
         // shared `Arc`.
         token.green_key.set(original_green_key);
+        self.configure_loop_token_for_driver(
+            token.as_ref(),
+            original_green_key,
+            driver_descriptor.as_ref(),
+        );
 
         // compile.py:532-546 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_loop ... finally:
@@ -11641,7 +11701,7 @@ impl<M: Clone> MetaInterp<M> {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend
-                    .compile_loop(bridge_inputargs, &optimized_ops, &token)
+                    .compile_loop(&entry_inputargs, &optimized_ops, &token)
             }))
         };
         let compile_time = Instant::now().saturating_duration_since(compile_start);
@@ -11661,13 +11721,13 @@ impl<M: Clone> MetaInterp<M> {
                 // compile.py:213 record_loop_or_bridge.
                 self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
                 let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-                    bridge_inputargs,
+                    &entry_inputargs,
                     &optimized_ops,
                     original_green_key,
                     self.active_frame_value_count_fn(),
                 );
                 let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
+                    compile::build_terminal_exit_layouts(&entry_inputargs, &optimized_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -11691,7 +11751,7 @@ impl<M: Clone> MetaInterp<M> {
                     &mut resume_data,
                     &mut exit_layouts,
                     trace_id,
-                    bridge_inputargs,
+                    &entry_inputargs,
                     trace_info.as_ref(),
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
@@ -11702,12 +11762,12 @@ impl<M: Clone> MetaInterp<M> {
                     &mut terminal_exit_layouts,
                 );
                 let mut next_global_opref =
-                    compute_next_global_opref(bridge_inputargs, &optimized_ops);
+                    compute_next_global_opref(&entry_inputargs, &optimized_ops);
                 let mut traces = indexmap::IndexMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: bridge_inputargs
+                        inputargs: entry_inputargs
                             .iter()
                             .map(InputArg::fresh_value_copy)
                             .collect(),

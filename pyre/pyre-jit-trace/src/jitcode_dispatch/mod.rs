@@ -9927,7 +9927,8 @@ fn handle<Sym: WalkSym>(
         // long_mod / long_div until the build-pipeline jtransform
         // port lands) get a `setdefault`-allocated dynamic byte and
         // resolve through BH dispatch only.
-        // `cast_int_to_float` / `cast_int_to_ptr` / `cast_ptr_to_int`
+        // `cast_float_to_int` / `cast_int_to_float` / `cast_int_to_ptr` /
+        // `cast_ptr_to_int`
         // route through `dispatch_regular_record` (see `arith.rs`
         // `unop_cast_record`) — part of the `pyjitpl.py`
         // exec-generated unary family.

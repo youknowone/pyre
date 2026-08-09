@@ -761,8 +761,8 @@ pub(crate) fn record_float_cmp<Sym: WalkSym>(
 }
 
 /// Bank-crossing unary cast family from the `pyjitpl.py`
-/// exec-generated unary loop (`cast_int_to_float` / `cast_int_to_ptr`
-/// / `cast_ptr_to_int`). PyPy generates these from one template
+/// exec-generated unary loop (`cast_float_to_int` / `cast_int_to_float` /
+/// `cast_int_to_ptr` / `cast_ptr_to_int`). PyPy generates these from one template
 /// because its boxes are untyped; pyre's typed register banks make
 /// each cast a distinct (src-bank, dst-bank, concrete-fold) triple, so
 /// the recorded `opcode` selects the shape. Operand layout `<s>><d>`
@@ -777,6 +777,31 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
     let dst = code[op.pc + 2] as usize;
     count_ops_executed(ctx, opcode);
     match opcode {
+        // `cast_float_to_int/f>i`: Float-bank → Int-bank.  This is the
+        // first member of RPython's generated unary cast family
+        // (`pyjitpl.py:357`) and uses the same concrete operation as
+        // `blackhole.py bhimpl_cast_float_to_int`.
+        OpCode::CastFloatToInt => {
+            let a = read_float_reg(code, op, 0, ctx)?;
+            let result = if let Some(majit_ir::Value::Float(f)) = a.inline_const_to_value()
+                && let Some(majit_ir::Value::Int(n)) =
+                    majit_metainterp::executor::execute_cast_const(
+                        opcode,
+                        majit_ir::Value::Float(f),
+                    ) {
+                ctx.trace_ctx.const_int(n)
+            } else {
+                count_ops_recorded(ctx, opcode);
+                let result = ctx.trace_ctx.record_op(opcode, &[a]);
+                if let Some(majit_ir::Value::Float(f)) = ctx.trace_ctx.box_value(a) {
+                    ctx.trace_ctx
+                        .set_opref_concrete(result, majit_ir::Value::Int(f as i64));
+                }
+                result
+            };
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+        }
         // `cast_int_to_float/i>f`: Int-bank → Float-bank. Stamp the
         // result with the operand's Box.value as an f64 so downstream
         // `box_value(result)` callers see the live value.
@@ -1077,6 +1102,7 @@ regular_record_table! {
     // shape from the opcode (pyre's typed banks cannot share one template
     // the way PyPy's untyped boxes do).
     unop_cast_record {
+        "cast_float_to_int/f>i" => CastFloatToInt,
         "cast_int_to_float/i>f" => CastIntToFloat,
         "cast_int_to_ptr/i>r" => CastIntToPtr,
         "cast_ptr_to_int/r>i" => CastPtrToInt,

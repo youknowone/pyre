@@ -2058,12 +2058,22 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     }
     discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
     crate::jitcode_dispatch::bool_box_truth_reset();
-    crate::jitcode_dispatch::fbw_finish_payload_reset();
     if adopted {
+        // `try_adopt_blackhole` mirrors `convert_and_run_from_pyjitpl` and can
+        // finish the root frame with `DoneWithThisFrame*`; it records that
+        // terminal in `FBW_FINISH_CONCRETE` for the bridge launcher to raise
+        // back to the caller.  Do not erase it while discarding the carrier's
+        // tracing-only state.  Doing so adopted a frame positioned after
+        // RETURN_VALUE but lost its result, so the interpreter fell through
+        // with `None` (`pickletools.optimize` after the carrier abort).
         // The chain ran the callee forward from where the sub-walk stopped, so
         // the eager stores it journaled stand exactly once.
         crate::jitcode_dispatch::fbw_store_journal_commit();
     } else {
+        // No blackhole terminal belongs to this walk.  Clear any sub-walk
+        // payload before the guard-state replay, as the old unconditional
+        // reset did.
+        crate::jitcode_dispatch::fbw_finish_payload_reset();
         // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
         // callee, and the blackhole replays it from the guard, so restore the
         // pre-walk heap rather than dropping the journals (which would leave every
