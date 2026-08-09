@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=20
+# pyre-check: max-pypy-ratio=40
 # A class body and an `exec(code, ns)` body are the two frames that receive
 # their namespace through `setdictscope`, and both route a hot loop through the
 # JIT portal.
@@ -20,13 +20,18 @@
 # correct without it, so that half is not observable here.  It needs a debug
 # build to show, and nothing in this suite runs one.
 #
-# The loop has to run far enough in one entry to warm the portal.
+# N has to run far enough in one entry to warm the portal.
 # `exec_fresh_globals_delete_name` already runs an exec-body loop and stayed
 # green throughout: at 400 iterations it never reached the divergence.
+#
+# REPEAT sizes the whole workload rather than the trace.  At 5 the pypy
+# baseline lands under its startup, `_baseline_exec_time_clamped` marks the
+# ratio `~`, and no ratio gate is applied at all; 100 puts pypy's execution
+# around 0.14s, well clear of `FLOOR_GATE_MIN_BASELINE_S`.
 import collections
 
 N = 3000
-REPEAT = 5
+REPEAT = 100
 
 
 def class_body_while():
