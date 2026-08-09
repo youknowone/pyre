@@ -18801,18 +18801,21 @@ fn init_bool_type(ns: PyObjectRef) {
             ),
         )
     };
+    let new_descr = make_new_descr(bool_descr_new);
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr) };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(bool_descr_new),
-        )
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function("__repr__", bool_repr),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__repr__",
+                bool_repr,
+                1,
+                "($self, /)",
+            ),
         )
     };
     // CPython 3.14 gives bool an explicit deprecated `__invert__` wrapper;
@@ -18821,7 +18824,12 @@ fn init_bool_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__invert__",
-            make_builtin_function("__invert__", bool_descr_invert),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__invert__",
+                bool_descr_invert,
+                1,
+                "($self, /)",
+            ),
         )
     };
     // boolobject.py:97-106 — bool defines its own bitwise dunders so that
@@ -18839,14 +18847,24 @@ fn init_bool_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 and_name,
-                make_builtin_function_with_arity(and_name, f, 2),
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    and_name,
+                    f,
+                    2,
+                    "($self, value, /)",
+                ),
             )
         };
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 rand_name,
-                make_builtin_function(rand_name, f),
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    rand_name,
+                    f,
+                    2,
+                    "($self, value, /)",
+                ),
             )
         };
     }
