@@ -1551,7 +1551,7 @@ impl UnrollOptimizer {
         }
         let mut body_ops = p2_ops;
         let mut redirected_tail_ops = Vec::new();
-        let jump_to_self = {
+        let jump_was_redirected = {
             let body_jump_args: Vec<OpRef> = body_terminal_op
                 .as_ref()
                 .map(|jump| jump.getarglist().iter().map(|a| a.to_opref()).collect())
@@ -1779,12 +1779,10 @@ impl UnrollOptimizer {
                 // Only take jump_ctx ops if we don't already have
                 // a self-loop Jump from the retrace path.
                 redirected_tail_ops = std::mem::take(&mut jump_ctx.new_operations);
-                // Check if the redirected Jump targets the current body token
-                // (last in target_tokens) or an external token from a previous
-                // compilation.  The Cranelift backend compiles each trace as a
-                // single function — cross-function jumps to external target
-                // tokens are not supported.  Discard the redirected tail and
-                // restore the body's original self-loop Jump instead.
+                // Check whether the redirected Jump targets the current body
+                // token (last in target_tokens) or an external token from a
+                // previous compilation. An external close is discarded and the
+                // body's original self-loop Jump restored instead.
                 let current_body_descr_idx = self
                     .target_tokens
                     .last()
@@ -1795,10 +1793,22 @@ impl UnrollOptimizer {
                     .and_then(|o| o.getdescr())
                     .map(|d| d.index());
                 if redirected_jump_descr_idx != current_body_descr_idx {
-                    // RPython parity: the Cranelift backend can't jump to
-                    // code from a previous compilation (separate function).
-                    // Fall back to jump_to_preamble, matching RPython's
-                    // behavior when the target isn't reachable (unroll.py:228).
+                    // Fall back to jump_to_preamble, matching the
+                    // unreachable-target path in unroll.py:228.
+                    //
+                    // Measured 2026-08-09 before widening this: admitting the
+                    // external close on dynasm — which does relocate every
+                    // LABEL and refuses a JUMP below the first page, so the
+                    // branch names a real address — still SIGSEGVs
+                    // `synth/exception_escape_inlined_midframe_tb_node` and
+                    // adds ~200 guard failures plus a bridge each to
+                    // `synth/{global_reassign,mapdict_unboxed_type_change_attr,
+                    // math_isqrt_compare_bridge_resume,method_reassign_after_warmup}`.
+                    // Reaching a live target address is therefore not the whole
+                    // precondition, and the reason is not the cranelift
+                    // one-function-per-trace layout this guard was first written
+                    // for. Find what else the close breaks before making this
+                    // per-backend.
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] jump_to_existing_trace: external target {:?} != body {:?}, falling back to preamble",
@@ -1828,7 +1838,7 @@ impl UnrollOptimizer {
             );
         }
 
-        if !jump_to_self {
+        if !jump_was_redirected {
             // unroll.py:170-171: jump_to_preamble — body JUMP → preamble Label
             //
             // force_box_for_end_of_preamble (unroll.py:126-127) has already run
@@ -1936,7 +1946,7 @@ impl UnrollOptimizer {
             &sp_jump_args,
             p2_ni,
             phase2_inputarg_base,
-            jump_to_self,
+            jump_was_redirected,
             &imported_short_aliases,
             &consts_p2,
             self.target_tokens
@@ -4627,7 +4637,7 @@ fn assemble_peeled_trace(
     start_label_args: &[OpRef],
     extra_label_args: &[OpRef],
     body_num_inputs: usize,
-    jump_to_self: bool,
+    jump_was_redirected: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
     constants: &majit_ir::ConstMap<majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
@@ -4651,7 +4661,7 @@ fn assemble_peeled_trace(
         extra_label_args,
         body_num_inputs,
         0, // inputarg_base — tests/simple cases use shared namespace
-        jump_to_self,
+        jump_was_redirected,
         imported_short_aliases,
         constants,
         start_label_descr,
@@ -4701,7 +4711,7 @@ fn assemble_peeled_trace_with_jump_args(
     extra_jump_args: &[OpRef],
     body_num_inputs: usize,
     inputarg_base: u32,
-    jump_to_self: bool,
+    jump_was_redirected: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
     constants: &majit_ir::ConstMap<majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
@@ -4994,8 +5004,8 @@ fn assemble_peeled_trace_with_jump_args(
     label_op
         .pos
         .set(OpRef::op_typed(label_pos, label_op.result_type()));
-    if let Some(d) = loop_label_descr {
-        label_op.setdescr(d);
+    if let Some(ref d) = loop_label_descr {
+        label_op.setdescr(d.clone());
     }
     result.extend(fallthrough_aliases.into_iter().map(std::rc::Rc::new));
     result.push(std::rc::Rc::new(label_op));
@@ -5247,7 +5257,7 @@ fn assemble_peeled_trace_with_jump_args(
                 .iter()
                 .map(|arg| {
                     let arg = arg.to_opref();
-                    if jump_to_self {
+                    if jump_was_redirected {
                         return arg;
                     }
                     // unroll.py:364 `_map_args` passes Const through unchanged.
@@ -5268,6 +5278,18 @@ fn assemble_peeled_trace_with_jump_args(
                         .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
                 })
                 .unwrap_or_else(|| full_label_args.clone());
+            let jump_target_descr_idx = new_op.getdescr().map(|descr| descr.index());
+            let local_label_descr_idx = match current_inner_label_index {
+                Some(label_idx) => result
+                    .get(label_idx)
+                    .and_then(|op| op.getdescr())
+                    .map(|descr| descr.index()),
+                None => loop_label_descr.as_ref().map(|descr| descr.index()),
+            };
+            let jump_targets_local_label = matches!(
+                (jump_target_descr_idx, local_label_descr_idx),
+                (Some(jump_idx), Some(label_idx)) if jump_idx == label_idx
+            );
             let target_base_len = if current_inner_label_index.is_some() {
                 original_args.len()
             } else {
@@ -5275,8 +5297,12 @@ fn assemble_peeled_trace_with_jump_args(
             };
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] assemble_jump: inner_label={:?} original_args={:?} mapped_base_args={:?} label_args={:?} filtered_extra_jump_args={:?}",
+                    "[jit] assemble_jump: inner_label={:?} redirected={} targets_local={} jump_target_descr={:?} local_label_descr={:?} original_args={:?} mapped_base_args={:?} label_args={:?} filtered_extra_jump_args={:?}",
                     current_inner_label_index,
+                    jump_was_redirected,
+                    jump_targets_local_label,
+                    jump_target_descr_idx,
+                    local_label_descr_idx,
                     original_args,
                     mapped_base_args,
                     label_args,
@@ -5284,10 +5310,11 @@ fn assemble_peeled_trace_with_jump_args(
                 );
             }
             let mut jump_args = mapped_base_args;
-            if jump_to_self {
-                // RPython compile.py:334: assert jump.numargs() == label.numargs().
-                // Truncate excess JUMP args (from forced virtuals in
-                // jump_to_existing_trace) to match the LABEL arity.
+            if jump_was_redirected && jump_targets_local_label {
+                // compile.py:334: same-label closes require equal JUMP and LABEL
+                // arity. A JUMP redirected to another token already carries the
+                // arity produced by that token's virtual state (unroll.py:346-357)
+                // and must pass through unchanged.
                 if jump_args.len() > target_label_args.len() {
                     jump_args.truncate(target_label_args.len());
                 }
@@ -8334,6 +8361,7 @@ mod tests {
         // — no source_slot input_remap needed. This test verifies that
         // pre-resolved body args survive intact.
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
         let p2_ops = vec![
             {
                 let mut op = Op::new(
@@ -8346,7 +8374,13 @@ mod tests {
                 op.pos.set(OpRef::int_op(20));
                 op
             },
-            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 200)]),
+            {
+                // The JUMP closes onto this trace's own LABEL, which is what
+                // makes the arity coercion below applicable.
+                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 200)]);
+                jump.setdescr(loop_descr.clone());
+                jump
+            },
         ];
 
         let combined = assemble_peeled_trace(
@@ -8360,7 +8394,7 @@ mod tests {
             &[],
             &constants,
             None,
-            None,
+            Some(loop_descr),
         );
 
         assert_eq!(combined[0].opcode, OpCode::Label);
@@ -8382,6 +8416,54 @@ mod tests {
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
             &[OpRef::int_op(200), OpRef::int_op(300)]
+        );
+    }
+
+    /// A JUMP redirected onto ANOTHER trace's target token already carries the
+    /// arity that token's virtual state produced (unroll.py:346-357), so the
+    /// assembler must pass it through. compile.py:334 asserts equal JUMP and
+    /// LABEL arity for the same-label close only; applying that coercion to an
+    /// external close cut the trailing arg and left the backend comparing a
+    /// short JUMP against the target LABEL.
+    #[test]
+    fn test_assemble_peeled_trace_keeps_external_target_jump_arity() {
+        let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
+        let external_descr = TargetToken::new_loop(2).as_jump_target_descr();
+        let p2_ops = vec![{
+            let mut jump = Op::new(
+                OpCode::Jump,
+                &[
+                    rooted_resop_operand(Type::Int, 200),
+                    rooted_resop_operand(Type::Int, 300),
+                    Operand::from_opref(OpRef::const_int(1)),
+                ],
+            );
+            jump.setdescr(external_descr);
+            jump
+        }];
+
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &[OpRef::int_op(200), OpRef::int_op(300)],
+            &[OpRef::int_op(0)],
+            &[],
+            6,
+            true,
+            &[],
+            &majit_ir::ConstMap::new(),
+            None,
+            Some(loop_descr),
+        );
+
+        let jump = combined.last().expect("assembled jump");
+        assert_eq!(jump.opcode, OpCode::Jump);
+        assert_eq!(
+            jump.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            &[OpRef::int_op(200), OpRef::int_op(300), OpRef::const_int(1)]
         );
     }
 
