@@ -12752,22 +12752,30 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "run");
 
+        let backward_target = |pc: usize, instr: I, op_arg: pyre_interpreter::OpArg| match instr {
+            I::JumpBackward { delta } => {
+                Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            I::JumpBackwardNoInterrupt { delta } => {
+                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            _ => None,
+        };
+
         let mut outer_header = usize::MAX;
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        for (pc, unit) in code.instructions.iter().copied().enumerate() {
+            let (instr, op_arg) = arg_state.get(unit);
+            if let Some(target) = backward_target(pc, instr, op_arg) {
+                outer_header = outer_header.min(target);
+            }
+        }
+
         let mut direct_end = None;
         let mut arg_state = pyre_interpreter::OpArgState::default();
         for (pc, unit) in code.instructions.iter().copied().enumerate() {
             let (instr, op_arg) = arg_state.get(unit);
-            let target = match instr {
-                I::JumpBackward { delta } => {
-                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                I::JumpBackwardNoInterrupt { delta } => {
-                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                _ => None,
-            };
-            if let Some(target) = target {
-                outer_header = outer_header.min(target);
+            if let Some(target) = backward_target(pc, instr, op_arg) {
                 if target == outer_header {
                     direct_end = Some(direct_end.map_or(pc, |end: usize| end.max(pc)));
                 }
