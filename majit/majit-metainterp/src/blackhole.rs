@@ -1213,14 +1213,12 @@ impl BlackholeInterpreter {
         if opcode == self.op_catch_exception {
             return self.route_to_catch(position, exc_value);
         }
-        // A guard resume coordinate may name the successor block's entry
-        // `-live-`, before that block mirrors the virtualizable and reaches
-        // the raising operation's trailing `-live-`.  The flattener emits the
-        // `catch_exception` immediately after that trailing marker
-        // (`flatten.py:206-217`).  Walk forward to the first such marker and
-        // accept only its immediately-following catch; crossing any other
-        // operation after it means this exception belongs to no handler at
-        // the resumed call site.
+        // A guard resume coordinate can name the successor block entry before
+        // the translated raising operation.  PyPy's MIFrame position already
+        // names the operation's trailing live/catch pair; pyre recovers that
+        // generated-coordinate gap by scanning to the FIRST such pair.  Ops
+        // before the trailing live belong to that translated operation.  Once
+        // the live is crossed, only its immediately-following catch is valid.
         if let Some(catch_pos) = self.find_catch_after_resume_live(resume_live_pos) {
             return self.route_to_catch(catch_pos, exc_value);
         }
@@ -1396,23 +1394,6 @@ impl BlackholeInterpreter {
             }
             if op == self.op_live {
                 crossed_trailing_live = true;
-                continue;
-            }
-            if !matches!(
-                op,
-                majit_translate::insns::BC_SETFIELD_VABLE_I
-                    | majit_translate::insns::BC_SETFIELD_VABLE_R
-                    | majit_translate::insns::BC_SETFIELD_VABLE_F
-                    | majit_translate::insns::BC_SETARRAYITEM_VABLE_I
-                    | majit_translate::insns::BC_SETARRAYITEM_VABLE_R
-                    | majit_translate::insns::BC_SETARRAYITEM_VABLE_F
-            ) {
-                // Only the codewriter's successor-block virtualizable mirror
-                // stores may separate the guard resume coordinate from the
-                // raising operation's trailing live marker.  Crossing an
-                // arbitrary operation would attach its exception to the next
-                // operation's handler and silently swallow it.
-                return None;
             }
         }
         None
@@ -4368,7 +4349,7 @@ mod tests {
         }
 
         #[test]
-        fn test_guard_exception_resume_does_not_cross_another_operation() {
+        fn test_guard_exception_resume_crosses_translated_operation() {
             let mut asm = majit_translate::codewriter::assembler::Assembler::new();
             let mut b = JitCodeBuilder::default();
             let resume_pc = b.current_pos();
@@ -4378,6 +4359,7 @@ mod tests {
             let handler_lbl = b.new_label();
             b.catch_exception(handler_lbl);
             b.mark_label(handler_lbl);
+            let handler_pc = b.current_pos();
             b.int_return(0);
             let jitcode = b.finish();
 
@@ -4385,7 +4367,8 @@ mod tests {
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
 
-            assert!(!bh.handle_exception_in_frame(0xCAFE_F00D));
+            assert!(bh.handle_exception_in_frame(0xCAFE_F00D));
+            assert_eq!(bh.position, handler_pc);
         }
 
         thread_local! {
