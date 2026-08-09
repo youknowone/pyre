@@ -2048,6 +2048,17 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // A declined adopt leaves everything to the rollback below, which is the
     // pre-existing behaviour.
     let live_root_addr = sym.live_vable_frame_addr();
+    // Clear a stash the sub-walk left BEFORE adopting, not after.  An adopted
+    // terminal stores the frame's `DoneWithThisFrame*` result here
+    // (`try_adopt_blackhole`), and that result IS this drain's answer: the
+    // guard's caller takes it as the bridge resolution
+    // (`fbw_finish_concrete_take` in `call_jit.rs`).  Clearing after the adopt
+    // dropped it, and the drop is silent — the adopt also commits the walk-end
+    // state, so the caller neither finds a concrete nor replays through the
+    // blackhole, and the frame's return value reaches Python as `None`.
+    // Clearing first keeps the same protection against a stale stash while
+    // leaving whatever the adopt installs intact.
+    crate::jitcode_dispatch::fbw_finish_payload_reset();
     let adopted = crate::jitcode_dispatch::fbw_executed_effect_count() != effects_at_entry
         && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::CarrierAbort);
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -2058,12 +2069,15 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     }
     discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
     crate::jitcode_dispatch::bool_box_truth_reset();
-    crate::jitcode_dispatch::fbw_finish_payload_reset();
     if adopted {
         // The chain ran the callee forward from where the sub-walk stopped, so
         // the eager stores it journaled stand exactly once.
         crate::jitcode_dispatch::fbw_store_journal_commit();
     } else {
+        // Nothing adopted the chain, so no result is owed to the caller and a
+        // stash `discard_bridge_carrier_walk` may have left must not leak into
+        // the next walk.
+        crate::jitcode_dispatch::fbw_finish_payload_reset();
         // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
         // callee, and the blackhole replays it from the guard, so restore the
         // pre-walk heap rather than dropping the journals (which would leave every
