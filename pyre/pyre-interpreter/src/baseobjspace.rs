@@ -7251,9 +7251,8 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
             if crate::builtins::lookup_exc_class("OSError")
                 .is_some_and(|os_error| unsafe { isinstance_w(obj, os_error) })
             {
-                let written = unsafe {
-                    pyre_object::interp_exceptions::w_exception_get_written(obj)
-                };
+                let written =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_written(obj) };
                 if written != -1 {
                     return Ok(pyre_object::w_int_new(written));
                 }
@@ -11430,9 +11429,7 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
             };
             if unsafe { isinstance_w(obj, os_error) } {
                 let written = int_w(value)?;
-                unsafe {
-                    pyre_object::interp_exceptions::w_exception_set_written(obj, written)
-                };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, written) };
                 return Ok(w_none());
             }
         }
@@ -12354,15 +12351,12 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(pyre_object::PY_NULL);
             };
             if unsafe { isinstance_w(obj, os_error) } {
-                let written = unsafe {
-                    pyre_object::interp_exceptions::w_exception_get_written(obj)
-                };
+                let written =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_written(obj) };
                 if written == -1 {
                     return Err(PyError::attribute_error("characters_written"));
                 }
-                unsafe {
-                    pyre_object::interp_exceptions::w_exception_set_written(obj, -1)
-                };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, -1) };
                 return Ok(w_none());
             }
         }

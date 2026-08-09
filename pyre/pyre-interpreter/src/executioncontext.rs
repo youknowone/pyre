@@ -2408,12 +2408,7 @@ impl UserDelAction {
                 "Exception ignored while calling deallocator ",
                 del_repr
             );
-            report_error(
-                self.base.space,
-                &error,
-                &where_desc,
-                pyre_object::w_none(),
-            );
+            report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
         }
     }
 }
