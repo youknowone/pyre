@@ -6049,6 +6049,71 @@ fn init_str_type(ns: PyObjectRef) {
 // ── Dict TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/dictmultiobject.py TypeDef("dict", ...)
 
+fn dict_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_dict_receiver(args, "__sizeof__", false)?;
+    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+
+    let receiver = args[0];
+    let dict = crate::type_methods::resolve_dict_backing(receiver);
+    debug_assert!(!dict.is_null());
+    let w_type = crate::typedef::r#type(receiver)
+        .expect("every dict has a type")
+        .as_ptr();
+    let basicsize = cpython_type_layout(w_type)
+        .expect("dict and its subclasses have CPython layout metadata")
+        .0 as usize;
+    let items = unsafe { pyre_object::dictmultiobject::w_dict_items(dict) };
+    if items.is_empty() {
+        // CPython's empty dict shares the immortal empty-keys table, whose
+        // storage is consequently not charged to the instance.
+        return Ok(w_int_new(basicsize as i64));
+    }
+
+    // CPython 3.14 `dictobject.c:_PyDict_KeysSize`: the smallest power-of-two
+    // key table whose two-thirds usable fraction holds the live entries, plus
+    // its indices and entries.  PyPy has no dict `__sizeof__`; this is one of
+    // the Python-3.14 surface additions where the project's stated version
+    // target takes precedence over the PyPy TypeDef.
+    let mut table_size = 8usize;
+    while (table_size << 1) / 3 < items.len() {
+        table_size = table_size
+            .checked_mul(2)
+            .ok_or_else(crate::builtins::reservation_failed)?;
+    }
+    let index_width = if table_size <= u8::MAX as usize {
+        1
+    } else if table_size <= u16::MAX as usize {
+        2
+    } else if table_size <= u32::MAX as usize {
+        4
+    } else {
+        8
+    };
+    let index_bytes = table_size
+        .checked_mul(index_width)
+        .ok_or_else(crate::builtins::reservation_failed)?
+        .max(std::mem::size_of::<usize>());
+    let unicode_only = items.iter().all(|(key, _)| unsafe {
+        pyre_object::pyobject::is_exact_type(*key, &pyre_object::STR_TYPE)
+    });
+    let entry_size = if unicode_only {
+        2 * std::mem::size_of::<usize>()
+    } else {
+        3 * std::mem::size_of::<usize>()
+    };
+    let usable = (table_size << 1) / 3;
+    let keys_size = 4usize
+        .checked_mul(std::mem::size_of::<usize>())
+        .and_then(|header| header.checked_add(index_bytes))
+        .and_then(|partial| partial.checked_add(usable.checked_mul(entry_size)?))
+        .ok_or_else(crate::builtins::reservation_failed)?;
+    Ok(w_int_new(
+        basicsize
+            .checked_add(keys_size)
+            .ok_or_else(crate::builtins::reservation_failed)? as i64,
+    ))
+}
+
 fn init_dict_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -6069,6 +6134,18 @@ fn init_dict_type(ns: PyObjectRef) {
     };
     // dictmultiobject.py:421 `__hash__ = None`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none()) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                dict_descr_sizeof,
+                1,
+                "($self, /)",
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -24341,6 +24418,56 @@ setlike_method_gateways!(
     setlike_descr_copy
 );
 
+fn setlike_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+    let w_type = crate::typedef::r#type(args[0])
+        .expect("every set has a type")
+        .as_ptr();
+    let basicsize = cpython_type_layout(w_type)
+        .expect("set and frozenset subclasses have CPython layout metadata")
+        .0 as usize;
+    let len = unsafe { pyre_object::w_set_len(args[0]) };
+
+    // CPython 3.14 `setobject.c:set___sizeof___impl` includes the inline
+    // eight-entry small table in `tp_basicsize` and charges an external table
+    // only after insertion crosses the 3/5 fill threshold.  Its resize target
+    // is four times `used` (twice above 50,000), rounded up to a power of two.
+    let mut table_size = 8usize;
+    let mut threshold = ((table_size - 1) * 3).div_ceil(5);
+    while len >= threshold {
+        let multiplier = if threshold > 50_000 { 2 } else { 4 };
+        let minimum = threshold
+            .checked_mul(multiplier)
+            .ok_or_else(crate::builtins::reservation_failed)?;
+        table_size = 8;
+        while table_size <= minimum {
+            table_size = table_size
+                .checked_mul(2)
+                .ok_or_else(crate::builtins::reservation_failed)?;
+        }
+        threshold = ((table_size - 1) * 3).div_ceil(5);
+    }
+    let external = if table_size == 8 {
+        0
+    } else {
+        table_size
+            .checked_mul(2 * std::mem::size_of::<usize>())
+            .ok_or_else(crate::builtins::reservation_failed)?
+    };
+    Ok(w_int_new(
+        basicsize
+            .checked_add(external)
+            .ok_or_else(crate::builtins::reservation_failed)? as i64,
+    ))
+}
+
+setlike_method_gateways!(
+    set_gateway_sizeof,
+    frozenset_gateway_sizeof,
+    "__sizeof__",
+    setlike_descr_sizeof
+);
+
 fn setlike_gateway(
     frozen: bool,
     set_gateway: crate::gateway::BuiltinCodeFn,
@@ -24354,6 +24481,18 @@ fn setlike_gateway(
 }
 
 fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                setlike_gateway(frozen, set_gateway_sizeof, frozenset_gateway_sizeof),
+                1,
+                "($self, /)",
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,

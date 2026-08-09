@@ -387,6 +387,38 @@ pub(crate) fn require_tuple_receiver(
     Ok(receiver)
 }
 
+/// Receiver check supplied by PyPy's
+/// `interp2app(W_DictMultiObject.descr_*)` gateway.
+pub(crate) fn require_dict_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method dict.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'dict' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe {
+        crate::baseobjspace::isinstance_w(
+            receiver,
+            crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+        )
+    } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!("descriptor '{name}' for 'dict' objects doesn't apply to a '{received}' object")
+        } else {
+            format!("descriptor '{name}' requires a 'dict' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
 /// The receiver check supplied by PyPy's
 /// `interp2app(W_SetObject.descr_*)` gateway.  CPython 3.14 exposes set's
 /// slot wrappers and ordinary methods as two descriptor kinds with distinct
