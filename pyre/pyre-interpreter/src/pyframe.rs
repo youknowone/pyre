@@ -3291,13 +3291,26 @@ impl PyFrame {
                         "cannot clear a suspended frame",
                     ));
                 }
-                crate::baseobjspace::generator_finalize(w_gen)?;
+                // `_PyGen_Finalize` can execute Python and collect.  Keep both
+                // owner and frame as explicit roots, then reload both before
+                // severing the association; neither raw pointer may survive
+                // the call unchanged across a nursery move.
+                let frame_anchor = crate::eval::FrameAnchor::new(self);
+                let roots = pyre_object::gc_roots::push_roots();
+                let gen_slot = roots.base();
+                roots.pin_root(w_gen);
+                crate::baseobjspace::generator_finalize(roots.get(gen_slot))?;
                 // CPython 3.14 `frame_clear_impl` finishes a never-started
                 // generator after `_PyGen_Finalize`, then clears the owned
                 // interpreter frame.  The suspended case was rejected above,
                 // so this is the same completion path used by close() and
                 // normal generator return, including severing `gi_frame`.
-                unsafe { crate::baseobjspace::generator_frame_is_finished(w_gen, self) };
+                unsafe {
+                    crate::baseobjspace::generator_frame_is_finished(
+                        roots.get(gen_slot),
+                        &mut *frame_anchor.live(),
+                    )
+                };
                 let ec = crate::call::getexecutioncontext()
                     as *mut crate::executioncontext::ExecutionContext;
                 if !ec.is_null() {

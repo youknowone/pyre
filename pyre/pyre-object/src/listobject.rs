@@ -85,6 +85,10 @@ pub enum ListStrategy {
     /// without any storage yet. First append picks a typed strategy via
     /// switch_to_correct_strategy.
     Empty = 3,
+    /// listobject.py:2193 IntOrFloatListStrategy.  Entries share the
+    /// `int_items` signed-longlong array: int32 values use RPython's
+    /// 0xfffffffe NaN payload and floats keep their raw IEEE-754 bits.
+    IntOrFloat = 4,
 }
 
 /// Python list object.
@@ -96,11 +100,10 @@ pub enum ListStrategy {
 /// offset-0 header holds the allocated capacity
 /// (upstream `len(l.items)` per rlist.py:251).
 ///
-/// `strategy`, `int_items`, `float_items` are pyre-only
-/// TODOs for PyPy's list strategy split
-/// (`pypy/objspace/std/listobject.py`). Only the Object strategy
-/// reads/writes `length` + `items`; Integer/Float strategies operate
-/// on their own typed arrays and keep `length = 0`, `items = null`.
+/// `strategy`, `int_items`, `float_items` implement PyPy's list strategy split
+/// (`pypy/objspace/std/listobject.py`). Only the Object strategy reads/writes
+/// `length` + `items`; Integer/IntOrFloat/Float strategies operate on their
+/// own typed arrays and keep `length = 0`, `items = null`.
 #[repr(C)]
 pub struct W_ListObject {
     pub ob_header: PyObject,
@@ -119,7 +122,7 @@ pub struct W_ListObject {
     /// the `ItemsBlock` whose offset-0 header is the allocated
     /// capacity (= upstream `len(l.items)` per rlist.py:251). Null
     /// when the list is in a non-Object strategy (Empty/Integer/
-    /// Float); lazily allocated on strategy switch.
+    /// IntOrFloat/Float); lazily allocated on strategy switch.
     pub items: *mut ItemsBlock,
     pub strategy: ListStrategy,
     pub int_items: IntArray,
@@ -150,8 +153,9 @@ impl W_ListObject {
             // Direct rlist `length` field reads keep this helper in the
             // annotator's structural subset; the public `.len()` wrappers are
             // host collection conveniences that translate as `__len__`.
-            ListStrategy::Integer => self.int_items.len,
-            ListStrategy::Float => self.float_items.len,
+            ListStrategy::Integer => self.int_items.len(),
+            ListStrategy::IntOrFloat => self.int_items.len(),
+            ListStrategy::Float => self.float_items.len(),
         }
     }
 
@@ -546,6 +550,108 @@ fn all_floats(items: &[PyObjectRef]) -> bool {
         .all(|&item| unsafe { is_float_strategy_item(item) })
 }
 
+// rpython/rlib/longlong2float.py:90-150.  Keep these bit operations local to
+// IntOrFloatListStrategy: the signed-longlong storage representation is part
+// of the upstream strategy, not a general numeric coercion.
+const INT_OR_FLOAT_INT_HIGH_WORD: u32 = 0xffff_fffe;
+
+#[inline]
+fn int_or_float_is_int(value: i64) -> bool {
+    ((value as u64) >> 32) as u32 == INT_OR_FLOAT_INT_HIGH_WORD
+}
+
+#[inline]
+fn int_or_float_encode_int(value: i64) -> Option<i64> {
+    let value = i32::try_from(value).ok()?;
+    Some(((INT_OR_FLOAT_INT_HIGH_WORD as u64) << 32 | value as u32 as u64) as i64)
+}
+
+#[inline]
+fn int_or_float_encode_float(value: f64) -> Option<i64> {
+    let bits = value.to_bits();
+    (((bits >> 32) as u32) != INT_OR_FLOAT_INT_HIGH_WORD).then_some(bits as i64)
+}
+
+#[inline]
+fn int_or_float_decode_int(value: i64) -> i64 {
+    value as u32 as i32 as i64
+}
+
+#[inline]
+fn int_or_float_as_float(value: i64) -> f64 {
+    if int_or_float_is_int(value) {
+        int_or_float_decode_int(value) as f64
+    } else {
+        f64::from_bits(value as u64)
+    }
+}
+
+#[inline]
+unsafe fn int_or_float_encode_item(item: PyObjectRef) -> Option<i64> {
+    if is_plain_int1(item) {
+        int_or_float_encode_int(plain_int_w(item))
+    } else if is_float_strategy_item(item) {
+        int_or_float_encode_float(w_float_get_value(item))
+    } else {
+        None
+    }
+}
+
+fn all_int_or_float(items: &[PyObjectRef]) -> bool {
+    items
+        .iter()
+        .all(|&item| unsafe { int_or_float_encode_item(item).is_some() })
+}
+
+fn boxed_from_int_or_float(values: &[i64]) -> Vec<PyObjectRef> {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    for &value in values {
+        let item = if int_or_float_is_int(value) {
+            w_int_new(int_or_float_decode_int(value))
+        } else {
+            w_float_new(f64::from_bits(value as u64))
+        };
+        crate::gc_roots::pin_root(item);
+    }
+    (0..values.len())
+        .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
+        .collect()
+}
+
+/// listobject.py:2034 IntegerListStrategy.switch_to_int_or_float_strategy.
+unsafe fn integer_to_int_or_float(list: &mut W_ListObject) -> bool {
+    let Some(values) = list
+        .int_items
+        .as_slice()
+        .iter()
+        .map(|&value| int_or_float_encode_int(value))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    list.int_items.install(IntArray::from_vec(values));
+    list.strategy = ListStrategy::IntOrFloat;
+    true
+}
+
+/// listobject.py:2156 FloatListStrategy.switch_to_int_or_float_strategy.
+unsafe fn float_to_int_or_float(list: &mut W_ListObject) -> bool {
+    let Some(values) = list
+        .float_items
+        .as_slice()
+        .iter()
+        .map(|&value| int_or_float_encode_float(value))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    list.int_items.install(IntArray::from_vec(values));
+    list.float_items.install(FloatArray::from_vec(Vec::new()));
+    list.strategy = ListStrategy::IntOrFloat;
+    true
+}
+
 fn boxed_from_ints(values: &[i64]) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
@@ -586,6 +692,7 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
     }
     let seed: Vec<PyObjectRef> = match list.strategy {
         ListStrategy::Integer => boxed_from_ints(list.int_items.as_slice()),
+        ListStrategy::IntOrFloat => boxed_from_int_or_float(list.int_items.as_slice()),
         ListStrategy::Float => boxed_from_floats(list.float_items.as_slice()),
         ListStrategy::Object | ListStrategy::Empty => Vec::new(),
     };
@@ -624,6 +731,8 @@ pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
         ListStrategy::Integer
     } else if all_floats(items) {
         ListStrategy::Float
+    } else if all_int_or_float(items) {
+        ListStrategy::IntOrFloat
     } else {
         ListStrategy::Object
     }
@@ -760,10 +869,13 @@ pub fn w_list_new_empty() -> PyObjectRef {
 /// scope those pins live in and closes the bracket with
 /// [`ListStorage::reload_typed_blocks`] after its last allocation.
 unsafe fn build_list_storage(items: &[PyObjectRef], strategy: ListStrategy) -> ListStorage {
-    let int_seed: Vec<i64> = if let ListStrategy::Integer = strategy {
-        items.iter().map(|&item| plain_int_w(item)).collect()
-    } else {
-        Vec::new()
+    let int_seed: Vec<i64> = match strategy {
+        ListStrategy::Integer => items.iter().map(|&item| plain_int_w(item)).collect(),
+        ListStrategy::IntOrFloat => items
+            .iter()
+            .map(|&item| int_or_float_encode_item(item).unwrap())
+            .collect(),
+        _ => Vec::new(),
     };
     let int_items = IntArray::from_vec(int_seed);
     let int_block_root = int_items.pin_block();
@@ -1117,6 +1229,20 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
             }
             Some(w_int_new(ll_list_int_getitem_fast(list, idx as usize)))
         }
+        ListStrategy::IntOrFloat => {
+            let items = list.int_items.as_slice();
+            let len = items.len() as i64;
+            let idx = if index < 0 { index + len } else { index };
+            if idx < 0 || idx >= len {
+                return None;
+            }
+            let value = items[idx as usize];
+            Some(if int_or_float_is_int(value) {
+                w_int_new(int_or_float_decode_int(value))
+            } else {
+                w_float_new(f64::from_bits(value as u64))
+            })
+        }
         ListStrategy::Float => {
             let items = list.float_items.as_slice();
             let len = items.len() as i64;
@@ -1169,6 +1295,22 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             if is_plain_int1(value) {
                 ll_list_int_setitem_fast(list, idx as usize, plain_int_w(value));
                 true
+            } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
+                w_list_setitem(obj, index, value)
+            } else {
+                switch_to_object_strategy(list);
+                w_list_setitem(obj, index, value)
+            }
+        }
+        ListStrategy::IntOrFloat => {
+            let len = list.int_items.len() as i64;
+            let idx = if index < 0 { index + len } else { index };
+            if idx < 0 || idx >= len {
+                return false;
+            }
+            if let Some(value) = int_or_float_encode_item(value) {
+                list.int_items[idx as usize] = value;
+                true
             } else {
                 switch_to_object_strategy(list);
                 w_list_setitem(obj, index, value)
@@ -1183,6 +1325,11 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             if is_float_strategy_item(value) {
                 list.float_items[idx as usize] = w_float_get_value(value);
                 true
+            } else if is_plain_int1(value)
+                && int_or_float_encode_int(plain_int_w(value)).is_some()
+                && float_to_int_or_float(list)
+            {
+                w_list_setitem(obj, index, value)
             } else {
                 switch_to_object_strategy(list);
                 w_list_setitem(obj, index, value)
@@ -1303,6 +1450,8 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 } else {
                     list.int_items.push(item);
                 }
+            } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
+                w_list_append_inner(obj, value);
             } else {
                 switch_to_object_strategy(list);
                 list.object_push(value);
@@ -1329,6 +1478,19 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 } else {
                     list.float_items.push(item);
                 }
+            } else if is_plain_int1(value)
+                && int_or_float_encode_int(plain_int_w(value)).is_some()
+                && float_to_int_or_float(list)
+            {
+                w_list_append_inner(obj, value);
+            } else {
+                switch_to_object_strategy(list);
+                list.object_push(value);
+            }
+        }
+        ListStrategy::IntOrFloat => {
+            if let Some(item) = int_or_float_encode_item(value) {
+                list.int_items.push(item);
             } else {
                 switch_to_object_strategy(list);
                 list.object_push(value);
@@ -1386,6 +1548,29 @@ pub unsafe fn w_list_int_set_len(obj: PyObjectRef, n: usize) {
     ll_list_int_set_len(list, n);
 }
 
+/// JIT rollback leaves for IntOrFloatListStrategy's signed-longlong storage.
+/// These mirror the Integer leaves but encode the restored boxed value using
+/// listobject.py:2193 `IntOrFloatListStrategy.unwrap`.
+pub unsafe fn w_list_int_or_float_set_len(obj: PyObjectRef, n: usize) {
+    let list = &mut *(obj as *mut W_ListObject);
+    debug_assert_eq!(list.strategy, ListStrategy::IntOrFloat);
+    list.int_items.set_len(n);
+}
+
+pub unsafe fn w_list_int_or_float_setitem(
+    obj: PyObjectRef,
+    index: usize,
+    value: PyObjectRef,
+) -> bool {
+    let list = &mut *(obj as *mut W_ListObject);
+    debug_assert_eq!(list.strategy, ListStrategy::IntOrFloat);
+    let Some(value) = int_or_float_encode_item(value) else {
+        return false;
+    };
+    list.int_items[index] = value;
+    true
+}
+
 /// Get the length of a list.
 ///
 /// # Safety
@@ -1403,6 +1588,7 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
         ListStrategy::Empty => 0,
         ListStrategy::Object => list.length,
         ListStrategy::Integer => ll_list_int_length(list),
+        ListStrategy::IntOrFloat => list.int_items.len(),
         ListStrategy::Float => list.float_items.len(),
     }
 }
@@ -1495,6 +1681,7 @@ pub unsafe fn w_list_can_append_without_realloc(obj: PyObjectRef) -> bool {
         ListStrategy::Empty => false,
         ListStrategy::Object => list.object_spare_capacity() > 0,
         ListStrategy::Integer => list.int_items.spare_capacity() > 0,
+        ListStrategy::IntOrFloat => list.int_items.spare_capacity() > 0,
         ListStrategy::Float => list.float_items.spare_capacity() > 0,
     }
 }
@@ -1513,6 +1700,7 @@ pub unsafe fn w_list_is_inline_storage(obj: PyObjectRef) -> bool {
         // "inline" bit either.
         ListStrategy::Object => false,
         ListStrategy::Integer => list.int_items.is_inline(),
+        ListStrategy::IntOrFloat => list.int_items.is_inline(),
         ListStrategy::Float => list.float_items.is_inline(),
     }
 }
@@ -1530,6 +1718,11 @@ pub unsafe fn w_list_uses_int_storage(obj: PyObjectRef) -> bool {
 pub unsafe fn w_list_uses_float_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     list.strategy == ListStrategy::Float
+}
+
+pub unsafe fn w_list_uses_int_or_float_storage(obj: PyObjectRef) -> bool {
+    let list = &*(obj as *const W_ListObject);
+    list.strategy == ListStrategy::IntOrFloat
 }
 
 pub unsafe fn w_list_uses_empty_storage(obj: PyObjectRef) -> bool {
@@ -1618,6 +1811,7 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
                 .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
                 .collect()
         }
+        ListStrategy::IntOrFloat => boxed_from_int_or_float(list.int_items.as_slice()),
         ListStrategy::Float => {
             let items = list.float_items.as_slice();
             let _roots = crate::gc_roots::push_roots();
@@ -1662,6 +1856,20 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
                 list.sync_allocated(old_size);
                 return;
             }
+            if is_float_strategy_item(value) && integer_to_int_or_float(list) {
+                w_list_insert(obj, index, value);
+            } else {
+                switch_to_object_strategy(list);
+                w_list_insert(obj, index, value);
+            }
+        }
+        ListStrategy::IntOrFloat => {
+            if let Some(value) = int_or_float_encode_item(value) {
+                let idx = normalize_insert_index(index, list.int_items.len());
+                list.int_items.insert(idx, value);
+                list.sync_allocated(old_size);
+                return;
+            }
             switch_to_object_strategy(list);
             w_list_insert(obj, index, value);
         }
@@ -1672,8 +1880,15 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
                 list.sync_allocated(old_size);
                 return;
             }
-            switch_to_object_strategy(list);
-            w_list_insert(obj, index, value);
+            if is_plain_int1(value)
+                && int_or_float_encode_int(plain_int_w(value)).is_some()
+                && float_to_int_or_float(list)
+            {
+                w_list_insert(obj, index, value);
+            } else {
+                switch_to_object_strategy(list);
+                w_list_insert(obj, index, value);
+            }
         }
         ListStrategy::Object => {
             let idx = normalize_insert_index(index, list.length);
@@ -1709,6 +1924,22 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
             }
             let item = list.int_items.remove(idx as usize);
             Some(w_int_new(item))
+        }
+        ListStrategy::IntOrFloat => {
+            let len = list.int_items.len() as i64;
+            if len == 0 {
+                return None;
+            }
+            let idx = if index < 0 { index + len } else { index };
+            if idx < 0 || idx >= len {
+                return None;
+            }
+            let item = list.int_items.remove(idx as usize);
+            Some(if int_or_float_is_int(item) {
+                w_int_new(int_or_float_decode_int(item))
+            } else {
+                w_float_new(f64::from_bits(item as u64))
+            })
         }
         ListStrategy::Float => {
             let len = list.float_items.len() as i64;
@@ -1767,6 +1998,7 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
     let length = match list.strategy {
         ListStrategy::Empty => 0,
         ListStrategy::Integer => ll_list_int_length(list),
+        ListStrategy::IntOrFloat => list.int_items.len(),
         ListStrategy::Float => list.float_items.len(),
         ListStrategy::Object => list.length,
     };
@@ -1799,6 +2031,14 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> PyObjectRef {
             let item = ll_list_int_getitem_fast(list, index);
             ll_list_int_set_len(list, index);
             w_int_new(item)
+        }
+        ListStrategy::IntOrFloat => {
+            let item = list.int_items.pop();
+            if int_or_float_is_int(item) {
+                w_int_new(int_or_float_decode_int(item))
+            } else {
+                w_float_new(f64::from_bits(item as u64))
+            }
         }
         ListStrategy::Float => w_float_new(list.float_items.pop()),
         ListStrategy::Object => list.object_pop(),
@@ -1835,6 +2075,31 @@ pub unsafe fn w_list_float_items_raw(obj: PyObjectRef) -> Option<(*mut f64, usiz
     }
     let items = list.float_items.as_mut_slice();
     Some((items.as_mut_ptr(), items.len()))
+}
+
+/// listobject.py:2234 IntOrFloatListStrategy.sort and
+/// listobject.py:2449 IntOrFloatSort.lt.  Unlike the homogeneous raw-array
+/// accessors above, the encoded `i64` values must be ordered after decoding.
+/// Reverse follows PyPy's reverse/stable-sort/reverse sequence so equal
+/// int/float values retain reverse-sort stability.
+pub unsafe fn w_list_sort_int_or_float(obj: PyObjectRef, reverse: bool) -> bool {
+    let list = &mut *(obj as *mut W_ListObject);
+    if list.strategy != ListStrategy::IntOrFloat {
+        return false;
+    }
+    let items = list.int_items.as_mut_slice();
+    if reverse {
+        items.reverse();
+    }
+    items.sort_by(|a, b| {
+        int_or_float_as_float(*a)
+            .partial_cmp(&int_or_float_as_float(*b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if reverse {
+        items.reverse();
+    }
+    true
 }
 
 /// Whether the list still holds the EmptyListStrategy.
@@ -1958,6 +2223,7 @@ pub unsafe fn w_list_reverse(obj: PyObjectRef) {
         // (listobject.py defaults) which is a no-op for length 0.
         ListStrategy::Empty => {}
         ListStrategy::Integer => list.int_items.as_mut_slice().reverse(),
+        ListStrategy::IntOrFloat => list.int_items.as_mut_slice().reverse(),
         ListStrategy::Float => list.float_items.as_mut_slice().reverse(),
         ListStrategy::Object => list.object_reverse(),
     }
@@ -1973,6 +2239,15 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
         // listobject.py:1177 EmptyListStrategy.deleteslice is a no-op (pass).
         ListStrategy::Empty => {}
         ListStrategy::Integer => {
+            let len = list.int_items.len();
+            let s = start.min(len);
+            let e = end.min(len);
+            if s < e {
+                list.int_items.drain(s..e);
+                changed = true;
+            }
+        }
+        ListStrategy::IntOrFloat => {
             let len = list.int_items.len();
             let s = start.min(len);
             let e = end.min(len);
@@ -2131,6 +2406,35 @@ pub unsafe fn w_list_find_or_count_fast(
                 ListFindFast::NotFound
             }
         }
+        // listobject.py:2280 IntOrFloatListStrategy._safe_find_or_count:
+        // compare raw longlongs first (same NaN payload), then decoded
+        // numeric values (0 == -0.0 and 42 == 42.0).
+        ListStrategy::IntOrFloat => {
+            let Some(target) = int_or_float_encode_item(w_item) else {
+                return ListFindFast::NeedsGeneric;
+            };
+            let target_float = int_or_float_as_float(target);
+            let items = list.int_items.as_slice();
+            let stop = stop.min(items.len() as i64);
+            let mut result = 0i64;
+            let mut i = start.max(0);
+            while i < stop {
+                let value = items[i as usize];
+                if value == target || int_or_float_as_float(value) == target_float {
+                    if count {
+                        result += 1;
+                    } else {
+                        return ListFindFast::Found(i);
+                    }
+                }
+                i += 1;
+            }
+            if count {
+                ListFindFast::Count(result)
+            } else {
+                ListFindFast::NotFound
+            }
+        }
         _ => ListFindFast::NeedsGeneric,
     }
 }
@@ -2187,6 +2491,12 @@ unsafe fn w_list_setslice_inner(
                     list.strategy = ListStrategy::Integer;
                     return Ok(());
                 }
+                ListStrategy::IntOrFloat => {
+                    let fresh = IntArray::from_vec(other.int_items.to_vec());
+                    list.int_items.install(fresh);
+                    list.strategy = ListStrategy::IntOrFloat;
+                    return Ok(());
+                }
                 ListStrategy::Float => {
                     let fresh = FloatArray::from_vec(other.float_items.to_vec());
                     list.float_items.install(fresh);
@@ -2199,6 +2509,55 @@ unsafe fn w_list_setslice_inner(
                     list_write_barrier(obj);
                     return Ok(());
                 }
+            }
+        }
+        // listobject.py:1998/2013 IntegerListStrategy and :2096/2110
+        // FloatListStrategy first generalize themselves when the donor is a
+        // compatible numeric strategy, then re-dispatch the same setslice.
+        if list.strategy == ListStrategy::Integer
+            && matches!(
+                other.strategy,
+                ListStrategy::Float | ListStrategy::IntOrFloat
+            )
+            && integer_to_int_or_float(list)
+        {
+            return w_list_setslice_inner(obj, start, end, w_other);
+        }
+        if list.strategy == ListStrategy::Float
+            && matches!(
+                other.strategy,
+                ListStrategy::Integer | ListStrategy::IntOrFloat
+            )
+            && float_to_int_or_float(list)
+        {
+            return w_list_setslice_inner(obj, start, end, w_other);
+        }
+        // listobject.py:2254 IntOrFloatListStrategy.setslice converts an
+        // Integer/Float donor to temporary signed-longlong storage without
+        // de-specialising the receiver.
+        if list.strategy == ListStrategy::IntOrFloat
+            && matches!(other.strategy, ListStrategy::Integer | ListStrategy::Float)
+        {
+            let converted: Option<Vec<i64>> = match other.strategy {
+                ListStrategy::Integer => other
+                    .int_items
+                    .as_slice()
+                    .iter()
+                    .map(|&value| int_or_float_encode_int(value))
+                    .collect(),
+                ListStrategy::Float => other
+                    .float_items
+                    .as_slice()
+                    .iter()
+                    .map(|&value| int_or_float_encode_float(value))
+                    .collect(),
+                _ => unreachable!(),
+            };
+            if let Some(converted) = converted {
+                let s = start.min(list.int_items.len());
+                let e = end.min(list.int_items.len());
+                list.int_items.splice(s, e - s, &converted);
+                return Ok(());
             }
         }
         // listobject.py:1752: not self.list_is_correct_type(w_other) and w_other.length() != 0
@@ -2224,6 +2583,23 @@ unsafe fn w_list_setslice_inner(
                     } else {
                         // RPython AbstractUnwrappedStrategy.setslice mutates
                         // the unerased typed storage directly.
+                        list.int_items.splice(s, e - s, new_items);
+                    }
+                    return Ok(());
+                }
+                ListStrategy::IntOrFloat => {
+                    let new_items = if list.strategy == other.strategy {
+                        other.int_items.as_slice()
+                    } else {
+                        &[]
+                    };
+                    let s = start.min(list.int_items.len());
+                    let e = end.min(list.int_items.len());
+                    if obj == w_other {
+                        let mut v = list.int_items.to_vec();
+                        v.splice(s..e, new_items.iter().copied());
+                        list.int_items.install(IntArray::from_vec(v));
+                    } else {
                         list.int_items.splice(s, e - s, new_items);
                     }
                     return Ok(());
@@ -2499,29 +2875,90 @@ mod tests {
     }
 
     #[test]
-    fn test_list_setitem_mixed_value_switches_to_object_strategy() {
+    fn test_list_setitem_mixed_value_switches_to_int_or_float_strategy() {
         let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
         let float = crate::floatobject::w_float_new(3.5);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             assert!(w_list_setitem(list, 0, float));
-            assert!(w_list_uses_object_storage(list));
+            assert!(w_list_uses_int_or_float_storage(list));
             let value = w_list_getitem(list, 0).unwrap();
             assert!(crate::pyobject::is_float(value));
         }
     }
 
     #[test]
-    fn test_list_append_mixed_value_switches_to_object_strategy() {
+    fn test_list_append_mixed_value_switches_to_int_or_float_strategy() {
         let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
         let float = crate::floatobject::w_float_new(3.5);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_append(list, float);
-            assert!(w_list_uses_object_storage(list));
+            assert!(w_list_uses_int_or_float_storage(list));
             assert_eq!(w_list_len(list), 3);
             let value = w_list_getitem(list, 2).unwrap();
             assert!(crate::pyobject::is_float(value));
+        }
+    }
+
+    #[test]
+    fn test_int_or_float_strategy_preserves_types_and_numeric_equality() {
+        let list = w_list_new(vec![
+            w_int_new(42),
+            crate::floatobject::w_float_new(42.0),
+            crate::floatobject::w_float_new(-0.0),
+        ]);
+        unsafe {
+            assert!(w_list_uses_int_or_float_storage(list));
+            let integer = w_list_getitem(list, 0).unwrap();
+            let float = w_list_getitem(list, 1).unwrap();
+            let negative_zero = w_list_getitem(list, 2).unwrap();
+            assert!(crate::pyobject::is_int(integer));
+            assert!(crate::pyobject::is_float(float));
+            assert_eq!(crate::intobject::w_int_get_value(integer), 42);
+            assert_eq!(crate::floatobject::w_float_get_value(float), 42.0);
+            assert!(crate::floatobject::w_float_get_value(negative_zero).is_sign_negative());
+
+            assert!(matches!(
+                w_list_find_or_count_fast(list, w_int_new(42), 0, 3, true),
+                ListFindFast::Count(2)
+            ));
+            assert!(matches!(
+                w_list_find_or_count_fast(list, crate::floatobject::w_float_new(0.0), 0, 3, false),
+                ListFindFast::Found(2)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_int_or_float_rejects_out_of_int32_range() {
+        let list = w_list_new(vec![w_int_new(i32::MAX as i64 + 1), w_int_new(1)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            w_list_append(list, crate::floatobject::w_float_new(2.5));
+            assert!(w_list_uses_object_storage(list));
+        }
+    }
+
+    #[test]
+    fn test_int_or_float_setslice_accepts_integer_and_float_strategies() {
+        let list = w_list_new(vec![w_int_new(1), crate::floatobject::w_float_new(4.0)]);
+        let integers = w_list_new(vec![w_int_new(2), w_int_new(3)]);
+        let floats = w_list_new(vec![crate::floatobject::w_float_new(2.5)]);
+        unsafe {
+            w_list_setslice(list, 1, 1, integers).unwrap();
+            assert!(w_list_uses_int_or_float_storage(list));
+            w_list_setslice(list, 1, 3, floats).unwrap();
+            assert!(w_list_uses_int_or_float_storage(list));
+            assert_eq!(w_list_len(list), 3);
+            assert_eq!(
+                crate::floatobject::w_float_get_value(w_list_getitem(list, 1).unwrap()),
+                2.5
+            );
+            assert_eq!(
+                crate::floatobject::w_float_get_value(w_list_getitem(list, 2).unwrap()),
+                4.0
+            );
         }
     }
 
@@ -2543,7 +2980,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_setitem_mixed_on_float_strategy_switches_to_object_strategy() {
+    fn test_list_setitem_mixed_on_float_strategy_switches_to_int_or_float_strategy() {
         let list = w_list_new(vec![
             crate::floatobject::w_float_new(1.0),
             crate::floatobject::w_float_new(2.0),
@@ -2551,14 +2988,14 @@ mod tests {
         unsafe {
             assert!(w_list_uses_float_storage(list));
             assert!(w_list_setitem(list, 0, w_int_new(7)));
-            assert!(w_list_uses_object_storage(list));
+            assert!(w_list_uses_int_or_float_storage(list));
             let value = w_list_getitem(list, 0).unwrap();
             assert!(crate::pyobject::is_int(value));
         }
     }
 
     #[test]
-    fn test_list_append_mixed_on_float_strategy_switches_to_object_strategy() {
+    fn test_list_append_mixed_on_float_strategy_switches_to_int_or_float_strategy() {
         let list = w_list_new(vec![
             crate::floatobject::w_float_new(1.0),
             crate::floatobject::w_float_new(2.0),
@@ -2566,7 +3003,7 @@ mod tests {
         unsafe {
             assert!(w_list_uses_float_storage(list));
             w_list_append(list, w_int_new(7));
-            assert!(w_list_uses_object_storage(list));
+            assert!(w_list_uses_int_or_float_storage(list));
             assert_eq!(w_list_len(list), 3);
             let value = w_list_getitem(list, 2).unwrap();
             assert!(crate::pyobject::is_int(value));
@@ -2637,14 +3074,14 @@ mod tests {
     }
 
     #[test]
-    fn test_int_list_insert_float_switches_to_object() {
+    fn test_int_list_insert_float_switches_to_int_or_float() {
         // AbstractUnwrappedStrategy.switch_to_next_strategy (listobject.py:1720)
         let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
         let fv = crate::floatobject::w_float_new(9.0);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_insert(list, 1, fv);
-            assert!(w_list_uses_object_storage(list));
+            assert!(w_list_uses_int_or_float_storage(list));
             assert_eq!(w_list_len(list), 3);
         }
     }

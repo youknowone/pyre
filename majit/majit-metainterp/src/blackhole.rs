@@ -1396,6 +1396,23 @@ impl BlackholeInterpreter {
             }
             if op == self.op_live {
                 crossed_trailing_live = true;
+                continue;
+            }
+            if !matches!(
+                op,
+                majit_translate::insns::BC_SETFIELD_VABLE_I
+                    | majit_translate::insns::BC_SETFIELD_VABLE_R
+                    | majit_translate::insns::BC_SETFIELD_VABLE_F
+                    | majit_translate::insns::BC_SETARRAYITEM_VABLE_I
+                    | majit_translate::insns::BC_SETARRAYITEM_VABLE_R
+                    | majit_translate::insns::BC_SETARRAYITEM_VABLE_F
+            ) {
+                // Only the codewriter's successor-block virtualizable mirror
+                // stores may separate the guard resume coordinate from the
+                // raising operation's trailing live marker.  Crossing an
+                // arbitrary operation would attach its exception to the next
+                // operation's handler and silently swallow it.
+                return None;
             }
         }
         None
@@ -4324,12 +4341,13 @@ mod tests {
         fn test_guard_exception_resume_finds_catch_after_successor_sync() {
             let mut asm = majit_translate::codewriter::assembler::Assembler::new();
             let mut b = JitCodeBuilder::default();
+            b.load_const_r_value(0, 1);
+            b.load_const_i_value(0, 2);
             let resume_pc = b.current_pos();
             b.live(&mut asm, &[], &[], &[]);
             // The normal-flow successor mirrors virtualizable state before
             // the can-raise block's trailing live/catch pair.
-            b.load_const_i_value(0, 1);
-            b.load_const_i_value(1, 2);
+            b.vable_setfield_int_with_base(0, 0, 0);
             b.live(&mut asm, &[], &[], &[]);
             let handler_lbl = b.new_label();
             b.catch_exception(handler_lbl);
@@ -4347,6 +4365,27 @@ mod tests {
 
             assert!(bh.handle_exception_in_frame(0xCAFE_F00D));
             assert_eq!(bh.position, handler_pc);
+        }
+
+        #[test]
+        fn test_guard_exception_resume_does_not_cross_another_operation() {
+            let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+            let mut b = JitCodeBuilder::default();
+            let resume_pc = b.current_pos();
+            b.live(&mut asm, &[], &[], &[]);
+            b.load_const_i_value(0, 1);
+            b.live(&mut asm, &[], &[], &[]);
+            let handler_lbl = b.new_label();
+            b.catch_exception(handler_lbl);
+            b.mark_label(handler_lbl);
+            b.int_return(0);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
+
+            assert!(!bh.handle_exception_in_frame(0xCAFE_F00D));
         }
 
         thread_local! {

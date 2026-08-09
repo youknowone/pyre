@@ -2215,9 +2215,9 @@ impl<'a> AssemblerARM64<'a> {
         // opref_to_slot stores ABSOLUTE jitframe slots (user position +
         // JITFRAME_FIXED_SIZE) so slot_offset(slot) gives the correct byte
         // offset without further adjustment.
-        for iarg in inputargs {
+        for (position, iarg) in inputargs.iter().enumerate() {
             self.opref_to_slot
-                .insert(iarg.opref(), JITFRAME_FIXED_SIZE + iarg.index as usize);
+                .insert(iarg.opref(), JITFRAME_FIXED_SIZE + position);
         }
         // Also sync any frame allocations from regalloc's FrameManager.
         for (&opref, lifetime) in ra.longevity.lifetimes_iter() {

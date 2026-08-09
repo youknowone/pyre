@@ -6254,6 +6254,7 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
             };
             if let Some(value) = w_filename.and_then(written) {
                 interp_exceptions::w_exception_set_written(exc, value);
+                interp_exceptions::w_exception_set_blocking_written_arg(exc);
             } else if let Some(fname) = w_filename {
                 interp_exceptions::w_exception_set_filename(exc, fname);
                 if let Some(f2) = args.get(4).copied().filter(|&f| !pyre_object::is_none(f)) {
@@ -13309,6 +13310,9 @@ pub(crate) fn sort_list_in_place(
             }
             if let Some((items, len)) = pyre_object::listobject::w_list_float_items_raw(list) {
                 sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
+                return Ok(());
+            }
+            if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
                 return Ok(());
             }
         }

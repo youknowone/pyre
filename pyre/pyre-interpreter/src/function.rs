@@ -520,19 +520,23 @@ pub(crate) fn function_new_impl(
         PY_NULL
     } else {
         let globals_backing = crate::type_methods::resolve_dict_backing(w_func_globals_obj);
-        let selected = unsafe { pyre_object::w_dict_getitem_str(globals_backing, "__builtins__") }
-            .unwrap_or_else(|| {
-                let exec_ctx = crate::call::take_last_exec_ctx();
-                if exec_ctx.is_null() {
-                    return PY_NULL;
-                }
-                let frame = unsafe { (*exec_ctx).gettopframe_raw() };
-                if frame.is_null() {
-                    unsafe { (*exec_ctx).get_builtin_dict() }
-                } else {
-                    unsafe { (*frame).fget_f_builtins() }
-                }
-            });
+        let selected = if globals_backing.is_null() {
+            None
+        } else {
+            unsafe { pyre_object::w_dict_getitem_str(globals_backing, "__builtins__") }
+        }
+        .unwrap_or_else(|| {
+            let exec_ctx = crate::call::take_last_exec_ctx();
+            if exec_ctx.is_null() {
+                return PY_NULL;
+            }
+            let frame = unsafe { (*exec_ctx).gettopframe_raw() };
+            if frame.is_null() {
+                unsafe { (*exec_ctx).get_builtin_dict() }
+            } else {
+                unsafe { (*frame).fget_f_builtins() }
+            }
+        });
         if !selected.is_null() && unsafe { pyre_object::is_module(selected) } {
             unsafe { pyre_object::w_module_get_w_dict(selected) }
         } else {

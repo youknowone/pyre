@@ -1229,8 +1229,15 @@ pub fn emit_promote_empty_list_inline(
             // capacity through `list.items` (list_items_descr), a path that
             // already resolves to the concrete block.
         }
-        pyre_object::listobject::ListStrategy::Empty => {
-            debug_assert_ne!(strategy, pyre_object::listobject::ListStrategy::Empty);
+        pyre_object::listobject::ListStrategy::Empty
+        | pyre_object::listobject::ListStrategy::IntOrFloat => {
+            // First append can only select Integer, Float, or Object;
+            // IntOrFloat is reached later by a numeric strategy transition.
+            debug_assert!(matches!(
+                strategy,
+                pyre_object::listobject::ListStrategy::Empty
+                    | pyre_object::listobject::ListStrategy::IntOrFloat
+            ));
         }
     }
 }

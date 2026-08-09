@@ -54,13 +54,28 @@ fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
         ));
     }
 
-    // `_PyType_PreHeaderSize(Py_TYPE(o))`: on 64-bit CPython a managed heap
-    // instance has a 16-byte GC header plus a 16-byte managed dict/weakref
-    // prefix (half those sizes on 32-bit). This unit covers heap instances and
-    // untracked str; tracked builtin types will extend the type-layout port.
-    let pre_header = crate::typedef::r#type(current())
-        .filter(|tp| unsafe { pyre_object::w_type_is_heaptype(tp.as_ptr()) })
-        .map_or(0u64, |_| (4 * std::mem::size_of::<usize>()) as u64);
+    // `_PyType_PreHeaderSize(Py_TYPE(o))` adds its two components
+    // independently: a two-word GC header for tracked objects, plus a two-word
+    // managed dict/weakref prefix where the instance type requests it.  A
+    // tracked builtin such as list has only the first; a normal heap instance
+    // has both; an untracked heap-derived value may have only the second.
+    let word = std::mem::size_of::<usize>() as u64;
+    let gc_header = if pyre_object::gc_hook::try_gc_owns_object(current() as *mut u8) {
+        2 * word
+    } else {
+        0
+    };
+    let managed_prefix = crate::typedef::r#type(current()).map_or(0, |tp| unsafe {
+        if pyre_object::w_type_is_heaptype(tp.as_ptr())
+            && (pyre_object::w_type_get_hasdict(tp.as_ptr())
+                || pyre_object::w_type_get_weakrefable(tp.as_ptr()))
+        {
+            2 * word
+        } else {
+            0
+        }
+    });
+    let pre_header = gc_header + managed_prefix;
     let total = (size as u64)
         .checked_add(pre_header)
         .expect("Py_ssize_t plus the fixed pre-header fits in size_t");

@@ -10284,7 +10284,7 @@ fn make_getset_property_full(
 /// Logical CPython 3.14 `tp_basicsize` / `tp_itemsize` values ported so far.
 /// These belong to the type object, not to its Python namespace: CPython's
 /// `type_members` exposes both through read-only data descriptors.
-fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
+pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
     if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
         return None;
     }
@@ -10341,7 +10341,10 @@ fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
         // subclasses append their declared slots to this prefix.
         (8 * word, 0)
     } else {
-        return None;
+        // CPython's ordinary fixed-size heap instance begins with
+        // PyObject_HEAD; user slots are appended below just like the
+        // specialized builtin prefixes above.
+        (2 * word, 0)
     };
     // PyPy typeobject.py:103-129 keeps the total slot count on Layout, whose
     // typedef identifies the fixed builtin prefix. CPython appends one pointer
@@ -10430,6 +10433,35 @@ fn init_type_type(ns: PyObjectRef) {
             ns,
             "__new__",
             make_new_descr(crate::builtins::type_descr_new),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                |args| {
+                    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+                    let word = std::mem::size_of::<usize>() as i64;
+                    let size = if pyre_object::w_type_is_heaptype(args[0]) {
+                        // CPython 3.14 typeobject.c:type___sizeof___impl:
+                        // PyHeapTypeObject plus the cached-keys table carried
+                        // by a managed instance dictionary.
+                        117 * word
+                            + if pyre_object::w_type_get_hasdict(args[0]) {
+                                96 * word
+                            } else {
+                                0
+                            }
+                    } else {
+                        52 * word
+                    };
+                    Ok(w_int_new(size))
+                },
+                1,
+                "($self, /)",
+            ),
         )
     };
     // `type[int]` builds a GenericAlias, but `type` carries no
@@ -19085,8 +19117,25 @@ fn init_object_type(ns: PyObjectRef) {
                         .unwrap_or((2 * std::mem::size_of::<usize>() as i64, 0));
                     let nitems = if itemsize == 0 {
                         0
-                    } else {
+                    } else if unsafe {
+                        pyre_object::is_bool(args[0])
+                            || pyre_object::is_int(args[0])
+                            || pyre_object::is_long(args[0])
+                    } {
                         int_cpython_digit_count(args[0])?
+                    } else if unsafe { pyre_object::is_tuple(args[0]) } {
+                        unsafe { pyre_object::w_tuple_len(args[0]) as i64 }
+                    } else if unsafe { pyre_object::is_bytes(args[0]) } {
+                        unsafe { pyre_object::w_bytes_len(args[0]) as i64 }
+                    } else if std::ptr::eq(
+                        unsafe { pyre_object::w_type_get_layout(w_type) },
+                        &pyre_object::memoryview::MEMORYVIEW_TYPE,
+                    ) {
+                        // PyMemoryViewObject's variable tail stores three
+                        // Py_ssize_t arrays (shape, strides, suboffsets).
+                        3 * unsafe { pyre_object::memoryview::w_memoryview_ndim(args[0]) }
+                    } else {
+                        0
                     };
                     Ok(w_int_new(basicsize + itemsize * nitems))
                 },

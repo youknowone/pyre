@@ -1016,6 +1016,21 @@ pub(crate) fn fbw_store_journal_rollback() {
                                     w_item,
                                 );
                             }
+                            pyre_object::listobject::ListStrategy::IntOrFloat => {
+                                pyre_object::listobject::w_list_int_or_float_set_len(
+                                    list,
+                                    length_before,
+                                );
+                                if !pyre_object::listobject::w_list_int_or_float_setitem(
+                                    list,
+                                    length_before - 1,
+                                    w_item,
+                                ) {
+                                    crate::trace::fbw_diag::bump(
+                                        crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
+                                    );
+                                }
+                            }
                             pyre_object::listobject::ListStrategy::Float
                             | pyre_object::listobject::ListStrategy::Empty => {
                                 crate::trace::fbw_diag::bump(
@@ -1048,6 +1063,12 @@ pub(crate) fn fbw_store_journal_rollback() {
                     }
                     pyre_object::listobject::ListStrategy::Integer => {
                         pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
+                    }
+                    pyre_object::listobject::ListStrategy::IntOrFloat => {
+                        pyre_object::listobject::w_list_int_or_float_set_len(
+                            list,
+                            length_before,
+                        );
                     }
                     // Float items are non-ptr f64 scalars (no stale GC ref to
                     // clear, unlike the Object slot), so rewinding the length

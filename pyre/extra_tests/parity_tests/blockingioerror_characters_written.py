@@ -26,4 +26,11 @@ plain.characters_written = 7
 assert plain.characters_written == 7
 del plain.characters_written
 
+generic = Exception()
+assert not hasattr(generic, "characters_written")
+generic.characters_written = 11
+assert generic.__dict__["characters_written"] == 11
+del generic.characters_written
+assert not hasattr(generic, "characters_written")
+
 print("OK")

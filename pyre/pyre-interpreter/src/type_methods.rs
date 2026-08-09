@@ -589,7 +589,10 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             pyre_object::gc_roots::pin_root(list);
             let items = pyre_object::w_set_items(other);
             pyre_object::gc_roots::pin_roots(&items);
-            pyre_object::listobject::w_list_resize_for_extend(list, items.len());
+            pyre_object::listobject::w_list_resize_for_extend(
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                items.len(),
+            );
             for index in 0..items.len() {
                 pyre_object::listobject::w_list_append_preallocated(
                     pyre_object::gc_roots::shadow_stack_get(root_base),

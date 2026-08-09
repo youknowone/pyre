@@ -436,21 +436,13 @@ pub fn exception_getclass(w_obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// True when `obj` is a `BlockingIOError` whose constructor took the numeric
-/// third argument as `characters_written` — recognised by `args_w[2]` still
-/// being an int (every other 2..=5-argument form trims `args_w` to two
-/// elements).  Suppresses `filename` derivation for that constructor argument
-/// even after the independent `written` slot is later deleted
-/// (`interp_exceptions.py` `_init_error`).
+/// third argument as `characters_written`.  The constructor records the
+/// successful `__index__` conversion independently from `args_w` because the
+/// original, possibly non-int indexable object remains in `args`, and from the
+/// writable/deletable `written` slot.  This suppresses `filename` even after
+/// the slot is deleted (`interp_exceptions.py` `_init_error`).
 fn exc_blocking_written(obj: PyObjectRef) -> bool {
-    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-    let n = unsafe { pyre_object::w_tuple_len(args) };
-    if n < 3 {
-        return false;
-    }
-    let Some(v) = (unsafe { pyre_object::w_tuple_getitem(args, 2) }) else {
-        return false;
-    };
-    if !unsafe { pyre_object::is_int(v) } {
+    if !unsafe { pyre_object::interp_exceptions::w_exception_get_blocking_written_arg(obj) } {
         return false;
     }
     let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") else {

@@ -4146,6 +4146,11 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
             Emit::Float(vals)
         }
         ListStrategy::Object => Emit::Object,
+        // The interpreter stores this as encoded signed-longlong values.
+        // The walker does not yet have an encoded numeric payload variant;
+        // leave construction to the ordinary residual instead of emitting an
+        // Integer array whose values would have the wrong representation.
+        ListStrategy::IntOrFloat => return Ok(None),
         // Empty is impossible here (len >= 1); decline defensively.
         ListStrategy::Empty => return Ok(None),
     };

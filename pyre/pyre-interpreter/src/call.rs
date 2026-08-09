@@ -5147,15 +5147,14 @@ pub unsafe fn create_all_slots(
         };
         // CPython 3.14 `type_new_slots`: a variable-sized base may add a
         // managed instance dict, but may not add weakrefs or any explicit
-        // `__slots__` entry.  These are the three variable layouts currently
-        // exposed by pyre's builtin type registry.
+        // `__slots__` entry.  Derive this from the same layout metadata which
+        // exposes `tp_itemsize`, so newly ported variable builtins cannot be
+        // omitted from type creation semantics.
         let base_has_variable_items = if base_layout.is_null() {
             false
         } else {
-            let typedef = (*base_layout).typedef;
-            std::ptr::eq(typedef, &pyre_object::INT_TYPE)
-                || std::ptr::eq(typedef, &pyre_object::TUPLE_TYPE)
-                || std::ptr::eq(typedef, &pyre_object::bytesobject::BYTES_TYPE)
+            crate::typedef::cpython_type_layout(w_bestbase)
+                .is_some_and(|(_, itemsize)| itemsize != 0)
         };
 
         // typeobject.py:1150-1204 create_all_slots

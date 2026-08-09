@@ -806,6 +806,62 @@ fn normalize_root_loop_entry_contract(
     Ok((inputargs, optimized_ops))
 }
 
+/// Backend handoff for compile.py:312
+/// `loop.inputargs = start_state.renamed_inputargs`.
+///
+/// RPython passes box objects, whose identity is independent of the runtime
+/// argument-vector position.  Pyre's backend wire format instead uses a dense
+/// InputArg payload for that position.  Rebind the renamed boxes and *every*
+/// use (ordinary args and guard failargs) together at this final boundary;
+/// renumbering only the input list makes the same RPython box appear as two
+/// different SSA values and reads an unrelated jitframe slot.
+fn densify_root_loop_inputargs(
+    args: &[OpRef],
+    ops: Vec<majit_ir::OpRc>,
+) -> (Vec<InputArg>, Vec<majit_ir::OpRc>) {
+    let mut replacements: indexmap::IndexMap<OpRef, majit_ir::InputArgRc> =
+        indexmap::IndexMap::new();
+    let inputargs = args
+        .iter()
+        .enumerate()
+        .map(|(position, &opref)| {
+            let tp = opref.ty().unwrap_or_else(|| {
+                panic!(
+                    "renamed inputarg {:?} has no intrinsic type \
+                     (history.py:220 Box.type invariant)",
+                    opref
+                )
+            });
+            let dense = std::rc::Rc::new(InputArg::from_type(tp, position as u32));
+            replacements.insert(opref, dense.clone());
+            InputArg::from_type(tp, position as u32)
+        })
+        .collect();
+
+    let remap = |operand: &majit_ir::operand::Operand| {
+        replacements
+            .get(&operand.to_opref())
+            .map(majit_ir::operand::Operand::from_bound_inputarg)
+            .unwrap_or_else(|| operand.clone())
+    };
+    let ops = ops
+        .into_iter()
+        .map(|op| {
+            let args = op
+                .getarglist()
+                .iter()
+                .map(&remap)
+                .collect::<smallvec::SmallVec<[_; 3]>>();
+            let cloned = std::rc::Rc::new(op.copy_and_change(op.opcode, Some(&args), None));
+            if let Some(failargs) = op.getfailargs() {
+                cloned.setfailargs(failargs.iter().map(&remap).collect());
+            }
+            cloned
+        })
+        .collect();
+    (inputargs, ops)
+}
+
 /// Slice T-final.F.0 survey probe.
 ///
 pub(crate) struct CompiledEntry<M> {
@@ -6318,11 +6374,11 @@ impl<M: Clone> MetaInterp<M> {
         // root inputarg types. RPython has no synthetic recovery when this
         // is absent; abort compilation so the caller falls back to the
         // interpreter instead of synthesizing Int-padded InputArgs.
-        let root_inputargs: Vec<InputArg> = if retried_without_unroll {
+        let renamed_root_args = if retried_without_unroll {
             // compile.py:233 compile_simple_loop: loop.inputargs is the
             // original trace inputargs. There is no ExportedState on the
             // simple path.
-            trace.inputargs_cloned()
+            None
         } else {
             match unroll_opt
                 .final_exported_state
@@ -6330,21 +6386,7 @@ impl<M: Clone> MetaInterp<M> {
                 .map(|es| es.renamed_inputargs.as_slice())
                 .filter(|args| args.len() == final_num_inputs)
             {
-                Some(args) => args
-                    .iter()
-                    .enumerate()
-                    .map(|(i, arg)| {
-                        let opref = *arg;
-                        let tp = opref.ty().unwrap_or_else(|| {
-                            panic!(
-                                "renamed inputarg {:?} has no intrinsic type \
-                                 (history.py:220 Box.type invariant)",
-                                opref
-                            )
-                        });
-                        InputArg::from_type(tp, i as u32)
-                    })
-                    .collect::<Vec<_>>(),
+                Some(args) => Some(args.to_vec()),
                 None => {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -6360,7 +6402,10 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
-        let mut optimized_ops = optimized_ops;
+        let (root_inputargs, mut optimized_ops) = match renamed_root_args {
+            Some(args) => densify_root_loop_inputargs(&args, optimized_ops),
+            None => (trace.inputargs_cloned(), optimized_ops),
+        };
         if retried_without_unroll
             && !optimized_ops
                 .first()
@@ -21322,6 +21367,47 @@ mod tests {
         let err =
             normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
         assert_eq!(err, (0, 2));
+    }
+
+    #[test]
+    fn test_root_inputargs_and_uses_are_densified_together() {
+        // TraceIterator freshens boxes into a disjoint namespace. The backend
+        // argument vector is positional, so its handoff must rewrite both the
+        // declarations and every use of those renamed boxes.
+        let renamed = vec![
+            OpRef::input_arg_ref(425),
+            OpRef::input_arg_int(596),
+            OpRef::input_arg_ref(614),
+        ];
+        let guard = std::rc::Rc::new(mk_op(
+            OpCode::GuardClass,
+            &[renamed[0], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
+            OpRef::NONE.raw(),
+        ));
+        guard.setfailargs(
+            [renamed[2]]
+                .into_iter()
+                .map(majit_ir::operand::Operand::bound_from_opref)
+                .collect(),
+        );
+        let (inputargs, ops) = densify_root_loop_inputargs(&renamed, vec![guard]);
+        assert_eq!(
+            inputargs.iter().map(InputArg::opref).collect::<Vec<_>>(),
+            vec![
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_ref(2),
+            ]
+        );
+        assert_eq!(
+            inputargs.iter().map(|arg| arg.tp).collect::<Vec<_>>(),
+            vec![Type::Ref, Type::Int, Type::Ref]
+        );
+        assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(0));
+        assert_eq!(
+            ops[0].getfailargs().unwrap()[0].to_opref(),
+            OpRef::input_arg_ref(2)
+        );
     }
 
     #[test]

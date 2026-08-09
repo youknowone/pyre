@@ -387,6 +387,11 @@ pub struct W_BaseException {
     /// A numeric third argument on an exact BlockingIOError stamps it; later
     /// descriptor writes and deletes mutate this slot without changing args.
     pub written: i64,
+    /// Whether the exact BlockingIOError constructor successfully interpreted
+    /// its third argument through `__index__` as `characters_written`.  This
+    /// is constructor shape, independent of later writes/deletion of
+    /// `written`; CPython continues to suppress `filename` after deletion.
+    pub blocking_written_arg: bool,
     /// `interp_exceptions.py:990 W_SystemExit.w_code` /
     /// `:1006 readwrite_attrproperty_w('w_code', W_SystemExit)`.
     /// `PY_NULL` is the class default `None`; the `code` getattr arm
@@ -706,6 +711,7 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         w_filename2: PY_NULL,
         // `interp_exceptions.py:528` W_OSError class default.
         written: -1,
+        blocking_written_arg: false,
         // `interp_exceptions.py:990` W_SystemExit class default
         // `w_code = None`.
         w_code: PY_NULL,
@@ -1388,6 +1394,16 @@ pub unsafe fn w_exception_get_written(obj: PyObjectRef) -> i64 {
 #[inline]
 pub unsafe fn w_exception_set_written(obj: PyObjectRef, value: i64) {
     unsafe { (*(obj as *mut W_BaseException)).written = value };
+}
+
+#[inline]
+pub unsafe fn w_exception_get_blocking_written_arg(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const W_BaseException)).blocking_written_arg }
+}
+
+#[inline]
+pub unsafe fn w_exception_set_blocking_written_arg(obj: PyObjectRef) {
+    unsafe { (*(obj as *mut W_BaseException)).blocking_written_arg = true };
 }
 
 /// `interp_exceptions.py:1006 readwrite_attrproperty_w('w_code', ...)`

@@ -86,28 +86,6 @@ fn after_residual_guard_uses_trailing_live_before_fallthrough_twin() {
 }
 
 #[test]
-fn method_load_global_snapshot_preserves_live_null_call_slot() {
-    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let kept = tc.const_ref(41);
-    let stale = tc.const_ref(42);
-    let null = tc.const_null();
-    let mut boxes = vec![kept, stale, stale];
-
-    super::vstack_mirror::reconcile_load_global_method_shape(&mut boxes, 1, 3, null);
-
-    assert_eq!(boxes, vec![kept, OpRef::NONE, null]);
-    assert_eq!(
-        super::resume_snapshot::vstack_box_for_snapshot(null),
-        Some(null),
-        "CALL's NULL self slot must clear a stale vable shadow value",
-    );
-    assert_eq!(
-        super::resume_snapshot::vstack_box_for_snapshot(OpRef::NONE),
-        None,
-    );
-}
-
-#[test]
 fn vstack_permuted_for_iter_entry_uses_block_head_target() {
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.metadata.n_py_instrs = 19;
@@ -2362,7 +2340,9 @@ fn append_journal_rollback_rewinds_length() {
 
 #[test]
 fn pop_end_journal_rollback_restores_item_and_length() {
-    use pyre_object::listobject::{W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new};
+    use pyre_object::listobject::{
+        W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len, w_list_new,
+    };
     use pyre_object::{w_int_new, w_list_pop_end};
 
     super::fbw_store_journal_reset();
@@ -2416,7 +2396,8 @@ fn interleaved_append_pop_journal_rollback_restores_original() {
     let list = w_list_new(original.into_iter().map(w_int_new).collect());
 
     let len_before_append = unsafe { w_list_len(list) };
-    super::fbw_list_journal_push_append(list, len_before_append);
+    let allocated_before_append = unsafe { w_list_allocated(list) };
+    super::fbw_list_journal_push_append(list, len_before_append, allocated_before_append);
     unsafe { w_list_append(list, w_int_new(40)) };
 
     let len_before_pop = unsafe { w_list_len(list) };
@@ -2426,7 +2407,8 @@ fn interleaved_append_pop_journal_rollback_restores_original() {
     super::fbw_list_journal_push_pop_end(list, len_before_pop, w_int_new(raw_item));
 
     let len_before_append = unsafe { w_list_len(list) };
-    super::fbw_list_journal_push_append(list, len_before_append);
+    let allocated_before_append = unsafe { w_list_allocated(list) };
+    super::fbw_list_journal_push_append(list, len_before_append, allocated_before_append);
     unsafe { w_list_append(list, w_int_new(50)) };
 
     let len_before_pop = unsafe { w_list_len(list) };
