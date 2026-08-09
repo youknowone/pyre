@@ -160,6 +160,22 @@ pub extern "C" fn jit_dict_value_at(dict: i64, index: i64, key: i64, hash: i64) 
     }
 }
 
+/// Force a frame's `f_backref` vref word to the concrete frame behind it —
+/// the callee of the residual `jit_force_virtual` the constant-depth
+/// `sys._getframe` fold emits per hop (`pyjitpl.py:2153-2172
+/// _do_jit_force_virtual`).
+///
+/// `executioncontext::force_vref` cannot be the callee directly:
+/// `fn(*mut PyFrame) -> *mut PyFrame` is `(i32) -> i32` on wasm32 while the
+/// residual-call ABI is uniformly `(i64×n) -> i64`
+/// (`majit-backend-wasm/src/codegen.rs residual_call_i64_arity`), so the direct
+/// `call_indirect` traps with an indirect call type mismatch.  Word-width
+/// agreement on 64-bit targets makes that difference invisible there.
+pub extern "C" fn jit_force_vref(frame: i64) -> i64 {
+    pyre_interpreter::executioncontext::force_vref(frame as usize as *mut pyre_interpreter::PyFrame)
+        as usize as i64
+}
+
 pub extern "C" fn jit_dict_exact_unicode_lookup_or_null(dict: i64, key: i64) -> i64 {
     unsafe {
         jit_dict_exact_lookup_or_null(

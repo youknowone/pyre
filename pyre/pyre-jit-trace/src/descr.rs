@@ -3252,6 +3252,27 @@ pub fn pycode_co_firstlineno_descr() -> DescrRef {
     PYCODE_CO_FIRSTLINENO_FIELD_DESCR.clone() as DescrRef
 }
 
+/// `PyCode.hidden_applevel` — the frame-hidden flag read by
+/// `PyFrame.hide()`.
+static PYCODE_HIDDEN_APPLEVEL_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
+    Arc::new(PyreFieldDescr {
+        offset: pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
+        field_size: std::mem::size_of::<bool>(),
+        field_type: Type::Int,
+        signed: false,
+        immutable: false,
+        quasi_immutable: false,
+        name: "hidden_applevel",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
+});
+
+pub fn pycode_hidden_applevel_descr() -> DescrRef {
+    PYCODE_HIDDEN_APPLEVEL_FIELD_DESCR.clone() as DescrRef
+}
+
 /// Size descriptor for W_IntObject allocation via NewWithVtable.
 /// vtable = &INT_TYPE (ob_type for virtual materialization).
 pub fn w_int_size_descr() -> DescrRef {

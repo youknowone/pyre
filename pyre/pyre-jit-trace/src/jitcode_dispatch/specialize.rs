@@ -7705,8 +7705,22 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// declines 100% of the time); `getfield_gc_r(frame, execution_context)` +
 /// `getfield_gc_r(ec, topframeref)` + `ptr_eq` + `guard_true`, the port of
 /// `_do_jit_force_virtual`'s identity check; and one non-forcing void `Call`
-/// for `mark_as_escaped`.  The result IS `standard_virtualizable_box()`,
-/// exactly as `_do_jit_force_virtual` returns `standard_box`.
+/// for `mark_as_escaped`.  At depth 0 the result IS
+/// `standard_virtualizable_box()`, exactly as `_do_jit_force_virtual` returns
+/// `standard_box`.
+///
+/// For constant depth >= 1, the same top-frame proof seeds the walk, then each
+/// hop emits the `ExecutionContext.getnextframe_nohidden(frame)` body shape:
+/// raw `frame.f_backref` read, the residual `OS_JIT_FORCE_VIRTUAL`
+/// `CallMayForceR(jit_force_vref, raw)` bracketed by FORCE_TOKEN/SETFIELD_GC and
+/// `GuardNotForced`, `GuardNonnull` for the "call stack is not deep enough"
+/// arm, then `frame.hide()` as `frame.pycode.hidden_applevel` with a
+/// `GuardFalse`.  The residual force stays in the trace: `pyjitpl.py:2153-2172
+/// _do_jit_force_virtual` returns `None` for a known non-standard
+/// virtualizable, and that `None` result is precisely the caller's signal to
+/// emit the residual `jit_force_virtual` call.  `optimize_jit_force_virtual`
+/// only elides it later for a trace Virtual, matching upstream and giving the
+/// cheap per-hop cost instead of the full `_getframe` residual.
 ///
 /// The guard reads `topframeref` raw, without the vref force or the
 /// hidden-frame walk `gettopframe_nohidden` performs, so the gate below
@@ -7717,14 +7731,18 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 ///
 /// Returns `None` (fall through to the generic residual, SAFE — exactly
 /// today's behaviour) for every other shape: a rebound `sys._getframe`, a
-/// bound receiver, a non-int / inexact / non-constant depth, any depth other
-/// than 0, an inline sub-walk, and a walk with no standard virtualizable.
+/// bound receiver, a negative / non-int / inexact / non-constant depth, an
+/// inline sub-walk, a walk with no standard virtualizable, armed audit hooks,
+/// a `topframeref` / `gettopframe_nohidden()` mismatch with the portal frame,
+/// a hop whose forced `f_backref` is null, or a hop whose result is hidden.
+/// Declines after emission rewind to the pre-specialization trace position and
+/// reset the heap cache before falling through.
 ///
-/// ⛔ Depth 0 at the TOP walk level is the only level this may take. Inside an
-/// inline sub-walk depth 0 names the callee's virtual frame, whose
+/// ⛔ The TOP walk level is the only level this may take, at any depth. Inside
+/// an inline sub-walk depth 0 names the callee's virtual frame, whose
 /// `last_instr` is still the `-1` its constructor wrote and which nothing
 /// updates through the inlined body (`jitcode_dispatch/mod.rs` says so in the
-/// tree); depth > 0 names a frame the walk holds no OpRef for at all.  The
+/// tree); depth > 0 would start the hop chain from that same frame.  The
 /// sub-walk gate is what makes "depth 0 == the portal" true rather than
 /// assumed.
 pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
@@ -7752,10 +7770,10 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    // The depth has to be an exact plain int holding 0 before anything is
+    // The depth has to be an exact plain non-negative int before anything is
     // emitted; the guards below pin both facts for the compiled loop.
     let exact_int_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    let depth_arg = if r_args.len() == 3 {
+    let (depth_arg, depth_value) = if r_args.len() == 3 {
         let ConcreteValue::Ref(depth_obj) = arg_concretes[2] else {
             return Ok(None);
         };
@@ -7764,13 +7782,16 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
                 !std::ptr::eq((*depth_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
                     || !std::ptr::eq((*depth_obj).w_class, exact_int_class)
             }
-            || unsafe { pyre_object::w_int_get_value(depth_obj) } != 0
         {
             return Ok(None);
         }
-        Some(r_args[2])
+        let depth = unsafe { pyre_object::w_int_get_value(depth_obj) };
+        if depth < 0 {
+            return Ok(None);
+        }
+        (Some(r_args[2]), depth)
     } else {
-        None
+        (None, 0)
     };
     // `virtualizable_boxes` describe the PORTAL frame only.  An inline sub-walk
     // publishes a different concrete frame, so depth 0 there names the callee —
@@ -7842,7 +7863,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             crate::descr::int_intval_descr(),
         );
         ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Int(0));
+            .set_opref_concrete(raw, majit_ir::Value::Int(depth_value));
         if !raw.is_constant() {
             ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
@@ -7877,6 +7898,100 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(is_standard, majit_ir::Value::Int(1));
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[is_standard])?;
+
+    let mut cur_op = vable_op;
+    let mut cur_ptr = frame;
+    for _ in 0..depth_value {
+        let raw_op = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            cur_op,
+            crate::descr::pyframe_f_backref_descr(),
+        );
+        let raw_ptr = unsafe { (*cur_ptr).f_backref };
+        ctx.trace_ctx.set_opref_concrete(
+            raw_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(raw_ptr as usize)),
+        );
+
+        let next_ptr = pyre_interpreter::executioncontext::force_vref(raw_ptr);
+        if next_ptr.is_null() || unsafe { (*next_ptr).hide() } {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+
+        maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+        let force_fn = crate::helpers::jit_force_vref as *const ();
+        let next_op = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallMayForceR,
+            force_fn,
+            &[raw_op],
+            &[majit_ir::Type::Ref],
+            majit_ir::Type::Ref,
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+                majit_ir::OopSpecIndex::JitForceVirtual,
+            ),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            next_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(next_ptr as usize)),
+        );
+        // `pyjitpl.py:2163-2165` short-circuits a known non-standard
+        // virtualizable to `None`; the caller turns that into this residual
+        // `jit_force_virtual` call, so the ptr_eq/guard_value half is not
+        // emitted for hop results.
+        ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[next_op])?;
+
+        let code_op = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            next_op,
+            crate::descr::pyframe_code_descr(),
+        );
+        let code_ptr = unsafe { (*next_ptr).pycode };
+        ctx.trace_ctx.set_opref_concrete(
+            code_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(code_ptr as usize)),
+        );
+        // `optimizer.py:464-480` reaches for `descr.get_parent_descr()` only
+        // when arg0 carries no pointer info yet; a preceding `GUARD_CLASS`
+        // gives it `info.InstancePtrInfo()` and that lookup never runs.  The
+        // code descrs are deliberately standalone rather than a positional
+        // group (see `descr.rs` on `PYCODE_CODE_PTR_FIELD_DESCR`: a `PyCode` is
+        // never allocated from a trace, and a partial layout under the live
+        // `W_CODE_GC_TYPE_ID` would double-answer the collector's registry), so
+        // their weak `parent_descr` is `None` by design and the guard is what
+        // makes this read legal — the same order the code-field arm of
+        // [`try_walker_specialize_traceback_walk`] uses.
+        let code_type_addr = &pyre_interpreter::pycode::CODE_TYPE as *const _ as i64;
+        if code_ptr.is_null()
+            || unsafe {
+                !std::ptr::eq(
+                    (*code_ptr.cast::<pyre_object::PyObject>()).ob_type,
+                    &pyre_interpreter::pycode::CODE_TYPE,
+                )
+            }
+        {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        walker_guard_class(ctx, op.pc, code_op, code_type_addr)?;
+        let hidden_op = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            code_op,
+            crate::descr::pycode_hidden_applevel_descr(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(hidden_op, majit_ir::Value::Int(0));
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardFalse, &[hidden_op])?;
+
+        cur_op = next_op;
+        cur_ptr = next_ptr;
+    }
+
     // `f.mark_as_escaped()` — vm.py:54.  `escaped` is not one of the six fields
     // `interp_jit.py:25-30` declares, so the store cannot force; it is
     // load-bearing at `executioncontext.py:99-106 leave`, which forces the
@@ -7885,8 +8000,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // read/or/store the `tb_frame` fold above already uses — an opaque call
     // would hide the update from the optimizer and its heap cache.
     let flags_descr = crate::descr::pyframe_flags_descr();
-    let live_flags =
-        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, vable_op, flags_descr.clone());
+    let live_flags = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, cur_op, flags_descr.clone());
     let escaped_bit = ctx
         .trace_ctx
         .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_ESCAPED));
@@ -7895,22 +8009,24 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
-        &[vable_op, new_flags],
+        &[cur_op, new_flags],
         flags_descr.clone(),
     );
     ctx.trace_ctx
-        .heapcache_setfield_cached(vable_op, flags_descr.index(), new_flags);
+        .heapcache_setfield_cached(cur_op, flags_descr.index(), new_flags);
     // The walk IS the interpreter running, so the recorded store has to take
     // effect here too — the residual would have applied it before returning.
-    unsafe { (*frame).mark_as_escaped() };
+    unsafe { (*cur_ptr).mark_as_escaped() };
 
     // `audit(space, "sys._getframe", [f])` — vm.py:51.  The gate above resolved
     // it to the no-hook early-out, so all that is emitted is the marker for the
     // read that reached that conclusion.
     walker_pin_audit_hooks(ctx, op.pc, audit_holder)?;
 
-    // `return f` — `_do_jit_force_virtual` hands back `standard_box` itself.
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', vable_op)?;
+    // `return f` — at depth 0 `cur_op` is still the standard virtualizable
+    // `_do_jit_force_virtual` hands back as `standard_box`; each hop above
+    // advanced it to the frame the walk settled on.
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', cur_op)?;
     Ok(Some(()))
 }
 
