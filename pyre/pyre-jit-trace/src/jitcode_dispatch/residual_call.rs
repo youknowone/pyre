@@ -1359,8 +1359,16 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
             // A declined full flush still escaped the virtualizable, so the
             // locals region is written anyway (`virtualizable.py:101-138
             // write_boxes` has no decline) — otherwise the callee reads an
-            // array of nulls.  That write claims no resume pc, and the undo
-            // stays armed so the legacy replay re-enters the pre-flush frame.
+            // array of nulls.  That write claims no resume pc, and NOTHING
+            // restores the pre-flush frame from here: the committed-pc
+            // walk-end leg is gated on a pc this arm never sets and the
+            // deferred leg on a flag it never arms, so the capture simply
+            // sits until [`capture_escape_flush_undo`] supersedes it or the
+            // walk-start reset drops it.  The deferred arm this arm used to
+            // carry was withdrawn once the `value-stack underflow` it was
+            // added for stopped reproducing on artefacts that pass
+            // `PYRE_LLBC_STRICT=1` — 0/10 on cranelift without it, with the
+            // whole synthetic suite and every recorded counter unmoved.
             //
             // Upstream reports the escape from the vable token state alone,
             // independent of any resume-image write.  See
