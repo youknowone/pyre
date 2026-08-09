@@ -9301,37 +9301,44 @@ fn guarded_branch_core<Sym: WalkSym>(
                     kept_stack_has_boxed_int_hazard(f, other_target, ctx.concrete_registers_r)
                 });
             // Hazard (4): a VALID mirror holds a kept operand-stack slot as
-            // the NULL `ConstPtr`, and the not-taken edge decodes no
-            // `ref_copy` trampoline.  Hazards (1)-(3) admit an uncovered
-            // slot on the premise that it is an edge-materialized merge temp
-            // whose value `resolved_recovered` supplies; with no moves
-            // decoded there is no such source, and a NULL `ConstPtr` is the
-            // one uncovered state with no fallback either — the encoding is
-            // both a genuine null operand and what an unset vable shadow
-            // slot decodes to, so nothing downstream can tell the snapshot
-            // which it is.  The resume then rebuilds a kept slot NULL, and
-            // when the arm's pending CALL binds that null `match_signature`
-            // renders it as a missing positional parameter:
-            // `re/_parser.py` `_parse_sub` evaluates
-            // `not nested and not items` inside `_parse`'s argument list, so
-            // both calls' `PUSH_NULL` slots are kept across the
-            // short-circuit guard and `nested + 1` arrives NULL.  This is
-            // strictly narrower than "the mirror does not cover": a mirror
-            // shorter than the resume depth, and a `NONE` hole, both still
-            // resume through the shadow and must keep compiling — declining
-            // for those instead loses every bridge in
-            // `bench/synth/attr_cache_invalidation` and turns its 1002 guard
-            // failures into 4 million.  `bhimpl_goto_if_not` has no
+            // the NULL `ConstPtr` and the not-taken edge recovers no value
+            // for that slot.  Hazards (1)-(3) admit an uncovered slot on the
+            // premise that it is an edge-materialized merge temp whose value
+            // `resolved_recovered` supplies; a NULL `ConstPtr` is the one
+            // uncovered state the snapshot's own mirror arm drops outright
+            // (`collect_outer_active_boxes` takes a mirror box only when it
+            // is neither `NONE` nor the NULL `ConstPtr`), so with no move
+            // naming that slot it has no source at all and the resume rebuilds
+            // the whole not-taken arm from the merge-color file.  What arrives
+            // wrong there is not the sentinel: `re/_parser.py` `_parse_sub`
+            // evaluates `not nested and not items` inside `_parse`'s argument
+            // list, so both calls' `PUSH_NULL` slots are kept across the
+            // short-circuit guard and `nested + 1` — an ordinary argument on
+            // the same kept stack — resumes NULL, which `match_signature`
+            // then reports as a missing positional parameter.  The NULL slots
+            // are the shape's signature, and declining on them is what keeps
+            // the decline narrow: a mirror shorter than the resume depth, and
+            // a `NONE` hole, both still resume through the shadow and must
+            // keep compiling — declining for those instead loses every bridge
+            // in `bench/synth/attr_cache_invalidation` and turns its 1002
+            // guard failures into 4 million.  `bhimpl_goto_if_not` has no
             // analogue: `consume_boxes` (resume.py) restores every register
             // bank by color, which is why suppressing bridge recording
             // (`MAJIT_NO_BRIDGE`) makes the same guard correct.
+            //
+            // The recovery test is per slot: a trampoline that renames some
+            // other slot says nothing about this one.  An edge whose moves
+            // could not be decoded at all (`resolved_recovered` is `None`)
+            // recovers nothing by definition, so it declines.
             let kept_null_const_slot = ctx.vstack_valid
                 && gate_frame.as_ref().is_some_and(|f| {
-                    kept_stack_has_null_const_slot(f, other_target, &ctx.vstack_boxes)
-                })
-                && resolved_recovered
-                    .as_deref()
-                    .is_none_or(|moves| moves.is_empty());
+                    kept_stack_has_unrecovered_null_const_slot(
+                        f,
+                        other_target,
+                        &ctx.vstack_boxes,
+                        resolved_recovered.as_deref().unwrap_or(&[]),
+                    )
+                });
             // A not-taken arm resuming at an exception-handler-protected
             // PC carries the kept exception operand (`PUSH_EXC_INFO`'s
             // Ref) on its operand stack; the handler-entry mirror reseed
