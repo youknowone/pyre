@@ -4855,7 +4855,7 @@ fn find_jump_target_label_index(ops: &[Op], jump: &Op) -> Option<usize> {
     })
 }
 
-fn find_loop_label_index(ops: &[Op]) -> Option<usize> {
+pub(crate) fn find_loop_label_index(ops: &[Op]) -> Option<usize> {
     match ops.iter().rev().find(|op| op.opcode == OpCode::Jump) {
         // x86/assembler.py:2463 `if target_token in
         // self.target_tokens_currently_compiling` — the TOKEN decides. A JUMP
