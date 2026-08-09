@@ -874,7 +874,7 @@
       "dynasm": "TIMEOUT"
     },
     "test.test_print": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_profile": {
       "dynasm": "IMPORTERROR"
