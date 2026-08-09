@@ -528,6 +528,9 @@ pub fn new_instance_with_extra(
     };
     pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // The tuple constructor can collect; the pin at `cls_slot` makes this
+    // post-allocation address current.
+    let rooted_cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     if !unsafe { pyre_object::w_type_get_hasdict(rooted_cls) } {
         unsafe {
             (*pyre_object::gc_roots::shadow_stack_get(obj_slot)).w_class = rooted_cls;
