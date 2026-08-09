@@ -2628,6 +2628,101 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
     }
 }
 
+/// `pypy/interpreter/gateway.py:1328-1332 GatewayCache.build` parity — attach
+/// the text signature after constructing the builtin function. The spellings
+/// are CPython 3.14's public `builtins` signatures, which take precedence when
+/// PyPy 3.11's generated signature differs.
+fn install_builtin_text_signatures(ns: PyObjectRef) {
+    const SIGNATURES: &[(&str, &str)] = &[
+        (
+            "__import__",
+            "($module, /, name, globals=None, locals=None, fromlist=(),\n           level=0)",
+        ),
+        ("abs", "($module, x, /)"),
+        ("aiter", "($module, async_iterable, /)"),
+        ("all", "($module, iterable, /)"),
+        (
+            "anext",
+            "($module, aiterator, default=<unrepresentable>, /)",
+        ),
+        ("any", "($module, iterable, /)"),
+        ("ascii", "($module, obj, /)"),
+        ("bin", "($module, number, /)"),
+        ("breakpoint", "($module, /, *args, **kws)"),
+        ("callable", "($module, obj, /)"),
+        ("chr", "($module, i, /)"),
+        (
+            "compile",
+            "($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, _feature_version=-1)",
+        ),
+        ("delattr", "($module, obj, name, /)"),
+        ("divmod", "($module, x, y, /)"),
+        ("eval", "($module, source, /, globals=None, locals=None)"),
+        (
+            "exec",
+            "($module, source, /, globals=None, locals=None, *, closure=None)",
+        ),
+        ("format", "($module, value, format_spec='', /)"),
+        ("globals", "($module, /)"),
+        ("hasattr", "($module, obj, name, /)"),
+        ("hash", "($module, obj, /)"),
+        ("hex", "($module, number, /)"),
+        ("id", "($module, obj, /)"),
+        ("input", "($module, prompt='', /)"),
+        ("isinstance", "($module, obj, class_or_tuple, /)"),
+        ("issubclass", "($module, cls, class_or_tuple, /)"),
+        ("len", "($module, obj, /)"),
+        ("locals", "($module, /)"),
+        ("oct", "($module, number, /)"),
+        (
+            "open",
+            "($module, /, file, mode='r', buffering=-1, encoding=None,\n     errors=None, newline=None, closefd=True, opener=None)",
+        ),
+        ("ord", "($module, character, /)"),
+        ("pow", "($module, /, base, exp, mod=None)"),
+        (
+            "print",
+            "($module, /, *args, sep=' ', end='\\n', file=None, flush=False)",
+        ),
+        ("repr", "($module, obj, /)"),
+        ("round", "($module, /, number, ndigits=None)"),
+        ("setattr", "($module, obj, name, value, /)"),
+        (
+            "sorted",
+            "($module, iterable, /, *, key=None, reverse=False)",
+        ),
+        ("sum", "($module, iterable, /, start=0)"),
+    ];
+
+    for &(name, signature) in SIGNATURES {
+        let function = crate::module_ns_get(ns, name)
+            .unwrap_or_else(|| panic!("missing builtin function {name}"));
+        unsafe {
+            crate::function::fset_func_text_signature(function, w_str_new(signature));
+        }
+    }
+
+    // CPython's getset descriptor exposes a real `None` for builtins whose
+    // signatures Argument Clinic cannot represent. Pyre's `PY_NULL` means
+    // the attribute is absent, so preserve this distinction explicitly.
+    for name in [
+        "__build_class__",
+        "dir",
+        "getattr",
+        "iter",
+        "max",
+        "min",
+        "next",
+        "vars",
+    ] {
+        let function = crate::module_ns_get(ns, name)
+            .unwrap_or_else(|| panic!("missing builtin function {name}"));
+        unsafe {
+            crate::function::fset_func_text_signature(function, w_none());
+        }
+    }
+}
+
 pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "print", || {
         make_module_builtin_function("print", builtin_print)
@@ -3503,6 +3598,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(ns, "classmethod", || {
         crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE)
     });
+    install_builtin_text_signatures(ns);
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:60-69
