@@ -99,6 +99,31 @@ class MarshalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             marshal.dumps([orig], allow_code=False)
 
+    def test_argument_binding(self):
+        data = marshal.dumps([1, 2, 3])
+
+        # `version` is positional-only: it binds positionally but rejects the
+        # keyword form.
+        self.assertEqual(marshal.loads(marshal.dumps([1, 2, 3], 2)), [1, 2, 3])
+        with self.assertRaises(TypeError):
+            marshal.dumps([1], version=2)
+        # a non-integer version reaches int() and raises.
+        with self.assertRaises(TypeError):
+            marshal.dumps([1], None)
+
+        # `bytes` / `file` are positional-only too.
+        with self.assertRaises(TypeError):
+            marshal.loads(bytes=data)
+
+        # `allow_code` is keyword-only and truth-tested, so a falsy value
+        # (including None) rejects a nested code object.
+        code = compile("1 + 1", "", "eval")
+        dumped_code = marshal.dumps([code])
+        with self.assertRaises(ValueError):
+            marshal.dumps([code], allow_code=None)
+        with self.assertRaises(ValueError):
+            marshal.loads(dumped_code, allow_code=False)
+
 
 if __name__ == "__main__":
     unittest.main()

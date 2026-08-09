@@ -401,20 +401,55 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 }
 
-fn parse_version(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> Result<i32, PyError> {
-    let value =
-        crate::builtins::kwarg_get(kwargs, "version").or_else(|| positional.get(1).copied());
-    match value {
+/// Resolve the optional `version` slot: an omitted slot uses the current
+/// format version; an explicit value goes through `int_w`, so a `None`
+/// raises `TypeError` like any other non-integer.
+fn resolve_version(version: Option<PyObjectRef>) -> Result<i32, PyError> {
+    match version {
         Some(value) => Ok(crate::baseobjspace::int_w(value)? as i32),
         None => Ok(wire::FORMAT_VERSION as i32),
     }
 }
 
-fn parse_allow_code(kwargs: Option<PyObjectRef>) -> Result<bool, PyError> {
-    match crate::builtins::kwarg_get(kwargs, "allow_code") {
+/// Resolve the keyword-only `allow_code` slot by truth-testing; an omitted
+/// slot defaults to true.
+fn resolve_allow_code(allow_code: Option<PyObjectRef>) -> Result<bool, PyError> {
+    match allow_code {
         Some(value) => crate::baseobjspace::is_true(value),
         None => Ok(true),
     }
+}
+
+/// Serialize one object to a marshal byte stream at `version`.  With
+/// `allow_code` false, a nested code object is rejected before writing
+/// (marshal.check_no_code).
+fn marshal_to_bytes(
+    value: PyObjectRef,
+    version: i32,
+    allow_code: bool,
+) -> Result<Vec<u8>, PyError> {
+    if !allow_code {
+        reject_code(value)?;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(value);
+    let mut out = Vec::new();
+    let mut refs = (version >= 3).then(WriterRefs::new);
+    write_object(&mut out, value, &mut refs, version, MAX_DEPTH)?;
+    Ok(out)
+}
+
+/// Deserialize one object from a marshal byte stream.  With `allow_code`
+/// false, a decoded code object is rejected (marshal.check_no_code).
+fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut reader: &[u8] = data;
+    let result = wire::deserialize_value(&mut reader, PyreMarshalBag).map_err(marshal_error)?;
+    let result = result.get();
+    if !allow_code {
+        reject_code(result)?;
+    }
+    Ok(result)
 }
 
 /// RustPython `marshal.check_no_code`, matching CPython's recursive
@@ -466,61 +501,11 @@ fn reject_code(value: PyObjectRef) -> Result<(), PyError> {
     }
 }
 
-fn dumps_impl(args: &[PyObjectRef]) -> PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(kwargs, &["version", "allow_code"], "dumps")?;
-    let Some(&value) = positional.first() else {
-        return Err(PyError::type_error(
-            "dumps() missing required argument 'value'",
-        ));
-    };
-    if positional.len() > 2 {
-        return Err(PyError::type_error("dumps() takes at most 2 arguments"));
-    }
-    let version = parse_version(positional, kwargs)?;
-    let allow_code = parse_allow_code(kwargs)?;
-    if !allow_code {
-        reject_code(value)?;
-    }
-    let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(value);
-    let mut out = Vec::new();
-    let mut refs = (version >= 3).then(WriterRefs::new);
-    write_object(&mut out, value, &mut refs, version, MAX_DEPTH)?;
-    Ok(bytesobject::w_bytes_from_bytes(&out))
-}
-
-fn loads_impl(args: &[PyObjectRef]) -> PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(kwargs, &["allow_code"], "loads")?;
-    let Some(&data) = positional.first() else {
-        return Err(PyError::type_error(
-            "loads() missing required argument 'bytes'",
-        ));
-    };
-    if positional.len() != 1 {
-        return Err(PyError::type_error("loads() takes exactly 1 argument"));
-    }
-    let allow_code = parse_allow_code(kwargs)?;
-    let data = bytes_like(data, "loads")?;
-    let _roots = pyre_object::gc_roots::push_roots();
-    let mut reader: &[u8] = &data;
-    let result = wire::deserialize_value(&mut reader, PyreMarshalBag).map_err(marshal_error)?;
-    let result = result.get();
-    if !allow_code {
-        reject_code(result)?;
-    }
-    Ok(result)
-}
-
 /// `PyMarshal_ReadObjectFromString` — deserialize one object out of a raw byte
 /// buffer.  `_imp.get_frozen_object` unmarshals caller-supplied frozen data
 /// through this and rewrites any failure into its own diagnostic.
 pub(crate) fn loads_bytes(data: &[u8]) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let mut reader: &[u8] = data;
-    let result = wire::deserialize_value(&mut reader, PyreMarshalBag).map_err(marshal_error)?;
-    Ok(result.get())
+    unmarshal_bytes(data, true)
 }
 
 /// `PyMarshal_WriteObjectToString` — serialize one object into a raw byte
@@ -528,57 +513,7 @@ pub(crate) fn loads_bytes(data: &[u8]) -> PyResult {
 /// hands these bytes back as the frozen data, so they are the same stream
 /// `loads_bytes` reads.
 pub(crate) fn dumps_bytes(value: PyObjectRef) -> Result<Vec<u8>, PyError> {
-    let version = wire::FORMAT_VERSION as i32;
-    let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(value);
-    let mut out = Vec::new();
-    let mut refs = (version >= 3).then(WriterRefs::new);
-    write_object(&mut out, value, &mut refs, version, MAX_DEPTH)?;
-    Ok(out)
-}
-
-fn dump_impl(args: &[PyObjectRef]) -> PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(kwargs, &["version", "allow_code"], "dump")?;
-    if positional.len() < 2 || positional.len() > 3 {
-        return Err(PyError::type_error("dump() expected 2 or 3 arguments"));
-    }
-    let mut dump_args = vec![positional[0]];
-    if let Some(version) = positional.get(2) {
-        dump_args.push(*version);
-    }
-    if let Some(kwargs) = kwargs {
-        dump_args.push(kwargs);
-    }
-    let bytes = dumps_impl(&dump_args)?;
-    call_method(positional[1], "write", &[bytes])?;
-    Ok(w_none())
-}
-
-fn load_impl(args: &[PyObjectRef]) -> PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(kwargs, &["allow_code"], "load")?;
-    if positional.len() != 1 {
-        return Err(PyError::type_error("load() takes exactly 1 argument"));
-    }
-    let file = positional[0];
-    let before = crate::baseobjspace::int_w(call_method(file, "tell", &[])?)?;
-    let bytes_obj = call_method(file, "read", &[])?;
-    let data = bytes_like(bytes_obj, "load")?;
-    let allow_code = parse_allow_code(kwargs)?;
-    let _roots = pyre_object::gc_roots::push_roots();
-    let mut reader = wire::Cursor {
-        data: data.as_slice(),
-        position: 0,
-    };
-    let result = wire::deserialize_value(&mut reader, PyreMarshalBag).map_err(marshal_error)?;
-    let new_position = w_int_new(before.saturating_add(reader.position as i64));
-    call_method(file, "seek", &[new_position])?;
-    let result = result.get();
-    if !allow_code {
-        reject_code(result)?;
-    }
-    Ok(result)
+    marshal_to_bytes(value, wire::FORMAT_VERSION as i32, true)
 }
 
 crate::py_module! {
@@ -586,10 +521,81 @@ crate::py_module! {
     int_constants: {
         "version" => wire::FORMAT_VERSION as i64,
     },
-    functions: {
-        "dump" / * = dump_impl,
-        "dumps" / * = dumps_impl,
-        "load" / * = load_impl,
-        "loads" / * = loads_impl,
+    inline_functions: {
+        // interp_marshal.py:33 `dumps(w_data, version=Py_MARSHAL_VERSION)` —
+        // `value` / `version` positional-only, `allow_code` keyword-only
+        // (the 3.13 accelerator signature `dumps(value, version, /, *,
+        // allow_code=True)`).  `version` stays `Option` so an explicit
+        // `None` reaches `int_w` and raises rather than defaulting.
+        fn dumps(
+            value: PyObjectRef,
+            version: Option<PyObjectRef>,
+            #[posonly]
+            #[kwonly]
+            allow_code: Option<PyObjectRef>,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let version = resolve_version(version)?;
+            let allow_code = resolve_allow_code(allow_code)?;
+            let out = marshal_to_bytes(value, version, allow_code)?;
+            Ok(bytesobject::w_bytes_from_bytes(&out))
+        }
+        // interp_marshal.py:49 `loads(w_str)` — `bytes` positional-only,
+        // `allow_code` keyword-only (`loads(bytes, /, *, allow_code=True)`).
+        fn loads(
+            data: PyObjectRef,
+            #[posonly]
+            #[kwonly]
+            allow_code: Option<PyObjectRef>,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let allow_code = resolve_allow_code(allow_code)?;
+            let data = bytes_like(data, "loads")?;
+            unmarshal_bytes(&data, allow_code)
+        }
+        // interp_marshal.py:26 `dump(w_data, w_f, version=Py_MARSHAL_VERSION)`
+        // — writes the stream `dumps` would return to `f.write`
+        // (`dump(value, file, version, /, *, allow_code=True)`).
+        fn dump(
+            value: PyObjectRef,
+            file: PyObjectRef,
+            version: Option<PyObjectRef>,
+            #[posonly]
+            #[kwonly]
+            allow_code: Option<PyObjectRef>,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let version = resolve_version(version)?;
+            let allow_code = resolve_allow_code(allow_code)?;
+            let out = marshal_to_bytes(value, version, allow_code)?;
+            let bytes = bytesobject::w_bytes_from_bytes(&out);
+            call_method(file, "write", &[bytes])?;
+            Ok(w_none())
+        }
+        // interp_marshal.py:40 `load(w_f)` reads one value from `f` and
+        // rewinds `f` past exactly the bytes consumed
+        // (`load(file, /, *, allow_code=True)`).
+        fn load(
+            file: PyObjectRef,
+            #[posonly]
+            #[kwonly]
+            allow_code: Option<PyObjectRef>,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let allow_code = resolve_allow_code(allow_code)?;
+            let before = crate::baseobjspace::int_w(call_method(file, "tell", &[])?)?;
+            let bytes_obj = call_method(file, "read", &[])?;
+            let data = bytes_like(bytes_obj, "load")?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut reader = wire::Cursor {
+                data: data.as_slice(),
+                position: 0,
+            };
+            let result =
+                wire::deserialize_value(&mut reader, PyreMarshalBag).map_err(marshal_error)?;
+            let new_position = w_int_new(before.saturating_add(reader.position as i64));
+            call_method(file, "seek", &[new_position])?;
+            let result = result.get();
+            if !allow_code {
+                reject_code(result)?;
+            }
+            Ok(result)
+        }
     },
 }
