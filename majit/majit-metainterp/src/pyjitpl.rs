@@ -7676,6 +7676,18 @@ impl<M: Clone> MetaInterp<M> {
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
+        // `compile.py:797-811` — a retrace grown from a guard failure is
+        // installed under the source guard's own loop token, so a close onto
+        // one of that token's target tokens stays inside a single live code
+        // buffer and may be admitted. Without a resumekey the retrace mints a
+        // fresh JitCellToken below and re-stamps the prior tokens onto it, so
+        // every seeded candidate is foreign at the moment the close is chosen
+        // and none may be admitted.
+        unroll_opt.attach_jitcell_token_number = retrace_resumekey
+            .as_ref()
+            .and_then(|bridge| bridge.source_descr.as_fail_descr())
+            .and_then(majit_backend::descr_owning_jct)
+            .map(|source_jct| source_jct.number);
         unroll_opt.retraced_count = self
             .compiled_loops
             .get(&green_key)
