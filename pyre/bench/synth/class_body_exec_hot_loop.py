@@ -18,7 +18,9 @@
 # without flushing it back left the live frame behind and tripped that check on
 # `last_instr` -- but the check is `debug_assertions`-gated and the values stay
 # correct without it, so that half is not observable here.  It needs a debug
-# build to show, and nothing in this suite runs one.
+# build, which this suite does not run; the gate for it is
+# `class_body_and_exec_loops_keep_the_vable_shadow_synchronized` in
+# pyre-jit's `gc_stress` test binary.
 #
 # N has to run far enough in one entry to warm the portal.
 # `exec_fresh_globals_delete_name` already runs an exec-body loop and stayed
