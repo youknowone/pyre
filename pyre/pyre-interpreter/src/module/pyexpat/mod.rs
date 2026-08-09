@@ -1764,14 +1764,20 @@ fn parser_create3(
         if unsafe { !is_str(encoding) } {
             return Err(parser_create_not_str("encoding", encoding));
         }
-        // The name reaches the expat setup as a `&str`, the same view the
-        // sibling `namespace_separator` arm takes below: a value with no UTF-8
-        // spelling is refused here rather than at that read.
+        // Both stored names are read back through `w_str_get_value`, which
+        // panics on a lone surrogate — `declared_or_forced_encoding` for this
+        // one, `namespace_separator` for the other. A name with no UTF-8
+        // spelling is refused here so that read cannot abort the process;
+        // `space.text_w` has no such reader behind it and so does not need the
+        // refusal.
         crate::baseobjspace::str_utf8_w(encoding)?;
         crate::baseobjspace::setdictvalue_native(parser, "_pyre_forced_encoding", encoding);
     }
     if unsafe { is_none(namespace_separator) } {
     } else if unsafe { is_str(namespace_separator) } {
+        // `namespace_separator` reads this back through `w_str_get_value`, so
+        // the refusal the encoding arm makes applies here too; the length check
+        // below then runs on a value that has a `&str` view.
         let value = crate::baseobjspace::str_utf8_w(namespace_separator)?;
         if value.chars().count() > 1 {
             return Err(crate::PyError::value_error(

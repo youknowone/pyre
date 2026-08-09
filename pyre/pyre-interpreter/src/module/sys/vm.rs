@@ -2678,6 +2678,10 @@ pub fn audit_hooks_armed() -> bool {
 /// parameters are positional-only, and the event name has to be a `str` with a
 /// UTF-8 spelling, so a bad event name is reported at the call rather than
 /// carried to whichever hook reads it.
+///
+/// The unwrap is `str_utf8_w` and not a surrogate-tolerant read because the
+/// encode is there for the error it raises: an event name holding a lone
+/// surrogate is a `UnicodeEncodeError` at the call.
 fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     if crate::builtins::has_real_kwargs(kwargs) {
