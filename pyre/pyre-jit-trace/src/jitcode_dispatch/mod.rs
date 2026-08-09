@@ -6521,6 +6521,12 @@ enum VstackOpClass {
     /// BINARY_SUBSCR / COMPARE_OP / unary ops / CALL /
     /// IS_OP / CONTAINS_OP / single-result BUILD_*.
     ResultToTos,
+    /// Pyre's method-form `LOAD_GLOBAL` pushes the callable and then a NULL
+    /// `self_or_null` sentinel.  The callable is recovered from the
+    /// virtualizable shadow; the top slot is an explicit Ref constant so a
+    /// guard inside the following CALL can snapshot the live NULL instead of
+    /// inheriting an older value from that frame slot.
+    LoadGlobalMethod,
     /// The opcode only pops (and/or stores to a local/global/attr/subscr,
     /// or is an unconditional control transfer).  Truncate to the new
     /// depth WITHOUT touching the surviving TOS — the box already in that

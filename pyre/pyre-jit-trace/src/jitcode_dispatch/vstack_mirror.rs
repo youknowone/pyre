@@ -223,19 +223,13 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::JumpBackwardNoInterrupt { .. }
         | Instruction::ReturnValue => VstackOpClass::PopOnlyOrSideStore,
 
-        // LOAD_GLOBAL: the global value is the new TOS = the last Ref written.
-        // When `namei & 1` the lowering also pushes a NULL sentinel BENEATH the
-        // result (net +2, for the upcoming method CALL).  Exactly like the
-        // two-push `LoadFast*LoadFast*` super-instructions, that leaves the slot
-        // below the new TOS a NONE hole which the general hole-fill below
-        // recovers from the virtualizable shadow (or leaves NONE when
-        // unsourceable — the overlay then omits the slot, which resume
-        // re-materializes) WITHOUT invalidating the mirror.  The NULL sentinel
-        // is consumed by the CALL before any short-circuit branch guard, so it
-        // is never a live kept-stack slot at a resume.  (Previously the
-        // `namei & 1` arm declined to `Unmodeled`; the hole-fill makes that
-        // unnecessary, and the decline killed the mirror for the rest of any
-        // walk with a method-form global load — the dominant mirror=NONE gap.)
+        // LOAD_GLOBAL: pyre pushes the global and then, for `namei & 1`, the
+        // NULL call sentinel. A guard emitted while lowering the following
+        // CALL can observe both slots, so method form keeps a distinct shape
+        // instead of treating NULL as an unsourceable result hole.
+        Instruction::LoadGlobal { namei } if namei.get(op_arg) & 1 != 0 => {
+            VstackOpClass::LoadGlobalMethod
+        }
         Instruction::LoadGlobal { .. } => VstackOpClass::ResultToTos,
 
         // LOAD_SUPER_ATTR: the attribute (non-method form) is the sole new TOS.
@@ -355,6 +349,29 @@ fn loadconst_operand_ref<Sym: WalkSym>(
         return OpRef::NONE;
     }
     ctx.trace_ctx.const_ref(w_const as i64)
+}
+
+/// Apply pyre's two-push method-form `LOAD_GLOBAL` stack shape.  The callable
+/// slot remains a hole until the ordinary shadow fill below supplies its box;
+/// the following NULL is already a complete Ref constant and must not be
+/// confused with an unresolved `OpRef::NONE` slot.
+pub(crate) fn reconcile_load_global_method_shape(
+    boxes: &mut Vec<OpRef>,
+    old_depth: usize,
+    new_depth: usize,
+    null: OpRef,
+) {
+    let old_depth = old_depth.min(new_depth);
+    boxes.truncate(new_depth);
+    if boxes.len() < new_depth {
+        boxes.resize(new_depth, OpRef::NONE);
+    }
+    for slot in &mut boxes[old_depth..new_depth] {
+        *slot = OpRef::NONE;
+    }
+    if new_depth > old_depth {
+        boxes[new_depth - 1] = null;
+    }
 }
 
 /// #73: reconcile the PREVIOUS Python opcode's stack effect into
@@ -581,6 +598,18 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 }
                 ctx.vstack_boxes[new_depth - 1] = top;
             }
+        }
+        VstackOpClass::LoadGlobalMethod => {
+            // `opcode_load_global`: push the callable, then NULL.  The
+            // callable's vable store fills the preceding hole below; NULL is
+            // semantically live even though it carries no GC pointer.
+            let null = ctx.trace_ctx.const_null();
+            reconcile_load_global_method_shape(
+                &mut ctx.vstack_boxes,
+                ctx.vstack_depth,
+                new_depth,
+                null,
+            );
         }
         VstackOpClass::PopOnlyOrSideStore => {
             ctx.vstack_boxes.truncate(new_depth);
