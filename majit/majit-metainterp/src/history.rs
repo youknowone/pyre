@@ -708,11 +708,13 @@ impl TreeLoop {
     /// become the new inputargs; any OpRef referenced after the cut but
     /// defined before it (and not in `original_boxes`) is re-emitted as a
     /// prefix operation (transitive closure of dependencies).
+    /// `None` when the cut cannot be taken without losing a live value; see
+    /// [`Self::cut_trace_from_with_consts`].  The caller keeps the uncut trace.
     pub fn cut_trace_from(
         &self,
         start: TreeLoopCutPosition,
         original_boxes: &[crate::trace_ctx::GreenBox],
-    ) -> TreeLoop {
+    ) -> Option<TreeLoop> {
         self.cut_trace_from_with_consts(start, original_boxes, &[])
     }
 
@@ -720,12 +722,26 @@ impl TreeLoop {
     /// original inputarg.  Escaped original inputargs are remapped to these
     /// pool-managed constants (already GC-rooted), preventing both stale
     /// pointers and entry-contract mismatches at compiled-code entry.
+    ///
+    /// Returns `None` when a pre-cut box reaches the cut region through a
+    /// guard snapshot alone and its definition cone cannot be re-emitted.
+    /// The value has no representation in the cut namespace, and the only
+    /// alternatives are a wrong one (mapping the slot to `OpRef::NONE`, which
+    /// the encoder turns into a NULL in the resumed frame) or re-executing a
+    /// side effect.
+    ///
+    /// The caller must CANCEL the compilation, not fall back to the uncut
+    /// trace: once a merge point is live, the loop token, entry contract and
+    /// optimizer seed downstream are all built for the cut namespace, and
+    /// handing them the uncut trace fails `test_re` outright (measured 3/3 vs
+    /// 0/3 on a same-binary toggle).  Cancelling runs the loop in the
+    /// interpreter, which is correct.
     pub fn cut_trace_from_with_consts(
         &self,
         start: TreeLoopCutPosition,
         original_boxes: &[crate::trace_ctx::GreenBox],
         inputarg_consts: &[OpRef],
-    ) -> TreeLoop {
+    ) -> Option<TreeLoop> {
         use indexmap::IndexSet;
         use std::collections::VecDeque;
 
@@ -805,12 +821,19 @@ impl TreeLoop {
         // cone, so the condition is on the CONE, not the root: an allocation
         // whose field feeds from a residual call would re-issue that call. Walk
         // the pre-cut dependencies and admit only an entirely side-effect-free
-        // cone; anything else keeps the `OpRef::NONE` mapping it has today.
-        // A `CallMayForceR` in a snapshot slot is therefore still lost — an
-        // extra observable call is worse than the NULL slot it would repair.
-        // Allocation (`NewWithVtable`) IS re-emitted: resume already hands a
-        // virtual a fresh object, and the boxed operands this recovers are
+        // cone. Allocation (`NewWithVtable`) IS re-emitted: resume already hands
+        // a virtual a fresh object, and the boxed operands this recovers are
         // compared by value.
+        //
+        // A cone that is NOT re-emittable (a `CallMayForceR` feeding a snapshot
+        // slot) leaves the value with no representation in the cut namespace at
+        // all: the operand stack it lives on is in the virtualizable, not in
+        // `original_boxes`, so it is neither an inputarg nor re-derivable. Both
+        // remaining options are worse than not cutting — mapping the slot to
+        // `OpRef::NONE` writes a NULL into the resumed frame (a live call
+        // argument arriving unbound), and re-emitting issues an extra observable
+        // call. Decline; the caller cancels the compilation and the loop runs in
+        // the interpreter.
         //
         // A pre-cut ORIGINAL inputarg has no definition to re-execute, so it is
         // a leaf — but only phase 4's pool-constant arm can actually deliver
@@ -820,9 +843,9 @@ impl TreeLoop {
         // array items, asserting it (`compile.py:458`). A snapshot's frame boxes
         // ARE the frame's locals, so seeding from snapshots reaches original
         // inputargs constantly where operand seeding reached them rarely. Test
-        // the same predicate phase 4 branches on, and refuse the root when the
-        // constant is absent: a widened entry contract crashes the compile,
-        // which is worse than the NULL slot it would repair.
+        // the same predicate phase 4 branches on, and decline when the constant
+        // is absent: a widened entry contract crashes the compile, which is
+        // worse still than the NULL slot it would repair.
         let snapshot_cone_is_reemittable = |root: &OpRef| -> bool {
             let mut seen: IndexSet<OpRef> = IndexSet::new();
             let mut stack: Vec<OpRef> = vec![*root];
@@ -866,10 +889,19 @@ impl TreeLoop {
                 .chain(snap.frames.iter().flat_map(|f| f.boxes.iter()));
             for t in tagged {
                 if let crate::recorder::SnapshotTagged::Box(r, _) = t {
-                    if is_pre_cut_ref(r)
-                        && snapshot_cone_is_reemittable(r)
-                        && escaped_set.insert(*r)
-                    {
+                    if !is_pre_cut_ref(r) {
+                        continue;
+                    }
+                    if !snapshot_cone_is_reemittable(r) {
+                        if crate::majit_log_enabled() {
+                            eprintln!(
+                                "[jit][cut-decline] snapshot-only ref {r:?} has a \
+                                 side-effecting definition cone; keeping the uncut trace",
+                            );
+                        }
+                        return None;
+                    }
+                    if escaped_set.insert(*r) {
                         queue.push_back(*r);
                     }
                 }
@@ -1122,7 +1154,11 @@ impl TreeLoop {
                 }
             })
             .collect();
-        TreeLoop::from_oprc(new_inputargs, new_ops, remapped_snapshots)
+        Some(TreeLoop::from_oprc(
+            new_inputargs,
+            new_ops,
+            remapped_snapshots,
+        ))
     }
 }
 
@@ -1880,7 +1916,9 @@ mod tests {
             crate::trace_ctx::GreenBox::new(iarg(1), Type::Int),
         ];
 
-        let cut = trace.cut_trace_from(start, &original_boxes);
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
         assert_eq!(cut.inputargs.len(), 2);
         assert_eq!(cut.ops.len(), 2); // IntMul + Jump
         assert_eq!(cut.ops[0].opcode, OpCode::IntMul);
@@ -1913,7 +1951,9 @@ mod tests {
         // original_boxes only has v0 — v2 is escaped
         let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
-        let cut = trace.cut_trace_from(start, &original_boxes);
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
         // v1 = OpRef::input_arg_int(1) is an original trace inputarg NOT in original_boxes.
         // It's referenced by the escaped int_add op → added as extra inputarg.
         // Result: inputargs = [v0, v1], prefix = [int_add], post-cut = [int_mul, jump]
@@ -1946,7 +1986,9 @@ mod tests {
         let start = TreeLoopCutPosition::new(1);
         let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
-        let cut = trace.cut_trace_from(start, &original_boxes);
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
         assert_eq!(cut.ops.len(), 2);
         // Constant ref should be preserved as-is
         assert_eq!(cut.ops[0].arg(1).to_opref(), const_ref);
@@ -1977,7 +2019,9 @@ mod tests {
         let start = TreeLoopCutPosition::new(2); // cut after op0 and op1
         let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
-        let cut = trace.cut_trace_from(start, &original_boxes);
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
         // 1 inputarg, 2 prefix ops (v1=int_add, v2=int_mul), 2 post-cut ops
         assert_eq!(cut.inputargs.len(), 1);
         assert_eq!(cut.ops.len(), 4);
@@ -2036,7 +2080,9 @@ mod tests {
             crate::trace_ctx::GreenBox::new(iarg(0), Type::Int),
             crate::trace_ctx::GreenBox::new(iarg(1), Type::Int),
         ];
-        let cut = trace.cut_trace_from(start, &original_boxes);
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
 
         // The add is re-emitted as a prefix op, and the snapshot slot names it.
         assert_eq!(cut.ops[0].opcode, OpCode::IntAdd);
@@ -2049,10 +2095,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cut_trace_from_leaves_side_effecting_snapshot_ref_unmapped() {
+    fn test_cut_trace_from_declines_on_a_side_effecting_snapshot_ref() {
         // Re-emission re-EXECUTES the definition, so a side-effecting pre-cut
-        // op is not admitted: an extra observable call is worse than the NULL
-        // slot it would repair. It keeps the `OpRef::NONE` mapping.
+        // op is not admitted. The value then has no representation in the cut
+        // namespace at all, and mapping the slot to `OpRef::NONE` would write a
+        // NULL into the resumed frame — so the cut is declined outright and the
+        // caller keeps the uncut trace, which still holds the definition.
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
         let mut op0 = Op::new(OpCode::CallMayForceR, &[iarg_box(0)]);
@@ -2075,16 +2123,9 @@ mod tests {
         let cut = trace.cut_trace_from(start, &original_boxes);
 
         assert!(
-            cut.ops.iter().all(|o| o.opcode != OpCode::CallMayForceR),
-            "a side-effecting op was re-emitted into the cut prefix"
-        );
-        let slot = cut.snapshots[0].vable_boxes[0];
-        let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
-            panic!("unexpected snapshot slot shape: {slot:?}");
-        };
-        assert!(
-            r.is_none(),
-            "expected the unmapped NONE fallback, got {r:?}"
+            cut.is_none(),
+            "expected the cut to be declined, got a trace whose snapshot slot is {:?}",
+            cut.map(|c| c.snapshots[0].vable_boxes[0]),
         );
     }
 
@@ -2098,7 +2139,9 @@ mod tests {
         // exactly the red args plus the virtualizable's fields
         // (`compile.py:458`) — `test.test_collections` and `test.test_urlparse`
         // crashed there with `assert i == len(inputargs) failed (18 != 19)`.
-        // Refuse the root instead; the slot keeps the NONE it has today.
+        // `is_always_pure()` does not cover this: the root here is an `IntAdd`,
+        // so the cone is replay-safe and it is the ENTRY CONTRACT, not the
+        // replay, that cannot represent the value. Decline the cut.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut ops = Vec::new();
         // v2 = int_add(v0, v1) — pre-cut, named by nothing after the cut.
@@ -2123,22 +2166,11 @@ mod tests {
         let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
         let cut = trace.cut_trace_from(start, &original_boxes);
 
-        assert_eq!(
-            cut.inputargs.len(),
+        assert!(
+            cut.is_none(),
+            "expected the cut to be declined, got one with {:?} inputargs for {} original boxes",
+            cut.map(|c| c.inputargs.len()),
             original_boxes.len(),
-            "the cut invented an inputarg the virtualizable expansion cannot account for"
-        );
-        assert!(
-            cut.ops.iter().all(|o| o.opcode != OpCode::IntAdd),
-            "a root whose cone needs an undeliverable inputarg was re-emitted"
-        );
-        let slot = cut.snapshots[0].vable_boxes[0];
-        let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
-            panic!("unexpected snapshot slot shape: {slot:?}");
-        };
-        assert!(
-            r.is_none(),
-            "expected the unmapped NONE fallback, got {r:?}"
         );
     }
 

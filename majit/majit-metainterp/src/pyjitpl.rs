@@ -5909,8 +5909,19 @@ impl<M: Clone> MetaInterp<M> {
             }
             // cut_trace_from_with_consts remaps escaped original inputargs to
             // their trace-entry Const via a transient build-time map keyed by
-            // `OpRef.raw()`.
-            trace.cut_trace_from_with_consts(start, original_boxes, &ctx.initial_inputarg_consts)
+            // `OpRef.raw()`.  It declines (`None`) when the cut would drop a
+            // value held only by a guard snapshot.  The uncut trace is NOT a
+            // fallback here: everything downstream of a live merge point is
+            // built for the cut namespace and entry contract, so cancel this
+            // compilation and let the interpreter run the loop instead.
+            let Some(cut) = trace.cut_trace_from_with_consts(
+                start,
+                original_boxes,
+                &ctx.initial_inputarg_consts,
+            ) else {
+                return CompileOutcome::Cancelled;
+            };
+            cut
         } else {
             trace
         };
@@ -7508,7 +7519,17 @@ impl<M: Clone> MetaInterp<M> {
                         header_pc,
                     );
                 }
-                trace.cut_trace_from_with_consts(start, original_boxes, &initial_inputarg_consts)
+                // As in `compile_loop_body`: a declined cut cannot fall back to
+                // the uncut trace, because the retrace is installed against the
+                // merge point's entry contract.  Cancel the retrace instead.
+                let Some(cut) = trace.cut_trace_from_with_consts(
+                    start,
+                    original_boxes,
+                    &initial_inputarg_consts,
+                ) else {
+                    return false;
+                };
+                cut
             } else {
                 trace
             };
