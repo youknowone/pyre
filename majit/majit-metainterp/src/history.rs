@@ -859,13 +859,31 @@ impl TreeLoop {
         // undeliverable — so test the same predicate phase 4 branches on and
         // decline when the constant is absent: `test.test_collections` and
         // `test.test_urlparse` crashed on that assert with `18 != 19`.
-        let snapshot_cone_is_reemittable = |root: &OpRef| -> bool {
+        //
+        // One impure ROOT stays admissible: an allocation, replayed TOGETHER
+        // with the stores that filled it. Replaying `New*` alone is what makes
+        // it inadmissible — the contents come from separate `SetfieldGc`s that
+        // no argument cone reaches, so the object arrives blank — but those
+        // stores write into an object that does not exist yet in the cut
+        // namespace, so replaying them observes nothing. That holds only while
+        // every pre-cut op naming the allocation is either a guard, which reads
+        // it and retains nothing, or a store whose FIRST argument is the
+        // allocation itself. A store that puts it into something else, or a
+        // call that receives it, publishes the object: a replay then mints a
+        // second identity that the original holder can tell apart, so refuse.
+        // Each stored value has to be reconstructible in its own right, so it
+        // is walked like any other operand.
+        //
+        // Returns the extra pre-cut ops the caller must seed alongside the
+        // root; `None` is the decline.
+        let snapshot_cone_is_reemittable = |root: &OpRef| -> Option<Vec<OpRef>> {
             let mut seen: IndexSet<OpRef> = IndexSet::new();
-            let mut stack: Vec<OpRef> = vec![*root];
-            while let Some(r) = stack.pop() {
+            let mut extra: Vec<OpRef> = Vec::new();
+            let mut stack: Vec<(OpRef, bool)> = vec![(*root, true)];
+            while let Some((r, is_root)) = stack.pop() {
                 if r.raw() < num_original_inputargs {
                     if inputarg_consts.get(r.raw() as usize).is_none() {
-                        return false;
+                        return None;
                     }
                     continue;
                 }
@@ -873,19 +891,46 @@ impl TreeLoop {
                     continue;
                 }
                 let Some(op) = self.ops.get((r.raw() - num_original_inputargs) as usize) else {
-                    return false;
+                    return None;
                 };
                 if !op.opcode.is_always_pure() {
-                    return false;
+                    if !is_root || !op.opcode.is_malloc() {
+                        return None;
+                    }
+                    for other in self.ops[..start.op_index].iter() {
+                        if !other.getarglist().iter().any(|a| a.to_opref() == r) {
+                            continue;
+                        }
+                        if other.opcode.is_guard() {
+                            continue;
+                        }
+                        let fills_the_allocation = (other.opcode.is_setfield()
+                            || other.opcode.is_setarrayitem()
+                            || other.opcode.is_setinteriorfield())
+                            && other.arg(0).to_opref() == r;
+                        if !fills_the_allocation {
+                            return None;
+                        }
+                        for i in 1..other.num_args() {
+                            let a = other.arg(i).to_opref();
+                            if a == r {
+                                return None;
+                            }
+                            if is_pre_cut_ref(&a) {
+                                stack.push((a, false));
+                            }
+                        }
+                        extra.push(other.pos.get());
+                    }
                 }
                 for arg in op.getarglist().iter() {
                     let a = arg.to_opref();
                     if is_pre_cut_ref(&a) {
-                        stack.push(a);
+                        stack.push((a, false));
                     }
                 }
             }
-            true
+            Some(extra)
         };
         for op in cut_ops {
             let snapshot_id = op.rd_resume_position.get();
@@ -905,7 +950,7 @@ impl TreeLoop {
                     if !is_pre_cut_ref(r) {
                         continue;
                     }
-                    if !snapshot_cone_is_reemittable(r) {
+                    let Some(extra) = snapshot_cone_is_reemittable(r) else {
                         if crate::majit_log_enabled() {
                             let root = r
                                 .raw()
@@ -919,9 +964,16 @@ impl TreeLoop {
                             );
                         }
                         return None;
-                    }
+                    };
                     if escaped_set.insert(*r) {
                         queue.push_back(*r);
+                    }
+                    // The allocation's filling stores ride along; `op_escaped`
+                    // is ordered by position, so they re-emit after it.
+                    for e in extra {
+                        if escaped_set.insert(e) {
+                            queue.push_back(e);
+                        }
                     }
                 }
             }
@@ -2203,6 +2255,105 @@ mod tests {
         );
     }
 
+    /// Ref-typed sibling of [`iop_box`], for allocation results.
+    fn rop_box(pos: u32) -> Operand {
+        rooted_resop_operand(Type::Ref, pos)
+    }
+
+    #[test]
+    fn test_cut_trace_from_replays_an_allocation_with_the_stores_that_filled_it() {
+        // `New*` alone reconstructs a BLANK object, because its contents come
+        // from separate stores no argument cone reaches. Replaying those stores
+        // alongside it restores the contents, and they observe nothing: they
+        // write into an object that does not exist yet in the cut namespace.
+        // The `GuardClass` reads the allocation and retains nothing, so it does
+        // not block the admission and is not replayed.
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut op0 = Op::new(OpCode::NewWithVtable, &[]);
+        op0.pos.set(OpRef::ref_op(1));
+        let mut op1 = Op::new(OpCode::SetfieldGc, &[rop_box(1), iarg_box(0)]);
+        op1.pos.set(vop(2));
+        let mut op2 = Op::new(OpCode::GuardClass, &[rop_box(1)]);
+        op2.pos.set(vop(3));
+        let mut op3 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        op3.pos.set(vop(4));
+        op3.rd_resume_position.set(0);
+        let mut op4 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        op4.pos.set(vop(5));
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
+            crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
+        ])];
+        let trace = TreeLoop::with_snapshots(inputargs, vec![op0, op1, op2, op3, op4], snapshots);
+
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+        let cut = trace
+            .cut_trace_from(TreeLoopCutPosition::new(3), &original_boxes)
+            .expect("an unpublished allocation and its stores are replayable");
+
+        assert_eq!(cut.ops[0].opcode, OpCode::NewWithVtable);
+        assert_eq!(
+            cut.ops[1].opcode,
+            OpCode::SetfieldGc,
+            "the store that filled the allocation was not replayed with it"
+        );
+        assert_eq!(
+            cut.ops[1].arg(0).to_opref(),
+            cut.ops[0].pos.get(),
+            "the replayed store does not write into the replayed allocation"
+        );
+        let slot = cut.snapshots[0].frames[0].boxes[0];
+        let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
+            panic!("snapshot slot lost its box: {slot:?}");
+        };
+        assert_eq!(r, cut.ops[0].pos.get());
+    }
+
+    #[test]
+    fn test_cut_trace_from_declines_on_an_allocation_that_escaped() {
+        // Publishing the allocation gives a second holder that can tell the
+        // replayed identity apart from the original. Both shapes publish it:
+        // storing it INTO another object, and handing it to a call — the call
+        // is the one the store-shape checks cannot see, since it is neither a
+        // guard nor a store at all.
+        for publish_with_a_call in [false, true] {
+            let inputargs = vec![InputArg::new_int(0)];
+            let mut op0 = Op::new(OpCode::NewWithVtable, &[]);
+            op0.pos.set(OpRef::ref_op(1));
+            let mut op1 = Op::new(OpCode::NewWithVtable, &[]);
+            op1.pos.set(OpRef::ref_op(2));
+            let mut publish = if publish_with_a_call {
+                Op::new(OpCode::CallMayForceR, &[rop_box(1)])
+            } else {
+                Op::new(OpCode::SetfieldGc, &[rop_box(2), rop_box(1)])
+            };
+            publish.pos.set(if publish_with_a_call {
+                OpRef::ref_op(3)
+            } else {
+                vop(3)
+            });
+            let mut op3 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+            op3.pos.set(vop(4));
+            op3.rd_resume_position.set(0);
+            let mut op4 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+            op4.pos.set(vop(5));
+            let snapshots = vec![snapshot_with_frame_boxes(vec![
+                crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
+            ])];
+            let trace =
+                TreeLoop::with_snapshots(inputargs, vec![op0, op1, publish, op3, op4], snapshots);
+
+            let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+            let cut = trace.cut_trace_from(TreeLoopCutPosition::new(3), &original_boxes);
+
+            assert!(
+                cut.is_none(),
+                "an allocation published by a {} was replayed; snapshot slot is {:?}",
+                if publish_with_a_call { "call" } else { "store" },
+                cut.map(|c| c.snapshots[0].frames[0].boxes[0]),
+            );
+        }
+    }
+
     #[test]
     fn test_cut_trace_from_declines_on_an_effect_observing_snapshot_ref() {
         // The boundary that matters is `is_always_pure`, not
@@ -2211,7 +2362,13 @@ mod tests {
         // so it never joins the cone; re-emitting the load at cut entry would
         // read the value written AFTER the snapshot named it. Pin the gap
         // between the two predicates so widening it back is a test failure.
-        for opcode in [OpCode::GetfieldGcR, OpCode::GcLoadR, OpCode::NewWithVtable] {
+        //
+        // The loads carry that subject on their own. `New*` also sits in the
+        // gap but has a rule of its own — it is replayed together with the
+        // stores that fill it, see
+        // `test_cut_trace_from_replays_an_allocation_with_the_stores_that_filled_it`
+        // and `test_cut_trace_from_declines_on_an_allocation_that_escaped`.
+        for opcode in [OpCode::GetfieldGcR, OpCode::GcLoadR] {
             assert!(
                 opcode.has_no_side_effect() && !opcode.is_always_pure(),
                 "{opcode:?} no longer sits between the two predicates, so this \
