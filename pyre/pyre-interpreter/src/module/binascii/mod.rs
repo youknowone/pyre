@@ -13,99 +13,39 @@ mod transforms;
 
 use pyre_object::*;
 
-/// `PyArg_UnpackTuple` for the entries that declare no keyword at all
-/// (`crc32(data, crc=0, /)`, `crc_hqx(data, crc, /)`).  A keyword is refused
-/// under the module-qualified name; the arity message names the function bare
-/// and is the only one in this module that carries no `()`.
-fn unpack_positional<'a>(
-    args: &'a [PyObjectRef],
+/// A required slot the `Signature` binder left `PY_NULL` because the caller
+/// omitted it.  `_PyArg` reports the bare parameter name and its 1-based
+/// position.
+fn arg_required(
+    w: PyObjectRef,
     fn_name: &str,
-    min: usize,
-    max: usize,
-) -> Result<&'a [PyObjectRef], crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::real_kwarg_count(kwargs) != 0 {
+    param: &str,
+    pos: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    if w.is_null() {
         return Err(crate::PyError::type_error(format!(
-            "binascii.{fn_name}() takes no keyword arguments"
+            "{fn_name}() missing required argument '{param}' (pos {pos})"
         )));
     }
-    if pos.len() < min {
-        return Err(crate::PyError::type_error(format!(
-            "{fn_name} expected {}{min} argument{}, got {}",
-            if min == max { "" } else { "at least " },
-            if min == 1 { "" } else { "s" },
-            pos.len(),
-        )));
-    }
-    if pos.len() > max {
-        return Err(crate::PyError::type_error(format!(
-            "{fn_name} expected {}{max} arguments, got {}",
-            if min == max { "" } else { "at most " },
-            pos.len(),
-        )));
-    }
-    Ok(pos)
+    Ok(w)
 }
 
-/// The entries whose `data` is positional-only and whose remaining slots are
-/// keyword-only (`a2b_base64`, `b2a_base64`, `b2a_uu`).  A positional-only
-/// parameter is never reported by name, so both an omitted and a surplus
-/// positional read as the one positional slot; `_PyArg_UnpackKeywords` holds
-/// an unrecognized keyword back until then, which is why `f(data=…)` is a
-/// missing positional rather than an unexpected keyword.
-fn arg_data_posonly(
-    args: &[PyObjectRef],
-    fn_name: &str,
-    kwonly: &[&str],
-) -> Result<(PyObjectRef, Option<PyObjectRef>), crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::clinic_arity(
-        fn_name,
-        pos.len(),
-        crate::builtins::real_kwarg_count(kwargs),
-        1,
-        1,
-        kwonly.len(),
-    )?;
-    if pos.is_empty() {
-        return Err(crate::PyError::type_error(format!(
-            "{fn_name}() takes exactly 1 positional argument (0 given)"
-        )));
-    }
-    if let Some(dict) = kwargs {
-        for (key, _) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }.iter() {
-            // A keyword can be any `str`, so the name is compared and reported
-            // as the WTF-8 it is: `format!` would fold a surrogate to U+FFFD.
-            let named = key.as_str().ok();
-            if named != Some("__pyre_kw__") && !named.is_some_and(|n| kwonly.contains(&n)) {
-                let mut msg = rustpython_wtf8::Wtf8Buf::from_string(format!(
-                    "{fn_name}() got an unexpected keyword argument '"
-                ));
-                msg.push_wtf8(key);
-                msg.push_str("'");
-                return Err(crate::PyError::type_error(msg));
-            }
-        }
-    }
-    Ok((pos[0], kwargs))
-}
-
-/// A keyword-only flag: absent or `None` keeps `default`.
-fn kwonly_bool(kwargs: Option<PyObjectRef>, name: &str, default: bool) -> bool {
-    slot_bool(
-        crate::builtins::kwarg_get(kwargs, name).unwrap_or(PY_NULL),
-        default,
-    )
-}
-
-/// A slot [`crate::builtins::bind_builtin_kwargs`] resolved: `PY_NULL` for an
-/// omitted optional argument, and `None` for one passed explicitly, both keep
-/// `default`.
+/// A slot the `Signature` binder resolved: `PY_NULL` for an omitted optional
+/// argument, and `None` for one passed explicitly, both keep `default`.
 fn slot_bool(w: PyObjectRef, default: bool) -> bool {
     if w.is_null() || unsafe { is_none(w) } {
         return default;
     }
     crate::baseobjspace::is_true(w).unwrap_or(default)
+}
+
+/// An optional `oldcrc` slot: `PY_NULL`/`None` keeps `default`, otherwise the
+/// low 32 bits of the integer.  `truncatedint_w` in `interp_crc32.py`.
+fn slot_u32(w: PyObjectRef, default: u32) -> Result<u32, crate::PyError> {
+    if w.is_null() || unsafe { is_none(w) } {
+        return Ok(default);
+    }
+    Ok(crate::baseobjspace::int_w(w)? as u32)
 }
 
 /// `ascii_buffer_converter` — accept a str (ASCII) or any bytes-like and
@@ -234,23 +174,94 @@ crate::py_module! {
         "Error" => crate::builtins::lookup_exc_class("ValueError").expect("ValueError installed"),
         "Incomplete" => crate::builtins::lookup_exc_class("Exception").expect("Exception installed"),
     },
+    inline_functions: {
+        // interp_hexlify.py:18 `hexlify(data, w_sep=None, w_bytes_per_sep=None)`
+        // — three positional-or-keyword slots.  `b2a_hex` is the alias.
+        fn b2a_hex(
+            data: PyObjectRef,
+            #[default(w_none())] sep: PyObjectRef,
+            #[default(w_none())] bytes_per_sep: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            hexlify_impl(data, sep, bytes_per_sep)
+        }
+        fn hexlify(
+            data: PyObjectRef,
+            #[default(w_none())] sep: PyObjectRef,
+            #[default(w_none())] bytes_per_sep: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            hexlify_impl(data, sep, bytes_per_sep)
+        }
+        // interp_qp.py:19 `a2b_qp(data, header=0)` and interp_qp.py:97
+        // `b2a_qp(data, quotetabs=0, istext=1, header=0)` — every slot
+        // positional-or-keyword.
+        fn a2b_qp(
+            data: PyObjectRef,
+            #[default(w_none())] header: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let data = as_bytes(arg_required(data, "a2b_qp", "data", 1)?)?;
+            let header = slot_bool(header, false);
+            Ok(w_bytes_from_bytes(&transforms::a2b_qp(&data, header)))
+        }
+        fn b2a_qp(
+            data: PyObjectRef,
+            #[default(w_none())] quotetabs: PyObjectRef,
+            #[default(w_none())] istext: PyObjectRef,
+            #[default(w_none())] header: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let data = as_buffer_bytes(arg_required(data, "b2a_qp", "data", 1)?)?;
+            let quotetabs = slot_bool(quotetabs, false);
+            let istext = slot_bool(istext, true);
+            let header = slot_bool(header, false);
+            Ok(w_bytes_from_bytes(&transforms::b2a_qp(&data, quotetabs, istext, header)))
+        }
+        // `a2b_base64(data, /, *, strict_mode=False)` — `data` positional-only,
+        // `strict_mode` keyword-only.  interp_base64.py:39
+        // `a2b_base64(ascii, strict_mode=0)` marks no `__kwonly__`, so upstream
+        // keeps `strict_mode` positional-or-keyword; the keyword-only form here
+        // predates this change and matches the 3.11+ accelerator signature.
+        fn a2b_base64(
+            data: PyObjectRef,
+            #[posonly]
+            #[kwonly]
+            #[default(w_none())]
+            strict_mode: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let data = as_bytes(arg_required(data, "a2b_base64", "data", 1)?)?;
+            let strict_mode = slot_bool(strict_mode, false);
+            let out = transforms::a2b_base64(&data, strict_mode).map_err(transform_error)?;
+            Ok(w_bytes_from_bytes(&out))
+        }
+        // interp_base64.py:102 `b2a_base64(bin, __kwonly__, newline=True)` —
+        // `data` positional-only, `newline` keyword-only (the `__kwonly__`
+        // marker).
+        fn b2a_base64(
+            data: PyObjectRef,
+            #[posonly]
+            #[kwonly]
+            #[default(w_none())]
+            newline: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let data = as_buffer_bytes(arg_required(data, "b2a_base64", "data", 1)?)?;
+            let newline = slot_bool(newline, true);
+            Ok(w_bytes_from_bytes(&transforms::b2a_base64(&data, newline)))
+        }
+        // interp_uu.py:77 `b2a_uu(bin, __kwonly__, backtick=False)`.
+        fn b2a_uu(
+            data: PyObjectRef,
+            #[posonly]
+            #[kwonly]
+            #[default(w_none())]
+            backtick: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let data = as_buffer_bytes(arg_required(data, "b2a_uu", "data", 1)?)?;
+            let backtick = slot_bool(backtick, false);
+            let out = transforms::b2a_uu(&data, backtick).map_err(transform_error)?;
+            Ok(w_bytes_from_bytes(&out))
+        }
+    },
     functions: {
-        // `(data, sep=<unrepresentable>, bytes_per_sep=1)` — three
-        // positional-or-keyword slots.
-        "b2a_hex" / * = |args| {
-            let scope = crate::builtins::bind_builtin_kwargs(
-                args, &["data", "sep", "bytes_per_sep"], &[true, false, false], "b2a_hex")?;
-            let data = as_buffer_bytes(scope[0])?;
-            let (sep, bytes_per_sep) = sep_args(scope[1], scope[2])?;
-            Ok(w_bytes_from_bytes(&transforms::hexlify(&data, sep, bytes_per_sep)))
-        },
-        "hexlify" / * = |args| {
-            let scope = crate::builtins::bind_builtin_kwargs(
-                args, &["data", "sep", "bytes_per_sep"], &[true, false, false], "hexlify")?;
-            let data = as_buffer_bytes(scope[0])?;
-            let (sep, bytes_per_sep) = sep_args(scope[1], scope[2])?;
-            Ok(w_bytes_from_bytes(&transforms::hexlify(&data, sep, bytes_per_sep)))
-        },
+        // interp_hexlify.py:53 `unhexlify(hexstr)` / interp_uu.py:25
+        // `a2b_uu(ascii)` — a single positional argument, no keyword surface.
         "a2b_hex" / 1 = |args| {
             let data = as_bytes(args.first().copied().unwrap_or(w_none()))?;
             let out = transforms::unhexlify(&data).map_err(transform_error)?;
@@ -261,70 +272,109 @@ crate::py_module! {
             let out = transforms::unhexlify(&data).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
         },
-        // `(data, crc=0, /)` and `(data, crc, /)` — positional-only throughout.
-        "crc32" / * = |args| {
-            let pos = unpack_positional(args, "crc32", 1, 2)?;
-            let data = as_buffer_bytes(pos[0])?;
-            let init = match pos.get(1) {
-                Some(&o) => crate::baseobjspace::int_w(o)? as u32,
-                None => 0,
-            };
-            Ok(w_int_new(transforms::crc32(&data, init) as i64))
-        },
-        "crc_hqx" / * = |args| {
-            let pos = unpack_positional(args, "crc_hqx", 2, 2)?;
-            let data = as_buffer_bytes(pos[0])?;
-            let init = crate::baseobjspace::int_w(pos[1])? as u32;
-            Ok(w_int_new(transforms::crc_hqx(&data, init) as i64))
-        },
-        // `(data, /, *, flag=…)` — one positional-only slot, the rest
-        // keyword-only.
-        "a2b_base64" / * = |args| {
-            let (w_data, kwargs) = arg_data_posonly(args, "a2b_base64", &["strict_mode"])?;
-            let data = as_bytes(w_data)?;
-            let strict_mode = kwonly_bool(kwargs, "strict_mode", false);
-            let out = transforms::a2b_base64(&data, strict_mode).map_err(transform_error)?;
-            Ok(w_bytes_from_bytes(&out))
-        },
-        "b2a_base64" / * = |args| {
-            let (w_data, kwargs) = arg_data_posonly(args, "b2a_base64", &["newline"])?;
-            let data = as_buffer_bytes(w_data)?;
-            let newline = kwonly_bool(kwargs, "newline", true);
-            Ok(w_bytes_from_bytes(&transforms::b2a_base64(&data, newline)))
-        },
-        // `(data, header=False)` / `(data, quotetabs, istext, header)` — every
-        // slot positional-or-keyword.
-        "a2b_qp" / * = |args| {
-            let scope = crate::builtins::bind_builtin_kwargs(
-                args, &["data", "header"], &[true, false], "a2b_qp")?;
-            let data = as_bytes(scope[0])?;
-            let header = slot_bool(scope[1], false);
-            Ok(w_bytes_from_bytes(&transforms::a2b_qp(&data, header)))
-        },
-        "b2a_qp" / * = |args| {
-            let scope = crate::builtins::bind_builtin_kwargs(
-                args,
-                &["data", "quotetabs", "istext", "header"],
-                &[true, false, false, false],
-                "b2a_qp",
-            )?;
-            let data = as_buffer_bytes(scope[0])?;
-            let quotetabs = slot_bool(scope[1], false);
-            let istext = slot_bool(scope[2], true);
-            let header = slot_bool(scope[3], false);
-            Ok(w_bytes_from_bytes(&transforms::b2a_qp(&data, quotetabs, istext, header)))
-        },
         "a2b_uu" / 1 = |args| {
             let data = as_bytes(args.first().copied().unwrap_or(w_none()))?;
             let out = transforms::a2b_uu(&data).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
         },
-        "b2a_uu" / * = |args| {
-            let (w_data, kwargs) = arg_data_posonly(args, "b2a_uu", &["backtick"])?;
-            let data = as_buffer_bytes(w_data)?;
-            let backtick = kwonly_bool(kwargs, "backtick", false);
-            let out = transforms::b2a_uu(&data, backtick).map_err(transform_error)?;
-            Ok(w_bytes_from_bytes(&out))
-        },
     },
+    extra_init: |ns| {
+        // interp_crc32.py:6 `crc32(data, oldcrc=0)` and interp_hqx.py:254
+        // `crc_hqx(data, w_oldcrc)`.  Both are all-positional-only, a shape the
+        // `#[pyre_function]` `#[posonly]` marker cannot express (there is no
+        // trailing parameter to mark the boundary before), so their
+        // `Signature` is built by hand: `posonlyargcount == argnames.len()`.
+        // With no keyword-only slot and `posonly == n_pos_params`, a keyword
+        // call is rejected as "() takes no keyword arguments".
+        // `oldcrc` is optional, so the argument count is not fixed: the
+        // signature is `HOPELESS` and the positional path routes through the
+        // binder rather than the fixed-arity fast entry.
+        crate::runtime_ops::module_ns_store(
+            ns,
+            "crc32",
+            crate::gateway::with_module(
+                "binascii",
+                crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                    "crc32",
+                    crc32,
+                    crate::HOPELESS,
+                    Some(sig_all_posonly("crc32", &["data", "crc"])),
+                ),
+            ),
+        );
+        // `HOPELESS` as well: a fixed arity would take the positional fast
+        // entry, which skips the binder and would let a surplus positional
+        // reach the body unchecked (`finish_builtin_code_positional`).
+        crate::runtime_ops::module_ns_store(
+            ns,
+            "crc_hqx",
+            crate::gateway::with_module(
+                "binascii",
+                crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                    "crc_hqx",
+                    crc_hqx,
+                    crate::HOPELESS,
+                    Some(sig_all_posonly("crc_hqx", &["data", "crc"])),
+                ),
+            ),
+        );
+    },
+}
+
+/// interp_hexlify.py:18 — the shared `hexlify` / `b2a_hex` body.  `data` is a
+/// bytes-like buffer; `sep` / `bytes_per_sep` are the length-1-ASCII separator
+/// controls validated by [`sep_args`].
+fn hexlify_impl(
+    data: PyObjectRef,
+    sep: PyObjectRef,
+    bytes_per_sep: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let data = as_buffer_bytes(arg_required(data, "hexlify", "data", 1)?)?;
+    let (sep, bytes_per_sep) = sep_args(sep, bytes_per_sep)?;
+    Ok(w_bytes_from_bytes(&transforms::hexlify(
+        &data,
+        sep,
+        bytes_per_sep,
+    )))
+}
+
+/// interp_crc32.py:6 `crc32(space, data, oldcrc=0)` — all-positional-only:
+/// `data` required, `oldcrc` an optional truncated-int.
+fn crc32(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = as_buffer_bytes(arg_required(
+        args.first().copied().unwrap_or(PY_NULL),
+        "crc32",
+        "data",
+        1,
+    )?)?;
+    let init = slot_u32(args.get(1).copied().unwrap_or(PY_NULL), 0)?;
+    Ok(w_int_new(transforms::crc32(&data, init) as i64))
+}
+
+/// interp_hqx.py:254 `crc_hqx(space, data, w_oldcrc)` — both positional-only
+/// and required.
+fn crc_hqx(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = as_buffer_bytes(arg_required(
+        args.first().copied().unwrap_or(PY_NULL),
+        "crc_hqx",
+        "data",
+        1,
+    )?)?;
+    let crc = arg_required(args.get(1).copied().unwrap_or(PY_NULL), "crc_hqx", "crc", 2)?;
+    let init = crate::baseobjspace::int_w(crc)? as u32;
+    Ok(w_int_new(transforms::crc_hqx(&data, init) as i64))
+}
+
+/// gateway `Signature` for an all-positional-only builtin: N appends then
+/// `marker_posonly()` gives `posonlyargcount == N`.
+fn sig_all_posonly(name: &'static str, names: &[&'static str]) -> crate::gateway::Signature {
+    let mut b = crate::SignatureBuilder {
+        name,
+        ..Default::default()
+    };
+    for n in names {
+        b.append(n);
+    }
+    b.marker_posonly();
+    b.signature()
 }
