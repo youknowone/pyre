@@ -3484,11 +3484,10 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// SizeDescr + field descrs for `W_BaseException` allocation via
 /// NewWithVtable, one set per `ExcKind`.  The vtable (`ob_type`) differs
 /// per kind (`exc_kind_to_pytype`), so each kind owns its group; the
-/// four SetField'd fields — `kind`, `w_class`, `args_w`, and
-/// `suppress_context` — share the same offsets across kinds.
-/// `w_cause`/`w_context`/… stay zeroed by
-/// GC pointer clearing (PY_NULL), matching
-/// `w_exception_new_empty`.
+/// constructor-written fields — `kind`, `w_class`, `args_w`, and
+/// `suppress_context` — share the same offsets across kinds. `w_context`
+/// is written separately by the raise lowering; the remaining pointer slots
+/// stay zeroed by GC pointer clearing (PY_NULL), matching `w_exception_new_empty`.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
     build_object_descr_group_with_def_path(
         W_BASE_EXCEPTION_SIZE,
