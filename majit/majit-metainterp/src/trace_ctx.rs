@@ -2559,7 +2559,10 @@ impl TraceCtx {
         let Some(values) = self.virtualizable_values.as_ref() else {
             return;
         };
-        if index >= info.num_static_extra_boxes || index >= values.len() {
+        // `virtualizable_values` ends with the vable identity
+        // (`virtualizable_boxes[-1]`), which is no static field's value.
+        let data_len = values.len().saturating_sub(1);
+        if index >= info.num_static_extra_boxes || index >= data_len {
             return;
         }
         if info.array_fields.iter().any(|a| {
