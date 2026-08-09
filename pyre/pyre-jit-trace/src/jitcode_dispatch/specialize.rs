@@ -12149,6 +12149,13 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     if w_globals.is_null() {
         return Ok(false);
     }
+    // Raw dict access in the inlined-callee builtins leg below is valid only
+    // for an exact plain dict or module dict.  Dict subclasses are legal exec
+    // namespaces but use a different object layout, so leave them to the live
+    // residual lookup.
+    if !unsafe { pyre_object::is_dict(w_globals) } {
+        return Ok(false);
+    }
     // `namei` is the raw `LOAD_GLOBAL` oparg; bit 0 is the push-NULL flag,
     // so the `co_names` index is `namei >> 1` (mirror `bh_load_global_fn`).
     let name_idx = (namei as usize) >> 1;

@@ -574,7 +574,10 @@ use crate::frame_layout::{PYFRAME_DEBUGDATA_OFFSET, PYFRAME_PYCODE_OFFSET};
 /// No-op when the virtualizable shadow is not seeded (non-virtualizable
 /// trace, or before `init_virtualizable_boxes`) and when only its OpRef
 /// half is live — a bridge-entry rebuild seeds no concrete values, and
-/// there is no concrete slot to mirror into.
+/// there is no concrete slot to mirror into. When a concrete slot is
+/// mirrored, pair the shadow write with `synchronize_virtualizable()`, just
+/// like `TraceCtx::vable_setfield` / RPython `_opimpl_setfield_vable`, so the
+/// live virtualizable cannot lag behind `virtualizable_boxes`.
 pub(crate) fn mirror_vable_static_to_boxes(
     ctx: &mut TraceCtx,
     static_field_name: &str,
@@ -589,6 +592,7 @@ pub(crate) fn mirror_vable_static_to_boxes(
         .and_then(|info| info.static_field_index_by_name(static_field_name));
     if let Some(idx) = idx {
         ctx.set_virtualizable_entry_at(idx, opref, concrete);
+        ctx.synchronize_virtualizable();
     }
 }
 

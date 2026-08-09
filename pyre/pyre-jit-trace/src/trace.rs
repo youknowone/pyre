@@ -5275,6 +5275,14 @@ fn loop_inlines_abort_permanent_callee(
         if root_globals.is_null() {
             return None;
         }
+        if !pyre_object::is_dict(root_globals) {
+            // A dict subclass is a legal exec namespace but does not carry the
+            // raw W_DictObject layout.  Stop the pre-emptive scan: `None` here
+            // means "could not enumerate", not "proved there is no aborting
+            // callee".  The ordinary walk remains responsible for meeting an
+            // `abort_permanent` marker.
+            return None;
+        }
         let raw_code = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const CodeObject;
         if raw_code.is_null() {
@@ -5341,6 +5349,13 @@ fn loop_inlines_abort_permanent_callee(
         }
 
         while let Some((code_ptr, globals)) = queue.pop_front() {
+            if !pyre_object::is_dict(globals) {
+                // Callee globals can likewise be an unreadable dict subclass.
+                // Abandon this conservative preflight rather than treating the
+                // skipped namespace as proof that no aborting callee exists;
+                // the ordinary walk will encounter any marker it reaches.
+                return None;
+            }
             let raw = pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef)
                 as *const CodeObject;
             if raw.is_null() {
