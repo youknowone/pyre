@@ -5599,7 +5599,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         // interp_posix.py:3061 `@unwrap_spec(pid=int)`; the
                         // timespec the call fills is answered as one float
                         // (`rposix.py:2525`).
-                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                         let mut interval: libc::timespec =
                             unsafe { core::mem::zeroed::<libc::timespec>() };
                         if unsafe { libc::sched_rr_get_interval(pid, &mut interval) } == -1 {
@@ -5626,7 +5626,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             ));
                         }
                         // interp_posix.py:3073 `@unwrap_spec(pid=int)`.
-                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                         let policy =
                             host_posix::sched_getscheduler(pid).map_err(|e| io_err(e, ""))?;
                         Ok(pyre_object::w_int_new(policy as i64))
@@ -5650,7 +5650,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         // interp_posix.py:3103 `@unwrap_spec(pid=int)`; the
                         // priority the call fills in is handed back wrapped in
                         // the type, not bare (`interp_posix.py:3113`).
-                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                         let param = host_posix::sched_getparam(pid).map_err(|e| io_err(e, ""))?;
                         Ok(crate::_structseq::new_instance(
                             sched_param_seq_type(),
@@ -5679,7 +5679,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 ));
                             }
                             // interp_posix.py:3085 `@unwrap_spec(pid=int, policy=int)`.
-                            let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                            let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                             let policy = crate::baseobjspace::int_w(args[1])? as libc::c_int;
                             let priority = sched_priority_w(args[2])?;
                             let mut param: libc::sched_param =
@@ -5706,7 +5706,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 ));
                             }
                             // interp_posix.py:3117 `@unwrap_spec(pid=int)`.
-                            let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                            let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                             let priority = sched_priority_w(args[1])?;
                             let mut param: libc::sched_param =
                                 unsafe { core::mem::zeroed::<libc::sched_param>() };
@@ -5749,7 +5749,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 "sched_getaffinity() requires 1 argument",
                             ));
                         }
-                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                         let mut mask: libc::cpu_set_t =
                             unsafe { core::mem::zeroed::<libc::cpu_set_t>() };
                         unsafe { libc::CPU_ZERO(&mut mask) };
@@ -5784,7 +5784,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 "sched_setaffinity() requires 2 arguments",
                             ));
                         }
-                        let pid = crate::baseobjspace::int_w(args[0])? as libc::pid_t;
+                        let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                         let items = crate::builtins::collect_iterable(args[1])?;
                         let int_type =
                             crate::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE);
