@@ -9374,7 +9374,8 @@ impl<M: Clone> MetaInterp<M> {
                 return None;
             }
         };
-        let expected = self.front_target_inputarg_types(green_key)?.len();
+        let types = self.front_target_inputarg_types(green_key)?;
+        let expected = types.len();
         if source_positions.len() != expected {
             if crate::callee_rca_enabled() {
                 eprintln!(
@@ -9387,7 +9388,7 @@ impl<M: Clone> MetaInterp<M> {
             return None;
         }
         let mut packed = Vec::with_capacity(source_positions.len());
-        for &source in source_positions {
+        for (slot, &source) in source_positions.iter().enumerate() {
             let Some(value) = full_live_values.get(source).copied() else {
                 if crate::callee_rca_enabled() {
                     eprintln!(
@@ -9399,6 +9400,23 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 return None;
             };
+            // The LABEL declares each argument's type, and compiled code reads a
+            // Ref slot as a pointer without checking it. A mapping that lands an
+            // Int in a Ref slot dereferences the integer, so a type disagreement
+            // is refused here rather than executed.
+            if value.get_type() != types[slot] {
+                if crate::callee_rca_enabled() {
+                    eprintln!(
+                        "[callee-rca][direct-entry-pack-detail] key={green_key} \
+                         slot={slot} source={source} value_type={:?} label_type={:?} \
+                         sources={:?}",
+                        value.get_type(),
+                        types[slot],
+                        source_positions,
+                    );
+                }
+                return None;
+            }
             packed.push(value);
         }
         Some(packed)
@@ -21369,6 +21387,120 @@ mod tests {
             meta.front_target_inputarg_types(green_key),
             Some(vec![Type::Ref, Type::Ref, Type::Ref, Type::Int])
         );
+    }
+
+    /// A `MetaInterp` holding one compiled loop whose front target LABEL takes
+    /// `(Int, Ref, Ref, Ref)`, with `source_positions` as given.
+    fn meta_with_front_label_int_ref_ref_ref(
+        green_key: u64,
+        source_positions: Option<Vec<usize>>,
+    ) -> (MetaInterp<()>, std::sync::Arc<JitCellToken>) {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let trace_id = 11;
+        let token = std::sync::Arc::new(JitCellToken::new(3));
+        let start_token = crate::history::TargetToken::new_preamble(0);
+        let start_descr = start_token.as_jump_target_descr();
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], 2),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)], 3),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[
+                    OpRef::int_op(3),
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_ref(1),
+                    OpRef::ref_op(2),
+                ],
+                OpRef::NONE.raw(),
+                start_descr,
+            ),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
+        constants.insert(100, majit_ir::Const::Int(1));
+        constants.insert(101, majit_ir::Const::Int(2));
+        let mut traces = indexmap::IndexMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+                constants,
+                exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: indexmap::IndexMap::new(),
+            },
+        );
+        meta.warm_state_mut()
+            .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&token),
+                meta: (),
+                front_target_tokens: vec![start_token],
+                front_entry_index: Some(0),
+                front_target_source_positions: source_positions,
+                root_trace_id: trace_id,
+                traces,
+                previous_tokens: Vec::new(),
+                next_global_opref: 0,
+            },
+        );
+        (meta, token)
+    }
+
+    /// The LABEL's argument order is its own, not the frontend's state-field
+    /// order, and the two can agree in length while disagreeing in position.
+    /// `aheui`'s `pi/pi.jinseo` under the cranelift backend hit exactly that:
+    /// four state values `(Int, Int, Ref, Ref)` entered a four-argument
+    /// `(Int, Ref, Ref, Ref)` LABEL, and compiled code dereferenced the second
+    /// `Int` as a pointer.
+    #[test]
+    fn test_pack_front_target_live_values_reorders_and_refuses_mismatches() {
+        let state_order = vec![
+            Value::Int(23),
+            Value::Int(2),
+            Value::Ref(majit_ir::GcRef(0x1000)),
+            Value::Ref(majit_ir::GcRef(0x2000)),
+        ];
+
+        // Sound mapping: LABEL slot i takes state value `sources[i]`. The
+        // permutation is not the identity, so a pack that silently passed its
+        // input through would fail this assert.
+        let (meta, _token) = meta_with_front_label_int_ref_ref_ref(7, Some(vec![1, 2, 3, 2]));
+        assert_eq!(
+            meta.front_target_inputarg_types(7),
+            Some(vec![Type::Int, Type::Ref, Type::Ref, Type::Ref])
+        );
+        let packed = meta
+            .pack_front_target_live_values(7, &state_order)
+            .expect("a complete, type-agreeing mapping packs");
+        assert_eq!(
+            packed,
+            vec![
+                Value::Int(2),
+                Value::Ref(majit_ir::GcRef(0x1000)),
+                Value::Ref(majit_ir::GcRef(0x2000)),
+                Value::Ref(majit_ir::GcRef(0x1000)),
+            ]
+        );
+        assert_ne!(packed, state_order, "the pack must not be a pass-through");
+
+        // Incomplete mapping: three sources for a four-argument LABEL. This is
+        // the `pi.jinseo` shape — the fourth LABEL argument is a trace-internal
+        // value with no state field behind it, so there is nothing to enter with.
+        let (meta, _token) = meta_with_front_label_int_ref_ref_ref(8, Some(vec![1, 2, 3]));
+        assert_eq!(meta.pack_front_target_live_values(8, &state_order), None);
+
+        // Right arity, wrong types: the identity mapping puts `Int(2)` in the
+        // LABEL's second slot, which is `Ref`.
+        let (meta, _token) = meta_with_front_label_int_ref_ref_ref(9, Some(vec![0, 1, 2, 3]));
+        assert_eq!(meta.pack_front_target_live_values(9, &state_order), None);
+
+        // No mapping recorded at all.
+        let (meta, _token) = meta_with_front_label_int_ref_ref_ref(10, None);
+        assert_eq!(meta.pack_front_target_live_values(10, &state_order), None);
     }
 
     #[test]

@@ -2322,34 +2322,32 @@ impl<S: JitState> JitDriver<S> {
             }
             None => None,
         };
+        // Only the compact values are already in the LABEL's argument order. The
+        // walk's full live values are in state-field order, so they get mapped
+        // here; `back_edge_internal` takes whatever it is handed as final.
         let direct_live_values = match compact_label_values {
             Some(values) => Some(values),
             None => match full_live_values {
                 Some(values) => {
-                    if let Some(expected) = self
-                        .meta
-                        .front_target_inputarg_types(key)
-                        .map(|types| types.len())
-                    {
-                        if values.len() != expected {
-                            if crate::callee_rca_enabled() {
-                                eprintln!(
-                                    "[callee-rca][direct-entry-pack] key={key} \
-                                     dispatch_key={dispatch_key} full_len={} \
-                                     label_len={expected} -> pack-in-back-edge",
-                                    values.len()
-                                );
-                            }
+                    let packed = self.meta.pack_front_target_live_values(key, &values);
+                    if crate::callee_rca_enabled() {
+                        match packed.as_ref() {
+                            Some(packed) => eprintln!(
+                                "[callee-rca][direct-entry-pack] key={key} \
+                                 dispatch_key={dispatch_key} \
+                                 source=full-live-packed full_len={} compact_len={}",
+                                values.len(),
+                                packed.len()
+                            ),
+                            None => eprintln!(
+                                "[callee-rca][direct-entry-pack] key={key} \
+                                 dispatch_key={dispatch_key} full_len={} \
+                                 source=full-live-packed -> decline",
+                                values.len()
+                            ),
                         }
                     }
-                    if crate::callee_rca_enabled() {
-                        eprintln!(
-                            "[callee-rca][direct-entry-pack] key={key} dispatch_key={dispatch_key} \
-                             source=full-compatible len={}",
-                            values.len()
-                        );
-                    }
-                    Some(values)
+                    packed
                 }
                 None => None,
             },
@@ -4186,6 +4184,10 @@ impl<S: JitState> JitDriver<S> {
             if !self.sync_before(state, &compiled_meta, descriptor.as_deref()) {
                 return None;
             }
+            // `direct_live_values` arrive already in the target LABEL's argument
+            // order; state-extracted ones are in state-field order and have to be
+            // mapped before a dispatch-key entry can use them.
+            let values_are_label_ordered = direct_live_values.is_some();
             let mut live_values = if let Some(values) = direct_live_values {
                 values
             } else {
@@ -4208,40 +4210,56 @@ impl<S: JitState> JitDriver<S> {
                 };
                 live_values
             };
-            if dispatch_key.is_some() {
-                let Some(expected) = self
+            if dispatch_key.is_some() && !values_are_label_ordered {
+                let full_len = live_values.len();
+                let Some(packed) = self
                     .meta
-                    .front_target_inputarg_types(green_key)
-                    .map(|types| types.len())
+                    .pack_front_target_live_values(green_key, &live_values)
                 else {
-                    return None;
-                };
-                if live_values.len() != expected {
-                    let full_len = live_values.len();
-                    let Some(packed) = self
-                        .meta
-                        .pack_front_target_live_values(green_key, &live_values)
-                    else {
-                        if crate::callee_rca_enabled() {
-                            eprintln!(
-                                "[callee-rca][direct-entry-pack] key={green_key} \
-                                 dispatch_key={:?} full_len={full_len} label_len={expected} \
-                                 source=front-target-source-positions -> decline",
-                                dispatch_key,
-                            );
-                        }
-                        return None;
-                    };
                     if crate::callee_rca_enabled() {
                         eprintln!(
-                            "[callee-rca][direct-entry-pack] key={green_key} dispatch_key={:?} \
-                             source=front-target-source-positions full_len={full_len} \
-                             compact_len={}",
+                            "[callee-rca][direct-entry-pack] key={green_key} \
+                             dispatch_key={:?} full_len={full_len} \
+                             source=front-target-source-positions -> decline",
                             dispatch_key,
-                            packed.len()
                         );
                     }
-                    live_values = packed;
+                    return None;
+                };
+                if crate::callee_rca_enabled() {
+                    eprintln!(
+                        "[callee-rca][direct-entry-pack] key={green_key} dispatch_key={:?} \
+                         source=front-target-source-positions full_len={full_len} \
+                         compact_len={}",
+                        dispatch_key,
+                        packed.len()
+                    );
+                }
+                live_values = packed;
+            }
+            if dispatch_key.is_some() && values_are_label_ordered {
+                // The compact values are LABEL-ordered by construction, but the
+                // same unchecked Ref dereference is downstream of them, so the
+                // types are confirmed here as well.
+                let Some(types) = self.meta.front_target_inputarg_types(green_key) else {
+                    return None;
+                };
+                if types.len() != live_values.len()
+                    || types
+                        .iter()
+                        .zip(live_values.iter())
+                        .any(|(want, value)| value.get_type() != *want)
+                {
+                    if crate::callee_rca_enabled() {
+                        eprintln!(
+                            "[callee-rca][direct-entry-pack] key={green_key} \
+                             dispatch_key={:?} source=compact-label label_types={types:?} \
+                             value_types={:?} -> decline",
+                            dispatch_key,
+                            live_values.iter().map(|v| v.get_type()).collect::<Vec<_>>(),
+                        );
+                    }
+                    return None;
                 }
             }
 
@@ -5464,29 +5482,19 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         let mut live_values = live_values;
+        // `live_values` is in state-field order; a dispatch-key entry lands on a
+        // LABEL whose arguments are its own, so the mapping runs unconditionally.
         if dispatch_key.is_some() {
-            let Some(expected) = self
+            let Some(packed) = self
                 .meta
-                .front_target_inputarg_types(green_key)
-                .map(|types| types.len())
+                .pack_front_target_live_values(green_key, &live_values)
             else {
                 return DetailedDriverRunOutcome::Abort {
                     restored: false,
                     via_blackhole: false,
                 };
             };
-            if live_values.len() != expected {
-                let Some(packed) = self
-                    .meta
-                    .pack_front_target_live_values(green_key, &live_values)
-                else {
-                    return DetailedDriverRunOutcome::Abort {
-                        restored: false,
-                        via_blackhole: false,
-                    };
-                };
-                live_values = packed;
-            }
+            live_values = packed;
         }
         pre_run();
         let result = if let Some(dispatch_key) = dispatch_key {
@@ -6715,13 +6723,12 @@ impl<S: JitState> JitDriver<S> {
         )?;
         let mut live_values = live_values;
         let mut dispatch_key = single_pass_dispatch_key;
+        // `live_values` is in state-field order; a dispatch-key entry lands on a
+        // LABEL whose arguments are its own, so the mapping runs unconditionally.
         if dispatch_key.is_some() {
-            let expected = self.meta.front_target_inputarg_types(key_hash)?.len();
-            if live_values.len() != expected {
-                live_values = self
-                    .meta
-                    .pack_front_target_live_values(key_hash, &live_values)?;
-            }
+            live_values = self
+                .meta
+                .pack_front_target_live_values(key_hash, &live_values)?;
         }
         pre_run();
 
