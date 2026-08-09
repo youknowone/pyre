@@ -6826,6 +6826,13 @@ fn loop_region_contains_escaping_range_append(
     false
 }
 
+/// Whether `PYRE_FOR_ITER_GATE_DIAG` is set. The per-opcode decline and the
+/// whole-region decline print under one flag, so they read one accessor.
+fn for_iter_gate_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some())
+}
+
 fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -6891,10 +6898,7 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
             )
             || matches!(body_instr, I::ListAppend { .. });
         if !permitted {
-            static FOR_ITER_GATE_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *FOR_ITER_GATE_DIAG
-                .get_or_init(|| std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some())
-            {
+            if for_iter_gate_diag_enabled() {
                 eprintln!(
                     "[for-iter-gate-opcode] code={} source={} for_iter_pc={pc} body_pc={body_pc} opcode={body_instr:?}",
                     code.qualname, code.source_path
@@ -7432,11 +7436,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
             code as *const _ as usize,
             DENIAL,
         );
-        static FOR_ITER_GATE_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if first_decline
-            && *FOR_ITER_GATE_DIAG
-                .get_or_init(|| std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some())
-        {
+        if first_decline && for_iter_gate_diag_enabled() {
             eprintln!(
                 "[for-iter-gate-decline] code={} source={} predicate={DENIAL}",
                 code.qualname, code.source_path
