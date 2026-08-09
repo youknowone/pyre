@@ -122,6 +122,18 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// Writing the fields individually instead lands the header's own `ob_type`
 /// slot at offset 0, which the wasm backend does not lower faithfully.
 ///
+/// The boundary is a deviation from `wrapint`
+/// (`objspace/std/intobject.py`), which keeps its allocation inline — its own
+/// comment there notes the function is inlined into every caller. The
+/// orthodox lowering is `new_with_vtable`, which stays in the trace and can be
+/// optimised away where the box does not escape. `fuse_boxing_alloc`
+/// (`majit-translate` `model.rs`) rewrites exactly this ctor-plus-`FieldWrite`
+/// shape into `NewWithVtable`, but instrumented over this tree it fires
+/// nowhere: all 134 candidate sites report the vtable unresolved, because
+/// `resolve_vtable_addr` reads `HostStaticAddrs.pytypes` and that table is
+/// empty in the build-script pipeline the pass runs in. Drop the boundary
+/// once the fusion resolves a vtable there.
+///
 /// Spelled `*mut PyObject` rather than `PyObjectRef` so the attribute emits
 /// its `extern "C"` call trampoline: the macro recognises raw pointers
 /// syntactically and declines to emit one for an aliased return type.
