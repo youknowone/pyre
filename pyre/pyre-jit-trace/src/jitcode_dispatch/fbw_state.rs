@@ -947,6 +947,29 @@ mod foriter_delivery_tests {
 
         fbw_store_journal_reset();
     }
+
+    #[test]
+    fn deferred_inline_abort_is_free_only_until_the_body_commits() {
+        fbw_store_journal_reset();
+        let callee = 0x1234usize;
+        let _guard = ForiterDeferredInlineGuard::enter(callee, true);
+        let item = 1usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+
+        // Nothing committed yet: discarding the walk costs nothing, so the arm
+        // owns the abort and names the callee to deny.
+        assert_eq!(fbw_foriter_deferred_inline_outermost(), Some(callee));
+        assert_eq!(fbw_foriter_deferred_inline_with_free_abort(), Some(callee));
+
+        // A residual wrote live heap for this iteration.  The rollback the abort
+        // falls back to cannot undo that, so the arm must step aside — taking it
+        // would replay the body over the mutated heap.
+        fbw_mark_foriter_body_effect_since_consume();
+        assert_eq!(fbw_foriter_deferred_inline_outermost(), Some(callee));
+        assert_eq!(fbw_foriter_deferred_inline_with_free_abort(), None);
+
+        fbw_store_journal_reset();
+    }
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push
@@ -1449,6 +1472,23 @@ fn fbw_foriter_deferred_inline_outermost() -> Option<usize> {
     FBW_FORITER_DEFERRED_INLINE.with(|c| c.borrow().first().copied())
 }
 
+/// [`fbw_foriter_deferred_inline_outermost`], restricted to the case where
+/// aborting the walk is still free.
+///
+/// The `DeferredCall` abort's whole justification is that discarding the walk
+/// costs nothing: the body re-runs in the interpreter and produces the same
+/// state.  That holds only while the body has committed nothing since its
+/// `FOR_ITER` consume.  Once a residual has written live heap, the rollback the
+/// abort falls back to cannot undo it and the replay re-runs the body on top of
+/// it, so taking the abort DOES the double it exists to prevent.
+///
+/// [`fbw_foriter_any_body_effect_signal`] is the same predicate
+/// [`fbw_foriter_inflight_take`] refuses delivery on, for the same reason, so
+/// the two agree by construction.
+fn fbw_foriter_deferred_inline_with_free_abort() -> Option<usize> {
+    fbw_foriter_deferred_inline_outermost().filter(|_| !fbw_foriter_any_body_effect_signal())
+}
+
 pub(crate) fn fbw_foriter_deferred_call_denied(callee_code_key: usize) -> bool {
     FBW_FORITER_DEFERRED_DENY.with(|c| c.borrow().contains(&callee_code_key))
 }
@@ -1537,11 +1577,21 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // stands on the promise that the sub-walk commits nothing: the static scan
     // cleared every direct heap write, leaving only Python-level CALL residuals
     // whose callee the lever resolves here.  One that did not inline breaks the
-    // promise, so abort BEFORE it executes — every op the sub-walk has run so
-    // far is write-free, so the resume re-runs the body benignly.  Denying the
-    // admitted callee makes the next attempt decline it statically, so this
-    // costs one abort per callee rather than an abort per trace attempt.
-    let foriter_deferred_inline = fbw_foriter_deferred_inline_outermost();
+    // promise, so abort BEFORE it executes and deny the admitted callee, which
+    // makes the next attempt decline it statically — one abort per callee rather
+    // than an abort per trace attempt.
+    //
+    // That abort is sound only while discarding the walk is free, which is a
+    // claim about runtime state rather than about the scan, so
+    // [`fbw_foriter_deferred_inline_with_free_abort`] tests it instead of
+    // assuming it.  The scan clears direct heap writes, not the residual CALLs
+    // it leaves behind, and one of those can mutate live heap before the one
+    // that fails to inline is reached; once it has, the rollback the abort falls
+    // back to cannot undo it and the replay re-runs the body on top of it.  With
+    // the premise broken the general depth-≥2 nested-residual rule below applies
+    // instead, and the residual executes the way `do_residual_call` runs it at
+    // any framestack depth (`pyjitpl.py`).
+    let foriter_deferred_inline = fbw_foriter_deferred_inline_with_free_abort();
     // Narrowed decline: the general depth-≥2 nested
     // residual inline is sound now that the portal-runner ABI is correct — a
     // straight-line mutating callee inlines bit-exact.  Only two callee shapes
