@@ -1178,33 +1178,24 @@ impl W_Struct {
         do_unpack(fmt, buf)
     }
 
-    /// `interp_struct.py:231 descr_pack_into` —
-    /// `do_pack_into(space, jit.promote_string(self.format), buffer, offset, args_w)`.
-    /// Whole-args ABI: `args[0]` = self, `args[1]` = buffer, `args[2]` =
-    /// offset, `args[3..]` = the packed values.
-    fn pack_into(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        self.ensure_ready()?;
-        let format = majit_metainterp::jit::promote_string(self.format);
-        let fmt = unsafe { w_str_get_value(format) };
-        let (pos, _) = crate::builtins::split_builtin_kwargs(&args[1..]);
-        if pos.len() < 2 {
-            return Err(crate::PyError::type_error(
-                "pack_into() missing buffer or offset argument",
-            ));
-        }
-        let offset = unsafe { crate::builtins::space_index_w(pos[1])? };
-        do_pack_into(fmt, pos[0], offset, &pos[2..])
-    }
-
-    /// `interp_struct.py:238 descr_unpack_from` —
+    /// `interp_struct.py:275 descr_unpack_from(self, w_buffer, offset=0)` —
     /// `do_unpack_from(space, jit.promote_string(self.format), buffer, offset)`.
-    /// `buffer` / `offset` are accepted positionally or by keyword.
-    fn unpack_from(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    /// `self` positional-only; `buffer` / `offset` positional-or-keyword.
+    /// `offset` is `Option` so an omitted slot becomes `0` while an explicit
+    /// `offset=None` reaches `space_index_w` and raises.
+    fn unpack_from(
+        &self,
+        buffer: PyObjectRef,
+        offset: Option<PyObjectRef>,
+    ) -> Result<PyObjectRef, crate::PyError> {
         self.ensure_ready()?;
         let format = majit_metainterp::jit::promote_string(self.format);
         let fmt = unsafe { w_str_get_value(format) };
-        let (buffer, offset) = resolve_buffer_offset(&args[1..])?;
         let buf = unsafe { readbuf(buffer)? };
+        let offset = match offset {
+            Some(o) => unsafe { crate::builtins::space_index_w(o)? },
+            None => 0,
+        };
         do_unpack_from(fmt, buf, offset)
     }
 
@@ -1227,26 +1218,73 @@ impl W_Struct {
     }
 }
 
-/// Resolve `(buffer, offset=0)` from a positional/keyword argument slice
-/// (`unpack_from` accepts both `buffer=` and `offset=`).
-fn resolve_buffer_offset(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let buffer = pos
-        .first()
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "buffer"))
-        .ok_or_else(|| {
-            crate::PyError::type_error("unpack_from() missing required argument 'buffer'")
-        })?;
-    let offset = match pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "offset"))
-    {
-        Some(o) => unsafe { crate::builtins::space_index_w(o)? },
-        None => 0,
+/// gateway `Signature` for a builtin whose named parameters are all
+/// positional-only followed by a `*args` tail: N appends then
+/// `marker_posonly()` gives `posonlyargcount == N`, and `varargname`
+/// records the tail.  With no keyword-only slot and `posonly ==
+/// n_pos_params`, a stray keyword is rejected as "() takes no keyword
+/// arguments" before the tail is packed (`bind_kwargs_to_signature`).
+fn sig_posonly_then_varargs(
+    name: &'static str,
+    names: &[&'static str],
+    varargname: &'static str,
+) -> crate::gateway::Signature {
+    let mut b = crate::SignatureBuilder {
+        name,
+        varargname: Some(varargname),
+        ..Default::default()
     };
-    Ok((buffer, offset))
+    for n in names {
+        b.append(n);
+    }
+    b.marker_posonly();
+    b.signature()
+}
+
+/// `interp_struct.py:66 pack(space, w_format, args_w)`.  The binder hands a
+/// bound slice `[format, (*args tuple)]`: the named `format` slot then the
+/// packed vararg tail as a single tuple.  A stray keyword is rejected by the
+/// binder before the body runs (`posonlyargcount == 1`, no `**kwargs`).  The
+/// binder pads an absent positional with `PY_NULL` rather than raising, so the
+/// required `format` slot is checked here.
+fn pack(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args[0].is_null() {
+        return Err(crate::PyError::type_error("missing format argument"));
+    }
+    let fmt = format_to_string(args[0])?;
+    let values = unsafe { w_tuple_items_copy_as_vec(args[1]) };
+    do_pack(&fmt, &values)
+}
+
+/// `interp_struct.py:76 pack_into(space, w_format, w_buffer, offset, args_w)`.
+/// Bound slice `[format, buffer, offset, (*args tuple)]`.  As with [`pack`],
+/// the three required positional slots are `PY_NULL`-checked here.
+fn pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+        return Err(crate::PyError::type_error(
+            "pack_into() missing format, buffer or offset argument",
+        ));
+    }
+    let fmt = format_to_string(args[0])?;
+    let offset = unsafe { crate::builtins::space_index_w(args[2])? };
+    let values = unsafe { w_tuple_items_copy_as_vec(args[3]) };
+    do_pack_into(&fmt, args[1], offset, &values)
+}
+
+/// `interp_struct.py:268 descr_pack_into(self, w_buffer, offset, args_w)` —
+/// the `Struct` method form.  Bound slice `[self, buffer, offset,
+/// (*args tuple)]`.  Registered by hand (below) because the
+/// `#[pyre_methods]` arm cannot emit a `varargname`-bearing `Signature` for a
+/// `&[PyObjectRef]` method.
+fn struct_pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let this = W_Struct::from_obj(args[0])
+        .ok_or_else(|| crate::PyError::type_error("descriptor 'pack_into' got wrong receiver"))?;
+    this.ensure_ready()?;
+    let format = majit_metainterp::jit::promote_string(this.format);
+    let fmt = unsafe { w_str_get_value(format) };
+    let offset = unsafe { crate::builtins::space_index_w(args[2])? };
+    let values = unsafe { w_tuple_items_copy_as_vec(args[3]) };
+    do_pack_into(fmt, args[1], offset, &values)
 }
 
 // ── W_UnpackIter ─────────────────────────────────────────────────────
@@ -1469,51 +1507,27 @@ crate::py_module! {
             let buf = unsafe { readbuf(buffer)? };
             do_unpack(&fmt, buf)
         }
+        // `interp_struct.py:154 unpack_from(space, w_format, w_buffer, offset=0)`.
+        // `format` positional-only; `buffer` / `offset` positional-or-keyword.
+        // `offset` is `Option` rather than `#[default]` so an omitted slot
+        // (`None`) becomes `0` while an explicit `offset=None` reaches
+        // `space_index_w` and raises the "cannot be interpreted as an integer"
+        // TypeError.
+        fn unpack_from(
+            fmt_obj: PyObjectRef,
+            #[posonly] buffer: PyObjectRef,
+            offset: Option<PyObjectRef>,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let fmt = format_to_string(fmt_obj)?;
+            let buf = unsafe { readbuf(buffer)? };
+            let offset = match offset {
+                Some(o) => unsafe { crate::builtins::space_index_w(o)? },
+                None => 0,
+            };
+            do_unpack_from(&fmt, buf, offset)
+        }
     },
     functions: {
-        // `pack(fmt, *args)` — variadic positional after fmt; route
-        // through the args slice (typed varargs are not supported by
-        // inline_functions arity inference).
-        "pack" / * = |args| {
-            let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            if crate::builtins::has_real_kwargs(kwargs) {
-                return Err(crate::PyError::type_error(
-                    "_struct.pack() takes no keyword arguments",
-                ));
-            }
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("missing format argument"));
-            }
-            let fmt = format_to_string(args[0])?;
-            do_pack(&fmt, &args[1..])
-        },
-        // `pack_into(fmt, buffer, offset, *args)` — write the packed bytes
-        // into a writable buffer at `offset`.
-        "pack_into" / * = |args| {
-            let (pos, _) = crate::builtins::split_builtin_kwargs(args);
-            if pos.len() < 3 {
-                return Err(crate::PyError::type_error(
-                    "pack_into() missing format, buffer or offset argument",
-                ));
-            }
-            let fmt = format_to_string(pos[0])?;
-            let offset = unsafe { crate::builtins::space_index_w(pos[2])? };
-            do_pack_into(&fmt, pos[1], offset, &pos[3..])
-        },
-        // `unpack_from(fmt, /, buffer, offset=0)` — `buffer` / `offset`
-        // are accepted positionally or by keyword.
-        "unpack_from" / * = |args| {
-            let (pos, _) = crate::builtins::split_builtin_kwargs(args);
-            if pos.is_empty() {
-                return Err(crate::PyError::type_error(
-                    "unpack_from() missing required argument 'format'",
-                ));
-            }
-            let fmt = format_to_string(pos[0])?;
-            let (buffer, offset) = resolve_buffer_offset(&args[1..])?;
-            let buf = unsafe { readbuf(buffer)? };
-            do_unpack_from(&fmt, buf, offset)
-        },
         // `iter_unpack(fmt, buffer)` — an iterator over the records.
         "iter_unpack" / 2 = |args| {
             let fmt = format_to_string(args[0])?;
@@ -1532,5 +1546,68 @@ crate::py_module! {
             base,
         );
         crate::module_ns_store(ns, "error", error);
+        // `interp_struct.py:66 pack(w_format, args_w)` and
+        // `interp_struct.py:76 pack_into(w_format, w_buffer, offset, args_w)`
+        // — `*args`-carrying builtins whose named parameters are all
+        // positional-only.  The `inline_functions:` / `functions:` arms cannot
+        // emit a `varargname`-bearing `Signature` (a `&[PyObjectRef]` slice
+        // suppresses the signature), so both are registered by hand with a
+        // vararg `Signature`.  `has_vararg()` forces `HOPELESS`, routing the
+        // positional path through the binder, which packs the excess
+        // positionals into the tuple the body reads.
+        crate::module_ns_store(
+            ns,
+            "pack",
+            crate::gateway::with_module(
+                "_struct",
+                crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                    "pack",
+                    pack,
+                    crate::HOPELESS,
+                    Some(sig_posonly_then_varargs("pack", &["format"], "args")),
+                ),
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "pack_into",
+            crate::gateway::with_module(
+                "_struct",
+                crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                    "pack_into",
+                    pack_into,
+                    crate::HOPELESS,
+                    Some(sig_posonly_then_varargs(
+                        "pack_into",
+                        &["format", "buffer", "offset"],
+                        "args",
+                    )),
+                ),
+            ),
+        );
+        // `interp_struct.py:268 descr_pack_into(self, w_buffer, offset, args_w)`
+        // — the `*args` method form.  The `#[pyre_methods]` arm gives a
+        // `&[PyObjectRef]` method a null `Signature` (raw whole-args
+        // passthrough), so it is registered by hand into the `Struct` type
+        // dict with a vararg `Signature` (`self` + two positional-only slots +
+        // `*args`).  `type_object()` is idempotent (`OnceLock`); the
+        // `interpleveldefs` entry has already built the type.
+        let struct_type = type_object();
+        let struct_dict = unsafe { pyre_object::w_type_get_dict_ptr(struct_type) } as PyObjectRef;
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                struct_dict,
+                "pack_into",
+                crate::make_builtin_function_maybe_sig(
+                    "pack_into",
+                    struct_pack_into,
+                    Some(sig_posonly_then_varargs(
+                        "pack_into",
+                        &["self", "buffer", "offset"],
+                        "args",
+                    )),
+                ),
+            );
+        }
     },
 }

@@ -102,3 +102,19 @@ assert struct.unpack("0p", b"") == (b"",)
 unpack_iterator_type = type(struct.iter_unpack("B", b""))
 with assert_raises(TypeError):
     unpack_iterator_type()
+
+# unpack_from accepts buffer / offset positionally or by keyword.
+_buf = struct.pack("ii", 111, 222)
+assert struct.unpack_from("ii", _buf, offset=0) == (111, 222)
+assert struct.unpack_from("ii", buffer=_buf, offset=0) == (111, 222)
+_s = struct.Struct("ii")
+assert _s.unpack_from(_buf, offset=0) == (111, 222)
+assert _s.unpack_from(buffer=_buf) == (111, 222)
+
+# pack / pack_into (module and method) reject keyword arguments.
+with assert_raises(TypeError):
+    struct.pack(format="ii")
+with assert_raises(TypeError):
+    struct.pack_into("ii", bytearray(8), 0, 1, 2, extra=3)
+with assert_raises(TypeError):
+    _s.pack_into(bytearray(8), 0, 1, 2, extra=3)
