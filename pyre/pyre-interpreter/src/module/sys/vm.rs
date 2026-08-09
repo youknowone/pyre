@@ -1287,15 +1287,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if ec.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            // Force the frame `topframeref` names before walking.  Kept where
-            // [`getframe`] no longer has it: this walk takes no force on the
-            // frame it ENDS at and then reads that frame's `w_globals`, so
-            // whether the force belongs here at all is a separate question from
-            // the one settled above.
-            let mut current = unsafe {
-                (*ec).gettopframe();
-                (*ec).gettopframe_nohidden()
-            };
+            let mut current = unsafe { (*ec).gettopframe_nohidden() };
             // `while (f && (_PyFrame_IsIncomplete(f) || depth-- > 0))` — the
             // post-decrement test fails immediately for a negative depth, so a
             // negative walks zero frames and reports the current module rather
@@ -1308,6 +1300,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if current.is_null() {
                 return Ok(pyre_object::w_none());
             }
+            // `w_globals` is one of the six fields `interp_jit.py:25-30`
+            // declares virtualizable, so the frame it is read off has to be
+            // materialized first.  The force belongs HERE, at the consumer, and
+            // not at the walk that reached the frame — see [`force_frame`]:
+            // forcing a walk escapes the traced virtualizable and
+            // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
+            crate::executioncontext::force_frame(current);
             let w_globals = unsafe { (*current).w_globals };
             if w_globals.is_null() {
                 return Ok(pyre_object::w_none());
