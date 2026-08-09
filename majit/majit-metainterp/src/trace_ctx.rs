@@ -2544,6 +2544,41 @@ impl TraceCtx {
         }
     }
 
+    /// `_opimpl_setfield_vable`'s `synchronize_virtualizable()` half
+    /// (`pyjitpl.py:1188-1199`, `virtualizable.py write_boxes`), narrowed to
+    /// the one static just written because the shadow's array half carries
+    /// NULL operand slots mid-opcode that a full `write_all_boxes` would stamp
+    /// into the live frame.
+    pub fn synchronize_virtualizable_static(&self, index: usize) {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+            return;
+        };
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        let Some(values) = self.virtualizable_values.as_ref() else {
+            return;
+        };
+        if index >= info.num_static_extra_boxes || index >= values.len() {
+            return;
+        }
+        if info.array_fields.iter().any(|a| {
+            matches!(
+                a.storage,
+                crate::virtualizable::VableArrayStorage::RustVec { .. }
+            )
+        }) {
+            return;
+        }
+        let value = values[index];
+        if value == Value::Ref(majit_ir::GcRef::NO_CONCRETE) {
+            return;
+        }
+        unsafe {
+            info.write_field(heap_ptr as *mut u8, index, value_to_raw_bits(value));
+        }
+    }
+
     /// pyjitpl.py:3463-3468 `check_synchronized_virtualizable()`, whose body is
     /// `virtualizable.py:157-170 check_boxes`.
     ///

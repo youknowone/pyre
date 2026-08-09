@@ -2892,6 +2892,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
     // the outer walk's mirror and a sub-walk never advances it.
     let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
+    let mut saved_last_instr_shadow: Option<(OpRef, Value)> = None;
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -2908,17 +2909,25 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // concrete store, publishing onto the callee's own frame instead.
         if current_inline_concrete_frame() == 0 {
             let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
+            // Scope the box half to the residual just as
+            // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
+            // leaves both halves equal (`pyjitpl.py:1188-1199`), and
+            // `check_synchronized_virtualizable` asserts that invariant
+            // (`pyjitpl.py:3463-3468`).
+            if let Some(idx) = info.static_field_index_by_name("last_instr")
+                && let Some((prev_op, prev_val)) = ctx.trace_ctx.virtualizable_entry_at(idx)
+            {
+                saved_last_instr_shadow = Some((prev_op, prev_val));
+            }
             crate::trace_opcode::mirror_vable_static_to_boxes(
                 ctx.trace_ctx,
                 "last_instr",
                 last_instr,
                 majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
             );
-            // …and the heap half of the same `_opimpl_setfield_vable` shape
-            // (`virtualizable_boxes[index] = valuebox; synchronize_virtualizable()`
-            // — the mirror above is only the box half, and writes the trace's
-            // shadow, never the frame).  The same constant feeds both so the
-            // shadow and the heap cannot disagree.
+            // Record the runtime heap half of the same `_opimpl_setfield_vable`
+            // shape.  The mirror above synchronizes the tracing-time shadow
+            // and live frame; this store keeps compiled execution paired too.
             //
             // Upstream needs neither at a residual call: its frame readers are
             // traced in and read `last_instr` off the virtual frame.  pyre
@@ -3147,6 +3156,20 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let forced = unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
         if let Some(depth) = vable_root_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+        }
+        // Match `LiveLastInstrGuard` by restoring both halves after the
+        // residual.  A force is excluded because the callee made the heap
+        // authoritative and its escape walk reloads the shadow; restoring a
+        // pre-force value would violate `_opimpl_setfield_vable`'s equality
+        // (`pyjitpl.py:1188-1199`) checked by
+        // `check_synchronized_virtualizable` (`pyjitpl.py:3463-3468`).
+        if !forced && let Some((prev_op, prev_val)) = saved_last_instr_shadow.take() {
+            crate::trace_opcode::mirror_vable_static_to_boxes(
+                ctx.trace_ctx,
+                "last_instr",
+                prev_op,
+                prev_val,
+            );
         }
         if forced {
             disarm_folded_inline_callee_after_escape(ctx, op_pc)?;
