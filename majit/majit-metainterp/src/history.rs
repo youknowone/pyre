@@ -2052,18 +2052,28 @@ mod tests {
         assert_eq!(cut.ops[1].arg(0).to_opref(), iop(1)); // v1 → prefix idx 0 → BoxInt at position 1
     }
 
-    /// Build a one-frame snapshot whose virtualizable array is `vable`.
-    fn snapshot_with_vable(
-        vable: Vec<crate::recorder::SnapshotTagged>,
+    /// Build a one-frame snapshot whose frame-live array is `boxes`.
+    ///
+    /// These are the frame's locals and operand stack — `_list_of_boxes`
+    /// (`opencoder.py:712-716`), consumed by `_prepare_next_section` — and the
+    /// array the dropped call operand actually lived in. `vable_boxes` and
+    /// `vref_boxes` are left empty on purpose: they are not interchangeable
+    /// with frame-live slots. `consume_virtualizable_boxes` reads slot zero as
+    /// the virtualizable ITSELF and sizes the rest against it
+    /// (`resume.py:1088-1091`), and `consume_virtualref_boxes` hands its pairs
+    /// to `continue_tracing`, so putting an operand-stack value there would
+    /// exercise a shape the recorder cannot produce.
+    fn snapshot_with_frame_boxes(
+        boxes: Vec<crate::recorder::SnapshotTagged>,
     ) -> crate::recorder::Snapshot {
         crate::recorder::Snapshot {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: 0,
                 py_pc: 0,
-                boxes: Vec::new(),
+                boxes,
             }],
-            vable_boxes: vable,
+            vable_boxes: Vec::new(),
             vref_boxes: Vec::new(),
         }
     }
@@ -2089,7 +2099,7 @@ mod tests {
         let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
         op2.pos.set(vop(4));
         ops.push(op2);
-        let snapshots = vec![snapshot_with_vable(vec![
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
         ])];
         let trace = TreeLoop::with_snapshots(inputargs, ops, snapshots);
@@ -2105,7 +2115,7 @@ mod tests {
 
         // The add is re-emitted as a prefix op, and the snapshot slot names it.
         assert_eq!(cut.ops[0].opcode, OpCode::IntAdd);
-        let slot = cut.snapshots[0].vable_boxes[0];
+        let slot = cut.snapshots[0].frames[0].boxes[0];
         let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
             panic!("snapshot slot lost its box: {slot:?}");
         };
@@ -2132,7 +2142,7 @@ mod tests {
         let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
         op2.pos.set(vop(3));
         ops.push(op2);
-        let snapshots = vec![snapshot_with_vable(vec![
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
         ])];
         let trace = TreeLoop::with_snapshots(inputargs, ops, snapshots);
@@ -2144,7 +2154,7 @@ mod tests {
         assert!(
             cut.is_none(),
             "expected the cut to be declined, got a trace whose snapshot slot is {:?}",
-            cut.map(|c| c.snapshots[0].vable_boxes[0]),
+            cut.map(|c| c.snapshots[0].frames[0].boxes[0]),
         );
     }
 
@@ -2174,7 +2184,7 @@ mod tests {
         let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
         op2.pos.set(vop(4));
         ops.push(op2);
-        let snapshots = vec![snapshot_with_vable(vec![
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
         ])];
         let trace = TreeLoop::with_snapshots(inputargs, ops, snapshots);
@@ -2216,7 +2226,7 @@ mod tests {
             op1.rd_resume_position.set(0);
             let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
             op2.pos.set(vop(3));
-            let snapshots = vec![snapshot_with_vable(vec![
+            let snapshots = vec![snapshot_with_frame_boxes(vec![
                 crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
             ])];
             let trace = TreeLoop::with_snapshots(inputargs, vec![op0, op1, op2], snapshots);
@@ -2227,7 +2237,7 @@ mod tests {
             assert!(
                 cut.is_none(),
                 "{opcode:?} was admitted for re-emission; snapshot slot is {:?}",
-                cut.map(|c| c.snapshots[0].vable_boxes[0]),
+                cut.map(|c| c.snapshots[0].frames[0].boxes[0]),
             );
         }
     }
