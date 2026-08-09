@@ -810,13 +810,30 @@ impl TreeLoop {
         // extra observable call is worse than the NULL slot it would repair.
         // Allocation (`NewWithVtable`) IS re-emitted: resume already hands a
         // virtual a fresh object, and the boxed operands this recovers are
-        // compared by value. A pre-cut ORIGINAL inputarg has no definition to
-        // re-execute — phase 4 maps it to its pool constant — so it is a leaf.
+        // compared by value.
+        //
+        // A pre-cut ORIGINAL inputarg has no definition to re-execute, so it is
+        // a leaf — but only phase 4's pool-constant arm can actually deliver
+        // one. Its other arm appends the inputarg to the new entry contract, and
+        // `patch_new_loop_to_load_virtualizable_fields` requires that list to be
+        // exactly the red args followed by the virtualizable's static fields and
+        // array items, asserting it (`compile.py:458`). A snapshot's frame boxes
+        // ARE the frame's locals, so seeding from snapshots reaches original
+        // inputargs constantly where operand seeding reached them rarely. Test
+        // the same predicate phase 4 branches on, and refuse the root when the
+        // constant is absent: a widened entry contract crashes the compile,
+        // which is worse than the NULL slot it would repair.
         let snapshot_cone_is_reemittable = |root: &OpRef| -> bool {
             let mut seen: IndexSet<OpRef> = IndexSet::new();
             let mut stack: Vec<OpRef> = vec![*root];
             while let Some(r) = stack.pop() {
-                if r.raw() < num_original_inputargs || !seen.insert(r) {
+                if r.raw() < num_original_inputargs {
+                    if inputarg_consts.get(r.raw() as usize).is_none() {
+                        return false;
+                    }
+                    continue;
+                }
+                if !seen.insert(r) {
                     continue;
                 }
                 let Some(op) = self.ops.get((r.raw() - num_original_inputargs) as usize) else {
@@ -2069,6 +2086,57 @@ mod tests {
             r.is_none(),
             "expected the unmapped NONE fallback, got {r:?}"
         );
+    }
+
+    #[test]
+    fn test_cut_trace_from_snapshot_seed_does_not_widen_the_entry_contract() {
+        // A snapshot's frame boxes are the frame's locals, so a snapshot root's
+        // cone reaches original inputargs that no post-cut argument names. Phase
+        // 4 can only deliver such an inputarg from a pool constant; without one
+        // it appends an extra inputarg, and
+        // `patch_new_loop_to_load_virtualizable_fields` asserts the list is
+        // exactly the red args plus the virtualizable's fields
+        // (`compile.py:458`) — `test.test_collections` and `test.test_urlparse`
+        // crashed there with `assert i == len(inputargs) failed (18 != 19)`.
+        // Refuse the root instead; the slot keeps the NONE it has today.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut ops = Vec::new();
+        // v2 = int_add(v0, v1) — pre-cut, named by nothing after the cut.
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        op0.pos.set(iop(2));
+        ops.push(op0);
+        let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        op1.pos.set(vop(3));
+        op1.rd_resume_position.set(0);
+        ops.push(op1);
+        let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        op2.pos.set(vop(4));
+        ops.push(op2);
+        let snapshots = vec![snapshot_with_vable(vec![
+            crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
+        ])];
+        let trace = TreeLoop::with_snapshots(inputargs, ops, snapshots);
+
+        // v1 is deliberately NOT an original box, and `cut_trace_from` passes an
+        // empty constant pool, so phase 4 would have to invent an inputarg.
+        let start = TreeLoopCutPosition::new(1);
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+        let cut = trace.cut_trace_from(start, &original_boxes);
+
+        assert_eq!(
+            cut.inputargs.len(),
+            original_boxes.len(),
+            "the cut invented an inputarg the virtualizable expansion cannot account for"
+        );
+        assert!(
+            cut.ops.iter().all(|o| o.opcode != OpCode::IntAdd),
+            "a root whose cone needs an undeliverable inputarg was re-emitted"
+        );
+        let slot = cut.snapshots[0].vable_boxes[0];
+        let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
+            panic!("unexpected snapshot slot shape: {slot:?}");
+        };
+        assert!(r.is_none(), "expected the unmapped NONE fallback, got {r:?}");
     }
 
     // ══════════════════════════════════════════════════════════════════
