@@ -4265,6 +4265,33 @@ fn install_functional_entry(ns: PyObjectRef, name: &'static str, value: PyObject
     unsafe { pyre_object::w_dict_setitem_str(ns, name, value) };
 }
 
+/// CPython 3.14's Argument Clinic signature shared by the functional iterator
+/// `tp_new` wrappers. PyPy's GatewayCache likewise attaches the generated text
+/// signature after constructing the builtin carrier.
+fn make_functional_new_descr(
+    function: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+) -> PyObjectRef {
+    let descr = make_new_descr(function);
+    unsafe {
+        crate::function::fset_func_text_signature(descr, w_str_new("($type, *args, **kwargs)"))
+    };
+    descr
+}
+
+fn make_functional_method(name: &'static str, function: DunderFn, arity: u16) -> PyObjectRef {
+    let text_signature = if arity == 1 {
+        "($self, /)"
+    } else {
+        "($self, object, /)"
+    };
+    crate::gateway::make_builtin_function_with_arity_and_text_signature(
+        name,
+        function,
+        arity,
+        text_signature,
+    )
+}
+
 /// PyPy `functional.py W_Enumerate.typedef`.
 fn init_enumerate_type(ns: PyObjectRef) {
     install_functional_entry(
@@ -4274,21 +4301,25 @@ fn init_enumerate_type(ns: PyObjectRef) {
             "Return an enumerate object.\n\n  iterable\n    an object supporting iteration\n\nThe enumerate object yields pairs containing a count (from start, which\ndefaults to zero) and a value yielded by the iterable argument.\n\nenumerate is useful for obtaining an indexed list:\n    (0, seq[0]), (1, seq[1]), (2, seq[2]), ...",
         ),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(enumerate_descr_new));
+    install_functional_entry(
+        ns,
+        "__new__",
+        make_functional_new_descr(enumerate_descr_new),
+    );
     install_functional_entry(
         ns,
         "__iter__",
-        make_builtin_function_with_arity("__iter__", crate::baseobjspace::enumerate_iter_method, 1),
+        make_functional_method("__iter__", crate::baseobjspace::enumerate_iter_method, 1),
     );
     install_functional_entry(
         ns,
         "__next__",
-        make_builtin_function_with_arity("__next__", crate::baseobjspace::enumerate_next_method, 1),
+        make_functional_method("__next__", crate::baseobjspace::enumerate_next_method, 1),
     );
     install_functional_entry(
         ns,
         "__reduce__",
-        make_builtin_function_with_arity(
+        make_functional_method(
             "__reduce__",
             crate::baseobjspace::enumerate_reduce_method,
             1,
@@ -4297,10 +4328,14 @@ fn init_enumerate_type(ns: PyObjectRef) {
     install_functional_entry(
         ns,
         "__class_getitem__",
-        pyre_object::function::w_classmethod_new(make_builtin_function(
-            "__class_getitem__",
-            crate::_pypy_generic_alias::generic_alias_class_getitem,
-        )),
+        pyre_object::function::w_classmethod_new(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+                2,
+                "($type, object, /)",
+            ),
+        ),
     );
 }
 
@@ -4311,7 +4346,7 @@ fn init_reversed_type(ns: PyObjectRef) {
         "__doc__",
         w_str_new("Return a reverse iterator over the values of the given sequence."),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(reversed_descr_new));
+    install_functional_entry(ns, "__new__", make_functional_new_descr(reversed_descr_new));
     for (name, function, arity) in [
         (
             "__iter__",
@@ -4331,11 +4366,7 @@ fn init_reversed_type(ns: PyObjectRef) {
             2,
         ),
     ] {
-        install_functional_entry(
-            ns,
-            name,
-            make_builtin_function_with_arity(name, function, arity),
-        );
+        install_functional_entry(ns, name, make_functional_method(name, function, arity));
     }
 }
 
@@ -4348,7 +4379,7 @@ fn init_map_type(ns: PyObjectRef) {
             "map(func, *iterables) --> map object\n\nMake an iterator that computes the function using arguments from\neach of the iterables.  Stops when the shortest iterable is exhausted.",
         ),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(map_descr_new));
+    install_functional_entry(ns, "__new__", make_functional_new_descr(map_descr_new));
     for (name, function, arity) in [
         (
             "__iter__",
@@ -4359,11 +4390,7 @@ fn init_map_type(ns: PyObjectRef) {
         ("__reduce__", crate::baseobjspace::map_reduce_method, 1),
         ("__setstate__", crate::baseobjspace::map_setstate_method, 2),
     ] {
-        install_functional_entry(
-            ns,
-            name,
-            make_builtin_function_with_arity(name, function, arity),
-        );
+        install_functional_entry(ns, name, make_functional_method(name, function, arity));
     }
 }
 
@@ -4376,7 +4403,7 @@ fn init_filter_type(ns: PyObjectRef) {
             "filter(function or None, iterable) --> filter object\n\nReturn an iterator yielding those items of iterable for which function(item)\nis true. If function is None, return the items that are true.",
         ),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(filter_descr_new));
+    install_functional_entry(ns, "__new__", make_functional_new_descr(filter_descr_new));
     for (name, function) in [
         (
             "__iter__",
@@ -4385,11 +4412,7 @@ fn init_filter_type(ns: PyObjectRef) {
         ("__next__", crate::baseobjspace::filter_next_method),
         ("__reduce__", crate::baseobjspace::filter_reduce_method),
     ] {
-        install_functional_entry(
-            ns,
-            name,
-            make_builtin_function_with_arity(name, function, 1),
-        );
+        install_functional_entry(ns, name, make_functional_method(name, function, 1));
     }
 }
 
@@ -4402,7 +4425,7 @@ fn init_zip_type(ns: PyObjectRef) {
             "zip(*iterables) --> A zip object yielding tuples until an input is exhausted.\n\nThe zip object yields n-length tuples, where n is the number of iterables\npassed as positional arguments to zip().  The i-th element in every tuple\ncomes from the i-th iterable argument to zip().  This continues until the\nshortest argument is exhausted.",
         ),
     );
-    install_functional_entry(ns, "__new__", make_new_descr(zip_descr_new));
+    install_functional_entry(ns, "__new__", make_functional_new_descr(zip_descr_new));
     for (name, function, arity) in [
         (
             "__iter__",
@@ -4413,11 +4436,7 @@ fn init_zip_type(ns: PyObjectRef) {
         ("__reduce__", crate::baseobjspace::zip_reduce_method, 1),
         ("__setstate__", crate::baseobjspace::zip_setstate_method, 2),
     ] {
-        install_functional_entry(
-            ns,
-            name,
-            make_builtin_function_with_arity(name, function, arity),
-        );
+        install_functional_entry(ns, name, make_functional_method(name, function, arity));
     }
 }
 
