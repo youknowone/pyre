@@ -3893,6 +3893,18 @@ pub unsafe extern "C" fn cranelift_realloc_frame(old_jf: *mut i64, new_depth: us
         *((old_base + JF_FORWARD_OFS as usize) as *mut *mut i64) = new_jf;
     }
 
+    // llmodel.py:150 `llop.gc_writebarrier(lltype.Void, new_frame)` covers the
+    // header words and frame items copied above; `frame.jf_forward = new_frame`
+    // (llmodel.py:141) is an ordinary GC-struct field assignment, so the
+    // framework transform emits its barrier as well.  Both stores are raw
+    // pointer writes here, and either frame can already sit in the old
+    // generation — a minor collection that runs while the loop executes
+    // promotes the frame it finds on the shadow stack.  Without the barriers
+    // the copied ref slots and the `jf_forward` link are old→young edges that
+    // no remembered-set entry names, so the next minor reclaims their targets.
+    write_barrier_if_managed(GcRef(new_base));
+    write_barrier_if_managed(GcRef(old_base));
+
     if majit_ir::debug::have_debug_prints() {
         majit_ir::debug::log_one(
             "jit-backend",
@@ -17791,6 +17803,73 @@ mod tests {
         let backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
         install_call_assembler_test_layout();
         backend
+    }
+
+    /// `llmodel.py:150` `llop.gc_writebarrier(lltype.Void, new_frame)`, and the
+    /// barrier the framework transform emits for the ordinary GC-struct field
+    /// store `frame.jf_forward = new_frame` (`llmodel.py:141`).
+    ///
+    /// `cranelift_realloc_frame` moves the old frame's ref slots into the new
+    /// frame through raw pointer writes, and a frame reaches the old generation
+    /// as soon as one minor collection promotes the one it finds on the shadow
+    /// stack.  `large_object_threshold` here sits below the frame size, so both
+    /// frames are born old and start with `TRACK_YOUNG_PTRS` set —
+    /// `remember_young_pointer` clearing that flag is the observable, since an
+    /// old-generation object can only lose it by being recorded in the
+    /// remembered set.
+    #[test]
+    fn realloc_frame_write_barriers_both_frames() {
+        let depth = 8usize;
+        let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+        let payload_bytes = (header_words + depth) * 8;
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 64,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let _backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+
+        let type_id = cranelift_jitframe_type_id().expect("JITFRAME type id must be registered");
+        let old = with_cranelift_gc_required(|gc| {
+            gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
+        });
+        assert_ne!(old.0, 0, "old frame allocation failed");
+        unsafe {
+            std::ptr::write_bytes(old.0 as *mut u8, 0, payload_bytes);
+            *((old.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = depth;
+        }
+
+        let tracks_young =
+            |addr: usize| unsafe { (*header_of(addr)).has_flag(flags::TRACK_YOUNG_PTRS) };
+        let in_nursery = |addr: usize| with_cranelift_gc_required(|gc| gc.is_nursery_object(addr));
+
+        assert!(
+            !in_nursery(old.0),
+            "the old frame must be born old-gen here"
+        );
+        assert!(
+            tracks_young(old.0),
+            "an old-generation object starts out tracking young pointers"
+        );
+
+        let new_jf = unsafe { cranelift_realloc_frame(old.0 as *mut i64, depth * 2) };
+        assert!(!new_jf.is_null(), "realloc returned no frame");
+
+        assert!(
+            !in_nursery(new_jf as usize),
+            "the new frame must be born old-gen here, or the barrier under test \
+             has nothing to record"
+        );
+        assert!(
+            !tracks_young(new_jf as usize),
+            "the copied frame items are old→young edges the barrier must remember"
+        );
+        assert!(
+            !tracks_young(old.0),
+            "`jf_forward` points at the new frame and must be remembered too"
+        );
     }
 
     #[derive(Default)]
