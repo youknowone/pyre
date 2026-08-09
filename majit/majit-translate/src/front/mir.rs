@@ -24214,14 +24214,13 @@ mod tests {
         );
     }
 
-    /// Array slicing keeps the residual RangeTo path because a general stop has
-    /// no proof that `end <= slice.len()`.  Both halves are asserted — the
-    /// residual call is present AND no `__getslice_rangeto` marker was planted
-    /// — so a lowering change that drops the call for an unrelated reason is a
-    /// failure rather than a pass.
+    /// The real site is in bounds: its `args: &[PyObjectRef]` is shared and
+    /// therefore cannot change length between the two `ArrayLen` reads. The
+    /// frontend has no shared-reference/immutability notion with which to
+    /// prove that fact, however, so the sound static-length fold declines.
     #[test]
     #[ignore]
-    fn call_function_impl_result_keeps_residual_array_index() {
+    fn call_function_impl_result_declines_residual_array_index() {
         use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -24247,14 +24246,15 @@ mod tests {
                 })
                 .count()
         };
-        assert!(
-            calls_path(&["core", "array", "<Impl>", "index"]) >= 1,
-            "general RangeTo array index remains residual"
+        assert_eq!(
+            calls_path(&["core", "array", "<Impl>", "index"]),
+            1,
+            "unproved RangeTo array index remains residual"
         );
         assert_eq!(
             calls_path(&["__getslice_rangeto"]),
             0,
-            "no general RangeTo site is rewritten — the fold is declined"
+            "no RangeTo getslice call is planted without an immutability proof"
         );
     }
 }
