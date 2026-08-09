@@ -886,14 +886,14 @@ pub fn fbw_foriter_inflight_take(
     };
     // The live frame passed by the legacy delivery site is the portal frame,
     // but an inline sub-walk's consumed item belongs to its own JitCode. Keep
-    // that per-frame code identity for the census; only legacy Python-pc
-    // entries lack a JitCode and fall back to the live frame's code.
+    // that per-frame code identity for the census; a legacy Python-pc entry,
+    // and an unresolvable identity (a negative index), fall back to the live
+    // frame's code.
     let code_ptr = match stash.body {
-        InflightForiterBody::Jit {
-            outer_jitcode_index,
-            ..
-        } => crate::state::raw_code_for_jitcode_index(outer_jitcode_index as i32)
-            .map_or(fallback_code_ptr, |code| code as usize),
+        InflightForiterBody::Jit { jitcode_index, .. } => {
+            crate::state::raw_code_for_jitcode_index(jitcode_index)
+                .map_or(fallback_code_ptr, |code| code as usize)
+        }
         InflightForiterBody::Py(_) => fallback_code_ptr,
     };
     let store_len = fbw_store_journal_len();
