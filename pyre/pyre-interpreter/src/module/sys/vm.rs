@@ -2707,14 +2707,19 @@ fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
             "audit() argument 1 must be str, not {given}"
         )));
     }
-    crate::baseobjspace::str_utf8_w(w_event)?;
-    audit_w(w_event, &positional[1..])?;
+    // The `@unwrap_spec` round trip is observable: the hooks are handed the
+    // `str` the unwrapped name is re-wrapped as, so a `str` subclass reaches
+    // them flattened to a plain one.
+    let event = crate::baseobjspace::str_utf8_w(w_event)?;
+    audit_w(w_str_new(event), &positional[1..])?;
     Ok(w_none())
 }
 
-/// `vm.py:485 addaudithook`.  The hooks already installed get a say: a
-/// `RuntimeError` out of the `sys.addaudithook` event means the set refused the
-/// new hook, and it is dropped rather than added.  Anything else propagates.
+/// `vm.py:486 addaudithook`.  The hooks already installed get a say: an
+/// `Exception` out of the `sys.addaudithook` event means the set refused the
+/// new hook, and it is dropped rather than added.  A `BaseException` outside
+/// `Exception` propagates.  The new hook is not installed yet when the event
+/// fires, so it never gets to refuse its own installation.
 fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let Some(&w_hook) = args.first() else {
         return Err(crate::PyError::type_error(
@@ -2722,7 +2727,7 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         ));
     };
     if let Err(err) = audit("sys.addaudithook", &[]) {
-        if !error_is_runtime_error(&err) {
+        if !error_is_exception(&err) {
             return Err(err);
         }
         return Ok(w_none());
@@ -2751,22 +2756,34 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
-/// `e.match(space, space.w_RuntimeError)` for a `PyError` that may carry either
-/// an interpreter-level kind or a materialised exception object.
-fn error_is_runtime_error(err: &crate::PyError) -> bool {
-    // A hook may raise a RuntimeError SUBCLASS, so the interpreter-level kind
-    // alone is not the test; it is the fallback for an error that never
-    // materialised an exception object.
-    let w_runtime_error = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
-        pyre_object::interp_exceptions::ExcKind::RuntimeError,
+/// `e.match(space, space.w_Exception)` for a `PyError` that may carry either an
+/// interpreter-level kind or a materialised exception object.
+///
+/// The C-level `PySys_AddAuditHook` reads a refusal as `RuntimeError`, but the
+/// `sys.addaudithook` a Python caller reaches widens it to `Exception`.
+/// Measured against 3.14 with a refusing hook already installed: `RuntimeError`,
+/// `ValueError` and `Exception` all leave the call returning `None`, and only a
+/// `BaseException` outside `Exception` — `KeyboardInterrupt`, bare
+/// `BaseException` — comes back out.
+fn error_is_exception(err: &crate::PyError) -> bool {
+    // A hook raises a real exception object, so the class test is the live one;
+    // the interpreter-level kind is the fallback for an error that never
+    // materialised an object.
+    let w_exception = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+        pyre_object::interp_exceptions::ExcKind::Exception,
     );
-    if !err.exc_object.is_null() && !w_runtime_error.is_null() {
+    if !err.exc_object.is_null() && !w_exception.is_null() {
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(err.exc_object);
-        pyre_object::gc_roots::pin_root(w_runtime_error);
-        return crate::baseobjspace::isinstance(err.exc_object, w_runtime_error).unwrap_or(false);
+        pyre_object::gc_roots::pin_root(w_exception);
+        return crate::baseobjspace::isinstance(err.exc_object, w_exception).unwrap_or(false);
     }
-    matches!(err.kind, crate::PyErrorKind::RuntimeError)
+    // `exc_kind_matches(kind, "Exception")` spelled over `PyErrorKind`: every
+    // variant descends from `Exception` except the two `BaseException` ones.
+    !matches!(
+        err.kind,
+        crate::PyErrorKind::GeneratorExit | crate::PyErrorKind::SystemExit
+    )
 }
 
 /// `sysmodule.c sys._clear_type_descriptors`: remove the instance-dict and weakref
