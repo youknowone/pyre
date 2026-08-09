@@ -961,19 +961,19 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_alloc_stable_raw",
         pyre_object::gc_hook::try_gc_alloc_stable_raw as *const (),
     );
-    // `w_int_gc_alloc` is the collector-heap arm of `w_int_new`, reached from
+    // `w_int_box_slow` is the allocating tail of `w_int_new`, reached from
     // inside a descended body whenever a fold boxes an int. Bind the
     // macro-emitted trampoline rather than the raw fn, for the reason
     // `prepare_list_ref_store` documents: the raw `(i64) -> *mut PyObject` is
     // `(i64) -> i32` on wasm32, while the wasm backend types the residual's
     // `call_indirect` `(i64) -> i64` from the descr alone.
-    let w_int_gc_alloc: extern "C" fn(i64) -> i64 =
-        pyre_object::intobject::__majit_call_target_w_int_gc_alloc;
+    let w_int_box_slow: extern "C" fn(i64) -> i64 =
+        pyre_object::intobject::__majit_call_target_w_int_box_slow;
     push_alias_pair(
         &mut entries,
-        "pyre_object::intobject::w_int_gc_alloc",
-        "pyre_object::w_int_gc_alloc",
-        w_int_gc_alloc as *const (),
+        "pyre_object::intobject::w_int_box_slow",
+        "pyre_object::w_int_box_slow",
+        w_int_box_slow as *const (),
     );
     // `w_type_set_abstract` stores the runtime-mutable `flag_abstract` atomic — a
     // side effect on per-type state, not a build-time constant, so it carries

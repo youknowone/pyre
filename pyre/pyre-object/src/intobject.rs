@@ -103,10 +103,40 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
         let idx = (value - PREBUILTINTFROM) as usize;
         return (&SMALL_INTS[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
     }
+    w_int_box_slow(value)
+}
+
+/// The allocating tail of [`w_int_new`], behind a residualisation boundary
+/// (`rlib/jit.py:139 @dont_look_inside`). The collector arm is the
+/// `gct_fv_gc_malloc` bracket (`rpython/memory/gctransform/framework.py`) in
+/// its alloc-then-init form — take the block, then write the header and
+/// payload into it; it falls through to `malloc_typed` when no collector owns
+/// the heap.
+///
+/// Both arms have a shape no trace can carry, which is why the boundary sits
+/// around the pair rather than around either one. A stack-built `W_IntObject`
+/// lowers to a `SyntheticTransparentCtor` for its `PyObject` header, whose
+/// funcptr constant degrades to a `symbolic_fnaddr` hash; a descending
+/// sub-jitcode walk cannot record such a call, so it declines the entire
+/// descent — that is what takes `list.pop()`'s fold off the compiled loop.
+/// Writing the fields individually instead lands the header's own `ob_type`
+/// slot at offset 0, which the wasm backend does not lower faithfully.
+///
+/// Spelled `*mut PyObject` rather than `PyObjectRef` so the attribute emits
+/// its `extern "C"` call trampoline: the macro recognises raw pointers
+/// syntactically and declines to emit one for an aliased return type.
+#[majit_macros::dont_look_inside]
+pub fn w_int_box_slow(value: i64) -> *mut PyObject {
     if crate::gc_interp::enabled() {
-        let boxed = w_int_gc_alloc(value);
-        if !boxed.is_null() {
-            return boxed;
+        let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
+        if !raw.is_null() {
+            unsafe {
+                let p = raw as *mut W_IntObject;
+                (*p).ob_header.ob_type = &INT_TYPE as *const PyType;
+                (*p).ob_header.w_class = get_instantiate(&INT_TYPE);
+                (*p).intval = value;
+            }
+            return raw as PyObjectRef;
         }
     }
     crate::lltype::malloc_typed(W_IntObject {
@@ -116,40 +146,6 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
         },
         intval: value,
     }) as PyObjectRef
-}
-
-/// The collector-heap arm of [`w_int_new`]: the `gct_fv_gc_malloc` bracket
-/// (`rpython/memory/gctransform/framework.py`) in its alloc-then-init form —
-/// take the block, then write the header and payload into it, rather than
-/// copying a stack-built struct over it. Returns null when no collector owns
-/// the heap, which is the caller's signal to take the `malloc_typed` arm.
-///
-/// Residualised (`rlib/jit.py:139 @dont_look_inside`) rather than traced. A
-/// stack-built struct would lower to a `SyntheticTransparentCtor` for the
-/// `PyObject` header whose funcptr constant degrades to a `symbolic_fnaddr`
-/// hash, which a descending sub-jitcode walk cannot record and declines on;
-/// writing the fields individually instead lands the header's own `ob_type`
-/// slot at offset 0, which the wasm backend does not lower faithfully. The
-/// boundary keeps both shapes out of the trace, and costs the arm nothing
-/// where it is unreachable: `gc_interp::enabled()` is false on the native
-/// backends, whose `malloc_typed` arm is fused into a `NewWithVtable` by the
-/// boxing-constructor pass exactly as before.
-/// Spelled `*mut PyObject` rather than `PyObjectRef` so the attribute emits
-/// its `extern "C"` call trampoline: the macro recognises raw pointers
-/// syntactically and declines to emit one for an aliased return type.
-#[majit_macros::dont_look_inside]
-pub fn w_int_gc_alloc(value: i64) -> *mut PyObject {
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
-    if raw.is_null() {
-        return crate::PY_NULL;
-    }
-    unsafe {
-        let p = raw as *mut W_IntObject;
-        (*p).ob_header.ob_type = &INT_TYPE as *const PyType;
-        (*p).ob_header.w_class = get_instantiate(&INT_TYPE);
-        (*p).intval = value;
-    }
-    raw as PyObjectRef
 }
 
 /// Create a W_IntObject bypassing the small-int cache.
