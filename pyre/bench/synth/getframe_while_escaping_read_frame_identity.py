@@ -34,8 +34,8 @@
 # Both reads still escape — `_gf()` names `leaf_a`'s published frame and
 # `_gf(1)` names `part_b`'s portal — but only once per call now that
 # `sys._getframe` forces the frame it RETURNS and not also the top of the stack.
-# The multi-frame adopts this file exists for are unmoved at 10; what the
-# duplicate escape carried was the single-frame count, 5 -> 0, alongside
+# The multi-frame adoption count this file exists for is unmoved at 10.  What
+# the duplicate escape carried was the single-frame count, 5 -> 0, alongside
 # `part_a`'s loop compiling.
 import sys
 

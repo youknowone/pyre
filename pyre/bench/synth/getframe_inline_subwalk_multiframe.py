@@ -54,7 +54,7 @@ import sys
 
 
 def leaf(x):
-    sys._getframe(0).f_locals
+    sys._getframe(0).f_locals  # noqa: B018 — the read itself is the force under test
     return sys._getframe(2).f_locals["base"] + x
 
 

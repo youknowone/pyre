@@ -12,7 +12,14 @@
 #   * installing a hook emits `sys.addaudithook` to the hooks already there,
 #     and a `RuntimeError` out of that event means those hooks REFUSED the new
 #     one: it is dropped and the refusal does not propagate.  Any other
-#     exception does propagate.
+#     exception does propagate -- not exercised here, and it cannot be: a hook
+#     is installed for the life of the interpreter and the first one that
+#     raises masks every hook behind it, so reaching the propagating branch
+#     needs the hook set cleared between cases.  Upstream's own facility for
+#     that (`__pypy__._testing_clear_audithooks`, `interp_magic.py:292`) refuses
+#     to run once translated, so no app-level program on a built interpreter
+#     can get there.  Same for the RuntimeError-SUBCLASS arm of
+#     `error_is_runtime_error`.
 #   * `__cantrace__` on a hook is honoured (the flag exists so a tracing hook
 #     can opt back in); nothing here can observe the tracing state, so only the
 #     attribute lookup path is exercised.
