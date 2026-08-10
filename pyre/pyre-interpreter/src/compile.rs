@@ -162,9 +162,20 @@ pub fn decode_source_bytes(
     let is_utf8 = encoding.as_deref().is_none_or(is_utf8_encoding);
     if has_bom && !is_utf8 {
         let enc = encoding.as_deref().unwrap_or("utf-8");
-        return Err(crate::PyError::syntax_error(format!(
-            "encoding problem: {enc} with BOM"
-        )));
+        let first_line = source[3..]
+            .split(|&byte| byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(first_line);
+        return Err(crate::PyError::syntax_error_located(
+            format!("encoding problem: {enc} with BOM"),
+            filename,
+            1,
+            0,
+            1,
+            text.chars().count() as i64,
+            Some(&text),
+        ));
     }
 
     if is_utf8 {
@@ -173,19 +184,32 @@ pub fn decode_source_bytes(
             Ok(s) => Ok(s.to_owned()),
             Err(e) => {
                 let bad_byte = src[e.valid_up_to()];
-                let line = src[..e.valid_up_to()]
+                let valid_prefix = &src[..e.valid_up_to()];
+                let line = valid_prefix.iter().filter(|&&b| b == b'\n').count() + 1;
+                let line_start = valid_prefix
                     .iter()
-                    .filter(|&&b| b == b'\n')
+                    .rposition(|&byte| byte == b'\n')
+                    .map_or(0, |index| index + 1);
+                let offset = core::str::from_utf8(&valid_prefix[line_start..])
+                    .expect("prefix before a UTF-8 decoding error is valid")
+                    .chars()
                     .count()
                     + 1;
+                let line_end = src[e.valid_up_to()..]
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(src.len(), |relative| e.valid_up_to() + relative);
+                let text = String::from_utf8_lossy(&src[line_start..line_end]);
                 // The name may hold the surrogate escape an undecodable path
                 // byte becomes, so the message is assembled as WTF-8;
                 // `format!` would render it through `Display` as U+FFFD.
-                let named_string = filename.as_str() == Ok("<string>");
+                let synthetic_name = filename
+                    .as_str()
+                    .is_ok_and(|name| name.starts_with('<') && name.ends_with('>'));
                 let mut message = rustpython_wtf8::Wtf8Buf::from_string(format!(
                     "Non-UTF-8 code starting with '\\x{bad_byte:02x}'"
                 ));
-                if !named_string {
+                if !synthetic_name {
                     message.push_str(" in file ");
                     message.push_wtf8(filename);
                 }
@@ -193,12 +217,15 @@ pub fn decode_source_bytes(
                     " on line {line}, but no encoding declared; \
                      see https://peps.python.org/pep-0263/ for details"
                 ));
-                if named_string {
-                    message.push_str(" (");
-                    message.push_wtf8(filename);
-                    message.push_str(&format!(", line {line})"));
-                }
-                Err(crate::PyError::syntax_error(message))
+                Err(crate::PyError::syntax_error_located(
+                    message,
+                    filename,
+                    line as i64,
+                    offset as i64,
+                    line as i64,
+                    offset as i64,
+                    Some(&text),
+                ))
             }
         }
     } else {
@@ -214,7 +241,7 @@ pub fn decode_source_bytes(
                     crate::PyErrorKind::UnicodeDecodeError => exc.message_text(),
                     _ => return exc,
                 };
-                crate::PyError::syntax_error_located(message, filename, 0, 0, 0, 0, None)
+                crate::PyError::syntax_error_located(message, filename, 0, -1, 0, 0, None)
             })?;
         // `pyparse.py:9-15 recode_to_utf8` re-encodes the decoded text to
         // UTF-8, so a declared codec that yields a surrogate rejects the

@@ -10729,6 +10729,30 @@ pub fn compile_err_to_syntax_error(
     compile_err_to_syntax_error_maybe_incomplete(e, source, false)
 }
 
+/// Convert Ruff/RustPython's one-based UTF-8 byte column to the one-based
+/// Unicode character column exposed by ``SyntaxError.offset``.
+///
+/// CPython's tokenizer keeps byte offsets internally too, but
+/// ``_PyPegen_byte_offset_to_character_offset`` converts them before the
+/// exception is materialised.  RustPython's `SourceLocation` is deliberately
+/// built with `PositionEncoding::Utf8`, so its `character_offset` is still a
+/// byte column despite the field name.  Preserve the parser's selected line
+/// and span and port only that final conversion here.
+fn syntax_error_character_offset(source: &str, lineno: usize, byte_offset: usize) -> usize {
+    if lineno == 0 || byte_offset == 0 {
+        return byte_offset;
+    }
+    let Some(line) = source.split('\n').nth(lineno - 1) else {
+        return byte_offset;
+    };
+    let byte_index = byte_offset.saturating_sub(1).min(line.len());
+    let boundary = (0..=byte_index)
+        .rev()
+        .find(|&index| line.is_char_boundary(index))
+        .unwrap_or(0);
+    line[..boundary].chars().count() + 1
+}
+
 /// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
 /// private Python 3.14 `_IncompleteInputError` subclass for parser failures
 /// which end at an unfinished interactive input when
@@ -10847,14 +10871,28 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         e.to_string()
     };
-    let (lineno, offset) = e.python_location();
+    let (lineno, byte_offset) = e.python_location();
+    // Parser diagnostics are converted by pegen before exposure, while
+    // compiler/symtable diagnostics retain the UTF-8 byte columns used by AST
+    // locations (for example `return "ä"` ends at offset 12, not 11).
+    let parser_error = matches!(&e, crate::compile::CompileError::Parse(_));
+    let offset = if parser_error {
+        syntax_error_character_offset(source, lineno, byte_offset)
+    } else {
+        byte_offset
+    };
     let mut error = if lineno == 0 {
         crate::PyError::syntax_error(msg)
     } else {
-        let (end_lineno, end_offset) = e
-            .python_end_location()
-            .or_else(|| codegen_statement_end(&e, source, lineno, offset))
-            .unwrap_or((lineno, offset));
+        let parser_end = e.python_end_location();
+        let (end_lineno, end_byte_offset) = parser_end
+            .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
+            .unwrap_or((lineno, byte_offset));
+        let end_offset = if parser_end.is_some() {
+            syntax_error_character_offset(source, end_lineno, end_byte_offset)
+        } else {
+            end_byte_offset
+        };
         let filename = e.source_path().to_string();
         // Parser errors own their source text directly, keeping the trailing
         // newline like `e.text`.  Later compiler failures omit it for the
@@ -17031,6 +17069,21 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntax_error_offsets_convert_utf8_bytes_to_characters() {
+        assert_eq!(
+            syntax_error_character_offset("Python = \"Python\" +", 1, 20),
+            20
+        );
+        assert_eq!(
+            syntax_error_character_offset("Python = \"Ṕýţĥòñ\" +", 1, 27),
+            20
+        );
+        assert_eq!(syntax_error_character_offset("α = 0xI", 1, 7), 6);
+        assert_eq!(syntax_error_character_offset("first\nα = 0xI", 2, 7), 6);
+        assert_eq!(syntax_error_character_offset("α", 1, 0), 0);
+    }
 
     #[test]
     fn builtin_ord_identity_uses_wrapped_code_not_display_name() {

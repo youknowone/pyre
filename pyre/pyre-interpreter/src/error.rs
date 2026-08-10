@@ -635,7 +635,11 @@ impl PyError {
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
         let offset_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(wrap_pos(offset));
+        // CPython 3.14 keeps the start offset numeric even for the tokenizer's
+        // two sentinel values: 0 for an encoding-cookie range beginning
+        // before the first character, and -1 for a location-less codec
+        // failure.  Only absent *end* positions use `None` below.
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(offset));
         let text_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(match text {
             Some(t) => pyre_object::w_str_new(t),
