@@ -198,7 +198,11 @@ pub fn enabled() -> bool {
 /// Pure half of [`enabled`], kept separate so the default-on contract is
 /// testable without racing process-global environment mutation.
 fn enabled_from_env(value: Option<&OsStr>) -> bool {
-    value.map(|v| !v.is_empty() && v != "0").unwrap_or(true)
+    // Exactly `0`, and nothing else, takes the rollback path. An empty value is
+    // what a launcher produces from an unset variable (`PYRE_GC_INTERP=$FOO`),
+    // and treating it as the off switch would route those processes onto the
+    // born-old stepping stone, which leaks every interpreter allocation.
+    value != Some(OsStr::new("0"))
 }
 
 /// Whether a collection reaching this safepoint right now would be performed.
@@ -324,8 +328,10 @@ mod tests {
     #[test]
     fn interpreter_gc_is_default_on_with_explicit_off_switch() {
         assert!(enabled_from_env(None));
-        assert!(!enabled_from_env(Some(OsStr::new(""))));
         assert!(!enabled_from_env(Some(OsStr::new("0"))));
         assert!(enabled_from_env(Some(OsStr::new("1"))));
+        // An unset variable expanded by a launcher arrives as an empty value;
+        // it must not select the leaking rollback path.
+        assert!(enabled_from_env(Some(OsStr::new(""))));
     }
 }

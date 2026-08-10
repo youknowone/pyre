@@ -63,37 +63,48 @@ impl HeapDumpWriter {
             return Ok(());
         }
         let byte_len = self.buffer.len() * std::mem::size_of::<isize>();
-        #[cfg(unix)]
-        let written: isize = unsafe {
-            libc::write(
-                self.fd,
-                self.buffer.as_ptr().cast::<libc::c_void>(),
-                byte_len,
-            )
-        };
-        #[cfg(windows)]
-        let written: isize = unsafe {
-            libc::_write(
-                self.fd,
-                self.buffer.as_ptr().cast::<libc::c_void>(),
-                byte_len as libc::c_uint,
-            ) as isize
-        };
+        // Neither `write` nor `_write` exists here, so no call was made and
+        // `errno` still names some unrelated earlier one. Report the dump's own
+        // failure code instead of reading a stale `errno`.
         #[cfg(not(any(unix, windows)))]
-        let written: isize = {
+        {
             let _ = (byte_len, self.fd);
-            -1isize
-        };
-        if written < 0 {
-            return Err(std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(HEAP_DUMP_EIO));
-        }
-        if written as usize != byte_len {
             return Err(HEAP_DUMP_EIO);
         }
-        self.buffer.clear();
-        Ok(())
+        #[cfg(any(unix, windows))]
+        {
+            #[cfg(unix)]
+            let written: isize = unsafe {
+                libc::write(
+                    self.fd,
+                    self.buffer.as_ptr().cast::<libc::c_void>(),
+                    byte_len,
+                )
+            };
+            // The CRT entry point is `_write`, but `libc` exports it under the
+            // POSIX name with a `#[link_name = "_write"]` alias, so the Rust
+            // path is `libc::write` on this target as well. It takes a
+            // `c_uint` count and returns `c_int`, unlike the `size_t`/`ssize_t`
+            // unix signature above.
+            #[cfg(windows)]
+            let written: isize = unsafe {
+                libc::write(
+                    self.fd,
+                    self.buffer.as_ptr().cast::<libc::c_void>(),
+                    byte_len as libc::c_uint,
+                ) as isize
+            };
+            if written < 0 {
+                return Err(std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(HEAP_DUMP_EIO));
+            }
+            if written as usize != byte_len {
+                return Err(HEAP_DUMP_EIO);
+            }
+            self.buffer.clear();
+            Ok(())
+        }
     }
 }
 

@@ -497,7 +497,9 @@ impl TypeInfo {
             "memory-pressure types must be fixed-size"
         );
         assert!(
-            offset + std::mem::size_of::<isize>() <= self.size,
+            offset
+                .checked_add(std::mem::size_of::<isize>())
+                .is_some_and(|end| end <= self.size),
             "memory-pressure field exceeds the object payload"
         );
         self.memory_pressure_offset = Some(offset);
