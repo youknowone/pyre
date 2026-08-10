@@ -925,7 +925,8 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         recipe.jitcode_pc,
     );
     let stack_only = recipe.valuestackdepth.saturating_sub(recipe.nlocals);
-    let maps = crate::state::bridge_semantic_maps_from_pc(recipe.jitcode_index, recipe.jitcode_pc);
+    let maps =
+        crate::state::bridge_semantic_maps_from_jitcode_pc(recipe.jitcode_index, recipe.jitcode_pc);
     let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
     let mut boxes = Vec::with_capacity(banks.total_len());
     // Per-color `(color, box)` pairs for the blackhole capture below, collected

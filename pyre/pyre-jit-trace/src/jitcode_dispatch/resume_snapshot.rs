@@ -1004,7 +1004,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             if after_residual_call && sym.owns_virtualizable_shadow() {
                 let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
                     jitcode_index as i32,
-                    liveness_py_pc as i32,
+                    Some(liveness_py_pc as i32),
                     guard_jitcode_pc,
                 );
                 let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
@@ -2058,9 +2058,12 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                 // `depth` is the operand-stack depth at the CALL return point,
                 // top slot = the pending nested-call result.
                 let pending_top_slot = nlocals + depth - 1;
+                // No Python coordinate here: `marker` is
+                // `inline_call_return_marker`'s `decode_op_at(..).next_pc`, a
+                // JitCode byte offset.
                 let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
                     jitcode_index as i32,
-                    marker as i32,
+                    None,
                     caller_liveness_word,
                 );
                 let array_descr = crate::state::pyobject_gcarray_descr();
@@ -2526,7 +2529,10 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     let mut recovered_regs_r = ctx.registers_r.to_vec();
     let code = unsafe { &*callee_pjc.code_ptr };
     let (stack_base, _) = crate::state::callee_layout_for_call_assembler(code);
-    let maps = crate::state::bridge_semantic_maps_from_pc(callee_jitcode_index, callee_jitcode_pc);
+    let maps = crate::state::bridge_semantic_maps_from_jitcode_pc(
+        callee_jitcode_index,
+        callee_jitcode_pc,
+    );
     // The kept-stack guard gate is certified by this callee frame's
     // operand-stack mirror.  Publish the same boxes into the carried
     // coordinate's Ref colors before collecting the frame snapshot, so the

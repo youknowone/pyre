@@ -2171,7 +2171,8 @@ fn carrier_stack_box_for_ref_arg<Sym: WalkSym>(
         return None;
     }
     let nlocals = unsafe { (&(*raw_code).varnames).len() };
-    let maps = crate::state::bridge_semantic_maps_from_pc(consts.jitcode_index, op_pc as i32);
+    let maps =
+        crate::state::bridge_semantic_maps_from_jitcode_pc(consts.jitcode_index, op_pc as i32);
     let semantic = crate::state::semantic_ref_slot_for_reg_color(
         nlocals,
         maps.stack_depth_at_pc,
