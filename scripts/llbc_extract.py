@@ -281,6 +281,19 @@ def metadata(
     args = [
         "cargo",
         "metadata",
+        # `--locked` because this call is reached from `--list-inputs`, which
+        # callers run as a read-only membership check before deciding whether
+        # a file they are about to edit is a fingerprint input. Without it
+        # `cargo metadata` refreshes `Cargo.lock` when the lock is out of
+        # date — and `Cargo.lock` is itself one of the inputs this driver
+        # fingerprints, so the check would edit the thing it is asked about.
+        # The hazard is conditional (a current lock makes it a no-op), which
+        # is the worse shape: it is harmless until it is not.
+        #
+        # A stale lock now fails loudly here instead of being silently
+        # updated. That is the intent: refreshing the lock is an action a
+        # caller should take deliberately, not one a query performs for them.
+        "--locked",
         "--format-version=1",
         "--filter-platform",
         platform,
