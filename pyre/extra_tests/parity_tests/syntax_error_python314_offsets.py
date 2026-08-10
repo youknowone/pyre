@@ -101,4 +101,17 @@ assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 2
     error.end_offset,
 )
 
+for operator, message in (
+    ("=", "cannot assign to dict comprehension here. Maybe you meant '==' instead of '='?"),
+    ("+=", "'dict comprehension' is an illegal expression for augmented assignment"),
+):
+    error = syntax_error(f"{{x: y for y, x in ((1, 2), (3, 4))}} {operator} 5")
+    assert error.msg == message, error.msg
+    assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 1, 1, 36), (
+        error.lineno,
+        error.offset,
+        error.end_lineno,
+        error.end_offset,
+    )
+
 print("syntax error Python 3.14 offsets ok")

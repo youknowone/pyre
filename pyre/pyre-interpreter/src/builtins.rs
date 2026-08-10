@@ -10969,6 +10969,88 @@ fn binary_call_generator_error_span(source: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// `python.gram:invalid_assignment_target` calls `_PyPegen_get_expr_name` for
+/// both ordinary and augmented assignments.  RustPython stops at the colon in
+/// a dict comprehension instead, so parse the complete left expression and
+/// restore CPython 3.14's diagnostic for that named target.
+fn dict_comprehension_assignment_error(source: &str) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast;
+
+    let bytes = source.as_bytes();
+    let mut delimiters = Vec::new();
+    let mut cursor = 0;
+    let assignment = loop {
+        let byte = *bytes.get(cursor)?;
+        match byte {
+            b'\'' | b'"' => {
+                let quote = byte;
+                let triple = bytes[cursor..].starts_with(&[quote, quote, quote]);
+                cursor += if triple { 3 } else { 1 };
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'\\' {
+                        cursor = (cursor + 2).min(bytes.len());
+                    } else if triple && bytes[cursor..].starts_with(&[quote, quote, quote]) {
+                        cursor += 3;
+                        break;
+                    } else if !triple && bytes[cursor] == quote {
+                        cursor += 1;
+                        break;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                delimiters.push(byte);
+                cursor += 1;
+            }
+            b')' | b']' | b'}' => {
+                delimiters.pop()?;
+                cursor += 1;
+            }
+            b'=' if delimiters.is_empty()
+                && !matches!(
+                    bytes.get(cursor.wrapping_sub(1)),
+                    Some(b'<' | b'>' | b'!' | b'=' | b':')
+                )
+                && bytes.get(cursor + 1) != Some(&b'=') =>
+            {
+                break cursor;
+            }
+            _ => cursor += 1,
+        }
+    };
+
+    let mut lhs_end = assignment;
+    while lhs_end > 0 && bytes[lhs_end - 1].is_ascii_whitespace() {
+        lhs_end -= 1;
+    }
+    let augmented = matches!(
+        bytes.get(lhs_end.wrapping_sub(1)),
+        Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'@' | b'&' | b'|' | b'^')
+    );
+    if augmented {
+        lhs_end -= 1;
+        while lhs_end > 0 && bytes[lhs_end - 1].is_ascii_whitespace() {
+            lhs_end -= 1;
+        }
+    }
+    let lhs_start = bytes[..lhs_end]
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())?;
+    let expression = source.get(lhs_start..lhs_end)?;
+    let parsed = crate::compile::parser::parse_expression(expression).ok()?;
+    if !matches!(parsed.syntax().body.as_ref(), ast::Expr::DictComp(_)) {
+        return None;
+    }
+    let message = if augmented {
+        "'dict comprehension' is an illegal expression for augmented assignment".to_owned()
+    } else {
+        "cannot assign to dict comprehension here. Maybe you meant '==' instead of '='?".to_owned()
+    };
+    Some((message, lhs_start, lhs_end))
+}
+
 /// `Parser/string_parser.c parse_string_literal` raises the non-ASCII bytes
 /// error at the token (`RAISE_SYNTAX_ERROR_KNOWN_LOCATION(t)`), not at the
 /// offending code point.  Ruff's diagnostic instead selects that code point;
@@ -11185,10 +11267,16 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     if generator_span.is_some() {
         msg = "invalid syntax".to_owned();
     }
+    let assignment_error = dict_comprehension_assignment_error(source);
+    if let Some((replacement, _, _)) = &assignment_error {
+        msg = replacement.clone();
+    }
+    let assignment_span = assignment_error.map(|(_, start, end)| (start, end));
     let diagnostic_span = literal_span
         .or(fstring_span)
         .or(scope_span)
-        .or(generator_span);
+        .or(generator_span)
+        .or(assignment_span);
     let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
         (
             source_byte_location(source, start),
