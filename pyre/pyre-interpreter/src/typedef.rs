@@ -9137,43 +9137,28 @@ fn init_slice_type(ns: PyObjectRef) {
             ),
         )
     };
+    let new_descr = make_new_descr(slice_descr_new);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(slice_descr_new),
-        )
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"));
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr)
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity("__repr__", slice_descr_repr, 1),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__eq__",
-            make_builtin_function_with_arity("__eq__", slice_descr_eq, 2),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__ne__",
-            make_builtin_function_with_arity("__ne__", slice_descr_ne, 2),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__lt__",
-            make_builtin_function_with_arity("__lt__", slice_descr_lt, 2),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__repr__",
+                slice_descr_repr,
+                1,
+                "($self, /)",
+            ),
         )
     };
     for (name, func) in [
-        ("__le__", slice_descr_le as DunderFn),
+        ("__eq__", slice_descr_eq as DunderFn),
+        ("__ne__", slice_descr_ne),
+        ("__lt__", slice_descr_lt),
+        ("__le__", slice_descr_le),
         ("__gt__", slice_descr_gt),
         ("__ge__", slice_descr_ge),
     ] {
@@ -9181,7 +9166,12 @@ fn init_slice_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, func, 2),
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    name,
+                    func,
+                    2,
+                    "($self, value, /)",
+                ),
             )
         };
     }
@@ -9190,14 +9180,24 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity("__hash__", slice_descr_hash, 1),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__hash__",
+                slice_descr_hash,
+                1,
+                "($self, /)",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity("__reduce__", slice_descr_reduce, 1),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__reduce__",
+                slice_descr_reduce,
+                1,
+                "($self, /)",
+            ),
         )
     };
     unsafe {
@@ -9237,7 +9237,12 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "indices",
-            make_builtin_function_with_arity("indices", slice_method_indices, 2),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "indices",
+                slice_method_indices,
+                2,
+                "($self, object, /)",
+            ),
         )
     };
 }
