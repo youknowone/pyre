@@ -1791,6 +1791,97 @@ pub(crate) struct BridgeSemanticMaps {
     pub pcdep_entries: Vec<(u8, u16, u16)>,
 }
 
+/// Measurement gate for the `via_py_pc` fallback of
+/// [`bridge_semantic_maps_at_with_jitcode_pc`].  The fallback indexes the
+/// Python-PC-keyed `LiveVars::depth_at_py_pc` with that function's `pc`
+/// parameter, but `bridge_semantic_maps_from_pc` supplies ONE word for both
+/// the `pc` and `jitcode_pc` slots, and five of its callers pass a JitCode
+/// byte offset (`RebuiltFrame::pc` is documented as the byte offset, with the
+/// Python coordinate in the separate `py_pc` field).
+///
+/// The partition that decides whether that mis-keying is observable:
+/// an offset past the end of the table reads `None` and the fallback already
+/// answers 0, but an offset that lands inside the table returns a real depth
+/// belonging to a different coordinate.  `in_range` with a non-zero depth is
+/// the only case that reaches `setup_bridge_sym`'s `semantic_prefix_len`.
+///
+/// Pure telemetry — with the variable unset every counter path is skipped and
+/// the fallback's value is unchanged.
+fn empty_twin_census_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("PYRE_M73_EMPTYTWIN_CENSUS").is_some())
+}
+
+/// One counter set per call site. The heartbeat has to be per site, not per
+/// process: with a single shared counter only the site that fires first is
+/// ever named, so a run in which one leg never executed is indistinguishable
+/// from one in which it executed second.
+struct EmptyTwinSite {
+    name: &'static str,
+    hits: std::sync::atomic::AtomicU64,
+    null_code: std::sync::atomic::AtomicU64,
+    out_of_range: std::sync::atomic::AtomicU64,
+    in_range_zero: std::sync::atomic::AtomicU64,
+    in_range_nonzero: std::sync::atomic::AtomicU64,
+}
+
+impl EmptyTwinSite {
+    const fn new(name: &'static str) -> Self {
+        const fn zero() -> std::sync::atomic::AtomicU64 {
+            std::sync::atomic::AtomicU64::new(0)
+        }
+        Self {
+            name,
+            hits: zero(),
+            null_code: zero(),
+            out_of_range: zero(),
+            in_range_zero: zero(),
+            in_range_nonzero: zero(),
+        }
+    }
+}
+
+/// The carried jitcode coordinate decoded, but the twin tables had no entry.
+static EMPTY_TWIN_MISS: EmptyTwinSite = EmptyTwinSite::new("twin_miss");
+/// No jitcode coordinate was carried at all.
+static EMPTY_TWIN_NON_DECODABLE: EmptyTwinSite = EmptyTwinSite::new("non_decodable");
+
+fn empty_twin_census(site: &EmptyTwinSite, rp: usize, table_len: Option<usize>, depth: u16) {
+    if !empty_twin_census_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    let name = site.name;
+    let hits = site.hits.fetch_add(1, Ordering::Relaxed) + 1;
+    // `in_range_nonzero` is the only bucket that can reach `setup_bridge_sym`'s
+    // `semantic_prefix_len`: a real depth read at a coordinate the caller never
+    // meant as a Python PC.
+    let (bucket, counter, live) = match table_len {
+        None => ("null_code", &site.null_code, false),
+        Some(len) if rp >= len => ("out_of_range", &site.out_of_range, false),
+        Some(_) if depth == 0 => ("in_range_zero", &site.in_range_zero, false),
+        Some(_) => ("in_range_nonzero", &site.in_range_nonzero, true),
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    // Every bucket announces its first witness, so the buckets that do fire are
+    // the positive control for the ones that do not: a bucket that stays silent
+    // on a stream carrying other buckets' lines is empty, not unprinted.
+    if n == 1 || (live && n <= 20) {
+        eprintln!(
+            "[M73-EMPTYTWIN] site={name} bucket={bucket} n={n} rp={rp} len={table_len:?} depth={depth}"
+        );
+    }
+    if hits % 100_000 == 0 {
+        eprintln!(
+            "[M73-EMPTYTWIN] totals site={name} hits={hits} null_code={} out_of_range={} in_range_zero={} in_range_nonzero={}",
+            site.null_code.load(Ordering::Relaxed),
+            site.out_of_range.load(Ordering::Relaxed),
+            site.in_range_zero.load(Ordering::Relaxed),
+            site.in_range_nonzero.load(Ordering::Relaxed),
+        );
+    }
+}
+
 /// When a kept-stack branch guard carries the guard's own jitcode
 /// coordinate (`jitcode_pc != NO_JITCODE_PC`), the pcdep/depth tables
 /// must be keyed at the GUARD's Python PC — the encode side
@@ -1830,15 +1921,15 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // `liveness_py_pc = guard_py_pc` keying. The guard PC is where the
         // computed kept operand-stack temps are live; at the merge-target PC
         // they've been consumed and carry no pcdep entry.
-        let via_py_pc = |rp: usize| -> usize {
+        let via_py_pc = |rp: usize, site: &'static EmptyTwinSite| -> usize {
             if payload.code_ptr.is_null() {
+                empty_twin_census(site, rp, None, 0);
                 return 0;
             }
-            crate::liveness::liveness_for(payload.code_ptr)
-                .depth_at_py_pc()
-                .get(rp)
-                .copied()
-                .unwrap_or(0) as usize
+            let table = crate::liveness::liveness_for(payload.code_ptr).depth_at_py_pc();
+            let depth = table.get(rp).copied().unwrap_or(0);
+            empty_twin_census(site, rp, Some(table.len()), depth);
+            depth as usize
         };
         let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc >= 0
             && payload
@@ -1860,12 +1951,12 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 payload.pcdep_for_jitcode_pc(jp),
             ) {
                 (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
-                _ => (via_py_pc(pc as usize), Vec::new()),
+                _ => (via_py_pc(pc as usize, &EMPTY_TWIN_MISS), Vec::new()),
             }
         } else {
             // A non-decodable carried coordinate falls back to the merge-target
             // PC so liveness and pcdep key the same point.
-            (via_py_pc(pc as usize), Vec::new())
+            (via_py_pc(pc as usize, &EMPTY_TWIN_NON_DECODABLE), Vec::new())
         };
         BridgeSemanticMaps {
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
