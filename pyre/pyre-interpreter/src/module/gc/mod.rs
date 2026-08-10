@@ -929,10 +929,16 @@ fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), cr
             pyre_object::gc_roots::shadow_stack_get(text_slot),
         )?;
     }
+    // Build and pin the value before reading `obj_slot`: Rust evaluates the
+    // receiver first, so an inline `w_int_new` here would allocate — and
+    // possibly collect — after the argument already held a raw address.
+    let time_value = w_int_new(total_gc_time);
+    pyre_object::gc_roots::pin_root(time_value);
+    let time_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     crate::baseobjspace::setattr_str(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
         "total_gc_time",
-        w_int_new(total_gc_time),
+        pyre_object::gc_roots::shadow_stack_get(time_slot),
     )?;
     Ok(())
 }
