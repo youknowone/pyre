@@ -462,9 +462,18 @@ pub fn jitframe_prefer_oldgen() -> bool {
 ///
 /// `alloc` is a raw allocator: given `size_bytes` it must return a
 /// zero-filled `*mut JitFrame` payload whose GC header is registered
-/// with the jitframe custom-trace hook. `write_barrier` marks `new_jf`
-/// as having received writes (generational barrier on the copied
-/// `jf_frame` / `jf_savedata` / `jf_guard_exc` stores).
+/// with the jitframe custom-trace hook. `write_barrier` covers `new_jf`
+/// (`llmodel.py:150`) — the generational barrier for the copied
+/// `jf_frame` / `jf_savedata` / `jf_guard_exc` stores.
+///
+/// It does **not** cover `old_jf`. `frame.jf_forward = new_frame`
+/// (`llmodel.py:141`) is an ordinary GC-struct field assignment, so upstream's
+/// framework transform emits a barrier for it too; this helper writes it raw.
+/// The one caller today (`dynasm_realloc_frame`) allocates frames off the GC
+/// heap through `alloc_off_gc_jitframe` and passes a shadow-stack registration
+/// rather than a barrier, so nothing is missing for it. **A caller whose frames
+/// are GC-managed must barrier `old_jf` itself after this returns** — the
+/// cranelift backend's own copy of this routine does exactly that.
 ///
 /// # Safety
 /// - `old_jf` must be a live, resolved `*mut JitFrame`.
