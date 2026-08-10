@@ -449,6 +449,12 @@ pub(crate) unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
     unsafe { pyre_object::memoryview::w_memoryview_view(mv).gather() }
 }
 
+/// `PyBuffer_ToContiguous(..., 'F')` for a live memoryview.
+#[majit_macros::dont_look_inside]
+unsafe fn memoryview_gather_fortran_bytes(mv: PyObjectRef) -> Vec<u8> {
+    unsafe { pyre_object::memoryview::w_memoryview_view(mv).gather_order(true) }
+}
+
 /// Buffer-acquisition parameters `(format, itemsize, readonly, total_bytes)`
 /// for a bytes / bytearray / array exporter (or a subclass of one), or
 /// `None` when `obj` provides no buffer.
@@ -1338,14 +1344,57 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     }
 }
 
-/// `memoryview.tobytes` — copy the live view (honouring stride) to `bytes`.
+/// CPython 3.14 `memoryview_tobytes_impl` — copy the live view through
+/// `PyBuffer_ToContiguous` in C, Fortran, or any-contiguous order.
 fn memoryview_tobytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    clinic_arity(
+        "tobytes",
+        positional.len().saturating_sub(1),
+        real_kwarg_count(kwargs),
+        0,
+        1,
+        0,
+    )?;
+    kwarg_reject_unknown(kwargs, &["order"], "tobytes")?;
+    let mv = positional.first().copied().unwrap_or(w_none());
+    let w_order = resolve_pos_or_kw(positional.get(1).copied(), kwargs, "order", "tobytes", 1)?;
     unsafe {
         memoryview_check_released(mv)?;
-        Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-            &memoryview_gather_bytes(mv),
-        ))
+        let order = match w_order {
+            None => 'C',
+            Some(value) if pyre_object::is_none(value) => 'C',
+            Some(value) if crate::baseobjspace::isinstance_str_w(value) => {
+                match pyre_object::w_str_get_wtf8(value).as_str() {
+                    Ok("C") => 'C',
+                    Ok("F") => 'F',
+                    Ok("A") => 'A',
+                    _ => {
+                        return Err(crate::PyError::value_error("order must be 'C', 'F' or 'A'"));
+                    }
+                }
+            }
+            Some(value) => {
+                return Err(crate::PyError::type_error(format!(
+                    "tobytes() argument 'order' must be str or None, not {}",
+                    crate::type_methods::arg_type_name(value)
+                )));
+            }
+        };
+        let fortran = match order {
+            'F' => true,
+            'A' => {
+                let (c_contiguous, f_contiguous) = memoryview_contiguity(mv);
+                f_contiguous && !c_contiguous
+            }
+            _ => false,
+        };
+        let bytes = if fortran {
+            memoryview_gather_fortran_bytes(mv)
+        } else {
+            memoryview_gather_bytes(mv)
+        };
+        Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
     }
 }
 
@@ -2529,7 +2578,6 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__gt__", memoryview_gt, 2),
         ("__ge__", memoryview_ge, 2),
         ("count", memoryview_count, 2),
-        ("tobytes", memoryview_tobytes, 1),
         ("tolist", memoryview_tolist, 1),
         ("toreadonly", memoryview_toreadonly, 1),
         ("release", memoryview_release, 1),
@@ -2592,6 +2640,7 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__exit__", memoryview_exit as MvFn),
         ("__release_buffer__", memoryview_release_buffer),
         ("__delitem__", memoryview_delitem),
+        ("tobytes", memoryview_tobytes),
         ("hex", memoryview_hex),
         ("cast", memoryview_cast),
     ] {

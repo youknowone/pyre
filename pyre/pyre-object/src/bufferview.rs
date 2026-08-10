@@ -56,6 +56,36 @@ fn copy_rec(
     }
 }
 
+/// `buffer_to_contiguous(..., 'F')` — recursive Fortran-order copy.  The
+/// first dimension is innermost, so dimension 0 changes fastest in the
+/// destination byte string (`memoryobject.c:init_fortran_strides_from_shape`).
+fn copy_rec_fortran(
+    full: &[u8],
+    shape: &[i64],
+    strides: &[i64],
+    idim: i64,
+    mut off: i64,
+    isz: usize,
+    out: &mut Vec<u8>,
+) {
+    let dimshape = shape.get(idim as usize).copied().unwrap_or(0);
+    let dimstride = strides.get(idim as usize).copied().unwrap_or(0);
+    if idim == 0 {
+        if dimstride == 0 {
+            return;
+        }
+        for _ in 0..dimshape {
+            copy_base(full, off, isz, out);
+            off += dimstride;
+        }
+    } else {
+        for _ in 0..dimshape {
+            copy_rec_fortran(full, shape, strides, idim - 1, off, isz, out);
+            off += dimstride;
+        }
+    }
+}
+
 /// Read a `tuple[int]` (shape or strides) into a native vector.
 ///
 /// # Safety
@@ -519,6 +549,19 @@ impl BufferView {
     /// The backing [`Buffer`]'s `w_obj` must point to a live object of its
     /// tagged kind.
     pub unsafe fn gather(&self) -> Vec<u8> {
+        unsafe { self.gather_order(false) }
+    }
+
+    /// The `PyBuffer_ToContiguous` copy for C order (`fortran == false`) or
+    /// Fortran order (`fortran == true`).  CPython constructs destination
+    /// strides for the requested order and copies matching logical indices;
+    /// iterating the source coordinates in that destination order is the same
+    /// operation without materialising a second `Py_buffer`.
+    ///
+    /// # Safety
+    /// The backing [`Buffer`]'s `w_obj` must point to a live object of its
+    /// tagged kind.
+    pub unsafe fn gather_order(&self, fortran: bool) -> Vec<u8> {
         unsafe {
             let itemsize = self.itemsize();
             let ndim = self.ndim();
@@ -538,7 +581,11 @@ impl BufferView {
                 0
             };
             let mut out = Vec::with_capacity(count.max(0) as usize * isz);
-            copy_rec(full, &shape, &strides, ndim, 0, offset, isz, &mut out);
+            if fortran {
+                copy_rec_fortran(full, &shape, &strides, ndim - 1, offset, isz, &mut out);
+            } else {
+                copy_rec(full, &shape, &strides, ndim, 0, offset, isz, &mut out);
+            }
             out
         }
     }
