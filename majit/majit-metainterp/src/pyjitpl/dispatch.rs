@@ -1434,150 +1434,228 @@ where
             // store_final_boxes_in_guard derives fail_args from the
             // snapshot (RPython parity, opencoder.py:819 +
             // resume.py:396-397).
-            //
-            // RPython `pyjitpl.py:2591-2602 capture_resumedata`
-            // temporarily swaps `frame.pc = resumepc` ahead of the
-            // framestack walk, then restores the original `frame.pc`.
-            // `build_state_field_snapshot` reads `frame.pc` directly
-            // (`pyjitpl/dispatch.rs:2596`), so the swap pins the
-            // snapshot's `SnapshotFrame.pc` to the guard's resumepc
-            // independent of the dispatcher's post-decode `frame.pc`.
-            let top_idx = self
-                .frames
-                .frames
-                .len()
-                .checked_sub(1)
-                .expect("record_state_guard: empty framestack");
-            let saved_top_pc = self.frames.frames[top_idx].pc;
-            // RPython pyjitpl.py:2591-2602 capture_resumedata swaps
-            // `frame.pc = resumepc` (a JitCode bytecode PC) before the
-            // framestack walk. `resume_pc` here is `opcode_pc =
-            // code_cursor - 1` (dispatch.rs ~2203), the guard op's JitCode
-            // position, whose `opcode_pc - SIZE_LIVE_OP` points at the LIVE
-            // marker that `get_list_of_active_boxes` (frame.rs:628) reads.
-            // The snapshot's liveness decode REQUIRES this to be a JitCode
-            // PC; using an interpreter PC underflows `pc - SIZE_LIVE_OP`.
-            // For an `after_residual_call` guard
-            // (`finish_residual_call_exception_path`) `resume_pc` is instead
-            // the post-call `code_cursor` itself: it already points AT that
-            // residual call's trailing LIVE marker, so the snapshot reads it
-            // directly (frame.rs:846-849) WITHOUT the `- SIZE_LIVE_OP`
-            // step-back. `MIFrame::pc` (the saved resume position) stays 0 in
-            // an inline sub-frame, so it must not be used here.
-            self.frames.frames[top_idx].pc = resume_pc;
-            // RPython only swaps the top frame pc before
-            // `capture_resumedata`; it never writes portal state into an
-            // inline callee frame.  State-field JIT still needs to
-            // materialize `__JitSym` scalars into an MIFrame register bank,
-            // but the only orthodox destination is the root/portal frame.
-            if crate::bh_debug_enabled() {
-                eprintln!(
-                    "[rec-guard] resume_pc={} frames={} root_i0_reg={:?} root_i0_val={:?}",
-                    resume_pc,
-                    self.frames.frames.len(),
-                    self.frames.frames[0].int_regs.first(),
-                    self.frames.frames[0].int_values.first(),
-                );
-            }
-            let n = sym
-                .int_identity_slots_end()
-                .min(self.frames.frames[0].int_regs.len());
-            let saved_int_regs: Vec<Option<OpRef>> = self.frames.frames[0].int_regs[..n].to_vec();
-            let saved_int_values: Vec<Option<i64>> = self.frames.frames[0].int_values[..n].to_vec();
-            let rn = sym
-                .ref_identity_slots_end()
-                .min(self.frames.frames[0].ref_regs.len());
-            let saved_ref_regs: Vec<Option<OpRef>> = self.frames.frames[0].ref_regs[..rn].to_vec();
-            let saved_ref_values: Vec<Option<i64>> =
-                self.frames.frames[0].ref_values[..rn].to_vec();
-            let root_inflight_int_result =
-                if self.frames.frames.len() > 1 && self.frames.frames[0]._result_argcode == b'i' {
-                    self.frames.frames[0].result_arg_index.or_else(|| {
-                        let pc = self.frames.frames[0].pc;
-                        pc.checked_sub(1)
-                            .and_then(|idx| self.frames.frames[0].jitcode.code.get(idx).copied())
-                            .map(|idx| idx as usize)
-                    })
-                } else {
-                    None
-                };
-            let root_inflight_ref_result =
-                if self.frames.frames.len() > 1 && self.frames.frames[0]._result_argcode == b'r' {
-                    self.frames.frames[0].result_arg_index.or_else(|| {
-                        let pc = self.frames.frames[0].pc;
-                        pc.checked_sub(1)
-                            .and_then(|idx| self.frames.frames[0].jitcode.code.get(idx).copied())
-                            .map(|idx| idx as usize)
-                    })
-                } else {
-                    None
-                };
-            sym.populate_frame_int_regs(&mut self.frames.frames[0]);
-            let op_live = ctx.metainterp_sd().op_live as u8;
-            let all_liveness = ctx.metainterp_sd().liveness_info.clone();
-            // `pyjitpl.py:2610` `_snapshot_box_list` — clone the per-trace
-            // virtualizable / virtualref boxes so the snapshot builder
-            // can read them without keeping a `&TraceCtx` borrow alive.
-            // Both vectors are short (one per live `@jit.virtualizable`,
-            // two per live vref).
-            let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
-            let virtualref_snapshot = ctx.virtualref_boxes.clone();
-            if crate::callee_rca_enabled() {
-                let vable_payload: Vec<_> = virtualizable_snapshot
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, op)| {
-                        let raw = ctx.box_value(*op).map(|value| match value {
-                            majit_ir::Value::Int(v) => v,
-                            majit_ir::Value::Ref(r) => r.as_usize() as i64,
-                            majit_ir::Value::Float(v) => v.to_bits() as i64,
-                            majit_ir::Value::Void => 0,
-                        });
-                        (idx, *op, raw)
-                    })
-                    .collect();
-                eprintln!(
-                    "[callee-rca][record-guard] opcode={:?} resume_pc={} \
-                     vable_boxes={} vref_boxes={} fail_args={}",
-                    opcode,
-                    resume_pc,
-                    virtualizable_snapshot.len(),
-                    virtualref_snapshot.len(),
-                    fail_args.len(),
-                );
-                eprintln!("[callee-rca][record-guard-vable] {:?}", vable_payload);
-            }
-            let snapshot = build_state_field_snapshot(
-                self.frames,
-                op_live,
-                &all_liveness,
+            self.publish_last_guard_resume_snapshot(
+                ctx,
+                sym,
+                resume_pc,
                 after_residual_call,
-                &virtualizable_snapshot,
-                &virtualref_snapshot,
-                Some((sym.int_identity_slots_base(), sym.int_identity_slots_end())),
+                false,
+                Some((opcode, fail_args.len())),
             );
-            for idx in 0..n {
-                // RPython pyjitpl.py:180-193 leaves the parent frame's
-                // in-flight int result slot cleared after get_list_of_active_boxes(True).
-                // Preserve that mutation instead of restoring the pre-snapshot
-                // state-field materialization save.
-                if Some(idx) != root_inflight_int_result {
-                    self.frames.frames[0].int_regs[idx] = saved_int_regs[idx];
-                    self.frames.frames[0].int_values[idx] = saved_int_values[idx];
-                }
-            }
-            for idx in 0..rn {
-                if Some(idx) != root_inflight_ref_result {
-                    self.frames.frames[0].ref_regs[idx] = saved_ref_regs[idx];
-                    self.frames.frames[0].ref_values[idx] = saved_ref_values[idx];
-                }
-            }
-            self.frames.frames[top_idx].pc = saved_top_pc;
-            let snapshot_id = ctx.capture_resumedata(snapshot);
-            ctx.set_last_guard_resume_position(snapshot_id);
             guard_op
         } else {
             ctx.record_guard(opcode, args, sym.total_slots())
+        }
+    }
+
+    /// Attach a resume snapshot to a guard a `TraceCtx::vable_*` call emitted
+    /// internally, if it emitted one.
+    ///
+    /// The vable opcodes promote before they load: `get_arrayitem_vable_index`
+    /// promotes the array index, and `_nonstandard_virtualizable`
+    /// (`pyjitpl.py:1120`) promotes the `isstandard` PTR_EQ for a frame that is
+    /// not the standard virtualizable. Both go through
+    /// `TraceCtx::record_guard_with_snapshot`, which has no `MIFrameStack` to
+    /// walk and so leaves the guard holding a frame marked
+    /// `recorder::UNSTAMPED_JITCODE_INDEX`. The dispatcher does hold the
+    /// framestack, so the real position is stamped here — upstream captures it
+    /// in `implement_guard_value` (`pyjitpl.py:1916`) →
+    /// `generate_guard(GUARD_VALUE, resumepc=orgpc)` (`:2582`) →
+    /// `capture_resumedata` (`:2610`), all at the promote itself.
+    ///
+    /// `guards_before` is `ctx.num_guards()` read before the `vable_*` call:
+    /// the promotes are conditional (an already-constant index, or the
+    /// standard virtualizable short-circuiting at step 1) and emit nothing in
+    /// the common case, so an unchanged count means there is nothing to stamp.
+    ///
+    /// `opcode_pc` is the vable op's own JitCode position. The lowering emits
+    /// a `-live-` marker in front of every vable op (`lower_vable.rs`, mirroring
+    /// `jtransform.py:764/798/814/845/926`), so `opcode_pc - SIZE_LIVE_OP`
+    /// resolves the liveness the snapshot needs.
+    fn capture_vable_promote_guard(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        opcode_pc: usize,
+        guards_before: usize,
+    ) {
+        if ctx.num_guards() <= guards_before {
+            return;
+        }
+        if sym.fail_args_with_ctx(ctx).is_none() {
+            // The sym cannot name the live set, so no snapshot is buildable —
+            // the same condition under which `record_state_guard` records a
+            // guard without one.
+            return;
+        }
+        self.publish_last_guard_resume_snapshot(ctx, sym, opcode_pc, false, true, None);
+    }
+
+    /// Attach a resume snapshot built from the live framestack to the guard
+    /// the caller just recorded, and point that guard's
+    /// `rd_resume_position` at it.
+    ///
+    /// RPython `pyjitpl.py:2591-2602 capture_resumedata` temporarily swaps
+    /// `frame.pc = resumepc` ahead of the framestack walk, then restores the
+    /// original `frame.pc`. `build_state_field_snapshot` reads `frame.pc`
+    /// directly, so the swap pins the snapshot's `SnapshotFrame.pc` to the
+    /// guard's resumepc independent of the dispatcher's post-decode
+    /// `frame.pc`.
+    ///
+    /// `stamp_last_guard_op` selects which recorded op receives the position:
+    /// the last op, or the last *guard* op. They differ whenever the guard is
+    /// not the last thing recorded — `emit_force_virtualizable` records
+    /// GETFIELD_GC / PTR_NE / COND_CALL on top of the vable promote, so that
+    /// caller needs the guard-op form or the position lands on the COND_CALL.
+    ///
+    /// `diag` carries the guard opcode and its fail-arg count for the
+    /// `callee_rca` trace only; callers re-stamping a guard `TraceCtx`
+    /// recorded internally pass `None`.
+    fn publish_last_guard_resume_snapshot(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        resume_pc: usize,
+        after_residual_call: bool,
+        stamp_last_guard_op: bool,
+        diag: Option<(OpCode, usize)>,
+    ) {
+        let top_idx = self
+            .frames
+            .frames
+            .len()
+            .checked_sub(1)
+            .expect("publish_last_guard_resume_snapshot: empty framestack");
+        let saved_top_pc = self.frames.frames[top_idx].pc;
+        // RPython pyjitpl.py:2591-2602 capture_resumedata swaps
+        // `frame.pc = resumepc` (a JitCode bytecode PC) before the
+        // framestack walk. `resume_pc` here is `opcode_pc =
+        // code_cursor - 1` (dispatch.rs ~2203), the guard op's JitCode
+        // position, whose `opcode_pc - SIZE_LIVE_OP` points at the LIVE
+        // marker that `get_list_of_active_boxes` (frame.rs:628) reads.
+        // The snapshot's liveness decode REQUIRES this to be a JitCode
+        // PC; using an interpreter PC underflows `pc - SIZE_LIVE_OP`.
+        // For an `after_residual_call` guard
+        // (`finish_residual_call_exception_path`) `resume_pc` is instead
+        // the post-call `code_cursor` itself: it already points AT that
+        // residual call's trailing LIVE marker, so the snapshot reads it
+        // directly (frame.rs:846-849) WITHOUT the `- SIZE_LIVE_OP`
+        // step-back. `MIFrame::pc` (the saved resume position) stays 0 in
+        // an inline sub-frame, so it must not be used here.
+        self.frames.frames[top_idx].pc = resume_pc;
+        // RPython only swaps the top frame pc before
+        // `capture_resumedata`; it never writes portal state into an
+        // inline callee frame.  State-field JIT still needs to
+        // materialize `__JitSym` scalars into an MIFrame register bank,
+        // but the only orthodox destination is the root/portal frame.
+        if crate::bh_debug_enabled() {
+            eprintln!(
+                "[rec-guard] resume_pc={} frames={} root_i0_reg={:?} root_i0_val={:?}",
+                resume_pc,
+                self.frames.frames.len(),
+                self.frames.frames[0].int_regs.first(),
+                self.frames.frames[0].int_values.first(),
+            );
+        }
+        let n = sym
+            .int_identity_slots_end()
+            .min(self.frames.frames[0].int_regs.len());
+        let saved_int_regs: Vec<Option<OpRef>> = self.frames.frames[0].int_regs[..n].to_vec();
+        let saved_int_values: Vec<Option<i64>> = self.frames.frames[0].int_values[..n].to_vec();
+        let rn = sym
+            .ref_identity_slots_end()
+            .min(self.frames.frames[0].ref_regs.len());
+        let saved_ref_regs: Vec<Option<OpRef>> = self.frames.frames[0].ref_regs[..rn].to_vec();
+        let saved_ref_values: Vec<Option<i64>> =
+            self.frames.frames[0].ref_values[..rn].to_vec();
+        let root_inflight_int_result =
+            if self.frames.frames.len() > 1 && self.frames.frames[0]._result_argcode == b'i' {
+                self.frames.frames[0].result_arg_index.or_else(|| {
+                    let pc = self.frames.frames[0].pc;
+                    pc.checked_sub(1)
+                        .and_then(|idx| self.frames.frames[0].jitcode.code.get(idx).copied())
+                        .map(|idx| idx as usize)
+                })
+            } else {
+                None
+            };
+        let root_inflight_ref_result =
+            if self.frames.frames.len() > 1 && self.frames.frames[0]._result_argcode == b'r' {
+                self.frames.frames[0].result_arg_index.or_else(|| {
+                    let pc = self.frames.frames[0].pc;
+                    pc.checked_sub(1)
+                        .and_then(|idx| self.frames.frames[0].jitcode.code.get(idx).copied())
+                        .map(|idx| idx as usize)
+                })
+            } else {
+                None
+            };
+        sym.populate_frame_int_regs(&mut self.frames.frames[0]);
+        let op_live = ctx.metainterp_sd().op_live as u8;
+        let all_liveness = ctx.metainterp_sd().liveness_info.clone();
+        // `pyjitpl.py:2610` `_snapshot_box_list` — clone the per-trace
+        // virtualizable / virtualref boxes so the snapshot builder
+        // can read them without keeping a `&TraceCtx` borrow alive.
+        // Both vectors are short (one per live `@jit.virtualizable`,
+        // two per live vref).
+        let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
+        let virtualref_snapshot = ctx.virtualref_boxes.clone();
+        if crate::callee_rca_enabled() {
+            let vable_payload: Vec<_> = virtualizable_snapshot
+                .iter()
+                .enumerate()
+                .map(|(idx, op)| {
+                    let raw = ctx.box_value(*op).map(|value| match value {
+                        majit_ir::Value::Int(v) => v,
+                        majit_ir::Value::Ref(r) => r.as_usize() as i64,
+                        majit_ir::Value::Float(v) => v.to_bits() as i64,
+                        majit_ir::Value::Void => 0,
+                    });
+                    (idx, *op, raw)
+                })
+                .collect();
+            eprintln!(
+                "[callee-rca][record-guard] opcode={:?} resume_pc={} \
+                 vable_boxes={} vref_boxes={} fail_args={:?}",
+                diag.map(|(opcode, _)| opcode),
+                resume_pc,
+                virtualizable_snapshot.len(),
+                virtualref_snapshot.len(),
+                diag.map(|(_, n)| n),
+            );
+            eprintln!("[callee-rca][record-guard-vable] {:?}", vable_payload);
+        }
+        let snapshot = build_state_field_snapshot(
+            self.frames,
+            op_live,
+            &all_liveness,
+            after_residual_call,
+            &virtualizable_snapshot,
+            &virtualref_snapshot,
+            Some((sym.int_identity_slots_base(), sym.int_identity_slots_end())),
+        );
+        for idx in 0..n {
+            // RPython pyjitpl.py:180-193 leaves the parent frame's
+            // in-flight int result slot cleared after get_list_of_active_boxes(True).
+            // Preserve that mutation instead of restoring the pre-snapshot
+            // state-field materialization save.
+            if Some(idx) != root_inflight_int_result {
+                self.frames.frames[0].int_regs[idx] = saved_int_regs[idx];
+                self.frames.frames[0].int_values[idx] = saved_int_values[idx];
+            }
+        }
+        for idx in 0..rn {
+            if Some(idx) != root_inflight_ref_result {
+                self.frames.frames[0].ref_regs[idx] = saved_ref_regs[idx];
+                self.frames.frames[0].ref_values[idx] = saved_ref_values[idx];
+            }
+        }
+        self.frames.frames[top_idx].pc = saved_top_pc;
+        let snapshot_id = ctx.capture_resumedata(snapshot);
+        if stamp_last_guard_op {
+            ctx.set_last_guard_op_resume_position(snapshot_id);
+        } else {
+            ctx.set_last_guard_resume_position(snapshot_id);
         }
     }
 
@@ -3247,8 +3325,10 @@ where
                 // cache-hit sanity check (plumbing;
                 // wires the check itself).
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                let guards_before = ctx.num_guards();
                 let (opref, value) =
                     ctx.vable_getfield_int(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
                 self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
             }
             jitcode::insns::BC_GETFIELD_VABLE_R => {
@@ -3264,8 +3344,10 @@ where
                     return TraceAction::Abort;
                 };
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                let guards_before = ctx.num_guards();
                 let (opref, value) =
                     ctx.vable_getfield_ref(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
                 self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
             }
             jitcode::insns::BC_GETFIELD_VABLE_F => {
@@ -3281,8 +3363,10 @@ where
                     return TraceAction::Abort;
                 };
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                let guards_before = ctx.num_guards();
                 let (opref, value) =
                     ctx.vable_getfield_float(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
                 self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
             }
             jitcode::insns::BC_NEW | jitcode::insns::BC_NEW_WITH_VTABLE => {
@@ -3700,6 +3784,7 @@ where
                     return TraceAction::Abort;
                 };
                 let (value, concrete) = self.read_int_reg(src);
+                let guards_before = ctx.num_guards();
                 ctx.vable_setfield(
                     opcode_pc,
                     vable_opref,
@@ -3707,6 +3792,7 @@ where
                     value,
                     Some(Value::Int(concrete)),
                 );
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
             }
             jitcode::insns::BC_SETFIELD_VABLE_R => {
                 let (opcode_pc, vable_reg, field_idx, src) = {
@@ -3721,6 +3807,7 @@ where
                     return TraceAction::Abort;
                 };
                 let (value, concrete) = self.read_ref_reg(src);
+                let guards_before = ctx.num_guards();
                 ctx.vable_setfield(
                     opcode_pc,
                     vable_opref,
@@ -3728,6 +3815,7 @@ where
                     value,
                     Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
                 );
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
             }
             jitcode::insns::BC_SETFIELD_VABLE_F => {
                 let (opcode_pc, vable_reg, field_idx, src) = {
@@ -3742,6 +3830,7 @@ where
                     return TraceAction::Abort;
                 };
                 let (value, concrete) = self.read_float_reg(src);
+                let guards_before = ctx.num_guards();
                 ctx.vable_setfield(
                     opcode_pc,
                     vable_opref,
@@ -3749,6 +3838,7 @@ where
                     value,
                     Some(Value::Float(f64::from_bits(concrete as u64))),
                 );
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
             }
             // ── BC_ARRAYLEN_GC ──
             //
@@ -4145,6 +4235,7 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
+                let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_int_indexed(
                     opcode_pc,
                     vable_opref,
@@ -4153,6 +4244,7 @@ where
                     fdescr,
                     adescr,
                 );
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
                 self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_R => {
@@ -4168,6 +4260,7 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
+                let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_ref_indexed(
                     opcode_pc,
                     vable_opref,
@@ -4176,6 +4269,7 @@ where
                     fdescr,
                     adescr,
                 );
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
                 self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_F => {
@@ -4191,6 +4285,7 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
+                let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_float_indexed(
                     opcode_pc,
                     vable_opref,
@@ -4199,6 +4294,7 @@ where
                     fdescr,
                     adescr,
                 );
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
                 self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_I => {
@@ -4215,6 +4311,7 @@ where
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, concrete) = self.read_int_reg(src);
+                let guards_before = ctx.num_guards();
                 if !ctx.vable_setarrayitem_indexed(
                     opcode_pc,
                     vable_opref,
@@ -4231,6 +4328,7 @@ where
                     // this slot cannot be virtualized, so abort the trace.
                     return TraceAction::Abort;
                 }
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_R => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
@@ -4246,6 +4344,7 @@ where
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, concrete) = self.read_ref_reg(src);
+                let guards_before = ctx.num_guards();
                 if !ctx.vable_setarrayitem_indexed(
                     opcode_pc,
                     vable_opref,
@@ -4259,6 +4358,7 @@ where
                 ) {
                     return TraceAction::Abort;
                 }
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_F => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
@@ -4274,6 +4374,7 @@ where
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, concrete) = self.read_float_reg(src);
+                let guards_before = ctx.num_guards();
                 if !ctx.vable_setarrayitem_indexed(
                     opcode_pc,
                     vable_opref,
@@ -4287,6 +4388,7 @@ where
                 ) {
                     return TraceAction::Abort;
                 }
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
             }
             jitcode::insns::BC_ARRAYLEN_VABLE => {
                 let (opcode_pc, vable_reg, array_idx, dest) = {
@@ -4301,6 +4403,7 @@ where
                     return TraceAction::Abort;
                 };
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                let guards_before = ctx.num_guards();
                 let result = ctx.vable_arraylen_vable(
                     opcode_pc,
                     vable_opref,
@@ -4308,6 +4411,7 @@ where
                     fdescr,
                     adescr,
                 );
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
                 // pyjitpl.py:1262-1263 `result =
                 // vinfo.get_array_length(virtualizable, arrayindex);
                 // return ConstInt(result)`.  RPython reads from the live
