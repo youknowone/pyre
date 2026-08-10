@@ -32,7 +32,6 @@ const STATE_MARKING: u8 = 1;
 const STATE_SWEEPING: u8 = 2;
 const STATE_FINALIZING: u8 = 3;
 const STATE_USERDEL: u8 = 4;
-const EIO_ERRNO: i32 = 5;
 
 /// `rgc.py:52-60 is_done__states`: a major collection has finished when the
 /// step ended in the starting state *and* did not start there. A collector
@@ -991,6 +990,81 @@ fn typeids_z_bytes() -> Result<Vec<u8>, crate::PyError> {
         .map_err(|error| crate::PyError::os_error(error.to_string()))
 }
 
+/// The spelling each typeid sidecar wants. `app_referents.py:34` opens
+/// `typeids.txt` binary and writes the decompressed bytes; `:40` opens
+/// `typeids.lst` text and writes a str, so the object handed to `write`
+/// differs even though the surrounding steps do not.
+enum TypeidsPayload<'a> {
+    Binary(&'a [u8]),
+    Text(&'a str),
+}
+
+/// `app_referents.py:32,38` `os.path.exists`. Under sandbox the probe is a
+/// controller round trip, the way `importing.rs`'s `SeamSourceProvider` does
+/// it; `Path::exists` stats the real filesystem, which is exactly what the
+/// jail is there to prevent. It escapes the `disallowed-methods` fence only
+/// because that list names `std::fs::metadata` rather than the `Path` method
+/// wrapping it.
+fn typeids_sidecar_exists(path: &std::path::Path) -> bool {
+    #[cfg(feature = "sandbox")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        crate::host_seam::ops::stat(path.as_os_str().as_bytes()).is_ok()
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        path.exists()
+    }
+}
+
+/// `app_referents.py:33-36,39-42`: open the sidecar, write it once, close it.
+///
+/// The write goes through `builtin_open` and the file object's own `write` /
+/// `close`, which is both what upstream writes and what a sandbox build routes
+/// to the controller — `std::fs::write` would reach the real filesystem from
+/// inside the jail. Errors are left to propagate from those calls, as they do
+/// upstream, so the raised `OSError` carries the sidecar's own name rather
+/// than the dump's.
+fn write_typeids_sidecar(
+    path: &std::path::Path,
+    payload: TypeidsPayload<'_>,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
+    let mode_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_str_new(match payload {
+        TypeidsPayload::Binary(_) => "wb",
+        TypeidsPayload::Text(_) => "w",
+    }));
+    let opened = crate::builtins::builtin_open(&[
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+        pyre_object::gc_roots::shadow_stack_get(mode_slot),
+    ])?;
+    let opened_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(opened);
+    // Materialize the payload only now: `builtin_open` allocates, so a value
+    // boxed before it would have to be rooted across the open for nothing.
+    let data_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(match payload {
+        TypeidsPayload::Binary(bytes) => w_bytes_from_bytes(bytes),
+        TypeidsPayload::Text(text) => w_str_new(text),
+    });
+    let written = gc_call_method(
+        pyre_object::gc_roots::shadow_stack_get(opened_slot),
+        "write",
+        &[pyre_object::gc_roots::shadow_stack_get(data_slot)],
+    );
+    let closed = gc_call_method(
+        pyre_object::gc_roots::shadow_stack_get(opened_slot),
+        "close",
+        &[],
+    );
+    written?;
+    closed?;
+    Ok(())
+}
+
 fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let file_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1030,23 +1104,19 @@ fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError
 
         let directory = path.parent().unwrap_or_else(|| std::path::Path::new(""));
         let typeids_txt = directory.join("typeids.txt");
-        if !typeids_txt.exists() {
+        if !typeids_sidecar_exists(&typeids_txt) {
             let text = majit_gc::get_typeids_text().ok_or_else(|| {
                 crate::PyError::not_implemented("operation not implemented by this GC")
             })?;
-            std::fs::write(&typeids_txt, text).map_err(|error| {
-                crate::PyError::os_error_syscall(error.raw_os_error().unwrap_or(EIO_ERRNO), file())
-            })?;
+            write_typeids_sidecar(&typeids_txt, TypeidsPayload::Binary(&text))?;
         }
         let typeids_lst = directory.join("typeids.lst");
-        if !typeids_lst.exists() {
+        if !typeids_sidecar_exists(&typeids_lst) {
             let list = majit_gc::get_typeids_list().ok_or_else(|| {
                 crate::PyError::not_implemented("operation not implemented by this GC")
             })?;
             let data: String = list.into_iter().map(|value| format!("{value}\n")).collect();
-            std::fs::write(&typeids_lst, data).map_err(|error| {
-                crate::PyError::os_error_syscall(error.raw_os_error().unwrap_or(EIO_ERRNO), file())
-            })?;
+            write_typeids_sidecar(&typeids_lst, TypeidsPayload::Text(&data))?;
         }
         return Ok(w_none());
     }
