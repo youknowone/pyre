@@ -535,8 +535,13 @@ def main() -> int:
             status, detail = fut.result()
             results[m] = (status, detail)
             done += 1
-            mark = {"PASS": "·", "FAIL": "F", "CRASH": "C",
-                    "TIMEOUT": "T", "IMPORTERROR": "i"}.get(status, "?")
+            # Every member of STATUSES needs a mark, SKIP included: a module
+            # that runs and bails with SkipTest is classified SKIP (:229),
+            # which is a different event from a module deselected before the
+            # run, and without its own mark it printed as "?" — the character
+            # reserved for a status this table does not know.
+            mark = {"PASS": "·", "FAIL": "F", "CRASH": "C", "TIMEOUT": "T",
+                    "IMPORTERROR": "i", "SKIP": "s"}.get(status, "?")
             sys.stdout.write(mark)
             sys.stdout.flush()
             if done % 80 == 0:
@@ -547,10 +552,23 @@ def main() -> int:
     counts = {s: 0 for s in STATUSES}
     for status, _ in results.values():
         counts[status] = counts.get(status, 0) + 1
-    counts["SKIP"] = len(skipped)
+    # `+=`, not `=`: SKIP arrives from two places — modules deselected before
+    # the run (`skipped`) and modules that ran and bailed with SkipTest
+    # (counted from `results` just above). Assigning dropped the second set,
+    # so the buckets did not sum to what was selected: a `--filter ctypes`
+    # run reported "2 to run" over "?F" and a summary totalling 1.
+    counts["SKIP"] += len(skipped)
     print("\n── summary ──")
     for s in STATUSES:
         print(f"  {s:12s} {counts[s]}")
+    # Reconcile rather than trust: the buckets partition the selection, so
+    # their sum is derivable and a disagreement means a status escaped the
+    # table. Computed, not read off the counters that produced it.
+    accounted = sum(counts[s] for s in STATUSES)
+    expected = len(to_run) + len(skipped)
+    if accounted != expected:
+        print(f"  {'UNACCOUNTED':12s} {expected - accounted}  "
+              f"(buckets sum to {accounted}, {expected} were selected)")
 
     # Regression / improvement analysis vs baseline.
     regressions: list[str] = []
