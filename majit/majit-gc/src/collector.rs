@@ -11,7 +11,38 @@ use majit_ir::GcRef;
 use std::collections::VecDeque;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+/// Monotonic source for the durations the collector reports to its hooks.
+///
+/// `wasm32-unknown-unknown` has no clock: `Instant::now` panics with "time not
+/// implemented on this platform", which is also why the interpreter does not
+/// install its `time` module on that target. Report a zero duration there
+/// rather than taking the panic — `duration`, `duration_min`, and
+/// `duration_max` only reach `hook.py`'s stats objects and the `total_gc_time`
+/// counter, and no collection decision reads any of them.
+struct GcClock {
+    #[cfg(not(target_arch = "wasm32"))]
+    start: std::time::Instant,
+}
+
+impl GcClock {
+    fn start() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            start: std::time::Instant::now(),
+        }
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.start.elapsed().as_secs_f64()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0.0
+        }
+    }
+}
 
 use crate::address_dict::AddressMap;
 use crate::flags;
@@ -2060,7 +2091,7 @@ impl MiniMarkGC {
     /// 3. Iteratively process newly discovered references until stable.
     /// 4. Reset nursery.
     pub fn do_collect_nursery(&mut self) {
-        let start = Instant::now();
+        let start = GcClock::start();
         let _stw = if crate::gc_sync::stw_required() {
             Some(crate::gc_sync::quiesce_mutators())
         } else {
@@ -2386,7 +2417,7 @@ impl MiniMarkGC {
 
         // incminimark.py:1962-1974 — report the completed minor before the
         // wrapper advances the incremental major state machine.
-        let duration = start.elapsed().as_secs_f64();
+        let duration = start.elapsed_secs();
         self.total_gc_time += duration;
         self.hooks.fire_gc_minor(
             duration,
@@ -3786,7 +3817,7 @@ impl MiniMarkGC {
 
     /// incminimark.py:2390-2634 `major_collection_step`.
     fn major_collection_step(&mut self) {
-        let start = Instant::now();
+        let start = GcClock::start();
         let old_state = self.gc_state.encoded();
         let oom_was_pending = self.oom_pending;
         self.debug_check_consistency();
@@ -3822,7 +3853,7 @@ impl MiniMarkGC {
         // before this site; pyre communicates it through `oom_pending`, so
         // suppress the transition event when this step newly raised it.
         if self.oom_pending == oom_was_pending {
-            let duration = start.elapsed().as_secs_f64();
+            let duration = start.elapsed_secs();
             self.total_gc_time += duration;
             self.hooks
                 .fire_gc_collect_step(duration, old_state, self.gc_state.encoded());
