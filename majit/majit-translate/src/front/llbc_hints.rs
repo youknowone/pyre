@@ -405,7 +405,7 @@ mod tests {
         let functions = HashSet::from(["rbigint::RBigInt::mul".to_string()]);
         assert_eq!(
             marker_path_to_fn_path(
-                "pyre_object::rbigint::RBigInt::mul::_elidable_function_mul",
+                "majit_rlib::rbigint::RBigInt::mul::_elidable_function_mul",
                 "_elidable_function_",
                 &functions,
             ),

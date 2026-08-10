@@ -4,7 +4,7 @@
 //! own Rust test binary so libtest's parallel unit-test threads cannot observe
 //! a transient algorithm cutoff halfway through another bigint operation.
 
-use pyre_object::rbigint::{HOLDER, RBigInt, divmod_big};
+use majit_rlib::rbigint::{HOLDER, RBigInt, divmod_big};
 
 #[test]
 fn test_upstream_divmod_big_bug() {

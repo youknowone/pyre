@@ -522,9 +522,10 @@ use crate::frame_layout::{PYFRAME_DEBUGDATA_OFFSET, PYFRAME_PYCODE_OFFSET};
 /// RPython does not have — RPython's `metainterp.virtualizable_boxes`
 /// is the single canonical source for vable static state.  Setfield-
 /// vable opcodes (`_opimpl_setfield_vable`) and the JUMP-time
-/// shadow flush (`flush_to_frame`) publish into the boxes shadow so
-/// future readers (JUMP-arg dedup, `close_loop_args_at`)
-/// observe the same identity as `s.vable_*`.  Callers gate on
+/// shadow flush (`flush_to_frame`) publish into the boxes shadow and
+/// synchronize the static back to the live frame, so future readers
+/// (JUMP-arg dedup, `close_loop_args_at`) observe the same identity as
+/// `s.vable_*`.  Callers gate on
 /// `s.owns_virtualizable_shadow()` before calling — upstream
 /// `_opimpl_setfield_vable` short-circuits on
 /// `_nonstandard_virtualizable` so callee inline frames never reach

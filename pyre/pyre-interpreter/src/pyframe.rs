@@ -41,10 +41,21 @@ macro_rules! locals_w {
 }
 
 /// Mutably borrow a frame's `locals_cells_stack_w` array. See [`locals_w!`].
+///
+/// The `&mut *` on the receiver is load-bearing: the field it projects is a
+/// raw pointer, which reads fine through a shared `&PyFrame`, so without it a
+/// safe caller holding a shared frame could mint `&mut` to the array.  The
+/// accessor this replaced took `&mut self` and this restores that requirement.
+///
+/// It does not bound the result's lifetime — `&mut *ptr` has an unconstrained
+/// one — so two overlapping calls still produce aliasing the borrow checker
+/// cannot see.  Tying the lifetime needs a function signature to tie it to,
+/// which is the accessor form that puts the `getfield` in its own graph and
+/// defeats the pairing described on [`locals_w!`].
 #[macro_export]
 macro_rules! locals_w_mut {
     ($frame:expr) => {
-        (unsafe { &mut *$frame.locals_cells_stack_w })
+        (unsafe { &mut *(&mut *$frame).locals_cells_stack_w })
     };
 }
 

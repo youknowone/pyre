@@ -72,15 +72,20 @@ pub struct W_TupleObject {
     /// `len(l.items)`); empty tuples carry a 0-cap header-only
     /// allocation (non-null pointer).
     pub wrappeditems: *mut ItemsBlock,
-    /// Mapdict's per-instance `dict` SPECIAL slot for a user subclass.
-    ///
-    /// PyPy's `user_setup` mixes mapdict storage into the concrete
-    /// user-subclass instance. Rust has one fixed payload layout, so the
-    /// optional slot lives on the canonical array-backed tuple object;
-    /// exact tuples leave it null. Tuple subclasses are deliberately rebuilt
-    /// with this layout in `tuple_descr_new`, never with an arity-2
-    /// specialised layout.
+    /// Mapdict's per-instance `dict` SPECIAL slot in the legacy tuple layout.
+    /// User subclasses use [`W_TupleObjectUser`]'s translated mapdict mixin;
+    /// exact tuples leave this null.
     pub w_dict: PyObjectRef,
+}
+
+/// The translated user-subclass layout selected by `typedef.py:174-227`.
+/// The builtin tuple payload stays unchanged; the generated user class adds
+/// `MapdictStorageMixin` after it.
+#[repr(C)]
+pub struct W_TupleObjectUser {
+    pub base: W_TupleObject,
+    pub map: *const u8,
+    pub storage: *mut ItemsBlock,
 }
 
 /// GC type id assigned to `W_TupleObject` at `JitDriver` init time.
@@ -92,6 +97,15 @@ pub struct W_TupleObject {
 /// call sites.
 pub const W_TUPLE_GC_TYPE_ID: u32 = 8;
 pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
+pub static W_TUPLE_USER_GC_TYPE_ID: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
+pub const W_TUPLE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObjectUser>();
+
+impl crate::lltype::GcType for W_TupleObjectUser {
+    fn type_id() -> u32 {
+        W_TUPLE_USER_GC_TYPE_ID.get()
+    }
+    const SIZE: usize = W_TUPLE_USER_OBJECT_SIZE;
+}
 
 // JIT field descriptors read/write the atomic cache as a signed machine word.
 const _: () = {
@@ -150,8 +164,6 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
     if is_specialised_tuple_ii(obj) || is_specialised_tuple_ff(obj) {
         return;
     }
-    let tuple = obj as *mut W_TupleObject;
-    visitor(std::ptr::addr_of_mut!((*tuple).w_dict));
     // General `W_TupleObject`: forward each slot of the exact-size items block.
     if let Some((ptr, n)) = w_tuple_object_items_ptr_len(obj) {
         for i in 0..n {
@@ -200,6 +212,25 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
 /// Residualized for the same GC-allocator reason as `w_tuple_new`.
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
+    w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false)
+}
+
+/// Build the array-backed layout used by a tuple user subclass. This is the
+/// allocation half of `typedef.py:174-227`: the base tuple fields keep their
+/// offsets and the generated user class alone receives mapdict storage.
+#[majit_macros::dont_look_inside]
+pub fn w_tuple_subclass_new_array_backed(
+    items: Vec<PyObjectRef>,
+    w_class: PyObjectRef,
+) -> PyObjectRef {
+    w_tuple_new_array_backed_impl(items, w_class, true)
+}
+
+fn w_tuple_new_array_backed_impl(
+    items: Vec<PyObjectRef>,
+    w_class: PyObjectRef,
+    user_layout: bool,
+) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     //   livevars = self.push_roots(hop)
     //   v_alloc = hop.genop("direct_call", [malloc_fast_ptr, ...])
@@ -226,9 +257,14 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
     // map and the tuple header. Both run while every item is pinned.
     let header = PyObject {
         ob_type: &TUPLE_TYPE as *const PyType,
-        w_class: get_instantiate(&TUPLE_TYPE),
+        w_class,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE);
+    let (type_id, object_size) = if user_layout {
+        (W_TUPLE_USER_GC_TYPE_ID.get(), W_TUPLE_USER_OBJECT_SIZE)
+    } else {
+        (W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE)
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(type_id, object_size);
     // The freshly allocated tuple header is itself a translated livevar across
     // the items-block allocation and the write barrier below. Publish it
     // immediately; in a free-threaded run either operation may park behind a
@@ -243,17 +279,12 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         None
     } else {
         unsafe {
-            std::ptr::write(
-                raw as *mut W_TupleObject,
-                W_TupleObject {
-                    ob_header: PyObject {
-                        ob_type: header.ob_type,
-                        w_class: header.w_class,
-                    },
-                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
-                    wrappeditems: std::ptr::null_mut(),
-                    w_dict: PY_NULL,
-                },
+            write_tuple_layout(
+                raw,
+                header.ob_type,
+                header.w_class,
+                std::ptr::null_mut(),
+                user_layout,
             );
         }
         crate::gc_roots::pin_root(raw as PyObjectRef);
@@ -317,43 +348,74 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         // block is still outstanding. Nothing below can collect, so the
         // remembered tuple keeps the block from here on.
         unsafe {
+            write_tuple_layout(
+                raw,
+                header.ob_type,
+                header.w_class,
+                items_block,
+                user_layout,
+            );
+        }
+        return raw as PyObjectRef;
+    }
+    if user_layout {
+        crate::lltype::malloc_typed(W_TupleObjectUser {
+            base: W_TupleObject {
+                ob_header: header,
+                hash: AtomicI64::new(TUPLE_HASH_UNSET),
+                wrappeditems: items_block,
+                w_dict: PY_NULL,
+            },
+            map: std::ptr::null(),
+            storage: std::ptr::null_mut(),
+        }) as PyObjectRef
+    } else {
+        Box::into_raw(Box::new(W_TupleObject {
+            ob_header: header,
+            hash: AtomicI64::new(TUPLE_HASH_UNSET),
+            wrappeditems: items_block,
+            w_dict: PY_NULL,
+        })) as PyObjectRef
+    }
+}
+
+unsafe fn write_tuple_layout(
+    raw: *mut u8,
+    ob_type: *const PyType,
+    w_class: PyObjectRef,
+    wrappeditems: *mut ItemsBlock,
+    user_layout: bool,
+) {
+    let header = PyObject { ob_type, w_class };
+    if user_layout {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_TupleObjectUser,
+                W_TupleObjectUser {
+                    base: W_TupleObject {
+                        ob_header: header,
+                        hash: AtomicI64::new(TUPLE_HASH_UNSET),
+                        wrappeditems,
+                        w_dict: PY_NULL,
+                    },
+                    map: std::ptr::null(),
+                    storage: std::ptr::null_mut(),
+                },
+            )
+        };
+    } else {
+        unsafe {
             std::ptr::write(
                 raw as *mut W_TupleObject,
                 W_TupleObject {
                     ob_header: header,
                     hash: AtomicI64::new(TUPLE_HASH_UNSET),
-                    wrappeditems: items_block,
+                    wrappeditems,
                     w_dict: PY_NULL,
                 },
-            );
-        }
-        return raw as PyObjectRef;
+            )
+        };
     }
-    Box::into_raw(Box::new(W_TupleObject {
-        ob_header: header,
-        hash: AtomicI64::new(TUPLE_HASH_UNSET),
-        wrappeditems: items_block,
-        w_dict: PY_NULL,
-    })) as PyObjectRef
-}
-
-/// Read the mapdict `dict` SPECIAL slot of an array-backed tuple subclass.
-///
-/// # Safety
-/// `obj` must be a non-specialised `W_TupleObject`.
-#[inline]
-pub unsafe fn w_tuple_getdict(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_TupleObject)).w_dict }
-}
-
-/// Replace the mapdict `dict` SPECIAL slot of an array-backed tuple subclass.
-///
-/// # Safety
-/// `obj` must be a non-specialised `W_TupleObject`.
-#[inline]
-pub unsafe fn w_tuple_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
-    unsafe { (*(obj as *mut W_TupleObject)).w_dict = w_dict };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// CPython 3.14 `FT_ATOMIC_LOAD_SSIZE_RELAXED(v->ob_hash)`, generalized over
@@ -735,7 +797,7 @@ mod tests {
     #[test]
     fn test_arity2_long_long_fits_int_routes_to_specialised_ii() {
         use crate::longobject::w_long_new;
-        use crate::rbigint::RBigInt as BigInt;
+        use majit_rlib::rbigint::RBigInt as BigInt;
         let tup = w_tuple_new(vec![
             w_long_new(BigInt::from(7)),
             w_long_new(BigInt::from(11)),
@@ -755,7 +817,7 @@ mod tests {
     #[test]
     fn test_arity2_overflow_long_falls_through_to_oo() {
         use crate::longobject::w_long_new;
-        use crate::rbigint::RBigInt as BigInt;
+        use majit_rlib::rbigint::RBigInt as BigInt;
         let huge = BigInt::from(i64::MAX) * BigInt::from(2);
         let tup = w_tuple_new(vec![w_long_new(huge), w_int_new(0)]);
         unsafe {

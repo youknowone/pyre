@@ -4053,13 +4053,30 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // Step 6: trim Link.args at indices whose target inputarg is dead.
     // `simplify.py:512-516`.  Walk in reverse so removals don't shift
     // surviving indices.
+    //
+    // The scope is the *target*'s reachability, not the source's.  Step 7
+    // trims the inputargs of every reachable block, and a block the
+    // reachability walk excludes — an orphan `eliminate_empty_blocks`
+    // bypassed, or one of the merge blocks jtransform leaves whose
+    // inputargs are phi targets rather than parameters — can still name a
+    // reachable block as its link target.  Skipping that link because its
+    // own block is unreachable breaks `len(link.args) ==
+    // len(link.target.inputargs)` with no diagnostic:
+    // `remove_duplicate_inputargs` reads each column by index across every
+    // incoming link, so the untrimmed one contributes the value one slot
+    // over, and the union-find merges two variables that are not the same
+    // value — a rename applied to the whole graph.  Reachability is closed
+    // under exits, so this only ever adds links, never drops one.
+    //
+    // Upstream cannot reach this: `graph.iterblocks()` *is* its block list,
+    // so an unreachable block is not in `blocks` and has no link to skip.
     for block_idx in 0..graph.blocks.len() {
-        if !reachable.contains(&graph.blocks[block_idx].id) {
-            continue;
-        }
         let exits_len = graph.blocks[block_idx].exits.len();
         for exit_idx in 0..exits_len {
             let target = graph.blocks[block_idx].exits[exit_idx].target;
+            if !reachable.contains(&target) {
+                continue;
+            }
             let target_iargs: Vec<crate::flowspace::model::Variable> = {
                 let &i = block_index
                     .get(&target)
@@ -6310,6 +6327,60 @@ mod tests {
             .iter()
             .any(|op| matches!(&op.kind, OpKind::Input { name, .. } if name == "x"));
         assert!(!has_phi_op, "orphan phi `OpKind::Input` must be dropped");
+    }
+
+    #[test]
+    fn prune_dead_phis_trims_an_unreachable_predecessors_link_with_the_target() {
+        //   entry  ─┐
+        //           ├→ merge(inputargs [dead, live]) → returnblock(live)
+        //   orphan ─┘
+        //
+        // `orphan` has no predecessor and is not a calling-convention entry —
+        // its inputarg is a phi target with no backing `OpKind::Input`, the
+        // shape `jtransform` leaves behind — so the reachability walk excludes
+        // it.  Steps 6 and 7 both walk `reachable`, so `merge`'s dead inputarg
+        // goes while `orphan`'s link keeps both args, and every later consumer
+        // that zips a link against its target's inputargs is then off by one.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let e_dead = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let e_live = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+
+        let merge = graph.create_block();
+        install_phi(&mut graph, merge, "dead");
+        let live_phi = install_phi(&mut graph, merge, "live");
+        graph.set_goto(entry, merge, vec![e_dead, e_live.clone()]);
+        graph.set_return(merge, Some(live_phi));
+
+        let orphan = graph.create_block();
+        let stranded = graph.alloc_value_var();
+        graph.push_inputarg_var(orphan, stranded);
+        let o_dead = graph
+            .push_op_var(orphan, OpKind::ConstInt(3), true)
+            .unwrap();
+        let o_live = graph
+            .push_op_var(orphan, OpKind::ConstInt(4), true)
+            .unwrap();
+        graph.set_goto(orphan, merge, vec![o_dead, o_live.clone()]);
+
+        prune_dead_phis(&mut graph);
+
+        assert_eq!(
+            graph.block(merge).inputargs.len(),
+            1,
+            "the unread phi column is dropped"
+        );
+        assert_eq!(
+            graph.block(entry).exits[0].args,
+            vec![LinkArg::Value(e_live)],
+            "the reachable predecessor keeps the live column"
+        );
+        assert_eq!(
+            graph.block(orphan).exits[0].args,
+            vec![LinkArg::Value(o_live)],
+            "an unreachable predecessor's link must be trimmed with its target, \
+             not left naming the column that was dropped"
+        );
     }
 
     #[test]

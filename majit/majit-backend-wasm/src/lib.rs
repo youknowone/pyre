@@ -1431,9 +1431,10 @@ fn normalize_ops_for_codegen(inputargs: &[InputArg], ops: &[OpRc]) -> Vec<Op> {
 /// CALL_ASSEMBLER target is admitted) lifts the CALL_ASSEMBLER decline so the
 /// CA arm (guest→guest `call_indirect`) lowers it instead.
 ///
-/// A JUMP with no local LABEL — the cross-loop terminal jump — is not judged
-/// here: it is lowered to `return_call_indirect(external_jump_slot)` and both
-/// callers resolve that slot through [`resolve_cross_loop_jump_target`].
+/// A JUMP whose target token is not defined by a local LABEL — the cross-loop
+/// terminal jump — is not judged here: it is lowered to
+/// `return_call_indirect(external_jump_slot)` and both callers resolve that
+/// slot through [`resolve_cross_loop_jump_target`].
 fn wasm_unsupported_trace_reason(ops: &[Op], allow_ca: bool) -> Option<String> {
     for op in ops {
         if op.opcode.is_call_assembler() && !allow_ca {
@@ -1452,13 +1453,15 @@ fn wasm_unsupported_trace_reason(ops: &[Op], allow_ca: bool) -> Option<String> {
     None
 }
 
-/// Whether a trace's terminal is a cross-loop `JUMP`: a JUMP with no local
-/// LABEL to close back onto, so codegen lowers it to a tail call into another
-/// module rather than a `br`.
+/// Whether a trace has a `JUMP` whose target token is not defined by one of
+/// this compilation's LABELs, so codegen lowers it to a tail call into another
+/// module rather than a `br`. This is the token test from
+/// `x86/assembler.py:2463`. Testing only whether the trace had any LABEL was
+/// wrong: a trace may define LABELs and still close onto a token from another
+/// compilation, as a retrace attached as a bridge does.
 fn has_cross_loop_terminal_jump(ops: &[Op]) -> bool {
-    let has_label = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Label);
     let has_jump = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Jump);
-    has_jump && !has_label
+    has_jump && codegen::find_loop_label_index(ops).is_none()
 }
 
 /// Resolve the re-entry target of a cross-loop terminal JUMP BY DESCR IDENTITY
@@ -3388,6 +3391,21 @@ mod tests {
     use majit_backend::{Backend, JitCellToken};
     use majit_gc::collector::MiniMarkGC;
     use majit_gc::trace::TypeInfo;
+
+    #[test]
+    fn cross_loop_terminal_jump_uses_target_descr_identity() {
+        let local_descr = majit_ir::make_loop_target_descr(1, false);
+        let foreign_descr = majit_ir::make_loop_target_descr(2, false);
+        let label = Op::new(majit_ir::OpCode::Label, &[]);
+        label.setdescr(local_descr.clone());
+        let jump = Op::new(majit_ir::OpCode::Jump, &[]);
+        jump.setdescr(foreign_descr);
+        let ops = vec![label, jump];
+
+        assert!(has_cross_loop_terminal_jump(&ops));
+        ops[1].setdescr(local_descr);
+        assert!(!has_cross_loop_terminal_jump(&ops));
+    }
 
     #[test]
     fn straightline_trace_defers_host_module_until_execution() {

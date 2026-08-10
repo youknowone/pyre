@@ -271,6 +271,17 @@ pub extern "C" fn jit_lookup_where_with_method_cache(
     w_descr as i64
 }
 
+/// The receiver test the mapdict storage wrappers share: `mapdict_carrier`'s
+/// own precondition. It admits the generated int/str/tuple user layouts as
+/// well as ordinary instances, so a builtin subclass reaches the same storage
+/// the interpreter reads. A null receiver answers false.
+///
+/// # Safety
+/// `w_obj` must be null or a live object reference.
+unsafe fn is_mapdict_carrier(w_obj: PyObjectRef) -> bool {
+    unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(w_obj) }
+}
+
 /// `mapdict.py:846-847 getdictvalue` residual: the instance-dict shadowing
 /// read the `LOAD_METHOD` fast path performs after the type lookup
 /// (`callmethod.py:66 w_value = w_obj.getdictvalue(space, name)`), to make
@@ -283,12 +294,12 @@ pub extern "C" fn jit_lookup_where_with_method_cache(
 /// so the result is guarded `null` per iteration rather than folded.  `w_name`
 /// is the interned immortal name pointer; the body reads it back via
 /// `w_str_get_wtf8`, mirroring [`jit_lookup_where_with_method_cache`].  Null
-/// on a null receiver / name or a non-instance receiver (the fast path
+/// on a null receiver / name or a non-carrier receiver (the fast path
 /// already pinned the receiver type with `guard_class`).
 pub extern "C" fn jit_instance_getdictvalue(w_obj: i64, w_name: i64) -> i64 {
     let w_obj = w_obj as PyObjectRef;
     let w_name = w_name as PyObjectRef;
-    if w_obj.is_null() || w_name.is_null() || !unsafe { is_instance(w_obj) } {
+    if w_name.is_null() || !unsafe { is_mapdict_carrier(w_obj) } {
         return PY_NULL as i64;
     }
     let name = unsafe { w_str_get_wtf8(w_name) };
@@ -305,12 +316,12 @@ pub extern "C" fn jit_instance_getdictvalue(w_obj: i64, w_name: i64) -> i64 {
 /// fast path resolved it off the promoted map) and the surrounding class / map
 /// / version_tag guards already established the shape, so this replaces
 /// `getattr_str`'s MRO walk + name hash + descriptor dispatch with a single
-/// `storage[index]` fetch.  Null receiver / non-instance returns `PY_NULL`
+/// `storage[index]` fetch.  Null receiver / non-carrier returns `PY_NULL`
 /// (the fast path pinned the receiver type with `guard_class`, so this only
 /// guards against a torn recording).
 pub extern "C" fn jit_mapdict_read(w_obj: i64, storageindex: i64) -> i64 {
     let w_obj = w_obj as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return PY_NULL as i64;
     }
     unsafe {
@@ -322,10 +333,10 @@ pub extern "C" fn jit_mapdict_read(w_obj: i64, storageindex: i64) -> i64 {
 /// Non-forcing boxed write for an existing mapdict attribute.  The guarded
 /// instance class and exact map pin the storage index, and a boxed slot accepts
 /// the incoming object reference directly (mapdict.py:446-447).  A torn
-/// recording with a null/non-instance receiver is a defensive no-op.
+/// recording with a null/non-carrier receiver is a defensive no-op.
 pub extern "C" fn jit_mapdict_boxed_write(w_obj: i64, storageindex: i64, value: i64) {
     let w_obj = w_obj as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return;
     }
     unsafe {
@@ -341,14 +352,14 @@ pub extern "C" fn jit_mapdict_boxed_write(w_obj: i64, storageindex: i64, value: 
 /// shared longlong-list coordinates, so this non-forcing helper performs only
 /// `_prim_direct_read`'s storage read (mapdict.py:600-601); boxing stays in the
 /// trace so an immediate consumer can virtualize it away.  Null receiver /
-/// non-instance returns zero only for a torn recording.
+/// non-carrier returns zero only for a torn recording.
 pub extern "C" fn jit_mapdict_unboxed_read_raw(
     w_obj: i64,
     storageindex: i64,
     listindex: i64,
 ) -> i64 {
     let w_obj = w_obj as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return 0;
     }
     unsafe {
@@ -384,10 +395,10 @@ pub extern "C" fn jit_hash_normalize_digest(digest: i64) -> i64 {
 /// Float-bank counterpart of [`jit_mapdict_unboxed_read_raw`].  Unboxed float
 /// storage already contains the value's IEEE-754 bit pattern, so this helper
 /// performs the raw read and reconstructs the float (mapdict.py:577-584).
-/// Null receiver / non-instance returns zero only for a torn recording.
+/// Null receiver / non-carrier returns zero only for a torn recording.
 pub extern "C" fn jit_mapdict_unboxed_read_f(w_obj: i64, storageindex: i64, listindex: i64) -> f64 {
     let w_obj = w_obj as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return 0.0;
     }
     unsafe {
@@ -405,7 +416,7 @@ pub extern "C" fn jit_mapdict_unboxed_read_f(w_obj: i64, storageindex: i64, list
 /// walker has already guarded the receiver's instance class and exact map,
 /// and proved that the incoming value is an integer, so this is only the
 /// same-type longlong-list update (mapdict.py:615-619).  A torn recording can
-/// reach the wrapper with a null/non-instance receiver; keep that defensive
+/// reach the wrapper with a null/non-carrier receiver; keep that defensive
 /// path a no-op.
 pub extern "C" fn jit_mapdict_unboxed_write_raw(
     w_obj: i64,
@@ -414,7 +425,7 @@ pub extern "C" fn jit_mapdict_unboxed_write_raw(
     raw: i64,
 ) {
     let w_obj = w_obj as usize as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return;
     }
     unsafe {
@@ -429,7 +440,7 @@ pub extern "C" fn jit_mapdict_unboxed_write_raw(
 
 /// Float-bank counterpart of [`jit_mapdict_unboxed_write_raw`].  A same-type
 /// float update writes its IEEE-754 bit pattern to the existing longlong-list
-/// slot (mapdict.py:615-619).  A torn recording with a null/non-instance
+/// slot (mapdict.py:615-619).  A torn recording with a null/non-carrier
 /// receiver is a defensive no-op.
 pub extern "C" fn jit_mapdict_unboxed_write_f(
     w_obj: i64,
@@ -438,7 +449,7 @@ pub extern "C" fn jit_mapdict_unboxed_write_f(
     value: f64,
 ) {
     let w_obj = w_obj as usize as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return;
     }
     unsafe {
@@ -572,9 +583,9 @@ pub fn emit_box_int_inline(
 /// gcmap-roots it, and the SetfieldGc into the registered `value`
 /// gc-pointer field carries the write barrier.
 ///
-/// Like [`emit_box_int_inline`], `w_class` is left zero-filled — the JIT int
-/// box does the same; `type(x)`/`isinstance` resolve through `ob_type` (the
-/// vtable the NewWithVtable writes).
+/// Like [`emit_box_int_inline`], `w_class` is cleared by the GC rewriter — the
+/// JIT int box does the same; `type(x)`/`isinstance` resolve through `ob_type`
+/// (the vtable the NewWithVtable writes).
 pub fn emit_box_long_inline(
     ctx: &mut TraceCtx,
     bigint_ref: OpRef,
@@ -589,16 +600,17 @@ pub fn emit_box_long_inline(
     new_op
 }
 
-/// Emit inline `W_BaseException` creation (NewWithVtable + SetfieldGc
-/// for `kind` / `w_class` / `args_w`), so a builtin exception built by a
-/// Python `raise Type(args)` becomes traced New+SetField ops the
+/// Emit inline `W_BaseException` creation (NewWithVtable + SetfieldGc for
+/// `kind` / `w_class` / `args_w` / `suppress_context`), so a builtin exception
+/// built by a Python `raise Type(args)` becomes traced New+SetField ops the
 /// optimizer can virtualize when the exception never escapes — instead
 /// of the opaque residual `jit_call_callable_N` constructor call.
 ///
 /// Mirrors the runtime construction:
-/// `w_exception_new_empty(kind)` (zeroed slots) + `exc_new_wrapper`
+/// `w_exception_new_empty(kind)` + `exc_new_wrapper`
 /// (`w_class = the called type`) + `descr_init` (`args_w = args list`).
-/// `w_cause`/`w_context`/… stay PY_NULL from the NewWithVtable memzero.
+/// GC pointer fields such as `w_cause` and `w_context` are cleared by the GC
+/// rewriter; the plain `suppress_context` byte is stored explicitly.
 pub fn emit_exception_new_inline(
     ctx: &mut TraceCtx,
     kind: pyre_object::interp_exceptions::ExcKind,
@@ -619,6 +631,15 @@ pub fn emit_exception_new_inline(
     let args_w_idx = args_w_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, args_w], args_w_descr);
     ctx.heapcache_setfield_cached(new_op, args_w_idx, args_w);
+    let suppress_context = ctx.const_int(0);
+    let suppress_context_descr = crate::descr::w_exception_suppress_context_descr(kind);
+    let suppress_context_idx = suppress_context_descr.index();
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_op, suppress_context],
+        suppress_context_descr,
+    );
+    ctx.heapcache_setfield_cached(new_op, suppress_context_idx, suppress_context);
     new_op
 }
 
@@ -856,10 +877,9 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
 ///     `pyobject_gcarray_descr` is byte-compatible with the runtime
 ///     `ItemsBlock` (both read `ITEMS_BLOCK_TOKEN`).
 ///   - `length` = `items.len()`.
-///   - `strategy` = `Object` (0). `NewWithVtable` already zero-fills the
-///     payload (`int_items` / `float_items` stay empty, never read under
-///     the Object strategy); the explicit store keeps the heap cache and
-///     optimizer field model in agreement.
+///   - `strategy` = `Object` (0). The inactive typed blocks are cleared by the
+///     GC rewriter and their lengths are stored as zero; the explicit stores
+///     keep the heap cache and optimizer field model in agreement.
 ///
 /// A `BUILD_LIST` caller must restrict to Object-strategy-eligible args
 /// (non-empty AND not all-int AND not all-float), since an app-level list
@@ -870,7 +890,8 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
 /// emit reproduces it for any element types and for zero arguments.
 pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     use crate::descr::{
-        list_items_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
+        list_float_items_len_descr, list_int_items_len_descr, list_items_descr, list_length_descr,
+        list_strategy_descr, w_list_size_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -908,6 +929,13 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, len_ref], length_descr);
     ctx.heapcache_setfield_cached(list, length_idx, len_ref);
 
+    let zero = ctx.const_int(0);
+    for inactive_len_descr in [list_int_items_len_descr(), list_float_items_len_descr()] {
+        let inactive_len_idx = inactive_len_descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, zero], inactive_len_descr);
+        ctx.heapcache_setfield_cached(list, inactive_len_idx, zero);
+    }
+
     let items_descr = list_items_descr();
     let items_idx = items_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, items_block], items_descr);
@@ -935,7 +963,10 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
 /// False`) — so it is stored explicitly here, as `rlist.py ll_newlist` does.
 /// OptVirtualize folds the whole wrapper when the list never escapes.
 pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
-    use crate::descr::{list_length_descr, list_strategy_descr, w_list_size_descr};
+    use crate::descr::{
+        list_float_items_len_descr, list_int_items_len_descr, list_length_descr,
+        list_strategy_descr, w_list_size_descr,
+    };
 
     let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
     ctx.heap_cache_mut().new_object(list);
@@ -946,6 +977,12 @@ pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, zero], length_descr);
     ctx.heapcache_setfield_cached(list, length_idx, zero);
 
+    for inactive_len_descr in [list_int_items_len_descr(), list_float_items_len_descr()] {
+        let inactive_len_idx = inactive_len_descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, zero], inactive_len_descr);
+        ctx.heapcache_setfield_cached(list, inactive_len_idx, zero);
+    }
+
     let strategy_const = ctx.const_int(pyre_object::listobject::ListStrategy::Empty as i64);
     let strategy_descr = list_strategy_descr();
     let strategy_idx = strategy_descr.index();
@@ -955,10 +992,9 @@ pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
     list
 }
 
-/// Initialize CPython 3.14's tuple hash cache on a trace-visible allocation.
-/// `NewWithVtable` clears memory to zero, but the tuple sentinel is
-/// `TUPLE_HASH_UNSET`, so every virtual/materializable tuple constructor must
-/// emit this store.
+/// Initialize the tuple hash cache on a trace-visible allocation.
+/// The tuple sentinel is `TUPLE_HASH_UNSET`, so every virtual/materializable
+/// tuple constructor must emit this store.
 pub fn emit_tuple_hash_sentinel(ctx: &mut TraceCtx, tuple: OpRef, hash_descr: majit_ir::DescrRef) {
     let uncomputed = ctx.const_int(pyre_object::tupleobject::TUPLE_HASH_UNSET);
     let descr_index = hash_descr.index();
@@ -1053,10 +1089,10 @@ pub fn emit_object_tuple_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
 /// (`rlist.py:324 ll_newlist`, two mallocs).
 ///
 /// The typed strategy keeps `length = 0` and `items = null`
-/// (`w_list_new_with_strategy` non-Object arm) — both stay zero-filled by
-/// `NewWithVtable`, matching the runtime.  `items_len_descr` / `items_block_descr`
+/// (`w_list_new_with_strategy` non-Object arm): `length` is stored explicitly
+/// and the GC rewriter clears `items`. `items_len_descr` / `items_block_descr`
 /// select the `int_items` / `float_items` sub-struct fields and `array_descr`
-/// the matching `int_gcarray_descr` / `float_gcarray_descr`.  Caller must have
+/// the matching `int_gcarray_descr` / `float_gcarray_descr`. Caller must have
 /// guarded + unboxed each element into `raws` already.
 pub fn emit_typed_list_inline(
     ctx: &mut TraceCtx,
@@ -1066,7 +1102,10 @@ pub fn emit_typed_list_inline(
     items_block_descr: majit_ir::DescrRef,
     strategy: pyre_object::listobject::ListStrategy,
 ) -> OpRef {
-    use crate::descr::{list_strategy_descr, w_list_size_descr};
+    use crate::descr::{
+        list_float_items_len_descr, list_int_items_len_descr, list_length_descr,
+        list_strategy_descr, w_list_size_descr,
+    };
 
     let len = raws.len();
     let len_ref = ctx.const_int(len as i64);
@@ -1095,9 +1134,19 @@ pub fn emit_typed_list_inline(
     let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
     ctx.heap_cache_mut().new_object(list);
 
-    // Step 4 — strategy / typed-items `len` + `block` SetfieldGc.  `length`
-    // and `items` stay zero-filled (0 / null) by NewWithVtable, as
-    // `w_list_new_with_strategy` leaves them for the typed strategies.
+    // Step 4 — initialize every scalar field, then install the active typed
+    // storage. The pointer fields are cleared by the GC rewriter.
+    let zero = ctx.const_int(0);
+    for scalar_descr in [
+        list_length_descr(),
+        list_int_items_len_descr(),
+        list_float_items_len_descr(),
+    ] {
+        let scalar_idx = scalar_descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, zero], scalar_descr);
+        ctx.heapcache_setfield_cached(list, scalar_idx, zero);
+    }
+
     let strategy_const = ctx.const_int(strategy as i64);
     let strategy_descr = list_strategy_descr();
     let strategy_idx = strategy_descr.index();
@@ -1369,9 +1418,9 @@ pub fn emit_box_float_inline(
 /// materialized lazily only on guard failure.  Carries every field the frame
 /// constructor assigns, so a forced materialization
 /// (`materialize_virtual_from_rd`) never dereferences a field the interpreter
-/// would have written; the class-level defaults listed at the end of the body
-/// stay at the allocation's zero-fill, exactly as they do in a frame the
-/// interpreter builds.
+/// would have written; the class-level GC-pointer defaults listed at the end
+/// of the body are cleared by the GC rewriter, exactly as they are initialized
+/// in a frame the interpreter builds.
 pub fn emit_new_pyframe_inline_with_params(
     ctx: &mut TraceCtx,
     param_boxes: &[OpRef],
@@ -1384,9 +1433,9 @@ pub fn emit_new_pyframe_inline_with_params(
     ec: OpRef,
 ) -> OpRef {
     use crate::descr::{
-        pyframe_code_descr, pyframe_execution_context_descr, pyframe_locals_cells_stack_descr,
-        pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
-        pyframe_w_globals_obj_descr,
+        pyframe_code_descr, pyframe_execution_context_descr, pyframe_flags_descr,
+        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
+        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1481,12 +1530,19 @@ pub fn emit_new_pyframe_inline_with_params(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
     ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
 
+    let zero = ctx.const_int(0);
+    let flags_descr = pyframe_flags_descr();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], flags_descr);
+    // The concrete carrier may already be marked escaped by record-time
+    // traceback inspection before this allocation shape is emitted. Do not
+    // seed TraceCtx's concrete sanity cache with the constructor-time zero;
+    // a later mark_as_escaped read must observe the carrier's current byte.
+
     // pyframe.py:76-79 `f_generator_nowref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (None/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
-    // setfield for them; the freshly allocated payload is already zeroed
-    // (zero_gc_pointers_inside, incminimark.py:960), so the fields read back
-    // as PY_NULL. No explicit store here.
+    // setfield for them; clear_gc_fields initializes these GC-reference slots,
+    // so the fields read back as PY_NULL. No explicit store here.
     //
     // `w_builtin` joins them: the frame constructor (pyframe.py) assigns
     // `self.builtin` only under `honor__builtins__`, which
@@ -1507,9 +1563,9 @@ pub fn emit_new_pyframe_inline_self_recursive(
     ec: OpRef,
 ) -> OpRef {
     use crate::descr::{
-        pyframe_code_descr, pyframe_execution_context_descr, pyframe_locals_cells_stack_descr,
-        pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
-        pyframe_w_globals_obj_descr,
+        pyframe_code_descr, pyframe_execution_context_descr, pyframe_flags_descr,
+        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
+        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1541,9 +1597,9 @@ pub fn emit_new_pyframe_inline_self_recursive(
         array_descr,
     );
 
-    // Step 4 — allocate the new PyFrame. NewWithVtable zero-fills the
-    // payload; the GC tags it with `PYFRAME_GC_TYPE_ID` because the
-    // size descr's parent type id is registered in `pyre-jit/src/eval.rs`.
+    // Step 4 — allocate the new PyFrame. The GC tags it with
+    // `PYFRAME_GC_TYPE_ID` because the size descr's parent type id is
+    // registered in `pyre-jit/src/eval.rs`.
     let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());
     ctx.heap_cache_mut().new_object(new_frame);
 
@@ -1597,12 +1653,18 @@ pub fn emit_new_pyframe_inline_self_recursive(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
     ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
 
+    let zero = ctx.const_int(0);
+    let flags_descr = pyframe_flags_descr();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], flags_descr);
+    // See emit_new_pyframe_inline_with_params: the trace store is required for
+    // materialization, but its constructor-time value is not the concrete
+    // carrier's necessarily later record-time state.
+
     // pyframe.py:76-79 `f_generator_nowref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (None/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
-    // setfield for them; the freshly allocated payload is already zeroed
-    // (zero_gc_pointers_inside, incminimark.py:960), so the fields read back
-    // as PY_NULL. No explicit store here.
+    // setfield for them; clear_gc_fields initializes these GC-reference slots,
+    // so the fields read back as PY_NULL. No explicit store here.
     //
     // `w_builtin` joins them: the frame constructor (pyframe.py) assigns
     // `self.builtin` only under `honor__builtins__`, which

@@ -20,6 +20,7 @@ members = [
     "majit/majit-gc",
     "majit/majit-macros",
     "majit/majit-metainterp",
+    "majit/majit-rlib",
     "majit/majit-translate",
     "majit/majit-charon-reader",
     "majit/examples/tlr",
@@ -86,6 +87,7 @@ majit-backend-dynasm = { version = "0.0.2", path = "majit/majit-backend-dynasm" 
 majit-backend-wasm = { version = "0.0.2", path = "majit/majit-backend-wasm" }
 majit-gc = { version = "0.0.2", path = "majit/majit-gc" }
 majit-macros = { version = "0.0.2", path = "majit/majit-macros" }
+majit-rlib = { version = "0.0.2", path = "majit/majit-rlib" }
 majit-translate = { version = "0.0.2", path = "majit/majit-translate" }
 majit-charon-reader = { version = "0.0.2", path = "majit/majit-charon-reader" }
 

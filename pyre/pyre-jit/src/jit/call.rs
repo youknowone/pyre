@@ -209,6 +209,18 @@ pub struct CallControl {
     /// `CallControl`, filled on miss by call.py:155-172 `get_jitcode`).
     pub loop_header_pcs: HashMap<usize, std::sync::Arc<VecSet<usize>>>,
 
+    /// Per-backedge result of pyre's temporary FOR_ITER safety gate.  The
+    /// corresponding upstream marker is fixed on the flow graph before
+    /// runtime; pyre derives it from immutable bytecode, so keep the derived
+    /// answer beside the other graph metadata instead of rescanning the loop
+    /// region on every interpreted backedge.
+    pub loop_region_jit_safe: HashMap<(usize, usize), bool>,
+
+    /// Immutable bytecode-derived facts used by the temporary FOR_ITER gate,
+    /// kept with the other per-graph codewriter metadata.
+    pub for_iter_bodies_jit_safe: HashMap<usize, bool>,
+    pub escaping_range_loop_regions: HashMap<(usize, usize), bool>,
+
     /// Pyre-only per-graph result of `eval::unsupported_jit_shape`.
     ///
     /// RPython has no runtime frame-shape gate: policy and encodability are
@@ -250,6 +262,9 @@ impl CallControl {
             unfinished_graphs: Vec::new(),
             callinfocollection: CallInfoCollection::new(),
             loop_header_pcs: HashMap::new(),
+            loop_region_jit_safe: HashMap::new(),
+            for_iter_bodies_jit_safe: HashMap::new(),
+            escaping_range_loop_regions: HashMap::new(),
             graph_jit_shapes: HashMap::new(),
         }
     }

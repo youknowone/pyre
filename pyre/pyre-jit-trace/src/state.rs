@@ -1264,6 +1264,25 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         let idx = jitcode_index as usize;
         let jc = match sd.jitcodes.get(idx) {
             Some(jc) => jc,
+            // `record_guard_with_snapshot` (`history.rs`) mints the
+            // interpreter-side vable promotes' resume frame with no
+            // coordinate of its own, marked
+            // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps
+            // it with the real position
+            // (`walker_capture_inline_nonstandard_vable_guard`). Arriving
+            // here still carrying the mark means that re-stamp was missed and
+            // the guard was compiled against a resume coordinate that names
+            // no frame. The frame holds no boxes, so `0` is the arithmetically
+            // right answer and the decode would survive it — but the guard it
+            // belongs to cannot resume, so say so instead of continuing.
+            None if jitcode_index == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 => {
+                panic!(
+                    "frame_value_count_at: guard resume frame is still \
+                     unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
+                     pc={pc}) — the `record_guard_with_snapshot` placeholder \
+                     reached the decoder without the walker's real position"
+                )
+            }
             None => return 0,
         };
         let payload = &jc.payload;
@@ -1344,6 +1363,16 @@ pub fn build_time_frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     };
     let jitcode = match crate::jitcode_runtime::get_jitcode_by_index(jitcode_index as usize) {
         Some(jc) => jc,
+        // Same missed re-stamp [`frame_value_count_at`] reports; see the
+        // comment there.
+        None if jitcode_index == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 => {
+            panic!(
+                "build_time_frame_value_count_at: guard resume frame is still \
+                 unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, pc={pc}) — \
+                 the `record_guard_with_snapshot` placeholder reached the \
+                 decoder without the walker's real position"
+            )
+        }
         None => return 0,
     };
     let all_liveness = liveness_info_snapshot();
@@ -3283,10 +3312,14 @@ pub(crate) fn note_inline_subwalk_end(
     jd_no: usize,
     pos: majit_metainterp::recorder::TracePosition,
 ) {
-    majit_metainterp::mc_diag_bump(59);
+    // Below the driver lookup, matching where `note_inline_subwalk_start`
+    // bumps 58: both counters then measure an APPENDED ENTRY, so an unclosed
+    // entry left by a driverless call shows up as `ptp_push != ptp_pop` rather
+    // than hiding behind equal counts.
     let Some((driver, _)) = crate::driver::try_driver_pair() else {
         return;
     };
+    majit_metainterp::mc_diag_bump(59);
     driver
         .meta_interp_mut()
         .push_portal_trace_position(jd_no, None, pos);

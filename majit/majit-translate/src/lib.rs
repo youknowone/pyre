@@ -305,9 +305,13 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
     //
     // The set is fixed at exactly these crates so the generated
     // `all_jitcodes` table is environment-invariant: every real build
-    // (`cargo test`, `pyre/check.py`) consumes the same three `.ullbc`
+    // (`cargo test`, `pyre/check.py`) consumes the same `.ullbc`
     // inputs, so a local tree and CI produce byte-identical codegen.
-    // `pyre-object.ullbc` and `pyre-interpreter.ullbc` are mandatory.
+    // `majit-rlib.ullbc`, `pyre-object.ullbc` and `pyre-interpreter.ullbc` are
+    // mandatory. `majit-rlib` comes first because it owns `rbigint`: the other
+    // artefacts carry whatever cross-crate references pulled in, and the
+    // first-writer-wins per-type tables below should take the owning crate's
+    // complete declarations rather than those partial ones.
     //
     // `pyre-jit.ullbc` hosts Pyre's exact `eval::eval_loop_jit` portal. The
     // extraction driver sets `MAJIT_LLBC_EXTRACTION=1` while producing that
@@ -315,8 +319,12 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
     // and never enters this analysis during the dependency bootstrap. A normal
     // Pyre build requires all three artifacts; generic consumers whose portal
     // lives in the mandatory pair may still use the two-artifact result.
-    const MANDATORY: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
-    let mut paths = Vec::with_capacity(3);
+    const MANDATORY: &[&str] = &[
+        "majit-rlib.ullbc",
+        "pyre-object.ullbc",
+        "pyre-interpreter.ullbc",
+    ];
+    let mut paths = Vec::with_capacity(MANDATORY.len() + 1);
     for name in MANDATORY {
         let p = llbc_dir.join(name);
         if !p.exists() {

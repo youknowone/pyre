@@ -1,9 +1,9 @@
 //! Deterministic, arbitrary-size differential checks for the RPython rbigint
 //! port. Malachite is a dev-only oracle; the pyre runtime remains entirely on
-//! `pyre_object::rbigint::RBigInt`.
+//! `majit_rlib::rbigint::RBigInt`.
 
+use majit_rlib::rbigint::{RBigInt, RBigIntSign};
 use malachite_bigint::{BigInt as Oracle, Sign as OracleSign};
-use pyre_object::rbigint::{RBigInt, RBigIntSign};
 
 fn next_u64(state: &mut u64) -> u64 {
     // Fixed xorshift64* stream: reproducible on every target and independent

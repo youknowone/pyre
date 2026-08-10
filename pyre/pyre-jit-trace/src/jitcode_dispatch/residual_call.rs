@@ -1359,8 +1359,16 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
             // A declined full flush still escaped the virtualizable, so the
             // locals region is written anyway (`virtualizable.py:101-138
             // write_boxes` has no decline) — otherwise the callee reads an
-            // array of nulls.  That write claims no resume pc, and the undo
-            // stays armed so the legacy replay re-enters the pre-flush frame.
+            // array of nulls.  That write claims no resume pc, and NOTHING
+            // restores the pre-flush frame from here: the committed-pc
+            // walk-end leg is gated on a pc this arm never sets and the
+            // deferred leg on a flag it never arms, so the capture simply
+            // sits until [`capture_escape_flush_undo`] supersedes it or the
+            // walk-start reset drops it.  The deferred arm this arm used to
+            // carry was withdrawn once the `value-stack underflow` it was
+            // added for stopped reproducing on artefacts that pass
+            // `PYRE_LLBC_STRICT=1` — 0/10 on cranelift without it, with the
+            // whole synthetic suite and every recorded counter unmoved.
             //
             // Upstream reports the escape from the vable token state alone,
             // independent of any resume-image write.  See
@@ -2800,16 +2808,52 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             let operand = args[2] as pyre_object::PyObjectRef;
             !operand.is_null() && unsafe { pyre_object::is_str(operand) }
         };
+    // `tuple(exact_list)` arrives through the generic `CallFn` helper, not the
+    // BUILD_TUPLE or CALL_INTRINSIC_1 helpers.  `builtin_tuple`'s exact-list
+    // arm reads the strategy-aware length/items through `w_list_len` and
+    // `w_list_getitem`, then passes the copied items to `w_tuple_new`
+    // (`builtins.rs`).  It neither calls user code nor writes the list, and it
+    // always returns a fresh tuple.  The exact callable, no-receiver, one-arg,
+    // exact-list checks below are therefore the complete replay-safe surface;
+    // every other `CallFn` remains opaque and effectful.  It shares the `CallFn`
+    // helper with the `str` and `ord` arms above and is separated from them by
+    // the callable identity each one pins, so at most one can hold.
+    let replay_safe_tuple_from_list = helper == majit_ir::PyreHelperKind::CallFn
+        && args.len() == 3
+        && args[1] == 0
+        && args[0] as usize
+            == pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
+                as usize
+        && args[2] != 0
+        && unsafe { pyre_object::is_exact_list(args[2] as usize as pyre_object::PyObjectRef) };
+    // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
+    // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
+    // cannot mutate an object visible before the call.  Upstream records list
+    // construction directly as `opimpl_newlist` (`pyjitpl.py:779-789`) and
+    // allows residual calls at every `MIFrame` depth (`pyjitpl.py:1995-2080`);
+    // it has no nested-callee abort for these allocation helpers.  Keep this
+    // executor predicate aligned with `fbw_callee_body_replay_safety`, which
+    // already admits both helpers as replay-safe reads/fresh allocations.
+    //
+    // Disjoint from the three observed-value classes above: those name `CallFn`
+    // and `GetIter` over exact builtin scalars, this one names the two
+    // allocation helpers, and no helper kind is in both.
+    let replay_safe_fresh_allocation = matches!(
+        helper,
+        majit_ir::PyreHelperKind::NewtupleFromArray | majit_ir::PyreHelperKind::NewlistFromArray
+    );
     let provably_side_effect_free = reentrant_residual
         || helper == majit_ir::PyreHelperKind::ForIterNext
         || observed_exact_scalar_str
         || observed_exact_str_iter
-        || observed_exact_str_ord;
+        || observed_exact_str_ord
+        || replay_safe_fresh_allocation
+        || replay_safe_tuple_from_list;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
+        || (helper == majit_ir::PyreHelperKind::CallFn && !replay_safe_tuple_from_list)
         || matches!(
             helper,
-            majit_ir::PyreHelperKind::CallFn
-                | majit_ir::PyreHelperKind::StoreSubscr
+            majit_ir::PyreHelperKind::StoreSubscr
                 | majit_ir::PyreHelperKind::SetCurrentException
                 | majit_ir::PyreHelperKind::StoreDeref
         );
@@ -2856,6 +2900,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
     // the outer walk's mirror and a sub-walk never advances it.
     let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
+    let mut saved_last_instr_shadow: Option<(OpRef, Value)> = None;
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -2872,17 +2917,25 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // concrete store, publishing onto the callee's own frame instead.
         if current_inline_concrete_frame() == 0 {
             let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
+            // Scope the box half to the residual just as
+            // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
+            // leaves both halves equal (`pyjitpl.py:1188-1199`), and
+            // `check_synchronized_virtualizable` asserts that invariant
+            // (`pyjitpl.py:3463-3468`).
+            if let Some(idx) = info.static_field_index_by_name("last_instr")
+                && let Some((prev_op, prev_val)) = ctx.trace_ctx.virtualizable_entry_at(idx)
+            {
+                saved_last_instr_shadow = Some((prev_op, prev_val));
+            }
             crate::trace_opcode::mirror_vable_static_to_boxes(
                 ctx.trace_ctx,
                 "last_instr",
                 last_instr,
                 majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
             );
-            // …and the heap half of the same `_opimpl_setfield_vable` shape
-            // (`virtualizable_boxes[index] = valuebox; synchronize_virtualizable()`
-            // — the mirror above is only the box half, and writes the trace's
-            // shadow, never the frame).  The same constant feeds both so the
-            // shadow and the heap cannot disagree.
+            // Record the runtime heap half of the same `_opimpl_setfield_vable`
+            // shape.  The mirror above synchronizes the tracing-time shadow
+            // and live frame; this store keeps compiled execution paired too.
             //
             // Upstream needs neither at a residual call: its frame readers are
             // traced in and read `last_instr` off the virtual frame.  pyre
@@ -3111,6 +3164,20 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let forced = unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
         if let Some(depth) = vable_root_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+        }
+        // Match `LiveLastInstrGuard` by restoring both halves after the
+        // residual.  A force is excluded because the callee made the heap
+        // authoritative and its escape walk reloads the shadow; restoring a
+        // pre-force value would violate `_opimpl_setfield_vable`'s equality
+        // (`pyjitpl.py:1188-1199`) checked by
+        // `check_synchronized_virtualizable` (`pyjitpl.py:3463-3468`).
+        if !forced && let Some((prev_op, prev_val)) = saved_last_instr_shadow.take() {
+            crate::trace_opcode::mirror_vable_static_to_boxes(
+                ctx.trace_ctx,
+                "last_instr",
+                prev_op,
+                prev_val,
+            );
         }
         if forced {
             disarm_folded_inline_callee_after_escape(ctx, op_pc)?;
@@ -5217,9 +5284,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)?.is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        if let Some(outcome) = try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)? {
+            return Ok((outcome, op.next_pc));
+        }
     }
 
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
@@ -6389,33 +6457,37 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     } else {
                         // int specialization first; float (incl. mixed int/float)
                         // as a fallback so two-int operands keep int arithmetic.
-                        let mut specialized = try_walker_specialize_binary_op_int(
+                        if let Some(outcome) = try_walker_specialize_binary_op_int(
+                            ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                        )? {
+                            return Ok((outcome, op.next_pc));
+                        }
+                        // longobject.py `_make_generic_descr_binop` and
+                        // `descr_sub` use the rbigint.int_* family for
+                        // mixed Long/Int operands.
+                        let mut specialized = try_walker_specialize_binary_op_long_int(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                         )?;
-                        if specialized.is_none() {
-                            // longobject.py `_make_generic_descr_binop` and
-                            // `descr_sub` use the rbigint.int_* family for
-                            // mixed Long/Int operands.
-                            specialized = try_walker_specialize_binary_op_long_int(
-                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?;
-                        }
                         if specialized.is_none() {
                             // `_make_descr_binop` gives shifts with an Int
                             // count their own `_int_lshift` / `_int_rshift`
                             // path before Long/Long.
-                            specialized = try_walker_specialize_binary_op_long_int_shift(
+                            if let Some(outcome) = try_walker_specialize_binary_op_long_int_shift(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?;
+                            )? {
+                                return Ok((outcome, op.next_pc));
+                            }
                         }
                         if specialized.is_none() {
                             // `_int_floordiv` / `_int_mod` are the same family:
                             // an Int divisor keeps its machine word instead of
                             // being widened to a bigint, and `_int_mod`'s
                             // result is a machine int rather than a long.
-                            specialized = try_walker_specialize_binary_op_long_int_div(
+                            if let Some(outcome) = try_walker_specialize_binary_op_long_int_div(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?;
+                            )? {
+                                return Ok((outcome, op.next_pc));
+                            }
                         }
                         if specialized.is_none() {
                             // `descr_pow` keeps a `W_IntObject` exponent
@@ -6441,9 +6513,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             )?;
                         }
                         if specialized.is_none() {
-                            specialized = try_walker_specialize_binary_op_float(
+                            if let Some(outcome) = try_walker_specialize_binary_op_float(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?;
+                            )? {
+                                return Ok((outcome, op.next_pc));
+                            }
                         }
                         specialized
                     }

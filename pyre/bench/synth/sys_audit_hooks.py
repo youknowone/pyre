@@ -10,9 +10,18 @@
 #   * `sys.audit` is free when no hook is installed, so the count a hook sees
 #     starts at the first `addaudithook`, not at interpreter start;
 #   * installing a hook emits `sys.addaudithook` to the hooks already there,
-#     and a `RuntimeError` out of that event means those hooks REFUSED the new
-#     one: it is dropped and the refusal does not propagate.  Any other
-#     exception does propagate.
+#     and an `Exception` out of that event means those hooks REFUSED the new
+#     one: it is dropped and the refusal does not propagate.  A `BaseException`
+#     outside `Exception` does propagate -- not exercised here, and it cannot
+#     be: a hook is installed for the life of the interpreter and the first one
+#     that raises masks every hook behind it, so reaching the propagating branch
+#     needs the hook set cleared between cases.  Upstream's own facility for
+#     that (`__pypy__._testing_clear_audithooks`, `interp_magic.py:292`) refuses
+#     to run once translated, so no app-level program on a built interpreter
+#     can get there.  The refusal below raises from app code, so it carries a
+#     real exception object and takes `error_is_exception`'s isinstance arm;
+#     the `PyErrorKind` fallback behind it answers only for an error that never
+#     materialised one, which nothing app-level can hand this event.
 #   * `__cantrace__` on a hook is honoured (the flag exists so a tracing hook
 #     can opt back in); nothing here can observe the tracing state, so only the
 #     attribute lookup path is exercised.

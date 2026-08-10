@@ -14,7 +14,7 @@
 //!   - `opt = res.ok()` → `Option<Layout>`.
 //! Both cross a value the census cannot model as a residual return (`Layout` is
 //! a 2-word `{size, align}` aggregate; `Result`/`Option` of it likewise), so
-//! the pair is the standing wall in `object_array::try_typed_items_block_layout`
+//! the pair is the standing wall in `rlist::try_typed_items_block_layout`
 //! once `checked_mul`/`checked_add` are natively lowered
 //! ([`crate::front::checked_arith_uint`]).
 //!

@@ -237,8 +237,9 @@ pub(crate) fn classify_vstack_opcode(
         // -1), so `self` is the new TOS (= last Ref written) and the `func` slot
         // beneath becomes a NONE hole the general hole-fill recovers from the
         // shadow (both pushed through `setarrayitem_vable_r`); like the
-        // method-form LOAD_GLOBAL the func slot is consumed by the CALL before
-        // any branch guard, so it is never a live kept-stack slot at a resume.
+        // method-form LOAD_GLOBAL the func slot survives to the CALL, and a
+        // short-circuit in the argument list can keep it across a branch guard
+        // on the way, which the kept-stack hazard handles there.
         Instruction::LoadSuperAttr { .. } => VstackOpClass::ResultToTos,
 
         // LOAD_SPECIAL pops the context-manager object at `prev_depth - 1`

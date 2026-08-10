@@ -11,7 +11,7 @@
 //! bytes) needs `int_w`/`float_w` and so lives in the interpreter.
 
 use crate::pyobject::*;
-use crate::rbigint::RBigInt as BigInt;
+use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_macros::pyre_class;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 

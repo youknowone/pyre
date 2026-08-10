@@ -7113,7 +7113,7 @@ mod tests {
     #[test]
     fn test_dict_store_raising_eq_leaves_dict_unchanged() {
         use crate::longobject::w_long_new;
-        use crate::rbigint::RBigInt as BigInt;
+        use majit_rlib::rbigint::RBigInt as BigInt;
         install_test_hash_hook();
         unsafe {
             crate::dict_eq_hook::register_hash_w_hook(constant_collision_hash);

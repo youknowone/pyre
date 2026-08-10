@@ -251,6 +251,18 @@ pub struct UnrollOptimizer {
     /// history.py: JitCellToken.target_tokens — compiled versions of this loop.
     /// Each TargetToken has its own virtual state and short preamble.
     pub target_tokens: Vec<TargetToken>,
+    /// `compile.py:355` — the `JitCellToken` this compilation's artifact will be
+    /// installed under, when there is one. `compile_retrace` resolves it from
+    /// `get_procedure_token(greenkey)` and the result is attached as a bridge to
+    /// that same token (`compile.py:797-811`), so a close onto one of its
+    /// `target_tokens` stays inside one code buffer.
+    ///
+    /// `None` for a fresh `compile_loop`, which mints its own token afterwards.
+    /// `compile.py:287-289` expresses the same thing by *resetting*
+    /// `jitcell_token.target_tokens` to `[start_descr]`, leaving nothing for
+    /// `_jump_to_existing_trace` to match; pyre seeds the previous
+    /// compilation's tokens instead, so the distinction has to be carried here.
+    pub attach_jitcell_token_number: Option<u64>,
     /// history.py: JitCellToken.retraced_count — number of times this loop
     /// has been retraced. Compared against retrace_limit to prevent infinite
     /// retracing.
@@ -373,6 +385,7 @@ impl UnrollOptimizer {
         UnrollOptimizer {
             short_preamble: None,
             target_tokens: Vec::new(),
+            attach_jitcell_token_number: None,
             retraced_count: 0,
             // unroll.py:215/265 reads
             // `warmrunnerdescr.memory_manager.{retrace_limit,max_retrace_guards}`.
@@ -1516,17 +1529,6 @@ impl UnrollOptimizer {
         );
         self.target_tokens.push(target_token);
 
-        // unroll.py:176-177: disable_retracing_if_max_retrace_guards
-        if Self::disable_retracing_if_max_retrace_guards(&p2_ops, self.max_retrace_guards) {
-            self.retraced_count = u32::MAX;
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] too many guards (>{}), disabling retracing",
-                    self.max_retrace_guards
-                );
-            }
-        }
-
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] finalize_short_preamble: target_tokens={}",
@@ -1534,7 +1536,7 @@ impl UnrollOptimizer {
             );
         }
 
-        // ── unroll.py:207-230: jump_to_existing_trace / retrace_limit ──
+        // ── unroll.py:151-177: jump_to_existing_trace / close ladder ──
         // Try to match the body's JUMP virtual state to an existing target.
         // RPython: new_virtual_state = jump_to_existing_trace(end_jump, ...)
         //
@@ -1709,110 +1711,79 @@ impl UnrollOptimizer {
 
             // unroll.py:154-158: on InvalidLoop, skip retry entirely
             if !jumped && !skip_jump_to_existing && !invalid_loop {
-                // unroll.py:161-174: virtual state not matched, retry
-                if self.retraced_count < self.retrace_limit {
-                    self.retraced_count += 1;
-                    if crate::majit_log_enabled() {
+                // unroll.py:161-168: force_boxes=True, except InvalidLoop: pass
+                let did_jump = opt_unroll
+                    .jump_to_existing_trace(
+                        &body_jump_args,
+                        Some(&current_label_args),
+                        &mut self.target_tokens,
+                        &mut opt_p2,
+                        &mut jump_ctx,
+                        true,
+                        &runtime_boxes,
+                    )
+                    .is_none();
+                jumped = if let Some(reason) = jump_ctx.take_invalid_loop() {
+                    if crate::log_jtet_enabled() {
                         eprintln!(
-                            "[jit] Retracing ({}/{})",
-                            self.retraced_count, self.retrace_limit
+                            "[jit][jte] InvalidLoop during force_boxes=true retry: {}",
+                            reason.0
                         );
                     }
-                    // unroll.py:164-168: force_boxes=True, except InvalidLoop: pass
-                    let did_jump = opt_unroll
-                        .jump_to_existing_trace(
-                            &body_jump_args,
-                            Some(&current_label_args),
-                            &mut self.target_tokens,
-                            &mut opt_p2,
-                            &mut jump_ctx,
-                            true,
-                            &runtime_boxes,
-                        )
-                        .is_none();
-                    jumped = if let Some(reason) = jump_ctx.take_invalid_loop() {
-                        if crate::log_jtet_enabled() {
-                            eprintln!(
-                                "[jit][jte] InvalidLoop during force_boxes=true retrace: {}",
-                                reason.0
-                            );
-                        }
-                        false // unroll.py:167-168: except InvalidLoop: pass
-                    } else {
-                        did_jump
-                    };
+                    false // unroll.py:167-168: except InvalidLoop: pass
                 } else {
-                    // unroll.py:220-226: limit reached, try force_boxes=true
-                    let did_jump = opt_unroll
-                        .jump_to_existing_trace(
-                            &body_jump_args,
-                            Some(&current_label_args),
-                            &mut self.target_tokens,
-                            &mut opt_p2,
-                            &mut jump_ctx,
-                            true,
-                            &runtime_boxes,
-                        )
-                        .is_none();
-                    jumped = if let Some(reason) = jump_ctx.take_invalid_loop() {
-                        if crate::log_jtet_enabled() {
-                            eprintln!(
-                                "[jit][jte] InvalidLoop during force_boxes=true limit: {}",
-                                reason.0
-                            );
-                        }
-                        false // unroll.py:224-225: except InvalidLoop: pass
-                    } else {
-                        did_jump
-                    };
-                    if !jumped {
-                        // unroll.py:228: "Retrace count reached, jumping to preamble"
-                        crate::debug::log_one(
-                            "jit-tracing",
-                            "Retrace count reached, jumping to preamble",
-                        );
-                        // jumped stays false → jump_to_preamble below
-                    }
-                }
+                    did_jump
+                };
             }
             if jumped && redirected_tail_ops.is_empty() {
                 // Only take jump_ctx ops if we don't already have
                 // a self-loop Jump from the retrace path.
                 redirected_tail_ops = std::mem::take(&mut jump_ctx.new_operations);
-                // Check whether the redirected Jump targets the current body
-                // token (last in target_tokens) or an external token from a
-                // previous compilation. An external close is discarded and the
-                // body's original self-loop Jump restored instead.
-                let current_body_descr_idx = self
-                    .target_tokens
-                    .last()
-                    .map(|t| t.as_jump_target_descr().index());
-                let redirected_jump_descr_idx = redirected_tail_ops
+                // A close onto the body token this compilation just minted is
+                // always legal. A close onto any other token is legal exactly
+                // when that token belongs to the artifact this compilation will
+                // be installed under — compile.py:197's own test — because the
+                // JUMP is emitted as an absolute branch to the target's
+                // `ll_loop_code()` and only a same-artifact target shares the
+                // buffer's lifetime and invalidation flag.
+                //
+                // `_jump_to_existing_trace` walks `jitcelltoken.target_tokens`
+                // (unroll.py:171), so upstream's candidates are all owned by one
+                // JitCellToken by construction. pyre seeds them from a green-key
+                // side table that outlives a recompile, so the ownership has to
+                // be re-checked here.
+                let current_body_descr =
+                    self.target_tokens.last().map(|t| t.as_jump_target_descr());
+                let current_body_descr_idx = current_body_descr.as_ref().map(|d| d.index());
+                let redirected_jump_descr = redirected_tail_ops
                     .iter()
                     .rfind(|o| o.opcode == OpCode::Jump)
-                    .and_then(|o| o.getdescr())
-                    .map(|d| d.index());
-                if redirected_jump_descr_idx != current_body_descr_idx {
+                    .and_then(|o| o.getdescr());
+                let redirected_jump_descr_idx = redirected_jump_descr.as_ref().map(|d| d.index());
+                let redirected_jump_owner_num = redirected_jump_descr
+                    .as_ref()
+                    .and_then(|d| d.as_loop_target_descr())
+                    .and_then(|d| d.original_jitcell_token_number());
+                let closes_onto_own_body = redirected_jump_descr_idx == current_body_descr_idx;
+                let closes_within_attached_artifact =
+                    match (self.attach_jitcell_token_number, redirected_jump_owner_num) {
+                        (Some(attach_num), Some(target_num)) => attach_num == target_num,
+                        // No artifact to attach to yet: compile_loop mints its token
+                        // after optimizing, so every seeded candidate still names the
+                        // *previous* compilation. compile.py:288-289 keeps that case
+                        // from arising at all by resetting the list.
+                        _ => false,
+                    };
+                if !closes_onto_own_body && !closes_within_attached_artifact {
                     // Fall back to jump_to_preamble, matching the
                     // unreachable-target path in unroll.py:228.
-                    //
-                    // Measured 2026-08-09 before widening this: admitting the
-                    // external close on dynasm — which does relocate every
-                    // LABEL and refuses a JUMP below the first page, so the
-                    // branch names a real address — still SIGSEGVs
-                    // `synth/exception_escape_inlined_midframe_tb_node` and
-                    // adds ~200 guard failures plus a bridge each to
-                    // `synth/{global_reassign,mapdict_unboxed_type_change_attr,
-                    // math_isqrt_compare_bridge_resume,method_reassign_after_warmup}`.
-                    // Reaching a live target address is therefore not the whole
-                    // precondition, and the reason is not the cranelift
-                    // one-function-per-trace layout this guard was first written
-                    // for. Find what else the close breaks before making this
-                    // per-backend.
                     if crate::majit_log_enabled() {
                         eprintln!(
-                            "[jit] jump_to_existing_trace: external target {:?} != body {:?}, falling back to preamble",
-                            redirected_jump_descr_idx, current_body_descr_idx
+                            "[jit] jump_to_existing_trace: target {:?} (owner {:?}) is neither this body {:?} nor inside the attached artifact {:?}, falling back to preamble",
+                            redirected_jump_descr_idx,
+                            redirected_jump_owner_num,
+                            current_body_descr_idx,
+                            self.attach_jitcell_token_number,
                         );
                     }
                     redirected_tail_ops.clear();
@@ -1932,6 +1903,19 @@ impl UnrollOptimizer {
                 "jit-tracing",
                 "jump_to_existing_trace: body JUMP → self-loop",
             );
+        }
+
+        // unroll.py:176-177: disable_retracing_if_max_retrace_guards
+        if jump_was_redirected
+            && Self::disable_retracing_if_max_retrace_guards(&body_ops, self.max_retrace_guards)
+        {
+            self.retraced_count = u32::MAX;
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] too many guards (>{}), disabling retracing",
+                    self.max_retrace_guards
+                );
+            }
         }
 
         // ── Assembly (compile.py:310-338) ──

@@ -1036,8 +1036,8 @@ impl OptVirtualize {
             // virtual fields but can be resolved from the SizeDescr vtable.
             // RPython doesn't need this because GUARD_CLASS reads the class
             // directly from the object, not via a separate field read.
+            let is_typeptr = op.with_field_descr(|fd| fd.is_typeptr()).unwrap_or(false);
             if field_val.is_none() && matches!(op.opcode, majit_ir::OpCode::GetfieldGcI) {
-                let is_typeptr = op.with_field_descr(|fd| fd.is_typeptr()).unwrap_or(false);
                 if is_typeptr {
                     let vtable = match &info {
                         PtrInfo::Virtual(vinfo) => vinfo
@@ -3941,6 +3941,37 @@ mod tests {
         assign_positions(&mut ops);
         let result = run_pass(&ops);
         assert!(result.is_empty(), "NEW should be removed");
+    }
+
+    #[test]
+    fn test_fresh_virtual_unwritten_fields_are_typed_zero() {
+        // virtualize.py:184-190 optimize_GETFIELD_GC_I: GC allocations are
+        // zero-filled, so an unset virtual field folds through
+        // optimizer.new_const(fielddescr) without forcing the allocation.
+        for (get_opcode, field_descr) in [
+            (OpCode::GetfieldGcI, field_descr(0)),
+            (OpCode::GetfieldGcR, ref_field_descr(0)),
+            (OpCode::GetfieldGcF, float_field_descr(0)),
+        ] {
+            let mut ops = vec![
+                Op::with_descr(OpCode::NewWithVtable, &[], size_descr(1)),
+                Op::with_descr(
+                    get_opcode,
+                    &[crate::history::test_support::rooted_resop_operand(
+                        Type::Ref,
+                        0,
+                    )],
+                    field_descr,
+                ),
+            ];
+            assign_positions(&mut ops);
+            let result = run_pass(&ops);
+            assert!(
+                result.is_empty(),
+                "{get_opcode:?} of an unset fresh field forced the virtual: {:?}",
+                result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

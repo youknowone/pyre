@@ -150,6 +150,17 @@ fn concrete_shadow_value(value: Value) -> Option<Value> {
     }
 }
 
+/// The address a `GcRef` names, or `None` when it names no live object: the
+/// unset marker, the all-ones tombstone, or NULL. A load through any of the
+/// three reads memory the object model does not own.
+fn live_gc_ptr(gcref: majit_ir::GcRef) -> Option<i64> {
+    if gcref == majit_ir::GcRef::NO_CONCRETE {
+        return None;
+    }
+    let ptr = gcref.0 as i64;
+    (ptr != 0 && ptr != usize::MAX as i64).then_some(ptr)
+}
+
 /// pyjitpl.py:2989 box-with-type pair.
 ///
 /// RPython's `Box` carries type implicitly via Python class identity
@@ -3797,7 +3808,10 @@ impl TraceCtx {
             .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
         self.profiler()
             .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
+        let op =
+            self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr.clone());
+        let vable_concrete = self.concrete_of_opref(vable_opref);
+        self.stamp_vable_array_base(op, vable_concrete, &record_descr);
         self.heapcache_getfield_now_known(vable_opref, field_index, op);
         op
     }
@@ -4357,8 +4371,14 @@ impl TraceCtx {
             .count_ops(OpCode::GetarrayitemGcI, crate::counters::OPS);
         self.profiler()
             .count_ops(OpCode::GetarrayitemGcI, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetarrayitemGcI, &[array_opref, index], adescr);
-        (op, None)
+        let op = self.record_op_with_descr(
+            OpCode::GetarrayitemGcI,
+            &[array_opref, index],
+            adescr.clone(),
+        );
+        let value =
+            self.stamp_vable_array_item(op, array_opref, item_index as i64, &adescr, Type::Int);
+        (op, value)
     }
 
     /// pyjitpl.py:1201-1216 `_get_arrayitem_vable_index(pc, arrayfielddescr, indexbox)`.
@@ -4446,6 +4466,7 @@ impl TraceCtx {
             .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
+        self.stamp_vable_array_base(array_opref, concrete, &fdescr);
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_int_vable(array_opref, &fdescr, item_index, adescr)
         } else {
@@ -4454,6 +4475,47 @@ impl TraceCtx {
                 None,
             )
         }
+    }
+
+    /// Stamp the array-base box a `_opimpl_getarrayitem_vable` fallback reads
+    /// through. pyjitpl.py:1221 reaches the array with `opimpl_getfield_gc_r`,
+    /// which executes the load before recording it, so the box it hands on
+    /// carries the loaded pointer. A base left symbolic propagates "no
+    /// concrete" into every element read taken through it.
+    fn stamp_vable_array_base(&mut self, op: OpRef, vable: Option<Value>, fdescr: &DescrRef) {
+        let Some(Value::Ref(vable_ref)) = vable else {
+            return;
+        };
+        let Some(vable_ptr) = live_gc_ptr(vable_ref) else {
+            return;
+        };
+        if let Some(base) = self.field_sanity_load(vable_ptr, fdescr, Type::Ref) {
+            self.set_opref_concrete(op, base);
+        }
+    }
+
+    /// `executor.execute` for a recorded virtualizable element read.
+    ///
+    /// pyjitpl.py:1223-1227 reaches the element with `opimpl_getarrayitem_gc_*`,
+    /// which executes the load and attaches the result to the box it returns
+    /// (`history.py:803 *FrontendOp(pos, value)`). The fallback legs below
+    /// record the op directly and must execute it the same way: an element box
+    /// left symbolic reaches a residual call as an unbound argument, and the
+    /// trace aborts there with the walk's heap effects already live.
+    fn stamp_vable_array_item(
+        &mut self,
+        op: OpRef,
+        array_opref: OpRef,
+        item_index: i64,
+        adescr: &DescrRef,
+        kind: Type,
+    ) -> Option<Value> {
+        let Some(Value::Ref(array_ref)) = self.concrete_of_opref(array_opref) else {
+            return None;
+        };
+        let value = self.array_sanity_load(live_gc_ptr(array_ref)?, item_index, adescr, kind)?;
+        self.set_opref_concrete(op, value);
+        Some(value)
     }
 
     /// Standard virtualizable array item read (ref).
@@ -4474,8 +4536,14 @@ impl TraceCtx {
             .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
         self.profiler()
             .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetarrayitemGcR, &[array_opref, index], adescr);
-        (op, None)
+        let op = self.record_op_with_descr(
+            OpCode::GetarrayitemGcR,
+            &[array_opref, index],
+            adescr.clone(),
+        );
+        let value =
+            self.stamp_vable_array_item(op, array_opref, item_index as i64, &adescr, Type::Ref);
+        (op, value)
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant.
@@ -4517,6 +4585,7 @@ impl TraceCtx {
             .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
+        self.stamp_vable_array_base(array_opref, concrete, &fdescr);
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_ref_vable(array_opref, &fdescr, item_index, adescr)
         } else {
@@ -4545,8 +4614,14 @@ impl TraceCtx {
             .count_ops(OpCode::GetarrayitemGcF, crate::counters::OPS);
         self.profiler()
             .count_ops(OpCode::GetarrayitemGcF, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetarrayitemGcF, &[array_opref, index], adescr);
-        (op, None)
+        let op = self.record_op_with_descr(
+            OpCode::GetarrayitemGcF,
+            &[array_opref, index],
+            adescr.clone(),
+        );
+        let value =
+            self.stamp_vable_array_item(op, array_opref, item_index as i64, &adescr, Type::Float);
+        (op, value)
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant.
@@ -4580,6 +4655,7 @@ impl TraceCtx {
             .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
+        self.stamp_vable_array_base(array_opref, concrete, &fdescr);
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_float_vable(array_opref, &fdescr, item_index, adescr)
         } else {
@@ -4828,7 +4904,15 @@ impl TraceCtx {
             .count_ops(OpCode::GetarrayitemGcI, crate::counters::OPS);
         self.profiler()
             .count_ops(OpCode::GetarrayitemGcI, crate::counters::RECORDED_OPS);
-        self.record_op_with_descr(OpCode::GetarrayitemGcI, &[array_opref, index], descr)
+        let op = self.record_op_with_descr(
+            OpCode::GetarrayitemGcI,
+            &[array_opref, index],
+            descr.clone(),
+        );
+        if let Some(Value::Int(item_index)) = self.concrete_of_opref(index) {
+            self.stamp_vable_array_item(op, array_opref, item_index, &descr, Type::Int);
+        }
+        op
     }
 
     /// Record a virtualizable array item read with an explicit array descriptor.
@@ -4842,7 +4926,15 @@ impl TraceCtx {
             .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
         self.profiler()
             .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
-        self.record_op_with_descr(OpCode::GetarrayitemGcR, &[array_opref, index], descr)
+        let op = self.record_op_with_descr(
+            OpCode::GetarrayitemGcR,
+            &[array_opref, index],
+            descr.clone(),
+        );
+        if let Some(Value::Int(item_index)) = self.concrete_of_opref(index) {
+            self.stamp_vable_array_item(op, array_opref, item_index, &descr, Type::Ref);
+        }
+        op
     }
 
     /// Record a virtualizable array item read with an explicit array descriptor.
@@ -4856,7 +4948,15 @@ impl TraceCtx {
             .count_ops(OpCode::GetarrayitemGcF, crate::counters::OPS);
         self.profiler()
             .count_ops(OpCode::GetarrayitemGcF, crate::counters::RECORDED_OPS);
-        self.record_op_with_descr(OpCode::GetarrayitemGcF, &[array_opref, index], descr)
+        let op = self.record_op_with_descr(
+            OpCode::GetarrayitemGcF,
+            &[array_opref, index],
+            descr.clone(),
+        );
+        if let Some(Value::Int(item_index)) = self.concrete_of_opref(index) {
+            self.stamp_vable_array_item(op, array_opref, item_index, &descr, Type::Float);
+        }
+        op
     }
 
     /// Record a virtualizable array item write with an explicit array descriptor.

@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
+use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_object::pyobject::*;
-use pyre_object::rbigint::RBigInt as BigInt;
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
@@ -3757,10 +3757,9 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let items: Vec<PyObjectRef> = (0..n)
             .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(value, i as i64) })
             .collect();
-        // Canonical array-backed layout (ob_type == TUPLE_TYPE) so the
-        // subclass tag never lands on an arity-2 specialised tuple.
-        let fresh = pyre_object::w_tuple_new_array_backed(items);
-        unsafe { store_subclass_tag(fresh, sub) };
+        // The generated user-class layout selected by `typedef.py:174-227`,
+        // never an arity-2 specialised tuple.
+        let fresh = pyre_object::w_tuple_subclass_new_array_backed(items, sub);
         pyre_object::gc_hook::maybe_register_finalizer(fresh);
         return Ok(fresh);
     }
@@ -17091,7 +17090,7 @@ type DunderFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 fn long_bit_length(value: &BigInt) -> Result<i64, crate::PyError> {
     match value.bit_length() {
         Ok(bits) => Ok(bits),
-        Err(pyre_object::rbigint::RBigIntError::Overflow) => {
+        Err(majit_rlib::rbigint::RBigIntError::Overflow) => {
             Err(crate::PyError::overflow_error("too many digits in integer"))
         }
         Err(_) => unreachable!("rbigint.bit_length only raises OverflowError"),
@@ -17130,12 +17129,11 @@ pub fn __pyre_wrap_int_descr_bit_length(
     // value, so long/bigint operands must route through their magnitude
     // rather than the i64 fast path (which leaves out-of-range values at 0).
     let bits = if !args.is_empty() && unsafe { pyre_object::is_bool(args[0]) } {
-        pyre_object::rbigint::bit_length_int(unsafe {
+        majit_rlib::rbigint::bit_length_int(unsafe {
             pyre_object::w_bool_get_value(args[0]) as i64
         }) as u64
     } else if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
-        pyre_object::rbigint::bit_length_int(unsafe { pyre_object::w_int_get_value(args[0]) })
-            as u64
+        majit_rlib::rbigint::bit_length_int(unsafe { pyre_object::w_int_get_value(args[0]) }) as u64
     } else if !args.is_empty() && unsafe { pyre_object::is_long(args[0]) } {
         long_bit_length(unsafe { pyre_object::w_long_get_value(args[0]) })? as u64
     } else {
@@ -17271,7 +17269,7 @@ fn init_int_type(ns: PyObjectRef) {
                     } else if unsafe { pyre_object::pyobject::is_int_or_long(args[0]) } {
                         match unsafe { pyre_object::w_long_get_value(args[0]).bit_count() } {
                             Ok(count) => count,
-                            Err(pyre_object::rbigint::RBigIntError::Overflow) => {
+                            Err(majit_rlib::rbigint::RBigIntError::Overflow) => {
                                 return Err(crate::PyError::overflow_error(
                                     "too many digits in integer",
                                 ));
@@ -17399,21 +17397,21 @@ fn init_int_type(ns: PyObjectRef) {
                 let bytes =
                     val.tobytes(length_i, byteorder, signed)
                         .map_err(|error| match error {
-                            pyre_object::rbigint::RBigIntError::InvalidEndianness => {
+                            majit_rlib::rbigint::RBigIntError::InvalidEndianness => {
                                 crate::PyError::value_error(
                                     "byteorder must be either 'little' or 'big'",
                                 )
                             }
-                            pyre_object::rbigint::RBigIntError::InvalidSignedness
-                            | pyre_object::rbigint::RBigIntError::NegativeToUnsigned => {
+                            majit_rlib::rbigint::RBigIntError::InvalidSignedness
+                            | majit_rlib::rbigint::RBigIntError::NegativeToUnsigned => {
                                 crate::PyError::overflow_error(
                                     "can't convert negative int to unsigned",
                                 )
                             }
-                            pyre_object::rbigint::RBigIntError::Overflow => {
+                            majit_rlib::rbigint::RBigIntError::Overflow => {
                                 crate::PyError::overflow_error("int too big to convert")
                             }
-                            pyre_object::rbigint::RBigIntError::Memory => {
+                            majit_rlib::rbigint::RBigIntError::Memory => {
                                 crate::PyError::memory_error("")
                             }
                             _ => unreachable!("rbigint.tobytes returned an unrelated error"),
@@ -21895,20 +21893,20 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .unwrap_or(false);
     // intobject.py:81-91 first tries the machine-word helper, then falls back
     // to the same linear rbigint.frombytes implementation for large input.
-    let w_result = match pyre_object::rbigint::frombytes_int(&bytes, byteorder, signed) {
+    let w_result = match majit_rlib::rbigint::frombytes_int(&bytes, byteorder, signed) {
         Ok(value) => pyre_object::w_int_new(value),
-        Err(pyre_object::rbigint::RBigIntError::Overflow) => {
+        Err(majit_rlib::rbigint::RBigIntError::Overflow) => {
             let value =
                 BigInt::frombytes(&bytes, byteorder, signed).map_err(|error| match error {
-                    pyre_object::rbigint::RBigIntError::InvalidEndianness => {
+                    majit_rlib::rbigint::RBigIntError::InvalidEndianness => {
                         crate::PyError::value_error("byteorder must be either 'little' or 'big'")
                     }
-                    pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+                    majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
                     _ => unreachable!("validated rbigint.frombytes returned an unrelated error"),
                 })?;
             pyre_object::w_long_new(value)
         }
-        Err(pyre_object::rbigint::RBigIntError::InvalidEndianness) => {
+        Err(majit_rlib::rbigint::RBigIntError::InvalidEndianness) => {
             return Err(crate::PyError::value_error(
                 "byteorder must be either 'little' or 'big'",
             ));

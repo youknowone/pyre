@@ -296,12 +296,21 @@ _RESOURCE_DRIVER = (
 
 # test_descr and test_enum assert fully qualified class/enum names. Running
 # their files as __main__ changes those names even on CPython, so preserve the
-# dotted identity that libregrtest gives them.
+# dotted identity that libregrtest gives them.  The thread suites repeatedly
+# spawn child interpreters and import their canonical `test.test_*` modules;
+# running the parent as a second `__main__` module would test a different
+# module identity from both libregrtest and those children.
 #
 # test_runpy's file as __main__ does not run test_runpy at all — it starts
 # libregrtest over the whole suite (measured: 491 modules on CPython 3.14,
 # 492 here), so script mode can only ever time out on it.
-DOTTED_IDENTITY_MODULES = {"test.test_descr", "test.test_enum", "test.test_runpy"}
+DOTTED_IDENTITY_MODULES = {
+    "test.test_descr",
+    "test.test_enum",
+    "test.test_runpy",
+    "test.test_thread",
+    "test.test_threading",
+}
 
 # test_datetime's load_tests appends an exhaustive test class for every
 # installed system timezone when test.support.use_resources is left as None.
@@ -433,8 +442,11 @@ def main() -> int:
     # The report is box-drawn and the module names it echoes come from the
     # stdlib, so a console whose codepage cannot spell one of those characters
     # used to kill the run with a `UnicodeEncodeError` before it reached a
-    # single test — the header alone does it on cp949.
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    # single test — the header alone does it on cp949.  The error paths below
+    # spell host paths to stderr, which has the same codepage, so reconfigure
+    # both streams.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
     binary = Path(args.binary) if args.binary else TARGET_RELEASE / f"{BIN_NAME[args.backend]}{EXE}"
     binary = binary.resolve()

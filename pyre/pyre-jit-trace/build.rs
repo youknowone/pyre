@@ -137,7 +137,7 @@ fn emit_llbc_extraction_placeholders() {
 /// `.fingerprint` stamp are both named after the crate.  Pyre production
 /// configures the exact `eval::eval_loop_jit` portal, so unlike generic
 /// two-artefact consumers it requires `pyre-jit` too.
-const LLBC_CRATES: &[&str] = &["pyre-object", "pyre-interpreter", "pyre-jit"];
+const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"];
 
 /// Pre-flight the LLBC prerequisite, mirroring the resolution order in
 /// `majit-translate` (`build_semantic_program_via_active_frontend`):
@@ -253,7 +253,7 @@ fn preflight_llbc_or_fail() {
    {}\n\
 \n\
  …or point the build at existing artefacts:\n\
-   export PYRE_MIR_FRONTEND_LLBC=/abs/pyre-object.ullbc:/abs/pyre-interpreter.ullbc:/abs/pyre-jit.ullbc{}\n\
+   export PYRE_MIR_FRONTEND_LLBC={}{}\n\
 ========================================================================\n",
         missing
             .iter()
@@ -262,6 +262,14 @@ fn preflight_llbc_or_fail() {
             .join("\n"),
         install_line,
         extract_cmd,
+        // Spelled from `LLBC_CRATES` because setting this override returns
+        // before the mandatory-artefact check: an example short one artefact
+        // is a working command that silently drops that crate's bodies.
+        LLBC_CRATES
+            .iter()
+            .map(|crate_name| format!("/abs/{crate_name}.ullbc"))
+            .collect::<Vec<_>>()
+            .join(":"),
         override_extra,
     );
 
@@ -882,12 +890,11 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
             }
         }
     }
-    for llbc in [
-        "pyre-object.ullbc",
-        "pyre-interpreter.ullbc",
-        "pyre-jit.ullbc",
-    ] {
-        println!("cargo::rerun-if-changed={repo_root}/build/llbc/{llbc}");
+    // Derived from `LLBC_CRATES` rather than repeated: a crate added there is a
+    // production input, and a copy of the list that missed it would let cargo
+    // skip this script after that artefact alone changed.
+    for crate_name in LLBC_CRATES {
+        println!("cargo::rerun-if-changed={repo_root}/build/llbc/{crate_name}.ullbc");
     }
     for sidecar in llbc_layout_sidecars() {
         println!("cargo::rerun-if-changed={repo_root}/build/llbc/{sidecar}");
@@ -911,7 +918,7 @@ fn llbc_layout_sidecars() -> Vec<String> {
     // spec for why), so only the object model gets cross-target layouts.
     // The naming convention lives in `majit_translate::layout` so it stays in
     // lockstep with `auto_discover_workspace_llbc_paths`.
-    ["pyre-object", "pyre-interpreter"]
+    ["majit-rlib", "pyre-object", "pyre-interpreter"]
         .iter()
         .map(|crate_name| majit_translate::layout::layout_sidecar_filename(crate_name, &target))
         .collect()
@@ -1155,17 +1162,15 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
         }
         return;
     }
-    for llbc in [
-        "pyre-object.ullbc",
-        "pyre-interpreter.ullbc",
-        "pyre-jit.ullbc",
-    ] {
+    // Same single source of truth as `emit_rerun_directives`: a crate missing
+    // from this hash keys the codegen cache on a stale snapshot of it.
+    for crate_name in LLBC_CRATES {
         hash_file_content(
             h,
             &std::path::Path::new(repo_root)
                 .join("build")
                 .join("llbc")
-                .join(llbc),
+                .join(format!("{crate_name}.ullbc")),
         );
     }
     // Cross-target sidecars are build inputs too: they supply the target field

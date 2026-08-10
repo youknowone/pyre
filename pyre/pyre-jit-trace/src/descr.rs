@@ -69,6 +69,11 @@ const HOLDER_TYP_INDEX: u32 = MAPDICT_DESCR_TAG | 3;
 // `descr.rs`).
 const AUDIT_HOLDER_HOOKS_INDEX: u32 = MAPDICT_DESCR_TAG | 4;
 
+// The generated native user layouts append mapdict fields at different base
+// sizes. HeapCache keys by descriptor index; give each translated STRUCT field
+// the distinct identity provided by descr.py's per-STRUCT cache.
+const NATIVE_MAPDICT_DESCR_TAG: u32 = 0x6100_0000;
+
 fn type_bits(tp: Type) -> u32 {
     match tp {
         Type::Int => 0,
@@ -691,6 +696,28 @@ fn build_object_descr_group_with_def_path(
         simple_name,
         def_path,
         &[],
+        &[],
+    )
+}
+
+fn build_object_descr_group_with_field_indices(
+    obj_size: usize,
+    type_id: u32,
+    vtable: usize,
+    fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
+    simple_name: &str,
+    def_path: &str,
+    field_indices: &[u32],
+) -> PyreObjectDescrGroup {
+    build_object_descr_group_with_extra_gc_edges(
+        obj_size,
+        type_id,
+        vtable,
+        fields,
+        simple_name,
+        def_path,
+        &[],
+        field_indices,
     )
 }
 
@@ -709,6 +736,7 @@ fn build_object_descr_group_with_extra_gc_edges(
     simple_name: &str,
     def_path: &str,
     extra_gc_edges: &[Arc<dyn FieldDescr>],
+    field_indices: &[u32],
 ) -> PyreObjectDescrGroup {
     let cache_key = if !def_path.is_empty() {
         majit_ir::descr::path_hash(def_path)
@@ -725,7 +753,10 @@ fn build_object_descr_group_with_extra_gc_edges(
                 index_in_parent,
                 &(field_key, offset, field_size, field_type, signed, immutable, quasi_immutable),
             )| majit_ir::descr::SimpleFieldDescrSpec {
-                index: stable_field_index(offset, field_size, field_type, signed),
+                index: field_indices
+                    .get(index_in_parent)
+                    .copied()
+                    .unwrap_or_else(|| stable_field_index(offset, field_size, field_type, signed)),
                 field_key: field_key.to_string(),
                 name: if simple_name.is_empty() {
                     field_key.to_string()
@@ -1573,8 +1604,6 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // Mapdict's optional instance dictionary for tuple subclasses.
-            // Exact tuples leave this mutable GC slot null.
             (
                 "W_TupleObject.w_dict",
                 std::mem::offset_of!(W_TupleObject, w_dict),
@@ -2038,6 +2067,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         "PyFrame",
         "pyframe::PyFrame",
         &[PYFRAME_VABLE_TOKEN_FIELD_DESCR.clone()],
+        &[],
     )
 });
 
@@ -2249,18 +2279,18 @@ use pyre_object::functional::{
     RANGE_LENGTH_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
 };
 use pyre_object::interp_exceptions::{
-    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET,
-    EXC_W_CODE_OFFSET, EXC_W_CONTEXT_OFFSET, EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET,
-    EXC_W_END_OFFSET, EXC_W_ERRNO_OFFSET, EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET,
-    EXC_W_GROUP_EXCEPTIONS_OFFSET, EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET,
-    EXC_W_IMPORT_MSG_OFFSET, EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET,
-    EXC_W_NAME_OFFSET, EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET,
-    EXC_W_STRERROR_OFFSET, EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET,
-    EXC_W_SYNTAX_FILENAME_OFFSET, EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET,
-    EXC_W_SYNTAX_MSG_OFFSET, EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
-    EXC_W_SYNTAX_TEXT_OFFSET, EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET,
-    EXC_W_WINERROR_OFFSET, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE,
-    exc_kind_to_pytype,
+    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_SUPPRESS_CONTEXT_OFFSET,
+    EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET, EXC_W_CODE_OFFSET, EXC_W_CONTEXT_OFFSET,
+    EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET, EXC_W_END_OFFSET, EXC_W_ERRNO_OFFSET,
+    EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET, EXC_W_GROUP_EXCEPTIONS_OFFSET,
+    EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET, EXC_W_IMPORT_MSG_OFFSET,
+    EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET, EXC_W_NAME_OFFSET,
+    EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET, EXC_W_STRERROR_OFFSET,
+    EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET, EXC_W_SYNTAX_FILENAME_OFFSET,
+    EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET, EXC_W_SYNTAX_MSG_OFFSET,
+    EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET, EXC_W_SYNTAX_TEXT_OFFSET,
+    EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET, EXC_W_WINERROR_OFFSET,
+    ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::W_CLASS_OFFSET;
@@ -2972,6 +3002,85 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
     group
 });
 
+fn build_native_user_mapdict_group(
+    size: usize,
+    type_id: u32,
+    vtable: usize,
+    map_offset: usize,
+    storage_offset: usize,
+    simple_name: &'static str,
+    def_path: &'static str,
+    tag: u32,
+) -> PyreObjectDescrGroup {
+    let group = build_object_descr_group_with_field_indices(
+        size,
+        type_id,
+        vtable,
+        &[
+            (
+                "map",
+                map_offset,
+                core::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            ("storage", storage_offset, 8, Type::Ref, false, false, false),
+        ],
+        simple_name,
+        def_path,
+        &[tag, tag | 1],
+    );
+    // The annotator can publish the shared `(STRUCT, fieldname)` shells before
+    // this runtime group is forced. `get_field_descr` correctly reuses those
+    // objects (descr.py:218-239), but their placeholder index is `u32::MAX`.
+    // Stamp the two shared descriptors after the cache lookup so HeapCache
+    // cannot alias map and storage through that placeholder.
+    group.field_descrs[0].set_index(tag);
+    group.field_descrs[1].set_index(tag | 1);
+    group
+}
+
+static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
+        pyre_object::intobject::W_INT_USER_GC_TYPE_ID.get(),
+        &INT_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, map),
+        std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, storage),
+        "W_IntObjectUser",
+        "intobject::W_IntObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG,
+    )
+});
+
+static W_UNICODE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
+        pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID.get(),
+        &pyre_object::pyobject::STR_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::unicodeobject::W_UnicodeObjectUser, map),
+        std::mem::offset_of!(pyre_object::unicodeobject::W_UnicodeObjectUser, storage),
+        "W_UnicodeObjectUser",
+        "unicodeobject::W_UnicodeObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x10,
+    )
+});
+
+static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
+        pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID.get(),
+        &pyre_object::pyobject::TUPLE_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::tupleobject::W_TupleObjectUser, map),
+        std::mem::offset_of!(pyre_object::tupleobject::W_TupleObjectUser, storage),
+        "W_TupleObjectUser",
+        "tupleobject::W_TupleObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x20,
+    )
+});
+
 /// `W_ObjectObject.map` (`objectobject.rs:38`) — the erased `*const MapNode`
 /// instance shape pointer, `self.map` of PyPy's `MapdictStorageMixin`
 /// (`mapdict.py:907`). Read as an opaque `Int` word so the LOAD_ATTR fast path
@@ -2992,6 +3101,39 @@ pub fn object_map_descr() -> DescrRef {
 /// replaces the block.
 pub fn object_storage_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 1)
+}
+
+/// Map field for a receiver already proven to carry a translated mapdict
+/// layout.
+pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
+    if unsafe { pyre_object::is_int(obj) } {
+        field_descr_from_group(&W_INT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::is_str(obj) } {
+        field_descr_from_group(&W_UNICODE_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::is_tuple(obj)
+            && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
+    } {
+        field_descr_from_group(&W_TUPLE_USER_DESCR_GROUP, 0)
+    } else {
+        object_map_descr()
+    }
+}
+
+/// Storage-field sibling of [`mapdict_map_descr`].
+pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
+    if unsafe { pyre_object::is_int(obj) } {
+        field_descr_from_group(&W_INT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::is_str(obj) } {
+        field_descr_from_group(&W_UNICODE_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::is_tuple(obj)
+            && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
+    } {
+        field_descr_from_group(&W_TUPLE_USER_DESCR_GROUP, 1)
+    } else {
+        object_storage_descr()
+    }
 }
 
 /// The instance's own `PyObject.w_class` — the Python class `w_instance_new`
@@ -3076,10 +3218,6 @@ pub fn tuple_w_class_descr() -> DescrRef {
 
 pub fn tuple_hash_descr() -> DescrRef {
     field_descr_from_group(&W_TUPLE_DESCR_GROUP, 2)
-}
-
-pub fn tuple_w_dict_descr() -> DescrRef {
-    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 3)
 }
 
 /// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
@@ -3346,10 +3484,10 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// SizeDescr + field descrs for `W_BaseException` allocation via
 /// NewWithVtable, one set per `ExcKind`.  The vtable (`ob_type`) differs
 /// per kind (`exc_kind_to_pytype`), so each kind owns its group; the
-/// three SetField'd fields — `kind`, `w_class`, `args_w` — share the
-/// same offsets across kinds.  `w_cause`/`w_context`/… stay zeroed by
-/// the `NewWithVtable` memzero (PY_NULL), matching
-/// `w_exception_new_empty`.
+/// constructor-written fields — `kind`, `w_class`, `args_w`, and
+/// `suppress_context` — share the same offsets across kinds. `w_context`
+/// is written separately by the raise lowering; the remaining pointer slots
+/// stay zeroed by GC pointer clearing (PY_NULL), matching `w_exception_new_empty`.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
     build_object_descr_group_with_def_path(
         W_BASE_EXCEPTION_SIZE,
@@ -3700,6 +3838,17 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
                 false,
             ),
+            // This plain byte is not included in gc_fielddescrs, so a nursery
+            // allocation must initialize it explicitly.
+            (
+                "W_BaseException.suppress_context",
+                EXC_SUPPRESS_CONTEXT_OFFSET,
+                1,
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
         ],
         // Empty name: the per-kind vtable means a shared "W_BaseException"
         // name-registry slot would be first-write-wins and lose the other
@@ -3768,6 +3917,22 @@ pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
         .iter()
         .position(|d| d.offset() == pyre_object::interp_exceptions::EXC_W_DICT_OFFSET)
         .expect("exception descr group has no w_dict field");
+    field_descr_from_group(group, field)
+}
+
+/// Field descr for the plain `W_BaseException.suppress_context` byte.
+pub fn w_exception_suppress_context_descr(kind: ExcKind) -> DescrRef {
+    let idx = kind as u8 as usize;
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let group = cache[idx].as_ref().unwrap();
+    let field = group
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == EXC_SUPPRESS_CONTEXT_OFFSET)
+        .expect("exception descr group has no suppress_context field");
     field_descr_from_group(group, field)
 }
 
@@ -4136,6 +4301,36 @@ pub fn pyframe_flags_descr() -> DescrRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_user_mapdict_fields_replace_prepass_placeholder_indices() {
+        assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_0000);
+        assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[1].index(), 0x6100_0001);
+        assert_eq!(
+            W_UNICODE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0010
+        );
+        assert_eq!(
+            W_TUPLE_USER_DESCR_GROUP.field_descrs[1].index(),
+            0x6100_0021
+        );
+        assert_eq!(
+            W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
+            Type::Ref
+        );
+        assert_eq!(
+            W_INT_USER_DESCR_GROUP.field_descrs[0].field_size(),
+            core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            W_UNICODE_USER_DESCR_GROUP.field_descrs[0].field_size(),
+            core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            W_TUPLE_USER_DESCR_GROUP.field_descrs[0].field_size(),
+            core::mem::size_of::<usize>()
+        );
+    }
 
     #[test]
     fn str_len_descr_keeps_its_unicode_parent_alive() {
@@ -4601,7 +4796,7 @@ mod tests {
     }
 
     #[test]
-    fn list_and_tuple_subclass_storage_is_cleared_by_allocation_descrs() {
+    fn list_subclass_storage_is_cleared_by_allocation_descrs() {
         let list_size = w_list_size_descr();
         let list_gc_offsets: Vec<_> = list_size
             .as_size_descr()
@@ -4611,16 +4806,6 @@ mod tests {
             .map(|field| field.offset())
             .collect();
         assert!(list_gc_offsets.contains(&std::mem::offset_of!(W_ListObject, w_slots)));
-
-        let tuple_size = w_tuple_size_descr();
-        let tuple_gc_offsets: Vec<_> = tuple_size
-            .as_size_descr()
-            .unwrap()
-            .gc_fielddescrs()
-            .iter()
-            .map(|field| field.offset())
-            .collect();
-        assert!(tuple_gc_offsets.contains(&std::mem::offset_of!(W_TupleObject, w_dict)));
     }
 
     #[test]
@@ -5503,9 +5688,6 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // RPython has only one FieldDescr identity for this field.
             if owner.as_str() == "ItemsBlock" && name.as_str() == "capacity" {
                 return items_block_capacity_descr();
-            }
-            if owner.as_str() == "W_TupleObject" && name.as_str() == "w_dict" {
-                return tuple_w_dict_descr();
             }
             if let Some(parent) = parent {
                 if parent.type_id != 0 {

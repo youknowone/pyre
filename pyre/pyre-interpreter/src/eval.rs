@@ -5563,7 +5563,7 @@ while i < 3000:
             .execute_frame(None, None)
             .expect("mixed-long/int hot loop failed");
 
-        let base = pyre_object::rbigint::RBigInt::one()
+        let base = majit_rlib::rbigint::RBigInt::one()
             .lshift(190)
             .unwrap()
             .int_add(81_985_529_216_486_895);
@@ -5573,7 +5573,7 @@ while i < 3000:
             ("sub_l", base.int_sub(2999)),
             (
                 "sub_r",
-                pyre_object::rbigint::RBigInt::fromint(2999).sub(&base),
+                majit_rlib::rbigint::RBigInt::fromint(2999).sub(&base),
             ),
             ("mul_l", base.int_mul(-17)),
             ("mul_r", base.int_mul(-17)),
@@ -5596,7 +5596,7 @@ while i < 3000:
                     w_long_get_value(value).clone()
                 } else {
                     assert!(is_int(value), "{name} is not an int object");
-                    pyre_object::rbigint::RBigInt::fromint(w_int_get_value(value))
+                    majit_rlib::rbigint::RBigInt::fromint(w_int_get_value(value))
                 };
                 assert!(actual.eq(&expected), "{name} differs from rbigint.int_*");
             }

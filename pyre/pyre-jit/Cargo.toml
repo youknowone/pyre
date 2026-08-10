@@ -40,6 +40,7 @@ majit-translate = { workspace = true }
 majit-backend = { workspace = true }
 majit-trace = { workspace = true }
 majit-gc = { workspace = true }
+majit-rlib = { workspace = true }
 pyre-jit-trace = { workspace = true }
 majit-backend-cranelift = { workspace = true, optional = true }
 majit-backend-dynasm = { workspace = true, optional = true }

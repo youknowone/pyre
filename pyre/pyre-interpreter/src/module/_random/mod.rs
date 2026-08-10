@@ -4,7 +4,7 @@
 //! exposes `random`/`seed`/`getstate`/`setstate`/`getrandbits`, matching
 //! `pypy/module/_random/interp_random.py W_Random`.
 
-use pyre_object::rbigint::{RBigInt as BigInt, RBigIntSign as Sign};
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntSign as Sign};
 use pyre_object::*;
 
 /// Mersenne Twister state — `rpython/rlib/rrandom.py Random`.

@@ -1,7 +1,7 @@
 //! `pypy/module/__builtin__/functional.py` line-by-line ports for built-in iterator functionals.
 
 use crate::pyobject::*;
-use crate::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 use pyre_macros::pyre_class;
 
 // ── functional.rs ─────────────────────────────────────────────

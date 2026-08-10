@@ -9,8 +9,8 @@
 //! Separated from space.rs to avoid bloating the hot-path compilation
 //! unit. Method functions are registered into TypeDef at startup.
 
+use majit_rlib::rbigint::RBigInt as BigInt;
 use num_traits::ToPrimitive;
-use pyre_object::rbigint::RBigInt as BigInt;
 use pyre_object::*;
 // `classify`/`case`/`identifier` back the `str` predicate and `casefold`
 // methods with the runtime-independent Unicode tables shared with the
@@ -2410,9 +2410,9 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
     let _ = parsed;
     let digits = match radix {
         2 => "01",
-        8 => pyre_object::rbigint::BASE8,
-        10 => pyre_object::rbigint::BASE10,
-        16 => pyre_object::rbigint::BASE16,
+        8 => majit_rlib::rbigint::BASE8,
+        10 => majit_rlib::rbigint::BASE10,
+        16 => majit_rlib::rbigint::BASE16,
         _ => unreachable!("integer format uses radix 2, 8, 10, or 16"),
     };
     let negative = num.int_lt(0);
@@ -2426,8 +2426,8 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
     let mut magnitude =
         num.format(digits, "", "", maxdigits as i64)
             .map_err(|error| match error {
-                pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
-                pyre_object::rbigint::RBigIntError::MaxStrDigits => {
+                majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+                majit_rlib::rbigint::RBigIntError::MaxStrDigits => {
                     crate::builtins::int_max_str_digits_error(maxdigits)
                 }
                 _ => unreachable!("validated radix formatting returned an unrelated error"),

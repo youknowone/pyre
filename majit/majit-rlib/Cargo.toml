@@ -1,0 +1,16 @@
+[package]
+name = "majit-rlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RPython rlib runtime support library"
+
+[dependencies]
+majit-gc = { workspace = true }
+majit-ir = { workspace = true }
+majit-macros = { workspace = true }
+num-traits = { workspace = true }
+
+[dev-dependencies]
+malachite-bigint = { workspace = true }

@@ -1,8 +1,9 @@
 use std::ops::{Index, IndexMut};
 
 use crate::object_array::{
-    GC_FLOAT_ARRAY_GC_TYPE_ID, TypedItemsBlock, alloc_typed_items_block, dealloc_typed_items_block,
-    grow_typed_items_block, typed_items_block_capacity, typed_items_block_items_base,
+    GC_FLOAT_ARRAY_GC_TYPE_ID, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock,
+    alloc_typed_items_block, dealloc_typed_items_block, grow_typed_items_block,
+    typed_items_block_capacity,
 };
 
 pub const FLOAT_ARRAY_INLINE_CAP: usize = 8;
@@ -18,7 +19,9 @@ pub const FLOAT_ARRAY_INLINE_CAP: usize = 8;
 /// as a GC ref (`GetfieldGcR(block) → GetarrayitemGcF`) the gcmap relocates.
 #[repr(C)]
 pub struct FloatArray {
-    /// `Ptr(GcArray(Float))` — the backing block (`l.items`). Always non-null.
+    /// `Ptr(GcArray(Float))` — the backing block (`l.items`). Null in the empty
+    /// form ([`FloatArray::empty`]), where the live length and the allocated
+    /// capacity are both zero.
     pub block: *mut TypedItemsBlock,
     /// Live length (rlist.py:116 `("length", Signed)`).
     len: usize,
@@ -28,10 +31,22 @@ pub const FLOAT_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(FloatArray, blo
 pub const FLOAT_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(FloatArray, len);
 
 impl FloatArray {
-    /// Items base pointer (`&l.items[0]`), derived from `block`.
+    /// Items base pointer (`&l.items[0]`), derived from `block`. The
+    /// [`crate::int_array::IntArray::base`] twin — see it for why the empty
+    /// form's null `block` is offset rather than branched on.
     #[inline]
     fn base(&self) -> *mut f64 {
-        unsafe { typed_items_block_items_base(self.block) as *mut f64 }
+        (self.block as *mut u8).wrapping_add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET) as *mut f64
+    }
+
+    /// Storage for a list whose strategy does not read this array. The
+    /// [`crate::int_array::IntArray::empty`] twin — see it for why
+    /// `from_vec(Vec::new())` is not the same thing.
+    pub fn empty() -> Self {
+        Self {
+            block: std::ptr::null_mut(),
+            len: 0,
+        }
     }
 
     pub fn from_vec(values: Vec<f64>) -> Self {

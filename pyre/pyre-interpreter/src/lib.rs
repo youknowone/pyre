@@ -843,11 +843,11 @@ pub use gateway::{
     make_slot_wrapper, make_slot_wrapper_with_arity,
 };
 pub use jit_fnaddr::*;
+pub use majit_rlib::rbigint::RBigInt as PyBigInt;
 pub use opcode_ops::*;
 pub use pycode::*;
 pub use pyframe::*;
 pub use pyopcode::*;
-pub use pyre_object::rbigint::RBigInt as PyBigInt;
 pub use pytraceback::*;
 pub use runtime_ops::*;
 pub use shared_opcode::*;
@@ -859,9 +859,9 @@ pub use shared_opcode::*;
 pub(crate) fn compiler_bigint_to_rbigint(value: &malachite_bigint::BigInt) -> PyBigInt {
     let (sign, bytes) = value.to_bytes_le();
     let sign = match sign {
-        malachite_bigint::Sign::Minus => pyre_object::rbigint::RBigIntSign::Minus,
-        malachite_bigint::Sign::NoSign => pyre_object::rbigint::RBigIntSign::NoSign,
-        malachite_bigint::Sign::Plus => pyre_object::rbigint::RBigIntSign::Plus,
+        malachite_bigint::Sign::Minus => majit_rlib::rbigint::RBigIntSign::Minus,
+        malachite_bigint::Sign::NoSign => majit_rlib::rbigint::RBigIntSign::NoSign,
+        malachite_bigint::Sign::Plus => majit_rlib::rbigint::RBigIntSign::Plus,
     };
     PyBigInt::from_bytes_le(sign, &bytes)
 }
@@ -882,9 +882,9 @@ pub extern "C" fn jit_compiler_bigint_to_rbigint(value: i64) -> *mut PyBigInt {
 
 pub(crate) fn rbigint_to_compiler_bigint(value: &PyBigInt) -> malachite_bigint::BigInt {
     let sign = match value.sign() {
-        pyre_object::rbigint::RBigIntSign::Minus => malachite_bigint::Sign::Minus,
-        pyre_object::rbigint::RBigIntSign::NoSign => malachite_bigint::Sign::NoSign,
-        pyre_object::rbigint::RBigIntSign::Plus => malachite_bigint::Sign::Plus,
+        majit_rlib::rbigint::RBigIntSign::Minus => malachite_bigint::Sign::Minus,
+        majit_rlib::rbigint::RBigIntSign::NoSign => malachite_bigint::Sign::NoSign,
+        majit_rlib::rbigint::RBigIntSign::Plus => malachite_bigint::Sign::Plus,
     };
     let magnitude = value.abs();
     let nbytes = (magnitude
