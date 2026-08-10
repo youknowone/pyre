@@ -2545,7 +2545,17 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
             )
         };
     }
+    let class_getitem = make_builtin_function(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+    );
+    let from_flags = make_builtin_function_with_arity("_from_flags", memoryview_from_flags, 3);
     unsafe {
+        crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"));
+        crate::function::fset_func_text_signature(
+            from_flags,
+            w_str_new("($type, /, object, flags)"),
+        );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__buffer__",
@@ -2561,19 +2571,12 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(class_getitem),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "_from_flags",
-            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
-                "_from_flags",
-                memoryview_from_flags,
-                3,
-            )),
+            pyre_object::function::w_classmethod_new(from_flags),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -2625,6 +2628,40 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
                 ),
             )
         };
+    }
+    // CPython 3.14 Argument Clinic metadata for the PyPy memoryview TypeDef.
+    // The two classmethod carriers are stamped before wrapping above.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__buffer__", "($self, flags, /)"),
+        ("__release_buffer__", "($self, buffer, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__setitem__", "($self, key, value, /)"),
+        ("__delitem__", "($self, key, /)"),
+        ("release", "($self, /)"),
+        ("tobytes", "($self, /, order='C')"),
+        ("hex", "($self, /, sep=<unrepresentable>, bytes_per_sep=1)"),
+        ("tolist", "($self, /)"),
+        ("cast", "($self, /, format, shape=<unrepresentable>)"),
+        ("toreadonly", "($self, /)"),
+        ("count", "($self, value, /)"),
+        ("index", "($self, value, start=0, stop=sys.maxsize, /)"),
+        ("__enter__", "($self, /)"),
+        ("__exit__", "($self, /, *exc_info)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("memoryview TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
 
