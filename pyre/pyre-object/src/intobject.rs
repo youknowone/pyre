@@ -101,13 +101,34 @@ static SMALL_INTS: LazyLock<PrebuiltInts> = LazyLock::new(|| {
     )
 });
 
-/// `pypy/objspace/std/intobject.py:883-897 wrapint` parity.
+/// `pypy/objspace/std/intobject.py:903-921 wrapint` parity.
 ///
 /// `withprebuiltint=False` (PyPy default) → always allocate fresh,
 /// matching upstream `return W_IntObject(x)`. With the flag enabled
 /// and `value` inside `[PREBUILTINTFROM, PREBUILTINTTO)` the cache
 /// returns the pre-allocated entry; outside the range we allocate
 /// (`instantiate(W_IntObject)` upstream).
+///
+/// Traced, not residualised, and `#[inline]` — `wrapint` carries no
+/// `@dont_look_inside` and its own comment reads "this whole function is
+/// getting inlined into every caller so keeping the branching to a minimum
+/// is a good idea" (intobject.py:908-910). The allocation upstream is
+/// `instantiate(W_IntObject)` followed by `w_res.intval = x`
+/// (intobject.py:913-920): alloc-then-init, which the rtyper lowers to the
+/// `new_with_vtable` + payload `setfield_gc` pair the optimizer can
+/// virtualize where the box does not escape. The stack-built
+/// `malloc_typed(W_IntObject { .. })` spelling below is the Rust form of the
+/// same thing: `fuse_boxing_alloc` (`majit-translate` `model.rs`) rewrites
+/// that cluster into exactly that pair, and it does fire here — its walk
+/// resolves the header pointers across the block boundary each call ends.
+///
+/// `bench/synth/list_pop_append` reads the same either way, and its negative
+/// control (boundary removed with the fusion reverted) failed to reproduce
+/// the regression that motivated the boundary, so that bench does not
+/// discriminate this mechanism in either direction. What decides it is the
+/// shape: a residual call can never be virtualized and `new_with_vtable`
+/// can, and the boundary's own stated blocker — the fusion not resolving a
+/// vtable here — is gone.
 ///
 /// The allocation path goes through [`crate::lltype::malloc_typed`]
 /// which carries `W_INT_GC_TYPE_ID` +
@@ -133,61 +154,10 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
         let idx = (value - PREBUILTINTFROM) as usize;
         return (&SMALL_INTS.0[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
     }
-    w_int_box_slow(value)
-}
-
-/// The allocating tail of [`w_int_new`], behind a residualisation boundary
-/// (`rlib/jit.py:139 @dont_look_inside`). The collector arm is the
-/// `gct_fv_gc_malloc` bracket (`rpython/memory/gctransform/framework.py`) in
-/// its alloc-then-init form — take the block, then write the header and
-/// payload into it; it falls through to `malloc_typed` when no collector owns
-/// the heap.
-///
-/// Both arms have a shape no trace can carry, which is why the boundary sits
-/// around the pair rather than around either one. A stack-built `W_IntObject`
-/// lowers to a `SyntheticTransparentCtor` for its `PyObject` header, whose
-/// funcptr constant degrades to a `symbolic_fnaddr` hash; a descending
-/// sub-jitcode walk cannot record such a call, so it declines the entire
-/// descent — that is what takes `list.pop()`'s fold off the compiled loop.
-/// Writing the fields individually instead lands the header's own `ob_type`
-/// slot at offset 0, which the wasm backend does not lower faithfully.
-///
-/// The boundary is a deviation from `wrapint`
-/// (`objspace/std/intobject.py:908-910`), which keeps its allocation inline —
-/// its own comment there notes the function is inlined into every caller. The
-/// orthodox lowering is `new_with_vtable`, which stays in the trace and can be
-/// optimised away where the box does not escape. `fuse_boxing_alloc`
-/// (`majit-translate` `model.rs`) rewrites exactly this ctor-plus-`FieldWrite`
-/// shape into `NewWithVtable`, and it does now fire here: the static address
-/// table is populated in the build-script pipeline, and the pass reported
-/// every site unresolved only because its walk stopped at a block boundary —
-/// each call ends a block, so a header store sitting before one crosses as a
-/// link argument while its `ConstRefAddr` producer stays in the predecessor.
-///
-/// So the vtable now resolves here, but removing the boundary was measured to
-/// change nothing: `bench/synth/list_pop_append` reads the same on all three
-/// backends with the boundary present, with it removed, and with it removed
-/// while the fusion is reverted. That last arm is a negative control which was
-/// expected to reproduce the pre-boundary regression and did not, so the bench
-/// no longer discriminates this mechanism and its null says nothing either
-/// way. The boundary stays until an instrument that can tell the two apart
-/// says otherwise.
-///
-/// Spelled `*mut PyObject` rather than `PyObjectRef` so the attribute emits
-/// its `extern "C"` call trampoline: the macro recognises raw pointers
-/// syntactically and declines to emit one for an aliased return type.
-#[majit_macros::dont_look_inside]
-pub fn w_int_box_slow(value: i64) -> *mut PyObject {
     if crate::gc_interp::enabled() {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
-        if !raw.is_null() {
-            unsafe {
-                let p = raw as *mut W_IntObject;
-                (*p).ob_header.ob_type = &INT_TYPE as *const PyType;
-                (*p).ob_header.w_class = get_instantiate(&INT_TYPE);
-                (*p).intval = value;
-            }
-            return raw as PyObjectRef;
+        let boxed = w_int_gc_alloc(value);
+        if !boxed.is_null() {
+            return boxed;
         }
     }
     crate::lltype::malloc_typed(W_IntObject {
@@ -197,6 +167,45 @@ pub fn w_int_box_slow(value: i64) -> *mut PyObject {
         },
         intval: value,
     }) as PyObjectRef
+}
+
+/// The collector-heap arm of [`w_int_new`]: the `gct_fv_gc_malloc` bracket
+/// (`rpython/memory/gctransform/framework.py`) in its alloc-then-init form —
+/// take the block, then write the header and payload into it, rather than
+/// copying a stack-built struct over it. Returns null when no collector owns
+/// the heap, which is the caller's signal to take the `malloc_typed` arm.
+///
+/// Residualised (`rlib/jit.py:139 @dont_look_inside`) rather than traced,
+/// which [`w_int_new`] is not — a deviation this arm alone carries, because
+/// neither spelling of it reaches the trace intact. Writing the fields into
+/// the collector's block, as below, lands the header's own `ob_type` slot at
+/// offset 0, which the wasm backend does not lower faithfully. Building the
+/// struct on the stack and copying it in instead is not the
+/// `malloc_typed(%agg)` route `fuse_boxing_alloc` rewrites, so its
+/// `SyntheticTransparentCtor` for the `PyObject` header survives lowering as
+/// a call to a `symbolic_fnaddr` hash, which a descending sub-jitcode walk
+/// cannot record and declines on. The boundary keeps both shapes out of the
+/// trace, and costs nothing where the arm is unreachable:
+/// `gc_interp::enabled()` is false on the native backends, whose
+/// `malloc_typed` arm is fused into a `NewWithVtable`. Drop it once the wasm
+/// backend lowers an offset-0 field store faithfully.
+///
+/// Spelled `*mut PyObject` rather than `PyObjectRef` so the attribute emits
+/// its `extern "C"` call trampoline: the macro recognises raw pointers
+/// syntactically and declines to emit one for an aliased return type.
+#[majit_macros::dont_look_inside]
+pub fn w_int_gc_alloc(value: i64) -> *mut PyObject {
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
+    if raw.is_null() {
+        return crate::PY_NULL;
+    }
+    unsafe {
+        let p = raw as *mut W_IntObject;
+        (*p).ob_header.ob_type = &INT_TYPE as *const PyType;
+        (*p).ob_header.w_class = get_instantiate(&INT_TYPE);
+        (*p).intval = value;
+    }
+    raw as PyObjectRef
 }
 
 /// Create a W_IntObject bypassing the small-int cache.
