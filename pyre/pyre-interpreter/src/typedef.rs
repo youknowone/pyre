@@ -4018,21 +4018,46 @@ fn init_super_type(ns: PyObjectRef) {
             ),
         )
     };
+    let new_descr = make_new_descr(super_descr_new);
+    unsafe {
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
+    };
     for (name, value) in [
-        ("__new__", make_new_descr(super_descr_new)),
+        ("__new__", new_descr),
         (
             "__init__",
-            make_builtin_function("__init__", super_descr_init),
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__init__",
+                super_descr_init,
+                "($self, /, *args, **kwargs)",
+            ),
         ),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", super_descr_repr, 1),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__repr__",
+                super_descr_repr,
+                1,
+                "($self, /)",
+            ),
         ),
         (
             "__getattribute__",
-            make_builtin_function_with_arity("__getattribute__", super_descr_getattribute, 2),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__getattribute__",
+                super_descr_getattribute,
+                2,
+                "($self, name, /)",
+            ),
         ),
-        ("__get__", make_builtin_function("__get__", super_descr_get)),
+        (
+            "__get__",
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__get__",
+                super_descr_get,
+                "($self, instance, owner=None, /)",
+            ),
+        ),
     ] {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
