@@ -8630,10 +8630,14 @@ fn init_tuple_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -8790,6 +8794,34 @@ fn init_tuple_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata. Keep the PyPy TypeDef entry
+    // construction above unchanged and attach each signature to its builtin
+    // carrier after registration, as GatewayCache does for interp2app.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("__getnewargs__", "($self, /)"),
+        ("index", "($self, value, start=0, stop=sys.maxsize, /)"),
+        ("count", "($self, value, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("tuple TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 /// `tupleobject.c` `tuple * n` / `n * tuple`.  A non-integer count
