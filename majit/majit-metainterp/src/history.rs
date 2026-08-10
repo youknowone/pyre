@@ -3362,20 +3362,21 @@ impl TraceCtx {
     /// `build_state_field_snapshot(frames, …, virtualizable_boxes,
     /// virtualref_boxes)` for the state-field JIT guards.
     ///
-    /// Convergence: the only callers of this path are the
-    /// interpreter-side vable promotes — `get_arrayitem_vable_index`
-    /// (`trace_ctx.rs`) and the `is_nonstandard_virtualizable` `isstandard`
-    /// PTR_EQ (`trace_ctx.rs`, `pyjitpl.rs`). Both emit a `GUARD_VALUE`
-    /// whose argument is constant-narrowed at optimization time — the array
-    /// index is a function of the already-promoted-constant `stackpos`, and
-    /// `isstandard` folds to `1` under pyre's single standard virtualizable —
-    /// so `optimize_guard_value` removes the guard (`rewrite.rs:653`,
-    /// `actual == expected → Remove`). The removed guard never reaches the
-    /// backend, so these empty boxes are never numbered or consumed: the
-    /// minimal snapshot is load-bearing ONLY for the `rd_resume_position >= 0`
-    /// invariant above, not for any live resume. The genuinely load-bearing
-    /// promote (`state.<scalar> = promote(...)`) does NOT use this path — it
-    /// lowers to `BC_*_GUARD_VALUE → record_state_guard → build_state_field_snapshot`
+    /// The frame therefore carries no coordinate of its own: its
+    /// `jitcode_index` is [`crate::recorder::UNSTAMPED_JITCODE_INDEX`], the
+    /// reserved value meaning "the dispatch layer has not re-stamped this
+    /// yet". The callers of this path are the interpreter-side vable
+    /// promotes — `get_arrayitem_vable_index` (`trace_ctx.rs`) and the
+    /// `is_nonstandard_virtualizable` `isstandard` PTR_EQ (`trace_ctx.rs`,
+    /// `pyjitpl.rs`) — and the walker re-stamps the position of each guard
+    /// that survives (`walker_capture_inline_nonstandard_vable_guard`,
+    /// `resume_snapshot.rs`). A guard whose frame reaches the resume decoder
+    /// still holding the reserved index is a missed re-stamp, and
+    /// `frame_value_count_at` (`pyre-jit-trace`) names it there.
+    ///
+    /// The genuinely load-bearing promote (`state.<scalar> = promote(...)`)
+    /// does NOT use this path — it lowers to `BC_*_GUARD_VALUE →
+    /// record_state_guard → build_state_field_snapshot`
     /// (`pyjitpl/dispatch.rs`), the full-framestack capture already at parity
     /// with `generate_guard`. Threading the live framestack into this recorder
     /// would only matter at framestack depth > 1 (inlined frames), which
@@ -3391,7 +3392,7 @@ impl TraceCtx {
         let snapshot_idx = self.snapshots.len() as i32;
         self.snapshots.push(crate::recorder::Snapshot {
             frames: vec![crate::recorder::SnapshotFrame {
-                jitcode_index: 0,
+                jitcode_index: crate::recorder::UNSTAMPED_JITCODE_INDEX,
                 pc: self.last_traced_pc as u32,
                 py_pc: self.last_traced_pc as u32,
                 boxes: Vec::new(),
