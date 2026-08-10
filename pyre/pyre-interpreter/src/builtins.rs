@@ -11179,6 +11179,105 @@ fn incompatible_string_prefix_error(
     ))
 }
 
+/// CPython 3.14 `Parser/string_parser.c:decode_unicode_with_escapes` sends
+/// non-raw Unicode literals through the `unicode_escape` decoder before the
+/// f-string parser interprets replacement fields.  Ruff instead diagnoses an
+/// incomplete `\N{...` as either its own escape error or an unclosed f-string
+/// field.  Recover the decoder-first error, including the byte range relative
+/// to the literal contents used by the codec error message.
+fn malformed_unicode_name_escape(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'#' {
+            cursor = bytes[cursor..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |newline| cursor + newline + 1);
+            continue;
+        }
+        if !matches!(bytes[cursor], b'\'' | b'"') {
+            cursor += 1;
+            continue;
+        }
+
+        let quote_start = cursor;
+        let mut token_start = quote_start;
+        while token_start > 0 && bytes[token_start - 1].is_ascii_alphabetic() {
+            token_start -= 1;
+        }
+        if bytes
+            .get(token_start.wrapping_sub(1))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            cursor += 1;
+            continue;
+        }
+        let prefix = &bytes[token_start..quote_start];
+        if !prefix
+            .iter()
+            .all(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'f' | b'r' | b't' | b'u'))
+            || prefix
+                .iter()
+                .any(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'r'))
+        {
+            cursor += 1;
+            continue;
+        }
+
+        let quote = bytes[quote_start];
+        let triple = bytes[quote_start..].starts_with(&[quote, quote, quote]);
+        let quote_len = if triple { 3 } else { 1 };
+        let content_start = quote_start + quote_len;
+        let mut content_end = content_start;
+        while content_end < bytes.len() {
+            if triple && bytes[content_end..].starts_with(&[quote, quote, quote]) {
+                break;
+            }
+            if !triple && bytes[content_end] == quote {
+                break;
+            }
+            if bytes[content_end] == b'\\' {
+                content_end = (content_end + 2).min(bytes.len());
+            } else {
+                content_end += 1;
+            }
+        }
+
+        let mut escape = content_start;
+        while escape < content_end {
+            if bytes[escape] != b'\\' {
+                escape += 1;
+                continue;
+            }
+            if bytes.get(escape + 1) != Some(&b'N') {
+                escape = (escape + 2).min(content_end);
+                continue;
+            }
+            let malformed_end = if bytes.get(escape + 2) != Some(&b'{') {
+                Some(escape + 1)
+            } else if bytes[escape + 3..content_end]
+                .iter()
+                .all(|byte| *byte != b'}')
+            {
+                Some(content_end.saturating_sub(1))
+            } else {
+                None
+            };
+            if let Some(malformed_end) = malformed_end {
+                return Some(format!(
+                    "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: malformed \\N character escape",
+                    escape - content_start,
+                    malformed_end - content_start,
+                ));
+            }
+            escape += 2;
+        }
+        cursor = content_end.saturating_add(quote_len);
+    }
+    None
+}
+
 /// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
 /// private Python 3.14 `_IncompleteInputError` subclass for parser failures
 /// which end at an unfinished interactive input when
@@ -11303,6 +11402,9 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         e.to_string()
     };
+    if let Some(unicode_error) = malformed_unicode_name_escape(source) {
+        msg = unicode_error;
+    }
     if msg == "f-string: expecting `}`" {
         msg = "f-string: expecting '}'".to_owned();
     } else if msg == "f-string: expecting '}', or format specs" && source.contains(":{{") {
@@ -17657,6 +17759,22 @@ mod tests {
             nonascii_bytes_literal_span("b'''aé''' + b'x'", 5),
             Some((0, 10))
         );
+    }
+
+    #[test]
+    fn malformed_unicode_name_escape_precedes_fstring_parsing() {
+        for (source, range) in [
+            (r"f'\N'", "0-1"),
+            (r"f'\N{'", "0-2"),
+            (r"'\N{GREEK CAPITAL LETTER DELTA'", "0-28"),
+        ] {
+            let message = malformed_unicode_name_escape(source).unwrap();
+            assert!(message.contains(&format!("position {range}:")), "{message}");
+            assert!(message.ends_with(r"malformed \N character escape"));
+        }
+        assert_eq!(malformed_unicode_name_escape(r"r'\N'"), None);
+        assert_eq!(malformed_unicode_name_escape(r"'\N{DELTA}'"), None);
+        assert_eq!(malformed_unicode_name_escape(r"'\\N'"), None);
     }
 
     #[test]
