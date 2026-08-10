@@ -18416,36 +18416,39 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "from_number",
-            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
-                "from_number",
-                |args| {
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "float.from_number() missing required argument 'number' (pos 1)",
-                        ));
-                    }
-                    let value = args[1];
-                    // Python 3.14 float.from_number uses the numeric
-                    // conversion protocol (__float__, then __index__) but,
-                    // unlike float(), never accepts textual inputs.
-                    if unsafe {
-                        pyre_object::is_str(value)
-                            || pyre_object::is_bytes(value)
-                            || pyre_object::is_bytearray(value)
-                            || pyre_object::is_complex(value)
-                    } {
-                        return Err(crate::PyError::type_error(format!(
-                            "must be real number, not {}",
-                            crate::type_methods::arg_type_name(value)
-                        )));
-                    }
-                    // Reuse float.__new__'s exact base/subclass allocation:
-                    // exact base floats retain identity, while a classmethod
-                    // invoked on a float subclass returns that subclass.
-                    float_descr_new(&[args[0], value])
-                },
-                2,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "from_number",
+                    |args| {
+                        if args.len() < 2 {
+                            return Err(crate::PyError::type_error(
+                                "float.from_number() missing required argument 'number' (pos 1)",
+                            ));
+                        }
+                        let value = args[1];
+                        // Python 3.14 float.from_number uses the numeric
+                        // conversion protocol (__float__, then __index__) but,
+                        // unlike float(), never accepts textual inputs.
+                        if unsafe {
+                            pyre_object::is_str(value)
+                                || pyre_object::is_bytes(value)
+                                || pyre_object::is_bytearray(value)
+                                || pyre_object::is_complex(value)
+                        } {
+                            return Err(crate::PyError::type_error(format!(
+                                "must be real number, not {}",
+                                crate::type_methods::arg_type_name(value)
+                            )));
+                        }
+                        // Reuse float.__new__'s exact base/subclass allocation:
+                        // exact base floats retain identity, while a classmethod
+                        // invoked on a float subclass returns that subclass.
+                        float_descr_new(&[args[0], value])
+                    },
+                    2,
+                    "($type, number, /)",
+                ),
+            ),
         )
     };
     // float.__getformat__(kind) → returns the format string for the
@@ -18455,29 +18458,32 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getformat__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__getformat__",
-                |args| {
-                    // A class method, so `args[0]` is the class and the kind
-                    // follows it.
-                    let kind = args
-                        .get(1)
-                        .copied()
-                        .filter(|&a| unsafe { pyre_object::is_str(a) })
-                        .map(|a| unsafe { pyre_object::w_str_get_value(a).to_string() })
-                        .ok_or_else(|| {
-                            crate::PyError::type_error(
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_text_signature(
+                    "__getformat__",
+                    |args| {
+                        // A class method, so `args[0]` is the class and the kind
+                        // follows it.
+                        let kind = args
+                            .get(1)
+                            .copied()
+                            .filter(|&a| unsafe { pyre_object::is_str(a) })
+                            .map(|a| unsafe { pyre_object::w_str_get_value(a).to_string() })
+                            .ok_or_else(|| {
+                                crate::PyError::type_error(
+                                    "__getformat__() argument must be 'double' or 'float'",
+                                )
+                            })?;
+                        match kind.as_str() {
+                            "double" | "float" => Ok(pyre_object::w_str_new("IEEE, little-endian")),
+                            _ => Err(crate::PyError::value_error(
                                 "__getformat__() argument must be 'double' or 'float'",
-                            )
-                        })?;
-                    match kind.as_str() {
-                        "double" | "float" => Ok(pyre_object::w_str_new("IEEE, little-endian")),
-                        _ => Err(crate::PyError::value_error(
-                            "__getformat__() argument must be 'double' or 'float'",
-                        )),
-                    }
-                },
-            )),
+                            )),
+                        }
+                    },
+                    "($type, typestr, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -18506,49 +18512,55 @@ fn init_float_type(ns: PyObjectRef) {
             // Registered without a fixed arity so the body's own `arity_exact`
             // words the mismatch: a class method's receiver is the class, and
             // only the body knows to discount it.
-            pyre_object::function::w_classmethod_new(make_builtin_function("fromhex", |args| {
-                // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
-                // Parse hexadecimal floating-point literals like '0x1.8p3'.
-                crate::type_methods::arity_exact(args, "fromhex", 1)?;
-                let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
-                    unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
-                } else {
-                    // `@unwrap_spec(s='text')` — the operand is rejected by
-                    // `space.text_w`, which words it this way.
-                    return Err(crate::PyError::type_error(format!(
-                        "expected str, got {} object",
-                        crate::type_methods::arg_type_name(args[1])
-                    )));
-                };
-                // Delegate parsing to the shared hex-float reader, which rounds
-                // round-half-even over the full exponent range (subnormals down to
-                // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
-                // ASCII whitespace itself, and flags overflow distinctly.
-                match rustpython_common::float_ops::from_hex(&s_arg) {
-                    Ok(v) => {
-                        let w_float = pyre_object::w_float_new(v);
-                        // floatobject.py:419: return
-                        // space.call_function(w_cls, w_float).  This runs a
-                        // subclass's __new__ and __init__ rather than merely
-                        // retagging the parsed base float.
-                        crate::call::call_function_impl_result(args[0], &[w_float])
-                    }
-                    Err(e) => {
-                        use rustpython_common::float_ops::HexFloatError;
-                        Err(match e {
-                            HexFloatError::Overflow => crate::PyError::overflow_error(
-                                "hexadecimal value too large to represent as a float",
-                            ),
-                            HexFloatError::TooLong => crate::PyError::value_error(
-                                "hexadecimal string too long to convert",
-                            ),
-                            HexFloatError::Invalid => crate::PyError::value_error(
-                                "invalid hexadecimal floating-point string",
-                            ),
-                        })
-                    }
-                }
-            })),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_text_signature(
+                    "fromhex",
+                    |args| {
+                        // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
+                        // Parse hexadecimal floating-point literals like '0x1.8p3'.
+                        crate::type_methods::arity_exact(args, "fromhex", 1)?;
+                        let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
+                            unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
+                        } else {
+                            // `@unwrap_spec(s='text')` — the operand is rejected by
+                            // `space.text_w`, which words it this way.
+                            return Err(crate::PyError::type_error(format!(
+                                "expected str, got {} object",
+                                crate::type_methods::arg_type_name(args[1])
+                            )));
+                        };
+                        // Delegate parsing to the shared hex-float reader, which rounds
+                        // round-half-even over the full exponent range (subnormals down to
+                        // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
+                        // ASCII whitespace itself, and flags overflow distinctly.
+                        match rustpython_common::float_ops::from_hex(&s_arg) {
+                            Ok(v) => {
+                                let w_float = pyre_object::w_float_new(v);
+                                // floatobject.py:419: return
+                                // space.call_function(w_cls, w_float).  This runs a
+                                // subclass's __new__ and __init__ rather than merely
+                                // retagging the parsed base float.
+                                crate::call::call_function_impl_result(args[0], &[w_float])
+                            }
+                            Err(e) => {
+                                use rustpython_common::float_ops::HexFloatError;
+                                Err(match e {
+                                    HexFloatError::Overflow => crate::PyError::overflow_error(
+                                        "hexadecimal value too large to represent as a float",
+                                    ),
+                                    HexFloatError::TooLong => crate::PyError::value_error(
+                                        "hexadecimal string too long to convert",
+                                    ),
+                                    HexFloatError::Invalid => crate::PyError::value_error(
+                                        "invalid hexadecimal floating-point string",
+                                    ),
+                                })
+                            }
+                        }
+                    },
+                    "($type, string, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -18802,6 +18814,56 @@ fn init_float_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata for the PyPy float TypeDef
+    // callables. Classmethod carriers are stamped before wrapping above;
+    // these are the remaining plain Function carriers.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__radd__", "($self, value, /)"),
+        ("__sub__", "($self, value, /)"),
+        ("__rsub__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__mod__", "($self, value, /)"),
+        ("__rmod__", "($self, value, /)"),
+        ("__divmod__", "($self, value, /)"),
+        ("__rdivmod__", "($self, value, /)"),
+        ("__pow__", "($self, value, mod=None, /)"),
+        ("__rpow__", "($self, value, mod=None, /)"),
+        ("__neg__", "($self, /)"),
+        ("__pos__", "($self, /)"),
+        ("__abs__", "($self, /)"),
+        ("__bool__", "($self, /)"),
+        ("__int__", "($self, /)"),
+        ("__float__", "($self, /)"),
+        ("__floordiv__", "($self, value, /)"),
+        ("__rfloordiv__", "($self, value, /)"),
+        ("__truediv__", "($self, value, /)"),
+        ("__rtruediv__", "($self, value, /)"),
+        ("conjugate", "($self, /)"),
+        ("__trunc__", "($self, /)"),
+        ("__floor__", "($self, /)"),
+        ("__ceil__", "($self, /)"),
+        ("__round__", "($self, ndigits=None, /)"),
+        ("as_integer_ratio", "($self, /)"),
+        ("hex", "($self, /)"),
+        ("is_integer", "($self, /)"),
+        ("__getnewargs__", "($self, /)"),
+        ("__format__", "($self, format_spec, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("float TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 /// `float.as_integer_ratio()` — PyPy
