@@ -365,10 +365,12 @@ DOTTED_IDENTITY_MODULES = {
     "test.test_threading",
 }
 
-# test_datetime's load_tests appends an exhaustive test class for every
-# installed system timezone when test.support.use_resources is left as None.
+# Modules whose resource-gated tests are ruinous when test.support.use_resources
+# is left as None: test_datetime's load_tests then appends an exhaustive test
+# class for every installed system timezone, and test_zipimport's Zip64 arms
+# build archives past 4 GiB, which cost 290s and over 6 GB of RSS.
 # libregrtest and PyPy's conftest use an empty default resource set.
-DEFAULT_RESOURCE_MODULES = {"test.test_datetime"}
+DEFAULT_RESOURCE_MODULES = {"test.test_datetime", "test.test_zipimport"}
 
 
 def build_cmd(binary: Path, module: str, mode: str) -> list[str]:

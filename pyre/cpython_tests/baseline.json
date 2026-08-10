@@ -1419,7 +1419,8 @@
       "reason": "demands too many resources"
     },
     "test.test_zipimport": {
-      "dynasm": "FAIL"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_zipimport_support": {
       "dynasm": "PASS"
