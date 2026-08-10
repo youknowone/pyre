@@ -10364,6 +10364,9 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
         "w_list_pop_end_call_site",
         None,
         &[],
+        // Not a branch-guard reconstruction: this is the pre-call site
+        // snapshot, so there is no kept operand-stack slot to report as
+        // unsourced.
         None,
     );
 
