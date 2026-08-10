@@ -466,6 +466,31 @@ pub fn no_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
 }
+/// `MAJIT_MAX_BRIDGES=N` (diagnostic): allow the first N bridge compilations
+/// and behave as `MAJIT_NO_BRIDGE` from then on.  Bisecting N names the bridge
+/// whose compilation first produces a wrong value, at seconds per run rather
+/// than a rebuild per arm.  Consumes fuel only when the rest of `should_bridge`
+/// already held, so the count is bridges actually taken — place it last in the
+/// `&&` chain.  `MAJIT_BRIDGE_FUEL_LOG` reports each one taken.
+fn bridge_fuel_take() -> bool {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let Some(limit) = *LIMIT.get_or_init(|| {
+        std::env::var("MAJIT_MAX_BRIDGES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    }) else {
+        return true;
+    };
+    static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= limit {
+        return false;
+    }
+    if std::env::var_os("MAJIT_BRIDGE_FUEL_LOG").is_some() {
+        eprintln!("@@@FUEL bridge #{n}");
+    }
+    true
+}
 fn guardlog_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
@@ -4413,7 +4438,8 @@ impl<S: JitState> JitDriver<S> {
             // pending-field prologue (resume.py:993-1007).
             let should_bridge = must_compile
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && !no_bridge_enabled();
+                && !no_bridge_enabled()
+                && bridge_fuel_take();
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
@@ -5715,7 +5741,8 @@ impl<S: JitState> JitDriver<S> {
         // every bridge.
         let should_bridge = must_compile
             && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-            && !no_bridge_enabled();
+            && !no_bridge_enabled()
+            && bridge_fuel_take();
 
         // Same `@@@GUARD` line the sibling loops emit. Without it this loop —
         // the one pyre reaches — had no per-guard-failure trace at all, so
@@ -6860,7 +6887,8 @@ impl<S: JitState> JitDriver<S> {
             // resume defects from the blackhole path.
             let should_bridge = must_compile
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && !no_bridge_enabled();
+                && !no_bridge_enabled()
+                && bridge_fuel_take();
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
