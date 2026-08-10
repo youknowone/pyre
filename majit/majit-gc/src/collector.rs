@@ -3682,7 +3682,8 @@ impl MiniMarkGC {
         // an object the collector no longer holds, so it is never an app-level
         // object however its type reads.  Only a managed object carries the
         // header the flag lives in.
-        if self.is_managed_heap_object(obj.0) && unsafe { (*header_of(obj.0)).has_flag(flags::DUMMY) }
+        if self.is_managed_heap_object(obj.0)
+            && unsafe { (*header_of(obj.0)).has_flag(flags::DUMMY) }
         {
             return false;
         }
