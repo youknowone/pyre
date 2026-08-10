@@ -6810,13 +6810,6 @@ impl<M: Clone> MetaInterp<M> {
                     &mut terminal_exit_layouts,
                 );
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
-                // unroll.py:176-177: disable_retracing_if_max_retrace_guards
-                let mut final_retraced_count = unroll_opt.retraced_count;
-                crate::optimizeopt::unroll::OptUnroll::disable_retracing_if_max_retrace_guards(
-                    &compiled_ops,
-                    &mut final_retraced_count,
-                    self.warm_state.max_retrace_guards(),
-                );
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &compiled_ops));
@@ -6858,7 +6851,7 @@ impl<M: Clone> MetaInterp<M> {
                     eprintln!("@@@SPDIAG compiled_loops.insert green_key={green_key}");
                 }
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
-                token.set_retraced_count(final_retraced_count);
+                token.set_retraced_count(unroll_opt.retraced_count);
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {

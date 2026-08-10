@@ -4259,6 +4259,10 @@ impl Optimizer {
                     &format!("Retracing ({}/{retrace_limit})", retraced_count + 1),
                 );
             }
+            // unroll.py:231-233: export the bridge's own runtime boxes for retracing.
+            if let Some(ref mut state) = self.exported_loop_state {
+                state.runtime_boxes = runtime_boxes.to_vec();
+            }
             return Ok((optimized_ops, true));
         }
 

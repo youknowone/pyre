@@ -1529,17 +1529,6 @@ impl UnrollOptimizer {
         );
         self.target_tokens.push(target_token);
 
-        // unroll.py:176-177: disable_retracing_if_max_retrace_guards
-        if Self::disable_retracing_if_max_retrace_guards(&p2_ops, self.max_retrace_guards) {
-            self.retraced_count = u32::MAX;
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] too many guards (>{}), disabling retracing",
-                    self.max_retrace_guards
-                );
-            }
-        }
-
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] finalize_short_preamble: target_tokens={}",
@@ -1547,7 +1536,7 @@ impl UnrollOptimizer {
             );
         }
 
-        // ── unroll.py:207-230: jump_to_existing_trace / retrace_limit ──
+        // ── unroll.py:151-177: jump_to_existing_trace / close ladder ──
         // Try to match the body's JUMP virtual state to an existing target.
         // RPython: new_virtual_state = jump_to_existing_trace(end_jump, ...)
         //
@@ -1722,71 +1711,29 @@ impl UnrollOptimizer {
 
             // unroll.py:154-158: on InvalidLoop, skip retry entirely
             if !jumped && !skip_jump_to_existing && !invalid_loop {
-                // unroll.py:161-174: virtual state not matched, retry
-                if self.retraced_count < self.retrace_limit {
-                    self.retraced_count += 1;
-                    if crate::majit_log_enabled() {
+                // unroll.py:161-168: force_boxes=True, except InvalidLoop: pass
+                let did_jump = opt_unroll
+                    .jump_to_existing_trace(
+                        &body_jump_args,
+                        Some(&current_label_args),
+                        &mut self.target_tokens,
+                        &mut opt_p2,
+                        &mut jump_ctx,
+                        true,
+                        &runtime_boxes,
+                    )
+                    .is_none();
+                jumped = if let Some(reason) = jump_ctx.take_invalid_loop() {
+                    if crate::log_jtet_enabled() {
                         eprintln!(
-                            "[jit] Retracing ({}/{})",
-                            self.retraced_count, self.retrace_limit
+                            "[jit][jte] InvalidLoop during force_boxes=true retry: {}",
+                            reason.0
                         );
                     }
-                    // unroll.py:164-168: force_boxes=True, except InvalidLoop: pass
-                    let did_jump = opt_unroll
-                        .jump_to_existing_trace(
-                            &body_jump_args,
-                            Some(&current_label_args),
-                            &mut self.target_tokens,
-                            &mut opt_p2,
-                            &mut jump_ctx,
-                            true,
-                            &runtime_boxes,
-                        )
-                        .is_none();
-                    jumped = if let Some(reason) = jump_ctx.take_invalid_loop() {
-                        if crate::log_jtet_enabled() {
-                            eprintln!(
-                                "[jit][jte] InvalidLoop during force_boxes=true retrace: {}",
-                                reason.0
-                            );
-                        }
-                        false // unroll.py:167-168: except InvalidLoop: pass
-                    } else {
-                        did_jump
-                    };
+                    false // unroll.py:167-168: except InvalidLoop: pass
                 } else {
-                    // unroll.py:220-226: limit reached, try force_boxes=true
-                    let did_jump = opt_unroll
-                        .jump_to_existing_trace(
-                            &body_jump_args,
-                            Some(&current_label_args),
-                            &mut self.target_tokens,
-                            &mut opt_p2,
-                            &mut jump_ctx,
-                            true,
-                            &runtime_boxes,
-                        )
-                        .is_none();
-                    jumped = if let Some(reason) = jump_ctx.take_invalid_loop() {
-                        if crate::log_jtet_enabled() {
-                            eprintln!(
-                                "[jit][jte] InvalidLoop during force_boxes=true limit: {}",
-                                reason.0
-                            );
-                        }
-                        false // unroll.py:224-225: except InvalidLoop: pass
-                    } else {
-                        did_jump
-                    };
-                    if !jumped {
-                        // unroll.py:228: "Retrace count reached, jumping to preamble"
-                        crate::debug::log_one(
-                            "jit-tracing",
-                            "Retrace count reached, jumping to preamble",
-                        );
-                        // jumped stays false → jump_to_preamble below
-                    }
-                }
+                    did_jump
+                };
             }
             if jumped && redirected_tail_ops.is_empty() {
                 // Only take jump_ctx ops if we don't already have
@@ -1956,6 +1903,19 @@ impl UnrollOptimizer {
                 "jit-tracing",
                 "jump_to_existing_trace: body JUMP → self-loop",
             );
+        }
+
+        // unroll.py:176-177: disable_retracing_if_max_retrace_guards
+        if jump_was_redirected
+            && Self::disable_retracing_if_max_retrace_guards(&body_ops, self.max_retrace_guards)
+        {
+            self.retraced_count = u32::MAX;
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] too many guards (>{}), disabling retracing",
+                    self.max_retrace_guards
+                );
+            }
         }
 
         // ── Assembly (compile.py:310-338) ──
