@@ -17759,10 +17759,13 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "from_bytes",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "from_bytes",
-                int_from_bytes,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_text_signature(
+                    "from_bytes",
+                    int_from_bytes,
+                    "($type, /, bytes, byteorder='big', *, signed=False)",
+                ),
+            ),
         )
     };
     // int.__index__ / __int__ / __trunc__ — exact ints preserve identity;
@@ -18025,6 +18028,72 @@ fn init_int_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata for the PyPy int TypeDef
+    // callables. `__pow__`, `__rpow__`, `from_bytes`, and `__sizeof__` are
+    // stamped at construction because their carrier/signature needs special
+    // handling; the remaining plain Function carriers are filled here.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__radd__", "($self, value, /)"),
+        ("__sub__", "($self, value, /)"),
+        ("__rsub__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__mod__", "($self, value, /)"),
+        ("__rmod__", "($self, value, /)"),
+        ("__divmod__", "($self, value, /)"),
+        ("__rdivmod__", "($self, value, /)"),
+        ("__neg__", "($self, /)"),
+        ("__pos__", "($self, /)"),
+        ("__abs__", "($self, /)"),
+        ("__bool__", "($self, /)"),
+        ("__invert__", "($self, /)"),
+        ("__lshift__", "($self, value, /)"),
+        ("__rlshift__", "($self, value, /)"),
+        ("__rshift__", "($self, value, /)"),
+        ("__rrshift__", "($self, value, /)"),
+        ("__and__", "($self, value, /)"),
+        ("__rand__", "($self, value, /)"),
+        ("__xor__", "($self, value, /)"),
+        ("__rxor__", "($self, value, /)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__int__", "($self, /)"),
+        ("__float__", "($self, /)"),
+        ("__floordiv__", "($self, value, /)"),
+        ("__rfloordiv__", "($self, value, /)"),
+        ("__truediv__", "($self, value, /)"),
+        ("__rtruediv__", "($self, value, /)"),
+        ("__index__", "($self, /)"),
+        ("conjugate", "($self, /)"),
+        ("bit_length", "($self, /)"),
+        ("bit_count", "($self, /)"),
+        (
+            "to_bytes",
+            "($self, /, length=1, byteorder='big', *, signed=False)",
+        ),
+        ("as_integer_ratio", "($self, /)"),
+        ("__trunc__", "($self, /)"),
+        ("__floor__", "($self, /)"),
+        ("__ceil__", "($self, /)"),
+        ("__round__", "($self, ndigits=None, /)"),
+        ("__getnewargs__", "($self, /)"),
+        ("__format__", "($self, format_spec, /)"),
+        ("is_integer", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("int TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 /// Complex `repr` (`Xj` for a pure-`+0` real part, else `(re±imj)`),
 /// delegated to `rustpython_literal::complex::to_string`.
