@@ -1301,6 +1301,13 @@ def provenance_for(
     # reason the HEAD pair is — so a tree that moved during the build is
     # legible — and repeating the whole listing to say so would bury the one
     # that describes the stamped state.
+    #
+    # ⚠ It is the WHOLE PORCELAIN, UNCLASSIFIED. `dirty_in_closure` and
+    # `dirty_outside` below are a partition of a LATER snapshot, so the only
+    # valid comparison is against their SUM; reading `dirty_before` against
+    # either half alone compares a total to a part. And the two are SUPPOSED to
+    # be free to differ — that difference is the whole instrument, and making
+    # them agree would delete it.
     lines.append(
         f"dirty_before={'unknown' if dirty_before is None else dirty_before}"
     )
@@ -1347,6 +1354,56 @@ def parse_provenance(text: str) -> tuple[dict[str, str], list[str]]:
     return fields, dirty
 
 
+def dirty_report_lines(fields: dict[str, str], in_closure: list[str]) -> list[str]:
+    """The dirty half of `report_provenance`'s output, as text.
+
+    Split out from the printer so `--self-test` can drive it. Both conditional
+    lines below are SILENT on a healthy sidecar — the delta is zero and nothing
+    is omitted — so a run against the real tree cannot tell a correct branch
+    from a dead one, and every sidecar this repository has ever written is
+    healthy in exactly that way. Keeping it a pure function also keeps the
+    self-test off the disk, for the reason `self_test_exclusion_diamond` gives.
+
+    Two moments, on two lines. Printed as one line with the pre-build count in a
+    parenthetical, this reads as a single measurement whose parts should sum,
+    and it silently mixes three bases: a stamp-time in-closure count, a
+    stamp-time outside count, and a pre-build UNCLASSIFIED whole-tree total.
+    That reading is what has to be prevented — the numbers were never wrong, and
+    a disagreement between the moments is the instrument, not a fault.
+    """
+    at_stamp_in = fields.get("dirty_in_closure", "?")
+    at_stamp_out = fields.get("dirty_outside", "?")
+    before = fields.get("dirty_before", "?")
+    lines = [
+        f"    dirty when stamped: {at_stamp_in} in this crate's closure,"
+        f" {at_stamp_out} outside",
+        f"    dirty before the build: {before} (whole tree, unclassified)",
+    ]
+    # Computed, not left to the reader to do in their head. The two TOTALS are
+    # comparable — `dirty_before` and `in_closure + outside` are both whole
+    # porcelain — and it is the naive comparison against one HALF, or against a
+    # count of the rows below, that is invalid. Silent at zero, and silent when
+    # `dirty_before` is `unknown`, which is not the same as zero.
+    if at_stamp_in.isdigit() and at_stamp_out.isdigit() and before.isdigit():
+        delta = int(at_stamp_in) + int(at_stamp_out) - int(before)
+        if delta:
+            lines.append(
+                f"    ⇒ the tree MOVED during the build: {delta:+d} dirty"
+                " path(s) between the two snapshots — the pair exists to say so"
+            )
+    # The `dirty=` rows are a bounded DISPLAY while the counts above are exact,
+    # so counting the rows is not a check on the counts. Said here because the
+    # bound lives in the writer and no reader of this output would find it.
+    omitted = fields.get("dirty_omitted", "0")
+    if omitted not in ("0", "?"):
+        lines.append(
+            f"      ⚠ {omitted} further dirty path(s) not listed — do not count"
+            " the rows, the counts above are the exact ones"
+        )
+    lines.extend(f"      {entry}" for entry in in_closure)
+    return lines
+
+
 def report_provenance(dest: Path) -> None:
     """Print an artefact's provenance. Returns nothing and gates nothing.
 
@@ -1386,13 +1443,8 @@ def report_provenance(dest: Path) -> None:
     # so the classification starts at offset 3. A substring test would also
     # match a PATH that happened to contain the word.
     in_closure = [entry for entry in dirty if entry[3:].startswith("in-closure ")]
-    print(
-        f"    dirty at build time: {fields.get('dirty_in_closure', '?')} in this"
-        f" crate's closure, {fields.get('dirty_outside', '?')} outside"
-        f" (before the build: {fields.get('dirty_before', '?')})"
-    )
-    for entry in in_closure:
-        print(f"      {entry}")
+    for line in dirty_report_lines(fields, in_closure):
+        print(line)
 
 
 def crate_layout_targets(eng: Engine, spec: CrateSpec) -> list[str]:
@@ -2137,6 +2189,58 @@ def self_test_exclusion_diamond() -> None:
         raise SystemExit(1)
 
 
+def self_test_provenance_rendering() -> None:
+    """Drive `dirty_report_lines` over cases the live sidecars cannot produce.
+
+    Both of its conditional lines are silent on every artefact this repository
+    has ever stamped — the delta is zero and nothing is omitted — so `--check`
+    against the real tree exercises neither, and a dead branch would read
+    exactly like a correct one. The movement line especially: it exists for a
+    build that straddled a peer's edit, which is the case nobody can arrange on
+    demand and everybody needs reported.
+
+    The three negatives are load-bearing, not padding. A renderer that emitted
+    the movement line unconditionally satisfies every positive row here and is
+    worse than no line at all, because it accuses a clean build of moving; and
+    `unknown` is not zero, so a renderer that coerced it would report a delta
+    against a count it never had.
+    """
+    base = {
+        "dirty_before": "3",
+        "dirty_in_closure": "0",
+        "dirty_outside": "3",
+        "dirty_omitted": "0",
+    }
+    cases = [
+        ("steady tree", {}, False, False),
+        ("grew by 2", {"dirty_in_closure": "1", "dirty_outside": "4"}, True, False),
+        ("shrank by 2", {"dirty_before": "5"}, True, False),
+        ("moved inside the closure", {"dirty_in_closure": "1"}, True, False),
+        ("pre-build count unknown", {"dirty_before": "unknown"}, False, False),
+        ("listing truncated", {"dirty_omitted": "7"}, False, True),
+        ("moved AND truncated", {"dirty_before": "9", "dirty_omitted": "4"}, True, True),
+    ]
+
+    print("  provenance rendering")
+    failures = []
+    for label, over, want_moved, want_omitted in cases:
+        text = "\n".join(dirty_report_lines({**base, **over}, []))
+        got_moved = "MOVED during the build" in text
+        got_omitted = "do not count" in text
+        verdict = "ok" if (got_moved, got_omitted) == (want_moved, want_omitted) else "FAILED"
+        print(f"    {verdict:<6} {label}: moved={got_moved} truncated={got_omitted}")
+        if verdict == "FAILED":
+            failures.append(
+                f"{label!r}: expected moved={want_moved} truncated={want_omitted},"
+                f" got moved={got_moved} truncated={got_omitted}"
+            )
+    if failures:
+        sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
+        for line in failures:
+            print(f"self-test FAILED: {line}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
     """A/B/A the fingerprint against a new untracked `.rs` under a covered path.
 
@@ -2293,6 +2397,10 @@ def run_cli(
         # fingerprint against itself, so it stays green over an input set that
         # is silently wrong.
         self_test_exclusion_diamond()
+        # Same reason, one artefact along: `--check` renders provenance on every
+        # run and exercises neither of its conditional lines, because no sidecar
+        # this tree has written is anything but steady and untruncated.
+        self_test_provenance_rendering()
         self_test(eng, crates, cargo_features)
         return
     if args.check:
