@@ -9699,7 +9699,10 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
+            }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             bool_box_truth_reset();
@@ -10236,7 +10239,10 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
         ctx, op, sym, &sub_body, self_ref, inner_self, len_before, raw_item, dst,
     ) {
         Ok(()) => Ok(Some(())),
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LIST-POP-SUBWALK pc={pc}");
+            }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             bool_box_truth_reset();
@@ -10483,7 +10489,10 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
+            }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             bool_box_truth_reset();
