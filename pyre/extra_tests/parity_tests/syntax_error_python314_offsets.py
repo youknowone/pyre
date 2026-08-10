@@ -47,4 +47,13 @@ assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 1
     error.end_offset,
 )
 
+error = syntax_error('x = rb"é"')
+assert error.msg == "bytes can only contain ASCII literal characters", error.msg
+assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 5, 1, 10), (
+    error.lineno,
+    error.offset,
+    error.end_lineno,
+    error.end_offset,
+)
+
 print("syntax error Python 3.14 offsets ok")

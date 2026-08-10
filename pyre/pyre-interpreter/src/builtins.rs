@@ -10753,6 +10753,75 @@ fn syntax_error_character_offset(source: &str, lineno: usize, byte_offset: usize
     line[..boundary].chars().count() + 1
 }
 
+fn source_byte_location(source: &str, byte_index: usize) -> (usize, usize) {
+    let byte_index = byte_index.min(source.len());
+    let line_start = source[..byte_index]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let lineno = source[..line_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    (lineno, byte_index - line_start + 1)
+}
+
+/// `Parser/string_parser.c parse_string_literal` raises the non-ASCII bytes
+/// error at the token (`RAISE_SYNTAX_ERROR_KNOWN_LOCATION(t)`), not at the
+/// offending code point.  Ruff's diagnostic instead selects that code point;
+/// recover the containing literal token while retaining its parser message.
+fn nonascii_bytes_literal_span(source: &str, raw_index: usize) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let raw_index = raw_index.min(bytes.len());
+    let line_start = bytes[..raw_index]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut quote_start = bytes[line_start..raw_index]
+        .iter()
+        .rposition(|byte| matches!(*byte, b'\'' | b'"'))?
+        + line_start;
+    let quote = bytes[quote_start];
+    let triple = quote_start >= line_start + 2
+        && bytes[quote_start - 1] == quote
+        && bytes[quote_start - 2] == quote;
+    if triple {
+        quote_start -= 2;
+    }
+    let mut token_start = quote_start;
+    while token_start > line_start && bytes[token_start - 1].is_ascii_alphabetic() {
+        token_start -= 1;
+    }
+    let prefix = &bytes[token_start..quote_start];
+    if !prefix.iter().any(|byte| matches!(*byte, b'b' | b'B'))
+        || !prefix
+            .iter()
+            .all(|byte| matches!(*byte, b'b' | b'B' | b'r' | b'R'))
+    {
+        return None;
+    }
+
+    let quote_len = if triple { 3 } else { 1 };
+    let mut cursor = quote_start + quote_len;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            cursor = (cursor + 2).min(bytes.len());
+            continue;
+        }
+        if triple {
+            if bytes[cursor..].starts_with(&[quote, quote, quote]) {
+                return Some((token_start, cursor + 3));
+            }
+        } else if bytes[cursor] == quote {
+            return Some((token_start, cursor + 1));
+        } else if bytes[cursor] == b'\n' {
+            return None;
+        }
+        cursor += 1;
+    }
+    None
+}
+
 /// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
 /// private Python 3.14 `_IncompleteInputError` subclass for parser failures
 /// which end at an unfinished interactive input when
@@ -10871,7 +10940,24 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         e.to_string()
     };
-    let (lineno, byte_offset) = e.python_location();
+    let literal_span = if msg == "bytes can only contain ASCII literal characters" {
+        match &e {
+            crate::compile::CompileError::Parse(parse_error) => {
+                nonascii_bytes_literal_span(source, parse_error.raw_location.start().to_usize())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let ((lineno, byte_offset), literal_end) = if let Some((start, end)) = literal_span {
+        (
+            source_byte_location(source, start),
+            Some(source_byte_location(source, end)),
+        )
+    } else {
+        (e.python_location(), None)
+    };
     // Parser diagnostics are converted by pegen before exposure, while
     // compiler/symtable diagnostics retain the UTF-8 byte columns used by AST
     // locations (for example `return "ä"` ends at offset 12, not 11).
@@ -10884,7 +10970,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let mut error = if lineno == 0 {
         crate::PyError::syntax_error(msg)
     } else {
-        let parser_end = e.python_end_location();
+        let parser_end = literal_end.or_else(|| e.python_end_location());
         let (end_lineno, end_byte_offset) = parser_end
             .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
             .unwrap_or((lineno, byte_offset));
@@ -17083,6 +17169,16 @@ mod tests {
         assert_eq!(syntax_error_character_offset("α = 0xI", 1, 7), 6);
         assert_eq!(syntax_error_character_offset("first\nα = 0xI", 2, 7), 6);
         assert_eq!(syntax_error_character_offset("α", 1, 0), 0);
+    }
+
+    #[test]
+    fn nonascii_bytes_error_selects_the_literal_token() {
+        assert_eq!(nonascii_bytes_literal_span("b\"fooжжж\"", 5), Some((0, 12)));
+        assert_eq!(nonascii_bytes_literal_span("x = rb'é'", 7), Some((4, 10)));
+        assert_eq!(
+            nonascii_bytes_literal_span("b'''aé''' + b'x'", 5),
+            Some((0, 10))
+        );
     }
 
     #[test]
