@@ -2334,10 +2334,15 @@ pub fn set_active_collect_step(hook: Option<CollectStepFn>) {
     ACTIVE_COLLECT_STEP.set(hook);
 }
 
+/// With no backend installed there is no state machine and nothing to step, so
+/// this reports the same completed transition the trait default does
+/// (`rgc.py:20-31`'s `_encode_states(1, 0)`). Reporting the starting state on
+/// both sides would say a collection is still in progress, and a caller
+/// stepping until [`GcStepTransition::is_done`] would never stop.
 pub fn collect_step() -> GcStepTransition {
     ACTIVE_COLLECT_STEP.get().map_or(
         GcStepTransition {
-            old_state: GcStepTransition::SCANNING,
+            old_state: GcStepTransition::MARKING,
             new_state: GcStepTransition::SCANNING,
         },
         |step| step(),
