@@ -12740,3 +12740,100 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
         "an unreadable window declines"
     );
 }
+
+/// `mirror_vable_static_to_boxes` must complete the `_opimpl_setfield_vable`
+/// pairing (pyjitpl.py:1189-1194) — the `virtualizable_boxes[index] = valuebox`
+/// store followed by `synchronize_virtualizable()` — so the shadow never runs
+/// ahead of the live frame.
+///
+/// Gated structurally rather than behaviourally on purpose.  The behavioural
+/// consequence is `check_synchronized_virtualizable`'s assert, which is
+/// `debug_assertions`-only, and on this tree no input reaches it through this
+/// helper: with the `synchronize_virtualizable()` call deleted, the whole debug
+/// suite passes 7599/0 and all 397 `pyre/bench/synth/*.py` fixtures run clean
+/// under a debug `pyre-dynasm` (20 of the first 25 compile loops, and
+/// `class_body_exec_hot_loop.py` reaches 4 loops / 1 bridge / 403 guard
+/// failures, so the search was live).  A test that asserts the pairing itself
+/// bites where a fixture cannot.
+#[test]
+fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let slot_count = info.num_static_extra_boxes;
+
+    // A frame-shaped block for the flush to land in.  `write_all_boxes` walks
+    // every static field and the array pointer, so the buffer has to span the
+    // whole struct and the array block needs its `[len][items]` header.
+    let frame_size = std::mem::size_of::<pyre_interpreter::PyFrame>();
+    let mut frame = vec![0u8; frame_size];
+    let mut array_block = vec![0u8; 64];
+    let frame_ptr = frame.as_mut_ptr();
+    unsafe {
+        let len_ptr = array_block
+            .as_mut_ptr()
+            .add(pyre_object::FIXED_OBJECT_ARRAY_TOKEN.len_offset)
+            as *mut i64;
+        *len_ptr = 0;
+        let slot =
+            frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *mut *mut u8;
+        *slot = array_block.as_mut_ptr();
+        let last_instr =
+            frame_ptr.add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize;
+        *last_instr = 11;
+    }
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let vable = tc.const_ref(frame_ptr as i64);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    let initial_values = vec![Value::Int(0); slot_count];
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
+        &initial_boxes,
+        &initial_values,
+        &[0],
+    );
+    // The synchronization target.  `init_virtualizable_boxes` seeds the boxes
+    // and the identity but not this, and `synchronize_virtualizable` returns
+    // early without it — an omission that would make the assert below pass for
+    // the wrong reason if it were the other way round.
+    tc.set_virtualizable_heap_ptr(frame_ptr);
+
+    let read_last_instr = || unsafe {
+        *(frame_ptr.add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *const isize)
+    };
+
+    // Non-vacuity: the frame must NOT already hold the value we are about to
+    // publish, or the assert below would hold with no flush at all.
+    assert_eq!(
+        read_last_instr(),
+        11,
+        "the fixture must start from a frame value distinct from the published one",
+    );
+
+    let published = tc.const_int(37);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        &mut tc,
+        "last_instr",
+        published,
+        Value::Int(37),
+    );
+
+    assert_eq!(
+        read_last_instr(),
+        37,
+        "mirroring a static vable field must flush it to the live frame — \
+         `_opimpl_setfield_vable` pairs the shadow store with \
+         `synchronize_virtualizable()` (pyjitpl.py:1189-1194), and without the \
+         flush the next `getfield_vable_*` fails `check_boxes` \
+         (virtualizable.py:157)",
+    );
+    let index = info
+        .static_field_index_by_name("last_instr")
+        .expect("last_instr is a declared static vable field");
+    assert_eq!(
+        tc.virtualizable_entry_at(index).map(|entry| entry.1),
+        Some(Value::Int(37)),
+        "the shadow half must carry the published value too",
+    );
+}
