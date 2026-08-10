@@ -1140,6 +1140,17 @@ pub struct WasmBackend {
     /// CPUTotalTracker()` parity — per-instance `cpu.tracker`
     /// exposed via [`majit_backend::Backend::cpu_tracker`].
     cpu_tracker: std::sync::Arc<majit_backend::CpuTotalTracker>,
+    /// `asmmemmgr.py:28` `AsmMemoryManager` parity — what
+    /// `jit_hooks.stats_asmmemmgr_{allocated,used}` reads. The emitted trace is
+    /// a wasm module handed to the host compiler, so there is no arena of ours
+    /// to size: `allocated` and `used` are both the module's byte length, which
+    /// is the figure `asmmemmgr.py:37` counts for a block a `materialize`
+    /// handed out.
+    asm_memory_stats: std::sync::Arc<majit_backend::AsmMemoryManagerStats>,
+    /// Lifetime tokens for the blocks recorded above. The host keeps every
+    /// instantiated module for as long as this backend can enter it, so the
+    /// tokens are held for the backend's life and give `used` back with it.
+    asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
     trace_counter: u64,
     /// Optimizer constant pool (constant-namespace OpRef → i64 value).
     constants: indexmap::IndexMap<u32, i64>,
@@ -1259,6 +1270,8 @@ impl WasmBackend {
     pub fn new() -> Self {
         WasmBackend {
             cpu_tracker: std::sync::Arc::new(majit_backend::CpuTotalTracker::default()),
+            asm_memory_stats: std::sync::Arc::new(majit_backend::AsmMemoryManagerStats::default()),
+            asm_memory_blocks: Vec::new(),
             trace_counter: 0,
             constants: indexmap::IndexMap::new(),
             vtable_offset: None,
@@ -1890,6 +1903,10 @@ impl majit_backend::Backend for WasmBackend {
         &self.cpu_tracker
     }
 
+    fn assembler_memory_stats(&self) -> (usize, usize) {
+        self.asm_memory_stats.get_stats()
+    }
+
     fn backend_name(&self) -> &'static str {
         "wasm"
     }
@@ -2207,6 +2224,10 @@ impl majit_backend::Backend for WasmBackend {
                 || op.opcode.is_call_assembler()
         });
         let code_size = wasm_bytes.len();
+        // `asmmemmgr.py:37` counts the block a `materialize` handed out, which
+        // here is the module the host is about to take.
+        let block = self.asm_memory_stats.record_block(code_size, code_size);
+        self.asm_memory_blocks.push(block);
 
         // Instantiate via the host binding on wasm32, or store bytes for
         // testing on native (no wasm host available).
@@ -2938,9 +2959,15 @@ impl majit_backend::Backend for WasmBackend {
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         let _ = (source_cells_base, bridge_slot);
 
+        let code_size = wasm_bytes.len();
+        // `asmmemmgr.py:37`, as in `compile_loop` above: a bridge's module is a
+        // block of its own.
+        let block = self.asm_memory_stats.record_block(code_size, code_size);
+        self.asm_memory_blocks.push(block);
+
         Ok(AsmInfo {
             code_addr: 0,
-            code_size: wasm_bytes.len(),
+            code_size,
         })
     }
 

@@ -8023,6 +8023,20 @@ pub struct CraneliftBackend {
     /// counterpart for the shared-Arc pairing rationale with the
     /// metainterp `JitProfiler`.
     cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
+    /// `asmmemmgr.py:28` `AsmMemoryManager` parity — the CPU owns the
+    /// accounting `jit_hooks.stats_asmmemmgr_{allocated,used}` reads. Cranelift
+    /// has no `AsmMemoryManager` of its own: `JITModule` owns the executable
+    /// mapping and does not publish its arena size, so `record_block` is given
+    /// the finalized code size for both figures rather than a page-rounded
+    /// number nothing measured.
+    asm_memory_stats: Arc<majit_backend::AsmMemoryManagerStats>,
+    /// Lifetime tokens for the blocks recorded above. `JITModule` frees its
+    /// mapping when this backend drops, so holding the tokens for the
+    /// backend's whole life gives back `used` at exactly the point the code
+    /// stops existing. `allocated` is not given back, which is
+    /// `asmmemmgr.py:90`'s shape: an arena counts once and is never
+    /// un-counted.
+    asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
     module: JITModule,
     func_ctx: FunctionBuilderContext,
     /// Constant pool keyed by OpRef raw index. Each `Const` carries its
@@ -8277,6 +8291,8 @@ impl CraneliftBackend {
 
         CraneliftBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
+            asm_memory_stats: Arc::new(majit_backend::AsmMemoryManagerStats::default()),
+            asm_memory_blocks: Vec::new(),
             module,
             func_ctx,
             constants: majit_ir::ConstMap::new(),
@@ -14632,6 +14648,12 @@ impl CraneliftBackend {
             self.module.clear_context(&mut ctx);
             return Err(BackendError::CompilationFailed(format!("{e}\n{e:?}")));
         }
+        // `asmmemmgr.py:37` counts the block a `materialize` handed out, so
+        // read the emitted size before `clear_context` discards it.
+        let body_code_bytes = ctx
+            .compiled_code()
+            .map(|code| code.code_info().total_size as usize)
+            .unwrap_or(0);
         self.module.clear_context(&mut ctx);
 
         // Build trace_N_entry wrapper: forwards jf_ptr to body via call_indirect,
@@ -14694,9 +14716,22 @@ impl CraneliftBackend {
                 "wrapper: {e}\n{e:?}"
             )));
         }
+        let wrapper_code_bytes = wrapper_compile_ctx
+            .compiled_code()
+            .map(|code| code.code_info().total_size as usize)
+            .unwrap_or(0);
         self.module.clear_context(&mut wrapper_compile_ctx);
 
         self.module.finalize_definitions().unwrap();
+        // `JITModule` owns the executable mapping and publishes no arena size,
+        // so `allocated` and `used` are both the finalized code size. The token
+        // is kept for this backend's lifetime because that is exactly how long
+        // the mapping lives.
+        let code_bytes = body_code_bytes + wrapper_code_bytes;
+        if code_bytes != 0 {
+            let block = self.asm_memory_stats.record_block(code_bytes, code_bytes);
+            self.asm_memory_blocks.push(block);
+        }
 
         let body_ptr = self.module.get_finalized_function(func_id);
         let code_ptr = self.module.get_finalized_function(entry_id);
@@ -15845,6 +15880,10 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn cpu_tracker(&self) -> &Arc<majit_backend::CpuTotalTracker> {
         &self.cpu_tracker
+    }
+
+    fn assembler_memory_stats(&self) -> (usize, usize) {
+        self.asm_memory_stats.get_stats()
     }
 
     fn compile_loop(
