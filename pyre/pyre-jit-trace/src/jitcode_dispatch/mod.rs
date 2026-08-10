@@ -5510,6 +5510,15 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// with the exact, depth-independent edge resolution. Empty outside the
     /// gated kept-stack path.
     pub branch_guard_kept_recovered: &'a [(u16, OpRef)],
+
+    /// Stamp the resume position on the most-recent *guard* op instead of the
+    /// last recorded op. Needed whenever the guard being captured is not the
+    /// last thing recorded: `_nonstandard_virtualizable` (pyjitpl.py:1120)
+    /// emits its promote `GUARD_VALUE` and then `emit_force_virtualizable`
+    /// records GETFIELD_GC / PTR_NE / COND_CALL on top of it, so the default
+    /// last-op stamp lands on the COND_CALL and leaves the guard holding the
+    /// recorder's placeholder resume position.
+    pub stamp_last_guard_op: bool,
 }
 
 /// `rlib/jit.py` `max_unroll_recursion` default (= warmstate

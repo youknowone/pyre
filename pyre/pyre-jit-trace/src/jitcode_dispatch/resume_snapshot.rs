@@ -155,7 +155,22 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
         if !ctx.trace_ctx.vable_snapshot_buildable() {
             return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
         }
-        return walker_capture_snapshot_for_last_guard(ctx, op_pc);
+        // Stamp the last *guard* op, not the last op — same reason the inline
+        // publish below does: `emit_force_virtualizable` records GETFIELD_GC /
+        // PTR_NE / COND_CALL after the promote. A last-op stamp lands on the
+        // COND_CALL and leaves the promote holding the recorder's placeholder
+        // frame (`jitcode_index: 0, pc: last_traced_pc`, history.rs
+        // `record_guard_with_snapshot`), which is not a decodable resume
+        // coordinate — `frame_value_count_at` fails loud on it if the
+        // optimizer does not remove the guard.
+        return walker_capture_snapshot_for_last_guard_scoped(
+            ctx,
+            op_pc,
+            GuardCaptureScope {
+                stamp_last_guard_op: true,
+                ..GuardCaptureScope::default()
+            },
+        );
     }
     // Same buildability precondition as `walker_capture_snapshot_for_last_guard`:
     // every virtualizable box must carry `OpRef::ty()` or the snapshot
@@ -1123,15 +1138,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             }
             let pc_word = resolved_offset as u32;
             let forward_py_pc = forward_snapshot_py_pc(jitcode_index, pc_word)?;
-            ctx.trace_ctx
-                .capture_snapshot_for_last_guard_with_vable_vref(
-                    &active,
-                    jitcode_index,
-                    pc_word,
-                    forward_py_pc,
-                    &vable_boxes,
-                    &vref_boxes,
-                );
+            publish_single_frame_snapshot(
+                ctx,
+                scope.stamp_last_guard_op,
+                &active,
+                jitcode_index,
+                pc_word,
+                forward_py_pc,
+                &vable_boxes,
+                &vref_boxes,
+            );
             return Ok(());
         }
     }
@@ -1156,16 +1172,53 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
     let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
-    ctx.trace_ctx
-        .capture_snapshot_for_last_guard_with_vable_vref(
-            &ctx.outer_active_boxes,
-            ctx.outer_jitcode_index,
-            arm_pc_word,
-            arm_py_pc,
-            &vable_boxes,
-            &vref_boxes,
-        );
+    let active = std::mem::take(&mut ctx.outer_active_boxes);
+    publish_single_frame_snapshot(
+        ctx,
+        scope.stamp_last_guard_op,
+        &active,
+        ctx.outer_jitcode_index,
+        arm_pc_word,
+        arm_py_pc,
+        &vable_boxes,
+        &vref_boxes,
+    );
+    ctx.outer_active_boxes = active;
     Ok(())
+}
+
+/// Attach a freshly built single-frame snapshot to the guard this capture is
+/// for.  `stamp_last_guard_op` picks the recorder-side target: the default
+/// stamps the last recorded op (the guard IS that op), while a guard that
+/// records further non-guard ops after itself — the
+/// `_nonstandard_virtualizable` promote, whose `emit_force_virtualizable`
+/// tail records GETFIELD_GC / PTR_NE / COND_CALL — must stamp the last
+/// *guard* op instead.
+#[allow(clippy::too_many_arguments)]
+fn publish_single_frame_snapshot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    stamp_last_guard_op: bool,
+    active: &[OpRef],
+    jitcode_index: u32,
+    pc: u32,
+    py_pc: u32,
+    vable_boxes: &[majit_metainterp::recorder::SnapshotTagged],
+    vref_boxes: &[majit_metainterp::recorder::SnapshotTagged],
+) {
+    let capture = if stamp_last_guard_op {
+        majit_metainterp::TraceCtx::capture_snapshot_for_last_guard_op_with_vable_vref
+    } else {
+        majit_metainterp::TraceCtx::capture_snapshot_for_last_guard_with_vable_vref
+    };
+    capture(
+        ctx.trace_ctx,
+        active,
+        jitcode_index,
+        pc,
+        py_pc,
+        vable_boxes,
+        vref_boxes,
+    );
 }
 
 /// Build the paused caller frame for a multi-frame inline snapshot (#68),
