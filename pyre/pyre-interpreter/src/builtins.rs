@@ -16749,6 +16749,7 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             return Ok(w_complex_new(r, i));
         }
     }
+    let mut real_was_complex = false;
     let (mut real, mut imag) = match w_real {
         Some(a) => {
             let has_real_protocol = unsafe { complex_constructor_has_real_protocol(a) };
@@ -16775,6 +16776,7 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
                     crate::type_methods::arg_type_name(a)
                 ))?;
             }
+            real_was_complex = has_complex_protocol;
             value
         }
         None => (0.0, 0.0),
@@ -16793,13 +16795,15 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             let converted = builtin_float(&[b])?;
             (unsafe { w_float_get_value(converted) }, 0.0)
         };
-        // complex(x, y) == x + y*j even if y is already complex; preserve the
-        // signs of zero lanes by subtracting/adding only when the source lane
-        // is nonzero, otherwise taking the operand's real part directly.
-        if bi != 0.0 {
-            real -= bi;
-        }
-        if imag != 0.0 {
+        // CPython 3.14 `complex_new_impl`: the real lane always uses ordinary
+        // IEEE subtraction. A complex-valued first operand combines its
+        // existing imaginary lane with `+=`; a real-valued first operand has
+        // no imaginary lane, so the second operand's real lane is assigned
+        // directly. Keeping the conversion-path distinction gives both
+        // `complex(complex(1, +0), -0).imag == +0` and
+        // `complex(-0, -0).imag == -0`.
+        real -= bi;
+        if real_was_complex {
             imag += br;
         } else {
             imag = br;
@@ -17331,12 +17335,33 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_complex_preserves_imag_arg_negative_zero_with_complex_real() {
+    fn test_builtin_complex_uses_python314_ieee_zero_combination() {
         crate::typedef::init_typeobjects();
         let result = builtin_complex(&[w_complex_new(1.0, 0.0), w_float_new(-0.0)]).unwrap();
         assert_eq!(
             unsafe { w_complex_get_real(result).to_bits() },
             1.0f64.to_bits()
+        );
+        assert_eq!(
+            unsafe { w_complex_get_imag(result).to_bits() },
+            0.0f64.to_bits()
+        );
+
+        let result = builtin_complex(&[w_float_new(-0.0), w_float_new(-0.0)]).unwrap();
+        assert_eq!(
+            unsafe { w_complex_get_real(result).to_bits() },
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            unsafe { w_complex_get_imag(result).to_bits() },
+            (-0.0f64).to_bits()
+        );
+
+        let result =
+            builtin_complex(&[w_complex_new(-0.0, -0.0), w_complex_new(-0.0, -0.0)]).unwrap();
+        assert_eq!(
+            unsafe { w_complex_get_real(result).to_bits() },
+            0.0f64.to_bits()
         );
         assert_eq!(
             unsafe { w_complex_get_imag(result).to_bits() },

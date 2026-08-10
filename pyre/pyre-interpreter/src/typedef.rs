@@ -18142,33 +18142,36 @@ fn init_complex_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "from_number",
-            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
-                "from_number",
-                |args| {
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "complex.from_number() missing required argument 'number' (pos 1)",
-                        ));
-                    }
-                    let value = args[1];
-                    if unsafe {
-                        pyre_object::is_str(value)
-                            || pyre_object::is_bytes(value)
-                            || pyre_object::is_bytearray(value)
-                    } {
-                        return Err(crate::PyError::type_error(format!(
-                            "must be real number, not {}",
-                            crate::type_methods::arg_type_name(value)
-                        )));
-                    }
-                    // Reuse complex.__new__'s exact-base identity and subclass
-                    // allocation.  The constructor's numeric-only path runs
-                    // __complex__, __float__, then __index__ without parsing
-                    // text because those inputs were rejected above.
-                    complex_descr_new(&[args[0], value])
-                },
-                2,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "from_number",
+                    |args| {
+                        if args.len() < 2 {
+                            return Err(crate::PyError::type_error(
+                                "complex.from_number() missing required argument 'number' (pos 1)",
+                            ));
+                        }
+                        let value = args[1];
+                        if unsafe {
+                            pyre_object::is_str(value)
+                                || pyre_object::is_bytes(value)
+                                || pyre_object::is_bytearray(value)
+                        } {
+                            return Err(crate::PyError::type_error(format!(
+                                "must be real number, not {}",
+                                crate::type_methods::arg_type_name(value)
+                            )));
+                        }
+                        // Reuse complex.__new__'s exact-base identity and subclass
+                        // allocation.  The constructor's numeric-only path runs
+                        // __complex__, __float__, then __index__ without parsing
+                        // text because those inputs were rejected above.
+                        complex_descr_new(&[args[0], value])
+                    },
+                    2,
+                    "($type, number, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -18368,6 +18371,42 @@ fn init_complex_type(ns: PyObjectRef) {
                 make_builtin_function_with_arity(name, func, 2),
             )
         };
+    }
+    // CPython 3.14 Argument Clinic metadata for the PyPy complex TypeDef
+    // callables. `from_number` is stamped before its classmethod wrapping;
+    // all remaining carriers are plain Function objects.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__radd__", "($self, value, /)"),
+        ("__sub__", "($self, value, /)"),
+        ("__rsub__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__pow__", "($self, value, mod=None, /)"),
+        ("__rpow__", "($self, value, mod=None, /)"),
+        ("__neg__", "($self, /)"),
+        ("__pos__", "($self, /)"),
+        ("__abs__", "($self, /)"),
+        ("__bool__", "($self, /)"),
+        ("__truediv__", "($self, value, /)"),
+        ("__rtruediv__", "($self, value, /)"),
+        ("conjugate", "($self, /)"),
+        ("__complex__", "($self, /)"),
+        ("__getnewargs__", "($self, /)"),
+        ("__format__", "($self, format_spec, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("complex TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
 
