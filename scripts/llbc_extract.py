@@ -1251,6 +1251,20 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     # rustc), so this never thrashes the runtime build's cache, and the LLBC is
     # independent of debuginfo so the artefact is byte-identical.
     env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
+    # The dev profile enables incremental compilation, which splits a crate into
+    # codegen units and reuses object files from the previous session. Charon
+    # drives rustc for the crates it extracts while plain rustc builds the rest,
+    # and the two disagree about which CGUs are still valid: the resulting
+    # archive fuses objects from different sessions, so CGU-local symbols
+    # (`...drop_in_place...llvm.<hash>`) are referenced by one object and
+    # defined in none. The failure surfaces far from its cause, as
+    # `Undefined symbols for architecture arm64` while LINKING the
+    # `pyre-jit-trace` BUILD SCRIPT, which is a host binary and therefore the
+    # first thing in the graph that has to resolve real code out of
+    # `libmajit_translate`. The tell is that the `.rcgu.o` files named in the
+    # linker error carry a different session tag than the loose ones on disk.
+    # Extraction only needs MIR, so incremental buys nothing here.
+    env["CARGO_INCREMENTAL"] = "0"
     # Dependency build scripts run while Charon extracts a target crate. They
     # must not recursively demand the very LLBC artefact currently being
     # produced (pyre-jit -> pyre-jit-trace -> pyre-jit.ullbc). Consumers may
