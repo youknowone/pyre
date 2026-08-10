@@ -373,6 +373,17 @@ fn rewire_one_slice_index_site(
     Ok(())
 }
 
+fn reachable_from_start(graph: &FunctionGraph) -> std::collections::HashSet<crate::model::BlockId> {
+    let mut reachable = std::collections::HashSet::new();
+    let mut todo = vec![graph.startblock];
+    while let Some(block) = todo.pop() {
+        if reachable.insert(block) {
+            todo.extend(graph.successors(block));
+        }
+    }
+    reachable
+}
+
 /// Resolve a variable through the single-input block edges that can represent
 /// an ordinary MIR copy. Multiple incoming values must converge to one
 /// identity; disagreement is deliberately not guessed through.
@@ -381,6 +392,7 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
         graph: &FunctionGraph,
         var: &Variable,
         seen: &mut std::collections::HashSet<Variable>,
+        reachable: &std::collections::HashSet<crate::model::BlockId>,
     ) -> Option<Variable> {
         if !seen.insert(var.clone()) {
             return None;
@@ -405,19 +417,20 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
         }) else {
             return Some(var.clone());
         };
-        let incoming: Vec<Variable> = graph
+        let incoming: Option<Vec<Variable>> = graph
             .blocks
             .iter()
+            .filter(|block| reachable.contains(&block.id))
             .flat_map(|b| &b.exits)
             .filter(|link| link.target == block_id)
-            .filter_map(|link| {
+            .map(|link| {
                 link.args
                     .get(arg_index)
                     .and_then(LinkArg::as_variable)
                     .cloned()
             })
             .collect();
-        let incoming: Vec<Variable> = incoming
+        let incoming: Vec<Variable> = incoming?
             .into_iter()
             .filter(|candidate| candidate != var)
             .collect();
@@ -425,9 +438,14 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
         if incoming.iter().any(|candidate| candidate != &first) {
             return None;
         }
-        visit(graph, &first, seen)
+        visit(graph, &first, seen, reachable)
     }
-    visit(graph, var, &mut std::collections::HashSet::new())
+    visit(
+        graph,
+        var,
+        &mut std::collections::HashSet::new(),
+        &reachable_from_start(graph),
+    )
 }
 
 fn const_int_value(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
@@ -665,13 +683,7 @@ fn array_len_base_is_stable(
         Some(root) => root == *base,
         None => true,
     };
-    let mut reachable_from_start = std::collections::HashSet::new();
-    let mut todo = vec![graph.startblock];
-    while let Some(block) = todo.pop() {
-        if reachable_from_start.insert(block) {
-            todo.extend(graph.successors(block));
-        }
-    }
+    let reachable_from_start = reachable_from_start(graph);
     let escaped_before_later = graph.blocks.iter().any(|block| {
         if !reachable_from_start.contains(&block.id) || !backward.contains(&block.id) {
             return false;
@@ -1085,10 +1097,14 @@ mod tests {
     }
 
     fn end_field_write(base: &Variable, value: &Variable) -> OpKind {
+        named_end_field_write(base, value, "end")
+    }
+
+    fn named_end_field_write(base: &Variable, value: &Variable, name: &str) -> OpKind {
         OpKind::FieldWrite {
             base: base.clone(),
             field: crate::model::FieldDescriptor {
-                name: "end".to_string(),
+                name: name.to_string(),
                 owner_root: Some("core::ops::range::RangeTo".to_string()),
                 owner_id: None,
                 base_is_deref: None,
@@ -1206,6 +1222,70 @@ mod tests {
         } else {
             g.set_return(site_block, Some(result));
         }
+        (
+            g,
+            SliceIndexRangeToSite {
+                range_result: range,
+                end,
+            },
+        )
+    }
+
+    fn build_rangeto_minusone_graph(field_name: &str) -> (FunctionGraph, SliceIndexRangeToSite) {
+        let mut g = FunctionGraph::new("rangeto_minusone");
+        let entry = g.startblock;
+        let slice = g.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let len = g
+            .push_op_var(
+                entry,
+                OpKind::ArrayLen {
+                    base: slice.clone(),
+                    array_type_id: None,
+                    nolength: false,
+                },
+                true,
+            )
+            .unwrap();
+        let one = g.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let end = g
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "sub".into(),
+                    lhs: len,
+                    rhs: one,
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let range = g
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: rangeto_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::RangeTo".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: named_end_field_write(&range, &end, field_name),
+        });
+        let result = g
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: slice_index_call_target(),
+                    args: vec![slice, range.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(entry, Some(result));
         (
             g,
             SliceIndexRangeToSite {
@@ -1536,6 +1616,25 @@ mod tests {
         assert!(has_residual_slice_index(&g));
     }
 
+    /// Positional `RangeTo.end` spelling deliberately stays rejected.
+    /// `is_construction_write` has never keyed on the field name, so the
+    /// `end_writes` gate is not what admits a site — it only requires the
+    /// write to be unique and named. Widening it to `__pos_0` therefore does
+    /// not restore an older rewrite; it admits sites that only
+    /// `resolve_block_alias` makes visible, and that widening was measured to
+    /// clear no additional prepass subject.
+    #[test]
+    fn rangeto_minusone_positional_end_write_declines() {
+        let (mut g, site) = build_rangeto_minusone_graph("__pos_0");
+
+        assert_eq!(
+            rewire_slice_index_rangeto_sites(&mut g, &[site]),
+            0,
+            "a positional MinusOne end write must decline"
+        );
+        assert!(has_residual_slice_index(&g));
+    }
+
     fn build_rangeto_self_phi_graph(
         distinct_incoming: bool,
     ) -> (FunctionGraph, SliceIndexRangeToSite) {
@@ -1672,6 +1771,71 @@ mod tests {
         let (mut g, site) = build_rangeto_self_phi_graph(true);
         assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
         assert!(has_residual_slice_index(&g));
+    }
+
+    #[test]
+    fn rangeto_static_length_mixed_variable_constant_phi_declines() {
+        let (mut g, site) = build_rangeto_self_phi_graph(false);
+        let (site_block, phi) = g
+            .blocks
+            .iter()
+            .find_map(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| is_slice_range_index_call(&op.kind))
+                    .then(|| (block.id, block.inputargs[0].clone()))
+            })
+            .unwrap();
+        let self_link = g
+            .block_mut(site_block)
+            .exits
+            .iter_mut()
+            .find(|link| link.target == site_block)
+            .unwrap();
+        self_link.args[0] = LinkArg::Const(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::Int(7),
+        ));
+
+        assert_eq!(
+            resolve_block_alias(&g, &phi),
+            None,
+            "a constant incoming phi argument must make alias resolution fail closed"
+        );
+        assert_eq!(
+            rewire_slice_index_rangeto_sites(&mut g, &[site]),
+            0,
+            "a RangeTo fold relying on a mixed variable/constant phi alias must decline"
+        );
+        assert!(has_residual_slice_index(&g));
+    }
+
+    #[test]
+    fn block_alias_ignores_constant_from_unreachable_predecessor() {
+        let (mut g, _) = build_rangeto_self_phi_graph(false);
+        let (site_block, phi) = g
+            .blocks
+            .iter()
+            .find_map(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| is_slice_range_index_call(&op.kind))
+                    .then(|| (block.id, block.inputargs[0].clone()))
+            })
+            .unwrap();
+        let root = resolve_block_alias(&g, &phi).unwrap();
+        let unreachable = g.create_block();
+        g.set_goto(unreachable, site_block, vec![root.clone()]);
+        g.block_mut(unreachable).exits[0].args[0] = LinkArg::Const(
+            crate::flowspace::model::Constant::new(crate::flowspace::model::ConstValue::Int(7)),
+        );
+
+        assert_eq!(
+            resolve_block_alias(&g, &phi),
+            Some(root),
+            "a constant from an unreachable predecessor must not veto alias resolution"
+        );
     }
 
     #[test]
