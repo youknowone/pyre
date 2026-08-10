@@ -25072,6 +25072,42 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             ),
         )
     };
+    // Shared CPython 3.14 Argument Clinic metadata for the callables in
+    // W_BaseSetObject's PyPy TypeDef surface.  The concrete set/frozenset
+    // initializers below add metadata for their type-specific entries.
+    for (name, text_signature) in [
+        ("__repr__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__sub__", "($self, value, /)"),
+        ("__rsub__", "($self, value, /)"),
+        ("__and__", "($self, value, /)"),
+        ("__rand__", "($self, value, /)"),
+        ("__xor__", "($self, value, /)"),
+        ("__rxor__", "($self, value, /)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__contains__", "($self, object, /)"),
+        ("copy", "($self, /)"),
+        ("difference", "($self, /, *others)"),
+        ("intersection", "($self, /, *others)"),
+        ("isdisjoint", "($self, other, /)"),
+        ("issubset", "($self, other, /)"),
+        ("issuperset", "($self, other, /)"),
+        ("__reduce__", "($self, /)"),
+        ("symmetric_difference", "($self, other, /)"),
+        ("union", "($self, /, *others)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("set-like TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 // The `|` / `&` / `-` / `^` operator slots (`nb_or` etc.) require the
@@ -25755,23 +25791,25 @@ fn init_set_type(ns: PyObjectRef) {
             pyre_object::w_str_new("Build an unordered collection of unique elements."),
         )
     };
+    let new_descr = make_new_descr(set_descr_new);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(set_descr_new),
-        )
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
     };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr) };
     // setobject.py __class_getitem__ = gateway.interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -25980,6 +26018,26 @@ fn init_set_type(ns: PyObjectRef) {
             make_builtin_function_with_arity("__ixor__", set_op_inplace_xor, 2),
         )
     };
+    for (name, text_signature) in [
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__isub__", "($self, value, /)"),
+        ("__iand__", "($self, value, /)"),
+        ("__ixor__", "($self, value, /)"),
+        ("__ior__", "($self, value, /)"),
+        ("add", "($self, object, /)"),
+        ("clear", "($self, /)"),
+        ("discard", "($self, object, /)"),
+        ("difference_update", "($self, /, *others)"),
+        ("intersection_update", "($self, /, *others)"),
+        ("pop", "($self, /)"),
+        ("remove", "($self, object, /)"),
+        ("symmetric_difference_update", "($self, other, /)"),
+        ("update", "($self, /, *others)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("set TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 fn init_frozenset_type(ns: PyObjectRef) {
@@ -25990,23 +26048,25 @@ fn init_frozenset_type(ns: PyObjectRef) {
             pyre_object::w_str_new("Build an immutable unordered collection of unique elements."),
         )
     };
+    let new_descr = make_new_descr(frozenset_descr_new);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(frozenset_descr_new),
-        )
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
     };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr) };
     // setobject.py __class_getitem__ = gateway.interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     init_setlike_common(ns, true);
@@ -26017,7 +26077,7 @@ fn init_frozenset_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__hash__",
                 |args| {
                     crate::type_methods::require_frozenset_receiver(args, "__hash__", false)?;
@@ -26026,6 +26086,7 @@ fn init_frozenset_type(ns: PyObjectRef) {
                     )?))
                 },
                 1,
+                "($self, /)",
             ),
         )
     };
