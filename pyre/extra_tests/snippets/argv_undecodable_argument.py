@@ -65,3 +65,5 @@ with tempfile.TemporaryDirectory() as tmp:
     assert result.stdout == b"True\n" + ascii(ESCAPED).encode() + b"\n", result.stdout
 
 print("OK")
+# CPython-suite gap: no test invokes the executable with this exact undecodable
+# argv byte. This generic process-boundary contract belongs in snippets.

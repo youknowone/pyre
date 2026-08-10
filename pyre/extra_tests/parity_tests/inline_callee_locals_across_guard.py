@@ -1,3 +1,6 @@
+# CPython-suite gap: frame tests cannot cover JIT guard resume in an inlined callee.
+# parity-tests reason: this guards pyre's per-frame red-frame identity on resume.
+
 # Locals of an inlined callee must survive a guard that fails inside the
 # callee's own body.  A callee's `LOAD_FAST`/`STORE_FAST` lower to
 # `getarrayitem_vable_*`/`setarrayitem_vable_*` on its own frame array, and the

@@ -1,3 +1,6 @@
+# CPython-suite gap: mutable-type-name tests omit str-subclass identity under hot reads.
+# parity-tests reason: this guards pyre's JIT fold of the metatype name slot.
+
 """Reading `Cls.__name__` hands back the object the rename was given.
 
 `type.__name__` is a getset on the metatype, and its setter stores the value

@@ -1,3 +1,6 @@
+# CPython-suite gap: displayhook tests do not collect while a sink replaces write.
+# parity-tests reason: this guards pyre/PyPy moving-GC roots across callbacks.
+
 # `sys.displayhook` writes twice, and either write may unbind the sink.
 #
 # The hook renders `repr(obj)` and then writes the repr and a newline.  Both

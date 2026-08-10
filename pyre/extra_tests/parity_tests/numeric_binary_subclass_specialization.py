@@ -1,3 +1,6 @@
+# CPython-suite gap: numeric tests do not alternate subclasses at a hot binary site.
+# parity-tests reason: this guards pyre's JIT exact-class specialization guards.
+
 """Hot numeric binary specializers preserve reflected subclass dispatch.
 
 The subclass operand has to arrive at the *same* BINARY_OP pc that went hot, so

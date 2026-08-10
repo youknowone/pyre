@@ -1,7 +1,9 @@
 # pyre/extra_tests
 
 Pure-Python snippet tests imported from
-[RustPython's `extra_tests/snippets`](https://github.com/RustPython/RustPython/tree/main/extra_tests/snippets).
+[RustPython's `extra_tests/snippets`](https://github.com/RustPython/RustPython/tree/main/extra_tests/snippets),
+plus pyre-authored generic CPython-compatibility gaps that do not belong to a
+JIT, GC, or PyPy-internal parity suite.
 
 Each `snippets/*.py` is a self-contained script that asserts a small
 piece of CPython semantics.  A snippet "passes" when the interpreter
@@ -22,12 +24,14 @@ works.  `testutils.py` is the helper module shipped with the snippets
 
 ## Layout
 
-- `snippets/` — imported RustPython suite, breadth-first surface
-  coverage.  Runner: `pyre/extra_tests/run.py`.
+- `snippets/` — imported RustPython tests and generic pyre-authored gaps,
+  breadth-first surface coverage.  Runner: `pyre/extra_tests/run.py`.
 - `parity_tests/` — pyre-authored scripts reserved for specific PyPy/JIT/GC
   invariants not already covered by `snippets/` or the vendored CPython suite
   under `lib-python/3/test/`.  Do not mirror general language, builtin, or
-  stdlib behavior here.  Each script cites the upstream file:line it guards;
+  stdlib behavior here. Each script must state both the missing CPython-suite
+  coverage and why JIT/GC/PyPy internals require placement here; the runner
+  rejects missing header fields. Each script cites the upstream file:line it guards;
   passing requires `exit 0` AND the final stdout line being `OK`.  Runner:
   `pyre/extra_tests/parity_tests/run.py`.
 - `upstream/` — no tests of its own: a runner plus a driver for the
@@ -65,6 +69,6 @@ file against CPython and every pyre backend first.
 
 ## Source
 
-Imported from `RustPython/extra_tests/snippets/` (190 `.py` files +
-`testutils.py`).  Future updates: pull from upstream when the snippet
-surface changes; pyre-specific additions stay in `parity_tests/`.
+The base corpus came from `RustPython/extra_tests/snippets/`. Future updates
+should pull upstream changes while preserving generic pyre-authored gap tests;
+only JIT/GC/PyPy-internal additions belong in `parity_tests/`.

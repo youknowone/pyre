@@ -1,3 +1,6 @@
+# CPython-suite gap: tuple tests omit 3.14 identity across PyPy float specialization.
+# parity-tests reason: this targets PyPy/pyre specialised tuple representation.
+
 # A tuple retains the element objects it was built from rather than
 # reconstructing them on read.  `is` between two plain floats answers by value
 # (`objspace/std/objspace.py:466 is_w` compares `W_FloatObject.floatval`), so

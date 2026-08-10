@@ -1,3 +1,6 @@
+# CPython-suite gap: list tests do not trace object-strategy append transitions.
+# parity-tests reason: this guards pyre's JIT list fold and GC write path.
+
 # Object-strategy `list.append`, run hot enough to be traced.
 #
 # The append fold descends the real `w_list_append` body.  Its Object arm

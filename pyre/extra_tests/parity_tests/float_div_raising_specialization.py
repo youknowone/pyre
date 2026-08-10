@@ -1,3 +1,6 @@
+# CPython-suite gap: float division tests do not compare cold/hot raising traces.
+# parity-tests reason: this guards pyre's JIT exact-float raising specialization.
+
 """Guarded raising arm for exact numeric true-division by zero."""
 
 import sys

@@ -1,3 +1,6 @@
+# CPython-suite gap: type-cache tests omit surrogate lookup through a tag-zero MRO.
+# parity-tests reason: this targets PyPy/pyre method-cache representation details.
+
 """A class-like non-type MRO entry keeps surrogate lookup on the tag-zero path."""
 
 import sys

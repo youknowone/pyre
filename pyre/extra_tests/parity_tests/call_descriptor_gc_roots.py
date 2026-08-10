@@ -1,3 +1,6 @@
+# CPython-suite gap: descriptor-call tests do not force collection while binding.
+# parity-tests reason: this is a pyre/PyPy moving-GC root-liveness regression.
+
 """A custom ``__call__`` descriptor must not invalidate call arguments."""
 
 import gc

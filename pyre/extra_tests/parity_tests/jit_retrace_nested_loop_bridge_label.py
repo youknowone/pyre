@@ -1,3 +1,6 @@
+# CPython-suite gap: loop tests cannot assemble a retrace label inside a bridge.
+# parity-tests reason: this is specific to pyre's JIT bridge relocation.
+
 """A retrace whose LABEL is assembled inside a bridge is branched to correctly.
 
 A retrace is attached to a guard, so it is assembled through the bridge path and

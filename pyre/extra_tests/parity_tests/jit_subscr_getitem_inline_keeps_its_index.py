@@ -1,3 +1,6 @@
+# CPython-suite gap: subscription tests cannot cover pyre's deferred inline abort.
+# parity-tests reason: this guards a JIT-only callee operand/resume defect.
+
 """A user `__getitem__` inlined from BINARY_OP keeps its own index operand.
 
 The FOR_ITER deferred-inline gate used to admit this inline because it carried

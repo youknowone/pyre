@@ -1,3 +1,6 @@
+# CPython-suite gap: traceback tests cannot create and clear pyre JIT frames.
+# parity-tests reason: this guards JIT frame ownership after return and unwind.
+
 """Completed JIT frames are clearable after return or exception unwind."""
 
 import sys

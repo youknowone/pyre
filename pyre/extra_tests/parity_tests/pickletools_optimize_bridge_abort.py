@@ -1,3 +1,6 @@
+# CPython-suite gap: pickletools tests cannot execute opcode walking in a bridge.
+# parity-tests reason: this guards pyre JIT bridge abort result propagation.
+
 """A bridge walk that adopts a blackhole terminal must keep the frame's result.
 
 ``pickletools.optimize`` ends in a single ``return out.getvalue()``. Under the

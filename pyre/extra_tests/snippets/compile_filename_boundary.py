@@ -1,4 +1,6 @@
 # pyre-check: platforms=linux,darwin
+# CPython-suite gap: compile() does not cover this filesystem-codec boundary.
+# It is generic compiler behavior, so it belongs in snippets.
 # `b"\xff.py"` only survives the filesystem-encoding converter where that
 # encoding is UTF-8 with `surrogateescape`; on Windows the same call raises
 # UnicodeDecodeError in the reference too.

@@ -1,3 +1,6 @@
+# CPython-suite gap: exception tests omit this PyPy instance-dict storage path.
+# parity-tests reason: it guards PyPy/pyre exception mapdict behavior.
+
 """A user attribute on an exception instance lives in its instance dict, which
 is mapdict-backed.  Each block below runs the read hot enough to compile, then
 perturbs the one thing that has to invalidate the compiled read.

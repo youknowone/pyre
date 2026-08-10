@@ -1,3 +1,6 @@
+# CPython-suite gap: CPython cannot emit PyPy's private packed-list pickle opcodes.
+# parity-tests reason: this guards PyPy pickle compatibility and moving-GC roots.
+
 """PyPy `_pickle` parity for argument expansion and BUILD."""
 
 import pickle

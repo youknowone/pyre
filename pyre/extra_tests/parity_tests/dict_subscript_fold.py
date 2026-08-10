@@ -1,3 +1,6 @@
+# CPython-suite gap: dict subscription tests do not run through pyre's trace fold.
+# parity-tests reason: this guards JIT folding, guards, and deoptimization.
+
 N = 3000
 
 

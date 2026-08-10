@@ -1,3 +1,6 @@
+# CPython-suite gap: divmod tests do not trace mixed bigint/int results under GC.
+# parity-tests reason: this targets pyre's JIT bigint lowering and GC-rooted pair.
+
 """`divmod(long, int)` under a JIT-hot loop.
 
 `_int_divmod` keeps a `W_IntObject` divisor unwrapped and calls

@@ -1,3 +1,6 @@
+# CPython-suite gap: slots tests omit instance-owned slots on a native list subclass.
+# parity-tests reason: this targets PyPy/pyre native-subclass storage layout.
+
 """Native list subclasses keep PyPy's instance-owned slot storage."""
 
 

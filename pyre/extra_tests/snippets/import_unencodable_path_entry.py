@@ -1,4 +1,6 @@
 # pyre-check: platforms=linux,darwin
+# CPython-suite gap: import tests omit this unencodable sys.path entry.
+# It is a generic import/filesystem boundary, so it belongs in snippets.
 # `os.fsencode` rejects a surrogate outside U+DC80..U+DCFF only under the
 # `surrogateescape` handler; Windows encodes with `surrogatepass` and accepts
 # it, so the reference never reaches the import at all.

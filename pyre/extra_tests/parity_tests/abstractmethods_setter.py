@@ -1,3 +1,6 @@
+# CPython-suite gap: no abstract-method setter test collects during truth testing.
+# parity-tests reason: this specifically guards pyre/PyPy moving-GC callback roots.
+
 """`type.__abstractmethods__` survives a `__bool__` that collects.
 
 The setter truth-tests the value before storing it, and that test runs the

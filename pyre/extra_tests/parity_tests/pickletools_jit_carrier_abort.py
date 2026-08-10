@@ -1,3 +1,6 @@
+# CPython-suite gap: pickletools tests cannot trigger pyre's JIT carrier abort.
+# parity-tests reason: this is a pyre trace-abort state-transfer regression.
+
 import pickle
 import pickletools
 import sys

@@ -57,6 +57,8 @@ TARGET_RELEASE = ROOT / "target" / "release"
 EXE = ".exe" if sys.platform == "win32" else ""
 
 PLATFORMS_PREFIX = "# pyre-check: platforms="
+CPYTHON_GAP_PREFIX = "# CPython-suite gap:"
+PARITY_REASON_PREFIX = "# parity-tests reason:"
 
 # The version whose observable behaviour these scripts pin, which is the one
 # pyre's native modules (`_sre.MAGIC`) and the vendored `lib-python/3` are
@@ -99,6 +101,15 @@ def _scripts() -> tuple[list[Path], list[Path]]:
     for p in sorted(HERE.glob("*.py")):
         if p.name == "run.py":
             continue
+        header = p.read_text(encoding="utf-8").splitlines()[:20]
+        missing = [
+            prefix
+            for prefix in (CPYTHON_GAP_PREFIX, PARITY_REASON_PREFIX)
+            if not any(line.startswith(prefix) for line in header)
+        ]
+        if missing:
+            names = ", ".join(missing)
+            raise RuntimeError(f"{p.name}: missing parity header field(s): {names}")
         (out if _runs_here(p) else skipped).append(p)
     return out, skipped
 

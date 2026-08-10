@@ -1,3 +1,6 @@
+# CPython-suite gap: divmod tests do not exercise exact ints in a hot JIT loop.
+# parity-tests reason: this targets pyre's div/mod fold and specialised pair result.
+
 """`divmod(a, b)` on two exact ints under a JIT-hot loop.
 
 The walker recognises the `divmod` builtin and emits the guarded

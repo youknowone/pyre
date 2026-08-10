@@ -1,3 +1,6 @@
+# CPython-suite gap: list tests do not trace pop across strategy changes and guards.
+# parity-tests reason: this guards pyre's eager JIT fold and rollback journal.
+
 # Integer-strategy `list.pop()`, run hot enough to be traced.
 #
 # The pop fold descends the real `w_list_pop_end_inner` body, which is the

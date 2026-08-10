@@ -1,3 +1,6 @@
+# CPython-suite gap: builtin exception tests omit hot specialized context chains.
+# parity-tests reason: this guards pyre's JIT builtin raising/resume path.
+
 """Compiled builtin raising arms retain the active exception context."""
 
 ROUNDS = 10000

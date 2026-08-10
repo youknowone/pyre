@@ -1,3 +1,6 @@
+# CPython-suite gap: attribute tests omit PyPy MapDict layouts on builtin subclasses.
+# parity-tests reason: this directly targets PyPy/pyre builtin-subclass storage.
+
 import gc
 import os
 

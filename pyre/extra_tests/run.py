@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runner for the imported RustPython extra_tests snippets.
+"""Runner for imported and pyre-authored generic extra_tests snippets.
 
 Runs every `*.py` under `pyre/extra_tests/snippets/` against:
   - CPython (the system `python3`),
@@ -40,6 +40,7 @@ ROOT = HERE.parent.parent
 TARGET_RELEASE = ROOT / "target" / "release"
 
 EXE = ".exe" if sys.platform == "win32" else ""
+PLATFORMS_PREFIX = "# pyre-check: platforms="
 
 # Snippet basenames that are not standalone test files (helpers /
 # scaffolding imported by other snippets).  Skip them from the run.
@@ -53,6 +54,15 @@ def _scripts(filter_substring: str | None) -> list[Path]:
     for p in sorted(SNIPPETS.glob("*.py")):
         if p.name in NON_TEST_FILES:
             continue
+        header = p.read_text(encoding="utf-8").splitlines()[:20]
+        marker = next((line for line in header if line.startswith(PLATFORMS_PREFIX)), None)
+        if marker is not None:
+            platforms = {
+                item.strip()
+                for item in marker[len(PLATFORMS_PREFIX):].split(",")
+            }
+            if sys.platform not in platforms:
+                continue
         if filter_substring and filter_substring not in p.name:
             continue
         out.append(p)

@@ -1,3 +1,6 @@
+# CPython-suite gap: range tests do not compare cold/hot zero-step exceptions.
+# parity-tests reason: this guards pyre's JIT range raising specialization.
+
 """Guarded raising arm for an exact ``range(..., step=0)`` call."""
 
 import sys

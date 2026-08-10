@@ -1,3 +1,6 @@
+# CPython-suite gap: weakref tests omit this PyPy lifeline across moving collection.
+# parity-tests reason: this targets PyPy/pyre weakref ownership in the moving GC.
+
 """Weakref lifelines remain owned by the GC across collection.
 
 PyPy stores each rweakref inside the GC-traced W_Weakref/WeakrefLifeline

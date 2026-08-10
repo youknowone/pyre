@@ -1,3 +1,6 @@
+# CPython-suite gap: comprehension tests cannot exercise pyre's FOR_ITER JIT gate.
+# parity-tests reason: this guards call-bearing comprehension trace admission.
+
 import random
 
 # A comprehension whose body calls a user Python function accumulates through

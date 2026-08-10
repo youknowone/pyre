@@ -1,3 +1,6 @@
+# CPython-suite gap: tuple subscription tests lack PyPy specialised-pair variants.
+# parity-tests reason: this guards pyre JIT layout guards and deoptimization.
+
 # `len(pair)` and `pair[i]` across every makespecialisedtuple2 arm, plus the
 # shapes the fold must decline: a slice key, an out-of-range index, an
 # __index__ key, a mixed class site, and a tuple subclass overriding both.

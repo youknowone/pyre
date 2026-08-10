@@ -1,3 +1,6 @@
+# CPython-suite gap: pow tests do not trace mixed bigint/int exponent paths.
+# parity-tests reason: this guards pyre's JIT bigint descriptor specialization.
+
 """`long ** int` under a JIT-hot loop.
 
 `descr_pow` keeps a `W_IntObject` exponent unwrapped and calls

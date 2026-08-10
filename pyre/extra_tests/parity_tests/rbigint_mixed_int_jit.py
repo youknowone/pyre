@@ -1,3 +1,6 @@
+# CPython-suite gap: bigint tests do not trace all mixed machine/bigint descriptors.
+# parity-tests reason: this guards PyPy rbigint operations lowered by pyre's JIT.
+
 """Mixed machine-int/rbigint paths used by PyPy's longobject descriptors."""
 
 import gc

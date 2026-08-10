@@ -1,3 +1,6 @@
+# CPython-suite gap: unary tests do not trace INT_MIN promotion and subclass guards.
+# parity-tests reason: this targets pyre's overflow-aware JIT integer fold.
+
 """`-x` on an exact int under a JIT-hot loop, across the INT_MIN promote.
 
 `descr_neg` (intobject.py:628) answers `-x` with a machine int for every

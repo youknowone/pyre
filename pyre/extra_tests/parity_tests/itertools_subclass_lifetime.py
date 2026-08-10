@@ -1,3 +1,6 @@
+# CPython-suite gap: itertools subclass tests omit user-finalizer lifetime.
+# parity-tests reason: this guards PyPy-style allocation and moving-GC ownership.
+
 import gc
 import itertools
 

@@ -18,3 +18,5 @@ else:
     raise AssertionError("surrogate-bearing module name unexpectedly imported")
 
 print("OK")
+# CPython-suite gap: import tests do not pass a lone-surrogate module name.
+# This interpreter-independent behavior belongs in snippets.

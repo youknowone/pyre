@@ -1,3 +1,6 @@
+# CPython-suite gap: dict tests do not trace Unicode-strategy changes at one site.
+# parity-tests reason: this guards pyre's JIT strategy fold and side exit.
+
 # `d[key]` on a str-keyed dict, run hot enough to be traced.
 #
 # The subscript fold pins the dict to the Unicode strategy and the key to the

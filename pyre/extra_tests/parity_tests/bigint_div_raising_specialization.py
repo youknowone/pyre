@@ -1,3 +1,6 @@
+# CPython-suite gap: bigint division tests do not compare cold/hot raising traces.
+# parity-tests reason: this guards pyre's JIT exact-bigint raising specialization.
+
 """Guarded raising arms for exact-bigint ``//`` and ``%`` by exact zero."""
 
 import sys

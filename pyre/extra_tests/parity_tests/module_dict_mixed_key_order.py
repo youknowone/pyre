@@ -1,3 +1,6 @@
+# CPython-suite gap: module tests omit mixed-key order across ModuleDictStrategy exit.
+# parity-tests reason: this targets PyPy/pyre module-dict storage transitions.
+
 """Phase 5 parity: mixed-key insertion order on W_ModuleDictObject.
 
 `celldict.py:173-186 switch_to_object_strategy` drains existing str

@@ -1,3 +1,6 @@
+# CPython-suite gap: module tests omit non-string keys on PyPy ModuleDictStrategy.
+# parity-tests reason: this targets PyPy/pyre module-dict strategy conversion.
+
 """Phase 5+ parity test: non-str keys on W_ModuleDictObject.
 
 PyPy `pypy/objspace/std/celldict.py:67-74 setitem` switches to the

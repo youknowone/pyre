@@ -1,3 +1,6 @@
+# CPython-suite gap: frame-line tests cannot inspect nested pyre inlined JIT frames.
+# parity-tests reason: this guards JIT caller coordinates across residual calls.
+
 # The line number a frame reports while a residual runs inside a call chain
 # that was inlined more than one level deep.
 #

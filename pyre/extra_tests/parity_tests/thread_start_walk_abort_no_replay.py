@@ -1,3 +1,6 @@
+# CPython-suite gap: threading tests cannot trigger pyre's inline-walk abort replay.
+# parity-tests reason: this is a JIT-only side-effect/resume regression.
+
 """A walk that aborts after executing a side-effecting residual must not replay it.
 
 An authoritative full-body walk executes residual calls concretely as it goes.

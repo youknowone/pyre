@@ -1,3 +1,6 @@
+# CPython-suite gap: unpack tests lack PyPy specialised-pair layout variants.
+# parity-tests reason: this guards pyre JIT layout guards and object identity.
+
 # Arity-2 unpacks across every makespecialisedtuple2 arm, plus the shapes the
 # fold must decline.
 BIG = (1 << 4095) + (1 << 2001) + 0x123456789

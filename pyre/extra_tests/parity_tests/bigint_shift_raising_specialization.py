@@ -1,3 +1,6 @@
+# CPython-suite gap: bigint shift tests do not compare cold/hot raising traces.
+# parity-tests reason: this guards pyre's JIT bigint shift specialization.
+
 """Guarded raising arms for exact-bigint shifts by a negative exact int."""
 
 import sys

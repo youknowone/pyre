@@ -1,3 +1,6 @@
+# CPython-suite gap: print tests do not collect while __str__ replaces the sink.
+# parity-tests reason: this guards pyre/PyPy moving-GC roots across callbacks.
+
 # `print()` keeps using the sink it resolved, after running Python that can
 # unbind it.
 #

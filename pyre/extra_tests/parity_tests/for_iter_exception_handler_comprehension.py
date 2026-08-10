@@ -1,3 +1,6 @@
+# CPython-suite gap: comprehension tests cannot trace FOR_ITER exception handlers.
+# parity-tests reason: this guards pyre's JIT comprehension handler control flow.
+
 class Payload:
     def __init__(self, value):
         self.value = value

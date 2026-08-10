@@ -1,3 +1,6 @@
+# CPython-suite gap: type-cache tests omit hot surrogate-name store/delete cycles.
+# parity-tests reason: this targets PyPy/pyre method-cache invalidation under JIT.
+
 """A hot surrogate-name type lookup observes store and delete invalidation."""
 
 N = 3000

@@ -1,3 +1,6 @@
+# CPython-suite gap: arithmetic tests do not trace mixed bigint/int division paths.
+# parity-tests reason: this guards pyre's JIT bigint descriptors and side exits.
+
 """`long // int` and `long % int` under a JIT-hot loop.
 
 The walker specialises this operand pair apart from the bigint/bigint leg:

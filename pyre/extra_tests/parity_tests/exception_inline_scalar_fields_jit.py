@@ -1,3 +1,6 @@
+# CPython-suite gap: exception tests do not trace inlined scalar field accesses.
+# parity-tests reason: this guards pyre's JIT exception-field virtualization.
+
 import io
 import sys
 

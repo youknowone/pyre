@@ -1,3 +1,6 @@
+# CPython-suite gap: functional builtin subclasses omit user-finalizer lifetime.
+# parity-tests reason: this guards PyPy-style allocation and moving-GC ownership.
+
 import gc
 
 

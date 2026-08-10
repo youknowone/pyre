@@ -1,3 +1,6 @@
+# CPython-suite gap: iteration tests cannot exercise a JIT inline-walk abort stack.
+# parity-tests reason: this is a pyre trace-abort operand-stack regression.
+
 # The operand stack an aborted inline sub-walk hands back to the interpreter,
 # for a call made inside a FOR_ITER body.
 #

@@ -1,3 +1,6 @@
+# CPython-suite gap: unpack tests cannot compare cold and JIT drain-loop kind fusion.
+# parity-tests reason: this is specific to pyre's traced unpack drain loop.
+
 """Facet A drain-loop exact-kind fusion regression guard.
 
 Guards pypy/interpreter/baseobjspace.py:1005-1015

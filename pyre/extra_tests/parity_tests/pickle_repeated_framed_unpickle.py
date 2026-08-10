@@ -1,3 +1,6 @@
+# CPython-suite gap: pickle tests omit this repeated framed-load hot/GC shape.
+# parity-tests reason: this guards pyre's JIT carrier state and moving-GC roots.
+
 """Trace cancellation must preserve every live Python frame.
 
 RPython's ``pyjitpl.py:2949-2955`` converts the complete MIFrame stack into

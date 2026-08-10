@@ -1,3 +1,6 @@
+# CPython-suite gap: CPython has no __pypy__.newmemoryview API to test.
+# parity-tests reason: this is an explicit PyPy API parity contract.
+
 """`__pypy__.newmemoryview` distinguishes an omitted geometry from `None`.
 
 `interp_buffer.py:47 if w_strides` / `:56 if w_shape` are reference tests over

@@ -67,3 +67,5 @@ assert "'ignore\\udcff'" in out, out
 assert "'error'" in out, out
 
 print("OK")
+# CPython-suite gap: command-line tests omit this undecodable option value.
+# It is a generic launcher contract, so it belongs in snippets.

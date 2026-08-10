@@ -1,3 +1,6 @@
+# CPython-suite gap: attribute tests omit raising probes in a devolved PyPy MapDict.
+# parity-tests reason: this directly targets PyPy/pyre MapDict lookup dispatch.
+
 """A devolved instance dictionary probed by attribute name.
 
 The probe compares the name against whatever each colliding bucket holds, so a

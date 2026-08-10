@@ -17,3 +17,5 @@ for filename in filenames:
         print(ascii(exc.filename))
 
 print("OK")
+# CPython-suite gap: symtable tests omit this filesystem-codec filename.
+# It is generic compiler behavior and therefore belongs in snippets.

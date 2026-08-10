@@ -1,3 +1,6 @@
+# CPython-suite gap: int div/mod tests do not compare cold/hot raising traces.
+# parity-tests reason: this guards pyre's JIT exact-int raising specialization.
+
 """Guarded raising arms for exact-int ``//`` and ``%``.
 
 Each traceback check compares a cold execution with the same source site after

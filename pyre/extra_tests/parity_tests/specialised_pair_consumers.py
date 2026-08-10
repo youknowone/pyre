@@ -1,3 +1,6 @@
+# CPython-suite gap: tuple consumers do not cover PyPy specialised-pair layouts.
+# parity-tests reason: this targets PyPy/pyre pair storage and JIT consumers.
+
 # Hot reads off an arity-2 tuple built by the interpreter, which routes
 # through `makespecialisedtuple2` and so carries inline `value0` / `value1`
 # slots instead of a `wrappeditems` array.  Every consumer that folds off the

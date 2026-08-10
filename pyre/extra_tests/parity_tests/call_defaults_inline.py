@@ -1,3 +1,6 @@
+# CPython-suite gap: call tests do not execute these default shapes in a hot trace.
+# parity-tests reason: the assertions target pyre's inlined-call JIT lowering.
+
 # Argument binding for calls that leave parameters to their defaults, run hot
 # enough to be traced.
 #

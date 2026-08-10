@@ -1,3 +1,6 @@
+# CPython-suite gap: call tests do not trace these *args callee seed shapes.
+# parity-tests reason: this guards pyre's inlined vararg frame construction.
+
 # Hot calls into a `*args` callee, across the shapes the inline seeding must
 # reproduce and the ones it must decline.  The vararg local is
 # `scope_w[co_argcount]` and holds `newtuple(starargs_w)`, so what is asserted

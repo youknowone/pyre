@@ -1,3 +1,6 @@
+# CPython-suite gap: exception tests do not inline stateful construction in a trace.
+# parity-tests reason: this guards pyre's JIT exception reconstruction.
+
 """A hot exception constructor keeps the fields its `descr_init` writes.
 
 The traced inline constructor rebuilds an exception from `kind` / `w_class` /
