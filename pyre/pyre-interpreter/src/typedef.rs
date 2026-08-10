@@ -11286,10 +11286,13 @@ fn init_type_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__prepare__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__prepare__",
-                |_args| Ok(pyre_object::w_dict_new()),
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_text_signature(
+                    "__prepare__",
+                    |_args| Ok(pyre_object::w_dict_new()),
+                    "($cls, name, bases, /, **kwds)",
+                ),
+            ),
         )
     };
 
@@ -11595,6 +11598,31 @@ fn init_type_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata for type's callable descriptor
+    // surface. `__prepare__` is attached to the carrier before its
+    // classmethod wrapper above; the remaining entries are plain builtin
+    // carriers in W_TypeObject.typedef's namespace.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__call__", "($self, /, *args, **kwargs)"),
+        ("__getattribute__", "($self, name, /)"),
+        ("__setattr__", "($self, name, value, /)"),
+        ("__delattr__", "($self, name, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("mro", "($self, /)"),
+        ("__subclasses__", "($self, /)"),
+        ("__instancecheck__", "($self, instance, /)"),
+        ("__subclasscheck__", "($self, subclass, /)"),
+        ("__dir__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("type TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 struct MroUpdate {
