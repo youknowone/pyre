@@ -195,8 +195,9 @@ pub fn enabled() -> bool {
     }
 }
 
-/// Pure half of [`enabled`], kept separate so the default-on contract is
-/// testable without racing process-global environment mutation.
+/// Pure half of [`enabled`] and [`collect_enabled`], kept separate so the
+/// default-on contract is testable without racing process-global environment
+/// mutation, and shared so the two switches cannot drift apart.
 fn enabled_from_env(value: Option<&OsStr>) -> bool {
     // Exactly `0`, and nothing else, takes the rollback path. An empty value is
     // what a launcher produces from an unset variable (`PYRE_GC_INTERP=$FOO`),
@@ -311,9 +312,8 @@ pub fn collect_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var_os("PYRE_GC_INTERP_COLLECT")
-                .map(|v| !v.is_empty() && v != "0")
-                .unwrap_or(true);
+            let value = std::env::var_os("PYRE_GC_INTERP_COLLECT");
+            let on = enabled_from_env(value.as_deref());
             COLLECT_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
@@ -331,7 +331,8 @@ mod tests {
         assert!(!enabled_from_env(Some(OsStr::new("0"))));
         assert!(enabled_from_env(Some(OsStr::new("1"))));
         // An unset variable expanded by a launcher arrives as an empty value;
-        // it must not select the leaking rollback path.
+        // it must not select the leaking rollback path, nor — through the
+        // `collect_enabled` sharing this predicate — silence the safepoint.
         assert!(enabled_from_env(Some(OsStr::new(""))));
     }
 }
