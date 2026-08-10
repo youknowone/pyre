@@ -59,23 +59,29 @@ fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
     // managed dict/weakref prefix where the instance type requests it.  A
     // tracked builtin such as list has only the first; a normal heap instance
     // has both; an untracked heap-derived value may have only the second.
+    //
+    // Both terms are read off the type. Asking instead which heap the instance
+    // landed in would make the answer depend on the allocation that produced
+    // it: a `str` folded into a code constant sits outside the collector's
+    // ranges and one built at run time does not, so the same value reported two
+    // different sizes.
     let word = std::mem::size_of::<usize>() as u64;
-    let gc_header = if pyre_object::gc_hook::try_gc_owns_object(current() as *mut u8) {
-        2 * word
-    } else {
-        0
-    };
-    let managed_prefix = crate::typedef::r#type(current()).map_or(0, |tp| unsafe {
-        if pyre_object::w_type_is_heaptype(tp.as_ptr())
-            && (pyre_object::w_type_get_hasdict(tp.as_ptr())
-                || pyre_object::w_type_get_weakrefable(tp.as_ptr()))
+    let pre_header = crate::typedef::r#type(current()).map_or(0, |tp| unsafe {
+        let tp = tp.as_ptr();
+        let gc_header = if pyre_object::typeobject::w_type_get_have_gc(tp) {
+            2 * word
+        } else {
+            0
+        };
+        let managed_prefix = if pyre_object::w_type_is_heaptype(tp)
+            && (pyre_object::w_type_get_hasdict(tp) || pyre_object::w_type_get_weakrefable(tp))
         {
             2 * word
         } else {
             0
-        }
+        };
+        gc_header + managed_prefix
     });
-    let pre_header = gc_header + managed_prefix;
     let total = (size as u64)
         .checked_add(pre_header)
         .expect("Py_ssize_t plus the fixed pre-header fits in size_t");

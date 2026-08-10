@@ -1547,6 +1547,41 @@ pub fn init_typeobjects() {
                 pyre_object::typeobject::w_type_set_flag_map_or_seq(w_typeobject, flag);
             }
         }
+        // `Py_TPFLAGS_HAVE_GC` — cleared for the builtin types whose CPython
+        // counterpart declares no `tp_traverse`, so `_PyType_PreHeaderSize`
+        // charges them no collector pre-header and `sys.getsizeof` adds none.
+        //
+        // These are exactly the leaf values: they hold no reference to another
+        // app-level object, only their own payload. That is a statement about
+        // the type, so it holds for an instance folded into a code constant and
+        // for one built at run time alike — the collector's own "does this
+        // struct have pointer fields" answer does not, because a pyre leaf
+        // struct still carries `w_dict` and `w_weakreflifeline` slots the
+        // CPython object has no counterpart of.
+        //
+        // Everything else keeps the default. Heap types keep it too, which is
+        // what `type_new` does: a class can always reach its instance dict.
+        for pytype in [
+            &pyre_object::pyobject::INSTANCE_TYPE,
+            &pyre_object::pyobject::INT_TYPE,
+            &pyre_object::pyobject::LONG_TYPE,
+            &pyre_object::pyobject::BOOL_TYPE,
+            &pyre_object::pyobject::FLOAT_TYPE,
+            &pyre_object::COMPLEX_TYPE,
+            &pyre_object::pyobject::STR_TYPE,
+            &pyre_object::bytesobject::BYTES_TYPE,
+            &pyre_object::bytearrayobject::BYTEARRAY_TYPE,
+            &pyre_object::pyobject::NONE_TYPE,
+            &pyre_object::pyobject::NOTIMPLEMENTED_TYPE,
+            &pyre_object::ELLIPSIS_TYPE,
+            &pyre_object::functional::RANGE_TYPE,
+        ] {
+            let w_typeobject = *reg
+                .get(&(pytype as *const PyType as usize))
+                .expect("built-in type object must be registered before flag_have_gc init")
+                as PyObjectRef;
+            unsafe { pyre_object::typeobject::w_type_clear_have_gc(w_typeobject) };
+        }
         // Set w_class on all built-in type objects to `type`.
         // baseobjspace.py getclass() — for type objects, the class
         // is the metatype (default: `type`).

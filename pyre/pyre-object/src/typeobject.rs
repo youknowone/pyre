@@ -236,6 +236,22 @@ pub struct W_TypeObject {
     /// `ModuleDictStrategy.version?`, the tree's other `?` declaration, the way
     /// upstream's one `QuasiImmut` class serves every quasi-immutable field.
     pub quasi_immut_watchers: crate::quasiimmut::QuasiImmutField,
+    /// `Py_TPFLAGS_HAVE_GC` (`1 << 14`) — whether instances of this type carry
+    /// the collector's two-word pre-header, which is what
+    /// `_PyType_PreHeaderSize` charges and `sys.getsizeof` therefore adds.
+    ///
+    /// A property of the type, not of the heap an instance landed in: the same
+    /// `str` value must report one size whether it was folded into a code
+    /// constant or built at run time. It is deliberately not the collector's
+    /// "does this object hold pointers" question either — a pyre `str` struct
+    /// carries `w_dict` and `w_weakreflifeline` slots the collector really does
+    /// follow, and the CPython `str` those slots have no counterpart in is not
+    /// a GC type.
+    ///
+    /// True by default, which is the answer for every heap type
+    /// (`type_new` sets the flag unconditionally) and for the container
+    /// builtins; the creation site of a scalar builtin clears it.
+    pub flag_have_gc: bool,
 }
 
 /// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py:73).
@@ -408,6 +424,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        flag_have_gc: true,
     };
     let (w_type, gc_managed) = if !raw.is_null() {
         unsafe { std::ptr::write(raw as *mut W_TypeObject, value) };
@@ -528,6 +545,7 @@ pub fn w_type_new_builtin(
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        flag_have_gc: true,
     }) as PyObjectRef;
     // A builtin type is Box-immortal, so its namespace values and `bases` are reachable only
     // through `walk_builtin_type_dicts_gc` (`pyre_interpreter::eval`).
@@ -629,6 +647,31 @@ pub unsafe fn w_type_set_disallow_instantiation(w_type: PyObjectRef) {
     let t = &*(w_type as *const W_TypeObject);
     t.flag_disallow_instantiation
         .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Clear [`W_TypeObject::flag_have_gc`] — the creation site of a builtin type
+/// whose CPython counterpart carries no `Py_TPFLAGS_HAVE_GC` calls this once.
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`.
+pub unsafe fn w_type_clear_have_gc(w_type: PyObjectRef) {
+    if w_type.is_null() || !is_type(w_type) {
+        return;
+    }
+    (*(w_type as *mut W_TypeObject)).flag_have_gc = false;
+}
+
+/// Whether instances of `w_type` carry the collector pre-header
+/// (`_PyType_IS_GC`). False for a null or non-type argument, which is the
+/// answer a caller with no type to ask wants.
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef.
+pub unsafe fn w_type_get_have_gc(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !is_type(w_type) {
+        return false;
+    }
+    (*(w_type as *const W_TypeObject)).flag_have_gc
 }
 
 /// `W_TypeObject.is_abstract` (typeobject.py:597-598).
