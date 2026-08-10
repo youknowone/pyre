@@ -91,7 +91,10 @@ assert isinstance(roots, list)
 raw_roots = [root for root in roots if type(root) is gc.GcRef]
 assert raw_roots
 
-raw_list_referents = gc.get_rpy_referents([])
+# A list with an item, because the raw walk reports the fields the object
+# actually holds: an empty list carries no storage block, so its only referent
+# is its type, which is app-level and passes through unwrapped.
+raw_list_referents = gc.get_rpy_referents([object()])
 assert any(type(referent) is gc.GcRef for referent in raw_list_referents)
 raw = raw_roots[0]
 memory_usage = gc.get_rpy_memory_usage(raw)
