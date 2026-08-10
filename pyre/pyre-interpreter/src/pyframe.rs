@@ -88,7 +88,7 @@ pub mod frame_locals_proxy {
 
         #[inline]
         fn mapping(&self) -> Result<PyObjectRef, crate::PyError> {
-            self.frame().getdictscope()
+            self.frame().frame_locals_proxy_snapshot()
         }
 
         fn call_mapping_method(
@@ -105,7 +105,7 @@ pub mod frame_locals_proxy {
             }
         }
 
-        fn key_is_fast_local(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
+        fn fast_local_index(&self, key: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
             let frame = self.frame();
             let code = frame.code();
             for (index, name) in code.varnames.iter().enumerate() {
@@ -113,10 +113,49 @@ pub mod frame_locals_proxy {
                     continue;
                 }
                 if crate::baseobjspace::eq_w(pyre_object::w_str_new(name.as_ref()), key)? {
-                    return Ok(true);
+                    return Ok(Some(index));
                 }
             }
-            Ok(false)
+            let mut index = code.varnames.len();
+            for name in code.cellvars.iter() {
+                if code.varnames.iter().any(|local| local == name) {
+                    continue;
+                }
+                if crate::baseobjspace::eq_w(pyre_object::w_str_new(name.as_ref()), key)? {
+                    return Ok(Some(index));
+                }
+                index += 1;
+            }
+            for name in code.freevars.iter() {
+                if crate::baseobjspace::eq_w(pyre_object::w_str_new(name.as_ref()), key)? {
+                    return Ok(Some(index));
+                }
+                index += 1;
+            }
+            Ok(None)
+        }
+
+        fn setitem_value(
+            &mut self,
+            key: PyObjectRef,
+            value: PyObjectRef,
+        ) -> Result<(), crate::PyError> {
+            if let Some(index) = self.fast_local_index(key)? {
+                let frame = self.frame();
+                let slot = locals_w!(frame)[index];
+                if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                    unsafe { pyre_object::w_cell_set(slot, value) };
+                } else {
+                    frame.set_locals_w(index, value);
+                }
+                return Ok(());
+            }
+            let backing = self.frame().get_or_create_w_locals();
+            crate::baseobjspace::setitem(backing, key, value).map(|_| ())
+        }
+
+        fn key_is_fast_local(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
+            Ok(self.fast_local_index(key)?.is_some())
         }
     }
 
@@ -160,9 +199,7 @@ pub mod frame_locals_proxy {
             key: PyObjectRef,
             value: PyObjectRef,
         ) -> Result<(), crate::PyError> {
-            let mapping = self.mapping()?;
-            crate::baseobjspace::setitem(mapping, key, value)?;
-            self.frame().locals2fast(false)
+            self.setitem_value(key, value)
         }
 
         fn __delitem__(&mut self, key: PyObjectRef) -> Result<(), crate::PyError> {
@@ -175,7 +212,7 @@ pub mod frame_locals_proxy {
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            crate::baseobjspace::delitem(mapping, key)
+            crate::baseobjspace::delitem(self.frame().get_or_create_w_locals(), key)
         }
 
         fn __len__(&self) -> Result<i64, crate::PyError> {
@@ -240,8 +277,19 @@ pub mod frame_locals_proxy {
         }
 
         fn update(&mut self, other: PyObjectRef) -> Result<(), crate::PyError> {
-            self.call_mapping_method("update", &[other])?;
-            self.frame().locals2fast(false)
+            // frameobject.c `framelocalsproxy_merge` applies only the incoming
+            // mapping's keys.  Starting from the proxy snapshot would also
+            // replay every existing hidden local into the backing namespace.
+            let incoming = unsafe { pyre_object::w_dict_new() };
+            let result = crate::baseobjspace::call_method(incoming, "update", &[other]);
+            if result.is_null() {
+                return Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| crate::PyError::runtime_error("update failed")));
+            }
+            for (key, value) in unsafe { pyre_object::dictmultiobject::w_dict_items(incoming) } {
+                self.setitem_value(key, value)?;
+            }
+            Ok(())
         }
 
         fn setdefault(
@@ -249,9 +297,14 @@ pub mod frame_locals_proxy {
             key: PyObjectRef,
             #[default(pyre_object::w_none())] default: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            let result = self.call_mapping_method("setdefault", &[key, default])?;
-            self.frame().locals2fast(false)?;
-            Ok(result)
+            match self.__getitem__(key) {
+                Ok(value) => Ok(value),
+                Err(err) if err.kind == crate::PyErrorKind::KeyError => {
+                    self.setitem_value(key, default)?;
+                    Ok(default)
+                }
+                Err(err) => Err(err),
+            }
         }
 
         fn pop(&mut self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -268,7 +321,14 @@ pub mod frame_locals_proxy {
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            self.call_mapping_method("pop", call_args)
+            let backing = self.frame().get_or_create_w_locals();
+            let result = crate::baseobjspace::call_method(backing, "pop", call_args);
+            if result.is_null() {
+                Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| crate::PyError::runtime_error("pop failed")))
+            } else {
+                Ok(result)
+            }
         }
 
         fn __or__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -2011,8 +2071,10 @@ pub fn ncells(code: &CodeObject) -> usize {
 }
 
 /// True when localsplus slot `idx` carries `CO_FAST_HIDDEN`, i.e. an inlined
-/// comprehension's iteration variable (PEP 709). These slots are workspace
-/// only and stay invisible to `locals()` / the fast↔locals sync.
+/// comprehension's iteration variable (PEP 709).  The flag records that the
+/// surrounding binding is saved and restored by the comprehension bytecode;
+/// while the comprehension is running, its current value is still visible to
+/// `locals()` like every other fast local.
 #[inline]
 #[majit_macros::elidable_cannot_raise]
 pub fn hidden_local(code: &CodeObject, idx: usize) -> bool {
@@ -2471,6 +2533,11 @@ impl PyFrame {
     /// Module and class frames keep handing back their real namespace, which
     /// is what makes a module-level `locals() is globals()` still hold.
     pub fn frame_locals_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        if !self.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+            && self.has_active_hidden_locals()
+        {
+            return self.frame_locals_proxy_snapshot();
+        }
         let w_locals = self.getdictscope()?;
         if w_locals.is_null() || !self.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
             return Ok(w_locals);
@@ -2486,6 +2553,53 @@ impl PyFrame {
             pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
             pyre_object::gc_roots::shadow_stack_get(locals_slot),
         )?;
+        Ok(pyre_object::gc_roots::shadow_stack_get(snapshot_slot))
+    }
+
+    /// CPython 3.14 `_PyFrame_HasHiddenLocals`: a non-optimized module/class
+    /// frame uses a locals proxy only while a PEP 709 hidden slot is bound.
+    pub fn has_active_hidden_locals(&self) -> bool {
+        let code = self.code();
+        (0..code.varnames.len())
+            .any(|index| hidden_local(code, index) && !locals_w!(self)[index].is_null())
+    }
+
+    /// Materialize the current contents of CPython's FrameLocalsProxy.
+    /// Optimized frames use their regular fast-to-locals snapshot.  For a
+    /// non-optimized frame, copy the real module/class namespace and overlay
+    /// only currently-bound hidden comprehension locals; never write those
+    /// temporary bindings into the real namespace.
+    pub fn frame_locals_proxy_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        if self.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
+            let w_locals = self.getdictscope()?;
+            let snapshot = unsafe { pyre_object::w_dict_new() };
+            crate::opcode_ops::dict_update_value(snapshot, w_locals)?;
+            return Ok(snapshot);
+        }
+
+        let _roots = pyre_object::gc_roots::push_roots();
+        let backing_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(self.get_or_create_w_locals());
+        let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_dict_new() });
+        crate::opcode_ops::dict_update_value(
+            pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
+            pyre_object::gc_roots::shadow_stack_get(backing_slot),
+        )?;
+        let code = self.code();
+        for index in 0..code.varnames.len() {
+            if !hidden_local(code, index) {
+                continue;
+            }
+            let value = locals_w!(self)[index];
+            if !value.is_null() {
+                setitem_str_object(
+                    pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
+                    &code.varnames[index],
+                    value,
+                )?;
+            }
+        }
         Ok(pyre_object::gc_roots::shadow_stack_get(snapshot_slot))
     }
 
@@ -3682,20 +3796,24 @@ impl PyFrame {
         let code = unsafe { &*code_ptr };
         let numlocals = code.varnames.len();
 
-        let mut new_fastlocals_w = vec![PY_NULL; numlocals];
         for i in 0..numlocals {
-            // CO_FAST_HIDDEN slots are not reflected in the locals mapping —
-            // preserve the current fast value instead of clearing it.
+            // FrameLocalsProxy writes do not target hidden comprehension
+            // locals; they fall through to the underlying module/class
+            // namespace instead (frameobject.c framelocalsproxy_getkeyindex).
             if hidden_local(code, i) {
-                new_fastlocals_w[i] = locals_w!(self)[i];
                 continue;
             }
             let name = &code.varnames[i];
-            if let Some(w_value) = finditem_str_object(w_locals, name)? {
-                new_fastlocals_w[i] = w_value;
+            let w_value = finditem_str_object(w_locals, name)?.unwrap_or(PY_NULL);
+            let slot = locals_w!(self)[i];
+            let is_cell_slot = i < code.localspluskinds.len()
+                && code.localspluskinds[i] & crate::bytecode::CO_FAST_CELL != 0;
+            if is_cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                unsafe { pyre_object::w_cell_set(slot, w_value) };
+            } else {
+                self.set_locals_w(i, w_value);
             }
         }
-        self.setfastscope(&new_fastlocals_w);
 
         let pure_cells: Vec<&_> = code
             .cellvars
@@ -3765,12 +3883,22 @@ impl PyFrame {
         let numlocals = varnames.len();
 
         for i in 0..numlocals {
-            // CO_FAST_HIDDEN slots are not user-visible — see fast2locals.
-            if hidden_local(code, i) {
+            // Non-optimized frames expose a bound hidden slot through a
+            // FrameLocalsProxy snapshot instead.  Copying it into the actual
+            // module/class namespace would leak the comprehension variable.
+            if hidden_local(code, i) && !code.flags.contains(CodeFlags::OPTIMIZED) {
                 continue;
             }
             let name = &varnames[i];
-            let w_value = locals_w!(self)[i];
+            let slot = locals_w!(self)[i];
+            let is_cell_slot = i < code.localspluskinds.len()
+                && code.localspluskinds[i] & crate::bytecode::CO_FAST_CELL != 0;
+            let w_value =
+                if is_cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                    unsafe { pyre_object::w_cell_get(slot) }
+                } else {
+                    slot
+                };
             if !w_value.is_null() {
                 setitem_str_object(w_locals, name, w_value)?;
             } else {

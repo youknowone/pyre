@@ -1385,6 +1385,9 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let mut filename_inherits_to_nested =
         unsafe { (*(w_self as *const PyCode)).filename_inherits_to_nested };
     let get = |name: &str| crate::builtins::kwarg_get(kwargs, name);
+    let rebuild_localspluskinds = get("co_varnames").is_some()
+        || get("co_cellvars").is_some()
+        || get("co_freevars").is_some();
 
     if let Some(v) = get("co_argcount") {
         code.arg_count = unsafe { read_code_u32(v, "co_argcount")? };
@@ -1479,21 +1482,26 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         ));
     }
 
-    // CPython's locals-plus table marks local/cell aliases in their existing
-    // local slot, then appends pure cells and free variables.
-    let mut localspluskinds = vec![crate::bytecode::CO_FAST_LOCAL; code.varnames.len()];
-    for cell in code.cellvars.iter() {
-        if let Some(index) = code.varnames.iter().position(|name| name == cell) {
-            localspluskinds[index] |= crate::bytecode::CO_FAST_CELL;
-        } else {
-            localspluskinds.push(crate::bytecode::CO_FAST_CELL);
+    // PyCode_Replace preserves the private locals-plus kind table when only
+    // unrelated public fields change.  This matters for PEP 709's
+    // CO_FAST_HIDDEN slots, which cannot be reconstructed from co_varnames,
+    // co_cellvars and co_freevars.  Rebuild only when one of those public
+    // layout fields was explicitly replaced.
+    if rebuild_localspluskinds {
+        let mut localspluskinds = vec![crate::bytecode::CO_FAST_LOCAL; code.varnames.len()];
+        for cell in code.cellvars.iter() {
+            if let Some(index) = code.varnames.iter().position(|name| name == cell) {
+                localspluskinds[index] |= crate::bytecode::CO_FAST_CELL;
+            } else {
+                localspluskinds.push(crate::bytecode::CO_FAST_CELL);
+            }
         }
+        localspluskinds.extend(std::iter::repeat_n(
+            crate::bytecode::CO_FAST_FREE,
+            code.freevars.len(),
+        ));
+        code.localspluskinds = localspluskinds.into_boxed_slice();
     }
-    localspluskinds.extend(std::iter::repeat_n(
-        crate::bytecode::CO_FAST_FREE,
-        code.freevars.len(),
-    ));
-    code.localspluskinds = localspluskinds.into_boxed_slice();
     code.locations = rustpython_compiler_core::marshal::linetable_to_locations(
         &code.linetable,
         firstlineno_raw,

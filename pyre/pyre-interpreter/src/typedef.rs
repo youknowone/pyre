@@ -7651,7 +7651,9 @@ fn init_frame_type(ns: PyObjectRef) {
             // reached through a traceback's `tb_frame` gets neither.
             crate::executioncontext::force_frame_before_locals_read(f);
             let frame = unsafe { &mut *f };
-            if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
+            if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+                || frame.has_active_hidden_locals()
+            {
                 return Ok(crate::pyframe::frame_locals_proxy::new(args[1]));
             }
             let w = frame.getdictscope()?;

@@ -12656,16 +12656,16 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if args.is_empty() {
         // `bltinmodule.c builtin_dir` — with no argument, list the names in
         // the caller's local scope: `sorted(frame.f_locals)`.  Resolve the
-        // frame exactly as `locals()` does (module scope returns the globals
-        // dict), then return the mapping's sorted keys.  `getdictscope` rather
-        // than `frame_locals_snapshot`: only the key set is read, and the two
-        // agree on it, so the snapshot copy would be a pure allocation.
+        // frame exactly as `locals()` does, then return the mapping's sorted
+        // keys.  PEP 709 hidden comprehension locals are present in the frame
+        // snapshot while active even though they are absent from a module or
+        // class namespace, so `getdictscope` is not equivalent here.
         let frame = topframe_for_locals();
         if frame.is_null() {
             return Ok(w_list_new(vec![]));
         }
         let frame_mut = unsafe { &mut *frame };
-        let w_locals_dict = frame_mut.getdictscope()?;
+        let w_locals_dict = frame_mut.frame_locals_snapshot()?;
         if w_locals_dict.is_null() {
             return Ok(w_list_new(vec![]));
         }
