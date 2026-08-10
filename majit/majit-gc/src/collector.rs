@@ -2095,6 +2095,19 @@ impl MiniMarkGC {
                 }
             }
         }
+        // incminimark.py:1826-1832: replace the list before anything can append
+        // to it, so parents discovered during this minor accumulate in the
+        // fresh one instead of in the copy being drained. Upstream performs the
+        // swap after `collect_roots_in_nursery` because its root callback
+        // passes a NULL parent and therefore records nothing; the
+        // old-generation jitframe arm of Phase 1c below traces with a real
+        // parent, so here the swap has to come first. A parent recorded after
+        // the swap keeps `GCFLAG_PINNED_OBJECT_PARENT_KNOWN` for the rest of
+        // the minor and would not be re-recorded when the drained copy is
+        // visited, which would drop it from the list permanently and leave the
+        // flag set for good.
+        let old_parents_pointing_to_pinned =
+            std::mem::take(&mut self.old_objects_pointing_to_pinned);
         crate::bh_probe_clear_traced();
         // Phase 1: Process roots — copy nursery objects they point to.
         // We use raw pointers to avoid borrow checker issues since
@@ -2220,13 +2233,10 @@ impl MiniMarkGC {
 
         // incminimark.py:1820-1832: old parents that reached a pinned child in
         // the previous minor must be traced again. `copy_nursery_object`
-        // repopulates a fresh list only for parents that still point to a
-        // pinned object.
-        if !self.old_objects_pointing_to_pinned.is_empty() {
-            let old_parents = std::mem::take(&mut self.old_objects_pointing_to_pinned);
-            for obj_addr in old_parents {
-                self.trace_and_update_object(obj_addr, "minor_old_parent_pinned");
-            }
+        // repopulates the list swapped in above, and only for parents that
+        // still point to a pinned object.
+        for obj_addr in old_parents_pointing_to_pinned {
+            self.trace_and_update_object(obj_addr, "minor_old_parent_pinned");
         }
 
         // incminimark parity: during an active marking cycle, old objects
@@ -2664,7 +2674,14 @@ impl MiniMarkGC {
         // pinning is not a root. Record it only when a real traced edge reaches
         // it, and remember an old parent so that edge is revisited next minor.
         if self.pinned_objects.contains(&obj_addr) {
-            if holder_addr != 0 && self.is_managed_heap_object(holder_addr) {
+            // incminimark.py:2194-2199 records an old parent. The list outlives
+            // the nursery reset at the end of this minor and is dereferenced in
+            // the next one, so a nursery holder would become a read of recycled
+            // nursery bytes; `is_managed_heap_object` alone accepts one.
+            if holder_addr != 0
+                && self.is_managed_heap_object(holder_addr)
+                && !self.is_in_nursery(holder_addr)
+            {
                 let holder_hdr = unsafe { header_of(holder_addr) };
                 if unsafe { !(*holder_hdr).has_flag(flags::PINNED) } {
                     self.old_objects_pointing_to_pinned.push(holder_addr);
@@ -3502,6 +3519,14 @@ impl MiniMarkGC {
     /// (`gctransform/framework.py:861-878`). A negative size releases
     /// previously reported pressure just as upstream does.
     pub fn do_add_memory_pressure(&mut self, size: isize, object: GcRef) {
+        // The forced-top store below rewrites the same published free/top words
+        // compiled code reads inline, so park the other mutators for it the way
+        // every other entry point that mutates published allocator state does.
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
         if !object.is_null() && self.is_managed_heap_object(object.0) {
             let type_id = unsafe { (*header_of(object.0)).type_id() };
             if (type_id as usize) < self.types.len() {
@@ -9975,6 +10000,46 @@ cache size\t: 8192 kB\n";
         assert!(!gc.is_pinned(child));
         assert_eq!(gc.pinned_objects_in_nursery, 0);
         assert!(gc.old_objects_pointing_to_pinned.is_empty());
+        gc.roots.clear();
+    }
+
+    /// The sibling above only ever discovers the parent *after* the list is
+    /// swapped out. Phase 1c traces an old-generation jitframe directly, with
+    /// itself as the holder, and that runs earlier — so a parent found there
+    /// would be re-flagged before the drained copy is visited, never make it
+    /// into the fresh list, and keep `PINNED` set for good.
+    #[test]
+    fn test_old_parent_found_before_the_swap_stays_in_the_list() {
+        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        crate::shadow_stack::clear();
+        let mut gc = test_gc(4096);
+        let child_tid = gc.register_type(TypeInfo::simple(16));
+        let parent_tid = gc.register_type(TypeInfo::with_gc_ptrs(16, vec![0]));
+        let child = gc.alloc_with_type(child_tid, 16);
+        let mut parent = gc.alloc_with_type(parent_tid, 16);
+        unsafe { *(parent.0 as *mut GcRef) = child };
+        assert!(gc.pin(child));
+        unsafe { gc.roots.add(&mut parent) };
+
+        gc.do_collect_nursery();
+        assert!(gc.oldgen.contains(parent.0));
+        assert!(gc.is_pinned(child));
+        assert_eq!(gc.old_objects_pointing_to_pinned, vec![parent.0]);
+
+        // Publish the promoted parent as a jitframe root so the minor below
+        // reaches it through the pre-swap old-generation arm as well.
+        crate::shadow_stack::push_jf(parent);
+        gc.do_collect_nursery();
+        assert_eq!(gc.old_objects_pointing_to_pinned, vec![parent.0]);
+        assert!(gc.is_pinned(child));
+
+        // The edge is still the child's only reference, so losing the parent
+        // record above would let this minor reclaim it.
+        gc.do_collect_nursery();
+        assert!(gc.is_pinned(child));
+        assert_eq!(unsafe { *(parent.0 as *const GcRef) }, child);
+
+        crate::shadow_stack::pop_jf_to(0);
         gc.roots.clear();
     }
 

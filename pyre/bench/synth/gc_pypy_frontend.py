@@ -177,10 +177,15 @@ def warm_jit_for_code_stats():
     return total
 
 
+before_jit_stats = gc._get_stats()
 jit_total = warm_jit_for_code_stats()
 assert jit_total == 12497500
 jit_stats = gc._get_stats()
 assert jit_stats.jit_backend_allocated >= jit_stats.jit_backend_used > 0
+# Tie the counters to this loop rather than to whatever the process emitted
+# earlier: a bare `> 0` would still pass if the warm-up compiled nothing.
+assert jit_stats.jit_backend_used > before_jit_stats.jit_backend_used
+assert jit_stats.jit_backend_allocated >= before_jit_stats.jit_backend_allocated
 
 
 # `hook.py:LowLevelGcHooks` only aggregates counters and fires three

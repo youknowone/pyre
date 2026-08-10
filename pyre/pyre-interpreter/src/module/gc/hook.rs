@@ -149,7 +149,7 @@ impl GcCollectStepHookAction {
             duration_max,
             oldstate,
             newstate,
-            newstate == 0,
+            super::is_done_states(oldstate, newstate),
         )?;
         pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;

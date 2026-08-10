@@ -1004,7 +1004,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 | retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 11 + 1 |
 | not gates (identifiers) | 12 |
 | dead (no read site) | 10 |
-| live default-ON, kept until epic closes | 10 |
+| live default-ON, kept until epic closes | 9 |
 | diagnostics (OFF) | ~34 |
 | default-OFF experiments (all keep — adoption targets) | 3 |
 | config / value / master | ~17 |
