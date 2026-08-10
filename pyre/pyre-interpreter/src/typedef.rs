@@ -4172,6 +4172,20 @@ fn range_descr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_bool_from(unsafe { pyre_object::w_range_bool(args[0]) }))
 }
 
+fn make_range_method(
+    name: &'static str,
+    function: DunderFn,
+    arity: u16,
+    text_signature: &'static str,
+) -> PyObjectRef {
+    crate::gateway::make_builtin_function_with_arity_and_text_signature(
+        name,
+        function,
+        arity,
+        text_signature,
+    )
+}
+
 /// PyPy `functional.py W_Range.typedef`, kept in the same entry order.
 fn init_range_type(ns: PyObjectRef) {
     unsafe {
@@ -4189,83 +4203,109 @@ fn init_range_type(ns: PyObjectRef) {
             ),
         )
     };
+    let new_descr = make_new_descr(range_descr_new);
+    unsafe {
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
+    };
     let entries = [
-        ("__new__", make_new_descr(range_descr_new)),
+        ("__new__", new_descr),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", range_descr_repr, 1),
+            make_range_method("__repr__", range_descr_repr, 1, "($self, /)"),
         ),
         (
             "__getitem__",
-            make_builtin_function_with_arity("__getitem__", range_descr_getitem, 2),
+            make_range_method("__getitem__", range_descr_getitem, 2, "($self, key, /)"),
         ),
         (
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::range_iter_method, 1),
+            make_range_method(
+                "__iter__",
+                crate::baseobjspace::range_iter_method,
+                1,
+                "($self, /)",
+            ),
         ),
         (
             "__len__",
-            make_builtin_function_with_arity("__len__", range_descr_len, 1),
+            make_range_method("__len__", range_descr_len, 1, "($self, /)"),
         ),
         (
             "__reversed__",
-            make_builtin_function_with_arity(
+            make_range_method(
                 "__reversed__",
                 crate::baseobjspace::range_reversed_method,
                 1,
+                "($self, /)",
             ),
         ),
         (
             "__reduce__",
-            make_builtin_function_with_arity(
+            make_range_method(
                 "__reduce__",
                 crate::baseobjspace::range_reduce_method,
                 1,
+                "($self, /)",
             ),
         ),
         (
             "__contains__",
-            make_builtin_function_with_arity("__contains__", range_descr_contains, 2),
+            make_range_method("__contains__", range_descr_contains, 2, "($self, key, /)"),
         ),
         (
             "__eq__",
-            make_builtin_function_with_arity("__eq__", range_descr_eq, 2),
+            make_range_method("__eq__", range_descr_eq, 2, "($self, value, /)"),
         ),
         (
             "__ne__",
-            make_builtin_function_with_arity("__ne__", range_descr_ne, 2),
+            make_range_method("__ne__", range_descr_ne, 2, "($self, value, /)"),
         ),
         (
             "__lt__",
-            make_builtin_function_with_arity("__lt__", range_descr_lt, 2),
+            make_range_method("__lt__", range_descr_lt, 2, "($self, value, /)"),
         ),
         (
             "__le__",
-            make_builtin_function_with_arity("__le__", range_descr_le, 2),
+            make_range_method("__le__", range_descr_le, 2, "($self, value, /)"),
         ),
         (
             "__gt__",
-            make_builtin_function_with_arity("__gt__", range_descr_gt, 2),
+            make_range_method("__gt__", range_descr_gt, 2, "($self, value, /)"),
         ),
         (
             "__ge__",
-            make_builtin_function_with_arity("__ge__", range_descr_ge, 2),
+            make_range_method("__ge__", range_descr_ge, 2, "($self, value, /)"),
         ),
         (
             "__hash__",
-            make_builtin_function_with_arity("__hash__", crate::baseobjspace::range_hash_method, 1),
+            make_range_method(
+                "__hash__",
+                crate::baseobjspace::range_hash_method,
+                1,
+                "($self, /)",
+            ),
         ),
         (
             "__bool__",
-            make_builtin_function_with_arity("__bool__", range_descr_bool, 1),
+            make_range_method("__bool__", range_descr_bool, 1, "($self, /)"),
         ),
         (
             "count",
-            make_builtin_function_with_arity("count", crate::baseobjspace::range_count_method, 2),
+            make_range_method(
+                "count",
+                crate::baseobjspace::range_count_method,
+                2,
+                "($self, object, /)",
+            ),
         ),
         (
             "index",
-            make_builtin_function_with_arity("index", crate::baseobjspace::range_index_method, 2),
+            make_range_method(
+                "index",
+                crate::baseobjspace::range_index_method,
+                2,
+                "($self, object, /)",
+            ),
         ),
     ];
     for (name, value) in entries {
