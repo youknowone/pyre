@@ -396,10 +396,22 @@ fn app_hooks() -> Option<&'static mut W_AppLevelHooks> {
         .and_then(|addr| W_AppLevelHooks::from_obj(*addr as PyObjectRef))
 }
 
-/// Create the space-owned singleton and bind its actions to the process
+/// Create the space-owned singleton and bind its three actions to an
 /// actionflag. The main ExecutionContext calls this during bootstrap, before
-/// worker ECs can import `gc`, so the actionflag pointer has process lifetime
-/// just like PyPy's `space.actionflag`.
+/// worker ECs can import `gc`, so the flag it passes outlives every later EC.
+///
+/// Reach, however, is not lifetime, and this is where pyre still departs from
+/// PyPy. There `actionflag` belongs to the `space`, so every execution context
+/// dispatches the same set; here it is a field on each `ExecutionContext`
+/// (`executioncontext.rs` `pub actionflag: ActionFlag`), and an `AsyncAction`
+/// binds to exactly one flag when `register_nonperiodic_action` hands it an
+/// `_action_index` for that flag's bitmask. `get_or_init` therefore leaves the
+/// hooks registered with the bootstrapping EC alone: a worker thread that runs
+/// a collection fires a bit its own dispatch loop never reads, so its callback
+/// waits for the bootstrapping thread to reach an opcode. Closing this means
+/// moving `ActionFlag` onto the space the way upstream has it, not
+/// re-registering per EC — the second flag would overwrite the index the first
+/// one handed out.
 pub fn initialize(
     space: PyObjectRef,
     actionflag: &mut (dyn ActionFlagOps + 'static),

@@ -4280,16 +4280,15 @@ thread_local! {
 }
 
 /// `jit_hooks.stats_asmmemmgr_{allocated,used}` parity.  The upstream stats
-/// object reads the CPU attached to the current interpreter. Pyre's existing
-/// interpreter/JIT owner is the per-mutator `JIT_DRIVER`; inspect that owner
-/// in place without creating a driver merely because `gc.get_stats()` was
-/// queried before any JIT activity.
+/// object reads the assembler memory manager of the single CPU an RPython
+/// process owns, so its numbers cover all compiled code.  Pyre builds a
+/// backend per mutator thread (`JIT_DRIVER` is thread-local), and reading the
+/// caller's entry would report zero from a thread that never compiled and omit
+/// every block a worker's compiler owns.  Read the process-wide mirror the
+/// per-CPU managers feed instead; it also answers before any driver exists,
+/// so `gc.get_stats()` still creates none.
 fn active_jit_backend_memory_stats() -> (usize, usize) {
-    JIT_DRIVER.with(|cell| unsafe {
-        (&*cell.get())
-            .as_ref()
-            .map_or((0, 0), |pair| pair.0.assembler_memory_stats())
-    })
+    majit_backend::process_assembler_memory_stats()
 }
 
 fn build_jit_driver_pair() -> JitDriverPair {

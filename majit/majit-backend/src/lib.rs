@@ -1714,11 +1714,37 @@ pub struct AsmMemoryManagerStats {
     total_mallocs: AtomicUsize,
 }
 
+/// The same accounting summed over every CPU in the process.
+///
+/// `jit_hooks.stats_asmmemmgr_{allocated,used}` reads the assembler memory
+/// manager of the one CPU an RPython process owns, so the numbers it reports
+/// are process totals. Pyre builds an independent backend — and with it an
+/// independent [`AsmMemoryManagerStats`] — per mutator thread, so no single
+/// instance answers that question: a query from one thread would omit every
+/// block another thread's compiler owns. Each instance therefore mirrors its
+/// counters here, and process-level consumers read this.
+static PROCESS_ASM_MEMORY_STATS: AsmMemoryManagerStats = AsmMemoryManagerStats {
+    total_memory_allocated: AtomicUsize::new(0),
+    total_mallocs: AtomicUsize::new(0),
+};
+
+/// `jit_hooks.stats_asmmemmgr_allocated` / `_used` — the whole process, not
+/// the calling thread. See [`PROCESS_ASM_MEMORY_STATS`].
+pub fn process_assembler_memory_stats() -> (usize, usize) {
+    PROCESS_ASM_MEMORY_STATS.get_stats()
+}
+
 impl AsmMemoryManagerStats {
     pub fn record_block(self: &Arc<Self>, allocated: usize, used: usize) -> AsmMemoryBlock {
         self.total_memory_allocated
             .fetch_add(allocated, Ordering::Relaxed);
         self.total_mallocs.fetch_add(used, Ordering::Relaxed);
+        PROCESS_ASM_MEMORY_STATS
+            .total_memory_allocated
+            .fetch_add(allocated, Ordering::Relaxed);
+        PROCESS_ASM_MEMORY_STATS
+            .total_mallocs
+            .fetch_add(used, Ordering::Relaxed);
         AsmMemoryBlock {
             owner: Arc::clone(self),
             used,
@@ -1742,6 +1768,9 @@ pub struct AsmMemoryBlock {
 impl Drop for AsmMemoryBlock {
     fn drop(&mut self) {
         self.owner
+            .total_mallocs
+            .fetch_sub(self.used, Ordering::Relaxed);
+        PROCESS_ASM_MEMORY_STATS
             .total_mallocs
             .fetch_sub(self.used, Ordering::Relaxed);
     }
