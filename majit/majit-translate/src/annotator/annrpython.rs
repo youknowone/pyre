@@ -11,7 +11,7 @@
 //! comment verbatim and a `todo!()` stub so every stub surfaces at
 //! runtime rather than silently no-op'ing.
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -30,6 +30,15 @@ use crate::translator::translator::TranslationContext;
 /// (`rpython/tool/ansi_print.py` parity port); both unconditionally
 /// route output to stderr.
 pub static LOG: AnsiLogger = AnsiLogger::new("annrpython");
+
+/// One entry of [`RPythonAnnotator::notify`].
+pub(crate) struct NotifyEntry {
+    /// Retains the block so its address cannot be recycled by a later
+    /// block — the identity the key encodes must stay unique for as
+    /// long as the entry lives.
+    block: BlockRef,
+    positions: IndexSet<PositionKey>,
+}
 
 /// RPython `class RPythonAnnotator(object)` (annrpython.py:22).
 ///
@@ -91,7 +100,9 @@ pub struct RPythonAnnotator {
     /// RPython `self.links_followed = {}` (annrpython.py:39).
     pub links_followed: RefCell<HashSet<LinkKey>>,
     /// RPython `self.notify = {}` (annrpython.py:40).
-    pub(crate) notify: RefCell<IndexMap<BlockKey, HashSet<PositionKey>>>,
+    /// The ordered container is required because the key hashes on a
+    /// pointer and the loop over the values produces a work order.
+    pub(crate) notify: RefCell<IndexMap<BlockKey, NotifyEntry>>,
     /// RPython `self.fixed_graphs = {}` (annrpython.py:41). Graphs
     /// that have already been rtyped — `addpendingblock` rejects new
     /// pending entries against these.
@@ -965,7 +976,11 @@ impl RPythonAnnotator {
             self.notify
                 .borrow_mut()
                 .entry(BlockKey::of(&returnblock))
-                .or_default()
+                .or_insert_with(|| NotifyEntry {
+                    block: Rc::clone(&returnblock),
+                    positions: IndexSet::new(),
+                })
+                .positions
                 .insert(pk);
         }
 
@@ -1314,7 +1329,10 @@ impl RPythonAnnotator {
                 // owning graph; treat `None` (= False) entries as
                 // "blocked".
                 let annotated = self.annotated.borrow();
-                let mut graphs: HashMap<GraphKey, GraphRef> = HashMap::new();
+                // The ordered container is required because the key
+                // hashes on a pointer and the loop over the values
+                // produces a work order.
+                let mut graphs: IndexMap<GraphKey, GraphRef> = IndexMap::new();
                 let mut got_blocked = false;
                 for bkey in added_set.keys() {
                     match annotated
@@ -1417,7 +1435,10 @@ impl RPythonAnnotator {
     pub(crate) fn seed_all_annotated_return_vars(&self) {
         let graphs: Vec<GraphRef> = {
             let annotated = self.annotated.borrow();
-            let mut seen: HashMap<GraphKey, GraphRef> = HashMap::new();
+            // The ordered container is required because the key hashes
+            // on a pointer and the loop over the values produces a work
+            // order.
+            let mut seen: IndexMap<GraphKey, GraphRef> = IndexMap::new();
             for g in annotated.values().flatten() {
                 seen.entry(GraphKey::of(g)).or_insert_with(|| Rc::clone(g));
             }
@@ -2877,12 +2898,14 @@ impl RPythonAnnotator {
         // self.notify[block]: self.reflowfromposition(position)`.
         let positions: Vec<PositionKey> = {
             let bkey = BlockKey::of(block);
-            self.notify
-                .borrow()
-                .get(&bkey)
-                .cloned()
-                .map(|set| set.into_iter().collect())
-                .unwrap_or_default()
+            let notify = self.notify.borrow();
+            match notify.get(&bkey) {
+                Some(entry) => {
+                    debug_assert_eq!(BlockKey::of(&entry.block), bkey);
+                    entry.positions.iter().cloned().collect()
+                }
+                None => Vec::new(),
+            }
         };
         for position in positions {
             // upstream: `self.reflowfromposition(position)`
@@ -3387,10 +3410,11 @@ mod tests {
         // position key.
         let returnblock = callee.borrow().returnblock.clone();
         let notify = ann.notify.borrow();
-        let positions = notify
+        let entry = notify
             .get(&BlockKey::of(&returnblock))
             .expect("notify entry missing");
-        assert_eq!(positions.len(), 1);
+        assert!(Rc::ptr_eq(&entry.block, &returnblock));
+        assert_eq!(entry.positions.len(), 1);
     }
 
     #[test]
@@ -3489,8 +3513,7 @@ mod tests {
             .notify
             .borrow()
             .get(&BlockKey::of(&returnblock))
-            .cloned()
-            .map(|set| set.into_iter().collect())
+            .map(|entry| entry.positions.iter().cloned().collect())
             .unwrap_or_default();
         assert_eq!(positions.len(), 1);
         for position in &positions {

@@ -34,9 +34,10 @@
 //!   but the semantics match byte-for-byte.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::fmt;
 use std::rc::{Rc, Weak};
+
+use indexmap::IndexSet;
 
 use super::repr_guard::ReprGuard;
 
@@ -188,7 +189,9 @@ pub struct ListItem {
     /// every owner currently using this `ListItem`.
     pub(crate) itemof: Vec<ItemOwner>,
     /// RPython `self.read_locations = set()` (listdef.py:33).
-    pub(crate) read_locations: HashSet<PositionKey>,
+    /// The ordered container is required because the key hashes on a
+    /// pointer and the loop over the members produces a work order.
+    pub(crate) read_locations: IndexSet<PositionKey>,
     /// Flattened `DictKey.custom_eq_hash` (dictdef.py:13). `false` for
     /// every non-DictKey ListItem.
     pub custom_eq_hash: bool,
@@ -215,7 +218,7 @@ impl ListItem {
             immutable: false,
             must_not_resize: false,
             itemof: Vec::new(),
-            read_locations: HashSet::new(),
+            read_locations: IndexSet::new(),
             // Flattened DictKey defaults (dictdef.py:8-9, 13).
             custom_eq_hash: false,
             s_rdict_eqfn: SomeValue::Impossible,
