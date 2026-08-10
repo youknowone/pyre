@@ -2980,7 +2980,27 @@ pub fn fuse_boxing_alloc(
                 _ => None,
             })
     }
-    fn const_ref_addr(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<i64> {
+    /// Resolve `var` to the constant address `terminal` reads off its producer.
+    ///
+    /// The walk itself is shared by every header spelling: it steps through
+    /// `__pyre_cast_instance[<root>]` pointer reinterprets, and through the
+    /// links when `var` is a `Block.inputargs` phi rather than an op result.
+    /// A boxing cluster whose header stores sit before a call is exactly that
+    /// shape — each call ends a block, so the header value crosses the
+    /// boundary as a link arg while its producer stays in the predecessor.
+    /// Every predecessor must agree: a phi merging two different pointers is
+    /// not a constant and must keep the cluster unfused.  `depth` bounds the
+    /// walk, which is what keeps a loop-carried phi (whose own link arg is
+    /// itself) from recursing forever.
+    fn resolve_addr<F>(
+        graph: &FunctionGraph,
+        var: &Variable,
+        depth: u32,
+        terminal: &F,
+    ) -> Option<i64>
+    where
+        F: Fn(&FunctionGraph, &OpKind, u32) -> Option<i64>,
+    {
         if depth == 0 {
             return None;
         }
@@ -2988,27 +3008,105 @@ pub fn fuse_boxing_alloc(
             .blocks
             .iter()
             .flat_map(|b| &b.operations)
-            .find(|o| o.result.as_ref() == Some(var))?;
-        match &producer.kind {
+            .find(|o| o.result.as_ref() == Some(var));
+        let Some(producer) = producer else {
+            let (target_id, slot) = graph.blocks.iter().find_map(|b| {
+                b.inputargs
+                    .iter()
+                    .position(|arg| arg == var)
+                    .map(|slot| (b.id, slot))
+            })?;
+            let mut resolved: Option<i64> = None;
+            for block in &graph.blocks {
+                for link in &block.exits {
+                    if link.target != target_id {
+                        continue;
+                    }
+                    // A link whose arity does not cover the slot is a malformed
+                    // edge; treat it as a disagreement rather than reading past it.
+                    let addr = link
+                        .args
+                        .get(slot)
+                        .and_then(LinkArg::as_variable)
+                        .and_then(|arg| resolve_addr(graph, arg, depth - 1, terminal))?;
+                    match resolved {
+                        None => resolved = Some(addr),
+                        Some(seen) if seen == addr => {}
+                        Some(_) => return None,
+                    }
+                }
+            }
+            return resolved;
+        };
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &producer.kind
+            && segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+            && args.len() == 1
+        {
+            return resolve_addr(graph, &args[0], depth - 1, terminal);
+        }
+        terminal(graph, &producer.kind, depth)
+    }
+    fn const_ref_addr(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<i64> {
+        resolve_addr(graph, var, depth, &|_, kind, _| match kind {
             OpKind::ConstRefAddr(addr) => Some(*addr),
-            // Walk `__pyre_cast_instance[<root>]` pointer reinterprets.
+            _ => None,
+        })
+    }
+    /// The `&T` a `pyre_object::pyobject::get_instantiate(&T)` call was handed.
+    ///
+    /// The owner path is matched in full rather than by the bare leaf, so a
+    /// function elsewhere that happens to share the name can never be read as
+    /// the `instantiate`-slot load.
+    fn get_instantiate_arg_addr(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<i64> {
+        const GET_INSTANTIATE: [&str; 3] = ["pyre_object", "pyobject", "get_instantiate"];
+        resolve_addr(graph, var, depth, &|graph, kind, depth| match kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments },
                 args,
                 ..
-            } if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
-                && args.len() == 1 =>
+            } if args.len() == 1
+                && segments.len() >= GET_INSTANTIATE.len()
+                && segments[segments.len() - GET_INSTANTIATE.len()..]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(GET_INSTANTIATE.iter().copied()) =>
             {
                 const_ref_addr(graph, &args[0], depth - 1)
             }
             _ => None,
-        }
+        })
     }
+    // The vtable the fusion keeps stands in for BOTH dropped header stores: the
+    // runtime stamps `ob_type` and `w_class` from it.  That is only faithful
+    // where the cluster's own `w_class` is the type object of the very type
+    // `ob_type` names, i.e. `get_instantiate(&T)` with that same `&T`.  A
+    // constructor taking `w_class` from anywhere else is building a SUBCLASS
+    // instance — `w_bytes_subclass_from_bytes` (bytesobject.rs) pins the
+    // caller's class on the shadow stack and reads it back — and
+    // re-synthesising `w_class` from the vtable would answer the base type for
+    // `type(B(b'x'))`.  An unresolvable spelling declines, leaving
+    // `malloc_typed` residual.
     let resolve_vtable_addr = |graph: &FunctionGraph, agg: &Variable| -> i64 {
-        store_value(graph, agg, "ob_header")
-            .and_then(|header| store_value(graph, &header, "ob_type"))
+        let Some(header) = store_value(graph, agg, "ob_header") else {
+            return 0;
+        };
+        let Some(vtable) = store_value(graph, &header, "ob_type")
             .and_then(|obtype| const_ref_addr(graph, &obtype, 8))
-            .unwrap_or(0)
+        else {
+            return 0;
+        };
+        let w_class_value = store_value(graph, &header, "w_class");
+        let w_class = w_class_value
+            .as_ref()
+            .and_then(|value| get_instantiate_arg_addr(graph, value, 8));
+        if w_class != Some(vtable) {
+            return 0;
+        }
+        vtable
     };
 
     struct Payload {
@@ -3100,13 +3198,16 @@ pub fn fuse_boxing_alloc(
             // zero vtable would stamp a null `ob_type`, and the assembler
             // fail-closes on it (`assembler.rs` `new_with_vtable`).  Untouched,
             // the `lltype::malloc_typed` stays a residual call, the same
-            // graceful outcome an incomplete payload store takes above.  This
-            // happens only when the `PyType` singleton addresses are
-            // unavailable (`HostStaticAddrs.pytypes` empty, as in the
-            // pure-translate registry fixture): the `&FLOAT_TYPE` read then
-            // lowers to a residual `FunctionPath` call rather than a
-            // `ConstRefAddr`.  The production driver supplies those addresses,
-            // so the type pointer resolves and the cluster fuses.
+            // graceful outcome an incomplete payload store takes above.  Two
+            // things reach here.  The type pointer may be genuinely absent —
+            // the `PyType` singleton addresses unavailable
+            // (`HostStaticAddrs.pytypes` empty, as in the pure-translate
+            // registry fixture), so the `&FLOAT_TYPE` read lowers to a
+            // residual `FunctionPath` call rather than a `ConstRefAddr`; the
+            // production driver supplies those addresses, so there the
+            // pointer resolves.  Or the cluster's `w_class` may not be the
+            // one the kept vtable stands for, which `resolve_vtable_addr`
+            // also answers `0` for — see its comment.
             if vtable == 0 {
                 continue;
             }
@@ -6582,6 +6683,68 @@ mod tests {
         ])
     }
 
+    /// Push the header a base-type constructor builds: a `PyObject` synthetic
+    /// ctor storing `ob_type: &T` and `w_class: get_instantiate(&T)`, both fed
+    /// from the same `&T` constant.  `fuse_boxing_alloc` keeps the vtable only
+    /// where those two agree, so a cluster modelling `ob_type` alone stays
+    /// unfused and its `malloc_typed` residual.
+    fn push_boxing_header(
+        graph: &mut FunctionGraph,
+        blk: BlockId,
+        ty_addr: i64,
+    ) -> crate::flowspace::model::Variable {
+        type Var = crate::flowspace::model::Variable;
+        let header_field = |base: &Var, name: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor {
+                name: name.into(),
+                owner_root: Some("PyObject".into()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+            },
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        let ob_type = graph
+            .push_op_var(blk, OpKind::ConstRefAddr(ty_addr), true)
+            .unwrap();
+        let instantiate_arg = graph
+            .push_op_var(blk, OpKind::ConstRefAddr(ty_addr), true)
+            .unwrap();
+        let w_class = graph
+            .push_op_var(
+                blk,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "pyre_object".into(),
+                            "pyobject".into(),
+                            "get_instantiate".into(),
+                        ],
+                    },
+                    args: vec![instantiate_arg],
+                    result_ty: ValueType::Ref(Some("object".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let header = graph
+            .push_op_var(
+                blk,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(blk, header_field(&header, "ob_type", &ob_type), false);
+        graph.push_op_var(blk, header_field(&header, "w_class", &w_class), false);
+        header
+    }
+
     #[test]
     fn fuse_boxing_alloc_lowers_float_box_cluster() {
         // entry: %v       = const (the boxed payload);
@@ -6601,41 +6764,12 @@ mod tests {
         let v = graph
             .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
             .unwrap();
-        // The `ob_header` carries a resolvable `ob_type` type-pointer (the
-        // `&FLOAT_TYPE` constant `w_float_new` stores), so `fuse_boxing_alloc`
-        // captures a non-zero vtable.  A cluster whose `ob_type` store resolves
-        // to no constant is left unfused (residual `malloc_typed`), so the
-        // header must model the real store chain for the fusion to fire.
-        let ty_addr = graph
-            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
-            .unwrap();
-        let header = graph
-            .push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
-                    args: vec![],
-                    result_ty: ValueType::Ref(Some("PyObject".into())),
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_op_var(
-            entry,
-            OpKind::FieldWrite {
-                base: header.clone(),
-                field: FieldDescriptor {
-                    name: "ob_type".into(),
-                    owner_root: Some("PyObject".into()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                },
-                value: LinkArg::Value(ty_addr),
-                ty: ValueType::Ref(None),
-            },
-            false,
-        );
+        // The `ob_header` carries the resolvable `ob_type` / `w_class` stores
+        // `w_float_new` writes, so `fuse_boxing_alloc` captures a non-zero
+        // vtable.  A cluster whose `ob_type` store resolves to no constant is
+        // left unfused (residual `malloc_typed`), so the header must model the
+        // real store chain for the fusion to fire.
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
         let agg = graph
             .push_op_var(
                 entry,
@@ -6780,39 +6914,10 @@ mod tests {
         let im = graph
             .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
             .unwrap();
-        // Resolvable `ob_header.ob_type` type-pointer so `fuse_boxing_alloc`
-        // captures a non-zero vtable; a cluster whose `ob_type` store resolves
-        // to no constant is left unfused (residual `malloc_typed`).
-        let ty_addr = graph
-            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
-            .unwrap();
-        let header = graph
-            .push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
-                    args: vec![],
-                    result_ty: ValueType::Ref(Some("PyObject".into())),
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_op_var(
-            entry,
-            OpKind::FieldWrite {
-                base: header.clone(),
-                field: FieldDescriptor {
-                    name: "ob_type".into(),
-                    owner_root: Some("PyObject".into()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                },
-                value: LinkArg::Value(ty_addr),
-                ty: ValueType::Ref(None),
-            },
-            false,
-        );
+        // Resolvable `ob_header` header stores so `fuse_boxing_alloc` captures
+        // a non-zero vtable; a cluster whose `ob_type` store resolves to no
+        // constant is left unfused (residual `malloc_typed`).
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
         let agg = graph
             .push_op_var(
                 entry,
@@ -6957,18 +7062,178 @@ mod tests {
     }
 
     #[test]
+    fn fuse_boxing_alloc_declines_a_w_class_the_vtable_cannot_stand_for() {
+        // Fusion drops the header and lets the runtime stamp both `ob_type`
+        // and `w_class` off the kept vtable, so it may only fire where the
+        // cluster's own `w_class` is `get_instantiate(&T)` for the very `&T`
+        // its `ob_type` names.  `w_bytes_subclass_from_bytes` (bytesobject.rs)
+        // stores the base `ob_type` beside a `w_class` read back off the
+        // shadow stack; re-synthesising that from the vtable would answer the
+        // base type for `type(B(b'x'))`.  A `get_instantiate` of some other
+        // type is the same hazard spelled differently.  Both keep the cluster
+        // unfused and its `malloc_typed` residual.
+        type Var = crate::flowspace::model::Variable;
+        const FLOAT_TYPE_ADDR: i64 = 4357049520;
+        const OTHER_TYPE_ADDR: i64 = 4357049600;
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                        },
+                        args,
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        fn instantiate_of(graph: &mut FunctionGraph, blk: BlockId, addr: i64) -> Var {
+            let arg = graph
+                .push_op_var(blk, OpKind::ConstRefAddr(addr), true)
+                .unwrap();
+            call(
+                graph,
+                blk,
+                &["pyre_object", "pyobject", "get_instantiate"],
+                vec![arg],
+            )
+        }
+        /// A one-payload `W_FloatObject` cluster storing `ob_type:
+        /// &FLOAT_TYPE` beside the `w_class` `feed` builds.
+        fn cluster(feed: &dyn Fn(&mut FunctionGraph, BlockId) -> Var) -> FunctionGraph {
+            let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            };
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let payload = graph
+                .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+                .unwrap();
+            let ob_type = graph
+                .push_op_var(entry, OpKind::ConstRefAddr(FLOAT_TYPE_ADDR), true)
+                .unwrap();
+            let w_class = feed(&mut graph, entry);
+            let header = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some("PyObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(
+                entry,
+                field(&header, "ob_type", "PyObject", &ob_type),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(&header, "w_class", "PyObject", &w_class),
+                false,
+            );
+            let agg = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(
+                entry,
+                field(&agg, "ob_header", "W_FloatObject", &header),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(&agg, "floatval", "W_FloatObject", &payload),
+                false,
+            );
+            let ret = call(
+                &mut graph,
+                entry,
+                &["pyre_object", "lltype", "malloc_typed"],
+                vec![agg],
+            );
+            graph.set_return(entry, Some(ret));
+            graph
+        }
+
+        // The first row is the control: the same cluster, differing only in
+        // the `w_class` feed, does fuse — so a decline below is attributable
+        // to the feed and not to some other unmet gate.
+        let same = |graph: &mut FunctionGraph, blk| instantiate_of(graph, blk, FLOAT_TYPE_ADDR);
+        let other = |graph: &mut FunctionGraph, blk| instantiate_of(graph, blk, OTHER_TYPE_ADDR);
+        let shadow_stack = |graph: &mut FunctionGraph, blk| {
+            let base = graph.push_op_var(blk, OpKind::ConstInt(0), true).unwrap();
+            call(
+                graph,
+                blk,
+                &["pyre_object", "gc_roots", "shadow_stack_get"],
+                vec![base],
+            )
+        };
+        let rows: [(&str, &dyn Fn(&mut FunctionGraph, BlockId) -> Var, usize); 3] = [
+            ("get_instantiate of the type ob_type names", &same, 1),
+            ("get_instantiate of another type", &other, 0),
+            ("a w_class read off the shadow stack", &shadow_stack, 0),
+        ];
+        for (feed, build, expected) in rows {
+            let mut graph = cluster(build);
+            let entry = graph.startblock;
+            assert_eq!(
+                fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+                expected,
+                "{feed}: wrong number of fused clusters"
+            );
+            let residual = graph.block(entry).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            });
+            assert_eq!(
+                residual,
+                expected == 0,
+                "{feed}: malloc_typed residual must survive exactly when the cluster declines"
+            );
+        }
+    }
+
+    #[test]
     fn fuse_boxing_alloc_sweeps_nested_header_chain() {
         // Faithful `w_float_new` shape: the boxing struct's header is a nested
-        // `PyObject` ctor whose `ob_type` / `w_class` fields are fed by
-        // `__pyre_cast_instance` pointer reinterprets of the `&FLOAT_TYPE`
-        // constant.  After fusion drops the `ob_header` (it rides the
-        // `NewWithVtable` descriptor), the entire header sub-tree — the inner
-        // `PyObject` ctor, the outer `W_FloatObject` ctor, and the two
-        // `__pyre_cast_instance` casts — is dead and must be swept, leaving
-        // only the `NewWithVtable`, its `floatval` payload store, and the
-        // return cast.  (The two `ConstRefAddr` constants legitimately survive
-        // as dead constants; the dual-gate seeds them from the constant table,
-        // so they do not diverge.)
+        // `PyObject` ctor whose `ob_type` is a `__pyre_cast_instance` pointer
+        // reinterpret of the `&FLOAT_TYPE` constant and whose `w_class` is a
+        // `get_instantiate` read of that same constant.  After fusion drops
+        // the `ob_header` (it rides the `NewWithVtable` descriptor), the
+        // entire header sub-tree — the inner `PyObject` ctor, the outer
+        // `W_FloatObject` ctor, the two `__pyre_cast_instance` casts and the
+        // `get_instantiate` — is dead and must be swept, leaving only the
+        // `NewWithVtable`, its `floatval` payload store, and the return cast.
+        // (The two `ConstRefAddr` constants legitimately survive as dead
+        // constants; the dual-gate seeds them from the constant table, so they
+        // do not diverge.)
         type Var = crate::flowspace::model::Variable;
         let cast_instance = |to: &str, arg: &Var| OpKind::Call {
             target: CallTarget::FunctionPath {
@@ -7003,8 +7268,28 @@ mod tests {
         let ty_addr2 = graph
             .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
             .unwrap();
-        let w_class = graph
+        // `w_class` is the type's `instantiate` slot rather than the type
+        // pointer itself, so it reaches the header through a `get_instantiate`
+        // read of the same `&FLOAT_TYPE` constant `ob_type` carries.
+        let w_class_cast = graph
             .push_op_var(entry, cast_instance("PyType", &ty_addr2), true)
+            .unwrap();
+        let w_class = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "pyre_object".into(),
+                            "pyobject".into(),
+                            "get_instantiate".into(),
+                        ],
+                    },
+                    args: vec![w_class_cast],
+                    result_ty: ValueType::Ref(Some("object".into())),
+                },
+                true,
+            )
             .unwrap();
         // Inner `PyObject` header ctor + its field stores.
         let header = graph
@@ -7102,6 +7387,14 @@ mod tests {
             )),
             "the dead ob_type/w_class header casts must be swept"
         );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("get_instantiate")
+            )),
+            "the dead w_class instantiate read must be swept"
+        );
         // The live spine survives: NewWithVtable + floatval store + return cast.
         // The vtable (type pointer) is captured from the dropped
         // `ob_header.ob_type = cast(ConstRefAddr(4357049520))` store so the
@@ -7142,37 +7435,8 @@ mod tests {
         let hash = graph
             .push_op_var(entry, OpKind::ConstInt(-1), true)
             .unwrap();
-        // Resolvable `ob_header.ob_type` type-pointer so the fusion fires.
-        let ty_addr = graph
-            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
-            .unwrap();
-        let header = graph
-            .push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
-                    args: vec![],
-                    result_ty: ValueType::Ref(Some("PyObject".into())),
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_op_var(
-            entry,
-            OpKind::FieldWrite {
-                base: header.clone(),
-                field: FieldDescriptor {
-                    name: "ob_type".into(),
-                    owner_root: Some("PyObject".into()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                },
-                value: LinkArg::Value(ty_addr),
-                ty: ValueType::Ref(None),
-            },
-            false,
-        );
+        // Resolvable `ob_header` header stores so the fusion fires.
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
         let agg = graph
             .push_op_var(
                 entry,

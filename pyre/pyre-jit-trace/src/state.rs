@@ -11156,11 +11156,18 @@ fn materialize_virtual_object(
     unsafe {
         let ptr = raw as *mut PyObject;
         (*ptr).ob_type = vtable as *const PyType;
-        // rclass.py:739-743 set `w_class` from the cached instantiate
-        // pointer on the PyType. Tracing may later overwrite this via
-        // an explicit `SetfieldGc(w_class)`; the field replay below
-        // takes precedence for that case (heaptracker.py:66-style
-        // "typeptr" filter does NOT apply to w_class in pyre).
+        // Seed `w_class` from the type's cached instantiate pointer.  This
+        // has no upstream counterpart: `OBJECT` carries the single field
+        // `typeptr` (rclass.py:162-165) and `new_instance` stores only that
+        // one word (rclass.py:742-743), while `instantiate` is a slot in
+        // `OBJECT_VTABLE` (rclass.py:171), i.e. per class, never per
+        // instance.  `heaptracker.py:66-69` skips exactly the name
+        // `typeptr` and recurses into every other field of a nested header
+        // struct, so upstream a second header word would be an ordinary
+        // traced field — as the Python-level class is for user subclasses
+        // (`mapdict.py:751-752`, reached through the ordinary `map` field).
+        // Tracing may therefore overwrite this via an explicit
+        // `SetfieldGc(w_class)`, and the field replay below takes precedence.
         //
         // `w_class_obj()` is None when the vtable word is not a `PyType`
         // pointer — `JitVirtualRef` stores the `jit_virtual_ref_vtable`

@@ -123,16 +123,25 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// slot at offset 0, which the wasm backend does not lower faithfully.
 ///
 /// The boundary is a deviation from `wrapint`
-/// (`objspace/std/intobject.py`), which keeps its allocation inline — its own
-/// comment there notes the function is inlined into every caller. The
+/// (`objspace/std/intobject.py:908-910`), which keeps its allocation inline —
+/// its own comment there notes the function is inlined into every caller. The
 /// orthodox lowering is `new_with_vtable`, which stays in the trace and can be
 /// optimised away where the box does not escape. `fuse_boxing_alloc`
 /// (`majit-translate` `model.rs`) rewrites exactly this ctor-plus-`FieldWrite`
-/// shape into `NewWithVtable`, but instrumented over this tree it fires
-/// nowhere: all 134 candidate sites report the vtable unresolved, because
-/// `resolve_vtable_addr` reads `HostStaticAddrs.pytypes` and that table is
-/// empty in the build-script pipeline the pass runs in. Drop the boundary
-/// once the fusion resolves a vtable there.
+/// shape into `NewWithVtable`, and it does now fire here: the static address
+/// table is populated in the build-script pipeline, and the pass reported
+/// every site unresolved only because its walk stopped at a block boundary —
+/// each call ends a block, so a header store sitting before one crosses as a
+/// link argument while its `ConstRefAddr` producer stays in the predecessor.
+///
+/// So the vtable now resolves here, but removing the boundary was measured to
+/// change nothing: `bench/synth/list_pop_append` reads the same on all three
+/// backends with the boundary present, with it removed, and with it removed
+/// while the fusion is reverted. That last arm is a negative control which was
+/// expected to reproduce the pre-boundary regression and did not, so the bench
+/// no longer discriminates this mechanism and its null says nothing either
+/// way. The boundary stays until an instrument that can tell the two apart
+/// says otherwise.
 ///
 /// Spelled `*mut PyObject` rather than `PyObjectRef` so the attribute emits
 /// its `extern "C"` call trampoline: the macro recognises raw pointers
