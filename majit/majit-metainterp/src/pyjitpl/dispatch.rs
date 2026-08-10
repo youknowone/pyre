@@ -1566,8 +1566,7 @@ where
             .ref_identity_slots_end()
             .min(self.frames.frames[0].ref_regs.len());
         let saved_ref_regs: Vec<Option<OpRef>> = self.frames.frames[0].ref_regs[..rn].to_vec();
-        let saved_ref_values: Vec<Option<i64>> =
-            self.frames.frames[0].ref_values[..rn].to_vec();
+        let saved_ref_values: Vec<Option<i64>> = self.frames.frames[0].ref_values[..rn].to_vec();
         let root_inflight_int_result =
             if self.frames.frames.len() > 1 && self.frames.frames[0]._result_argcode == b'i' {
                 self.frames.frames[0].result_arg_index.or_else(|| {
