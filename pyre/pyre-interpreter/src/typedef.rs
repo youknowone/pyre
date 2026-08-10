@@ -6289,10 +6289,14 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     // `dictmultiobject.py:137-138 descr_init` →
@@ -6822,6 +6826,43 @@ fn init_dict_type(ns: PyObjectRef) {
             pyre_object::function::w_classmethod_new(fromkeys),
         )
     };
+    // CPython 3.14 Argument Clinic metadata. Keep the PyPy TypeDef carriers
+    // installed above and fill only their Function metadata fields.  In
+    // particular, `update` deliberately keeps a None text signature.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__ior__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__setitem__", "($self, key, value, /)"),
+        ("__delitem__", "($self, key, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("get", "($self, key, default=None, /)"),
+        ("setdefault", "($self, key, default=None, /)"),
+        ("pop", "($self, key, default=<unrepresentable>, /)"),
+        ("popitem", "($self, /)"),
+        ("keys", "($self, /)"),
+        ("items", "($self, /)"),
+        ("values", "($self, /)"),
+        ("clear", "($self, /)"),
+        ("copy", "($self, /)"),
+        ("__reversed__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("dict TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
     fn dict_fromkeys_impl(
         cls: PyObjectRef,
         iterable: PyObjectRef,
