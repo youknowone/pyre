@@ -10971,8 +10971,8 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // `syntax_error_subclass` can supply a replacement message, so it
     // runs before the located error is built.
     let subclass = syntax_error_subclass(&e, source);
-    let mut msg = if let Some((_, Some(replacement))) = subclass {
-        replacement.to_string()
+    let mut msg = if let Some((_, Some(replacement))) = &subclass {
+        replacement.clone()
     } else if let crate::compile::CompileError::Parse(parse_err) = &e {
         // astcompiler/codegen.py:3048-3051 reports duplicate call/class
         // keywords after parsing, using CPython 3.14's lower-case wording.
@@ -11252,7 +11252,7 @@ fn scan_line_nesting(bytes: &[u8], depth: &mut usize, in_triple: &mut Option<u8>
 fn syntax_error_subclass(
     e: &crate::compile::CompileError,
     source: &str,
-) -> Option<(&'static str, Option<&'static str>)> {
+) -> Option<(&'static str, Option<String>)> {
     use rustpython_compiler::parser::{LexicalErrorType, ParseErrorType};
     let crate::compile::CompileError::Parse(parse_err) = e else {
         return None;
@@ -11265,11 +11265,21 @@ fn syntax_error_subclass(
     let indentation = |plain: Option<&'static str>| match first_indent_fault(source) {
         Some(IndentFault::TabsAndSpaces) => (
             "TabError",
-            Some("inconsistent use of tabs and spaces in indentation"),
+            Some("inconsistent use of tabs and spaces in indentation".to_owned()),
         ),
-        _ => ("IndentationError", plain),
+        _ => ("IndentationError", plain.map(str::to_owned)),
     };
     match &parse_err.error {
+        ParseErrorType::OtherError(msg)
+            if (msg.starts_with("Missing parentheses in call to 'print'")
+                || msg.starts_with("Missing parentheses in call to 'exec'"))
+                && matches!(first_indent_fault(source), Some(IndentFault::TabsAndSpaces)) =>
+        {
+            Some((
+                "TabError",
+                Some("inconsistent use of tabs and spaces in indentation".to_owned()),
+            ))
+        }
         // The parser spells this one "Unexpected indentation"; the tokenizer
         // raises `unexpected indent`.  The dedent message below already reads
         // as the tokenizer writes it, so it keeps the parser's.
@@ -11279,6 +11289,46 @@ fn syntax_error_subclass(
         // which the compiler reconstructs as a plain message.
         ParseErrorType::OtherError(msg) if msg.starts_with("expected an indented block") => {
             Some(("IndentationError", None))
+        }
+        // `python.gram:invalid_if_stmt` checks `NEWLINE !INDENT` before an
+        // invalid expression on the following line.  RustPython's diagnostic
+        // normalization currently chooses its Python-2 `print` hint first;
+        // restore the grammar's priority when the source has no suite indent.
+        ParseErrorType::OtherError(msg)
+            if msg.starts_with("Missing parentheses in call to 'print'") =>
+        {
+            let lineno = parse_err.location.line.get();
+            let current = source.split_inclusive('\n').nth(lineno.checked_sub(1)?)?;
+            let (header_index, header) = source
+                .split_inclusive('\n')
+                .take(lineno.checked_sub(1)?)
+                .enumerate()
+                .filter(|(_, line)| {
+                    let line = line.trim();
+                    !line.is_empty() && !line.starts_with('#')
+                })
+                .last()?;
+            let indent_width = |line: &str| {
+                line.as_bytes()
+                    .iter()
+                    .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\x0c'))
+                    .count()
+            };
+            let header_text = header.trim();
+            if indent_width(current) <= indent_width(header)
+                && header_text.starts_with("if ")
+                && header_text.ends_with(':')
+            {
+                Some((
+                    "IndentationError",
+                    Some(format!(
+                        "expected an indented block after 'if' statement on line {}",
+                        header_index + 1
+                    )),
+                ))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -17273,6 +17323,29 @@ mod tests {
                 43,
             ),
             Some((33, 48))
+        );
+    }
+
+    #[test]
+    fn missing_if_suite_precedes_legacy_print_diagnostic() {
+        let source = "if True:\nprint \"No indent\"";
+        let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+        assert_eq!(
+            syntax_error_subclass(&error, source),
+            Some((
+                "IndentationError",
+                Some("expected an indented block after 'if' statement on line 1".to_owned())
+            ))
+        );
+
+        let source = "if True:\n        print()\n\texec \"mixed tabs and spaces\"";
+        let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+        assert_eq!(
+            syntax_error_subclass(&error, source),
+            Some((
+                "TabError",
+                Some("inconsistent use of tabs and spaces in indentation".to_owned())
+            ))
         );
     }
 

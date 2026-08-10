@@ -69,4 +69,18 @@ for source, expected in (
         error.end_offset,
     )
 
+error = syntax_error('if True:\nprint "No indent"')
+assert isinstance(error, IndentationError), type(error)
+assert error.msg == "expected an indented block after 'if' statement on line 1", error.msg
+assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (2, 1, 2, 6), (
+    error.lineno,
+    error.offset,
+    error.end_lineno,
+    error.end_offset,
+)
+
+error = syntax_error('if True:\n        print()\n\texec "mixed tabs and spaces"')
+assert isinstance(error, TabError), type(error)
+assert error.msg == "inconsistent use of tabs and spaces in indentation", error.msg
+
 print("syntax error Python 3.14 offsets ok")
