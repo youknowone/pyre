@@ -271,6 +271,17 @@ pub extern "C" fn jit_lookup_where_with_method_cache(
     w_descr as i64
 }
 
+/// The receiver test the mapdict storage wrappers share: `mapdict_carrier`'s
+/// own precondition. It admits the generated int/str/tuple user layouts as
+/// well as ordinary instances, so a builtin subclass reaches the same storage
+/// the interpreter reads. A null receiver answers false.
+///
+/// # Safety
+/// `w_obj` must be null or a live object reference.
+unsafe fn is_mapdict_carrier(w_obj: PyObjectRef) -> bool {
+    unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(w_obj) }
+}
+
 /// `mapdict.py:846-847 getdictvalue` residual: the instance-dict shadowing
 /// read the `LOAD_METHOD` fast path performs after the type lookup
 /// (`callmethod.py:66 w_value = w_obj.getdictvalue(space, name)`), to make
@@ -283,12 +294,12 @@ pub extern "C" fn jit_lookup_where_with_method_cache(
 /// so the result is guarded `null` per iteration rather than folded.  `w_name`
 /// is the interned immortal name pointer; the body reads it back via
 /// `w_str_get_wtf8`, mirroring [`jit_lookup_where_with_method_cache`].  Null
-/// on a null receiver / name or a non-instance receiver (the fast path
+/// on a null receiver / name or a non-carrier receiver (the fast path
 /// already pinned the receiver type with `guard_class`).
 pub extern "C" fn jit_instance_getdictvalue(w_obj: i64, w_name: i64) -> i64 {
     let w_obj = w_obj as PyObjectRef;
     let w_name = w_name as PyObjectRef;
-    if w_obj.is_null() || w_name.is_null() || !unsafe { is_instance(w_obj) } {
+    if w_name.is_null() || !unsafe { is_mapdict_carrier(w_obj) } {
         return PY_NULL as i64;
     }
     let name = unsafe { w_str_get_wtf8(w_name) };
@@ -305,12 +316,12 @@ pub extern "C" fn jit_instance_getdictvalue(w_obj: i64, w_name: i64) -> i64 {
 /// fast path resolved it off the promoted map) and the surrounding class / map
 /// / version_tag guards already established the shape, so this replaces
 /// `getattr_str`'s MRO walk + name hash + descriptor dispatch with a single
-/// `storage[index]` fetch.  Null receiver / non-instance returns `PY_NULL`
+/// `storage[index]` fetch.  Null receiver / non-carrier returns `PY_NULL`
 /// (the fast path pinned the receiver type with `guard_class`, so this only
 /// guards against a torn recording).
 pub extern "C" fn jit_mapdict_read(w_obj: i64, storageindex: i64) -> i64 {
     let w_obj = w_obj as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return PY_NULL as i64;
     }
     unsafe {
@@ -322,10 +333,10 @@ pub extern "C" fn jit_mapdict_read(w_obj: i64, storageindex: i64) -> i64 {
 /// Non-forcing boxed write for an existing mapdict attribute.  The guarded
 /// instance class and exact map pin the storage index, and a boxed slot accepts
 /// the incoming object reference directly (mapdict.py:446-447).  A torn
-/// recording with a null/non-instance receiver is a defensive no-op.
+/// recording with a null/non-carrier receiver is a defensive no-op.
 pub extern "C" fn jit_mapdict_boxed_write(w_obj: i64, storageindex: i64, value: i64) {
     let w_obj = w_obj as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return;
     }
     unsafe {
@@ -341,14 +352,14 @@ pub extern "C" fn jit_mapdict_boxed_write(w_obj: i64, storageindex: i64, value: 
 /// shared longlong-list coordinates, so this non-forcing helper performs only
 /// `_prim_direct_read`'s storage read (mapdict.py:600-601); boxing stays in the
 /// trace so an immediate consumer can virtualize it away.  Null receiver /
-/// non-instance returns zero only for a torn recording.
+/// non-carrier returns zero only for a torn recording.
 pub extern "C" fn jit_mapdict_unboxed_read_raw(
     w_obj: i64,
     storageindex: i64,
     listindex: i64,
 ) -> i64 {
     let w_obj = w_obj as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return 0;
     }
     unsafe {
@@ -384,10 +395,10 @@ pub extern "C" fn jit_hash_normalize_digest(digest: i64) -> i64 {
 /// Float-bank counterpart of [`jit_mapdict_unboxed_read_raw`].  Unboxed float
 /// storage already contains the value's IEEE-754 bit pattern, so this helper
 /// performs the raw read and reconstructs the float (mapdict.py:577-584).
-/// Null receiver / non-instance returns zero only for a torn recording.
+/// Null receiver / non-carrier returns zero only for a torn recording.
 pub extern "C" fn jit_mapdict_unboxed_read_f(w_obj: i64, storageindex: i64, listindex: i64) -> f64 {
     let w_obj = w_obj as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return 0.0;
     }
     unsafe {
@@ -405,7 +416,7 @@ pub extern "C" fn jit_mapdict_unboxed_read_f(w_obj: i64, storageindex: i64, list
 /// walker has already guarded the receiver's instance class and exact map,
 /// and proved that the incoming value is an integer, so this is only the
 /// same-type longlong-list update (mapdict.py:615-619).  A torn recording can
-/// reach the wrapper with a null/non-instance receiver; keep that defensive
+/// reach the wrapper with a null/non-carrier receiver; keep that defensive
 /// path a no-op.
 pub extern "C" fn jit_mapdict_unboxed_write_raw(
     w_obj: i64,
@@ -414,7 +425,7 @@ pub extern "C" fn jit_mapdict_unboxed_write_raw(
     raw: i64,
 ) {
     let w_obj = w_obj as usize as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return;
     }
     unsafe {
@@ -429,7 +440,7 @@ pub extern "C" fn jit_mapdict_unboxed_write_raw(
 
 /// Float-bank counterpart of [`jit_mapdict_unboxed_write_raw`].  A same-type
 /// float update writes its IEEE-754 bit pattern to the existing longlong-list
-/// slot (mapdict.py:615-619).  A torn recording with a null/non-instance
+/// slot (mapdict.py:615-619).  A torn recording with a null/non-carrier
 /// receiver is a defensive no-op.
 pub extern "C" fn jit_mapdict_unboxed_write_f(
     w_obj: i64,
@@ -438,7 +449,7 @@ pub extern "C" fn jit_mapdict_unboxed_write_f(
     value: f64,
 ) {
     let w_obj = w_obj as usize as PyObjectRef;
-    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+    if !unsafe { is_mapdict_carrier(w_obj) } {
         return;
     }
     unsafe {

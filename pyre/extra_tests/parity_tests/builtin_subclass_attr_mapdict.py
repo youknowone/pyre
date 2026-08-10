@@ -83,6 +83,39 @@ for user, exact in zip((int_user, str_user, tuple_user), exact_values):
     assert user.mark == 19
 
 
+def sum_marks(values):
+    total = 0
+    for value in values:
+        total += value.mark
+    return total
+
+
+def sum_ratios(values):
+    total = 0.0
+    for value in values:
+        total += value.ratio
+    return total
+
+
+def bump_marks(values):
+    for value in values:
+        value.mark = value.mark + 1
+
+
+# The unboxed int and float slots of a builtin-subclass carrier must read and
+# write the same storage the interpreter uses. A receiver test that admits only
+# ordinary instances answers zero for every read and drops every write, which
+# the loops above never observe because they discard the loaded value.
+for carrier in (I(5), S("user"), T((3, 4))):
+    carrier_name = type(carrier).__name__
+    carrier.mark = 7
+    carrier.ratio = 0.5
+    assert sum_marks([carrier] * 4000) == 28000, carrier_name
+    assert sum_ratios([carrier] * 4000) == 2000.0, carrier_name
+    bump_marks([carrier] * 4000)
+    assert carrier.mark == 4007, carrier_name
+
+
 class Before(str):
     pass
 
