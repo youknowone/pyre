@@ -969,12 +969,13 @@ Polarity below follows this file's rule, with one correction it needed: an
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
 `PYRE_WASM_GUEST_PROFILE`, `PYRE_WASM_MODULE`.
 
-### §6c — Default-OFF diagnostics, censuses and probes (51): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (52): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
 
-`PYRE_BH_NULL_ARG`, `PYRE_CALLEE_RCA`, `PYRE_DESCR_SPELLING_GATE`,
+`PYRE_BH_NULL_ARG`, `PYRE_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
+`PYRE_DESCR_SPELLING_GATE`,
 `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
 `PYRE_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,

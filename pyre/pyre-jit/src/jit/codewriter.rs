@@ -4439,12 +4439,22 @@ fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usi
     groups
 }
 
-/// `PYRE_CATCH_LIVE_CENSUS=1`: count the silent drop-outs between
+/// `PYRE_CATCH_LIVE_CENSUS`: when set to any value, count the silent drop-outs between
 /// `catch_exception` anchors and handler-live widening, so the remaining
 /// anchorless exception-table population can be measured directly.
 fn catch_live_census_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_CATCH_LIVE_CENSUS").is_some())
+}
+
+#[derive(Default)]
+struct CatchLiveCensus {
+    catch_sites: usize,
+    anchorless_redundant: usize,
+    anchorless_orphan: usize,
+    orphan_sites_missing: usize,
+    orphan_colors_missing: usize,
+    orphan_owner_remap_differs: usize,
 }
 
 /// Extra Ref colors a `-live-` marker must name because the PC it belongs to is
@@ -4466,9 +4476,10 @@ fn catch_live_census_enabled() -> bool {
 /// coordinate must name what the explicit catch edge reads.  Widening a
 /// `-live-` set is the conservative direction — the snapshot carries boxes the
 /// no-exception arm does not consume, which costs a slot and never mis-restores.
-/// An orphaned `catch_exception` with no preceding `-live-` still carries its
-/// landing `TLabel`, so the label is reachable without the anchor; the anchor
-/// is only how the marker index is located.
+/// Every anchorless `catch_exception` with no preceding `-live-` still widens
+/// from its own landing `TLabel`; an anchor at the same PC does not cover a
+/// second site because the per-PC anchor table keeps only one entry.  The owner
+/// PC is only how the marker index is located.
 ///
 /// Returns `marker insn index -> extra Ref colors`.
 fn catch_target_extra_ref_colors(
@@ -4527,20 +4538,8 @@ fn catch_target_extra_ref_colors(
         }
         catch_ref_colors_from_args(args)
     };
-    let (
-        catch_sites,
-        anchorless_redundant,
-        anchorless_orphan,
-        orphan_sites_missing,
-        orphan_colors_missing,
-        orphan_owner_remap_differs,
-    ) = {
-        let mut catch_sites = 0usize;
-        let mut anchorless_redundant = 0usize;
-        let mut anchorless_orphan = 0usize;
-        let mut orphan_sites_missing = 0usize;
-        let mut orphan_colors_missing = 0usize;
-        let mut orphan_owner_remap_differs = 0usize;
+    let census = {
+        let mut census = CatchLiveCensus::default();
         for (q, insn) in ssarepr.insns.iter().enumerate() {
             let is_catch = matches!(
                 insn,
@@ -4550,72 +4549,65 @@ fn catch_target_extra_ref_colors(
                 continue;
             }
             if census_enabled {
-                catch_sites += 1;
+                census.catch_sites += 1;
             }
             if q.checked_sub(1)
                 .filter(|&i| ssarepr.insns[i].is_live())
                 .is_none()
             {
                 let owner_pc = sparse_owner_pc(&pc_pos, q);
-                if owner_pc
+                let has_anchor = owner_pc
                     .and_then(|pc| after_call_markers.get(pc))
                     .and_then(|entry| *entry)
-                    .is_some()
-                {
+                    .is_some();
+                if has_anchor {
                     if census_enabled {
-                        anchorless_redundant += 1;
+                        census.anchorless_redundant += 1;
                     }
                 } else {
                     if census_enabled {
-                        anchorless_orphan += 1;
+                        census.anchorless_orphan += 1;
                     }
-                    let landing_refs = catch_ref_colors_at(q);
-                    let live_idx = owner_pc.and_then(|pc| live_markers.get(pc)).copied();
-                    let mut missing_refs = std::collections::BTreeSet::new();
-                    if let Some(live_idx) = live_idx {
-                        out.entry(live_idx)
-                            .or_default()
-                            .extend(landing_refs.iter().copied());
-                    } else if census_enabled {
-                        missing_refs = landing_refs.clone();
+                }
+                let landing_refs = catch_ref_colors_at(q);
+                let live_idx = owner_pc.and_then(|pc| live_markers.get(pc)).copied();
+                let mut missing_refs = std::collections::BTreeSet::new();
+                if let Some(live_idx) = live_idx {
+                    out.entry(live_idx)
+                        .or_default()
+                        .extend(landing_refs.iter().copied());
+                } else if census_enabled && !has_anchor {
+                    missing_refs = landing_refs.clone();
+                }
+                if census_enabled && !has_anchor {
+                    if !missing_refs.is_empty() {
+                        census.orphan_sites_missing += 1;
+                        census.orphan_colors_missing += missing_refs.len();
                     }
-                    if census_enabled {
-                        if !missing_refs.is_empty() {
-                            orphan_sites_missing += 1;
-                            orphan_colors_missing += missing_refs.len();
-                        }
-                        let pre_merge_owner_pc = pre_merge_pc_pos
-                            .as_ref()
-                            .and_then(|pre_merge_pc_pos| sparse_owner_pc(pre_merge_pc_pos, q));
-                        if pre_merge_owner_pc != owner_pc {
-                            orphan_owner_remap_differs += 1;
-                        }
-                        let owner = owner_pc
-                            .map(|pc| pc.to_string())
-                            .unwrap_or_else(|| "none".to_string());
-                        let pre_merge_owner = pre_merge_owner_pc
-                            .map(|pc| pc.to_string())
-                            .unwrap_or_else(|| "none".to_string());
-                        eprintln!(
-                            "[catch-live-orphan] code={} q={} owning_py_pc={} \
-                             pre_merge_owner_py_pc={} landing_ref_colors={:?} \
-                             missing_ref_colors={:?}",
-                            code.obj_name, q, owner, pre_merge_owner, landing_refs, missing_refs
-                        );
+                    let pre_merge_owner_pc = pre_merge_pc_pos
+                        .as_ref()
+                        .and_then(|pre_merge_pc_pos| sparse_owner_pc(pre_merge_pc_pos, q));
+                    if pre_merge_owner_pc != owner_pc {
+                        census.orphan_owner_remap_differs += 1;
                     }
+                    let owner = owner_pc
+                        .map(|pc| pc.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    let pre_merge_owner = pre_merge_owner_pc
+                        .map(|pc| pc.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    eprintln!(
+                        "[catch-live-orphan] code={} q={} owning_py_pc={} \
+                         pre_merge_owner_py_pc={} landing_ref_colors={:?} \
+                         missing_ref_colors={:?}",
+                        code.obj_name, q, owner, pre_merge_owner, landing_refs, missing_refs
+                    );
                 }
             }
         }
-        (
-            catch_sites,
-            anchorless_redundant,
-            anchorless_orphan,
-            orphan_sites_missing,
-            orphan_colors_missing,
-            orphan_owner_remap_differs,
-        )
+        census
     };
-    let anchorless_sites = anchorless_redundant + anchorless_orphan;
+    let anchorless_sites = census.anchorless_redundant + census.anchorless_orphan;
     let mut covered_pcs = 0usize;
     let mut anchored_pcs = 0usize;
     let mut widened_pcs = 0usize;
@@ -4665,17 +4657,17 @@ fn catch_target_extra_ref_colors(
              widened_pcs={} empty_refs_pcs={} orphan_sites_missing={} \
              orphan_colors_missing={} orphan_owner_remap_differs={}",
             code.obj_name,
-            catch_sites,
+            census.catch_sites,
             anchorless_sites,
-            anchorless_redundant,
-            anchorless_orphan,
+            census.anchorless_redundant,
+            census.anchorless_orphan,
             covered_pcs,
             anchored_pcs,
             widened_pcs,
             empty_refs_pcs,
-            orphan_sites_missing,
-            orphan_colors_missing,
-            orphan_owner_remap_differs
+            census.orphan_sites_missing,
+            census.orphan_colors_missing,
+            census.orphan_owner_remap_differs
         );
     }
     out
