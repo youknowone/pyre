@@ -5093,9 +5093,14 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         let code = unsafe { pyre_interpreter::getcode(callable) };
         if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
             let call_args = reload_args();
-            return match unsafe {
-                pyre_interpreter::builtin_code_call(code as pyre_object::PyObjectRef, &call_args)
-            } {
+            // `call_args` are raw positionals; a HOPELESS-arity Signature
+            // (`*args`, optional positional) needs `_match_signature` binding
+            // before the body reads its slots.  `builtin_code_call` never binds,
+            // so route through the positional entry that does.
+            return match pyre_interpreter::call::builtin_code_call_positional(
+                code as pyre_object::PyObjectRef,
+                &call_args,
+            ) {
                 Ok(result) if !result.is_null() => result as i64,
                 Ok(_) => 0,
                 Err(mut err) => {

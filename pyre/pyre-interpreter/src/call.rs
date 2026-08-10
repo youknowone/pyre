@@ -918,10 +918,16 @@ pub(crate) fn set_orig_class(
     }
 }
 
-fn finish_builtin_code_positional(
+/// Invoke a builtin from a slice of raw positional arguments, binding through
+/// its `Signature` first when it has a HOPELESS fast arity.  `builtin_code_call`
+/// itself never binds — the direct call sites hand it an already-bound flat
+/// slice — so any entry that starts from raw positionals (the frame dispatch
+/// here, and the JIT residual-call path in `pyre-jit`) must route through this
+/// to give a `*args`/optional-positional body the slot shape it reads.
+pub fn builtin_code_call_positional(
     current_code: PyObjectRef,
     current_args: &[PyObjectRef],
-) -> PyResult {
+) -> Result<PyObjectRef, crate::PyError> {
     if let Some(sig) = unsafe { crate::builtin_code_get_signature(current_code) } {
         // Every HOPELESS signature needs `_match_signature`, not only
         // *args/**kwargs/kw-only shapes.  A plain optional positional
@@ -941,7 +947,7 @@ fn finish_builtin_code_positional(
 fn call_builtin_code_many_from_roots(root_base: usize, nargs: usize) -> PyResult {
     let mut rooted = vec![pyre_object::PY_NULL; 1 + nargs];
     pyre_object::gc_roots::shadow_stack_copy_range(root_base, &mut rooted);
-    finish_builtin_code_positional(rooted[0], &rooted[1..])
+    builtin_code_call_positional(rooted[0], &rooted[1..])
 }
 
 fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
@@ -963,28 +969,28 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     // indirect call.  The uncommon variadic case stays a residual helper.
     let current_code = _roots.get(root_base);
     match args.len() {
-        0 => finish_builtin_code_positional(current_code, &[]),
+        0 => builtin_code_call_positional(current_code, &[]),
         1 => {
             let a0 = _roots.get(root_base + 1);
-            finish_builtin_code_positional(current_code, &[a0])
+            builtin_code_call_positional(current_code, &[a0])
         }
         2 => {
             let a0 = _roots.get(root_base + 1);
             let a1 = _roots.get(root_base + 2);
-            finish_builtin_code_positional(current_code, &[a0, a1])
+            builtin_code_call_positional(current_code, &[a0, a1])
         }
         3 => {
             let a0 = _roots.get(root_base + 1);
             let a1 = _roots.get(root_base + 2);
             let a2 = _roots.get(root_base + 3);
-            finish_builtin_code_positional(current_code, &[a0, a1, a2])
+            builtin_code_call_positional(current_code, &[a0, a1, a2])
         }
         4 => {
             let a0 = _roots.get(root_base + 1);
             let a1 = _roots.get(root_base + 2);
             let a2 = _roots.get(root_base + 3);
             let a3 = _roots.get(root_base + 4);
-            finish_builtin_code_positional(current_code, &[a0, a1, a2, a3])
+            builtin_code_call_positional(current_code, &[a0, a1, a2, a3])
         }
         nargs => call_builtin_code_many_from_roots(root_base, nargs),
     }
