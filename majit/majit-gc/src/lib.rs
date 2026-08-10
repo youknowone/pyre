@@ -316,8 +316,11 @@ impl GcStepTransition {
     pub const SWEEPING: u8 = 2;
     pub const FINALIZING: u8 = 3;
 
+    /// `rgc.py:52-60 is_done__states`: a major collection is done when the
+    /// step ended in the starting state *and* did not begin there. A step that
+    /// found no work reports `(SCANNING, SCANNING)`, which completes nothing.
     pub const fn is_done(self) -> bool {
-        self.new_state == Self::SCANNING
+        self.old_state != Self::SCANNING && self.new_state == Self::SCANNING
     }
 }
 

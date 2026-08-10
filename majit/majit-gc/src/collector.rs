@@ -267,6 +267,11 @@ fn read_uint_from_env(varname: &str) -> Option<usize> {
 /// options this is a plain integer count: an absent or empty value selects the
 /// nursery-derived default, while an invalid or negative value leaves the
 /// constructor's initial zero in place and therefore disables pinning.
+///
+/// A value too large for `usize` saturates. `int()` is unbounded upstream, so
+/// the limit it installs there is simply larger than any reachable pin count —
+/// which is what `usize::MAX` is here. The field is a `usize`, so saturating is
+/// the only representable reading of "a cap this program can never hit".
 fn read_max_number_of_pinned_objects() -> Option<usize> {
     let raw = env_var("PYPY_GC_MAX_PINNED")?;
     let value = raw.trim();
