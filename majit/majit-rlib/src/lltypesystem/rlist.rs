@@ -184,6 +184,93 @@ pub unsafe fn typed_items_block_clear(block: *mut TypedItemsBlock) {
     }
 }
 
+/// The `[Digit]` list body `rbigint._digits` is lowered to — a
+/// `Ptr(GcArray(Signed))`.
+///
+/// This is a namespace, not a wrapper: the field stays a raw
+/// `*mut TypedItemsBlock` so the annotator keeps seeing the source-level
+/// `GcArray(Signed)` shape and `RBigInt::digit` keeps projecting `_digits`
+/// directly.
+///
+/// What it owns is the *vocabulary*. Upstream draws this line already:
+/// `rbigint.py` writes `[NULLDIGIT] * size` and `rbigint(digits, sign, size)`
+/// and never names a malloc, an allocation tier, or an array type id — the
+/// rtyper supplies those, `ll_newlist` (rlist.py:324-329) and
+/// `ll_alloc_and_set` (rtyper/rlist.py:494-503). A consumer of this type
+/// spells the list operation; the array's GC type id and the tier it is
+/// allocated in stay here.
+pub struct Digits;
+
+impl Digits {
+    /// `ll_newlist(LIST, length)` (rlist.py:324-329) — allocate the items
+    /// array without initializing it. `malloc_zero_filled` is false for
+    /// incminimark (incminimark.py:211), so the items keep whatever the
+    /// nursery held.
+    ///
+    /// # Safety
+    /// Every item the caller reads must be one it has written. Use
+    /// [`Digits::alloc_and_set_zero`] for the `[NULLDIGIT] * n` shape.
+    #[inline]
+    pub unsafe fn new(length: usize) -> *mut TypedItemsBlock {
+        unsafe { alloc_typed_items_block_nursery(length, GC_INT_ARRAY_GC_TYPE_ID) }
+    }
+
+    /// Fallible [`Digits::new`], for the upstream paths whose translated
+    /// allocation carries an explicit `MemoryError` edge.
+    ///
+    /// # Safety
+    /// Same obligation as [`Digits::new`].
+    #[inline]
+    pub unsafe fn try_new(length: usize) -> Option<*mut TypedItemsBlock> {
+        unsafe { try_alloc_typed_items_block_nursery(length, GC_INT_ARRAY_GC_TYPE_ID) }
+    }
+
+    /// `ll_alloc_and_set(LIST, count, 0)` (rtyper/rlist.py:494-503) —
+    /// `ll_newlist` followed by `rgc.ll_arrayclear`. This is what
+    /// `[NULLDIGIT] * count` lowers to.
+    ///
+    /// # Safety
+    /// The result is a fresh block outside any traced owner; the caller must
+    /// store it into one before anything can collect.
+    #[inline]
+    pub unsafe fn alloc_and_set_zero(count: usize) -> *mut TypedItemsBlock {
+        unsafe {
+            let block = Self::new(count);
+            typed_items_block_clear(block);
+            block
+        }
+    }
+
+    /// Fallible [`Digits::alloc_and_set_zero`].
+    ///
+    /// # Safety
+    /// Same obligation as [`Digits::alloc_and_set_zero`].
+    #[inline]
+    pub unsafe fn try_alloc_and_set_zero(count: usize) -> Option<*mut TypedItemsBlock> {
+        unsafe {
+            let block = Self::try_new(count)?;
+            typed_items_block_clear(block);
+            Some(block)
+        }
+    }
+
+    /// The one-element body of a prebuilt list, at process lifetime.
+    ///
+    /// Upstream's prebuilt `rbigint` digit lists are translated constants with
+    /// the same lifetime; see [`alloc_typed_items_block_immortal`].
+    ///
+    /// # Safety
+    /// Only for a prebuilt whose owner is itself immortal.
+    #[inline]
+    pub unsafe fn prebuilt(item: i64) -> *mut TypedItemsBlock {
+        unsafe {
+            let block = alloc_typed_items_block_immortal(1);
+            *(typed_items_block_items_base(block) as *mut i64) = item;
+            block
+        }
+    }
+}
+
 /// Allocate a headerless, process-lifetime `GcArray(Signed/Float)` body.
 ///
 /// This is only for translated prebuilt objects whose module-global owner is
