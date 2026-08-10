@@ -1160,6 +1160,15 @@ def file_mtime(path: Path) -> str:
 # nicety — it is what makes that first sidecar read `dirty_in_closure=0`. Run
 # it the other way round and the change lists ITSELF as an in-closure dirty
 # file, which is the correct report and looks like a defect.
+#
+# ⚠ AND THE GENERAL FORM, which outlives that one occasion: A NONZERO
+# `dirty_in_closure` IS A REPORT, NOT A DEFECT. An extraction is normally
+# batched into a window several people's work lands in, so a sidecar routinely
+# names files somebody else was editing. What it tells you is narrow and worth
+# saying exactly: `source=` hashes the WORKING TREE, so the artefact is correct
+# FOR THAT TREE and is not reproducible from any commit. Kill such a run only
+# if commit-reproducible artefacts are what you came for; the freshness
+# question was already answered, by the stamp, and the answer was yes.
 # ---------------------------------------------------------------------------
 
 
