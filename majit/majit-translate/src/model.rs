@@ -7284,6 +7284,202 @@ mod tests {
     }
 
     #[test]
+    fn fuse_boxing_alloc_resolves_a_split_cluster_only_when_the_links_agree() {
+        // A boxing cluster's header stores sit before its `malloc_typed`, and
+        // each call ends a block, so `ob_type` / `w_class` reach the ctor as
+        // `Block.inputargs` while the `ConstRefAddr` producing them stays in a
+        // predecessor.  `resolve_addr` steps through the links to read it, and
+        // takes an answer only when every predecessor agrees: a phi merging two
+        // type pointers is not a constant, and stamping either one onto the
+        // allocation would name the wrong type.  Every other cluster here is
+        // built in one block, so neither half of that walk is otherwise reached.
+        type Var = crate::flowspace::model::Variable;
+        const FLOAT_TYPE_ADDR: i64 = 4357049520;
+        const OTHER_TYPE_ADDR: i64 = 4357049600;
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                        },
+                        args,
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        /// The `(ob_type, w_class)` pair a `w_float_new` header stores, both
+        /// read off a `&FLOAT_TYPE`-shaped constant at `addr`.
+        fn header_pair(graph: &mut FunctionGraph, blk: BlockId, addr: i64) -> Vec<Var> {
+            let cast = |graph: &mut FunctionGraph| {
+                let ty = graph
+                    .push_op_var(blk, OpKind::ConstRefAddr(addr), true)
+                    .unwrap();
+                call(graph, blk, &["__pyre_cast_instance", "PyType"], vec![ty])
+            };
+            let ob_type = cast(graph);
+            let w_class_cast = cast(graph);
+            let w_class = call(
+                graph,
+                blk,
+                &["pyre_object", "pyobject", "get_instantiate"],
+                vec![w_class_cast],
+            );
+            vec![ob_type, w_class]
+        }
+        /// The rest of the cluster, in `blk`: the nested `PyObject` header
+        /// taking the two values `blk` was handed, the `W_FloatObject` ctor and
+        /// its payload store, and the `malloc_typed` the fusion rewrites.
+        fn cluster_in(graph: &mut FunctionGraph, blk: BlockId, ob_type: &Var, w_class: &Var) {
+            let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            };
+            let ctor = |graph: &mut FunctionGraph, name: &str| {
+                graph
+                    .push_op_var(
+                        blk,
+                        OpKind::Call {
+                            target: CallTarget::synthetic_transparent_ctor(name),
+                            args: vec![],
+                            result_ty: ValueType::Ref(Some(name.into())),
+                        },
+                        true,
+                    )
+                    .unwrap()
+            };
+            let payload = graph
+                .push_op_var(blk, OpKind::ConstFloat(0.0f64.to_bits()), true)
+                .unwrap();
+            let header = ctor(graph, "PyObject");
+            graph.push_op_var(blk, field(&header, "ob_type", "PyObject", ob_type), false);
+            graph.push_op_var(blk, field(&header, "w_class", "PyObject", w_class), false);
+            let agg = ctor(graph, "W_FloatObject");
+            graph.push_op_var(
+                blk,
+                field(&agg, "ob_header", "W_FloatObject", &header),
+                false,
+            );
+            graph.push_op_var(
+                blk,
+                field(&agg, "floatval", "W_FloatObject", &payload),
+                false,
+            );
+            let ret = call(
+                graph,
+                blk,
+                &["pyre_object", "lltype", "malloc_typed"],
+                vec![agg],
+            );
+            graph.set_return(blk, Some(ret));
+        }
+
+        /// One producer of the header pair, `crossings` blocks of pure relay,
+        /// then the cluster — the shape a run of calls before the allocation
+        /// leaves behind.
+        fn chain(crossings: usize) -> FunctionGraph {
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let mut carried = header_pair(&mut graph, entry, FLOAT_TYPE_ADDR);
+            let mut from = entry;
+            for _ in 0..crossings {
+                let (next, args) = graph.create_block_with_arg_vars(2);
+                graph.set_goto(from, next, carried);
+                carried = args;
+                from = next;
+            }
+            cluster_in(&mut graph, from, &carried[0], &carried[1]);
+            graph
+        }
+        /// Two predecessors of one merge block, each building its own header
+        /// pair off the address it is given, and the cluster in the merge.
+        fn merge(left_addr: i64, right_addr: i64) -> FunctionGraph {
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let cond = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+            let (join, carried) = graph.create_block_with_arg_vars(2);
+            let arms: Vec<Link> = [(true, left_addr), (false, right_addr)]
+                .into_iter()
+                .map(|(case, addr)| {
+                    let arm = graph.create_block();
+                    let pair = header_pair(&mut graph, arm, addr);
+                    graph.set_goto(arm, join, pair);
+                    Link::from_variables(&graph, vec![], arm, Some(ExitCase::Bool(case)))
+                })
+                .collect();
+            graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+            graph.closeblock(entry, arms);
+            cluster_in(&mut graph, join, &carried[0], &carried[1]);
+            graph
+        }
+
+        let rows: [(&str, &dyn Fn() -> FunctionGraph, usize); 4] = [
+            ("one link crossing", &|| chain(1), 1),
+            ("two link crossings", &|| chain(2), 1),
+            (
+                "predecessors naming one type",
+                &|| merge(FLOAT_TYPE_ADDR, FLOAT_TYPE_ADDR),
+                1,
+            ),
+            (
+                "predecessors naming two types",
+                &|| merge(FLOAT_TYPE_ADDR, OTHER_TYPE_ADDR),
+                0,
+            ),
+        ];
+        for (shape, build, expected) in rows {
+            let mut graph = build();
+            assert_eq!(
+                fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+                expected,
+                "{shape}: wrong number of fused clusters"
+            );
+            let vtables: Vec<i64> = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::NewWithVtable { vtable, .. } => Some(*vtable),
+                    _ => None,
+                })
+                .collect();
+            // Naming the address rather than counting the op is what separates
+            // a walk that read the predecessor from one that read some other
+            // constant in the graph.
+            let expected_vtables = if expected == 0 {
+                Vec::new()
+            } else {
+                vec![FLOAT_TYPE_ADDR]
+            };
+            assert_eq!(vtables, expected_vtables, "{shape}: wrong vtable stamped");
+            let residual = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            });
+            assert_eq!(
+                residual,
+                expected == 0,
+                "{shape}: malloc_typed residual must survive exactly when the cluster declines"
+            );
+        }
+    }
+
+    #[test]
     fn fuse_boxing_alloc_sweeps_nested_header_chain() {
         // Faithful `w_float_new` shape: the boxing struct's header is a nested
         // `PyObject` ctor whose `ob_type` is a `__pyre_cast_instance` pointer
