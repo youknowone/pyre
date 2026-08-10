@@ -56,4 +56,17 @@ assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 5
     error.end_offset,
 )
 
+for source, expected in (
+    ("f'{6 0}'", (1, 4, 1, 7)),
+    ('f"""\n\n\n            {\n            6\n            0="""', (5, 13, 6, 14)),
+):
+    error = syntax_error(source)
+    assert error.msg == "invalid syntax. Perhaps you forgot a comma?", error.msg
+    assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == expected, (
+        error.lineno,
+        error.offset,
+        error.end_lineno,
+        error.end_offset,
+    )
+
 print("syntax error Python 3.14 offsets ok")

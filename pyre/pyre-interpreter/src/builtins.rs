@@ -10766,6 +10766,72 @@ fn source_byte_location(source: &str, byte_index: usize) -> (usize, usize) {
     (lineno, byte_index - line_start + 1)
 }
 
+fn source_byte_index(source: &str, lineno: usize, byte_offset: usize) -> Option<usize> {
+    let line_start = source
+        .split_inclusive('\n')
+        .take(lineno.checked_sub(1)?)
+        .map(str::len)
+        .sum::<usize>();
+    let index = line_start.checked_add(byte_offset.checked_sub(1)?)?;
+    (index <= source.len() && source.is_char_boundary(index)).then_some(index)
+}
+
+/// `pypy/interpreter/pyparser/python.gram:invalid_expression` is also run by
+/// the recursive parser used for an f-string replacement field.  Ruff finds
+/// the outer f-string error first, so repeat that recursive parse and map its
+/// known range back onto the original source.
+fn fstring_missing_comma_span(source: &str, raw_index: usize) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let raw_index = raw_index.min(bytes.len());
+    let open = bytes[..raw_index].iter().rposition(|byte| *byte == b'{')?;
+    let mut cursor = open + 1;
+    let mut delimiters = Vec::new();
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\'' | b'"' => {
+                let quote = bytes[cursor];
+                let triple = bytes[cursor..].starts_with(&[quote, quote, quote]);
+                let quote_len = if triple { 3 } else { 1 };
+                cursor += quote_len;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'\\' {
+                        cursor = (cursor + 2).min(bytes.len());
+                    } else if triple && bytes[cursor..].starts_with(&[quote, quote, quote]) {
+                        cursor += 3;
+                        break;
+                    } else if !triple && bytes[cursor] == quote {
+                        cursor += 1;
+                        break;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                delimiters.push(bytes[cursor]);
+                cursor += 1;
+            }
+            b')' | b']' | b'}' if !delimiters.is_empty() => {
+                delimiters.pop();
+                cursor += 1;
+            }
+            b'}' | b'!' | b':' | b'=' if delimiters.is_empty() => break,
+            _ => cursor += 1,
+        }
+    }
+    let expression = source.get(open + 1..cursor)?;
+    let wrapped = format!("({expression})");
+    let inner_error = crate::compile::compile_source(&wrapped, crate::compile::Mode::Eval).err()?;
+    if inner_error.to_string() != "invalid syntax. Perhaps you forgot a comma?" {
+        return None;
+    }
+    let (start_line, start_offset) = inner_error.python_location();
+    let (end_line, end_offset) = inner_error.python_end_location()?;
+    let start = source_byte_index(&wrapped, start_line, start_offset)?.checked_sub(1)?;
+    let end = source_byte_index(&wrapped, end_line, end_offset)?.checked_sub(1)?;
+    Some((open + 1 + start, open + 1 + end))
+}
+
 /// `Parser/string_parser.c parse_string_literal` raises the non-ASCII bytes
 /// error at the token (`RAISE_SYNTAX_ERROR_KNOWN_LOCATION(t)`), not at the
 /// offending code point.  Ruff's diagnostic instead selects that code point;
@@ -10905,7 +10971,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // `syntax_error_subclass` can supply a replacement message, so it
     // runs before the located error is built.
     let subclass = syntax_error_subclass(&e, source);
-    let msg = if let Some((_, Some(replacement))) = subclass {
+    let mut msg = if let Some((_, Some(replacement))) = subclass {
         replacement.to_string()
     } else if let crate::compile::CompileError::Parse(parse_err) = &e {
         // astcompiler/codegen.py:3048-3051 reports duplicate call/class
@@ -10950,7 +11016,21 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         None
     };
-    let ((lineno, byte_offset), literal_end) = if let Some((start, end)) = literal_span {
+    let fstring_span = if literal_span.is_none() && msg.starts_with("f-string: expecting") {
+        match &e {
+            crate::compile::CompileError::Parse(parse_error) => {
+                fstring_missing_comma_span(source, parse_error.raw_location.start().to_usize())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if fstring_span.is_some() {
+        msg = "invalid syntax. Perhaps you forgot a comma?".to_owned();
+    }
+    let diagnostic_span = literal_span.or(fstring_span);
+    let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
         (
             source_byte_location(source, start),
             Some(source_byte_location(source, end)),
@@ -10970,7 +11050,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let mut error = if lineno == 0 {
         crate::PyError::syntax_error(msg)
     } else {
-        let parser_end = literal_end.or_else(|| e.python_end_location());
+        let parser_end = diagnostic_end.or_else(|| e.python_end_location());
         let (end_lineno, end_byte_offset) = parser_end
             .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
             .unwrap_or((lineno, byte_offset));
@@ -17178,6 +17258,21 @@ mod tests {
         assert_eq!(
             nonascii_bytes_literal_span("b'''aé''' + b'x'", 5),
             Some((0, 10))
+        );
+    }
+
+    #[test]
+    fn fstring_missing_comma_uses_recursive_expression_range() {
+        assert_eq!(fstring_missing_comma_span("f'{6 0}'", 5), Some((3, 6)));
+        // Ruff's normalized range can end in the middle of a UTF-8 scalar;
+        // never project such a range into the outer SyntaxError.
+        assert_eq!(fstring_missing_comma_span("f'{α β}'", 7), None);
+        assert_eq!(
+            fstring_missing_comma_span(
+                "f\"\"\"\n\n\n            {\n            6\n            0=\"\"\"",
+                43,
+            ),
+            Some((33, 48))
         );
     }
 
