@@ -240,12 +240,21 @@ collect_step_stat_getter!(collect_step_oldstate, "_oldstate");
 collect_step_stat_getter!(collect_step_newstate, "_newstate");
 collect_step_stat_getter!(collect_step_major_is_done, "_major_is_done");
 
+/// Whether `name` is one of a stats object's hidden storage slots.
+///
+/// Both stats types keep their values in mapdict slots under single-underscore
+/// names, so the rule is the prefix rather than the seven names that exist
+/// today — a slot added later is hidden without a second edit. Dunders are not
+/// storage and stay reachable: upstream's `W_GcCollectStepStats` is an ordinary
+/// `TypeDef` object, so `__class__` and `__repr__` answer the way they do on
+/// any other one. `__dict__` is the exception, because these objects have none.
+fn is_hidden_stat_slot(name: &str) -> bool {
+    name == "__dict__" || (name.starts_with('_') && !name.starts_with("__"))
+}
+
 fn collect_step_stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let name = crate::baseobjspace::text_w(args[1])?;
-    // Same rule as `stats_getattribute`: both types keep their values in
-    // mapdict slots under leading-underscore names, so hiding the whole prefix
-    // covers a slot added later instead of only the seven that exist today.
-    if name == "__dict__" || name.starts_with('_') {
+    if is_hidden_stat_slot(name) {
         return Err(crate::PyError::attribute_error(format!(
             "'GcCollectStepStats' object has no attribute '{name}'"
         )));
@@ -427,7 +436,7 @@ fn stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let name = crate::baseobjspace::text_w(args[1])?;
-    if name == "__dict__" || name.starts_with('_') {
+    if is_hidden_stat_slot(name) {
         return Err(crate::PyError::attribute_error(format!(
             "stats object has no attribute '{name}'"
         )));
