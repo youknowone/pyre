@@ -2084,6 +2084,34 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
             f"{' '.join(group)}",
             file=sys.stderr,
         )
+    # Two things a reader needs at exactly this moment and can find nowhere
+    # near it: what makes the re-extraction stick, and what they may still do
+    # meanwhile. Both are printed here rather than left in a doc, because this
+    # banner is where someone learns they are blocked.
+    print(
+        "\n"
+        "  ⚠ Re-extracting while a closure input is dirty re-stales the result\n"
+        "  the moment that edit changes again. The fingerprint is over the\n"
+        "  WORKING TREE, so an uncommitted in-closure edit is invisible to\n"
+        "  `git log` and to a --check taken a minute earlier. On a shared\n"
+        "  checkout, require this intersection to be EMPTY first:\n"
+        f"      python3 {driver} --list-inputs {' '.join(crates)} | sort -u > cl.txt\n"
+        "      git status --porcelain | sed 's/^...//' | sort -u        > dirty.txt\n"
+        "      comm -12 dirty.txt cl.txt          # must print nothing\n"
+        "  Both sides are repo-relative, so they compare directly. If it comes\n"
+        "  back empty, confirm the instrument is live before believing it —\n"
+        "  `Cargo.lock` is an input, so seeding it into dirty.txt must produce\n"
+        "  a hit.\n"
+        "\n"
+        "  Meanwhile: COMPILING is available under PYRE_LLBC_STRICT=0, which\n"
+        "  demotes this to a warning rather than silencing it. MEASURING is\n"
+        "  not. Stale offsets can name the wrong bytes, and a miscompiled field\n"
+        "  access returns a NUMBER rather than an error, so an unsound run is\n"
+        "  indistinguishable from a real one. The criterion is whether the work\n"
+        "  READS FIELD OFFSETS, not which crate it lives in: a pure source-text\n"
+        "  audit is exempt, anything that runs a trace never is.",
+        file=sys.stderr,
+    )
     print("=" * 72, file=sys.stderr)
     raise SystemExit(1)
 
