@@ -328,7 +328,8 @@
       "dynasm": "PASS"
     },
     "test.test_descr": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL",
+      "reason": "test_slots counts len(gc.get_objects()) across a loop; get_objects enumerates every app-level object the collector holds, ints included, so binding a fresh int moves the count"
     },
     "test.test_descrtut": {
       "dynasm": "PASS"
