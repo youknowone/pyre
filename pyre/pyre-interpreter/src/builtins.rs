@@ -3836,6 +3836,20 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         },
     };
 
+    // The sink has to outlive the Python this call runs.  `str(arg)` and every
+    // `file.write` attribute lookup re-enter the eval loop, so a `sys.stdout`
+    // rebinding there can drop the last reference to the object resolved just
+    // above and the next safepoint reclaims it — the write that follows would
+    // then go through a dangling pointer.  Root it once for the rest of the
+    // call and read the rooted slot at each use, so a collection that moves it
+    // is followed and one that would have freed it cannot happen.
+    let file_roots = pyre_object::gc_roots::push_roots();
+    let file_slot = file.map(|fp| {
+        let base = file_roots.base();
+        file_roots.pin_root(fp);
+        base
+    });
+
     // `bltinmodule.c print_impl` writes incrementally: `str(arg)`, then the
     // separator before each following arg, then `end`.  Each source is rendered
     // at emit time so a raising `__str__` leaves the bytes already emitted on
@@ -3845,7 +3859,7 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // stdout path renders through the strict utf-8 error handler in
     // `print_render`.
     let emit = |source: PyObjectRef| -> Result<(), crate::PyError> {
-        let Some(fp) = file else {
+        let Some(file_slot) = file_slot else {
             let s = unsafe { print_render(source)? };
             crate::print_output(&s);
             return Ok(());
@@ -3859,6 +3873,10 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         pyre_object::gc_roots::pin_root(s_obj);
         let s_obj =
             pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
+        // Read the sink only here: `py_str_wtf8` above ran `__str__`, and the
+        // rooted slot — not the pointer resolved before it — is what a move
+        // under that call updated.
+        let fp = file_roots.get(file_slot);
         let r = crate::baseobjspace::call_method(fp, "write", &[s_obj]);
         if r.is_null() {
             return Err(crate::call::take_call_error()
@@ -3871,7 +3889,7 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // throwaway str object per gap/line.  The `file=` path still hands a str
     // to `file.write`.
     let emit_literal = |lit: &str| -> Result<(), crate::PyError> {
-        let Some(fp) = file else {
+        let Some(file_slot) = file_slot else {
             crate::print_output(lit);
             return Ok(());
         };
@@ -3882,6 +3900,9 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         pyre_object::gc_roots::pin_root(s);
         let s =
             pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
+        // Same as `emit`: the preceding write's own lookup may have moved the
+        // sink, so take it from the rooted slot.
+        let fp = file_roots.get(file_slot);
         let r = crate::baseobjspace::call_method(fp, "write", &[s]);
         if r.is_null() {
             return Err(crate::call::take_call_error()
@@ -3903,11 +3924,12 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         None => emit_literal("\n")?,
     }
     if flush {
-        match file {
+        match file_slot {
             None => {
                 crate::host_seam::flush_stdout();
             }
-            Some(fp) => {
+            Some(file_slot) => {
+                let fp = file_roots.get(file_slot);
                 let r = crate::baseobjspace::call_method(fp, "flush", &[]);
                 if r.is_null() {
                     return Err(crate::call::take_call_error().unwrap_or_else(|| {
@@ -3928,6 +3950,44 @@ fn set_builtins_underscore(value: PyObjectRef) {
     }
 }
 
+/// One `print_item_to(x, sys_stdout())` / `print_newline_to(sys_stdout())`
+/// step: resolve the live sink, then write one string through it.
+///
+/// The resolution belongs to the step, not to the call. `app.py:252-253`
+/// evaluates `sys_stdout()` once per write, so the sink is never carried from
+/// one write to the next — and it must not be here either, because a write
+/// runs Python that may rebind `sys.stdout`. A sink reachable only through
+/// that binding is reclaimed at the following safepoint, and reusing the
+/// pointer then reads freed memory.
+///
+/// `Ok(false)` reports `sys.stdout is None`, which writes nothing.
+fn displayhook_write(part: PyObjectRef) -> Result<bool, crate::PyError> {
+    // Pin the string for the whole step. It is reachable only through this
+    // Rust local, and both resolving the sink (a module `__getattr__`) and
+    // looking up its `write` can re-enter the eval loop, where the
+    // `PYRE_GC_INTERP` safepoint sweeps an unrooted old-gen object and moves a
+    // surviving one — so read it back from the rooted slot at the point of use.
+    let roots = pyre_object::gc_roots::push_roots();
+    let part_slot = roots.base();
+    roots.pin_root(part);
+    match resolve_default_print_target()? {
+        DefaultPrintTarget::Native => {
+            let s = unsafe { print_render(roots.get(part_slot))? };
+            crate::print_output(&s);
+        }
+        DefaultPrintTarget::Rebound(fp) => {
+            let r = crate::baseobjspace::call_method(fp, "write", &[roots.get(part_slot)]);
+            if r.is_null() {
+                return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                    crate::PyError::runtime_error("displayhook: file.write() failed")
+                }));
+            }
+        }
+        DefaultPrintTarget::Silent => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// `sys.displayhook(value)` — print `repr(value)` followed by a newline to
 /// the live `sys.stdout` and bind `builtins._` to the value. A `None` value
 /// prints nothing and leaves `_` unchanged (`sys_displayhook` in sysmodule.c).
@@ -3940,24 +4000,17 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     // stale binding, then set to the value once the write succeeds.
     set_builtins_underscore(w_none());
     let repr = pyre_object::w_str_from_wtf8(unsafe { crate::display::py_repr_wtf8(value)? });
-    let newline = w_str_new("\n");
-    match resolve_default_print_target()? {
-        DefaultPrintTarget::Native => {
-            let s = unsafe { print_render(repr)? };
-            crate::print_output(&s);
-            crate::print_output("\n");
-        }
-        DefaultPrintTarget::Rebound(fp) => {
-            for part in [repr, newline] {
-                let r = crate::baseobjspace::call_method(fp, "write", &[part]);
-                if r.is_null() {
-                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                        crate::PyError::runtime_error("displayhook: file.write() failed")
-                    }));
-                }
-            }
-        }
-        DefaultPrintTarget::Silent => return Ok(w_none()),
+    // `pypy/module/sys/app.py:252-253` —
+    //     print_item_to(repr(obj), sys_stdout())
+    //     print_newline_to(sys_stdout())
+    // two writes, each against a freshly fetched `sys.stdout`. The newline
+    // string is built here rather than alongside `repr` for the same reason:
+    // nothing outlives the write it belongs to.
+    if !displayhook_write(repr)? {
+        return Ok(w_none());
+    }
+    if !displayhook_write(w_str_new("\n"))? {
+        return Ok(w_none());
     }
     set_builtins_underscore(value);
     Ok(w_none())
@@ -6042,8 +6095,7 @@ fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bo
 /// A 2..=5 positional-argument call fills the `errno` / `strerror` /
 /// `filename` / `filename2` slots; when a filename is present it is
 /// dropped from `args_w` (`self.args_w = [w_errno, w_strerror]`, line
-/// 652) for pickle / repr compatibility.  The `BlockingIOError.written`
-/// special-case is not modelled.  `kind` is `OSError` for the base type and
+/// 652) for pickle / repr compatibility.  `kind` is `OSError` for the base type and
 /// `FileNotFoundError` for that dedicated kind; every other OSError subclass
 /// routes here as `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
 fn os_error_build(
@@ -6248,8 +6300,15 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
             // `_init_error` line 636-643: for an exact `BlockingIOError`, a
             // numeric third argument is `characters_written`, not a filename —
             // it stays in `args_w` and the tuple is not trimmed.
-            let written = |f| exc_is_blocking_io_error(exc) && pyre_object::is_int(f);
-            if let Some(fname) = w_filename.filter(|&f| !written(f)) {
+            let written = |f| {
+                exc_is_blocking_io_error(exc)
+                    .then(|| crate::baseobjspace::int_w(f).ok())
+                    .flatten()
+            };
+            if let Some(value) = w_filename.and_then(written) {
+                interp_exceptions::w_exception_set_written(exc, value);
+                interp_exceptions::w_exception_set_blocking_written_arg(exc);
+            } else if let Some(fname) = w_filename {
                 interp_exceptions::w_exception_set_filename(exc, fname);
                 if let Some(f2) = args.get(4).copied().filter(|&f| !pyre_object::is_none(f)) {
                     interp_exceptions::w_exception_set_filename2(exc, f2);
@@ -7331,7 +7390,7 @@ pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
         exception_repr_method as crate::gateway::BuiltinCodeFn,
     ]
     .iter()
-    .any(|&target| std::ptr::fn_addr_eq(f, target))
+    .any(|&target| crate::gateway::builtin_code_fn_eq(f, target))
 }
 
 /// `interp_exceptions.py:993-998 W_SystemExit.descr_init` — a lone argument
@@ -10006,34 +10065,19 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     if args.is_empty() {
         return Ok(w_list_new(vec![]));
     }
-    let obj = args[0];
-    unsafe {
-        // The raw-storage copy fast paths apply only to EXACT tuple/list
-        // instances; a subclass may override `__iter__`, so it must go
-        // through `collect_iterable` (`iter(obj)`).
-        if is_exact_list(obj) {
-            // Copy the list
-            let n = w_list_len(obj);
-            let items: Vec<_> = (0..n)
-                .filter_map(|i| w_list_getitem(obj, i as i64))
-                .collect();
-            return Ok(w_list_new(items));
-        }
-        if is_exact_tuple(obj) {
-            let n = w_tuple_len(obj);
-            let items: Vec<_> = (0..n)
-                .filter_map(|i| w_tuple_getitem(obj, i as i64))
-                .collect();
-            return Ok(w_list_new(items));
-        }
-    }
-    // listobject.py:1049-1053 `_extend_from_iterable` asks for the source's
-    // length hint before obtaining/consuming its iterator.  The hint is only a
-    // preallocation aid, but RuntimeError and other non-TypeError failures
-    // from `__len__` / `__length_hint__` are observable and must propagate.
-    let _ = crate::baseobjspace::length_hint(obj, 0)?;
-    // Consume iterator — PyPy: listobject.py W_ListObject(iterable)
-    Ok(w_list_new(collect_iterable(obj)?))
+    // CPython `list_vectorcall_impl` allocates an empty list then delegates to
+    // the same `list_extend` machinery as `list.__init__`. Keep both the source
+    // and result rooted across that allocation and the iterator callbacks.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let list = w_list_new(vec![]);
+    pyre_object::gc_roots::pin_root(list);
+    crate::type_methods::list_method_extend(&[
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+    ])?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(root_base + 1))
 }
 
 /// The message-less `MemoryError` an unsatisfiable reservation raises.
@@ -13290,7 +13334,7 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // `sorted_lst.sort(key=key, reverse=reverse)`, so the built list picks its
     // storage strategy first and the sort runs through the same body
     // `list.sort` uses.
-    let w_list = w_list_new(collect_iterable(iterable)?);
+    let w_list = builtin_list_ctor(&[iterable])?;
     let _roots = pyre_object::gc_roots::push_roots();
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_list);
@@ -13321,6 +13365,9 @@ pub(crate) fn sort_list_in_place(
                 sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
                 return Ok(());
             }
+            if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
+                return Ok(());
+            }
         }
     }
     unsafe {
@@ -13329,6 +13376,7 @@ pub(crate) fn sort_list_in_place(
         // for the whole operation, so user code cannot alter this sorting
         // slice through the visible list.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+        let saved_allocated = pyre_object::listobject::w_list_allocated(list);
         let saved = pyre_object::listobject::w_list_items_copy_as_vec(list);
         let _roots = pyre_object::gc_roots::push_roots();
         let item_base = pyre_object::gc_roots::shadow_stack_len();
@@ -13337,13 +13385,14 @@ pub(crate) fn sort_list_in_place(
         }
         let saved_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
         pyre_object::listobject::w_list_clear(list);
+        // CPython 3.14 list_sort_impl detaches ob_item and marks `allocated`
+        // as -1. Any resizing mutation replaces the sentinel with a normal
+        // allocation, which is how the final modification check works.
+        pyre_object::listobject::w_list_set_allocated(list, -1);
 
         let (order, sorted) = sort_rooted_items(item_base, saved_len, key_fn, reverse);
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
-        // Whether the user mucked with the list during the sort: any mutation
-        // switches the emptied receiver away from the Empty strategy, and a
-        // list never switches back, so a net-zero append+pop is caught too.
-        let mucked = !pyre_object::listobject::w_list_is_empty_strategy(list);
+        let mucked = pyre_object::listobject::w_list_allocated(list) != -1;
 
         // `descr_sort`'s `finally` puts the items back unconditionally,
         // discarding whatever the user stored into the receiver meanwhile.
@@ -13352,6 +13401,7 @@ pub(crate) fn sort_list_in_place(
             .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
             .collect();
         pyre_object::listobject::w_list_init_items(list, restored);
+        pyre_object::listobject::w_list_set_allocated(list, saved_allocated);
         sorted?;
         if mucked {
             return Err(crate::PyError::new(
@@ -15131,6 +15181,10 @@ fn open_flags_for_mode(mode: &str) -> i32 {
     if exclusive {
         flags |= libc::O_CREAT | libc::O_EXCL;
     }
+    // PyPy `W_FileIO.descr_init`: every pathname/opener call receives
+    // `O_CLOEXEC` when the platform provides it.  The explicit fcntl below
+    // remains necessary for an opener that ignores the supplied flag.
+    flags |= libc::O_CLOEXEC;
     flags
 }
 #[cfg(not(unix))]
@@ -15157,6 +15211,23 @@ fn fileio_validate_fd(
 #[cfg(unix)]
 fn fileio_close_owned_fd(fd: i32) {
     let _ = crate::host_seam::ops::close(fd);
+}
+
+/// PyPy `_open_inhcache.set_non_inheritable(fd)` / `rposix.set_inheritable`.
+/// A caller-supplied integer descriptor is deliberately excluded: FileIO must
+/// preserve that descriptor's existing inheritance flag.
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    let current = crt_call!(libc::fcntl(fd, libc::F_GETFD));
+    if current < 0 {
+        return Err(crate::PyError::os_error_syscall(crt_errno(), w_name));
+    }
+    if current & libc::FD_CLOEXEC == 0
+        && crt_call!(libc::fcntl(fd, libc::F_SETFD, current | libc::FD_CLOEXEC)) < 0
+    {
+        return Err(crate::PyError::os_error_syscall(crt_errno(), w_name));
+    }
+    Ok(())
 }
 
 /// `open()` — PyPy `pypy/module/_io/interp_io.py:open`.
@@ -15529,6 +15600,11 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if fd < 0 {
                 return Err(crate::PyError::value_error(format!("opener returned {fd}")));
             }
+            #[cfg(all(unix, not(feature = "sandbox")))]
+            if let Err(error) = fileio_set_non_inheritable(fd, resolved_path.w_path()) {
+                fileio_close_owned_fd(fd);
+                return Err(error);
+            }
             #[cfg(unix)]
             if let Err(error) = fileio_validate_fd(fd, resolved_path.w_path()) {
                 fileio_close_owned_fd(fd);
@@ -15590,6 +15666,10 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // wrapper from which it came.
         let fd = crate::host_seam::ops::open(path_bytes, flags, 0o666)
             .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, resolved_path.w_path()))?;
+        if let Err(error) = fileio_set_non_inheritable(fd, resolved_path.w_path()) {
+            fileio_close_owned_fd(fd);
+            return Err(error);
+        }
         if let Err(error) = fileio_validate_fd(fd, resolved_path.w_path()) {
             fileio_close_owned_fd(fd);
             return Err(error);

@@ -506,16 +506,37 @@ pub(crate) fn function_new_impl(
     let globals_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_func_globals_obj);
 
-    // CPython 3.14 `_PyEval_BuiltinsFromGlobals` at function construction:
+    // CPython 3.14 `_PyDict_LoadBuiltinsFromGlobals` at function construction:
     // retain the selected mapping identity even if the globals entry changes
-    // later.  Builtin/gateway carriers have no globals and keep a null slot.
+    // later.  Its `_Py_dict_lookup_threadsafe_stackref` reads the native dict
+    // backing directly (including for a dict subclass), and a missing key
+    // inherits `PyEval_GetBuiltins()` from the live caller frame.  This differs
+    // from PyPy's `pick_builtin`, whose missing-key result is a fresh anonymous
+    // module containing only `None`; 3.14 is pyre's compatibility target for
+    // the observable `function.__builtins__` field.
+    //
+    // Builtin/gateway carriers have no globals and keep a null slot.
     let w_builtins = if w_func_globals_obj.is_null() {
         PY_NULL
     } else {
-        let selected = crate::baseobjspace::pick_builtin_obj(
-            w_func_globals_obj,
-            crate::call::take_last_exec_ctx(),
-        );
+        let globals_backing = crate::type_methods::resolve_dict_backing(w_func_globals_obj);
+        let selected = if globals_backing.is_null() {
+            None
+        } else {
+            unsafe { pyre_object::w_dict_getitem_str(globals_backing, "__builtins__") }
+        }
+        .unwrap_or_else(|| {
+            let exec_ctx = crate::call::take_last_exec_ctx();
+            if exec_ctx.is_null() {
+                return PY_NULL;
+            }
+            let frame = unsafe { (*exec_ctx).gettopframe_raw() };
+            if frame.is_null() {
+                unsafe { (*exec_ctx).get_builtin_dict() }
+            } else {
+                unsafe { (*frame).fget_f_builtins() }
+            }
+        });
         if !selected.is_null() && unsafe { pyre_object::is_module(selected) } {
             unsafe { pyre_object::w_module_get_w_dict(selected) }
         } else {
@@ -525,7 +546,7 @@ pub(crate) fn function_new_impl(
     let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_builtins);
 
-    // `pick_builtin_obj` and later allocations may collect.  Reload every
+    // Resolving the caller vref and later allocations may collect.  Reload every
     // pinned input before embedding it in the new Function; the original raw
     // locals are not rewritten when the shadow-stack slots are forwarded.
     let closure = pyre_object::gc_roots::shadow_stack_get(closure_slot);
@@ -1939,6 +1960,24 @@ pub unsafe fn function_get_func_name(obj: PyObjectRef) -> &'static str {
     unsafe { function_get_name(obj) }
 }
 
+/// The UTF-8 mirror a `Function`'s raw `name` slot holds.
+///
+/// `NameStorage` is a `String`, so a name carrying a lone surrogate — which
+/// `surrogateescape` puts there for any byte an operating-system name failed
+/// to decode — has no exact form in that slot. The `w_name` slot keeps the
+/// object the caller supplied and is what `__name__` reads, so the stored
+/// value survives; this is the `&str` view `repr` and the `__qualname__`
+/// default consume, and it renders the surrogate rather than aborting the
+/// process on it.
+unsafe fn name_utf8_mirror(w_name: PyObjectRef) -> String {
+    match unsafe { pyre_object::w_str_get_value_opt(w_name) } {
+        Some(value) => value.to_string(),
+        None => unsafe { pyre_object::w_str_get_wtf8(w_name) }
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
 /// PyPy-compatible `__name__` setter.
 ///
 /// A GC-managed (user) function boxes the new name in a GC-managed storage box
@@ -1956,7 +1995,7 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
         }
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_name = name;
-        let raw_name = pyre_object::w_str_get_value(name).to_string();
+        let raw_name = name_utf8_mirror(name);
         let raw_name = if pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
             pyre_object::gc_storage::gc_alloc_storage_box(
                 raw_name,
@@ -2292,7 +2331,7 @@ pub unsafe fn descr_function__new__(
     unsafe {
         let _ = _argdefs;
         let name = if !w_name.is_null() && !pyre_object::is_none(w_name) {
-            pyre_object::w_str_get_value(w_name).to_string()
+            name_utf8_mirror(w_name)
         } else {
             String::new()
         };
@@ -2301,7 +2340,15 @@ pub unsafe fn descr_function__new__(
         } else {
             w_closure
         };
-        function_new_with_closure(code, name, w_globals, closure)
+        let func = function_new_with_closure(code, name, w_globals, closure);
+        // `name` above is only the UTF-8 mirror. The object the caller passed
+        // is what `__name__` must answer with, so store it: otherwise the
+        // getter rebuilds one from the mirror and a name carrying a lone
+        // surrogate comes back escaped instead of equal to what went in.
+        if !w_name.is_null() && !pyre_object::is_none(w_name) {
+            function_set_name_obj(func, w_name);
+        }
+        func
     }
 }
 
@@ -2413,7 +2460,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let name = if w_name.is_null() || unsafe { pyre_object::is_none(w_name) } {
         unsafe { (*code_ptr).obj_name.to_string() }
     } else if unsafe { pyre_object::is_str(w_name) } {
-        unsafe { pyre_object::w_str_get_value(w_name).to_string() }
+        unsafe { name_utf8_mirror(w_name) }
     } else {
         return Err(crate::PyError::type_error(
             "arg 3 (name) must be None or string",
@@ -2430,6 +2477,11 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // supplies unresolved names through `__missing__` when it clones a PEP
     // 649 annotate function with `types.FunctionType`.
     let func = function_new_with_closure(w_code as *const (), name, w_globals, closure);
+    // As in `descr_function__new__`: the mirror cannot hold a lone surrogate,
+    // so the supplied object is what `__name__` reads back.
+    if !w_name.is_null() && !unsafe { pyre_object::is_none(w_name) } {
+        unsafe { function_set_name_obj(func, w_name) };
+    }
     let qualname = pyre_object::w_str_new(unsafe { (*code_ptr).qualname.as_ref() });
     unsafe { function_set_qualname(func, qualname) };
     if !w_argdefs.is_null() && !unsafe { pyre_object::is_none(w_argdefs) } {

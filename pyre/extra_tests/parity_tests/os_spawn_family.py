@@ -35,10 +35,8 @@ check(os.P_NOWAIT == os.P_NOWAITO, "P_NOWAIT and P_NOWAITO disagree")
 exe = sys.executable
 check(bool(exe), "no sys.executable to spawn")
 
-# P_WAIT hands back what the child exited with.
-code = os.spawnv(os.P_WAIT, exe, [exe, "-c", "raise SystemExit(7)"])
-check(code == 7, f"spawnv(P_WAIT) returned {code!r}, not the child's exit code")
-
+# P_WAIT hands back what the child exited with. `extra_tests/test_os.py`
+# pins the non-zero code; this is the zero one.
 code = os.spawnv(os.P_WAIT, exe, [exe, "-c", ""])
 check(code == 0, f"spawnv(P_WAIT) on a clean exit returned {code!r}")
 
@@ -50,14 +48,7 @@ waited, status = os.waitpid(pid, 0)
 check(waited == pid, f"waitpid returned {waited!r} for {pid!r}")
 check(os.waitstatus_to_exitcode(status) == 3, f"child status {status!r}")
 
-# spawnve carries an environment of its own.
-code = os.spawnve(
-    os.P_WAIT,
-    exe,
-    [exe, "-c", "import os,sys; sys.exit(int(os.environ['PARITY_MARK']))"],
-    {**os.environ, "PARITY_MARK": "5"},
-)
-check(code == 5, f"spawnve did not pass the environment: {code!r}")
+# `spawnve` and the environment it carries are `extra_tests/test_os.py`'s.
 
 # spawnvp looks the name up along $PATH, so a bare name resolves.
 if hasattr(os, "spawnvp"):

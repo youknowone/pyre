@@ -3260,18 +3260,18 @@ impl PyFrame {
     /// frame.  Refuses on an executing (non-generator) frame or a running
     /// generator (`"cannot clear an executing frame"`) and on a generator
     /// frame suspended at a `yield` (`"cannot clear a suspended frame"`);
-    /// a not-yet-started or already-exhausted generator is finalized
-    /// (marked exhausted).  Otherwise clears `w_f_trace`, resets
+    /// a not-yet-started or already-exhausted generator is finalized.
+    /// Otherwise clears `w_f_trace`, resets
     /// `w_locals` to a fresh dict, and replaces every local / cell / free
     /// var / stack slot (cells are rebound to fresh empty cells so a
     /// shared inner/outer cell is not mutated).
     pub fn descr_clear(&mut self) -> Result<(), crate::PyError> {
-        if !self.frame_finished_execution() {
-            if !self._is_generator_or_coroutine() {
-                return Err(crate::PyError::runtime_error(
-                    "cannot clear an executing frame",
-                ));
-            }
+        // CPython 3.14 `frameobject.c:frame_clear_impl`: a frame owned by a
+        // generator/coroutine is finalized and then returned from directly.
+        // In particular, clearing a never-started coroutine frame must run
+        // the unawaited-coroutine warning while the owner is still reachable;
+        // merely marking it exhausted loses that finalizer event.
+        if self._is_generator_or_coroutine() {
             let w_gen = self.get_generator();
             if !w_gen.is_null() {
                 if unsafe { pyre_object::generator::w_generator_is_running(w_gen) } {
@@ -3291,11 +3291,54 @@ impl PyFrame {
                         "cannot clear a suspended frame",
                     ));
                 }
-                // Not started or already exhausted: finalize.
-                unsafe { pyre_object::generator::w_generator_set_exhausted(w_gen) };
+                // `_PyGen_Finalize` can execute Python and collect.  Keep both
+                // owner and frame as explicit roots, then reload both before
+                // severing the association; neither raw pointer may survive
+                // the call unchanged across a nursery move.
+                let frame_anchor = crate::eval::FrameAnchor::new(self);
+                let roots = pyre_object::gc_roots::push_roots();
+                let gen_slot = roots.base();
+                roots.pin_root(w_gen);
+                crate::baseobjspace::generator_finalize(roots.get(gen_slot))?;
+                // CPython 3.14 `frame_clear_impl` finishes a never-started
+                // generator after `_PyGen_Finalize`, then clears the owned
+                // interpreter frame.  The suspended case was rejected above,
+                // so this is the same completion path used by close() and
+                // normal generator return, including severing `gi_frame`.
+                unsafe {
+                    crate::baseobjspace::generator_frame_is_finished(
+                        roots.get(gen_slot),
+                        &mut *frame_anchor.live(),
+                    )
+                };
+                let ec = crate::call::getexecutioncontext()
+                    as *mut crate::executioncontext::ExecutionContext;
+                if !ec.is_null() {
+                    unsafe { (*ec).finalize_explicitly_cleared_frame_references() };
+                }
+                return Ok(());
             }
+            // pyframe.py:815-820: a dead `f_generator_wref` simply skips the
+            // generator finalizer and proceeds to clear the escaped frame.
+            // It is not an executing non-generator frame.
+            self.clear_references();
+            return Ok(());
+        }
+        if !self.frame_finished_execution() {
+            return Err(crate::PyError::runtime_error(
+                "cannot clear an executing frame",
+            ));
         }
 
+        self.clear_references();
+        Ok(())
+    }
+
+    /// Clear the frame-owned reference region after its owner has already
+    /// completed.  This is the internal `_PyFrame_ClearExceptCode` half used
+    /// by generator completion; unlike public `frame.clear()`, it must not
+    /// re-enter `_PyGen_Finalize` on the generator that is doing the clearing.
+    pub(crate) fn clear_references(&mut self) {
         if let Some(debug) = self.getdebug() {
             let had_locals = !debug.w_locals.is_null();
             // Allocate before remembering debugdata: a minor can happen here.
@@ -3322,7 +3365,6 @@ impl PyFrame {
             self.set_locals_w(i, w_newvalue);
         }
         self.valuestackdepth = 0;
-        Ok(())
     }
 
     /// pyframe.py:773 fget_f_lasti → space.newint(self.last_instr)

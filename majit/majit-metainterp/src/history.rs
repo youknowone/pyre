@@ -708,11 +708,14 @@ impl TreeLoop {
     /// become the new inputargs; any OpRef referenced after the cut but
     /// defined before it (and not in `original_boxes`) is re-emitted as a
     /// prefix operation (transitive closure of dependencies).
+    /// `None` when the cut cannot be taken without losing a live value; the
+    /// caller must cancel the compilation — see
+    /// [`Self::cut_trace_from_with_consts`].
     pub fn cut_trace_from(
         &self,
         start: TreeLoopCutPosition,
         original_boxes: &[crate::trace_ctx::GreenBox],
-    ) -> TreeLoop {
+    ) -> Option<TreeLoop> {
         self.cut_trace_from_with_consts(start, original_boxes, &[])
     }
 
@@ -720,12 +723,26 @@ impl TreeLoop {
     /// original inputarg.  Escaped original inputargs are remapped to these
     /// pool-managed constants (already GC-rooted), preventing both stale
     /// pointers and entry-contract mismatches at compiled-code entry.
+    ///
+    /// Returns `None` when a pre-cut box reaches the cut region through a
+    /// guard snapshot alone and its definition cone cannot be re-emitted.
+    /// The value has no representation in the cut namespace, and the only
+    /// alternatives are a wrong one (mapping the slot to `OpRef::NONE`, which
+    /// the encoder turns into a NULL in the resumed frame) or re-executing a
+    /// side effect.
+    ///
+    /// The caller must CANCEL the compilation, not fall back to the uncut
+    /// trace: once a merge point is live, the loop token, entry contract and
+    /// optimizer seed downstream are all built for the cut namespace, and
+    /// handing them the uncut trace fails `test_re` outright (measured 3/3 vs
+    /// 0/3 on a same-binary toggle).  Cancelling runs the loop in the
+    /// interpreter, which is correct.
     pub fn cut_trace_from_with_consts(
         &self,
         start: TreeLoopCutPosition,
         original_boxes: &[crate::trace_ctx::GreenBox],
         inputarg_consts: &[OpRef],
-    ) -> TreeLoop {
+    ) -> Option<TreeLoop> {
         use indexmap::IndexSet;
         use std::collections::VecDeque;
 
@@ -767,12 +784,197 @@ impl TreeLoop {
 
         // Seed with refs used by post-cut ops (args only, not fail_args).
         // RPython CutTrace parity: pre-cut refs in fail_args map to
-        // OpRef::NONE (resume data handles materialization). Only regular
-        // op args seed escaped refs for prefix re-emission.
+        // OpRef::NONE (resume data handles materialization) — fail_args are
+        // attached after optimization by `store_final_boxes_in_guard`, so the
+        // cut namespace owes them nothing. Only regular op args seed escaped
+        // refs for prefix re-emission.
         for op in cut_ops {
             for arg in op.getarglist().iter() {
                 if is_pre_cut_ref(&arg.to_opref()) && escaped_set.insert(arg.to_opref()) {
                     queue.push_back(arg.to_opref());
+                }
+            }
+        }
+
+        // A snapshot is NOT fail_args: it is captured during tracing and is the
+        // only description a guard has of the frame state it resumes into. Some
+        // pre-cut boxes reach the cut region through a snapshot slot alone —
+        // a pure loop-invariant value (`nested + 1` computed once before the
+        // cut) stays live on the Python operand stack across the merge point
+        // while every post-cut operand reads the cached pre-cut box, so no
+        // post-cut ARGUMENT names it and the loop above never sees it.
+        //
+        // Upstream never has to re-emit any of this: `CutTrace`
+        // (`opencoder.py`) is a view over the same trace, and the cut is a
+        // jitdriver merge point where the whole live set is already
+        // `inputargs` — a snapshot referencing a position before `start` would
+        // trip `TraceIterator._get`'s assert. Pyre cuts at a position whose
+        // live set is wider than `original_boxes`, so a snapshot-only
+        // reference has to seed the same prefix re-emission the operand path
+        // uses. Left unseeded, the remap below rewrote the slot to
+        // `OpRef::NONE`, `_number_boxes` emitted `NULLREF`, and the resumed
+        // frame's operand slot was written NULL — the argument of a live call
+        // arriving unbound.
+        //
+        // Prefix re-emission RE-EXECUTES the definition at the cut point, so a
+        // definition is admissible only if re-running it there yields the value
+        // the snapshot recorded. That is `is_always_pure`: a function of its own
+        // arguments alone. `has_no_side_effect` is a strictly weaker property
+        // and does NOT imply it — an op can be free of effects while still
+        // OBSERVING them:
+        //
+        //   - the loads between `ALWAYS_PURE_LAST` and `NOSIDEEFFECT_LAST`
+        //     (`GcLoad*`, `Getfield*`, `Getarrayitem*`, `RawLoad*`,
+        //     `ThreadlocalrefGet`, ...) read memory. A pre-cut store between the
+        //     load and the cut is itself side-effecting, so it is never in the
+        //     cone; replaying the load at cut entry then returns the NEW value,
+        //     not the one the snapshot named.
+        //   - allocations (`New*`) get their contents from separate `SetfieldGc`
+        //     stores, which are likewise side-effecting and outside the argument
+        //     cone. Re-emitting the allocation alone yields a BLANK object.
+        //   - `ForceToken` / `VirtualRef*` mint identity; a replay mints a
+        //     different one.
+        //
+        // The condition is on the CONE, not the root, since the BFS below pulls
+        // in the whole transitive definition set.
+        //
+        // A cone that is NOT re-emittable leaves the value with no
+        // representation in the cut namespace at all. Promoting it to an extra
+        // inputarg is not available either: inputargs are re-bound from
+        // `original_boxes` on every entry, and an op-defined value has no box
+        // there. That leaves only mapping the slot to `OpRef::NONE`, which
+        // writes a NULL into the resumed frame (a live call argument arriving
+        // unbound), or re-emitting anyway and recovering the wrong value. Both
+        // are worse than not compiling: decline, and the caller cancels.
+        //
+        // A pre-cut ORIGINAL inputarg has no definition to re-execute, so it is
+        // a leaf — but only phase 4's pool-constant arm can actually deliver
+        // one. Its other arm appends the inputarg to the new entry contract, and
+        // `patch_new_loop_to_load_virtualizable_fields` requires that list to be
+        // exactly the red args followed by the virtualizable's static fields and
+        // array items, asserting it (`compile.py:458`). A snapshot's frame boxes
+        // ARE the frame's locals, so seeding from snapshots reaches original
+        // inputargs constantly where operand seeding reached them rarely. Purity
+        // does not cover this — an `IntAdd` cone is replay-safe and still
+        // undeliverable — so test the same predicate phase 4 branches on and
+        // decline when the constant is absent: `test.test_collections` and
+        // `test.test_urlparse` crashed on that assert with `18 != 19`.
+        //
+        // One impure ROOT stays admissible: an allocation, replayed TOGETHER
+        // with the stores that filled it. Replaying `New*` alone is what makes
+        // it inadmissible — the contents come from separate `SetfieldGc`s that
+        // no argument cone reaches, so the object arrives blank — but those
+        // stores write into an object that does not exist yet in the cut
+        // namespace, so replaying them observes nothing. That holds only while
+        // every pre-cut op naming the allocation is either a guard, which reads
+        // it and retains nothing, or a store whose FIRST argument is the
+        // allocation itself. A store that puts it into something else, or a
+        // call that receives it, publishes the object: a replay then mints a
+        // second identity that the original holder can tell apart, so refuse.
+        // Each stored value has to be reconstructible in its own right, so it
+        // is walked like any other operand.
+        //
+        // Returns the extra pre-cut ops the caller must seed alongside the
+        // root; `None` is the decline.
+        let snapshot_cone_is_reemittable = |root: &OpRef| -> Option<Vec<OpRef>> {
+            let mut seen: IndexSet<OpRef> = IndexSet::new();
+            let mut extra: Vec<OpRef> = Vec::new();
+            let mut stack: Vec<(OpRef, bool)> = vec![(*root, true)];
+            while let Some((r, is_root)) = stack.pop() {
+                if r.raw() < num_original_inputargs {
+                    if inputarg_consts.get(r.raw() as usize).is_none() {
+                        return None;
+                    }
+                    continue;
+                }
+                if !seen.insert(r) {
+                    continue;
+                }
+                let Some(op) = self.ops.get((r.raw() - num_original_inputargs) as usize) else {
+                    return None;
+                };
+                if !op.opcode.is_always_pure() {
+                    if !is_root || !op.opcode.is_malloc() {
+                        return None;
+                    }
+                    for other in self.ops[..start.op_index].iter() {
+                        if !other.getarglist().iter().any(|a| a.to_opref() == r) {
+                            continue;
+                        }
+                        if other.opcode.is_guard() {
+                            continue;
+                        }
+                        let fills_the_allocation = (other.opcode.is_setfield()
+                            || other.opcode.is_setarrayitem()
+                            || other.opcode.is_setinteriorfield())
+                            && other.arg(0).to_opref() == r;
+                        if !fills_the_allocation {
+                            return None;
+                        }
+                        for i in 1..other.num_args() {
+                            let a = other.arg(i).to_opref();
+                            if a == r {
+                                return None;
+                            }
+                            if is_pre_cut_ref(&a) {
+                                stack.push((a, false));
+                            }
+                        }
+                        extra.push(other.pos.get());
+                    }
+                }
+                for arg in op.getarglist().iter() {
+                    let a = arg.to_opref();
+                    if is_pre_cut_ref(&a) {
+                        stack.push((a, false));
+                    }
+                }
+            }
+            Some(extra)
+        };
+        for op in cut_ops {
+            let snapshot_id = op.rd_resume_position.get();
+            if snapshot_id < 0 {
+                continue;
+            }
+            let Some(snap) = self.snapshots.get(snapshot_id as usize) else {
+                continue;
+            };
+            let tagged = snap
+                .vable_boxes
+                .iter()
+                .chain(snap.vref_boxes.iter())
+                .chain(snap.frames.iter().flat_map(|f| f.boxes.iter()));
+            for t in tagged {
+                if let crate::recorder::SnapshotTagged::Box(r, _) = t {
+                    if !is_pre_cut_ref(r) {
+                        continue;
+                    }
+                    let Some(extra) = snapshot_cone_is_reemittable(r) else {
+                        if crate::majit_log_enabled() {
+                            let root = r
+                                .raw()
+                                .checked_sub(num_original_inputargs)
+                                .and_then(|i| self.ops.get(i as usize))
+                                .map(|op| op.opcode);
+                            eprintln!(
+                                "[jit][cut-decline] snapshot-only ref {r:?} (root {root:?}) \
+                                 has a definition cone that is not replay-safe; \
+                                 cancelling this compilation",
+                            );
+                        }
+                        return None;
+                    };
+                    if escaped_set.insert(*r) {
+                        queue.push_back(*r);
+                    }
+                    // The allocation's filling stores ride along; `op_escaped`
+                    // is ordered by position, so they re-emit after it.
+                    for e in extra {
+                        if escaped_set.insert(e) {
+                            queue.push_back(e);
+                        }
+                    }
                 }
             }
         }
@@ -1023,7 +1225,11 @@ impl TreeLoop {
                 }
             })
             .collect();
-        TreeLoop::from_oprc(new_inputargs, new_ops, remapped_snapshots)
+        Some(TreeLoop::from_oprc(
+            new_inputargs,
+            new_ops,
+            remapped_snapshots,
+        ))
     }
 }
 
@@ -1781,7 +1987,9 @@ mod tests {
             crate::trace_ctx::GreenBox::new(iarg(1), Type::Int),
         ];
 
-        let cut = trace.cut_trace_from(start, &original_boxes);
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
         assert_eq!(cut.inputargs.len(), 2);
         assert_eq!(cut.ops.len(), 2); // IntMul + Jump
         assert_eq!(cut.ops[0].opcode, OpCode::IntMul);
@@ -1814,7 +2022,9 @@ mod tests {
         // original_boxes only has v0 — v2 is escaped
         let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
-        let cut = trace.cut_trace_from(start, &original_boxes);
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
         // v1 = OpRef::input_arg_int(1) is an original trace inputarg NOT in original_boxes.
         // It's referenced by the escaped int_add op → added as extra inputarg.
         // Result: inputargs = [v0, v1], prefix = [int_add], post-cut = [int_mul, jump]
@@ -1847,7 +2057,9 @@ mod tests {
         let start = TreeLoopCutPosition::new(1);
         let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
-        let cut = trace.cut_trace_from(start, &original_boxes);
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
         assert_eq!(cut.ops.len(), 2);
         // Constant ref should be preserved as-is
         assert_eq!(cut.ops[0].arg(1).to_opref(), const_ref);
@@ -1878,7 +2090,9 @@ mod tests {
         let start = TreeLoopCutPosition::new(2); // cut after op0 and op1
         let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
-        let cut = trace.cut_trace_from(start, &original_boxes);
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
         // 1 inputarg, 2 prefix ops (v1=int_add, v2=int_mul), 2 post-cut ops
         assert_eq!(cut.inputargs.len(), 1);
         assert_eq!(cut.ops.len(), 4);
@@ -1888,6 +2102,301 @@ mod tests {
         assert_eq!(cut.ops[3].opcode, OpCode::Jump);
         // Verify remapping chain: v2's arg should reference re-emitted v1
         assert_eq!(cut.ops[1].arg(0).to_opref(), iop(1)); // v1 → prefix idx 0 → BoxInt at position 1
+    }
+
+    /// Build a one-frame snapshot whose frame-live array is `boxes`.
+    ///
+    /// These are the frame's locals and operand stack — `_list_of_boxes`
+    /// (`opencoder.py:712-716`), consumed by `_prepare_next_section` — and the
+    /// array the dropped call operand actually lived in. `vable_boxes` and
+    /// `vref_boxes` are left empty on purpose: they are not interchangeable
+    /// with frame-live slots. `consume_virtualizable_boxes` reads slot zero as
+    /// the virtualizable ITSELF and sizes the rest against it
+    /// (`resume.py:1088-1091`), and `consume_virtualref_boxes` hands its pairs
+    /// to `continue_tracing`, so putting an operand-stack value there would
+    /// exercise a shape the recorder cannot produce.
+    fn snapshot_with_frame_boxes(
+        boxes: Vec<crate::recorder::SnapshotTagged>,
+    ) -> crate::recorder::Snapshot {
+        crate::recorder::Snapshot {
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: 0,
+                py_pc: 0,
+                boxes,
+            }],
+            vable_boxes: Vec::new(),
+            vref_boxes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_cut_trace_from_reemits_ref_held_only_by_a_snapshot() {
+        // A pre-cut op that NO post-cut argument names, but that a post-cut
+        // guard's snapshot still holds: the operand-stack slot of a loop-
+        // invariant value. Seeded only from op args, the cut mapped it to
+        // `OpRef::NONE`, `_number_boxes` emitted NULLREF, and the resumed
+        // frame read that operand as NULL.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut ops = Vec::new();
+        // v2 = int_add(v0, v1) — before the cut; consumed by nothing after it.
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        op0.pos.set(iop(2));
+        ops.push(op0);
+        // guard_true(v0) — after the cut, resuming through snapshot 0.
+        let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        op1.pos.set(vop(3));
+        op1.rd_resume_position.set(0);
+        ops.push(op1);
+        let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        op2.pos.set(vop(4));
+        ops.push(op2);
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
+            crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
+        ])];
+        let trace = TreeLoop::with_snapshots(inputargs, ops, snapshots);
+
+        let start = TreeLoopCutPosition::new(1); // cut after op0
+        let original_boxes = vec![
+            crate::trace_ctx::GreenBox::new(iarg(0), Type::Int),
+            crate::trace_ctx::GreenBox::new(iarg(1), Type::Int),
+        ];
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
+
+        // The add is re-emitted as a prefix op, and the snapshot slot names it.
+        assert_eq!(cut.ops[0].opcode, OpCode::IntAdd);
+        let slot = cut.snapshots[0].frames[0].boxes[0];
+        let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
+            panic!("snapshot slot lost its box: {slot:?}");
+        };
+        assert!(!r.is_none(), "snapshot slot mapped to NONE: {slot:?}");
+        assert_eq!(r, cut.ops[0].pos.get());
+    }
+
+    #[test]
+    fn test_cut_trace_from_declines_on_a_side_effecting_snapshot_ref() {
+        // Re-emission re-EXECUTES the definition, so a side-effecting pre-cut
+        // op is not admitted. The value then has no representation in the cut
+        // namespace at all, and mapping the slot to `OpRef::NONE` would write a
+        // NULL into the resumed frame — so the cut is declined outright and the
+        // caller cancels the compilation.
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut ops = Vec::new();
+        let mut op0 = Op::new(OpCode::CallMayForceR, &[iarg_box(0)]);
+        op0.pos.set(OpRef::ref_op(1));
+        ops.push(op0);
+        let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        op1.pos.set(vop(2));
+        op1.rd_resume_position.set(0);
+        ops.push(op1);
+        let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        op2.pos.set(vop(3));
+        ops.push(op2);
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
+            crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
+        ])];
+        let trace = TreeLoop::with_snapshots(inputargs, ops, snapshots);
+
+        let start = TreeLoopCutPosition::new(1);
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+        let cut = trace.cut_trace_from(start, &original_boxes);
+
+        assert!(
+            cut.is_none(),
+            "expected the cut to be declined, got a trace whose snapshot slot is {:?}",
+            cut.map(|c| c.snapshots[0].frames[0].boxes[0]),
+        );
+    }
+
+    #[test]
+    fn test_cut_trace_from_snapshot_seed_does_not_widen_the_entry_contract() {
+        // A snapshot's frame boxes are the frame's locals, so a snapshot root's
+        // cone reaches original inputargs that no post-cut argument names. Phase
+        // 4 can only deliver such an inputarg from a pool constant; without one
+        // it appends an extra inputarg, and
+        // `patch_new_loop_to_load_virtualizable_fields` asserts the list is
+        // exactly the red args plus the virtualizable's fields
+        // (`compile.py:458`) — `test.test_collections` and `test.test_urlparse`
+        // crashed there with `assert i == len(inputargs) failed (18 != 19)`.
+        // `is_always_pure()` does not cover this: the root here is an `IntAdd`,
+        // so the cone is replay-safe and it is the ENTRY CONTRACT, not the
+        // replay, that cannot represent the value. Decline the cut.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut ops = Vec::new();
+        // v2 = int_add(v0, v1) — pre-cut, named by nothing after the cut.
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        op0.pos.set(iop(2));
+        ops.push(op0);
+        let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        op1.pos.set(vop(3));
+        op1.rd_resume_position.set(0);
+        ops.push(op1);
+        let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        op2.pos.set(vop(4));
+        ops.push(op2);
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
+            crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
+        ])];
+        let trace = TreeLoop::with_snapshots(inputargs, ops, snapshots);
+
+        // v1 is deliberately NOT an original box, and `cut_trace_from` passes an
+        // empty constant pool, so phase 4 would have to invent an inputarg.
+        let start = TreeLoopCutPosition::new(1);
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+        let cut = trace.cut_trace_from(start, &original_boxes);
+
+        assert!(
+            cut.is_none(),
+            "expected the cut to be declined, got one with {:?} inputargs for {} original boxes",
+            cut.map(|c| c.inputargs.len()),
+            original_boxes.len(),
+        );
+    }
+
+    /// Ref-typed sibling of [`iop_box`], for allocation results.
+    fn rop_box(pos: u32) -> Operand {
+        rooted_resop_operand(Type::Ref, pos)
+    }
+
+    #[test]
+    fn test_cut_trace_from_replays_an_allocation_with_the_stores_that_filled_it() {
+        // `New*` alone reconstructs a BLANK object, because its contents come
+        // from separate stores no argument cone reaches. Replaying those stores
+        // alongside it restores the contents, and they observe nothing: they
+        // write into an object that does not exist yet in the cut namespace.
+        // The `GuardClass` reads the allocation and retains nothing, so it does
+        // not block the admission and is not replayed.
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut op0 = Op::new(OpCode::NewWithVtable, &[]);
+        op0.pos.set(OpRef::ref_op(1));
+        let mut op1 = Op::new(OpCode::SetfieldGc, &[rop_box(1), iarg_box(0)]);
+        op1.pos.set(vop(2));
+        let mut op2 = Op::new(OpCode::GuardClass, &[rop_box(1)]);
+        op2.pos.set(vop(3));
+        let mut op3 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        op3.pos.set(vop(4));
+        op3.rd_resume_position.set(0);
+        let mut op4 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        op4.pos.set(vop(5));
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
+            crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
+        ])];
+        let trace = TreeLoop::with_snapshots(inputargs, vec![op0, op1, op2, op3, op4], snapshots);
+
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+        let cut = trace
+            .cut_trace_from(TreeLoopCutPosition::new(3), &original_boxes)
+            .expect("an unpublished allocation and its stores are replayable");
+
+        assert_eq!(cut.ops[0].opcode, OpCode::NewWithVtable);
+        assert_eq!(
+            cut.ops[1].opcode,
+            OpCode::SetfieldGc,
+            "the store that filled the allocation was not replayed with it"
+        );
+        assert_eq!(
+            cut.ops[1].arg(0).to_opref(),
+            cut.ops[0].pos.get(),
+            "the replayed store does not write into the replayed allocation"
+        );
+        let slot = cut.snapshots[0].frames[0].boxes[0];
+        let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
+            panic!("snapshot slot lost its box: {slot:?}");
+        };
+        assert_eq!(r, cut.ops[0].pos.get());
+    }
+
+    #[test]
+    fn test_cut_trace_from_declines_on_an_allocation_that_escaped() {
+        // Publishing the allocation gives a second holder that can tell the
+        // replayed identity apart from the original. Both shapes publish it:
+        // storing it INTO another object, and handing it to a call — the call
+        // is the one the store-shape checks cannot see, since it is neither a
+        // guard nor a store at all.
+        for publish_with_a_call in [false, true] {
+            let inputargs = vec![InputArg::new_int(0)];
+            let mut op0 = Op::new(OpCode::NewWithVtable, &[]);
+            op0.pos.set(OpRef::ref_op(1));
+            let mut op1 = Op::new(OpCode::NewWithVtable, &[]);
+            op1.pos.set(OpRef::ref_op(2));
+            let mut publish = if publish_with_a_call {
+                Op::new(OpCode::CallMayForceR, &[rop_box(1)])
+            } else {
+                Op::new(OpCode::SetfieldGc, &[rop_box(2), rop_box(1)])
+            };
+            publish.pos.set(if publish_with_a_call {
+                OpRef::ref_op(3)
+            } else {
+                vop(3)
+            });
+            let mut op3 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+            op3.pos.set(vop(4));
+            op3.rd_resume_position.set(0);
+            let mut op4 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+            op4.pos.set(vop(5));
+            let snapshots = vec![snapshot_with_frame_boxes(vec![
+                crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
+            ])];
+            let trace =
+                TreeLoop::with_snapshots(inputargs, vec![op0, op1, publish, op3, op4], snapshots);
+
+            let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+            let cut = trace.cut_trace_from(TreeLoopCutPosition::new(3), &original_boxes);
+
+            assert!(
+                cut.is_none(),
+                "an allocation published by a {} was replayed; snapshot slot is {:?}",
+                if publish_with_a_call { "call" } else { "store" },
+                cut.map(|c| c.snapshots[0].frames[0].boxes[0]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cut_trace_from_declines_on_an_effect_observing_snapshot_ref() {
+        // The boundary that matters is `is_always_pure`, not
+        // `has_no_side_effect`: a load causes no effect but OBSERVES one. A
+        // pre-cut store between the load and the cut is itself side-effecting,
+        // so it never joins the cone; re-emitting the load at cut entry would
+        // read the value written AFTER the snapshot named it. Pin the gap
+        // between the two predicates so widening it back is a test failure.
+        //
+        // The loads carry that subject on their own. `New*` also sits in the
+        // gap but has a rule of its own — it is replayed together with the
+        // stores that fill it, see
+        // `test_cut_trace_from_replays_an_allocation_with_the_stores_that_filled_it`
+        // and `test_cut_trace_from_declines_on_an_allocation_that_escaped`.
+        for opcode in [OpCode::GetfieldGcR, OpCode::GcLoadR] {
+            assert!(
+                opcode.has_no_side_effect() && !opcode.is_always_pure(),
+                "{opcode:?} no longer sits between the two predicates, so this \
+                 test cannot tell them apart",
+            );
+
+            let inputargs = vec![InputArg::new_int(0)];
+            let mut op0 = Op::new(opcode, &[iarg_box(0)]);
+            op0.pos.set(OpRef::ref_op(1));
+            let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+            op1.pos.set(vop(2));
+            op1.rd_resume_position.set(0);
+            let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
+            op2.pos.set(vop(3));
+            let snapshots = vec![snapshot_with_frame_boxes(vec![
+                crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
+            ])];
+            let trace = TreeLoop::with_snapshots(inputargs, vec![op0, op1, op2], snapshots);
+
+            let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+            let cut = trace.cut_trace_from(TreeLoopCutPosition::new(1), &original_boxes);
+
+            assert!(
+                cut.is_none(),
+                "{opcode:?} was admitted for re-emission; snapshot slot is {:?}",
+                cut.map(|c| c.snapshots[0].frames[0].boxes[0]),
+            );
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════

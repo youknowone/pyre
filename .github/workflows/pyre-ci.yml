@@ -439,9 +439,27 @@ jobs:
       # semantics fails here. check.py has just built the release pyre-dynasm
       # and pyre-cranelift binaries the runner drives, so this costs only the
       # per-script process spawns.
+      #
+      # Run it even when check.py above failed. The two gates answer different
+      # questions and check.py is the one that goes red on a jitstats drift
+      # nobody has re-recorded yet; while it does, every later step in this job
+      # is skipped and the parity suite reports nothing at all. Windows spent
+      # its whole history that way: thirteen real parity failures sat unseen
+      # until one run happened to get past check.py. The job still fails on
+      # either — this only stops one from hiding the other.
+      if: ${{ !cancelled() }}
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py
+    - name: Run the vendored root extra_tests
+      # PyPy's own `extra_tests/` tree, run in place through a driver that
+      # supplies the pytest names those files use. Only `run.py`'s ENABLED list
+      # runs; the rest of the tree needs pytest surface, third-party packages,
+      # or PyPy modules that are not here. Windows selects nothing today and
+      # the runner exits 0 saying so.
+      env:
+        PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/upstream/run.py
     - name: JIT structural stats vs committed baseline (Linux, informational)
       # Diff each benchmark's [jit-stats] counters against the committed
       # pyre/bench/<name>.<backend>.jitstats baselines. The counters are decided

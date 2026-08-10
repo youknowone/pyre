@@ -802,6 +802,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         "bridge_root_parent",
         None,
         &[],
+        None,
     );
     // The concrete image this paused root resumes from when a descendant
     // sub-walk aborts and the drain converts the chain instead of rewinding to

@@ -2570,7 +2570,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // augmented-assignment iteration at the trace-entry boundary.  Let the
     // normal residual dispatch execute user special methods; its existing
     // user-frame effect accounting handles any later abort.
-    let inplace_list_journal: Option<(pyre_object::PyObjectRef, usize)> =
+    let inplace_list_journal: Option<(pyre_object::PyObjectRef, usize, isize)> =
         if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::BinaryOp
             && args.len() >= 3
             && pyre_interpreter::runtime_ops::binary_op_tag_is_inplace(args[2])
@@ -2584,7 +2584,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     && pyre_object::pyobject::is_exact_list(rhs)
                     && pyre_object::listobject::w_list_is_integer_strategy(rhs)
                 {
-                    Some((lhs, pyre_object::w_list_len(lhs)))
+                    Some((
+                        lhs,
+                        pyre_object::w_list_len(lhs),
+                        pyre_object::listobject::w_list_allocated(lhs),
+                    ))
                 } else if pyre_object::pyobject::is_int_or_long(lhs)
                     || pyre_object::pyobject::is_bool(lhs)
                     || pyre_object::pyobject::is_float(lhs)
@@ -2612,13 +2616,19 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // rollback rewinds the one append and the deliver re-applies it exactly once
     // (the same `fbw_list_journal_push_append` contract the fold's own commit uses),
     // making the fall-through abort-safe instead of a silent double.
-    let list_append_journal: Option<(pyre_object::PyObjectRef, usize)> =
+    let list_append_journal: Option<(pyre_object::PyObjectRef, usize, isize)> =
         if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ListAppendValue {
             let list = args
                 .first()
                 .map(|&a| a as usize as pyre_object::PyObjectRef);
             list.filter(|&l| !l.is_null() && unsafe { pyre_object::pyobject::is_list(l) })
-                .map(|l| (l, unsafe { pyre_object::w_list_len(l) }))
+                .map(|l| unsafe {
+                    (
+                        l,
+                        pyre_object::w_list_len(l),
+                        pyre_object::listobject::w_list_allocated(l),
+                    )
+                })
         } else {
             None
         };
@@ -3460,9 +3470,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // the deliver re-applies it exactly once.  `result_i64 == lhs`
             // confirms the in-place mutation (list `__iadd__`/`__imul__` return
             // self) rather than a fresh-object op that merely shared the slot.
-            if let Some((lhs, len_before)) = inplace_list_journal {
+            if let Some((lhs, len_before, allocated_before)) = inplace_list_journal {
                 if result_i64 as usize == lhs as usize {
-                    fbw_list_journal_push_append(lhs, len_before);
+                    fbw_list_journal_push_append(lhs, len_before, allocated_before);
                 }
             }
             // A folded-decline `jit_list_append` fall-through (realloc-boundary
@@ -3470,8 +3480,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // the abort rollback rewinds it and the deliver re-applies exactly
             // once.  The append always mutates its receiver (void `0` result),
             // so no in-place `result == lhs` re-check is needed.
-            if let Some((list, len_before)) = list_append_journal {
-                fbw_list_journal_push_append(list, len_before);
+            if let Some((list, len_before, allocated_before)) = list_append_journal {
+                fbw_list_journal_push_append(list, len_before, allocated_before);
             }
             // pyjitpl.py `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
@@ -5006,6 +5016,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Range FOR_ITER is a C-level iterator advance.  Re-emit its field
     // updates so the opaque ForIterNext residual cannot invalidate optheap;
     // other iterator families retain the residual and its Python semantics.
+    // In particular, a generic W_SeqIterObject must stay residual: its PyPy
+    // `W_SeqIterObject.descr_next` frame catches IndexError from `__getitem__`
+    // and turns it into iterator exhaustion.  Inlining only `__getitem__`
+    // drops that catch frame, so GUARD_NO_EXCEPTION leaks IndexError on deopt.
     // The specialization supplies the same Ref result that the residual would,
     // including NULL for exhaustion, so the codewriter's trailing
     // GuardNonnull remains the only loop-exit guard.
@@ -5015,11 +5029,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
-        if let Some(outcome) = try_walker_specialize_seqiter_getitem_next(
-            ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
-        )? {
-            return Ok(outcome);
         }
     }
 

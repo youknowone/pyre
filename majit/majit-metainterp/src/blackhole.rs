@@ -1213,6 +1213,15 @@ impl BlackholeInterpreter {
         if opcode == self.op_catch_exception {
             return self.route_to_catch(position, exc_value);
         }
+        // A guard resume coordinate can name the successor block entry before
+        // the translated raising operation.  PyPy's MIFrame position already
+        // names the operation's trailing live/catch pair; pyre recovers that
+        // generated-coordinate gap by scanning to the FIRST such pair.  Ops
+        // before the trailing live belong to that translated operation.  Once
+        // the live is crossed, only its immediately-following catch is valid.
+        if let Some(catch_pos) = self.find_catch_after_resume_live(resume_live_pos) {
+            return self.route_to_catch(catch_pos, exc_value);
+        }
         // Backward case (after-residual-call guard): pyre resumes the post-call
         // `GUARD_NO_EXCEPTION` at the next opcode's `-live-`
         // (`pc_map[fallthrough_pc]`, jitcode_dispatch.rs / capture_resumedata),
@@ -1360,6 +1369,31 @@ impl BlackholeInterpreter {
                 // The op immediately before the block-entry `-live-` is not a
                 // `catch_exception` — it is the raising op itself (uncaught).
                 return None;
+            }
+        }
+        None
+    }
+
+    fn find_catch_after_resume_live(&self, resume_live_pos: usize) -> Option<usize> {
+        let code = &self.jitcode.code;
+        let startpoints = self.jitcode.startpoints.as_ref()?;
+        let mut points: Vec<usize> = startpoints
+            .iter()
+            .copied()
+            .filter(|&q| q > resume_live_pos)
+            .collect();
+        points.sort_unstable();
+        let mut crossed_trailing_live = false;
+        for q in points {
+            let op = code[q];
+            if op == self.op_catch_exception {
+                return crossed_trailing_live.then_some(q);
+            }
+            if crossed_trailing_live {
+                return None;
+            }
+            if op == self.op_live {
+                crossed_trailing_live = true;
             }
         }
         None
@@ -4282,6 +4316,59 @@ mod tests {
                 "caught path must run; fallthrough sentinel is {FALLTHROUGH_SENTINEL}"
             );
             assert_eq!(bh.return_type, BhReturnType::Int);
+        }
+
+        #[test]
+        fn test_guard_exception_resume_finds_catch_after_successor_sync() {
+            let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+            let mut b = JitCodeBuilder::default();
+            b.load_const_r_value(0, 1);
+            b.load_const_i_value(0, 2);
+            let resume_pc = b.current_pos();
+            b.live(&mut asm, &[], &[], &[]);
+            // The normal-flow successor mirrors virtualizable state before
+            // the can-raise block's trailing live/catch pair.
+            b.vable_setfield_int_with_base(0, 0, 0);
+            b.live(&mut asm, &[], &[], &[]);
+            let handler_lbl = b.new_label();
+            b.catch_exception(handler_lbl);
+            b.load_const_i_value(2, 99);
+            b.int_return(2);
+            b.mark_label(handler_lbl);
+            let handler_pc = b.current_pos();
+            b.load_const_i_value(2, 42);
+            b.int_return(2);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
+
+            assert!(bh.handle_exception_in_frame(0xCAFE_F00D));
+            assert_eq!(bh.position, handler_pc);
+        }
+
+        #[test]
+        fn test_guard_exception_resume_crosses_translated_operation() {
+            let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+            let mut b = JitCodeBuilder::default();
+            let resume_pc = b.current_pos();
+            b.live(&mut asm, &[], &[], &[]);
+            b.load_const_i_value(0, 1);
+            b.live(&mut asm, &[], &[], &[]);
+            let handler_lbl = b.new_label();
+            b.catch_exception(handler_lbl);
+            b.mark_label(handler_lbl);
+            let handler_pc = b.current_pos();
+            b.int_return(0);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
+
+            assert!(bh.handle_exception_in_frame(0xCAFE_F00D));
+            assert_eq!(bh.position, handler_pc);
         }
 
         thread_local! {

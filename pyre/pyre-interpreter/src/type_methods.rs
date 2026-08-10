@@ -563,16 +563,18 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // must use the generic incremental iterator path below.
         if is_exact_list(other) {
             let n = w_list_len(other);
+            pyre_object::listobject::w_list_reserve_for_extend(list, n);
             for i in 0..n {
                 if let Some(item) = w_list_getitem(other, i as i64) {
-                    w_list_append(list, item);
+                    pyre_object::listobject::w_list_append_preallocated(list, item);
                 }
             }
         } else if is_exact_tuple(other) {
             let n = w_tuple_len(other);
+            pyre_object::listobject::w_list_reserve_for_extend(list, n);
             for i in 0..n {
                 if let Some(item) = w_tuple_getitem(other, i as i64) {
-                    w_list_append(list, item);
+                    pyre_object::listobject::w_list_append_preallocated(list, item);
                 }
             }
         } else if pyre_object::is_set_or_frozenset(other)
@@ -587,8 +589,12 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             pyre_object::gc_roots::pin_root(list);
             let items = pyre_object::w_set_items(other);
             pyre_object::gc_roots::pin_roots(&items);
+            pyre_object::listobject::w_list_resize_for_extend(
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                items.len(),
+            );
             for index in 0..items.len() {
-                w_list_append(
+                pyre_object::listobject::w_list_append_preallocated(
                     pyre_object::gc_roots::shadow_stack_get(root_base),
                     pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index),
                 );
@@ -604,17 +610,42 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             let root_base = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(list);
             pyre_object::gc_roots::pin_root(other);
+            // CPython 3.14 `list_extend_iter_lock_held` obtains the iterator
+            // before asking the original iterable for its length hint.
+            let iterator =
+                crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
+            pyre_object::gc_roots::pin_root(iterator);
             // listobject.py:1052 _extend_from_iterable — consult the length
             // hint before iterating.  A `__length_hint__` returning a negative
             // value raises ValueError, and one exceeding a C ssize_t raises
             // OverflowError (via `int_w`), rather than being silently ignored.
-            crate::baseobjspace::length_hint(
+            let hint = crate::baseobjspace::length_hint(
                 pyre_object::gc_roots::shadow_stack_get(root_base + 1),
-                0,
+                8,
             )?;
-            let iterator =
-                crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
-            pyre_object::gc_roots::pin_root(iterator);
+            // `length_hint` has already rejected negative and non-i64 values.
+            let hint = hint as usize;
+            let target = pyre_object::gc_roots::shadow_stack_get(root_base);
+            let source = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let current_size = pyre_object::w_list_len(target);
+            // CPython ignores an overflowing `m + n` hint on the chance that
+            // the iterator lied, then grows from yielded items. Otherwise the
+            // pointer-array byte size must be representable before reserving.
+            if current_size <= (isize::MAX as usize).saturating_sub(hint) {
+                if current_size + hint > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>()
+                {
+                    return Err(crate::PyError::memory_error(""));
+                }
+                let exact_dict = pyre_object::is_dict(source)
+                    && (*source).w_class == pyre_object::get_instantiate(&*(*source).ob_type);
+                // CPython has sibling `list_extend_dict{,items}` branches for
+                // its three exact dict-view types; all use ordinary resize.
+                if exact_dict || pyre_object::dictmultiobject::is_dict_view(source) {
+                    pyre_object::listobject::w_list_resize_for_extend(target, hint);
+                } else {
+                    pyre_object::listobject::w_list_reserve_for_extend(target, hint);
+                }
+            }
             loop {
                 let item = match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(
                     root_base + 2,
@@ -626,11 +657,14 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 let _item_roots = pyre_object::gc_roots::push_roots();
                 let item_slot = pyre_object::gc_roots::shadow_stack_len();
                 pyre_object::gc_roots::pin_root(item);
-                w_list_append(
+                pyre_object::listobject::w_list_append_preallocated(
                     pyre_object::gc_roots::shadow_stack_get(root_base),
                     pyre_object::gc_roots::shadow_stack_get(item_slot),
                 );
             }
+            pyre_object::listobject::w_list_finish_extend(pyre_object::gc_roots::shadow_stack_get(
+                root_base,
+            ));
         }
     }
     Ok(w_none())

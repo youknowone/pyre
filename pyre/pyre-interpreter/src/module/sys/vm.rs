@@ -10,39 +10,83 @@ use crate::{
 use pyre_object::*;
 use std::sync::OnceLock;
 
-const GETSIZEOF_MISSING: &str = r#"getsizeof(...)
-    getsizeof(object, default) -> int
+const GETSIZEOF_DOC: &str = "getsizeof(object [, default]) -> int\n\n\
+Return the size of object in bytes.";
 
-    Return the size of object in bytes.
+/// CPython 3.14 `_PySys_GetSizeOf`: look up `__sizeof__` on the type,
+/// call the bound method, require a non-negative Py_ssize_t result, then add
+/// the pre-header used by a heap type.  Pyre has no physical CPython object
+/// pre-header, but exposes the 3.14 logical size required by `sys.getsizeof`.
+fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    roots.pin_root(w_obj);
+    let current = || roots.get(obj_slot);
+    let method = unsafe { crate::baseobjspace::lookup_special(current(), "__sizeof__")? }
+        .ok_or_else(|| {
+            crate::PyError::type_error(format!(
+                "Type {} doesn't define __sizeof__",
+                crate::baseobjspace::object_functionstr_type_name(current()),
+            ))
+        })?;
+    let w_size = crate::call::call_function_impl_result(method, &[])?;
 
-sys.getsizeof(object, default) will always return default on PyPy, and
-raise a TypeError if default is not provided.
+    // PyLong_AsSsize_t accepts bool/int subclasses but performs no __index__
+    // conversion on an arbitrary return value.
+    let size = if unsafe { pyre_object::is_bool(w_size) } {
+        unsafe { pyre_object::w_bool_get_value(w_size) as i64 }
+    } else if unsafe { pyre_object::is_int(w_size) } {
+        unsafe { pyre_object::w_int_get_value(w_size) }
+    } else if unsafe { pyre_object::is_long(w_size) } {
+        let value = unsafe { pyre_object::w_long_get_value(w_size) };
+        if pyre_object::longobject::jit_bigint_to_i64_fits(value) == 0 {
+            return Err(crate::PyError::overflow_error(
+                "Python int too large to convert to C ssize_t",
+            ));
+        }
+        pyre_object::longobject::jit_bigint_to_i64_value(value)
+    } else {
+        return Err(crate::PyError::type_error("an integer is required"));
+    };
+    if size < 0 {
+        return Err(crate::PyError::value_error(
+            "__sizeof__() should return >= 0",
+        ));
+    }
 
-First note that the CPython documentation says that this function may
-raise a TypeError, so if you are seeing it, it means that the program
-you are using is not correctly handling this case.
-
-On PyPy, though, it always raises TypeError.  Before looking for
-alternatives, please take a moment to read the following explanation as
-to why it is the case.  What you are looking for may not be possible.
-
-A memory profiler using this function is most likely to give results
-inconsistent with reality on PyPy.  It would be possible to have
-sys.getsizeof() return a number (with enough work), but that may or
-may not represent how much memory the object uses.  It doesn't even
-make really sense to ask how much *one* object uses, in isolation
-with the rest of the system.  For example, instances have maps,
-which are often shared across many instances; in this case the maps
-would probably be ignored by an implementation of sys.getsizeof(),
-but their overhead is important in some cases if they are many
-instances with unique maps.  Conversely, equal strings may share
-their internal string data even if they are different objects---or
-empty containers may share parts of their internals as long as they
-are empty.  Even stranger, some lists create objects as you read
-them; if you try to estimate the size in memory of range(10**6) as
-the sum of all items' size, that operation will by itself create one
-million integer objects that never existed in the first place.
-"#;
+    // `_PyType_PreHeaderSize(Py_TYPE(o))` adds its two components
+    // independently: a two-word GC header for tracked objects, plus a two-word
+    // managed dict/weakref prefix where the instance type requests it.  A
+    // tracked builtin such as list has only the first; a normal heap instance
+    // has both; an untracked heap-derived value may have only the second.
+    let word = std::mem::size_of::<usize>() as u64;
+    let gc_header = if pyre_object::gc_hook::try_gc_owns_object(current() as *mut u8) {
+        2 * word
+    } else {
+        0
+    };
+    let managed_prefix = crate::typedef::r#type(current()).map_or(0, |tp| unsafe {
+        if pyre_object::w_type_is_heaptype(tp.as_ptr())
+            && (pyre_object::w_type_get_hasdict(tp.as_ptr())
+                || pyre_object::w_type_get_weakrefable(tp.as_ptr()))
+        {
+            2 * word
+        } else {
+            0
+        }
+    });
+    let pre_header = gc_header + managed_prefix;
+    let total = (size as u64)
+        .checked_add(pre_header)
+        .expect("Py_ssize_t plus the fixed pre-header fits in size_t");
+    if total <= i64::MAX as u64 {
+        Ok(w_int_new(total as i64))
+    } else {
+        Ok(pyre_object::w_long_new(
+            pyre_object::rbigint::RBigInt::from_u128(total as u128),
+        ))
+    }
+}
 
 /// Shared stub type for `sys._getframe`, `sys.stdout` and other module-level
 /// sys attributes that expose attribute bags.
@@ -1433,6 +1477,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    // sys._get_cpu_count_config() — the cpu count the interpreter was
+    // configured with, or -1 where none was. `os.py:1180` asks before it
+    // decides whether `process_cpu_count` counts the affinity mask or aliases
+    // `cpu_count`, so a `posix` that publishes `sched_getaffinity` and a `sys`
+    // that does not answer this makes `import os` raise.
+    //
+    // -1 is the answer here rather than a placeholder: the value is set by
+    // `-X cpu_count` and `PYTHON_CPU_COUNT`, and this interpreter reads
+    // neither, so there is no configured count to report.
+    module_ns_store(
+        ns,
+        "_get_cpu_count_config",
+        make_builtin_function_with_arity("_get_cpu_count_config", |_| Ok(w_int_new(-1)), 0),
+    );
     // sys.getrecursionlimit / setrecursionlimit — pypy/module/sys/vm.py:45.
     // The runtime stack budget lives in `crate::stack_check`; both
     // helpers route through it so the interpreter, JIT prologue probe,
@@ -2274,13 +2332,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     &[true, false],
                     "getsizeof",
                 )?;
+                let w_obj = scope[0];
                 let w_default = scope[1];
-                if w_default.is_null() {
-                    return Err(crate::PyError::type_error(GETSIZEOF_MISSING));
+                let roots = pyre_object::gc_roots::push_roots();
+                let obj_slot = roots.base();
+                roots.pin_root(w_obj);
+                let default_slot = obj_slot + 1;
+                roots.pin_root(w_default);
+                match get_sizeof(roots.get(obj_slot)) {
+                    Ok(size) => Ok(size),
+                    Err(err)
+                        if !w_default.is_null() && err.kind == crate::PyErrorKind::TypeError =>
+                    {
+                        Ok(roots.get(default_slot))
+                    }
+                    Err(err) => Err(err),
                 }
-                Ok(w_default)
             },
-            GETSIZEOF_MISSING,
+            GETSIZEOF_DOC,
         ),
     );
     // PyPy normally omits CPython's raw refcount API.  The shared ctypes
@@ -2658,25 +2727,54 @@ pub fn audit_hooks_armed() -> bool {
     !holder.is_null() && unsafe { (*holder).hooks_armed.get() }
 }
 
+/// `vm.py:474 audit(space, event, args_w)` under `@unwrap_spec(event="text")`.
+///
+/// The unwrap in front of the hook dispatch is observable on its own: the
+/// parameters are positional-only, and the event name has to be a `str` with a
+/// UTF-8 spelling, so a bad event name is reported at the call rather than
+/// carried to whichever hook reads it.
+///
+/// The unwrap is `str_utf8_w` and not a surrogate-tolerant read because the
+/// encode is there for the error it raises: an event name holding a lone
+/// surrogate is a `UnicodeEncodeError` at the call.
 fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
-    let Some(&w_event) = args.first() else {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
-            "audit() missing 1 required positional argument: 'event'",
+            "sys.audit() takes no keyword arguments",
+        ));
+    }
+    let Some(&w_event) = positional.first() else {
+        return Err(crate::PyError::type_error(
+            "audit expected at least 1 argument, got 0",
         ));
     };
     // `@unwrap_spec(event="text")`
     if !unsafe { pyre_object::is_str(w_event) } {
-        return Err(crate::PyError::type_error(
-            "audit() argument 1 must be str, not other",
-        ));
+        // `_PyArg_BadArgument` names the `None` singleton itself rather than
+        // its type.
+        let given = if unsafe { pyre_object::is_none(w_event) } {
+            "None".to_string()
+        } else {
+            crate::type_methods::arg_type_name(w_event)
+        };
+        return Err(crate::PyError::type_error(format!(
+            "audit() argument 1 must be str, not {given}"
+        )));
     }
-    audit_w(w_event, &args[1..])?;
+    // The `@unwrap_spec` round trip is observable: the hooks are handed the
+    // `str` the unwrapped name is re-wrapped as, so a `str` subclass reaches
+    // them flattened to a plain one.
+    let event = crate::baseobjspace::str_utf8_w(w_event)?;
+    audit_w(w_str_new(event), &positional[1..])?;
     Ok(w_none())
 }
 
-/// `vm.py:485 addaudithook`.  The hooks already installed get a say: a
-/// `RuntimeError` out of the `sys.addaudithook` event means the set refused the
-/// new hook, and it is dropped rather than added.  Anything else propagates.
+/// `vm.py:486 addaudithook`.  The hooks already installed get a say: an
+/// `Exception` out of the `sys.addaudithook` event means the set refused the
+/// new hook, and it is dropped rather than added.  A `BaseException` outside
+/// `Exception` propagates.  The new hook is not installed yet when the event
+/// fires, so it never gets to refuse its own installation.
 fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let Some(&w_hook) = args.first() else {
         return Err(crate::PyError::type_error(
@@ -2684,7 +2782,7 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         ));
     };
     if let Err(err) = audit("sys.addaudithook", &[]) {
-        if !error_is_runtime_error(&err) {
+        if !error_is_exception(&err) {
             return Err(err);
         }
         return Ok(w_none());
@@ -2713,22 +2811,34 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
-/// `e.match(space, space.w_RuntimeError)` for a `PyError` that may carry either
-/// an interpreter-level kind or a materialised exception object.
-fn error_is_runtime_error(err: &crate::PyError) -> bool {
-    // A hook may raise a RuntimeError SUBCLASS, so the interpreter-level kind
-    // alone is not the test; it is the fallback for an error that never
-    // materialised an exception object.
-    let w_runtime_error = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
-        pyre_object::interp_exceptions::ExcKind::RuntimeError,
+/// `e.match(space, space.w_Exception)` for a `PyError` that may carry either an
+/// interpreter-level kind or a materialised exception object.
+///
+/// The C-level `PySys_AddAuditHook` reads a refusal as `RuntimeError`, but the
+/// `sys.addaudithook` a Python caller reaches widens it to `Exception`.
+/// Measured against 3.14 with a refusing hook already installed: `RuntimeError`,
+/// `ValueError` and `Exception` all leave the call returning `None`, and only a
+/// `BaseException` outside `Exception` — `KeyboardInterrupt`, bare
+/// `BaseException` — comes back out.
+fn error_is_exception(err: &crate::PyError) -> bool {
+    // A hook raises a real exception object, so the class test is the live one;
+    // the interpreter-level kind is the fallback for an error that never
+    // materialised an object.
+    let w_exception = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+        pyre_object::interp_exceptions::ExcKind::Exception,
     );
-    if !err.exc_object.is_null() && !w_runtime_error.is_null() {
+    if !err.exc_object.is_null() && !w_exception.is_null() {
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(err.exc_object);
-        pyre_object::gc_roots::pin_root(w_runtime_error);
-        return crate::baseobjspace::isinstance(err.exc_object, w_runtime_error).unwrap_or(false);
+        pyre_object::gc_roots::pin_root(w_exception);
+        return crate::baseobjspace::isinstance(err.exc_object, w_exception).unwrap_or(false);
     }
-    matches!(err.kind, crate::PyErrorKind::RuntimeError)
+    // `exc_kind_matches(kind, "Exception")` spelled over `PyErrorKind`: every
+    // variant descends from `Exception` except the two `BaseException` ones.
+    !matches!(
+        err.kind,
+        crate::PyErrorKind::GeneratorExit | crate::PyErrorKind::SystemExit
+    )
 }
 
 /// `sysmodule.c sys._clear_type_descriptors`: remove the instance-dict and weakref

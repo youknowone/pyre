@@ -1742,7 +1742,17 @@ fn init_parser_slots(parser: PyObjectRef) {
     );
 }
 
-/// `ParserCreate(encoding=None, namespace_separator=None, intern=None)`.
+/// `ParserCreate()`'s spelling for a `str`-or-`None` parameter handed
+/// something else.  Both parameters report it, so the argument name is the only
+/// thing that varies.
+fn parser_create_not_str(param: &str, obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "ParserCreate() argument '{param}' must be str or None, not {}",
+        crate::type_methods::arg_type_name(obj)
+    ))
+}
+
+/// `ParserCreate(encoding=None, namespace_separator=None[, intern])`.
 fn parser_create3(
     encoding: PyObjectRef,
     namespace_separator: PyObjectRef,
@@ -1752,14 +1762,22 @@ fn parser_create3(
     init_parser_slots(parser);
     if unsafe { !is_none(encoding) } {
         if unsafe { !is_str(encoding) } {
-            return Err(crate::PyError::type_error(
-                "ParserCreate() argument 'encoding' must be str or None",
-            ));
+            return Err(parser_create_not_str("encoding", encoding));
         }
+        // Both stored names are read back through `w_str_get_value`, which
+        // panics on a lone surrogate — `declared_or_forced_encoding` for this
+        // one, `namespace_separator` for the other. A name with no UTF-8
+        // spelling is refused here so that read cannot abort the process;
+        // `space.text_w` has no such reader behind it and so does not need the
+        // refusal.
+        crate::baseobjspace::str_utf8_w(encoding)?;
         crate::baseobjspace::setdictvalue_native(parser, "_pyre_forced_encoding", encoding);
     }
     if unsafe { is_none(namespace_separator) } {
     } else if unsafe { is_str(namespace_separator) } {
+        // `namespace_separator` reads this back through `w_str_get_value`, so
+        // the refusal the encoding arm makes applies here too; the length check
+        // below then runs on a value that has a `&str` view.
         let value = crate::baseobjspace::str_utf8_w(namespace_separator)?;
         if value.chars().count() > 1 {
             return Err(crate::PyError::value_error(
@@ -1772,11 +1790,17 @@ fn parser_create3(
             w_str_new(value),
         );
     } else {
-        return Err(crate::PyError::type_error(
-            "ParserCreate() argument 'namespace_separator' must be str or None, not int",
+        return Err(parser_create_not_str(
+            "namespace_separator",
+            namespace_separator,
         ));
     }
-    if unsafe { !is_none(intern) } {
+    // interp_pyexpat.py:948-952 — "Explicitly passing None means no interning
+    // is desired. Not passing anything means that a new dictionary is used."
+    // `init_parser_slots` installed that new dictionary already, so an omitted
+    // argument has nothing to write and the two named cases write themselves;
+    // `intern_string` reads `None` back as "do not intern".
+    if !intern.is_null() {
         crate::baseobjspace::setdictvalue_native(parser, "intern", intern);
     }
     Ok(parser)
@@ -1931,7 +1955,10 @@ crate::py_module! {
         fn ParserCreate(
             #[default(w_none())] encoding: PyObjectRef,
             #[default(w_none())] namespace_separator: PyObjectRef,
-            #[default(w_none())] intern: PyObjectRef,
+            // Omitted has to be distinguishable from an explicit `None` here —
+            // they mean different things (`parser_create3`) — so the default is
+            // the absent marker and not the value.
+            #[default(pyre_object::PY_NULL)] intern: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             parser_create3(encoding, namespace_separator, intern)
         }

@@ -3582,18 +3582,23 @@ impl<'a> Transformer<'a> {
             let kind = cc.guess_call_kind(op);
             return match kind {
                 crate::call::CallKind::Regular => {
-                    // No `effective_call_result_ty` reconciliation here (only
-                    // the Residual arm below): an INLINED callee threads its
-                    // `Result<(), PyError>` unit `()` result as a live
-                    // `Ref`-carried value — a block inputarg / link arg the
-                    // regalloc must colour — not a droppable void.  Retyping
-                    // it to `Void` leaves an uncolourable carried variable
-                    // that `assembler.rs` `lookup_coloring` rejects.  The
-                    // residual case is different: `residual_call_v` genuinely
-                    // drops the result slot, so the reconciliation is safe
-                    // (and required) only there.  Keep the front-derived
-                    // `result_ty`.
-                    self.handle_regular_call(op, target, args, result_ty, graph_name, graph)
+                    // RPython call.py:230: the call result must have the same
+                    // concretetype as FUNC.RESULT.  In particular, after
+                    // exceptiontransform a `Result<(), PyError>` callee has a
+                    // void RESULT; emitting `inline_call_r_r` for the front's
+                    // aggregate-shaped unit shell would disagree with the
+                    // callee's `void_return`.  Reconcile it just like the
+                    // residual-call arm below.
+                    let effective_result_ty =
+                        self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
+                    self.handle_regular_call(
+                        op,
+                        target,
+                        args,
+                        &effective_result_ty,
+                        graph_name,
+                        graph,
+                    )
                 }
                 crate::call::CallKind::Residual => {
                     // RPython jtransform.py:456-471:

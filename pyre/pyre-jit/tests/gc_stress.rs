@@ -23,6 +23,11 @@
 //! must be live, proving the program's objects routed through the real managed
 //! heap rather than the leaking `lltype::malloc` Box fallback (which would make
 //! the survival checks meaningless).
+//!
+//! This binary is also the crate's only end-to-end Python path that runs with
+//! `debug_assertions` on. One regression test uses it for the non-GC invariant
+//! that the virtualizable shadow and heap agree when
+//! `check_synchronized_virtualizable` runs.
 
 use std::rc::Rc;
 
@@ -127,6 +132,73 @@ fn run_on_worker(
         .join()
         .expect("worker thread panicked")
         .expect(fail_msg);
+}
+
+/// Class and `exec(code, ns)` bodies use dict-scope frames, whose LOAD_NAME /
+/// STORE_NAME traffic reads Ref static virtualizable fields. In debug builds,
+/// that path checks that the virtualizable shadow and heap copy stay
+/// synchronized after tracing mirrors static fields into boxes.
+#[test]
+fn class_body_and_exec_loops_keep_the_vable_shadow_synchronized() {
+    const PROGRAM: &str = r#"
+class Namespace(dict):
+    pass
+
+CODE = """
+i = 0
+total = 0
+while i < 3000:
+    total = total + i
+    i = i + 1
+"""
+
+def class_bodies():
+    acc = 0
+    repeat = 0
+    while repeat < 3:
+        class Probe:
+            i = 0
+            total = 0
+            while i < 3000:
+                total = total + i
+                i = i + 1
+        assert Probe.total == 4498500, Probe.total
+        assert Probe.i == 3000, Probe.i
+        acc = acc + Probe.total + Probe.i
+        repeat = repeat + 1
+    return acc
+
+def exec_bodies():
+    acc = 0
+    repeat = 0
+    while repeat < 3:
+        plain = {}
+        exec(CODE, plain)
+        assert plain["total"] == 4498500, plain["total"]
+        assert plain["i"] == 3000, plain["i"]
+        acc = acc + plain["total"] + plain["i"]
+
+        subclass = Namespace()
+        exec(CODE, subclass)
+        assert subclass["total"] == 4498500, subclass["total"]
+        assert subclass["i"] == 3000, subclass["i"]
+        acc = acc + subclass["total"] + subclass["i"]
+
+        repeat = repeat + 1
+    return acc
+
+class_result = class_bodies()
+exec_result = exec_bodies()
+assert class_result == 13504500, class_result
+assert exec_result == 27009000, exec_result
+assert class_result + exec_result == 40513500
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<vable_shadow_debug_gate>",
+        "virtualizable shadow synchronization checks",
+        "virtualizable shadow debug gate program failed",
+    );
 }
 
 /// `W_ObjectObject` is GC-managed: an instance's movable attribute values

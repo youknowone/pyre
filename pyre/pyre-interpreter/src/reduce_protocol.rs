@@ -306,6 +306,20 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         }
     }
     if proto >= 2 {
+        // CPython 3.14 `typeobject.c:reduce_newobj`: `tp_new == NULL`
+        // means there is no constructor with which `__newobj__` can rebuild
+        // the instance.  Pyre represents that slot state with
+        // `Py_TPFLAGS_DISALLOW_INSTANTIATION`; check it before collecting new
+        // arguments, exactly as `reduce_newobj` does.  Coroutine objects and
+        // their `__await__` wrappers both have this shape.
+        let w_type = crate::typedef::r#type(w_obj)
+            .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
+        if unsafe { pyre_object::w_type_disallows_instantiation(w_type.as_ptr()) } {
+            return Err(PyError::type_error(format!(
+                "cannot pickle '{}' object",
+                typename(w_obj)
+            )));
+        }
         let (hasargs, w_args, w_kwargs) = getnewargs(w_obj)?;
         // objectobject.py:276 / `_PyObject_GetState(required)`: a type whose
         // instances carry C-level state that `__dict__`/`__slots__` cannot

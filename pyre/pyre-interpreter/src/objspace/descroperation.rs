@@ -2183,9 +2183,10 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     // the copies are appended.  Holding the refs across `w_list_append` is
     // the same idiom `list_method_extend` uses for its iterable branch.
     let snapshot = w_list_items_copy_as_vec(list);
+    pyre_object::listobject::w_list_reserve_for_extend(list, cap - len);
     for _ in 1..count {
         for &item in &snapshot {
-            w_list_append(list, item);
+            pyre_object::listobject::w_list_append_preallocated(list, item);
         }
     }
     Ok(())
@@ -2214,6 +2215,7 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
     }
     if count == 0 {
         pyre_object::bytearrayobject::w_bytearray_vec_mut(ba).clear();
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
         return Ok(());
     }
     if len == 0 {
@@ -2226,6 +2228,7 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
     for _ in 1..count {
         vec.extend_from_slice(&snapshot);
     }
+    pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
     Ok(())
 }
 

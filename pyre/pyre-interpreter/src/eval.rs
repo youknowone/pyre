@@ -1032,8 +1032,12 @@ pub unsafe fn walk_pyframe_roots_area(
                 let locals_slot =
                     &mut (*(frame)).locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray;
                 visitor(&mut *(locals_slot as *mut majit_ir::GcRef));
-                let gen_slot = &mut (*(frame)).f_generator_nowref as *mut PyObjectRef;
-                visitor(&mut *(gen_slot as *mut majit_ir::GcRef));
+                // pyframe.py:75-76/276-279: translated PyPy stores the
+                // generator owner in `f_generator_wref`; the `_nowref`
+                // fallback exists only when translation has no weakrefs.
+                // This field is therefore a non-owning back-reference in
+                // pyre and must not keep the generator alive through an
+                // escaped `cr_frame`/`gi_frame`.
                 let yielding_slot = &mut (*(frame)).w_yielding_from as *mut PyObjectRef;
                 visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
                 // pyframe.py:115-116 `self.builtin = ...` — the picked
@@ -1382,8 +1386,10 @@ pub fn walk_suspended_generator_frame(
             }
         }
 
-        let gen_slot = &mut (*frame).f_generator_nowref as *mut PyObjectRef;
-        visitor(&mut *(gen_slot as *mut majit_ir::GcRef));
+        // `f_generator_nowref` is the raw counterpart of PyPy's translated
+        // `f_generator_wref`, not a frame-owned GC edge (pyframe.py:75-76,
+        // 276-279).  The generator owns this suspended frame in the other
+        // direction.
         let yielding_slot = &mut (*frame).w_yielding_from as *mut PyObjectRef;
         visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
 
@@ -4358,7 +4364,30 @@ impl OpcodeStepExecutor for PyFrame {
     // ── yield from / send ──
     fn get_yield_from_iter(&mut self) -> Result<(), PyError> {
         let iterable = self.pop();
-        let iter = crate::baseobjspace::iter(iterable)?;
+        // CPython 3.14 `GET_YIELD_FROM_ITER` / PyPy's coroutine-aware
+        // `YIELD_FROM`: exact generators already are their iterator.  A
+        // native coroutine is also sent to directly, but only when the
+        // current frame is itself a coroutine or was marked by
+        // `types.coroutine` with CO_ITERABLE_COROUTINE.  Calling ordinary
+        // `iter()` here loses both halves of that distinction because native
+        // coroutine objects intentionally expose no public `__iter__`.
+        let iter = unsafe {
+            if pyre_object::generator::is_coroutine(iterable) {
+                let flags = self.code().flags;
+                if !flags
+                    .intersects(crate::CodeFlags::COROUTINE | crate::CodeFlags::ITERABLE_COROUTINE)
+                {
+                    return Err(PyError::type_error(
+                        "cannot 'yield from' a coroutine object in a non-coroutine generator",
+                    ));
+                }
+                iterable
+            } else if pyre_object::generator::is_generator(iterable) {
+                iterable
+            } else {
+                crate::baseobjspace::iter(iterable)?
+            }
+        };
         self.push(iter);
         Ok(())
     }
@@ -4473,14 +4502,29 @@ impl OpcodeStepExecutor for PyFrame {
                 ))
             })?;
         let next = crate::call::call_function_impl_result(method, &[])?;
-        let awaitable = crate::baseobjspace::get_awaitable_iter(next, 0).map_err(|err| {
-            if err.kind == crate::PyErrorKind::TypeError {
-                crate::PyError::type_error(format!(
-                    "'async for' received an invalid object from __anext__: {}",
-                    crate::type_methods::arg_type_name(next)
-                ))
-            } else {
-                err
+        let awaitable = crate::baseobjspace::get_awaitable_iter(next, 0).map_err(|mut cause| {
+            // CPython 3.14 `_PyEval_GetANext` uses
+            // `_PyErr_FormatFromCause` for *every* failure produced while
+            // converting `__anext__`'s result to an awaitable.  In
+            // particular, an exception raised by `result.__await__()` is the
+            // explicit cause of this TypeError; only an exception raised by
+            // `__anext__` itself propagates unchanged above.
+            let message = format!(
+                "'async for' received an invalid object from __anext__: {}",
+                crate::type_methods::arg_type_name(next)
+            );
+            let cause_obj = cause.to_exc_object();
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(cause_obj);
+            let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let mut error = crate::PyError::type_error(message);
+            let error_obj = error.to_exc_object();
+            let cause_obj = pyre_object::gc_roots::shadow_stack_get(cause_slot);
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_context(error_obj, cause_obj);
+                pyre_object::interp_exceptions::w_exception_set_cause(error_obj, cause_obj);
+                pyre_object::interp_exceptions::w_exception_set_suppress_context(error_obj, true);
+                crate::PyError::from_exc_object(error_obj)
             }
         })?;
         self.push(awaitable);
@@ -8187,6 +8231,151 @@ result = (
 ";
         let (res, frame) = run_exec_frame(source);
         res.expect("bytearray.__init__ streaming behavior failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytearray_cpython_allocation_and_sizeof() {
+        let source = "\
+value = bytearray()
+allocations = []
+for item in range(20):
+    value.append(item)
+    allocations.append(value.__alloc__())
+
+del value[:5]
+after_prefix_delete = value.__alloc__()
+for _ in range(7):
+    value.append(0)
+
+class Sub(bytearray):
+    pass
+sub = Sub(b'abc')
+
+value.clear()
+result = (
+    allocations == [2, 5, 5, 5, 8, 8, 8, 12, 12, 12, 12,
+                    19, 19, 19, 19, 19, 19, 19, 27, 27]
+    and after_prefix_delete == 27
+    and value.__alloc__() == 1
+    and sub.__alloc__() == 4
+    and sub.__sizeof__() == Sub.__basicsize__ + sub.__alloc__()
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("CPython bytearray allocation metadata failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_list_cpython_allocation_and_sizeof() {
+        let source = "\
+def allocation(value):
+    return (value.__sizeof__() - type(value).__basicsize__) // 8
+
+value = []
+append_allocations = []
+for item in range(20):
+    value.append(item)
+    append_allocations.append(allocation(value))
+
+sources = (
+    list([1, 2, 3, 4, 5]),
+    list((1, 2, 3, 4, 5)),
+    list(range(5)),
+    list(item for item in range(5)),
+    list(dict.fromkeys(range(5))),
+    list(set(range(5))),
+    list(dict.fromkeys(range(5)).keys()),
+    list(dict.fromkeys(range(5)).values()),
+    list(dict.fromkeys(range(5)).items()),
+)
+
+class HintTwenty:
+    def __iter__(self):
+        return iter(range(3))
+    def __len__(self):
+        return 20
+
+sorted_value = [3, 2, 1]
+sort_seen = []
+def sort_key(item):
+    sort_seen.append((len(sorted_value), sorted_value.__sizeof__()))
+    return item
+sorted_value.sort(key=sort_key)
+
+noop_sorted = [3, 2, 1]
+def noop_key(item):
+    noop_sorted.clear()
+    del noop_sorted[:]
+    noop_sorted[:] = []
+    return item
+noop_sorted.sort(key=noop_key)
+
+mucked_sorted = [3, 2, 1]
+def mucked_key(item):
+    if item == 3:
+        mucked_sorted.append(9)
+        mucked_sorted.pop()
+    return item
+try:
+    mucked_sorted.sort(key=mucked_key)
+except ValueError as exc:
+    mucked_detected = str(exc) == 'list modified during sort'
+else:
+    mucked_detected = False
+
+class Sub(list):
+    pass
+sub = Sub(range(3))
+
+class HugeHint:
+    def __iter__(self):
+        return self
+    def __next__(self):
+        raise StopIteration
+    def __length_hint__(self):
+        return (1 << 63) - 1
+
+nonempty = [1]
+try:
+    nonempty.extend(HugeHint())
+except MemoryError:
+    ignored_overflowing_hint = False
+else:
+    ignored_overflowing_hint = nonempty == [1]
+try:
+    list(HugeHint())
+except MemoryError:
+    empty_huge_hint_fails = True
+else:
+    empty_huge_hint_fails = False
+
+result = (
+    append_allocations == [4, 4, 4, 4, 8, 8, 8, 8,
+                           16, 16, 16, 16, 16, 16, 16, 16,
+                           24, 24, 24, 24]
+    and [allocation(item) for item in sources] == [6, 6, 6, 8, 8, 8, 8, 8, 8]
+    and allocation(list(HintTwenty())) == 8
+    and sort_seen == [(0, 32), (0, 32), (0, 32)]
+    and sorted_value == [1, 2, 3]
+    and allocation(sorted_value) == 4
+    and noop_sorted == [1, 2, 3]
+    and mucked_sorted == [1, 2, 3]
+    and mucked_detected
+    and ignored_overflowing_hint
+    and empty_huge_hint_fails
+    and sub.__sizeof__() == Sub.__basicsize__ + 4 * 8
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("CPython list allocation metadata failed");
         unsafe {
             let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
             assert!(crate::baseobjspace::is_true(result).unwrap());

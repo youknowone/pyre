@@ -6300,7 +6300,7 @@ mod register_keyed_size_authority_tests {
         // Parent lists f16, f24, f32 — so `f24` is at index 1.
         gc._cache_size
             .insert(key.clone(), size_descr_at(7, 0, &[16, 24, 32]));
-        let mut lookup = |gc: &mut GcCache| {
+        let lookup = |gc: &mut GcCache| {
             gc.get_field_descr(
                 key.clone(),
                 "f24",

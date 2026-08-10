@@ -830,6 +830,15 @@ impl ExecutionContext {
         self._run_finalizers_now();
     }
 
+    /// Request the CPython refcount boundary associated with exposing a
+    /// coroutine's frame.  The action runs before the next opcode, after the
+    /// attribute receiver has left the value stack.
+    pub fn finalize_discarded_coroutine_after_frame_get(&mut self) {
+        if !self.user_del_action.is_null() {
+            unsafe { (*self.user_del_action).collect_oldgen_and_fire() };
+        }
+    }
+
     /// pypy/interpreter/executioncontext.py:185-200 `run_trace_func`.
     ///
     /// ```python
@@ -2212,6 +2221,12 @@ pub struct UserDelAction {
     pub finalizers_lock_count: usize,
     pub enabled_at_app_level: bool,
     pub pending_with_disabled_del: Option<Vec<PyObjectRef>>,
+    /// Run one old-generation reachability pass immediately before the next
+    /// finalizer drain.  CPython's temporary coroutine decref can make
+    /// `f().cr_frame` warn before the following opcode; pyre's tracing GC
+    /// requests the equivalent pass only after LOAD_ATTR has replaced the
+    /// coroutine with its escaped frame on the value stack.
+    collect_oldgen_before_run: bool,
     /// `pypy/interpreter/executioncontext.py:640` —
     /// `self.space.finalizer_queue` access target.
     ///
@@ -2255,6 +2270,7 @@ impl UserDelAction {
             finalizers_lock_count: 0,
             enabled_at_app_level: true,
             pending_with_disabled_del: None,
+            collect_oldgen_before_run: false,
             finalizer_queue: WRootFinalizerQueue,
         });
         let action_ptr: *mut dyn AsyncActionOps = &mut *action;
@@ -2292,6 +2308,14 @@ impl UserDelAction {
                 }
             }
         }
+    }
+
+    /// Defer the reachability pass until the next opcode boundary.  Calling
+    /// it inside the `cr_frame` getter would still see the getter argument as
+    /// a root and could not observe a discarded temporary coroutine.
+    pub fn collect_oldgen_and_fire(&mut self) {
+        self.collect_oldgen_before_run = true;
+        self.fire();
     }
 
     pub fn gc_disabled(&mut self, w_obj: PyObjectRef) -> bool {
@@ -2337,6 +2361,18 @@ impl UserDelAction {
                     current(),
                 );
             }
+            // pyframe.py:75-76/276-279 stores this back-reference as
+            // `f_generator_wref` in translated PyPy.  The collector has
+            // already declared `current()` dead, so clear pyre's raw
+            // representation before the finalizer queue releases its last
+            // temporary root.  Explicit `frame.clear()` also calls
+            // `generator_finalize`, but must retain this association while
+            // its still-live generator owns the frame.
+            let frame =
+                unsafe { pyre_object::generator::w_generator_get_frame(current()) } as *mut PyFrame;
+            if !frame.is_null() && unsafe { (*frame).f_generator_nowref == current() } {
+                unsafe { (*frame).f_generator_nowref = pyre_object::PY_NULL };
+            }
             return;
         }
         let Some(w_type) = crate::typedef::r#type(current()) else {
@@ -2361,12 +2397,18 @@ impl UserDelAction {
         if let Err(error) = unsafe {
             crate::baseobjspace::get_and_call_function(del(), current(), w_type.as_ptr(), &[])
         } {
-            report_error(
-                self.base.space,
-                &error,
-                rustpython_wtf8::Wtf8::new(""),
-                del(),
+            // PyPy executioncontext.py:680-690 passes an empty `where` and
+            // the `__del__` descriptor to `write_unraisable`.  Python 3.14's
+            // `_PyErr_FormatUnraisable` gives this finalizer case a more
+            // specific hook message; 3.14 is pyre's compatibility target
+            // when its observable result differs from PyPy's.
+            let del_repr = unsafe { crate::display::py_repr_wtf8(del()) }
+                .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_string()));
+            let where_desc = crate::display::wtf8_format!(
+                "Exception ignored while calling deallocator ",
+                del_repr
             );
+            report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
         }
     }
 }
@@ -2380,6 +2422,10 @@ impl AsyncActionOps for UserDelAction {
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<(), crate::PyError> {
+        if self.collect_oldgen_before_run {
+            self.collect_oldgen_before_run = false;
+            pyre_object::gc_hook::try_gc_collect_oldgen();
+        }
         self._run_finalizers();
         Ok(())
     }

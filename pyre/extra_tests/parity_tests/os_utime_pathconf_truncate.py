@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 
 def check(cond, what):
@@ -135,6 +136,30 @@ else:
     check(st.st_mtime == second + 1e-9 * nanosecond, (st.st_mtime, st.st_mtime_ns))
     if st.st_mtime == FAR:
         check(st.st_mtime_ns == 880_000_000_000_000_000_000, st.st_mtime_ns)
+
+# ── utime with no time named ──────────────────────────────────────────────
+# Neither `times` nor `ns` means "now", and the filesystem is the one that
+# answers what now is — the call carries UTIME_NOW rather than a stamp read
+# off this process's clock. That distinction is not observable from here (both
+# land within a second of `time.time()`); what is observable is that the flag
+# reached the call at all, since a dropped one would write the zero pair and
+# date the file to the epoch.
+OLD = 10**18  # 2001-09-09 in nanoseconds — a stamp no clock here will answer
+
+os.utime(p, ns=(OLD, OLD))
+before = time.time()
+os.utime(p)
+check(abs(os.stat(p).st_mtime - before) < 60, f"utime(p) -> {os.stat(p).st_mtime}")
+check(abs(os.stat(p).st_atime - before) < 60, "utime(p) left the access time behind")
+
+if os.utime in os.supports_fd:
+    os.utime(p, ns=(OLD, OLD))
+    fd = os.open(p, os.O_RDWR)
+    try:
+        os.utime(fd)
+    finally:
+        os.close(fd)
+    check(abs(os.stat(p).st_mtime - before) < 60, f"utime(fd) -> {os.stat(p).st_mtime}")
 
 # Back to a time the rest of the file can be reasoned about.
 os.utime(p, ns=(1_000_000_000, 2_000_000_000))

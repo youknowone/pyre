@@ -460,11 +460,16 @@ pub(crate) fn fbw_store_journal_push(
 /// append's gate), so the rewind is allocation-free.
 // Consumed by the #171 `list.append` orthodox descent
 // (`try_walker_orthodox_list_append`).
-pub(crate) fn fbw_list_journal_push_append(list: pyre_object::PyObjectRef, length_before: usize) {
+pub(crate) fn fbw_list_journal_push_append(
+    list: pyre_object::PyObjectRef,
+    length_before: usize,
+    allocated_before: isize,
+) {
     FBW_LIST_EFFECT_JOURNAL.with(|j| {
         j.borrow_mut().push(FbwListEffect::Append {
             list,
             length_before,
+            allocated_before,
         })
     });
     // gh#467: see `fbw_store_journal_push`.
@@ -972,11 +977,12 @@ pub(crate) fn fbw_store_journal_rollback() {
         let mut entries = j.borrow_mut();
         while let Some(entry) = entries.pop() {
             unsafe {
-                let (list, length_before) = match entry {
+                let (list, length_before, allocated_before) = match entry {
                     FbwListEffect::Append {
                         list,
                         length_before,
-                    } => (list, length_before),
+                        allocated_before,
+                    } => (list, length_before, allocated_before),
                     FbwListEffect::PopEnd {
                         list,
                         length_before,
@@ -1009,6 +1015,21 @@ pub(crate) fn fbw_store_journal_rollback() {
                                     length_before - 1,
                                     w_item,
                                 );
+                            }
+                            pyre_object::listobject::ListStrategy::IntOrFloat => {
+                                pyre_object::listobject::w_list_int_or_float_set_len(
+                                    list,
+                                    length_before,
+                                );
+                                if !pyre_object::listobject::w_list_int_or_float_setitem(
+                                    list,
+                                    length_before - 1,
+                                    w_item,
+                                ) {
+                                    crate::trace::fbw_diag::bump(
+                                        crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
+                                    );
+                                }
                             }
                             pyre_object::listobject::ListStrategy::Float
                             | pyre_object::listobject::ListStrategy::Empty => {
@@ -1043,6 +1064,12 @@ pub(crate) fn fbw_store_journal_rollback() {
                     pyre_object::listobject::ListStrategy::Integer => {
                         pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
                     }
+                    pyre_object::listobject::ListStrategy::IntOrFloat => {
+                        pyre_object::listobject::w_list_int_or_float_set_len(
+                            list,
+                            length_before,
+                        );
+                    }
                     // Float items are non-ptr f64 scalars (no stale GC ref to
                     // clear, unlike the Object slot), so rewinding the length
                     // field suffices.
@@ -1053,6 +1080,7 @@ pub(crate) fn fbw_store_journal_rollback() {
                     // fold path records it); nothing to rewind.
                     pyre_object::listobject::ListStrategy::Empty => {}
                 }
+                pyre_object::listobject::w_list_set_allocated(list, allocated_before);
             }
         }
     });

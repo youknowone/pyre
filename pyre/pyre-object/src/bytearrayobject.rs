@@ -13,6 +13,15 @@ pub static BYTEARRAY_TYPE: PyType = crate::pyobject::new_pytype("bytearray");
 pub struct W_BytearrayObject {
     pub ob_header: PyObject,
     pub data: *mut Vec<u8>,
+    /// CPython `PyByteArrayObject.ob_alloc`, including the trailing NUL byte.
+    ///
+    /// This cannot be derived from `Vec::capacity()`: Rust's allocator uses a
+    /// different growth policy, while `bytearray.__alloc__()` and
+    /// `bytearray.__sizeof__()` expose CPython's logical allocation directly.
+    pub alloc: usize,
+    /// Logical `ob_start - ob_bytes` offset. pyre keeps the payload itself at
+    /// `Vec[0]`, but preserves this allocation state for prefix slice deletes.
+    pub logical_offset: usize,
     /// `_exports` — count of active buffer exports.  Size-changing mutators
     /// are refused while this is positive (`_check_exports`).
     pub exports: i64,
@@ -47,6 +56,7 @@ impl crate::lltype::GcType for W_BytearrayObject {
 /// `dont_look_inside` public constructors below, so the tracer never reaches it
 /// (the `Vec<u8>`-by-value argument never crosses a residual call ABI).
 fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
+    let alloc = if buf.is_empty() { 0 } else { buf.len() + 1 };
     let data =
         crate::gc_storage::gc_alloc_storage_box(buf, crate::bytesobject::bytes_data_gc_type_id());
     let header = PyObject {
@@ -62,6 +72,8 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
                 W_BytearrayObject {
                     ob_header: header,
                     data,
+                    alloc,
+                    logical_offset: 0,
                     exports: 0,
                     w_dict: PY_NULL,
                     w_weakreflifeline: PY_NULL,
@@ -73,6 +85,8 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
         crate::lltype::malloc_typed(W_BytearrayObject {
             ob_header: header,
             data,
+            alloc,
+            logical_offset: 0,
             exports: 0,
             w_dict: PY_NULL,
             w_weakreflifeline: PY_NULL,
@@ -128,6 +142,8 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
             w_class: crate::gc_roots::shadow_stack_get(root_base),
         },
         data: crate::lltype::malloc_raw(bytes.to_vec()),
+        alloc: if bytes.is_empty() { 0 } else { bytes.len() + 1 },
+        logical_offset: 0,
         exports: 0,
         w_dict: PY_NULL,
         w_weakreflifeline: PY_NULL,
@@ -178,14 +194,39 @@ pub unsafe fn w_bytearray_len(obj: PyObjectRef) -> usize {
     }
 }
 
-/// Number of payload bytes currently reserved by the backing storage.
-/// `bytearrayobject.py:604 descr_alloc` reports the resizable list allocation;
-/// pyre's `Vec` is the equivalent storage object.
+/// CPython 3.14 `PyByteArrayObject.ob_alloc`, including the trailing NUL.
 pub unsafe fn w_bytearray_capacity(obj: PyObjectRef) -> usize {
+    unsafe { (*(obj as *const W_BytearrayObject)).alloc }
+}
+
+/// Port of CPython 3.14 `bytearray_resize_lock_held`'s allocation policy.
+pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
     unsafe {
-        let ba = &*(obj as *const W_BytearrayObject);
-        (*ba.data).capacity()
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        let size = (*ba.data).len();
+        if size == old_size {
+            return;
+        }
+        let current = ba.alloc;
+        let fits = size + ba.logical_offset + 1 <= current;
+        if fits && size >= current / 2 {
+            return;
+        }
+        ba.alloc = if fits {
+            size + 1
+        } else if size <= current + (current >> 3) {
+            size + (size >> 3) + if size < 9 { 3 } else { 6 }
+        } else {
+            size + 1
+        };
+        ba.logical_offset = 0;
     }
+}
+
+/// CPython `bytearray_setslice_linear`: a shrinking prefix slice advances
+/// `ob_start` before entering the resize policy.
+pub unsafe fn w_bytearray_advance_logical_start(obj: PyObjectRef, amount: usize) {
+    unsafe { (*(obj as *mut W_BytearrayObject)).logical_offset += amount }
 }
 
 pub unsafe fn w_bytearray_getitem(obj: PyObjectRef, index: usize) -> u8 {
@@ -220,7 +261,9 @@ pub unsafe fn w_bytearray_find(obj: PyObjectRef, value: u8, start: usize) -> i64
 pub unsafe fn w_bytearray_extend(obj: PyObjectRef, other: &[u8]) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
+        let old_size = (*ba.data).len();
         (*ba.data).extend_from_slice(other);
+        w_bytearray_sync_alloc(obj, old_size);
     }
 }
 
@@ -243,7 +286,8 @@ pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
 
 /// Get a mutable reference to the backing `Vec`, for length-changing
 /// mutators (append / insert / remove / pop / clear).  Caller must
-/// ensure the bytearray is not aliased while the reference is live.
+/// ensure the bytearray is not aliased while the reference is live and call
+/// [`w_bytearray_sync_alloc`] after every actual length change.
 pub unsafe fn w_bytearray_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);

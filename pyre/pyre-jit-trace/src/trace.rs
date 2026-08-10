@@ -2070,13 +2070,20 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
     crate::jitcode_dispatch::bool_box_truth_reset();
     if adopted {
+        // `try_adopt_blackhole` mirrors `convert_and_run_from_pyjitpl` and can
+        // finish the root frame with `DoneWithThisFrame*`; it records that
+        // terminal in `FBW_FINISH_CONCRETE` for the bridge launcher to raise
+        // back to the caller.  Do not erase it while discarding the carrier's
+        // tracing-only state.  Doing so adopted a frame positioned after
+        // RETURN_VALUE but lost its result, so the interpreter fell through
+        // with `None` (`pickletools.optimize` after the carrier abort).
         // The chain ran the callee forward from where the sub-walk stopped, so
         // the eager stores it journaled stand exactly once.
         crate::jitcode_dispatch::fbw_store_journal_commit();
     } else {
-        // Nothing adopted the chain, so no result is owed to the caller and a
-        // stash `discard_bridge_carrier_walk` may have left must not leak into
-        // the next walk.
+        // No blackhole terminal belongs to this walk.  Clear any sub-walk
+        // payload before the guard-state replay, as the old unconditional
+        // reset did.
         crate::jitcode_dispatch::fbw_finish_payload_reset();
         // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
         // callee, and the blackhole replays it from the guard, so restore the
@@ -5289,6 +5296,14 @@ fn loop_inlines_abort_permanent_callee(
         if root_globals.is_null() {
             return None;
         }
+        if !pyre_object::is_dict(root_globals) {
+            // A dict subclass is a legal exec namespace but does not carry the
+            // raw W_DictObject layout.  Stop the pre-emptive scan: `None` here
+            // means "could not enumerate", not "proved there is no aborting
+            // callee".  The ordinary walk remains responsible for meeting an
+            // `abort_permanent` marker.
+            return None;
+        }
         let raw_code = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const CodeObject;
         if raw_code.is_null() {
@@ -5355,6 +5370,13 @@ fn loop_inlines_abort_permanent_callee(
         }
 
         while let Some((code_ptr, globals)) = queue.pop_front() {
+            if !pyre_object::is_dict(globals) {
+                // Callee globals can likewise be an unreadable dict subclass.
+                // Abandon this conservative preflight rather than treating the
+                // skipped namespace as proof that no aborting callee exists;
+                // the ordinary walk will encounter any marker it reaches.
+                return None;
+            }
             let raw = pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef)
                 as *const CodeObject;
             if raw.is_null() {
@@ -5706,6 +5728,12 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 DE::GuardSnapshotVableUntyped { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
+                // Listed with its sibling kept-stack decline rather than left
+                // to the catch-all: the mirror shape and recovery set behind it
+                // are per-walk, not a static property of the coordinate, so
+                // retiring the location would be too strong.  The abort ceiling
+                // reaches the same terminal state if it does recur.
+                | DE::BranchGuardKeptSlotUnsourced { .. }
                 | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
                 // Plain, retryable: `ABORT_FORCE_QUASIIMMUT` abandons THIS

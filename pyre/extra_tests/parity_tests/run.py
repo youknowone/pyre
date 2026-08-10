@@ -274,11 +274,31 @@ def _annotate(failures: list[Failure]) -> None:
         print(f"::error file={path},title=parity::{escaped}")
 
 
+def _cpython_env() -> dict[str, str]:
+    """Lend the oracle the vendored `test` package.
+
+    Scripts that import `test.support` cannot run on an oracle whose build
+    omits the `test` package, as the standalone CPython distributions do —
+    the import fails before the script asserts anything.  `_oracle_stdlib`
+    holds a `test` package whose `__path__` is `lib-python/3/test`, so the
+    helpers are CPython's own source at the version the rest of the vendored
+    stdlib is pinned to, on every host alike.
+
+    A `PYTHONPATH` entry precedes the stdlib, so this wins even where the
+    oracle does ship `test`; that is the point of pinning it.  Only `test` is
+    exposed — `lib-python/3` itself on the path would shadow the oracle's whole
+    stdlib with the tree under test.
+    """
+    entry = str(HERE / "_oracle_stdlib")
+    existing = os.environ.get("PYTHONPATH")
+    return {"PYTHONPATH": f"{entry}{os.pathsep}{existing}" if existing else entry}
+
+
 def _runners(
     only_dynasm: bool, only_cranelift: bool, gc_poison: bool
 ) -> list[tuple[str, list[str], dict[str, str] | None]]:
     runners: list[tuple[str, list[str], dict[str, str] | None]] = []
-    runners.append(("cpython", [_cpython()], None))
+    runners.append(("cpython", [_cpython()], _cpython_env()))
     pyre_env = {"MAJIT_GC_NURSERY_POISON": "1"} if gc_poison else None
     dynasm = TARGET_RELEASE / f"pyre-dynasm{EXE}"
     cranelift = TARGET_RELEASE / f"pyre-cranelift{EXE}"

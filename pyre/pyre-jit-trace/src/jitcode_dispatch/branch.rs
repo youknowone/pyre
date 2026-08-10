@@ -332,6 +332,39 @@ pub(crate) fn kept_stack_has_boxed_int_hazard(
     }
 }
 
+/// Whether the walk mirror holds any kept operand-stack slot at `target` as the
+/// NULL `ConstPtr`.
+///
+/// That encoding is ambiguous by construction: it is what a genuine null operand
+/// (`PUSH_NULL` ahead of a `CALL`) and an unset vable shadow slot both decode to,
+/// which is why `opref_is_null_const_ptr` makes every reader treat it as no value
+/// at all.  A kept stack carrying one therefore has a slot the snapshot cannot
+/// source, and it is a strictly narrower state than an uncovered slot in general
+/// — a mirror shorter than the resume depth, or a `NONE` hole, both still resume
+/// through the shadow.
+pub(crate) fn kept_stack_has_null_const_slot(
+    frame: &ActiveResumeFrame,
+    target: usize,
+    vstack_boxes: &[OpRef],
+) -> bool {
+    let pjc = &frame.0;
+    if pjc.code_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: the depth twin is a read-only payload table kept alive by the
+    // frame's `Arc<PyJitCode>`.
+    let depth = unsafe { pjc.depth_trivia_for_jitcode_pc(target) };
+    let Some(depth) = depth.map(|d| d as usize) else {
+        return false;
+    };
+    (0..depth).any(|s| {
+        vstack_boxes
+            .get(s)
+            .copied()
+            .is_some_and(opref_is_null_const_ptr)
+    })
+}
+
 /// The resume snapshot's live Ref register colors at a kept-stack branch
 /// guard's not-taken arm, plus the jitcode `num_regs_r` (the const-window
 /// boundary `n()`).  These are exactly the registers the blackhole restores

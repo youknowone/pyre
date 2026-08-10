@@ -436,20 +436,13 @@ pub fn exception_getclass(w_obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// True when `obj` is a `BlockingIOError` whose constructor took the numeric
-/// third argument as `characters_written` — recognised by `args_w[2]` still
-/// being an int (every other 2..=5-argument form trims `args_w` to two
-/// elements).  Gates the `characters_written` reader and suppresses the
-/// `filename` derivation for that argument (`interp_exceptions.py` `_init_error`).
+/// third argument as `characters_written`.  The constructor records the
+/// successful `__index__` conversion independently from `args_w` because the
+/// original, possibly non-int indexable object remains in `args`, and from the
+/// writable/deletable `written` slot.  This suppresses `filename` even after
+/// the slot is deleted (`interp_exceptions.py` `_init_error`).
 fn exc_blocking_written(obj: PyObjectRef) -> bool {
-    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-    let n = unsafe { pyre_object::w_tuple_len(args) };
-    if n < 3 {
-        return false;
-    }
-    let Some(v) = (unsafe { pyre_object::w_tuple_getitem(args, 2) }) else {
-        return false;
-    };
-    if !unsafe { pyre_object::is_int(v) } {
+    if !unsafe { pyre_object::interp_exceptions::w_exception_get_blocking_written_arg(obj) } {
         return false;
     }
     let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") else {
@@ -4025,11 +4018,19 @@ unsafe fn setitem_bytearray_slice(
         crate::builtins::bytearray_check_exports(obj)?;
     }
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+    let old_size = vec.len();
     if step == 1 {
         let cur = vec.len();
         let s = (start.max(0) as usize).min(cur);
         let e = (stop.max(start) as usize).min(cur).max(s);
+        if s == 0 && sequence2.len() < e - s {
+            pyre_object::bytearrayobject::w_bytearray_advance_logical_start(
+                obj,
+                e - s - sequence2.len(),
+            );
+        }
         vec.splice(s..e, sequence2.iter().copied());
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
         return Ok(w_none());
     }
     // Extended slice: `descr_setitem` forbids resizing — the source length
@@ -7238,10 +7239,15 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
         // `BlockingIOError` constructed with a numeric third argument keeps
         // it in `args_w[2]` as `characters_written`; otherwise the slot is
         // unset (`written == -1`) and the attribute raises `AttributeError`.
-        "characters_written" if exc_blocking_written(obj) => {
-            let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-            if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 2) } {
-                return Ok(v);
+        "characters_written" => {
+            if crate::builtins::lookup_exc_class("OSError")
+                .is_some_and(|os_error| unsafe { isinstance_w(obj, os_error) })
+            {
+                let written =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_written(obj) };
+                if written != -1 {
+                    return Ok(pyre_object::w_int_new(written));
+                }
             }
         }
         // `interp_exceptions.py:409-411 W_ImportError` exposes
@@ -11405,6 +11411,20 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
                 return Ok(w_none());
             }
         }
+        // `interp_exceptions.py:709-711 W_OSError.descr_set_written` — the
+        // descriptor is declared on OSError (and therefore applies to every
+        // subclass), converts through `space.int_w`, and stores independently
+        // from the constructor args tuple.
+        "characters_written" => {
+            let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
+                return Ok(pyre_object::PY_NULL);
+            };
+            if unsafe { isinstance_w(obj, os_error) } {
+                let written = int_w(value)?;
+                unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, written) };
+                return Ok(w_none());
+            }
+        }
         // `interp_exceptions.py:723-728`: the `winerror` descriptor is
         // installed only where the platform has Windows error codes, so
         // elsewhere the name falls through to the ordinary instance dict.
@@ -12315,6 +12335,22 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
             ) =>
         {
             return Err(PyError::type_error("can't delete numeric/char attribute"));
+        }
+        // `interp_exceptions.py:713-715 W_OSError.descr_del_written` — an
+        // already-unset slot raises; otherwise deletion restores `-1`.
+        "characters_written" => {
+            let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
+                return Ok(pyre_object::PY_NULL);
+            };
+            if unsafe { isinstance_w(obj, os_error) } {
+                let written =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_written(obj) };
+                if written == -1 {
+                    return Err(PyError::attribute_error("characters_written"));
+                }
+                unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, -1) };
+                return Ok(w_none());
+            }
         }
         _ if unsafe { exception_deletable_slot(obj, name) } => {
             return object_setattr(obj, name, w_none());
@@ -16878,14 +16914,19 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 /// generator.py:313-315 `frame_is_finished` plus Python 3.14's eager frame
 /// clearing on `close()`.  Dropping the generator's frame edge releases all
 /// suspended locals; an escaped `gi_frame` remains a valid, cleared frame.
-unsafe fn generator_frame_is_finished(gen_obj: PyObjectRef, frame: &mut crate::pyframe::PyFrame) {
+pub(crate) unsafe fn generator_frame_is_finished(
+    gen_obj: PyObjectRef,
+    frame: &mut crate::pyframe::PyFrame,
+) {
     use pyre_object::generator::*;
     unsafe { w_generator_set_exhausted(gen_obj) };
     frame.set_frame_finished_execution(true);
     frame.w_yielding_from = PY_NULL;
-    // The exhausted flag makes `descr_clear` take its permitted finalized
-    // branch.  It has no semantic failure path after that state transition.
-    let _ = frame.descr_clear();
+    // Internal generator completion clears the owned frame directly.  Public
+    // `frame.clear()` instead calls the generator finalizer first; routing
+    // completion through it would report a normally closed coroutine as
+    // never awaited.
+    frame.clear_references();
     frame.f_backref = std::ptr::null_mut();
     frame.f_generator_nowref = PY_NULL;
     unsafe { w_generator_set_frame(gen_obj, std::ptr::null_mut()) };
@@ -16966,10 +17007,16 @@ fn generator_send_ex(
     w_arg: PyObjectRef,
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
+    closing: bool,
 ) -> PyResult {
     use pyre_object::generator::*;
     unsafe {
         if w_generator_is_exhausted(gen_obj) {
+            if is_coroutine(gen_obj) && !closing {
+                return Err(PyError::runtime_error(
+                    "cannot reuse already awaited coroutine",
+                ));
+            }
             if let Some(err) = operr {
                 return Err(err);
             }
@@ -16983,6 +17030,11 @@ fn generator_send_ex(
         let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
         if frame_ptr.is_null() {
             w_generator_set_exhausted(gen_obj);
+            if is_coroutine(gen_obj) && !closing {
+                return Err(PyError::runtime_error(
+                    "cannot reuse already awaited coroutine",
+                ));
+            }
             if let Some(err) = operr {
                 return Err(err);
             }
@@ -17057,7 +17109,7 @@ pub(crate) fn resume_yield_from(
         Some(err) => throw_yield_from(w_yf, err, throw_args),
         None if unsafe { pyre_object::is_none(w_arg) } => {
             if unsafe { pyre_object::generator::is_generator_or_coroutine(w_yf) } {
-                generator_send_ex(w_yf, w_none(), None, None)
+                generator_send_ex(w_yf, w_none(), None, None, false)
             } else {
                 next(w_yf)
             }
@@ -17104,7 +17156,7 @@ fn throw_yield_from(
 ) -> PyResult {
     unsafe {
         if pyre_object::generator::is_generator_or_coroutine(w_yf) {
-            return generator_send_ex(w_yf, w_none(), Some(err), throw_args);
+            return generator_send_ex(w_yf, w_none(), Some(err), throw_args, false);
         }
     }
     let throw = match getattr_str(w_yf, "throw") {
@@ -17128,7 +17180,7 @@ fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
     unsafe {
         if pyre_object::generator::is_generator_or_coroutine(w_yf) {
             let exit = PyError::new(PyErrorKind::GeneratorExit, String::new());
-            return match generator_send_ex(w_yf, w_none(), Some(exit), None) {
+            return match generator_send_ex(w_yf, w_none(), Some(exit), None, true) {
                 Ok(_) => Err(PyError::runtime_error(format!(
                     "{} ignored GeneratorExit",
                     generator_kind(w_yf)
@@ -17248,7 +17300,7 @@ unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
 
 /// PyPy: GeneratorIterator.next() — equivalent to __next__
 fn generator_next(gen_obj: PyObjectRef) -> PyResult {
-    generator_send_ex(gen_obj, w_none(), None, None)
+    generator_send_ex(gen_obj, w_none(), None, None, false)
 }
 
 /// __next__ method wrapper
@@ -17408,7 +17460,7 @@ pub(crate) fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     let value = if args.len() > 1 { args[1] } else { w_none() };
-    generator_send_ex(gen_obj, value, None, None)
+    generator_send_ex(gen_obj, value, None, None, false)
 }
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
@@ -17486,6 +17538,7 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
                 w_none(),
                 Some(err),
                 Some(([w_type, w_val, w_tb], argc)),
+                false,
             );
         }
     };
@@ -17494,6 +17547,7 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
         w_none(),
         Some(err),
         Some(([w_type, w_val, w_tb], argc)),
+        false,
     )
 }
 
@@ -17525,7 +17579,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
         }
     }
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
-    let mut result = match generator_send_ex(gen_obj, w_none(), Some(err), None) {
+    let mut result = match generator_send_ex(gen_obj, w_none(), Some(err), None, true) {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError.
             // generator.py:267-268 `"%s ignored GeneratorExit" % self.KIND`.
@@ -17540,9 +17594,20 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             let w_exc = e.to_exc_object();
             let _roots = pyre_object::gc_roots::push_roots();
             pyre_object::gc_roots::pin_root(w_exc);
-            getattr_str(w_exc, "value").or_else(|_| Ok(w_none()))
+            let value = getattr_str(w_exc, "value").or_else(|_| Ok(w_none()));
+            // The StopIteration has been consumed at this Rust-level catch;
+            // unlike a Python handler, no PUSH_EXC_INFO will clear the
+            // temporary propagation root for us.
+            crate::eval::set_in_flight_exception(PY_NULL);
+            value
         }
-        Err(e) if e.kind == PyErrorKind::GeneratorExit => Ok(w_none()),
+        Err(e) if e.kind == PyErrorKind::GeneratorExit => {
+            // generator.py:265 `except OperationError as e` consumes the
+            // GeneratorExit after matching it.  Mirror PUSH_EXC_INFO's
+            // ownership transfer by ending pyre's propagation root here.
+            crate::eval::set_in_flight_exception(PY_NULL);
+            Ok(w_none())
+        }
         Err(e) => Err(e),
     };
     unsafe {
@@ -17579,14 +17644,14 @@ pub(crate) fn coroutine_await_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn coroutine_wrapper_next_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
-    generator_send_ex(coroutine, w_none(), None, None)
+    generator_send_ex(coroutine, w_none(), None, None, false)
 }
 
 pub(crate) fn coroutine_wrapper_send_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
     let value = crate::type_methods::arg_or_none(args, 1);
-    generator_send_ex(coroutine, value, None, None)
+    generator_send_ex(coroutine, value, None, None, false)
 }
 
 pub(crate) fn coroutine_wrapper_throw_method(args: &[PyObjectRef]) -> PyResult {
@@ -17730,7 +17795,7 @@ fn async_gen_asend_do_send(awaitable: PyObjectRef, mut arg: PyObjectRef) -> PyRe
         }
         unsafe { w_async_generator_set_running(async_gen, true) };
     }
-    let result = generator_send_ex(async_gen, arg, None, None)
+    let result = generator_send_ex(async_gen, arg, None, None, false)
         .and_then(|value| async_gen_unwrap_value(async_gen, value));
     if result.is_err() {
         unsafe { w_async_generator_set_running(async_gen, false) };
@@ -17770,6 +17835,7 @@ pub(crate) fn async_gen_asend_close_method(args: &[PyObjectRef]) -> PyResult {
         w_none(),
         Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
         None,
+        true,
     );
     unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
     match result {
@@ -17907,6 +17973,7 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
                 w_none(),
                 Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
                 None,
+                true,
             )
         } else {
             // `AsyncGenerator.athrow` already warned from the caller-visible
@@ -17915,7 +17982,7 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
             generator_throw_impl(&[async_gen, exc_type, exc_value, exc_tb], false)
         }
     } else {
-        generator_send_ex(async_gen, arg, None, None)
+        generator_send_ex(async_gen, arg, None, None, false)
     };
     let result = match result {
         Ok(value) => {
@@ -17968,6 +18035,7 @@ pub(crate) fn async_gen_athrow_close_method(args: &[PyObjectRef]) -> PyResult {
         w_none(),
         Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
         None,
+        true,
     );
     unsafe { pyre_object::generator::w_async_generator_set_running(async_gen, false) };
     match result {
@@ -18036,6 +18104,51 @@ pub(crate) fn async_gen_athrow_throw_method(args: &[PyObjectRef]) -> PyResult {
 /// is collected. If the suspended frame is still live and its current instruction is
 /// covered by an exception-table handler (a `finally`/`except`/`with` cleanup), raise
 /// GeneratorExit into it so the cleanup runs.
+fn warn_unawaited_coroutine(gen_obj: PyObjectRef) {
+    // CPython 3.14 `_PyErr_WarnUnawaitedCoroutine`: the public `warnings`
+    // module owns the overridable formatting hook.  A hook failure is
+    // unraisable from finalizer context, and only a RuntimeWarning raised by
+    // the warning filter counts as already warned; every other failure gets a
+    // direct warning fallback as well.
+    let repr = unsafe { crate::display::py_repr_wtf8(gen_obj) }
+        .unwrap_or_else(|_| Wtf8Buf::from_string("<coroutine object>".to_string()));
+    let where_desc =
+        crate::display::wtf8_format!("Exception ignored while finalizing coroutine ", repr);
+
+    let hook_result = crate::importing::get_sys_module("warnings").and_then(|warnings| {
+        match findattr_result(warnings, "_warn_unawaited_coroutine") {
+            Ok(Some(hook)) => Some(crate::call::call_function_impl_result(hook, &[gen_obj])),
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
+        }
+    });
+    let warned = match hook_result {
+        Some(Ok(_)) => true,
+        Some(Err(mut err)) => {
+            let exc = err.to_exc_object();
+            let is_runtime_warning = crate::builtins::lookup_exc_class("RuntimeWarning")
+                .is_some_and(|cls| unsafe { isinstance_w(exc, cls) });
+            err.write_unraisable(w_none(), &where_desc, gen_obj);
+            is_runtime_warning
+        }
+        None => false,
+    };
+
+    if !warned {
+        let qualname = unsafe { pyre_object::generator::w_generator_get_qualname(gen_obj) };
+        let qualname = if qualname.is_null() {
+            Wtf8Buf::from_string("<unknown>".to_string())
+        } else {
+            unsafe { pyre_object::w_str_get_wtf8(qualname) }.to_wtf8_buf()
+        };
+        let message = crate::display::wtf8_format!("coroutine '", qualname, "' was never awaited");
+        let w_message = pyre_object::w_str_from_wtf8(message);
+        if let Err(mut err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
+            err.write_unraisable(w_none(), &where_desc, gen_obj);
+        }
+    }
+}
+
 pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
     unsafe {
         use pyre_object::generator::*;
@@ -18055,20 +18168,8 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         {
             w_coroutine_set_warned_unawaited(gen_obj);
             let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(gen_obj);
-            let w_mod = crate::importing::get_sys_module("_warnings")
-                .ok_or_else(|| PyError::runtime_error("_warnings is not initialized"))?;
-            pyre_object::gc_roots::pin_root(w_mod);
-            let w_f = getattr_str(
-                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
-                "_warn_unawaited_coroutine",
-            )?;
-            pyre_object::gc_roots::pin_root(w_f);
-            crate::call::call_function_impl_result(
-                pyre_object::gc_roots::shadow_stack_get(root_base + 2),
-                &[pyre_object::gc_roots::shadow_stack_get(root_base)],
-            )?;
+            warn_unawaited_coroutine(gen_obj);
         }
         if last_instr < 0 {
             return Ok(w_none()); // not started — cannot be inside a handler
@@ -19019,6 +19120,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 // Extended-slice delete: gather the selected indices, then
                 // pop them in descending order so earlier removals do not
                 // shift the positions of later targets.
+                let old_allocated = w_list_allocated(obj);
                 let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
                 let mut i = start;
                 for n in 0..slicelength {
@@ -19034,6 +19136,13 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                     if idx >= 0 && idx < w_list_len(obj) as i64 {
                         w_list_pop(obj, idx);
                     }
+                }
+                if slicelength > 0 {
+                    pyre_object::listobject::w_list_finish_batch_resize(
+                        obj,
+                        len as usize,
+                        old_allocated,
+                    );
                 }
                 return Ok(());
             }
@@ -19082,10 +19191,15 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 let (start, stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
                 let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+                let old_size = vec.len();
                 if step == 1 {
                     let s = start.max(0) as usize;
                     let e = stop.max(start).min(vec.len() as i64) as usize;
+                    if s == 0 {
+                        pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, e - s);
+                    }
                     vec.drain(s..e);
+                    pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
                     return Ok(());
                 }
                 let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
@@ -19105,13 +19219,18 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                         vec.remove(idx as usize);
                     }
                 }
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
                 return Ok(());
             }
             let i = subscript_index_w("bytearray", index)?;
             let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
             let idx = if i < 0 { len + i } else { i };
             if idx >= 0 && idx < len {
+                if idx == 0 {
+                    pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, 1);
+                }
                 pyre_object::bytearrayobject::w_bytearray_vec_mut(obj).remove(idx as usize);
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, len as usize);
                 return Ok(());
             }
             return Err(PyError::new(

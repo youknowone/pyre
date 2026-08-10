@@ -1510,6 +1510,20 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // CPython 3.14 `PyListObject.allocated`.  The orthodox append
+            // descent now walks `W_ListObject::sync_allocated`, so this field
+            // must belong to the canonical list descr group just like every
+            // other mutable field reached by the translated body.  Keep it at
+            // the end so the established list field indices remain stable.
+            (
+                "allocated",
+                std::mem::offset_of!(W_ListObject, allocated),
+                std::mem::size_of::<isize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_ListObject",
         "listobject::W_ListObject",

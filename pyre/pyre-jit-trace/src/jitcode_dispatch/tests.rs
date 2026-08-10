@@ -2298,6 +2298,7 @@ fn append_journal_rollback_rewinds_length() {
     // (the only shape the arm specializes).
     unsafe { w_list_append(list, w_int_new(40)) };
     let len_before = unsafe { w_list_len(list) };
+    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
     assert_eq!(len_before, 4);
     assert!(
         unsafe { w_list_can_append_without_realloc(list) },
@@ -2307,7 +2308,7 @@ fn append_journal_rollback_rewinds_length() {
     // Rollback path: journal push + eager append (production order, see
     // try_walker_orthodox_list_append), then a non-commit exit rewinds
     // the length.
-    super::fbw_list_journal_push_append(list, len_before);
+    super::fbw_list_journal_push_append(list, len_before, allocated_before);
     unsafe { w_list_append(list, w_int_new(50)) };
     assert_eq!(unsafe { w_list_len(list) }, 5);
     super::fbw_store_journal_rollback();
@@ -2316,9 +2317,14 @@ fn append_journal_rollback_rewinds_length() {
         len_before,
         "non-commit walk must rewind the eager append's length"
     );
+    assert_eq!(
+        unsafe { pyre_object::listobject::w_list_allocated(list) },
+        allocated_before,
+        "non-commit walk must restore the logical allocation"
+    );
 
     // Commit path: the eager append stands; the log is dropped.
-    super::fbw_list_journal_push_append(list, len_before);
+    super::fbw_list_journal_push_append(list, len_before, allocated_before);
     unsafe { w_list_append(list, w_int_new(60)) };
     super::fbw_store_journal_commit();
     assert_eq!(
@@ -2334,7 +2340,9 @@ fn append_journal_rollback_rewinds_length() {
 
 #[test]
 fn pop_end_journal_rollback_restores_item_and_length() {
-    use pyre_object::listobject::{W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new};
+    use pyre_object::listobject::{
+        W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len, w_list_new,
+    };
     use pyre_object::{w_int_new, w_list_pop_end};
 
     super::fbw_store_journal_reset();
@@ -2380,7 +2388,9 @@ fn pop_end_journal_rollback_after_strategy_switch() {
 
 #[test]
 fn interleaved_append_pop_journal_rollback_restores_original() {
-    use pyre_object::listobject::{W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new};
+    use pyre_object::listobject::{
+        W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len, w_list_new,
+    };
     use pyre_object::{w_int_new, w_list_append, w_list_pop_end};
 
     super::fbw_store_journal_reset();
@@ -2388,7 +2398,8 @@ fn interleaved_append_pop_journal_rollback_restores_original() {
     let list = w_list_new(original.into_iter().map(w_int_new).collect());
 
     let len_before_append = unsafe { w_list_len(list) };
-    super::fbw_list_journal_push_append(list, len_before_append);
+    let allocated_before_append = unsafe { w_list_allocated(list) };
+    super::fbw_list_journal_push_append(list, len_before_append, allocated_before_append);
     unsafe { w_list_append(list, w_int_new(40)) };
 
     let len_before_pop = unsafe { w_list_len(list) };
@@ -2398,7 +2409,8 @@ fn interleaved_append_pop_journal_rollback_restores_original() {
     super::fbw_list_journal_push_pop_end(list, len_before_pop, w_int_new(raw_item));
 
     let len_before_append = unsafe { w_list_len(list) };
-    super::fbw_list_journal_push_append(list, len_before_append);
+    let allocated_before_append = unsafe { w_list_allocated(list) };
+    super::fbw_list_journal_push_append(list, len_before_append, allocated_before_append);
     unsafe { w_list_append(list, w_int_new(50)) };
 
     let len_before_pop = unsafe { w_list_len(list) };
@@ -2438,13 +2450,14 @@ fn append_journal_rollback_rewinds_object_length() {
     // (the only shape the journal records).
     unsafe { w_list_append(list, w_none()) };
     let len_before = unsafe { w_list_len(list) };
+    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
     assert_eq!(len_before, 4);
     assert!(
         unsafe { w_list_can_append_without_realloc(list) },
         "post-grow object list must have spare capacity for the in-place append"
     );
 
-    super::fbw_list_journal_push_append(list, len_before);
+    super::fbw_list_journal_push_append(list, len_before, allocated_before);
     unsafe { w_list_append(list, w_none()) };
     assert_eq!(unsafe { w_list_len(list) }, 5);
     super::fbw_store_journal_rollback();
@@ -6864,6 +6877,27 @@ fn cast_int_to_float_folds_a_const_int_without_recording() {
         regs_f[0].inline_const_to_value(),
         Some(majit_ir::Value::Float(42.0)),
         "dst must hold the folded ConstFloat",
+    );
+}
+
+#[test]
+fn cast_float_to_int_folds_a_const_float_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("cast_float_to_int/f>i")
+        .expect("`cast_float_to_int/f>i` must be in insns table");
+    let code = [byte, 0x00, 0x00]; // `f>i`: f-src=0, i-dst=0
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_float((42.75f64).to_bits() as i64);
+    let mut regs_f = [operand];
+    let mut regs_i = [OpRef::None];
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut regs_i)
+        .expect("cast_float_to_int on a const float must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(tc.num_ops(), 0, "a const operand folds without recording");
+    assert_eq!(
+        regs_i[0].inline_const_to_value(),
+        Some(majit_ir::Value::Int(42)),
+        "dst must hold the folded ConstInt",
     );
 }
 

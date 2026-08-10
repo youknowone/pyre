@@ -223,7 +223,12 @@ pub fn weakref_type() -> PyObjectRef {
         // CPython exposes `_weakref.ref` as `weakref.ReferenceType`.
         // The dotted builtin name supplies the public module while the type
         // metadata getters expose the final component as the bare name.
-        let tp = crate::typedef::make_builtin_type("weakref.ReferenceType", init_weakref_type);
+        let tp = crate::typedef::make_builtin_type_with_layout(
+            "weakref.ReferenceType",
+            init_weakref_type,
+            crate::typedef::w_object(),
+            &pyre_object::weakref::WEAKREF_LAYOUT_TYPE as *const PyType,
+        );
         unsafe { pyre_object::w_type_set_hasdict(tp, true) };
         tp as usize
     }) as PyObjectRef
@@ -271,7 +276,12 @@ fn init_proxy_type(ns: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub fn proxy_type() -> PyObjectRef {
     *PROXY_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("weakref.ProxyType", init_proxy_type);
+        let tp = crate::typedef::make_builtin_type_with_layout(
+            "weakref.ProxyType",
+            init_proxy_type,
+            crate::typedef::w_object(),
+            &pyre_object::weakref::WEAKREF_LAYOUT_TYPE as *const PyType,
+        );
         unsafe {
             pyre_object::w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
@@ -330,9 +340,11 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub fn callable_proxy_type() -> PyObjectRef {
     *CALLABLE_PROXY_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type(
+        let tp = crate::typedef::make_builtin_type_with_layout(
             "weakref.CallableProxyType",
             init_callable_proxy_type,
+            crate::typedef::w_object(),
+            &pyre_object::weakref::WEAKREF_LAYOUT_TYPE as *const PyType,
         );
         unsafe {
             pyre_object::w_type_set_hasdict(tp, true);

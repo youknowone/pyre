@@ -18,7 +18,7 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
 use pyre_object::pyobject::{
-    FLOAT_TYPE, INT_TYPE, get_instantiate, is_bool, is_float, is_int, py_type_check,
+    FLOAT_TYPE, INT_TYPE, get_instantiate, is_bool, is_dict, is_float, is_int, py_type_check,
 };
 use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 
@@ -6791,23 +6791,33 @@ impl PyreJitState {
         self.frame_array_mut(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
     }
 
-    fn namespace_len(&self) -> usize {
+    /// Return the namespace length for module dictionaries and exact plain
+    /// dictionaries. Other mappings use a different object layout, so their
+    /// length is unknown rather than zero: namespace-dependent traces must not
+    /// treat two unsafe-to-inspect mappings as compatible.
+    fn namespace_len(&self) -> Option<usize> {
         let Some(frame_ptr) = self.frame_ptr() else {
-            return 0;
+            return None;
         };
         let w_globals = unsafe {
             *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const pyre_object::PyObjectRef)
         };
         if w_globals.is_null() {
-            return 0;
+            return None;
         }
         // `dictmultiobject.py:107-109 W_DictMultiObject.length`. The common
         // module-dict case reads `ModuleDictStorage` directly (O(1)) — this guard is on the
-        // per-portal-entry path. Plain dict globals (exec/eval) fall back to
-        // the polymorphic strategy length.
-        unsafe {
-            pyre_object::dictmultiobject::module_dict_storage_len(w_globals)
-                .unwrap_or_else(|| pyre_object::dictmultiobject::w_dict_len(w_globals))
+        // per-portal-entry path. Exact plain dict globals (exec/eval) fall back
+        // to the polymorphic strategy length; dict subclasses and other
+        // mappings do not carry that layout and remain unknown.
+        if let Some(len) =
+            unsafe { pyre_object::dictmultiobject::module_dict_storage_len(w_globals) }
+        {
+            Some(len)
+        } else if unsafe { is_dict(w_globals) } {
+            Some(unsafe { pyre_object::dictmultiobject::w_dict_len(w_globals) })
+        } else {
+            None
         }
     }
 
@@ -9292,7 +9302,7 @@ impl JitState for PyreJitState {
         let capacity = self.array_capacity();
         PyreMeta {
             num_locals,
-            ns_len: self.namespace_len(),
+            ns_len: self.namespace_len().unwrap_or(0),
             // Provisional seed only.  build_meta runs at trace START, before the
             // walk records any LOAD_GLOBAL/LOAD_NAME, so the true value does not
             // exist yet.  finish_trace_namespace_dependency overwrites this from
@@ -9554,7 +9564,8 @@ impl JitState for PyreJitState {
         // module-global reads still need this conservative gate because
         // same-key value rebinds are not value-guarded yet.
         self.local_count() == meta.num_locals
-            && (!meta.namespace_dependent || self.namespace_len() == meta.ns_len)
+            && (!meta.namespace_dependent
+                || self.namespace_len().is_some_and(|len| len == meta.ns_len))
     }
 
     fn setup_bridge_sym(
@@ -12152,7 +12163,7 @@ mod tests {
         let mut meta = empty_meta();
         meta.num_locals = state.local_count();
         meta.namespace_dependent = false;
-        meta.ns_len = state.namespace_len() + 5;
+        meta.ns_len = state.namespace_len().unwrap_or(0) + 5;
         assert!(<PyreJitState as JitState>::is_compatible(&state, &meta));
     }
 
@@ -12165,7 +12176,7 @@ mod tests {
         let mut meta = empty_meta();
         meta.num_locals = state.local_count();
         meta.namespace_dependent = true;
-        meta.ns_len = state.namespace_len() + 5;
+        meta.ns_len = state.namespace_len().unwrap_or(0) + 5;
         assert!(!<PyreJitState as JitState>::is_compatible(&state, &meta));
     }
 

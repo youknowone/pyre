@@ -31,6 +31,8 @@ rather than on its wording — the reference dropped it and refuses where
 reason.
 """
 
+import os
+
 
 def expect_type_error(label, fn, shared=""):
     """Assert `fn` is refused with a TypeError whose message contains `shared`."""
@@ -169,21 +171,20 @@ expect_value("meta_empty_bases", lambda: type.__new__(Meta, "A", (), {}).__bases
 
 # The allocation check reads the metatype's recorded instance layout, so a
 # metaclass an extension module defines has to record that its instances are
-# type objects.  Importing `ctypes` alone exercises it — `class
-# py_object(_SimpleCData)` is a `type.__new__` under one of those metaclasses —
-# and the rows below name the metatype rather than assert its spelling, which
-# the runtimes disagree on.
-import ctypes  # noqa: E402
+# type objects. Pyre's real ctypes types are currently the POSIX + host_env
+# implementation; non-POSIX builds deliberately expose only an import stub.
+if os.name == "posix":
+    import ctypes  # noqa: E402
 
-CTYPES_META = type(ctypes.py_object)
+    CTYPES_META = type(ctypes.py_object)
 
-expect_value("ctypes_metatype_is_a_type", lambda: isinstance(CTYPES_META, type), True)
-expect_value("ctypes_metatype_subtypes_type", lambda: issubclass(CTYPES_META, type), True)
-expect_value("ctypes_subclass_name", lambda: type("P", (ctypes.py_object,), {}).__name__, "P")
-expect_value(
-    "ctypes_subclass_metatype",
-    lambda: type(type("P", (ctypes.py_object,), {})),
-    CTYPES_META,
-)
+    expect_value("ctypes_metatype_is_a_type", lambda: isinstance(CTYPES_META, type), True)
+    expect_value("ctypes_metatype_subtypes_type", lambda: issubclass(CTYPES_META, type), True)
+    expect_value("ctypes_subclass_name", lambda: type("P", (ctypes.py_object,), {}).__name__, "P")
+    expect_value(
+        "ctypes_subclass_metatype",
+        lambda: type(type("P", (ctypes.py_object,), {})),
+        CTYPES_META,
+    )
 
 print("OK")
