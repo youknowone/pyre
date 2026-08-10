@@ -5963,6 +5963,73 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
+        // PyPy interp_posix.py:1703-1706 delegates to
+        // `_run_forking_function(space, "P")`, so forkpty must use the same
+        // before/parent/child hook and thread-reinitialization lifecycle as
+        // fork above while returning the master descriptor as its second item.
+        crate::module_ns_store(
+            ns,
+            "forkpty",
+            crate::make_builtin_function_with_arity(
+                "forkpty",
+                |_| {
+                    if majit_gc::gc_sync::registered_threads() > 1 {
+                        crate::warn::warn_deprecation(
+                            "This process is multi-threaded, use of forkpty() may lead to deadlocks",
+                        )?;
+                    }
+                    let blocked = crate::module::thread::before_external_block();
+                    let fork_serial = FORK_SERIALIZER
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    drop(blocked);
+                    run_fork_callbacks("before");
+                    let mut master_fd = -1;
+                    let mut fork_result = None;
+                    majit_gc::gc_sync::request_stw(|_| {
+                        let pid = unsafe {
+                            libc::forkpty(
+                                &mut master_fd,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        fork_result = Some(if pid == -1 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(pid)
+                        });
+                    });
+                    match fork_result.expect("forkpty STW closure must run") {
+                        Ok(0) => {
+                            crate::module::thread::after_fork_child();
+                            run_fork_callbacks("child");
+                            drop(fork_serial);
+                            Ok(pyre_object::w_tuple_new(vec![
+                                pyre_object::w_int_new(0),
+                                pyre_object::w_int_new(master_fd as i64),
+                            ]))
+                        }
+                        Ok(pid) => {
+                            run_fork_callbacks("parent");
+                            drop(fork_serial);
+                            Ok(pyre_object::w_tuple_new(vec![
+                                pyre_object::w_int_new(pid as i64),
+                                pyre_object::w_int_new(master_fd as i64),
+                            ]))
+                        }
+                        Err(error) => {
+                            run_fork_callbacks("parent");
+                            drop(fork_serial);
+                            Err(io_err(error, ""))
+                        }
+                    }
+                },
+                0,
+            ),
+        );
+
         // os.getppid() -> int
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(

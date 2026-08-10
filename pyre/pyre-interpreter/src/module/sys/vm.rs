@@ -3202,11 +3202,10 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             Ok(w_none())
         }),
     );
-    crate::baseobjspace::setdictvalue_native(
-        stream,
-        "isatty",
-        crate::make_builtin_function("isatty", |_| Ok(w_bool_from(false))),
-    );
+    // PyPy's W_TextIOWrapper.isatty_w delegates to its live buffer, which in
+    // turn delegates to the raw descriptor.  Do not install an instance
+    // override here: after forkpty changes fd 0 into the slave terminal, the
+    // type method must observe that new descriptor state.
     // `BuiltinCodeFn` is a bare `fn` pointer (no captures), so select a
     // constant-returning function per descriptor rather than closing over `fd`.
     let fileno_fn = match fd {
