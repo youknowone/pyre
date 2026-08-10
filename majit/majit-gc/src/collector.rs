@@ -3672,7 +3672,20 @@ impl MiniMarkGC {
     /// `T_IS_RPYTHON_INSTANCE` bit is `TypeInfo::is_object`; the explicit hide
     /// bit covers internal structs that share a Python-object prefix but have
     /// no app-level typedef.
+    ///
+    /// This is the single predicate behind every app-level inspector — the
+    /// `gc.get_objects` filter, the `get_rpy_*` wrap decision, and the walk
+    /// terminator in [`Self::do_get_referents`] — because upstream passes the
+    /// one `try_cast_gcref_to_w_root` to all three.
     fn is_app_level_object_ref(&self, obj: GcRef) -> bool {
+        // `referents.py:18 rgc.get_gcflag_dummy(gcref)`: a dummy stands in for
+        // an object the collector no longer holds, so it is never an app-level
+        // object however its type reads.  Only a managed object carries the
+        // header the flag lives in.
+        if self.is_managed_heap_object(obj.0) && unsafe { (*header_of(obj.0)).has_flag(flags::DUMMY) }
+        {
+            return false;
+        }
         let Some(type_id) = self.get_actual_typeid(obj) else {
             return false;
         };
@@ -3731,9 +3744,7 @@ impl MiniMarkGC {
             while i < pending.len() {
                 parent = pending[i];
                 i += 1;
-                let hdr = unsafe { header_of(parent.0) };
-                let type_id = unsafe { (*hdr).type_id() };
-                if !unsafe { (*hdr).has_flag(flags::DUMMY) } && self.types.get(type_id).is_object {
+                if self.is_app_level_object_ref(parent) {
                     result.push(parent);
                 } else {
                     expand = true;
@@ -6562,6 +6573,47 @@ mod tests {
         }
         assert!(gc.types.typeids_text().starts_with(b"member0"));
         assert_eq!(gc.types.typeids_list(), vec![0, 0, 1]);
+        gc.roots.clear();
+    }
+
+    /// `referents.py:66-70` terminates a branch on `try_cast_gcref_to_w_root`,
+    /// so the two rejections that helper opens with — the dummy flag and the
+    /// missing typedef — look *through* a node here rather than reporting it.
+    #[test]
+    fn get_referents_looks_through_a_hidden_or_dummy_node() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(ptr_size, vec![0]));
+        let mut hidden_info = TypeInfo::object_with_gc_ptrs(ptr_size, vec![0]);
+        hidden_info.hide_from_app_level_inspector = true;
+        let hidden_tid = gc.register_type(hidden_info);
+
+        // holder -> hidden -> leaf, and holder -> dummy -> tail.
+        let leaf = gc.alloc_with_type(object_tid, ptr_size);
+        let tail = gc.alloc_with_type(object_tid, ptr_size);
+        let hidden = gc.alloc_with_type(hidden_tid, ptr_size);
+        let dummy = gc.alloc_with_type(object_tid, ptr_size);
+        let mut holder = gc.alloc_with_type(object_tid, ptr_size);
+        unsafe {
+            (*header_of(dummy.0)).set_flag(flags::DUMMY);
+            *(hidden.0 as *mut GcRef) = leaf;
+            *(dummy.0 as *mut GcRef) = tail;
+            *(holder.0 as *mut GcRef) = hidden;
+            gc.roots.add(&mut holder);
+        }
+
+        let mut referents = Vec::new();
+        gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents, vec![leaf]);
+
+        unsafe { *(holder.0 as *mut GcRef) = dummy };
+        let mut referents = Vec::new();
+        gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents, vec![tail]);
+
+        for object in [holder, hidden, dummy, leaf, tail] {
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+        }
         gc.roots.clear();
     }
 
