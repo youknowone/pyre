@@ -599,27 +599,6 @@ fn real_main(binary_name: &str) {
             }
         }
         RunMode::Script(path) => {
-            // The script is read through the import machinery's source
-            // provider, so under sandbox the controller VFS mediates it over
-            // the same channel module imports use.  The bytes then go through
-            // the tokenizer's BOM / PEP 263 decoding in every build.
-            let source = match importing::read_source_bytes(Path::new(&path)) {
-                Ok(bytes) => match pyre_interpreter::decode_source_bytes(
-                    &bytes,
-                    rustpython_wtf8::Wtf8::new(path.as_str()),
-                    false,
-                ) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        pyre_interpreter::eprint_exception(&error, false);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("{binary_name}: cannot open '{path}': {e}");
-                    std::process::exit(1);
-                }
-            };
             // Initialize sys.path with the script's directory. Under sandbox,
             // `canonicalize()` issues raw host-FS syscalls (realpath) past the
             // seccomp lockdown and resolves against the real filesystem, not the
@@ -648,6 +627,34 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![std::ffi::OsString::from(&path)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
+            // A declared non-UTF-8 source codec is resolved through the Python
+            // codec registry, whose first lookup imports `encodings`.  PyPy's
+            // app_main reaches that import with the thread's ExecutionContext
+            // already installed; use the same context for decoding, compiling,
+            // and executing rather than collapsing startup onto a null EC or
+            // creating a second frame owner after decoding.
+            let execution_context = setup_exec_context();
+            // The script is read through the import machinery's source
+            // provider, so under sandbox the controller VFS mediates it over
+            // the same channel module imports use.  The bytes then go through
+            // the tokenizer's BOM / PEP 263 decoding in every build.
+            let source = match importing::read_source_bytes(Path::new(&path)) {
+                Ok(bytes) => match pyre_interpreter::decode_source_bytes(
+                    &bytes,
+                    rustpython_wtf8::Wtf8::new(path.as_str()),
+                    false,
+                ) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        pyre_interpreter::eprint_exception(&error, false);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{binary_name}: cannot open '{path}': {e}");
+                    std::process::exit(1);
+                }
+            };
             // CPython compiles a script with the same absolute path exposed
             // as `__main__.__file__`; warnings use `code.co_filename`, so the
             // two must not diverge when argv[0] was relative.
@@ -658,7 +665,13 @@ fn real_main(binary_name: &str) {
                 .into_owned();
             #[cfg(feature = "sandbox")]
             let compile_path = path.clone();
-            run_source(&source, Mode::Exec, &compile_path, no_site);
+            run_source_with_context(
+                &source,
+                Mode::Exec,
+                &compile_path,
+                no_site,
+                execution_context,
+            );
             if inspect {
                 repl::run_repl(true, no_site);
             }
@@ -1371,6 +1384,16 @@ fn absolute_script_path(filename: &str) -> Option<String> {
 }
 
 fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
+    run_source_with_context(source, mode, filename, no_site, setup_exec_context());
+}
+
+fn run_source_with_context(
+    source: &str,
+    mode: Mode,
+    filename: &str,
+    no_site: bool,
+    execution_context: Rc<PyExecutionContext>,
+) {
     // `config_run_filename_abspath` absolutizes the run filename before the
     // module is compiled, so `co_filename` — and with it every `File "…"` line
     // a traceback prints — carries the absolute path, not the literal argv
@@ -1388,7 +1411,6 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
         }
     };
 
-    let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
     let mut frame = match PyFrame::new_with_context(code, execution_context) {
         Ok(frame) => frame,
