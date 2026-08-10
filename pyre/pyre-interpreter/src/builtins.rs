@@ -11273,6 +11273,12 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             ParseErrorType::DuplicateKeywordArgumentError(name) => {
                 format!("keyword argument repeated: {name}")
             }
+            ParseErrorType::Lexical(LexicalErrorType::FStringError(
+                InterpolatedStringErrorType::SingleRbrace,
+            )) => "f-string: single '}' is not allowed".to_owned(),
+            ParseErrorType::Lexical(LexicalErrorType::FStringError(
+                InterpolatedStringErrorType::UnclosedLbrace,
+            )) => "f-string: expecting '}'".to_owned(),
             // The parser spells every unlexable character the same way. Split
             // it the way `pytokenizer.py:130-140` does — non-printable
             // characters name only their code point, printable ones are quoted
@@ -11297,6 +11303,18 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         e.to_string()
     };
+    if msg == "f-string: expecting `}`" {
+        msg = "f-string: expecting '}'".to_owned();
+    } else if msg == "f-string: expecting '}', or format specs" && source.contains(":{{") {
+        msg = "f-string: expecting a valid expression after '{'".to_owned();
+    }
+    if msg == "f-string: expecting a valid expression after '{'" {
+        let bytes = source.as_bytes();
+        let quote = bytes.iter().rposition(|byte| matches!(*byte, b'\'' | b'"'));
+        if quote.is_some_and(|quote| bytes.get(quote.wrapping_sub(1)) == Some(&b'{')) {
+            msg = "f-string: expecting '}'".to_owned();
+        }
+    }
     let literal_span = if msg == "bytes can only contain ASCII literal characters" {
         match &e {
             crate::compile::CompileError::Parse(parse_error) => {
