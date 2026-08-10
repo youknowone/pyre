@@ -7487,6 +7487,16 @@ pub(crate) fn get_type_flag(
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     use majit_ir::descr::ArrayFlag;
     match type_str {
+        // descr.py:241-254: Ptr whose pointee has `_gckind == 'raw'` is an
+        // unsigned, int-banked word.  Pyre's mapdict shape pointers are erased
+        // to `*const u8`; they are immortal raw identities, not GC references.
+        // Keep `*mut PyObject` and other erased managed pointers on the
+        // conservative Ref fallback below.
+        "*const u8" => (
+            ArrayFlag::Unsigned,
+            majit_ir::value::Type::Int,
+            crate::layout::target_word_size(),
+        ),
         // RPython: isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc' → FLAG_POINTER
         s if s.starts_with('&')
             || s.starts_with("Box<")
@@ -9615,6 +9625,17 @@ mod tests {
         cc.set_known_struct_names(known_structs);
         assert!(cc.is_known_struct("PyObject"));
         assert!(!cc.is_known_struct("*mut PyObject"));
+    }
+
+    #[test]
+    fn raw_byte_identity_pointer_is_int_banked() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let (flag, field_type, size) = get_type_flag("*const u8");
+        assert_eq!(flag, ArrayFlag::Unsigned);
+        assert_eq!(field_type, Type::Int);
+        assert_eq!(size, crate::layout::target_word_size());
     }
 
     #[derive(Debug)]

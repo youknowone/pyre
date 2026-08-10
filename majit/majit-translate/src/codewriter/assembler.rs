@@ -3283,6 +3283,8 @@ fn type_flag_from_str(
     use majit_ir::descr::ArrayFlag;
     let word = crate::layout::target_word_size();
     match type_str {
+        // descr.py:241-254 raw Ptr parity; see call.rs::get_type_flag.
+        "*const u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
         s if s.starts_with('&')
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
