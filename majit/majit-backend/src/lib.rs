@@ -1705,9 +1705,21 @@ impl CpuDescrAttachments {
 pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
 
 /// `llsupport/asmmemmgr.py:AsmMemoryManager` accounting owned by one CPU.
-/// `total_memory_allocated` is the mapped capacity and never shrinks;
-/// `total_mallocs` is live code bytes and is released with each compiled
-/// block, exactly like `AsmMemoryManager.free(start, stop)`.
+/// `total_memory_allocated` is the mapped capacity and never shrinks
+/// (`asmmemmgr.py:90` bumps it and nothing subtracts); `total_mallocs` is live
+/// code bytes and is released with each compiled block, exactly like
+/// `AsmMemoryManager.free(start, stop)` (`asmmemmgr.py:47-50`).
+///
+/// The counters are upstream's, but the allocator under them is not.
+/// `total_memory_allocated` is monotonic there because the arena it counts is
+/// *retained*: `free` puts the range back on a reuse list and the mapping
+/// stays, so the figure is the capacity the process still holds. Here every
+/// compiled block instead carries its own executable mapping, unmapped when
+/// the block is reaped, so the same monotonic figure over-reports once code is
+/// freed and grows without bound across compile/invalidate cycles. The fix is
+/// the missing allocator — a real reusable `AsmMemoryManager` with the free
+/// list of `asmmemmgr.py:53-90` — not a subtraction here, which would make the
+/// number honest while leaving the semantics further from upstream.
 #[derive(Default)]
 pub struct AsmMemoryManagerStats {
     total_memory_allocated: AtomicUsize,
@@ -1767,6 +1779,9 @@ pub struct AsmMemoryBlock {
 
 impl Drop for AsmMemoryBlock {
     fn drop(&mut self) {
+        // `used` only, as `free` does at `asmmemmgr.py:47-50`. The capacity
+        // stays charged; see [`AsmMemoryManagerStats`] for what that costs
+        // without the arena upstream keeps it in.
         self.owner
             .total_mallocs
             .fetch_sub(self.used, Ordering::Relaxed);
