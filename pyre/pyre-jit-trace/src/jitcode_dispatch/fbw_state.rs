@@ -2523,20 +2523,31 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 // the walker's specialization erases the residual before the
                 // backstop is reached.
                 //
-                // Method-form bodies get the same treatment for `truth` and
-                // `load_method_self`.  `truth` is the branch predicate sibling
-                // of the binary/compare family, and `load_method_self` is the
-                // pure method-binding half of the same opcode as `load_attr`,
-                // no stronger than the `load_attr` case already deferred here.
-                // An operand that stays opaque leaves the residual standing,
-                // and it reaches `fbw_abort_nested_unjournaled_residual` like
-                // any other — the helper never runs.
-                let defer_method_form_helper = method_form_deferred_helpers
-                    && matches!(
-                        ei.pyre_helper,
-                        majit_ir::PyreHelperKind::LoadMethodSelf | majit_ir::PyreHelperKind::Truth
-                    );
-                let defer_helper = defer_method_form_helper
+                // `truth` gets the same treatment in every body: it is the
+                // branch predicate sibling of the binary/compare family, and
+                // the branch it feeds consumes it as the very next op, so no
+                // body shape can observe it half-applied.  An operand that
+                // stays opaque leaves the residual standing, and it reaches
+                // `fbw_abort_nested_unjournaled_residual` like any other — the
+                // helper never runs.
+                //
+                // `load_method_self` is the pure method-binding half of the
+                // same opcode as `load_attr`, and no stronger than the
+                // `load_attr` case already deferred here — but unlike every
+                // other helper on this list its result is TWO operand-stack
+                // entries that stay live from the `LOAD_ATTR` all the way to
+                // the matching `CALL`.  A guard failing inside that window
+                // resumes a frame whose callable slot was never written, so
+                // widening it past a method-form body needs
+                // `foriter_deferred_admit`'s loop-header check to account for
+                // it (`fbw_callee_body_has_load_method_self_residual`).  Keep
+                // the surface where it was.
+                let defer_truth_or_method_self = match ei.pyre_helper {
+                    majit_ir::PyreHelperKind::LoadMethodSelf => method_form_deferred_helpers,
+                    majit_ir::PyreHelperKind::Truth => true,
+                    _ => false,
+                };
+                let defer_helper = defer_truth_or_method_self
                     || matches!(
                         ei.pyre_helper,
                         majit_ir::PyreHelperKind::CallFn
@@ -2654,6 +2665,38 @@ pub(crate) fn fbw_callee_body_replay_safety(
     } else {
         CalleeReplaySafety::Clean
     }
+}
+
+/// True iff the body carries a `load_method_self` residual.
+///
+/// `LOAD_ATTR name + NULL|self` pushes TWO operand-stack entries that stay live
+/// from that opcode until the matching `CALL` consumes them, which is as far
+/// apart as the argument expressions make it.  Every other deferred helper's
+/// result is consumed by the very next op.  A body that owns a loop header puts
+/// guards inside that window, so it is the one shape where a deopt can land
+/// between the push and the call.
+pub(crate) fn fbw_callee_body_has_load_method_self_residual(
+    body_code: &[u8],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if op.opname.starts_with("residual_call")
+            && residual_call_descr_index_in_body(body_code, &op)
+                .and_then(|index| callee_descr_refs.get(index))
+                .and_then(|descr| descr.as_call_descr())
+                .is_some_and(|descr| {
+                    descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadMethodSelf
+                })
+        {
+            return true;
+        }
+        pc = op.next_pc;
+    }
+    false
 }
 
 pub(crate) fn fbw_callee_body_has_binary_op_residual(

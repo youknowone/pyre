@@ -462,6 +462,14 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
 /// `[callable, null_or_self, args…]` operand list.  A route that enters with a
 /// callee it resolved itself (rather than off a CALL) carries a differently
 /// shaped operand list, so it declines such a body up front.
+///
+/// The CALL-entered `foriter_deferred_admit` route reaches no CALL_ASSEMBLER at
+/// all, so that reason does not apply to it — but a second, independent one
+/// does: a loop header is where a deferred `load_method_self`'s two
+/// operand-stack entries can be crossed by a failing guard.  See the admission
+/// itself, which pairs this predicate with
+/// [`fbw_callee_body_has_load_method_self_residual`] rather than declining
+/// every loop-bearing body.
 pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "jit_merge_point")
 }
@@ -3010,8 +3018,23 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // entry or skip the handler cleanup.  Keep handler-bearing
                 // bodies on the residual path unless this scan proves them
                 // clean.
+                //
+                // A body that owns a loop header puts failing guards between a
+                // deferred `load_method_self` and the `CALL` that consumes the
+                // two operand-stack entries it pushed, and a deopt landing in
+                // that window resumes a frame whose callable slot was never
+                // written — `names(traceback)` in
+                // `synth/exception_reentry_guard_finally_residual` SIGSEGVs in
+                // `classify_callable` on a null callable.  No other deferred
+                // helper's result outlives the next op, so the loop header is
+                // only disqualifying together with that one residual.  The test
+                // is a superset of the failing shape: `names` also needs an
+                // in-window guard that actually fails, which a plain `self.attr`
+                // read folds away.
+                let loop_header_admitted = !body_facts.owns_loop_header
+                    || !fbw_callee_body_has_load_method_self_residual(body.code, callee_descr_refs);
                 foriter_deferred_admit = entry_is_call_boundary
-                    && !body_facts.owns_loop_header
+                    && loop_header_admitted
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !body_facts.has_exception_table
                     && !fbw_foriter_deferred_call_denied(callee_code_key);
