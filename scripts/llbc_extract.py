@@ -1130,6 +1130,262 @@ def file_mtime(path: Path) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# PROVENANCE: what the repository looked like around the build. Recorded beside
+# the artefact, reported by `check`, and NEVER gated on.
+#
+# ⛔ This does not go in the fingerprint stamp, and must not be moved there.
+# Two independent reasons, either one sufficient:
+#
+#   * `check` compares the stamp as exact text and already has an arm for a
+#     stamp that "carries content this engine did not write". Extra lines in
+#     the stamp file are a REFUSAL, not extra information.
+#   * a commit sha moves on EVERY commit, including the overwhelming majority
+#     that touch nothing this artefact reads. A git field inside a compared
+#     stamp would report every artefact stale after every unrelated commit,
+#     which deletes the entire point of a content-addressed fingerprint —
+#     `source=` exists precisely so that an unrelated commit does not force a
+#     re-extraction.
+#
+# So the two files answer different questions and are kept apart on purpose:
+# the stamp answers "is this artefact current", the provenance answers "what
+# was going on when it was built". Only the first is allowed to fail a build.
+#
+# ⚠ THE FIRST SIDECARS THIS CODE WRITES DESCRIBE A TREE THAT CONTAINS THIS
+# CODE, and that is not an anomaly. This file is one of the engine sources
+# listed in every driver's base pathspecs, so it is hashed into `source=` for
+# EVERY crate: editing it re-stales all artefacts by construction, and the only
+# run that can produce a provenance sidecar is one made from a tree that
+# already holds the change. Committing before extracting is therefore not a
+# nicety — it is what makes that first sidecar read `dirty_in_closure=0`. Run
+# it the other way round and the change lists ITSELF as an in-closure dirty
+# file, which is the correct report and looks like a defect.
+# ---------------------------------------------------------------------------
+
+
+def git_head(root: Path) -> str:
+    """`HEAD`'s sha, or a LABELLED reason it is unavailable.
+
+    Never raises, and never returns the empty string. An unlabelled blank would
+    read as "no commit" when it means "could not ask", and those call for
+    opposite reactions from whoever reads the sidecar.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return "unavailable(git-not-runnable)"
+    if result.returncode != 0:
+        return "unavailable(rev-parse-failed)"
+    return result.stdout.decode("utf-8", errors="replace").strip() or "unavailable(empty)"
+
+
+def git_dirty(root: Path) -> tuple[str, list[tuple[str, str]]]:
+    """`(status, [(porcelain XY, path), …])` for the worktree at `root`.
+
+    `-uall` is load-bearing. The default collapses an untracked directory into
+    a single `?? dir/` entry, while the fingerprint's own untracked leg
+    (`git ls-files --others --exclude-standard`) works per FILE. Classifying a
+    directory against a set of files would report `?? majit/examples/new/` as
+    outside the closure while every file under it is inside it — the one
+    reading a person would act on, inverted.
+
+    The status is returned separately rather than folded into an empty list,
+    because "the tree is clean" and "git could not be asked" both produce no
+    entries and demand opposite reactions.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "-z", "-uall"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return "unavailable(git-not-runnable)", []
+    if result.returncode != 0:
+        return "unavailable(status-failed)", []
+
+    fields = result.stdout.decode("utf-8", errors="replace").split("\0")
+    entries: list[tuple[str, str]] = []
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if not entry:
+            continue
+        # Porcelain v1 spends exactly two columns on the status and one on the
+        # separator, so slice rather than split: a path may itself begin with a
+        # space, and `-z` means it is not quoted to hide that.
+        code, path = entry[:2], entry[3:]
+        # An `R`/`C` entry spends a SECOND NUL-separated field on the original
+        # path. Not consuming it re-reads that path as a status code and mints
+        # a junk entry — and, worse, shifts every entry after it by one.
+        if "R" in code or "C" in code:
+            if index < len(fields):
+                path = f"{path} (from {fields[index]})"
+                index += 1
+        entries.append((code, path))
+    return "ok", entries
+
+
+# Ceiling on the per-file `dirty=` listing. Not a ceiling on the COUNTS, which
+# stay exact however far past this the tree is.
+DIRTY_LINE_LIMIT = 200
+
+
+def provenance_for(
+    *,
+    crate: str,
+    head_before: str,
+    head_after: str,
+    started: str,
+    finished: str,
+    dirty_status: str,
+    dirty: list[tuple[str, str]],
+    dirty_before: int | None,
+    closure: set[str],
+) -> str:
+    """The provenance sidecar's text: the HEAD pair, and dirt CLASSIFIED.
+
+    ⭐ Both halves exist because of a specific failure they each fix.
+
+    `head_before`/`head_after` are a PAIR because a build that straddles a
+    commit is only visible as one. A single post-hoc `rev-parse` records the
+    later sha and shows nothing unusual — the straddle that motivated this
+    (`e69f4388a3c` → `8dd18ba2bf4`, landing while an artefact was being
+    stamped) reads as an ordinary clean build under one sha, and as an obvious
+    straddle under two.
+
+    Every dirty path is classified against this crate's own fingerprint
+    closure, because the bare porcelain is not actionable: three files dirty
+    during an extraction is a run to kill if they are inputs and a non-event if
+    they are not, and only the classification distinguishes those. A reader
+    handed the unclassified list has to reconstruct the closure by hand, which
+    is the step nobody takes.
+
+    ⚠ `in-closure` covers the IN-ROOT half only. The out-of-root inputs
+    `external=` hashes live in sibling checkouts this `git status` never sees,
+    so `outside` means "not an input from this repository", never "cannot
+    affect the artefact".
+
+    A `dirty=` line is `<XY> <where> <path>` with the field widths FIXED at the
+    front: `value[:2]` is the porcelain status, `value[3:]` is
+    `<where> <path>`. Splitting the whole value on whitespace does not work and
+    the reason is easy to miss — a porcelain code is two columns of which
+    either may be a SPACE (` M`, `A `), so ` M in-closure x.rs` splits into an
+    empty first field. Positions, not separators.
+    """
+    lines = [
+        f"crate={crate}",
+        f"head_before={head_before}",
+        f"head_after={head_after}",
+        f"started={started}",
+        f"finished={finished}",
+        f"dirty_status={dirty_status}",
+    ]
+    # A count, not a second list: the pre-build snapshot is here for the same
+    # reason the HEAD pair is — so a tree that moved during the build is
+    # legible — and repeating the whole listing to say so would bury the one
+    # that describes the stamped state.
+    lines.append(
+        f"dirty_before={'unknown' if dirty_before is None else dirty_before}"
+    )
+    classified = [
+        (code, path, "in-closure" if path in closure else "outside")
+        for code, path in dirty
+    ]
+    in_closure = [entry for entry in classified if entry[2] == "in-closure"]
+    outside = [entry for entry in classified if entry[2] == "outside"]
+    # COUNTS ARE ALWAYS EXACT; only the per-file listing is bounded. `-uall`
+    # asks git to expand untracked directories file by file, so a single
+    # untracked tree of generated files could otherwise write a sidecar of
+    # unbounded size into `build/`. In-closure entries are listed first and
+    # never dropped: they are the actionable set, and a truncation that ate
+    # them would remove the only lines anyone acts on.
+    lines.append(f"dirty_in_closure={len(in_closure)}")
+    lines.append(f"dirty_outside={len(outside)}")
+    shown = in_closure + outside[: max(0, DIRTY_LINE_LIMIT - len(in_closure))]
+    # Always written, including as `0`, so a reader never has to decide what an
+    # absent key meant.
+    lines.append(f"dirty_omitted={len(classified) - len(shown)}")
+    for code, path, where in shown:
+        lines.append(f"dirty={code} {where} {path}")
+    return "\n".join(lines)
+
+
+def parse_provenance(text: str) -> tuple[dict[str, str], list[str]]:
+    """`({single-valued key: value}, [dirty line, …])`.
+
+    `dirty=` repeats, so it is returned as its own list; collapsing it into the
+    dict would keep the last entry and silently report one dirty file where
+    there were thirty.
+    """
+    fields: dict[str, str] = {}
+    dirty: list[str] = []
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        if key == "dirty":
+            dirty.append(value)
+        else:
+            fields[key] = value
+    return fields, dirty
+
+
+def report_provenance(dest: Path) -> None:
+    """Print an artefact's provenance. Returns nothing and gates nothing.
+
+    ⛔ Absence is NOT a staleness signal and must never become one. Every
+    artefact extracted before this sidecar existed lacks it, and so does every
+    artefact copied in from elsewhere; refusing on that would turn a reporting
+    aid into a second, weaker freshness gate answering a question `source=`
+    already answers properly.
+
+    The in-closure dirty entries are printed in full and the outside ones only
+    counted, because that is the asymmetry the classification exists to
+    express: an input dirty during the build is the thing to act on, and a
+    hundred unrelated edits are the noise that hid it.
+    """
+    path = dest.with_suffix(dest.suffix + ".provenance")
+    if not path.exists():
+        print(
+            "    no provenance sidecar (predates it, or was written by another"
+            " tool) — not a staleness signal"
+        )
+        return
+    fields, dirty = parse_provenance(path.read_text())
+    before, after = fields.get("head_before", "?"), fields.get("head_after", "?")
+    if before == after:
+        print(f"    built at HEAD {before}, {fields.get('started', '?')}")
+    else:
+        # Said plainly rather than as a warning: the artefact may be perfectly
+        # current — `source=` is content-addressed and does not care which
+        # commit the tree sat on. What a straddle costs is the ability to name
+        # ONE tree this artefact came from.
+        print(f"    ⚠ built ACROSS a commit: {before} -> {after}")
+    status = fields.get("dirty_status", "?")
+    if status != "ok":
+        print(f"    dirty state at build time: {status} — neither clean nor known")
+        return
+    # Positional, per `provenance_for`: the status occupies two fixed columns,
+    # so the classification starts at offset 3. A substring test would also
+    # match a PATH that happened to contain the word.
+    in_closure = [entry for entry in dirty if entry[3:].startswith("in-closure ")]
+    print(
+        f"    dirty at build time: {fields.get('dirty_in_closure', '?')} in this"
+        f" crate's closure, {fields.get('dirty_outside', '?')} outside"
+        f" (before the build: {fields.get('dirty_before', '?')})"
+    )
+    for entry in in_closure:
+        print(f"      {entry}")
+
+
 def crate_layout_targets(eng: Engine, spec: CrateSpec) -> list[str]:
     """Cross targets this crate emits a layout sidecar for.
 
@@ -1320,7 +1576,20 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             and stamp_path.read_text() == stamp + "\n"
         ):
             print(f"=== skipping {crate} -> {dest} (fingerprint unchanged) ===")
+            # No provenance is written here on purpose. The sidecar describes
+            # THE ARTEFACT, and the artefact is the one the previous run built:
+            # re-stamping it with today's HEAD would claim this tree produced
+            # bytes it did not.
             continue
+
+        # Opening half of the provenance pair, taken before the Charon build
+        # that is about to run for minutes. See `provenance_for`.
+        head_before = git_head(eng.root)
+        started = datetime.datetime.now().isoformat(timespec="seconds")
+        dirty_status_before, dirty_entries_before = git_dirty(eng.root)
+        dirty_before = (
+            len(dirty_entries_before) if dirty_status_before == "ok" else None
+        )
 
         print(f"=== extracting {crate} -> {dest} ===")
         # Charon writes the `.ullbc` only while rustc actually compiles
@@ -1405,6 +1674,48 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             write_layout_sidecar(full, sidecar)
             full.unlink()
             print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
+        # Closing half of the provenance pair, and the sidecar write.
+        #
+        # ⚠ This precedes the two guards below, both of which can end the run,
+        # because the artefact at `dest` has ALREADY been rewritten by the
+        # Charon build above. The invariant worth holding is "the provenance
+        # beside an artefact describes the bytes in it" — leaving the write
+        # until after the guards would, on a guard failure, leave the previous
+        # run's provenance sitting beside this run's bytes, which is the same
+        # lie the skip path is careful not to tell.
+        #
+        # It is also the reason this is not gated: an artefact the stamp
+        # refuses is exactly the one whose provenance a reader needs.
+        head_after = git_head(eng.root)
+        finished = datetime.datetime.now().isoformat(timespec="seconds")
+        dirty_status, dirty_entries = git_dirty(eng.root)
+        closure = {
+            path.as_posix()
+            for path in fingerprint_inputs(eng, [crate], cargo_features)
+        }
+        provenance_path = dest.with_suffix(dest.suffix + ".provenance")
+        provenance_path.write_text(
+            provenance_for(
+                crate=crate,
+                head_before=head_before,
+                head_after=head_after,
+                started=started,
+                finished=finished,
+                dirty_status=dirty_status,
+                dirty=dirty_entries,
+                dirty_before=dirty_before,
+                closure=closure,
+            )
+            + "\n"
+        )
+        if head_after != head_before:
+            print(
+                f"    NOTE: HEAD moved during this build"
+                f" ({head_before[:11]} -> {head_after[:11]}); recorded in"
+                f" {provenance_path.name}. Whether that matters is answered by"
+                f" the source-hash check below, not by this line."
+            )
+
         # Guard the fingerprint exclusion (CrateSpec.excluded_deps): a package
         # dropped from this crate's fingerprint must not appear in its artefact,
         # else a later edit to that package would silently serve a stale cache.
@@ -1574,6 +1885,9 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
             )
             continue
         print(f"    artefact {dest.stat().st_size} bytes, mtime {file_mtime(dest)}")
+        # Before the stamp arms, all of which can `continue`. Provenance is
+        # most useful on exactly the paths that refuse.
+        report_provenance(dest)
 
         for target in crate_layout_targets(eng, spec):
             sidecar = dest_dir / spec.layout_sidecar_name(target)
