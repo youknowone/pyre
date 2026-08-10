@@ -1,7 +1,8 @@
 //! `_ctypes` — the native surface the CPython `ctypes` package sits on.
 //!
-//! On unix with the `host_env` feature this provides a working end-to-end
-//! slice: the dynamic-linker primitives (`dlopen`/`dlsym`/`dlclose`), the
+//! With the `host_env` feature this provides a working end-to-end slice: the
+//! dynamic-linker primitives (`dlopen`/`dlsym`/`dlclose` on posix,
+//! `LoadLibrary`/`FreeLibrary` on Windows, over one shared library cache), the
 //! scalar data type (`_SimpleCData`, see [`super::cdata`]), the foreign
 //! function object (`CFuncPtr`, see [`super::funcptr`]), `sizeof`/`addressof`/
 //! `byref`/`alignment`/`resize`, and the import-time constants the package
@@ -13,48 +14,74 @@
 //! contains no direct `libc::` FFI.
 
 pub fn register_module(ns: pyre_object::PyObjectRef) {
-    #[cfg(all(unix, feature = "host_env"))]
+    #[cfg(all(any(unix, windows), feature = "host_env"))]
     register_host_ctypes(ns);
-    #[cfg(not(all(unix, feature = "host_env")))]
+    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
     register_stub_ctypes(ns);
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Functional surface (unix + host_env)
+// Functional surface (host_env)
 // ──────────────────────────────────────────────────────────────────────
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     use rustpython_host_env::ctypes as host_ctypes;
 
-    // ── dlopen flags (POSIX) ──
-    crate::module_ns_store(
-        ns,
-        "RTLD_LOCAL",
-        pyre_object::w_int_new(libc::RTLD_LOCAL as i64),
-    );
-    crate::module_ns_store(
-        ns,
-        "RTLD_GLOBAL",
-        pyre_object::w_int_new(libc::RTLD_GLOBAL as i64),
-    );
-    crate::module_ns_store(
-        ns,
-        "RTLD_LAZY",
-        pyre_object::w_int_new(libc::RTLD_LAZY as i64),
-    );
-    crate::module_ns_store(
-        ns,
-        "RTLD_NOW",
-        pyre_object::w_int_new(libc::RTLD_NOW as i64),
-    );
+    // ── dlopen flags ──
+    //
+    // `ctypes/__init__.py:14` imports `RTLD_LOCAL`/`RTLD_GLOBAL` before it
+    // branches on `os.name`, so both names have to exist wherever the module
+    // is real; where there is no `dlfcn.h` they are 0, which is the value
+    // `host_env`'s own pair carries.  `RTLD_LAZY`/`RTLD_NOW` have no such
+    // caller and stay with the platform that defines them.
+    #[cfg(unix)]
+    {
+        crate::module_ns_store(
+            ns,
+            "RTLD_LOCAL",
+            pyre_object::w_int_new(libc::RTLD_LOCAL as i64),
+        );
+        crate::module_ns_store(
+            ns,
+            "RTLD_GLOBAL",
+            pyre_object::w_int_new(libc::RTLD_GLOBAL as i64),
+        );
+        crate::module_ns_store(
+            ns,
+            "RTLD_LAZY",
+            pyre_object::w_int_new(libc::RTLD_LAZY as i64),
+        );
+        crate::module_ns_store(
+            ns,
+            "RTLD_NOW",
+            pyre_object::w_int_new(libc::RTLD_NOW as i64),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        crate::module_ns_store(
+            ns,
+            "RTLD_LOCAL",
+            pyre_object::w_int_new(host_ctypes::RTLD_LOCAL as i64),
+        );
+        crate::module_ns_store(
+            ns,
+            "RTLD_GLOBAL",
+            pyre_object::w_int_new(host_ctypes::RTLD_GLOBAL as i64),
+        );
+    }
     crate::module_ns_store(
         ns,
         "DEFAULT_MODE",
         pyre_object::w_int_new(host_ctypes::dlopen_mode(None) as i64),
     );
 
+    #[cfg(windows)]
+    register_windows_loader(ns);
+
     // ── dlopen(name, mode=DEFAULT_MODE) → integer handle into host libcache ──
+    #[cfg(unix)]
     crate::module_ns_store(
         ns,
         "dlopen",
@@ -108,6 +135,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     );
 
     // ── dlsym(handle, name) → address (int) ──
+    #[cfg(unix)]
     crate::module_ns_store(
         ns,
         "dlsym",
@@ -142,6 +170,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     );
 
     // ── dlclose(handle) → None ──
+    #[cfg(unix)]
     crate::module_ns_store(
         ns,
         "dlclose",
@@ -384,9 +413,262 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     );
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Windows surface — `_ctypes.c`'s `#ifdef MS_WIN32` module methods
+// ──────────────────────────────────────────────────────────────────────
+
+/// The names `ctypes/__init__.py` reaches for once `os.name == "nt"`.
+///
+/// The dynamic loader is the only part of the module that is written twice:
+/// `libloading` already spells `LoadLibrary`/`FreeLibrary` for the same
+/// `host_env` library cache the posix `dlopen` uses, so what differs is the
+/// module surface, not the machinery below it.
+#[cfg(all(windows, feature = "host_env"))]
+fn register_windows_loader(ns: pyre_object::PyObjectRef) {
+    use rustpython_host_env::ctypes as host_ctypes;
+
+    // `_ctypes.h`: `STDCALL` is the absence of the `CDECL` bit, and `HRESULT`
+    // marks a return value `_check_HRESULT` inspects.  Both sit inside the
+    // same `#ifdef MS_WIN32` as the functions below, so neither is defined on
+    // the posix side.
+    crate::module_ns_store(ns, "FUNCFLAG_STDCALL", pyre_object::w_int_new(0x0));
+    crate::module_ns_store(ns, "FUNCFLAG_HRESULT", pyre_object::w_int_new(0x2));
+
+    // ── LoadLibrary(name, load_flags=0) → handle into the host libcache ──
+    crate::module_ns_store(
+        ns,
+        "LoadLibrary",
+        crate::make_builtin_function("LoadLibrary", |args| {
+            let Some(&name) = args.first() else {
+                return Err(crate::PyError::type_error(
+                    "LoadLibrary() missing library name",
+                ));
+            };
+            // A library name is a path, so it reaches the loader in the
+            // filesystem's own units rather than through a lossy decode.
+            let name = if unsafe { pyre_object::is_bytes(name) } {
+                crate::gateway::os_string_from_fs_bytes(unsafe {
+                    pyre_object::bytesobject::w_bytes_data(name)
+                })
+            } else if unsafe { pyre_object::is_str(name) } {
+                crate::gateway::os_string_from_fs_bytes(&crate::gateway::fsencode(name)?)
+            } else {
+                return Err(crate::PyError::type_error(
+                    "LoadLibrary: name must be a string or bytes",
+                ));
+            };
+            let handle = host_ctypes::open_library(&name).map_err(|e| {
+                let mut msg = rustpython_wtf8::Wtf8Buf::from_string("LoadLibrary(".to_string());
+                msg.push_wtf8(&crate::gateway::fsdecode_os_str_wtf8(&name));
+                msg.push_str(&format!("): {e}"));
+                crate::PyError::os_error(msg)
+            })?;
+            Ok(pyre_object::w_int_new(handle as i64))
+        }),
+    );
+
+    // ── FreeLibrary(handle) → None ──
+    crate::module_ns_store(
+        ns,
+        "FreeLibrary",
+        crate::make_builtin_function_with_arity(
+            "FreeLibrary",
+            |args| {
+                let Some(&handle) = args.first() else {
+                    return Err(crate::PyError::type_error("FreeLibrary() needs handle"));
+                };
+                host_ctypes::drop_library(crate::baseobjspace::int_w(handle)? as usize);
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
+    );
+
+    // ── FormatError(code=GetLastError()) → str ──
+    crate::module_ns_store(
+        ns,
+        "FormatError",
+        crate::make_builtin_function("FormatError", |args| {
+            // `if (code == 0) code = GetLastError();` — an explicit zero is
+            // the same request as no argument, not a request to describe
+            // ERROR_SUCCESS.
+            let code = match args.first() {
+                Some(&code) => match crate::baseobjspace::int_w(code)? as u32 {
+                    0 => None,
+                    code => Some(code),
+                },
+                None => None,
+            };
+            // The code the system cannot describe still has to produce a
+            // string: `FormatMessageW` failing is not an error here.
+            let message = host_ctypes::format_error_message(code)
+                .unwrap_or_else(|| "<no description>".to_string());
+            Ok(pyre_object::w_str_new(&message))
+        }),
+    );
+
+    // ── get_last_error / set_last_error — the ctypes-local copy, which is
+    //    separate from the thread's own Win32 last error ──
+    crate::module_ns_store(
+        ns,
+        "get_last_error",
+        crate::make_builtin_function_with_arity(
+            "get_last_error",
+            |_| Ok(pyre_object::w_int_new(host_ctypes::get_last_error() as i64)),
+            0,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
+        "set_last_error",
+        crate::make_builtin_function_with_arity(
+            "set_last_error",
+            |args| {
+                let Some(&value) = args.first() else {
+                    return Err(crate::PyError::type_error("set_last_error() needs value"));
+                };
+                let previous =
+                    host_ctypes::set_last_error(crate::baseobjspace::int_w(value)? as u32);
+                Ok(pyre_object::w_int_new(previous as i64))
+            },
+            1,
+        ),
+    );
+
+    // ── _check_HRESULT(hr) → hr, or the Win32 error it names ──
+    //
+    // `HRESULT`'s `_check_retval_`.  `FAILED(hr)` is the sign bit, and the
+    // raise is `PyErr_SetFromWindowsErr(hr)` — the code lands in `.winerror`
+    // and the errmap picks `.errno`.
+    crate::module_ns_store(
+        ns,
+        "_check_HRESULT",
+        crate::make_builtin_function_with_arity(
+            "_check_HRESULT",
+            |args| {
+                let Some(&hr) = args.first() else {
+                    return Err(crate::PyError::type_error("_check_HRESULT() needs hresult"));
+                };
+                let hr = crate::baseobjspace::int_w(hr)? as i32;
+                if hr < 0 {
+                    return Err(crate::PyError::os_error_win32_syscall2(
+                        hr,
+                        pyre_object::PY_NULL,
+                        pyre_object::PY_NULL,
+                    ));
+                }
+                Ok(pyre_object::w_int_new(hr as i64))
+            },
+            1,
+        ),
+    );
+
+    // ── CopyComPointer(src, dst) → HRESULT ──
+    //
+    // `dst` is a `byref()` carrier, so the destination is the address that
+    // carrier already resolved; `src` is a COM interface pointer held in a
+    // cdata buffer.  The `AddRef` before the store is what makes this a copy
+    // rather than a move.
+    crate::module_ns_store(
+        ns,
+        "CopyComPointer",
+        crate::make_builtin_function_with_arity(
+            "CopyComPointer",
+            |args| {
+                use super::cdata;
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "CopyComPointer() needs (src, dst)",
+                    ));
+                }
+                let (src, dst) = (args[0], args[1]);
+                let destination = if is_carg(dst) { carg_ptr(dst) } else { 0 };
+                if destination == 0 {
+                    return Ok(pyre_object::w_int_new(
+                        host_ctypes::HRESULT_E_POINTER as i64,
+                    ));
+                }
+                let source = if unsafe { pyre_object::is_none(src) } {
+                    0
+                } else if cdata::is_cdata_instance(src) {
+                    let (Some(addr), Some(len)) = (cdata::cdata_addr(src), cdata::cdata_len(src))
+                    else {
+                        return Ok(pyre_object::w_int_new(
+                            host_ctypes::HRESULT_E_POINTER as i64,
+                        ));
+                    };
+                    let buffer = unsafe { host_ctypes::borrow_memory(addr as *const u8, len) };
+                    host_ctypes::read_pointer_from_buffer(buffer)
+                } else {
+                    return Ok(pyre_object::w_int_new(
+                        host_ctypes::HRESULT_E_POINTER as i64,
+                    ));
+                };
+                Ok(pyre_object::w_int_new(
+                    host_ctypes::copy_com_pointer(source, destination) as i64,
+                ))
+            },
+            2,
+        ),
+    );
+
+    // ── COMError — `args` is the (text, details) tail, not the whole tuple ──
+    let w_exception = crate::builtins::lookup_exc_class("Exception")
+        .expect("Exception must be installed before _ctypes init");
+    crate::module_ns_store(
+        ns,
+        "COMError",
+        crate::builtins::make_exc_type_with_init(
+            "COMError",
+            Some("Raised when a COM method call failed."),
+            crate::builtins::exc_exception_new,
+            Some(comerror_init),
+            w_exception,
+        ),
+    );
+}
+
+/// `comerror_init` — stamps the three slots and re-points `args` at the tail.
+#[cfg(all(windows, feature = "host_env"))]
+fn comerror_init(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let Some(&w_self) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "__init__() missing 1 required positional argument: 'self'",
+        ));
+    };
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    if kwargs.is_some_and(|dict| {
+        unsafe { pyre_object::w_dict_str_entries(dict) }
+            .iter()
+            .any(|(key, _)| key != "__pyre_kw__")
+    }) {
+        return Err(crate::PyError::type_error(
+            "COMError() takes no keyword arguments",
+        ));
+    }
+    let [hresult, text, details] = positional else {
+        return Err(crate::PyError::type_error(format!(
+            "COMError expected 3 arguments, got {}",
+            positional.len()
+        )));
+    };
+    crate::baseobjspace::setattr_str(w_self, "hresult", *hresult)?;
+    crate::baseobjspace::setattr_str(w_self, "text", *text)?;
+    crate::baseobjspace::setattr_str(w_self, "details", *details)?;
+    // `args = args[1:]`, so the hresult is reachable only through its slot.
+    crate::baseobjspace::setattr_str(
+        w_self,
+        "args",
+        pyre_object::tupleobject::w_tuple_new(vec![*text, *details]),
+    )?;
+    Ok(pyre_object::w_none())
+}
+
 // ── sizeof / alignment (types and instances) ──────────────────────────
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn ctypes_sizeof(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -412,7 +694,7 @@ fn ctypes_sizeof(
     Err(crate::PyError::type_error("this type has no size"))
 }
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn ctypes_alignment(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -442,7 +724,7 @@ fn ctypes_alignment(
 
 // ── addressof / byref / resize (instances) ────────────────────────────
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn ctypes_addressof(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -458,7 +740,7 @@ fn ctypes_addressof(
     Ok(pyre_object::w_int_new(addr as i64))
 }
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn ctypes_byref(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -483,7 +765,7 @@ fn ctypes_byref(
     Ok(make_carg(addr, obj))
 }
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn ctypes_resize(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -528,13 +810,13 @@ fn ctypes_resize(
 
 // ── byref carrier ──────────────────────────────────────────────────────
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 static CARG_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// The minimal `byref` carrier type — holds `_ptr` (address) and `_obj`
 /// (the referenced instance, kept alive).  Foreign-call consumption of the
 /// carrier (the CArgObject P-tag path) is a later slice.
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn carg_type() -> pyre_object::PyObjectRef {
     let raw = *CARG_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("CArgObject", |ns| {
@@ -556,7 +838,7 @@ fn carg_type() -> pyre_object::PyObjectRef {
     raw as pyre_object::PyObjectRef
 }
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 pub(super) fn make_carg(addr: usize, obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     let carg = pyre_object::w_instance_new(carg_type());
     let d = crate::baseobjspace::getdict_native(carg);
@@ -570,13 +852,13 @@ pub(super) fn make_carg(addr: usize, obj: pyre_object::PyObjectRef) -> pyre_obje
 }
 
 /// Whether `obj` is a `byref()` carrier (consumed by [`super::funcptr`]).
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 pub(super) fn is_carg(obj: pyre_object::PyObjectRef) -> bool {
     !obj.is_null() && unsafe { pyre_object::w_instance_get_type(obj) } == carg_type()
 }
 
 /// The address a `byref()` carrier points at.
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 pub(super) fn carg_ptr(carg: pyre_object::PyObjectRef) -> usize {
     let d = crate::baseobjspace::getdict_native(carg);
     if d.is_null() {
@@ -594,7 +876,7 @@ pub(super) fn carg_ptr(carg: pyre_object::PyObjectRef) -> usize {
 // Stub surface (non-unix or no host_env) — keeps names importable.
 // ──────────────────────────────────────────────────────────────────────
 
-#[cfg(not(all(unix, feature = "host_env")))]
+#[cfg(not(all(any(unix, windows), feature = "host_env")))]
 fn register_stub_ctypes(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "ArgumentError", crate::typedef::w_object());
     crate::module_ns_store(ns, "_Pointer", crate::typedef::w_object());

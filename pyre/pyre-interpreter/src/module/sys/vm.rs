@@ -1190,6 +1190,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // reads it to build USER_SITE.
     #[cfg(windows)]
     module_ns_store(ns, "winver", w_str_new("3.14"));
+    // sys.dllhandle — the module handle the interpreter lives in, published
+    // beside `winver` because both come from the same `MS_COREDLL` block.
+    // `ctypes/__init__.py:562` builds `pythonapi` out of it with no import
+    // guard, so a missing attribute is an AttributeError out of `import
+    // ctypes`. There is no separate interpreter DLL here, so the module that
+    // hosts it is the executable: `GetModuleHandleW(NULL)`, which is what
+    // makes a lookup through `pythonapi` report the symbol it could not find
+    // rather than fail on the handle.
+    #[cfg(windows)]
+    module_ns_store(ns, "dllhandle", {
+        let module = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
+        };
+        w_int_new(module as isize as i64)
+    });
     // sys._vpath — the build's relative path from the executable's directory to
     // the prefix. `sysconfig._init_config_vars` subscripts it under `os.name ==
     // 'nt'`, so it is an AttributeError out of the first `get_config_var` call

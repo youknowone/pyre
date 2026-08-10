@@ -100,6 +100,29 @@ mod process {
         Ok(w_int_new(host_winapi::get_last_error() as i64))
     }
 
+    /// `_winapi.GetModuleFileName(module_handle)` — the path the module was
+    /// loaded from, or the executable's own path for handle 0.
+    ///
+    /// `sysconfig._init_non_posix` calls it on `sys.dllhandle` to locate the
+    /// install prefix, so it is on the path of every `import sysconfig` here.
+    /// The buffer is `MAX_PATH` because that is what the caller allocates: a
+    /// longer path comes back truncated rather than retried, and the result is
+    /// NUL-terminated in place before it is read.
+    pub fn get_module_file_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        const MAX_PATH: usize = 260;
+        let module = handle_w(arg(args, 0, "GetModuleFileName")?)? as *mut core::ffi::c_void;
+        let mut buffer = [0u16; MAX_PATH];
+        let length = host_winapi::get_module_file_name(module, &mut buffer);
+        if length == 0 {
+            return Err(super::last_os_error());
+        }
+        buffer[MAX_PATH - 1] = 0;
+        let filename = &buffer[..buffer.iter().position(|&u| u == 0).unwrap_or(MAX_PATH)];
+        Ok(pyre_object::w_str_from_wtf8(
+            rustpython_wtf8::Wtf8Buf::from_wide(filename),
+        ))
+    }
+
     /// `_winapi.TerminateProcess(handle, exit_code)`
     pub fn terminate_process(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let handle = handle_w(arg(args, 0, "TerminateProcess")?)?;
@@ -408,6 +431,7 @@ crate::py_module! {
                 ("GetCurrentProcess", 0, process::get_current_process),
                 ("GetFileType", 1, process::get_file_type),
                 ("GetLastError", 0, process::get_last_error),
+                ("GetModuleFileName", 1, process::get_module_file_name),
                 ("TerminateProcess", 2, process::terminate_process),
                 ("CreatePipe", 2, process::create_pipe),
                 ("CreateProcess", 9, process::create_process),

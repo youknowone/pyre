@@ -7591,7 +7591,7 @@ fn make_exc_type_with_doc(
 /// `UnicodeDecodeError.__new__(cls, *args)` call would inherit the
 /// typechecking that PyPy keeps confined to `descr_init` — see
 /// `_new` at `:274-284` (no per-arg validation).
-fn make_exc_type_with_init(
+pub(crate) fn make_exc_type_with_init(
     name: &'static str,
     doc: Option<&'static str>,
     new_fn: crate::gateway::BuiltinCodeFn,
