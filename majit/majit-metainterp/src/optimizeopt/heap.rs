@@ -3649,15 +3649,22 @@ impl Optimization for OptHeap {
             //             structinfo = info.InstancePtrInfo(parent_descr)
             //             structinfo.init_fields(parent_descr, descr.get_index())
             //             box1.set_forwarded(structinfo)
-            let resolved_is_virtual = ctx
+            // The `isinstance` test is against `AbstractVirtualPtrInfo`, which
+            // a NON-virtual `InstancePtrInfo` also satisfies (info.py:313 ->
+            // :175 -> :124), so an info that is merely class-known keeps its
+            // class. Reading it as `is_virtual` instead replaces it with a
+            // fresh `Instance(known_class: None)` and discards the class bit
+            // `make_constant_class` just decoded from the parent's rd_numb.
+            let resolved_has_info = ctx
                 .get_box_replacement_operand_opt(*box1)
                 .as_ref()
-                .map_or(false, |b| ctx.is_virtual(b));
+                .and_then(|b| ctx.peek_ptr_info(b))
+                .is_some_and(|info| info.is_abstract_virtual_ptr_info());
             let needs_install = !ctx
                 .get_box_replacement_operand_opt(resolved)
                 .and_then(|cb| cb.const_value())
                 .is_some()
-                && !resolved_is_virtual;
+                && !resolved_has_info;
             if needs_install {
                 // info.py:175-188 InstancePtrInfo + init_fields
                 if let Some(b) = ctx.get_box_replacement_operand_opt(resolved) {
@@ -3765,15 +3772,19 @@ impl Optimization for OptHeap {
             //         if not isinstance(arrayinfo, info.AbstractVirtualPtrInfo):
             //             arrayinfo = info.ArrayPtrInfo(descr)
             //             box1.set_forwarded(arrayinfo)
-            let resolved_is_virtual = ctx
+            // Same `AbstractVirtualPtrInfo` test as the struct half above: an
+            // existing non-virtual `ArrayPtrInfo` satisfies it (info.py:496 ->
+            // :124) and must be kept, along with the length bound it carries.
+            let resolved_has_info = ctx
                 .get_box_replacement_operand_opt(*box1)
                 .as_ref()
-                .map_or(false, |b| ctx.is_virtual(b));
+                .and_then(|b| ctx.peek_ptr_info(b))
+                .is_some_and(|info| info.is_abstract_virtual_ptr_info());
             let needs_install = !ctx
                 .get_box_replacement_operand_opt(resolved)
                 .and_then(|cb| cb.const_value())
                 .is_some()
-                && !resolved_is_virtual;
+                && !resolved_has_info;
             if needs_install {
                 if let Some(b) = ctx.get_box_replacement_operand_opt(resolved) {
                     ctx.set_ptr_info(

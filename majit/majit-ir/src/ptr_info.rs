@@ -773,6 +773,24 @@ impl PtrInfo {
         }
     }
 
+    /// `isinstance(x, info.AbstractVirtualPtrInfo)` — whether this info can
+    /// carry cached fields/items, which is a WIDER test than `is_virtual`.
+    ///
+    /// `AbstractVirtualPtrInfo` (info.py:124) is the base of
+    /// `AbstractStructPtrInfo` (:175, so `InstancePtrInfo` :313 and
+    /// `StructPtrInfo`), `ArrayPtrInfo` (:496), `AbstractRawPtrInfo` (:374)
+    /// and `StrPtrInfo` (vstring.py:50). Only `NonNullPtrInfo` (:90) and
+    /// `ConstPtrInfo` (:706, which does not even inherit `NonNullPtrInfo`)
+    /// fall outside it. A NON-virtual `InstancePtrInfo` therefore answers
+    /// `True` here and `False` to `is_virtual`.
+    ///
+    /// Call sites that decide whether to REPLACE an existing info want this
+    /// one: `is_virtual` would throw away a non-virtual `Instance` that
+    /// already carries a known class or cached fields.
+    pub fn is_abstract_virtual_ptr_info(&self) -> bool {
+        !matches!(self, PtrInfo::NonNull { .. } | PtrInfo::Constant(_))
+    }
+
     /// Whether this is a constant pointer.
     pub fn is_constant(&self) -> bool {
         matches!(self, PtrInfo::Constant(_))
