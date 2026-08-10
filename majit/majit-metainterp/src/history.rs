@@ -2711,6 +2711,14 @@ impl TraceCtx {
         self.recorder.set_last_guard_op_resume_position(snapshot_id);
     }
 
+    /// Set rd_resume_position on the guard op `from_end` guards back from the
+    /// most recent one (see
+    /// [`crate::recorder::Trace::set_guard_op_resume_position_from_end`]).
+    pub fn set_guard_op_resume_position_from_end(&mut self, from_end: usize, snapshot_id: i32) {
+        self.recorder
+            .set_guard_op_resume_position_from_end(from_end, snapshot_id);
+    }
+
     /// TODO: low-level / single-frame snapshot helper
     /// used by callers that record guards without a populated framestack
     /// to walk.

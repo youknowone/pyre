@@ -5086,7 +5086,7 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        let ok = self
+        let stored = self
             .tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_int requires active tracing")
@@ -5102,7 +5102,7 @@ impl<M: Clone> MetaInterp<M> {
                 false,
             );
         assert!(
-            ok,
+            matches!(stored, crate::trace_ctx::VableArrayStore::Stored(_)),
             "opimpl_setarrayitem_vable_int: virtualizable array slot missing"
         );
     }
@@ -5119,7 +5119,7 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        let ok = self
+        let stored = self
             .tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_ref requires active tracing")
@@ -5135,7 +5135,7 @@ impl<M: Clone> MetaInterp<M> {
                 false,
             );
         assert!(
-            ok,
+            matches!(stored, crate::trace_ctx::VableArrayStore::Stored(_)),
             "opimpl_setarrayitem_vable_ref: virtualizable array slot missing"
         );
     }
@@ -5152,7 +5152,7 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        let ok = self
+        let stored = self
             .tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_float requires active tracing")
@@ -5168,7 +5168,7 @@ impl<M: Clone> MetaInterp<M> {
                 false,
             );
         assert!(
-            ok,
+            matches!(stored, crate::trace_ctx::VableArrayStore::Stored(_)),
             "opimpl_setarrayitem_vable_float: virtualizable array slot missing"
         );
     }

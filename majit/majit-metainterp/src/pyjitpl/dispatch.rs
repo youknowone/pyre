@@ -13,7 +13,20 @@ use majit_ir::{OpCode, OpRef, Type, Value};
 use super::{MIFrame, MIFrameStack};
 use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
+use crate::trace_ctx::{VableArrayStore, VableEntryWrite};
 use crate::{TraceAction, TraceCtx};
+
+/// Which recorded op [`JitCodeMachine::publish_last_guard_resume_snapshot`]
+/// points at the snapshot it just captured.
+#[derive(Clone, Copy)]
+enum GuardStampTarget {
+    /// The last recorded op — correct when the guard IS the last op, which is
+    /// the case for every guard the dispatcher records itself.
+    LastOp,
+    /// A guard op counted back from the most recent one (`0` == the most
+    /// recent), for guards a `TraceCtx` helper emitted before returning.
+    GuardFromEnd(usize),
+}
 
 /// Decode a virtualizable shadow Value (RPython Box concrete) back into the
 /// raw int/ref/float bit pattern that pyre stores in register shadows
@@ -1443,7 +1456,7 @@ where
                 sym,
                 resume_pc,
                 after_residual_call,
-                false,
+                GuardStampTarget::LastOp,
                 Some((opcode, fail_args.len())),
             );
             guard_op
@@ -1471,6 +1484,19 @@ where
     /// the promotes are conditional (an already-constant index, or the
     /// standard virtualizable short-circuiting at step 1) and emit nothing in
     /// the common case, so an unchanged count means there is nothing to stamp.
+    /// One call can emit TWO: a vable array access whose symbolic frame box
+    /// differs from the standard box but shares its pointer promotes the
+    /// `isstandard` PTR_EQ and then the index, so every guard the call added is
+    /// stamped, not just the last.  Both take the same snapshot content, which
+    /// is what the two upstream `capture_resumedata` calls would produce here:
+    /// what runs between them is `replace_box`, and pyre's does not carry the
+    /// framestack walk (`TraceCtx::replace_box`).
+    ///
+    /// `write` is the shadow slot a `vable_set*` overwrote. Upstream reaches
+    /// `virtualizable_boxes[index] = valuebox` only after both promotes have
+    /// captured their resume data, so the slot is put back for the duration of
+    /// the capture — otherwise the guard's resume data carries the very write
+    /// its resume pc re-executes (see [`VableEntryWrite`]).
     ///
     /// `opcode_pc` is the vable op's own JitCode position. The lowering emits
     /// a `-live-` marker in front of every vable op (`lower_vable.rs`, mirroring
@@ -1482,8 +1508,10 @@ where
         sym: &mut S,
         opcode_pc: usize,
         guards_before: usize,
+        write: Option<VableEntryWrite>,
     ) {
-        if ctx.num_guards() <= guards_before {
+        let minted = ctx.num_guards().saturating_sub(guards_before);
+        if minted == 0 {
             return;
         }
         if sym.fail_args_with_ctx(ctx).is_none() {
@@ -1492,7 +1520,23 @@ where
             // guard without one.
             return;
         }
-        self.publish_last_guard_resume_snapshot(ctx, sym, opcode_pc, false, true, None);
+        let restored = write.and_then(|w| {
+            ctx.swap_virtualizable_entry(w.index, w.prev_box, w.prev_value)
+                .map(|current| (w.index, current))
+        });
+        for from_end in 0..minted {
+            self.publish_last_guard_resume_snapshot(
+                ctx,
+                sym,
+                opcode_pc,
+                false,
+                GuardStampTarget::GuardFromEnd(from_end),
+                None,
+            );
+        }
+        if let Some((index, (op, value))) = restored {
+            ctx.swap_virtualizable_entry(index, op, value);
+        }
     }
 
     /// Attach a resume snapshot built from the live framestack to the guard
@@ -1506,11 +1550,12 @@ where
     /// guard's resumepc independent of the dispatcher's post-decode
     /// `frame.pc`.
     ///
-    /// `stamp_last_guard_op` selects which recorded op receives the position:
-    /// the last op, or the last *guard* op. They differ whenever the guard is
-    /// not the last thing recorded — `emit_force_virtualizable` records
-    /// GETFIELD_GC / PTR_NE / COND_CALL on top of the vable promote, so that
-    /// caller needs the guard-op form or the position lands on the COND_CALL.
+    /// `target` selects which recorded op receives the position: the last op,
+    /// or a *guard* op counted back from the most recent one. They differ
+    /// whenever the guard is not the last thing recorded —
+    /// `emit_force_virtualizable` records GETFIELD_GC / PTR_NE / COND_CALL on
+    /// top of the vable promote, so that caller needs the guard form or the
+    /// position lands on the COND_CALL.
     ///
     /// `diag` carries the guard opcode and its fail-arg count for the
     /// `callee_rca` trace only; callers re-stamping a guard `TraceCtx`
@@ -1521,7 +1566,7 @@ where
         sym: &mut S,
         resume_pc: usize,
         after_residual_call: bool,
-        stamp_last_guard_op: bool,
+        target: GuardStampTarget,
         diag: Option<(OpCode, usize)>,
     ) {
         let top_idx = self
@@ -1655,10 +1700,11 @@ where
         }
         self.frames.frames[top_idx].pc = saved_top_pc;
         let snapshot_id = ctx.capture_resumedata(snapshot);
-        if stamp_last_guard_op {
-            ctx.set_last_guard_op_resume_position(snapshot_id);
-        } else {
-            ctx.set_last_guard_resume_position(snapshot_id);
+        match target {
+            GuardStampTarget::LastOp => ctx.set_last_guard_resume_position(snapshot_id),
+            GuardStampTarget::GuardFromEnd(from_end) => {
+                ctx.set_guard_op_resume_position_from_end(from_end, snapshot_id)
+            }
         }
     }
 
@@ -3331,7 +3377,7 @@ where
                 let guards_before = ctx.num_guards();
                 let (opref, value) =
                     ctx.vable_getfield_int(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
             }
             jitcode::insns::BC_GETFIELD_VABLE_R => {
@@ -3350,7 +3396,7 @@ where
                 let guards_before = ctx.num_guards();
                 let (opref, value) =
                     ctx.vable_getfield_ref(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
             }
             jitcode::insns::BC_GETFIELD_VABLE_F => {
@@ -3369,7 +3415,7 @@ where
                 let guards_before = ctx.num_guards();
                 let (opref, value) =
                     ctx.vable_getfield_float(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
             }
             jitcode::insns::BC_NEW | jitcode::insns::BC_NEW_WITH_VTABLE => {
@@ -3788,14 +3834,14 @@ where
                 };
                 let (value, concrete) = self.read_int_reg(src);
                 let guards_before = ctx.num_guards();
-                ctx.vable_setfield(
+                let write = ctx.vable_setfield(
                     opcode_pc,
                     vable_opref,
                     fielddescr,
                     value,
                     Some(Value::Int(concrete)),
                 );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
             }
             jitcode::insns::BC_SETFIELD_VABLE_R => {
                 let (opcode_pc, vable_reg, field_idx, src) = {
@@ -3811,14 +3857,14 @@ where
                 };
                 let (value, concrete) = self.read_ref_reg(src);
                 let guards_before = ctx.num_guards();
-                ctx.vable_setfield(
+                let write = ctx.vable_setfield(
                     opcode_pc,
                     vable_opref,
                     fielddescr,
                     value,
                     Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
                 );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
             }
             jitcode::insns::BC_SETFIELD_VABLE_F => {
                 let (opcode_pc, vable_reg, field_idx, src) = {
@@ -3834,14 +3880,14 @@ where
                 };
                 let (value, concrete) = self.read_float_reg(src);
                 let guards_before = ctx.num_guards();
-                ctx.vable_setfield(
+                let write = ctx.vable_setfield(
                     opcode_pc,
                     vable_opref,
                     fielddescr,
                     value,
                     Some(Value::Float(f64::from_bits(concrete as u64))),
                 );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
             }
             // ── BC_ARRAYLEN_GC ──
             //
@@ -4247,7 +4293,7 @@ where
                     fdescr,
                     adescr,
                 );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_R => {
@@ -4272,7 +4318,7 @@ where
                     fdescr,
                     adescr,
                 );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_F => {
@@ -4297,7 +4343,7 @@ where
                     fdescr,
                     adescr,
                 );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_I => {
@@ -4315,7 +4361,7 @@ where
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, concrete) = self.read_int_reg(src);
                 let guards_before = ctx.num_guards();
-                if !ctx.vable_setarrayitem_indexed(
+                let write = match ctx.vable_setarrayitem_indexed(
                     opcode_pc,
                     vable_opref,
                     index,
@@ -4329,9 +4375,10 @@ where
                     // Promoted index falls outside the standard virtualizable
                     // array (e.g. a transient out-of-bounds state-field index);
                     // this slot cannot be virtualized, so abort the trace.
-                    return TraceAction::Abort;
-                }
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                    VableArrayStore::OutOfVable => return TraceAction::Abort,
+                    VableArrayStore::Stored(write) => write,
+                };
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_R => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
@@ -4348,7 +4395,7 @@ where
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, concrete) = self.read_ref_reg(src);
                 let guards_before = ctx.num_guards();
-                if !ctx.vable_setarrayitem_indexed(
+                let write = match ctx.vable_setarrayitem_indexed(
                     opcode_pc,
                     vable_opref,
                     index,
@@ -4359,9 +4406,10 @@ where
                     Value::Ref(majit_ir::GcRef(concrete as usize)),
                     false,
                 ) {
-                    return TraceAction::Abort;
-                }
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                    VableArrayStore::OutOfVable => return TraceAction::Abort,
+                    VableArrayStore::Stored(write) => write,
+                };
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_F => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
@@ -4378,7 +4426,7 @@ where
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, concrete) = self.read_float_reg(src);
                 let guards_before = ctx.num_guards();
-                if !ctx.vable_setarrayitem_indexed(
+                let write = match ctx.vable_setarrayitem_indexed(
                     opcode_pc,
                     vable_opref,
                     index,
@@ -4389,9 +4437,10 @@ where
                     Value::Float(f64::from_bits(concrete as u64)),
                     false,
                 ) {
-                    return TraceAction::Abort;
-                }
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                    VableArrayStore::OutOfVable => return TraceAction::Abort,
+                    VableArrayStore::Stored(write) => write,
+                };
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
             }
             jitcode::insns::BC_ARRAYLEN_VABLE => {
                 let (opcode_pc, vable_reg, array_idx, dest) = {
@@ -4414,7 +4463,7 @@ where
                     fdescr,
                     adescr,
                 );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 // pyjitpl.py:1262-1263 `result =
                 // vinfo.get_array_length(virtualizable, arrayindex);
                 // return ConstInt(result)`.  RPython reads from the live
@@ -10775,6 +10824,259 @@ mod tests {
 
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 0);
+    }
+
+    /// A `JitCodeSym` that names a live set, so guard capture is reachable.
+    /// `DummySym` answers `None` and skips it entirely.
+    struct FailArgsSym {
+        fail_args: Vec<OpRef>,
+    }
+
+    impl JitCodeSym for FailArgsSym {
+        fn total_slots(&self) -> usize {
+            self.fail_args.len()
+        }
+
+        fn loop_header_pc(&self) -> usize {
+            0
+        }
+
+        fn fail_args(&self) -> Option<Vec<OpRef>> {
+            Some(self.fail_args.clone())
+        }
+    }
+
+    #[test]
+    fn vable_setarrayitem_promote_guard_snapshot_predates_the_store() {
+        // `_opimpl_setarrayitem_vable` (pyjitpl.py:1236-1247) promotes the
+        // index in `_get_arrayitem_vable_index` (:1201-1216) and only THEN
+        // reaches `virtualizable_boxes[index] = valuebox`.  The promote's
+        // `implement_guard_value` captures resume data at the promote, so the
+        // guard's snapshot names the slot's OLD Box.
+        //
+        // Were it captured after the store, a failing index promote would
+        // restore the traced write into the promoted slot and then re-execute
+        // the setter at the real index — one spurious write per failure.
+        // The snapshot's liveness decode reads the `-live-` marker in front of
+        // the vable op (`lower_vable.rs`, jtransform.py:764/798/814/845/926).
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        builder.live(&mut asm, &[0, 1], &[0], &[]);
+        builder.vable_setarrayitem_int_with_base(0, 0, 0, 1);
+        let jitcode = builder.finish();
+
+        let mut staticdata = crate::MetaInterpStaticData::new();
+        staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
+        staticdata.liveness_info = asm.all_liveness().to_vec();
+        let mut recorder = crate::recorder::Trace::new();
+        recorder.record_input_arg(majit_ir::Type::Int); // index
+        recorder.record_input_arg(majit_ir::Type::Int); // value
+        let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
+        let info = make_test_vable_info();
+        let field_box = ctx.const_int(111);
+        let array_box = ctx.const_int(222);
+        let vable_ref = ctx.const_ref(999);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable_ref,
+            Value::Ref(majit_ir::GcRef(999)),
+            &[field_box, array_box],
+            &[Value::Int(111), Value::Int(222)],
+            &[1],
+        );
+        // Flat layout is [static field 0, array slot 0, identity]; the write
+        // below lands on slot 1, which currently holds `array_box`.
+        assert_eq!(
+            ctx.virtualizable_entry_at(1).map(|(op, _)| op),
+            Some(array_box)
+        );
+
+        let mut sym = FailArgsSym {
+            fail_args: vec![OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        };
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[
+                (JitArgKind::Ref, vable_ref, 999),
+                // A non-constant index is what makes the promote emit a guard;
+                // a Const index short-circuits `implement_guard_value`.
+                (JitArgKind::Int, OpRef::input_arg_int(0), 0),
+                (JitArgKind::Int, OpRef::input_arg_int(1), 777),
+            ],
+        );
+        assert!(matches!(action, TraceAction::Continue));
+
+        let value_box = ctx
+            .virtualizable_entry_at(1)
+            .map(|(op, _)| op)
+            .expect("the store must have landed on slot 1");
+        assert_ne!(
+            value_box, array_box,
+            "the setter must have replaced the slot's Box",
+        );
+
+        let snapshots = ctx.snapshots().to_vec();
+        let recorder = ctx.into_recorder();
+        let guard = recorder
+            .ops()
+            .iter()
+            .rev()
+            .find(|op| op.opcode == OpCode::GuardValue)
+            .expect("a non-constant vable array index must promote");
+        let resume = guard.rd_resume_position.get();
+        assert!(
+            resume >= 0,
+            "the promote guard must carry a resume position",
+        );
+        // `build_vable_snapshot_boxes` moves the identity Box to the front, so
+        // assert on membership rather than on the shadow's flat index.
+        let boxes = &snapshots[resume as usize].vable_boxes;
+        assert!(
+            boxes.contains(&crate::recorder::SnapshotTagged::Box(
+                array_box,
+                majit_ir::Type::Int
+            )),
+            "the promote guard's snapshot must hold the PRE-store Box; got {boxes:?}",
+        );
+        assert!(
+            !boxes.contains(&crate::recorder::SnapshotTagged::Box(
+                value_box,
+                majit_ir::Type::Int
+            )),
+            "the snapshot must not carry the write its resume pc re-executes; got {boxes:?}",
+        );
+    }
+
+    #[test]
+    fn both_promote_guards_of_one_vable_opcode_are_stamped() {
+        // When the vable Box is not the standard Box but carries its pointer,
+        // `_nonstandard_virtualizable` cannot short-circuit on Box identity
+        // (pyjitpl.py:1131) and promotes the `isstandard` PTR_EQ (:1135-1138);
+        // `_get_arrayitem_vable_index` then promotes the index (:1201-1216).
+        // One opcode, two guards, and upstream captures resume data at each
+        // `implement_guard_value` — so neither may be left unstamped.
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        builder.live(&mut asm, &[0, 1], &[0], &[]);
+        builder.vable_setarrayitem_int_with_base(0, 0, 0, 1);
+        let jitcode = builder.finish();
+
+        let mut staticdata = crate::MetaInterpStaticData::new();
+        staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
+        staticdata.liveness_info = asm.all_liveness().to_vec();
+        let mut recorder = crate::recorder::Trace::new();
+        let vable_arg = recorder.record_input_arg(majit_ir::Type::Ref);
+        recorder.record_input_arg(majit_ir::Type::Int); // index
+        recorder.record_input_arg(majit_ir::Type::Int); // value
+        let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
+        let info = make_test_vable_info();
+        let field_box = ctx.const_int(111);
+        let array_box = ctx.const_int(222);
+        let standard_box = ctx.const_ref(999);
+        ctx.init_virtualizable_boxes(
+            &info,
+            standard_box,
+            Value::Ref(majit_ir::GcRef(999)),
+            &[field_box, array_box],
+            &[Value::Int(111), Value::Int(222)],
+            &[1],
+        );
+        // Same pointer, different Box: `concrete_ptrs_eq` answers isstandard=1,
+        // which is the leg that emits the PTR_EQ guard and then continues into
+        // the standard path instead of falling back to the heap.
+        ctx.set_opref_concrete(vable_arg, Value::Ref(majit_ir::GcRef(999)));
+
+        let mut sym = FailArgsSym {
+            fail_args: vec![OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        };
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[
+                (JitArgKind::Ref, vable_arg, 999),
+                (JitArgKind::Int, OpRef::input_arg_int(0), 0),
+                (JitArgKind::Int, OpRef::input_arg_int(1), 777),
+            ],
+        );
+        assert!(matches!(action, TraceAction::Continue));
+
+        let snapshots = ctx.snapshots().to_vec();
+        let recorder = ctx.into_recorder();
+        let guards: Vec<_> = recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode.is_guard())
+            .collect();
+        assert_eq!(
+            guards.len(),
+            2,
+            "one setarrayitem_vable over a non-identical standard Box promotes \
+             twice; got {:?}",
+            guards.iter().map(|op| op.opcode).collect::<Vec<_>>(),
+        );
+        // A guard `TraceCtx` minted internally already points at the one-frame
+        // placeholder `record_guard_with_snapshot` publishes, so a resume
+        // position alone proves nothing: the frame it names carries
+        // `UNSTAMPED_JITCODE_INDEX` until the dispatch layer re-stamps it, and
+        // resume decoding sizes the frame from that coordinate.
+        for (i, guard) in guards.iter().enumerate() {
+            let resume = guard.rd_resume_position.get();
+            assert!(
+                resume >= 0,
+                "guard {i} ({:?}) was left without a resume position",
+                guard.opcode,
+            );
+            let frames = &snapshots[resume as usize].frames;
+            assert!(
+                frames
+                    .iter()
+                    .all(|f| f.jitcode_index != crate::recorder::UNSTAMPED_JITCODE_INDEX),
+                "guard {i} ({:?}) still points at an unstamped frame",
+                guard.opcode,
+            );
+        }
+    }
+
+    #[test]
+    fn every_guard_one_vable_opcode_emits_gets_a_resume_position() {
+        // `set_guard_op_resume_position_from_end` is what lets a caller stamp
+        // more than the last guard: one vable array access can emit the
+        // `isstandard` PTR_EQ promote (`_nonstandard_virtualizable`,
+        // pyjitpl.py:1135-1138) and then the index promote (:1201-1216).
+        // Walking back over them leaves none holding the
+        // `UNSTAMPED_JITCODE_INDEX` frame the recorder mints.
+        let mut recorder = crate::recorder::Trace::new();
+        let a = recorder.record_input_arg(majit_ir::Type::Int);
+        recorder.record_guard(OpCode::GuardValue, &[a], None);
+        recorder.record_op(OpCode::IntAdd, &[a, a]);
+        recorder.record_guard(OpCode::GuardValue, &[a], None);
+
+        recorder.set_guard_op_resume_position_from_end(0, 7);
+        recorder.set_guard_op_resume_position_from_end(1, 5);
+
+        let guards: Vec<i32> = recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode.is_guard())
+            .map(|op| op.rd_resume_position.get())
+            .collect();
+        assert_eq!(guards, vec![5, 7]);
+        // Past the end is a no-op, not a panic or a mis-stamp.
+        recorder.set_guard_op_resume_position_from_end(2, 9);
+        let guards: Vec<i32> = recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode.is_guard())
+            .map(|op| op.rd_resume_position.get())
+            .collect();
+        assert_eq!(guards, vec![5, 7]);
     }
 
     #[test]

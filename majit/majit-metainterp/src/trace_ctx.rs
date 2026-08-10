@@ -705,6 +705,51 @@ pub struct BridgeInlineCarrier {
     pub recipes: Vec<ReconstructRecipe>,
 }
 
+/// The virtualizable shadow slot a `vable_set*` standard leg overwrote, and
+/// the Box it held before.
+///
+/// `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` (pyjitpl.py:1188,
+/// :1236) reach `virtualizable_boxes[index] = valuebox` only AFTER
+/// `_nonstandard_virtualizable` / `_get_arrayitem_vable_index` have promoted,
+/// and each promote captures its guard's resume data inside
+/// `implement_guard_value` — that is, against the shadow as it stood before the
+/// write.  Pyre fuses promote and store into one `TraceCtx` call and the
+/// dispatcher builds the snapshot afterwards, so the caller puts this slot back
+/// for the duration of the capture ([`TraceCtx::swap_virtualizable_entry`]).
+/// Without it the guard's resume data carries the very write its resume pc will
+/// re-execute: a failing index promote would restore the value into the
+/// promoted slot and then write it again at the real index.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VableEntryWrite {
+    /// Flat index into `virtualizable_boxes` / `virtualizable_values`.
+    pub index: usize,
+    pub prev_box: OpRef,
+    pub prev_value: Value,
+}
+
+impl VableEntryWrite {
+    /// Read the slot `index` currently holds, or `None` when no shadow is
+    /// active — the caller then has nothing to restore.
+    fn of(ctx: &TraceCtx, index: usize) -> Option<Self> {
+        let (prev_box, prev_value) = ctx.virtualizable_entry_at(index)?;
+        Some(Self {
+            index,
+            prev_box,
+            prev_value,
+        })
+    }
+}
+
+/// Outcome of `vable_setarrayitem_indexed`.
+pub enum VableArrayStore {
+    /// The promoted index falls outside the standard virtualizable array, so
+    /// the slot cannot be virtualized and the caller aborts the trace.
+    OutOfVable,
+    /// Stored.  `Some` names the shadow slot the standard leg overwrote;
+    /// `None` is the nonstandard leg, which records a heap `SetarrayitemGc`.
+    Stored(Option<VableEntryWrite>),
+}
+
 /// rlib/jit.py:592 default `trace_limit` — mirrored here so standalone
 /// TraceCtx construction (unit tests, `setup_tracing` before a warmstate
 /// override) matches the RPython baseline.
@@ -2845,6 +2890,30 @@ impl TraceCtx {
         }
     }
 
+    /// Put `opref`/`value` into flat slot `index` and hand back what it held.
+    ///
+    /// This is the save/restore half of [`VableEntryWrite`], not a store: it
+    /// deliberately leaves `virtualizable_live_null_slots` alone, where
+    /// [`Self::set_virtualizable_entry_at`] clears it and
+    /// `vable_setarrayitem_indexed`'s `live_null_push` arm sets it right after.
+    /// Restoring through the store would drop that flag.
+    ///
+    /// `None` when no shadow is active or `index` is out of range — the same
+    /// condition under which [`Self::virtualizable_entry_at`] reads `None`.
+    pub fn swap_virtualizable_entry(
+        &mut self,
+        index: usize,
+        opref: OpRef,
+        value: Value,
+    ) -> Option<(OpRef, Value)> {
+        let prev = self.virtualizable_entry_at(index)?;
+        let boxes = self.virtualizable_boxes.as_mut()?;
+        *boxes.get_mut(index)? = opref;
+        let values = self.virtualizable_values.as_mut()?;
+        *values.get_mut(index)? = value;
+        Some(prev)
+    }
+
     /// Whether the last executed store into flat slot `index` wrote a live NULL Ref.
     pub fn virtualizable_slot_stored_live_null(&self, index: usize) -> bool {
         self.virtualizable_live_null_slots
@@ -4056,6 +4125,12 @@ impl TraceCtx {
     ///      self.metainterp.synchronize_virtualizable()
     ///      # XXX only the index'th field needs to be synchronized, really
     /// ```
+    ///
+    /// Returns the shadow slot the standard leg overwrote, so a caller that
+    /// still has to build a resume snapshot for a guard the promote above
+    /// emitted can put the old Box back first — see [`VableEntryWrite`].
+    /// `None` on the nonstandard leg, which records a heap `SetfieldGc` and
+    /// leaves the shadow untouched.
     pub fn vable_setfield(
         &mut self,
         pc: usize,
@@ -4063,7 +4138,7 @@ impl TraceCtx {
         fielddescr: DescrRef,
         value: OpRef,
         concrete: Option<Value>,
-    ) {
+    ) -> Option<VableEntryWrite> {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, vable_concrete) {
             // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
@@ -4091,7 +4166,7 @@ impl TraceCtx {
                     // (Box identity, not value equality).
                     self.profiler()
                         .count_ops(OpCode::SetfieldGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
-                    return;
+                    return None;
                 }
             }
             // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
@@ -4109,7 +4184,7 @@ impl TraceCtx {
             // it through `box_value(cached)`.
             let _ = concrete;
             self.heapcache_setfield_cached(vable_opref, field_index, value);
-            return;
+            return None;
         }
         // index = self._get_virtualizable_field_index(fielddescr)
         // self.metainterp.virtualizable_boxes[index] = valuebox
@@ -4125,6 +4200,7 @@ impl TraceCtx {
         // role-2 shadow store keeps a `Value::Ref(GcRef::NO_CONCRETE)`
         // until that store is itself moved to `Vec<Option<Value>>`.
         let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+        let overwritten = VableEntryWrite::of(self, index);
         self.set_virtualizable_entry_at(index, value, stored);
         // Keep the heapcache consistent: if a prior nonstandard getfield
         // cached a value for this field (e.g., before a replace_box made
@@ -4136,6 +4212,7 @@ impl TraceCtx {
         // pyjitpl.py:3446 write_boxes parity: mirror the updated
         // shadow slot back into the live virtualizable.
         self.synchronize_virtualizable();
+        overwritten
     }
 
     /// Record a virtualizable field write with an explicit field descriptor.
@@ -4699,7 +4776,7 @@ impl TraceCtx {
         value: OpRef,
         concrete: Value,
         live_null_push: bool,
-    ) -> bool {
+    ) -> VableArrayStore {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, vable_concrete) {
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
@@ -4708,7 +4785,7 @@ impl TraceCtx {
             self.profiler()
                 .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
             self.execute_setarrayitem_gc(array_opref, index, value, adescr);
-            return true;
+            return VableArrayStore::Stored(None);
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
         // self.metainterp.virtualizable_boxes[index] = valuebox
@@ -4716,8 +4793,9 @@ impl TraceCtx {
         let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
         else {
-            return false;
+            return VableArrayStore::OutOfVable;
         };
+        let overwritten = VableEntryWrite::of(self, flat_idx);
         self.set_virtualizable_entry_at(flat_idx, value, concrete);
         if live_null_push && matches!(concrete, Value::Ref(r) if r.is_null()) {
             if let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut() {
@@ -4725,7 +4803,7 @@ impl TraceCtx {
             }
         }
         self.synchronize_virtualizable();
-        true
+        VableArrayStore::Stored(overwritten)
     }
 
     /// pyjitpl.py:754-763 `opimpl_arraylen_gc(arraybox, arraydescr)`.

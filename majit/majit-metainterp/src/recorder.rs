@@ -427,7 +427,27 @@ impl Trace {
     /// COND_CALL) is not the last op when the caller captures, so the
     /// resume position must target the guard by its guard-ness.
     pub fn set_last_guard_op_resume_position(&mut self, snapshot_id: i32) {
-        if let Some(op) = self.ops.iter().rev().find(|op| op.opcode.is_guard()) {
+        self.set_guard_op_resume_position_from_end(0, snapshot_id);
+    }
+
+    /// Set rd_resume_position on the guard op `from_end` guards back from the
+    /// most recently recorded one (`0` == the most recent).
+    ///
+    /// One helper call can emit more than one guard: a vable array access
+    /// promotes the `isstandard` PTR_EQ in `_nonstandard_virtualizable`
+    /// (`pyjitpl.py:1135-1138`) and then the index in
+    /// `_get_arrayitem_vable_index` (`:1201-1216`).  Upstream captures resume
+    /// data inside each `implement_guard_value`, so both are stamped; a caller
+    /// that only reaches the guards after the helper returns walks back over
+    /// them with this.
+    pub fn set_guard_op_resume_position_from_end(&mut self, from_end: usize, snapshot_id: i32) {
+        if let Some(op) = self
+            .ops
+            .iter()
+            .rev()
+            .filter(|op| op.opcode.is_guard())
+            .nth(from_end)
+        {
             op.rd_resume_position.set(snapshot_id);
         }
     }
