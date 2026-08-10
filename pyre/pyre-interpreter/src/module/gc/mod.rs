@@ -1283,8 +1283,13 @@ crate::py_module! {
         "get_referrers" / * = |args| {
             // referents.py:147-169 get_referrers: list every app-level object,
             // then keep the ones whose direct referents include an argument.
-            // An object referring to the same argument twice is reported once,
-            // but one passed the same argument twice is reported twice.
+            //
+            // The argument scan at `referents.py:166-168` has no `break`, and
+            // the multiplicity that follows from that is the contract: an
+            // object referring to the same argument twice is reported once
+            // (the membership test collapses it), but one that refers to two
+            // of the arguments — or one argument passed twice — is reported
+            // once per match.
             let _roots = pyre_object::gc_roots::push_roots();
             let args_base = pyre_object::gc_roots::pin_roots(args);
             let mut rooted_args = vec![std::ptr::null_mut(); args.len()];
