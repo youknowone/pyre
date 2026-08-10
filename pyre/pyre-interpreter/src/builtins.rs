@@ -11302,6 +11302,76 @@ fn fstring_comment_diagnostic(message: &str, source: &str) -> Option<&'static st
     }
 }
 
+/// CPython's tokenizer keeps the opening-delimiter stack while lexing an
+/// f-string replacement field.  Ruff sometimes lets its expression parser
+/// replace that tokenizer error with `Expected ...` or a generic missing
+/// brace, so recover the first mismatched closer and its exact source byte.
+fn fstring_mismatched_delimiter(source: &str) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    let quote = bytes.iter().enumerate().find_map(|(index, byte)| {
+        if !matches!(*byte, b'\'' | b'"') {
+            return None;
+        }
+        let mut prefix = index;
+        while prefix > 0 && bytes[prefix - 1].is_ascii_alphabetic() {
+            prefix -= 1;
+        }
+        bytes[prefix..index]
+            .iter()
+            .any(|byte| byte.eq_ignore_ascii_case(&b'f'))
+            .then_some(index)
+    })?;
+    let quote_byte = bytes[quote];
+    let triple = bytes[quote..].starts_with(&[quote_byte, quote_byte, quote_byte]);
+    let mut cursor = quote + if triple { 3 } else { 1 };
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'{' || bytes.get(cursor + 1) == Some(&b'{') {
+            cursor += 1;
+            continue;
+        }
+        cursor += 1;
+        let mut stack = Vec::new();
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'\'' | b'"' => {
+                    let inner_quote = bytes[cursor];
+                    cursor += 1;
+                    while cursor < bytes.len() && bytes[cursor] != inner_quote {
+                        cursor += if bytes[cursor] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                opener @ (b'(' | b'[' | b'{') => stack.push(opener),
+                closer @ (b')' | b']' | b'}') => {
+                    let expected_open = match closer {
+                        b')' => b'(',
+                        b']' => b'[',
+                        b'}' => b'{',
+                        _ => unreachable!(),
+                    };
+                    if let Some(&opening) = stack.last() {
+                        if opening != expected_open {
+                            return Some((
+                                format!(
+                                    "closing parenthesis '{}' does not match opening parenthesis '{}'",
+                                    closer as char, opening as char
+                                ),
+                                cursor,
+                            ));
+                        }
+                        stack.pop();
+                    } else if closer == b'}' {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        cursor += 1;
+    }
+    None
+}
+
 /// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
 /// private Python 3.14 `_IncompleteInputError` subclass for parser failures
 /// which end at an unfinished interactive input when
@@ -11432,6 +11502,10 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     if let Some(comment_error) = fstring_comment_diagnostic(&msg, source) {
         msg = comment_error.to_owned();
     }
+    let delimiter_error = fstring_mismatched_delimiter(source);
+    if let Some((delimiter_message, _)) = &delimiter_error {
+        msg = delimiter_message.clone();
+    }
     if msg == "f-string: expecting `}`" {
         msg = "f-string: expecting '}'".to_owned();
     } else if msg == "f-string: expecting '}', or format specs" && source.contains(":{{") {
@@ -11501,12 +11575,14 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         msg = replacement.clone();
     }
     let prefix_span = prefix_error.map(|(_, start, end)| (start, end));
+    let delimiter_span = delimiter_error.map(|(_, index)| (index, index));
     let diagnostic_span = literal_span
         .or(fstring_span)
         .or(scope_span)
         .or(generator_span)
         .or(assignment_span)
-        .or(prefix_span);
+        .or(prefix_span)
+        .or(delimiter_span);
     let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
         (
             source_byte_location(source, start),
@@ -17821,6 +17897,32 @@ mod tests {
             ),
             Some("f-string: valid expression required before '}'")
         );
+    }
+
+    #[test]
+    fn fstring_delimiters_report_the_opening_mismatch() {
+        for (source, message, index) in [
+            (
+                "f'{((}'",
+                "closing parenthesis '}' does not match opening parenthesis '('",
+                5,
+            ),
+            (
+                "f'{a[4)}'",
+                "closing parenthesis ')' does not match opening parenthesis '['",
+                6,
+            ),
+            (
+                "f'{a(4]}'",
+                "closing parenthesis ']' does not match opening parenthesis '('",
+                6,
+            ),
+        ] {
+            assert_eq!(
+                fstring_mismatched_delimiter(source),
+                Some((message.to_owned(), index))
+            );
+        }
     }
 
     #[test]
