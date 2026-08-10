@@ -11278,6 +11278,30 @@ fn malformed_unicode_name_escape(source: &str) -> Option<String> {
     None
 }
 
+/// CPython 3.14 `Parser/python.gram` f-string replacement-field invalid
+/// rules.  A `#` starts an ordinary tokenizer comment inside a field: on one
+/// physical line it consumes the apparent closing brace, while a multiline
+/// field containing only comments reaches the dedicated empty-expression
+/// rule.  Ruff surfaces both through coarser f-string parser errors.
+fn fstring_comment_diagnostic(message: &str, source: &str) -> Option<&'static str> {
+    if !source.contains('#') {
+        return None;
+    }
+    if message == "f-string: unterminated string" {
+        return Some("'{' was never closed");
+    }
+    if message != "Expected an expression" {
+        return None;
+    }
+    if source.contains("{)#") {
+        Some("f-string: unmatched ')'")
+    } else if source.contains('\n') {
+        Some("f-string: valid expression required before '}'")
+    } else {
+        None
+    }
+}
+
 /// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
 /// private Python 3.14 `_IncompleteInputError` subclass for parser failures
 /// which end at an unfinished interactive input when
@@ -11404,6 +11428,9 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     };
     if let Some(unicode_error) = malformed_unicode_name_escape(source) {
         msg = unicode_error;
+    }
+    if let Some(comment_error) = fstring_comment_diagnostic(&msg, source) {
+        msg = comment_error.to_owned();
     }
     if msg == "f-string: expecting `}`" {
         msg = "f-string: expecting '}'".to_owned();
@@ -17775,6 +17802,25 @@ mod tests {
         assert_eq!(malformed_unicode_name_escape(r"r'\N'"), None);
         assert_eq!(malformed_unicode_name_escape(r"'\N{DELTA}'"), None);
         assert_eq!(malformed_unicode_name_escape(r"'\\N'"), None);
+    }
+
+    #[test]
+    fn fstring_comments_follow_tokenizer_precedence() {
+        assert_eq!(
+            fstring_comment_diagnostic("f-string: unterminated string", "f'{1#}'"),
+            Some("'{' was never closed")
+        );
+        assert_eq!(
+            fstring_comment_diagnostic("Expected an expression", "f'{)#}'"),
+            Some("f-string: unmatched ')'")
+        );
+        assert_eq!(
+            fstring_comment_diagnostic(
+                "Expected an expression",
+                "f'''\n{\n# only a comment\n}'''\n",
+            ),
+            Some("f-string: valid expression required before '}'")
+        );
     }
 
     #[test]
