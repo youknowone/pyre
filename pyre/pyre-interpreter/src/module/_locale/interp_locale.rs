@@ -111,6 +111,53 @@ fn c_locale_conv() -> LocaleConvData {
     }
 }
 
+/// The three numeric fields of `localeconv()`, as
+/// `rpython/rlib/rlocale.py:169-178 numeric_formatting` returns them:
+/// `(decimal_point, thousands_sep, grouping)`.
+///
+/// `grouping` stays the raw `lconv.grouping` bytes rather than the
+/// `_w_copy_grouping` list `localeconv()` publishes: the consumer
+/// (`newformat.py:740 _group_digits`) reads `0xFF` as "stop" and `0` as
+/// "repeat the previous group", and the published list drops the former and
+/// appends the latter.
+///
+/// Lives here, beside the other host-locale access, rather than in
+/// `majit-rlib` where the `rpython/rlib/` mapping would put it: that crate
+/// carries no libc dependency and is compiled for wasm, where there is no
+/// locale to read.
+pub(crate) fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        let lc = rustpython_host_env::locale::localeconv_data();
+        let raw = unsafe { libc::localeconv() };
+        let grouping = if raw.is_null() {
+            Vec::new()
+        } else {
+            let mut v: Vec<u8> = Vec::new();
+            let mut cur = unsafe { (*raw).grouping };
+            if !cur.is_null() {
+                unsafe {
+                    while *cur != 0 {
+                        v.push(*cur as u8);
+                        cur = cur.add(1);
+                    }
+                }
+            }
+            v
+        };
+        (
+            lc.decimal_point.clone(),
+            lc.thousands_sep.clone(),
+            grouping,
+        )
+    }
+    #[cfg(not(all(unix, feature = "host_env")))]
+    {
+        let c = c_locale_conv();
+        (c.decimal_point, c.thousands_sep, Vec::new())
+    }
+}
+
 /// `_locale` C-extension stub — PyPy: pypy/module/_locale/.
 ///
 /// Provides the 'C' locale defaults so locale.py's `from _locale import *`

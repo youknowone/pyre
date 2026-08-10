@@ -2329,6 +2329,119 @@ fn pad_to_width(
     })
 }
 
+/// The `(decimal_point, thousands_sep, grouping)` a presentation type formats
+/// under — `newformat.py:642-658 _get_locale`.
+///
+/// `n` reads the current locale; an explicit `,`/`_` is the fixed default
+/// grouping (`\4` for the power-of-two radices, `\3` otherwise); anything else
+/// carries the `0xFF` byte that means "stop" to [`group_digits`].
+fn get_locale(ty: char, thousands_sep: Option<char>) -> (String, String, Vec<u8>) {
+    if ty == 'n' {
+        let (dec, thousands, grouping) =
+            crate::module::_locale::interp_locale::numeric_formatting();
+        (
+            String::from_utf8_lossy(&dec).into_owned(),
+            String::from_utf8_lossy(&thousands).into_owned(),
+            grouping,
+        )
+    } else if let Some(sep) = thousands_sep {
+        let grouping = if matches!(ty, 'b' | 'o' | 'x' | 'X') {
+            vec![4]
+        } else {
+            vec![3]
+        };
+        (".".to_string(), sep.to_string(), grouping)
+    } else {
+        (".".to_string(), String::new(), vec![0xFF])
+    }
+}
+
+/// `newformat.py:726-735 _fill_digits`. The separator is pushed *before* the
+/// group it follows because the caller reverses the whole buffer at the end;
+/// each element is a whole string, so the reversal reorders elements and never
+/// the characters inside a multi-byte separator.
+fn fill_digits(
+    buf: &mut Vec<String>,
+    digits: &[u8],
+    d_state: i32,
+    n_chars: i32,
+    n_zeros: i32,
+    thousands_sep: Option<&str>,
+) {
+    if let Some(sep) = thousands_sep
+        && !sep.is_empty()
+    {
+        buf.push(sep.to_string());
+    }
+    for i in (d_state - n_chars..d_state).rev() {
+        buf.push((digits[i as usize] as char).to_string());
+    }
+    for _ in 0..n_zeros {
+        buf.push("0".to_string());
+    }
+}
+
+/// `newformat.py:738-777 _group_digits`.
+///
+/// `loc_grouping` is walked one byte per group; running off its end repeats the
+/// last group seen, which is how a one-byte `"\3"` groups a number of any
+/// length, and `0xFF` stops grouping outright. `min_width` is the zero-padding
+/// target — the `0` fill with `=` alignment counts its zeros as digits, so the
+/// separators land in the padding too.
+fn group_digits(
+    digits: &[u8],
+    mut min_width: i32,
+    mut left: i32,
+    loc_grouping: &[u8],
+    loc_thousands: &str,
+) -> String {
+    let mut buf: Vec<String> = Vec::new();
+    let mut grouping_state = 0usize;
+    let n_ts = loc_thousands.chars().count() as i32;
+    let mut need_separator = false;
+    let mut done = false;
+    let mut previous: i32 = 0;
+    loop {
+        let group = if grouping_state >= loc_grouping.len() {
+            previous
+        } else {
+            let next = loc_grouping[grouping_state] as i32;
+            if next == 0xFF {
+                break;
+            }
+            grouping_state += 1;
+            previous = next;
+            next
+        };
+        let final_grouping = group.min(left.max(min_width.max(1)));
+        let n_zeros = (final_grouping - left).max(0);
+        let n_chars = left.min(final_grouping).max(0);
+        let ts = need_separator.then_some(loc_thousands);
+        fill_digits(&mut buf, digits, left, n_chars, n_zeros, ts);
+        need_separator = true;
+        left -= n_chars;
+        min_width -= final_grouping;
+        if left <= 0 && min_width <= 0 {
+            done = true;
+            break;
+        }
+        min_width -= n_ts;
+    }
+    if !done {
+        let group = left.max(min_width).max(1);
+        let n_zeros = (group - left).max(0);
+        let n_chars = left.min(group).max(0);
+        let ts = need_separator.then_some(loc_thousands);
+        fill_digits(&mut buf, digits, left, n_chars, n_zeros, ts);
+    }
+    buf.reverse();
+    buf.concat()
+}
+
+/// The fixed-interval case of [`group_digits`]: an explicit `,`/`_` in the
+/// spec, whose grouping is a single repeated width. Retained as its own
+/// routine because it also carries the pre-existing zero-padding arithmetic;
+/// converging it onto `group_digits` is the remaining step.
 fn separate_integer_digits(
     mut magnitude: String,
     interval: i32,
@@ -2449,7 +2562,27 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
         }
     };
     let sign_prefix = format!("{sign}{prefix}");
-    if let Some(separator) = p.grouping {
+    if p.ty == 'n' {
+        // `n` takes its separator from the locale rather than from the spec,
+        // and its group widths may vary along the number (`hi_IN` groups 3
+        // then 2), so it walks the grouping string instead of a fixed
+        // interval.
+        let (_loc_dec, loc_thousands, loc_grouping) = get_locale('n', None);
+        if !loc_thousands.is_empty() {
+            let min_width = if p.fill == '0' && p.align == Some('=') {
+                (p.width as i32 - sign_prefix.len() as i32).max(0)
+            } else {
+                0
+            };
+            magnitude = group_digits(
+                magnitude.as_bytes(),
+                min_width,
+                magnitude.len() as i32,
+                &loc_grouping,
+                &loc_thousands,
+            );
+        }
+    } else if let Some(separator) = p.grouping {
         let displayed_digits = if p.fill == '0' && p.align == Some('=') {
             (p.width as i32 - sign_prefix.len() as i32).max(magnitude.len() as i32)
         } else {
@@ -3173,6 +3306,54 @@ fn format_finite_float(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     } else {
         v
     };
+    if p.ty == 'n' {
+        // `n` renders exactly as `g` and then substitutes the locale's
+        // separator and decimal point (`_get_locale`, newformat.py:642-658).
+        // The engine has neither, so the substitution happens here, on the
+        // unpadded body: only the leading digit run is grouped, leaving an
+        // `e+10` exponent or a fractional tail untouched.
+        let (loc_dec, loc_thousands, loc_grouping) = get_locale('n', None);
+        let unpadded_spec = float_engine_spec_with_width(&p, None);
+        let body = rustpython_common::format::FormatSpec::parse(&unpadded_spec)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?
+            .format_float(v)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?;
+        let (sign, rest) = match body.strip_prefix(['-', '+', ' ']) {
+            Some(rest) => body.split_at(body.len() - rest.len()),
+            None => ("", body.as_str()),
+        };
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let (int_part, remainder) = rest.split_at(digits_end);
+        let grouped = if loc_thousands.is_empty() {
+            int_part.to_string()
+        } else {
+            let min_width = if p.fill == '0' && p.align == Some('=') {
+                (p.width as i32 - sign.len() as i32 - remainder.chars().count() as i32).max(0)
+            } else {
+                0
+            };
+            group_digits(
+                int_part.as_bytes(),
+                min_width,
+                int_part.len() as i32,
+                &loc_grouping,
+                &loc_thousands,
+            )
+        };
+        let remainder = if loc_dec == "." {
+            remainder.to_string()
+        } else {
+            remainder.replacen('.', &loc_dec, 1)
+        };
+        return pad_to_width(
+            format!("{sign}{grouped}{remainder}"),
+            p.fill,
+            p.align.unwrap_or('>'),
+            p.width,
+        );
+    }
     if p.fill.to_char().is_none() {
         // A fill with no `char` cannot come back out of the `String`-typed
         // engine, so render the value unpadded and pad it by code point.
@@ -6525,6 +6706,55 @@ pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
         }
     }
     Ok(default)
+}
+
+#[cfg(test)]
+mod group_digits_tests {
+    use super::*;
+
+    /// `\3` is one group width that repeats for the whole number: running off
+    /// the end of the grouping string reuses the last width
+    /// (`newformat.py:747-755`).
+    #[test]
+    fn a_single_group_width_repeats_to_the_end() {
+        assert_eq!(group_digits(b"123456789", 0, 9, &[3], ","), "123,456,789");
+        assert_eq!(group_digits(b"1234", 0, 4, &[3], ","), "1,234");
+        assert_eq!(group_digits(b"123", 0, 3, &[3], ","), "123");
+    }
+
+    /// The width may change along the number — `hi_IN` groups the low three
+    /// digits, then twos. A fixed interval cannot express this, which is why
+    /// the walk reads one byte per group instead of multiplying.
+    #[test]
+    fn a_grouping_pattern_changes_width_along_the_number() {
+        assert_eq!(
+            group_digits(b"123456789", 0, 9, &[3, 2], ","),
+            "12,34,56,789"
+        );
+    }
+
+    /// `0xFF` stops grouping outright — the `NO_LOCALE` spelling.
+    #[test]
+    fn the_stop_byte_leaves_the_digits_alone() {
+        assert_eq!(group_digits(b"123456789", 0, 9, &[0xFF], ","), "123456789");
+    }
+
+    /// `min_width` is the `0=`-padding target, and the padding zeros are
+    /// grouped with the digits rather than prepended to them.
+    #[test]
+    fn zero_padding_is_grouped_with_the_digits() {
+        assert_eq!(group_digits(b"1234", 15, 4, &[3], ","), "000,000,001,234");
+    }
+
+    /// A separator wider than one byte is one buffer element, so the final
+    /// reversal reorders the groups without reversing the separator itself.
+    #[test]
+    fn a_multi_byte_separator_survives_the_reversal() {
+        assert_eq!(
+            group_digits(b"1234567", 0, 7, &[3], "\u{2009}"),
+            "1\u{2009}234\u{2009}567"
+        );
+    }
 }
 
 #[cfg(test)]
