@@ -7,6 +7,19 @@
 # `warm_find` searches a long wide payload repeatedly: resolving those bounds
 # by walking, or by materialising the whole offset table per call, costs orders
 # of magnitude rather than staying flat. Output verified against CPython/PyPy.
+#
+# The wasm baseline records loops_aborted=1 and 199 more guard failures than
+# the native two, and both come from one decline. Measured: with the bridge
+# path switched off (`trace_eagerness=1000000`) the guest and pyre-dynasm agree
+# to the digit — 6 loops, 0 bridges, 0 aborts, 64819 guard failures each — so
+# the recorded trace and the compiled loop's deopt behaviour carry no
+# divergence. At `trace_eagerness=1` the per-walk census matches walk for walk
+# until one bridge walk, off guard 6 of the first loop trace, meets a callee
+# the walker cannot inline because it carries a loop; that decline resumes the
+# caller at its CALL and leaves the guard unbridged, so the guard re-fires one
+# `trace_eagerness` cycle later. The excess tracks the parameter (+1 at 1, +199
+# at the default 200, 0 with bridging off), which is what says the abort
+# produces the guard failures rather than the other way round.
 SAMPLES = (
     ("empty", ""),
     ("ascii", "abcabcabc"),
