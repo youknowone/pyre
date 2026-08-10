@@ -83,4 +83,13 @@ error = syntax_error('if True:\n        print()\n\texec "mixed tabs and spaces"'
 assert isinstance(error, TabError), type(error)
 assert error.msg == "inconsistent use of tabs and spaces in indentation", error.msg
 
+error = syntax_error("def f():\n  global x\n  nonlocal x")
+assert error.msg == "name 'x' is nonlocal and global", error.msg
+assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (2, 3, 2, 11), (
+    error.lineno,
+    error.offset,
+    error.end_lineno,
+    error.end_offset,
+)
+
 print("syntax error Python 3.14 offsets ok")

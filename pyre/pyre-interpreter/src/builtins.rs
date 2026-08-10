@@ -10832,6 +10832,97 @@ fn fstring_missing_comma_span(source: &str, raw_index: usize) -> Option<(usize, 
     Some((open + 1 + start, open + 1 + end))
 }
 
+/// CPython 3.14's symtable reports a `global`/`nonlocal` conflict at the first
+/// declaration in the lexical scope.  RustPython misses the conflict while it
+/// scans and later reports an unbound nonlocal at the second declaration.
+fn global_nonlocal_conflict_span(
+    error: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast::{self, visitor::Visitor};
+
+    let message = error.to_string();
+    let name = message
+        .strip_prefix("no binding for nonlocal '")
+        .and_then(|rest| rest.strip_suffix("' found"))
+        .or_else(|| {
+            message
+                .strip_prefix("name '")
+                .and_then(|rest| rest.strip_suffix("' is nonlocal and global"))
+        })?;
+    let (lineno, offset) = error.python_location();
+    let error_index = source_byte_index(source, lineno, offset)?;
+    let parsed = crate::compile::parser::parse_module(source).ok()?;
+
+    fn innermost_scope<'a>(body: &'a [ast::Stmt], index: usize) -> Option<&'a [ast::Stmt]> {
+        for statement in body {
+            let range = statement.range();
+            if !(range.start().to_usize() <= index && index <= range.end().to_usize()) {
+                continue;
+            }
+            let child = match statement {
+                ast::Stmt::FunctionDef(node) => Some(node.body.as_slice()),
+                ast::Stmt::ClassDef(node) => Some(node.body.as_slice()),
+                _ => None,
+            };
+            if let Some(child) = child {
+                return innermost_scope(child, index).or(Some(child));
+            }
+        }
+        None
+    }
+
+    struct DeclarationVisitor<'a> {
+        name: &'a str,
+        first: Option<(usize, usize)>,
+        global: bool,
+        nonlocal: bool,
+    }
+
+    impl Visitor<'_> for DeclarationVisitor<'_> {
+        fn visit_stmt(&mut self, statement: &ast::Stmt) {
+            let names = match statement {
+                ast::Stmt::Global(node) => Some((true, node.names.as_slice())),
+                ast::Stmt::Nonlocal(node) => Some((false, node.names.as_slice())),
+                // These bodies are distinct lexical scopes.  Their decorators,
+                // defaults, and annotations cannot contain declarations.
+                ast::Stmt::FunctionDef(_) | ast::Stmt::ClassDef(_) => return,
+                _ => None,
+            };
+            if let Some((is_global, names)) = names
+                && names
+                    .iter()
+                    .any(|identifier| identifier.as_str() == self.name)
+            {
+                self.global |= is_global;
+                self.nonlocal |= !is_global;
+                let range = statement.range();
+                let range = (range.start().to_usize(), range.end().to_usize());
+                if self.first.is_none_or(|first| range.0 < first.0) {
+                    self.first = Some(range);
+                }
+            }
+            ast::visitor::walk_stmt(self, statement);
+        }
+    }
+
+    let module_body = parsed.syntax().body.as_slice();
+    let scope = innermost_scope(module_body, error_index).unwrap_or(module_body);
+    let mut visitor = DeclarationVisitor {
+        name,
+        first: None,
+        global: false,
+        nonlocal: false,
+    };
+    for statement in scope {
+        visitor.visit_stmt(statement);
+    }
+    let (start, end) = visitor
+        .first
+        .filter(|_| visitor.global && visitor.nonlocal)?;
+    Some((format!("name '{name}' is nonlocal and global"), start, end))
+}
+
 /// `Parser/string_parser.c parse_string_literal` raises the non-ASCII bytes
 /// error at the token (`RAISE_SYNTAX_ERROR_KNOWN_LOCATION(t)`), not at the
 /// offending code point.  Ruff's diagnostic instead selects that code point;
@@ -11029,7 +11120,12 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     if fstring_span.is_some() {
         msg = "invalid syntax. Perhaps you forgot a comma?".to_owned();
     }
-    let diagnostic_span = literal_span.or(fstring_span);
+    let scope_conflict = global_nonlocal_conflict_span(&e, source);
+    if let Some((replacement, _, _)) = &scope_conflict {
+        msg = replacement.clone();
+    }
+    let scope_span = scope_conflict.map(|(_, start, end)| (start, end));
+    let diagnostic_span = literal_span.or(fstring_span).or(scope_span);
     let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
         (
             source_byte_location(source, start),
@@ -11054,7 +11150,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         let (end_lineno, end_byte_offset) = parser_end
             .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
             .unwrap_or((lineno, byte_offset));
-        let end_offset = if parser_end.is_some() {
+        let end_offset = if parser_error && parser_end.is_some() {
             syntax_error_character_offset(source, end_lineno, end_byte_offset)
         } else {
             end_byte_offset
@@ -17347,6 +17443,33 @@ mod tests {
                 Some("inconsistent use of tabs and spaces in indentation".to_owned())
             ))
         );
+    }
+
+    #[test]
+    fn global_nonlocal_conflict_uses_first_declaration() {
+        for (source, declaration) in [
+            ("def f():\n  global x\n  nonlocal x", "global x"),
+            (
+                "def f():\n  if True:\n    global x\n  nonlocal x",
+                "global x",
+            ),
+        ] {
+            let error =
+                crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+            let start = source.find(declaration).unwrap();
+            assert_eq!(
+                global_nonlocal_conflict_span(&error, source),
+                Some((
+                    "name 'x' is nonlocal and global".to_owned(),
+                    start,
+                    start + declaration.len(),
+                ))
+            );
+        }
+
+        let source = "def f():\n  global x\n  def g():\n    nonlocal x";
+        let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+        assert_eq!(global_nonlocal_conflict_span(&error, source), None);
     }
 
     #[test]
