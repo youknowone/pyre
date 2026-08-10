@@ -11107,6 +11107,78 @@ fn nonascii_bytes_literal_span(source: &str, raw_index: usize) -> Option<(usize,
     None
 }
 
+/// CPython 3.14 `Parser/lexer/lexer.c`
+/// `maybe_raise_syntax_error_for_string_prefixes`.  Ruff tokenizes an
+/// incompatible prefix as a NAME followed by a STRING and reports the gap
+/// between simple statements, so recover the prefix immediately before the
+/// quote selected by that parser error and apply CPython's ordered checks.
+fn incompatible_string_prefix_error(
+    source: &str,
+    raw_index: usize,
+) -> Option<(String, usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut quote = raw_index.min(bytes.len());
+    if !matches!(bytes.get(quote), Some(b'\'' | b'"')) {
+        quote = bytes[..quote]
+            .iter()
+            .rposition(|byte| matches!(*byte, b'\'' | b'"'))?;
+    }
+    let mut start = quote;
+    while start > 0
+        && matches!(
+            bytes[start - 1].to_ascii_lowercase(),
+            b'b' | b'r' | b'u' | b'f' | b't'
+        )
+    {
+        start -= 1;
+    }
+    if start == quote
+        || bytes
+            .get(start.wrapping_sub(1))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return None;
+    }
+    let prefix = &bytes[start..quote];
+    let mut seen = [false; 5];
+    for byte in prefix {
+        let index = match byte.to_ascii_lowercase() {
+            b'b' => 0,
+            b'r' => 1,
+            b'u' => 2,
+            b'f' => 3,
+            b't' => 4,
+            _ => return None,
+        };
+        if seen[index] {
+            return None;
+        }
+        seen[index] = true;
+    }
+    let pair = if seen[2] && seen[0] {
+        ("u", "b")
+    } else if seen[2] && seen[1] {
+        ("u", "r")
+    } else if seen[2] && seen[3] {
+        ("u", "f")
+    } else if seen[2] && seen[4] {
+        ("u", "t")
+    } else if seen[0] && seen[3] {
+        ("b", "f")
+    } else if seen[0] && seen[4] {
+        ("b", "t")
+    } else if seen[3] && seen[4] {
+        ("f", "t")
+    } else {
+        return None;
+    };
+    Some((
+        format!("'{}' and '{}' prefixes are incompatible", pair.0, pair.1),
+        start,
+        quote,
+    ))
+}
+
 /// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
 /// private Python 3.14 `_IncompleteInputError` subclass for parser failures
 /// which end at an unfinished interactive input when
@@ -11272,11 +11344,22 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         msg = replacement.clone();
     }
     let assignment_span = assignment_error.map(|(_, start, end)| (start, end));
+    let prefix_error = match &e {
+        crate::compile::CompileError::Parse(parse_error) => {
+            incompatible_string_prefix_error(source, parse_error.raw_location.start().to_usize())
+        }
+        _ => None,
+    };
+    if let Some((replacement, _, _)) = &prefix_error {
+        msg = replacement.clone();
+    }
+    let prefix_span = prefix_error.map(|(_, start, end)| (start, end));
     let diagnostic_span = literal_span
         .or(fstring_span)
         .or(scope_span)
         .or(generator_span)
-        .or(assignment_span);
+        .or(assignment_span)
+        .or(prefix_span);
     let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
         (
             source_byte_location(source, start),
