@@ -4108,6 +4108,7 @@ fn register_thread_root_areas() {
 /// they only store function pointers in pyre-object's thread-local
 /// `Cell` slots and do not touch interpreter state.
 fn install_pyre_object_hooks() {
+    majit_gc::set_active_jit_backend_memory_stats(Some(active_jit_backend_memory_stats));
     pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
     pyre_object::register_gc_alloc_with_placement_hook(
         pyre_object_gc_alloc_with_placement_trampoline,
@@ -4247,7 +4248,6 @@ pub fn init_gc_subsystem() {
         install_gc_into_backend();
         GC_TLS_INSTALLED.with(|c| c.set(true));
     }
-    majit_gc::set_active_jit_backend_memory_stats(Some(active_jit_backend_memory_stats));
     // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
     // translated prebuilt equivalent before any collector root walk rather
     // than lazily manufacturing it from inside the walker. After registration,
