@@ -622,10 +622,17 @@ pub trait GcAllocator: Send {
     /// `incminimark.py:810-822 collect_step`: perform one minor collection
     /// and exactly one major-collection state transition, independently of
     /// the automatic-collection enabled flag.
+    ///
+    /// The default is `rgc.py:20-31`'s non-incremental answer: a collector
+    /// with no state machine does the whole collection at once and reports
+    /// `_encode_states(1, 0)`, a transition [`GcStepTransition::is_done`]
+    /// accepts. Reporting the starting state on both sides would instead say
+    /// the collection is still in progress, so a caller stepping until done
+    /// would run a full collection on every iteration and never stop.
     fn collect_step(&mut self) -> GcStepTransition {
         self.collect_full();
         GcStepTransition {
-            old_state: GcStepTransition::SCANNING,
+            old_state: GcStepTransition::MARKING,
             new_state: GcStepTransition::SCANNING,
         }
     }
