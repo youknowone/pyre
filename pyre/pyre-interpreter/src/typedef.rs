@@ -16122,6 +16122,13 @@ fn init_staticmethod_type(ns: PyObjectRef) {
         make_builtin_function_with_arity("__annotate__", staticmethod_annotate_set, 3);
     let annotate_deleter =
         make_builtin_function_with_arity("__annotate__", staticmethod_annotate_del, 2);
+    let class_getitem = make_builtin_function(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+    );
+    unsafe {
+        crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"))
+    };
     let entries = [
         (
             "__doc__",
@@ -16190,10 +16197,7 @@ fn init_staticmethod_type(ns: PyObjectRef) {
         ),
         (
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(class_getitem),
         ),
         (
             "__repr__",
@@ -16206,6 +16210,17 @@ fn init_staticmethod_type(ns: PyObjectRef) {
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__call__", "($self, /, *args, **kwargs)"),
+        ("__get__", "($self, instance, owner=None, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("staticmethod TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
 
@@ -16403,6 +16418,13 @@ fn init_classmethod_type(ns: PyObjectRef) {
         make_builtin_function_with_arity("__annotate__", classmethod_annotate_set, 3);
     let annotate_deleter =
         make_builtin_function_with_arity("__annotate__", classmethod_annotate_del, 2);
+    let class_getitem = make_builtin_function(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+    );
+    unsafe {
+        crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"))
+    };
     let entries = [
         (
             "__doc__",
@@ -16467,10 +16489,7 @@ fn init_classmethod_type(ns: PyObjectRef) {
         ),
         (
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(class_getitem),
         ),
         (
             "__repr__",
@@ -16483,6 +16502,16 @@ fn init_classmethod_type(ns: PyObjectRef) {
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__get__", "($self, instance, owner=None, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("classmethod TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
 
