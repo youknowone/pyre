@@ -4475,6 +4475,7 @@ fn catch_target_extra_ref_colors(
     ssarepr: &super::flatten::SSARepr,
     live_markers: &[usize],
     after_call_markers: &[Option<usize>],
+    first_insn_post_merge: &[Option<usize>],
     label2alive: &std::collections::HashMap<
         String,
         std::collections::HashSet<super::flatten::Register>,
@@ -4491,12 +4492,21 @@ fn catch_target_extra_ref_colors(
                 "[catch-live-census] code={} catch_sites=0 anchorless_sites=0 \
                  anchorless_redundant=0 anchorless_orphan=0 covered_pcs=0 anchored_pcs=0 \
                  widened_pcs=0 empty_refs_pcs=0 orphan_sites_missing=0 \
-                 orphan_colors_missing=0",
+                 orphan_colors_missing=0 orphan_owner_remap_differs=0",
                 code.obj_name
             );
         }
         return out;
     }
+    let mut pc_pos: Vec<(usize, usize)> = first_insn_post_merge
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, entry)| entry.map(|pos| (pos, pc)))
+        .collect();
+    pc_pos.sort_unstable();
+    // Folded ties resolve to the higher PC; both candidates share the folded
+    // marker anyway, so widening lands on the same `out` key.
+    let pre_merge_pc_pos = census_enabled.then(|| sparse_pc_owner_table(ssarepr));
     let catch_ref_colors_from_args = |args: &[SsaOperand]| -> std::collections::BTreeSet<u16> {
         args.iter()
             .filter_map(|op| match op {
@@ -4523,13 +4533,14 @@ fn catch_target_extra_ref_colors(
         anchorless_orphan,
         orphan_sites_missing,
         orphan_colors_missing,
+        orphan_owner_remap_differs,
     ) = {
         let mut catch_sites = 0usize;
         let mut anchorless_redundant = 0usize;
         let mut anchorless_orphan = 0usize;
         let mut orphan_sites_missing = 0usize;
         let mut orphan_colors_missing = 0usize;
-        let pc_pos = sparse_pc_owner_table(ssarepr);
+        let mut orphan_owner_remap_differs = 0usize;
         for (q, insn) in ssarepr.insns.iter().enumerate() {
             let is_catch = matches!(
                 insn,
@@ -4573,13 +4584,23 @@ fn catch_target_extra_ref_colors(
                             orphan_sites_missing += 1;
                             orphan_colors_missing += missing_refs.len();
                         }
+                        let pre_merge_owner_pc = pre_merge_pc_pos
+                            .as_ref()
+                            .and_then(|pre_merge_pc_pos| sparse_owner_pc(pre_merge_pc_pos, q));
+                        if pre_merge_owner_pc != owner_pc {
+                            orphan_owner_remap_differs += 1;
+                        }
                         let owner = owner_pc
+                            .map(|pc| pc.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        let pre_merge_owner = pre_merge_owner_pc
                             .map(|pc| pc.to_string())
                             .unwrap_or_else(|| "none".to_string());
                         eprintln!(
                             "[catch-live-orphan] code={} q={} owning_py_pc={} \
-                             landing_ref_colors={:?} missing_ref_colors={:?}",
-                            code.obj_name, q, owner, landing_refs, missing_refs
+                             pre_merge_owner_py_pc={} landing_ref_colors={:?} \
+                             missing_ref_colors={:?}",
+                            code.obj_name, q, owner, pre_merge_owner, landing_refs, missing_refs
                         );
                     }
                 }
@@ -4591,6 +4612,7 @@ fn catch_target_extra_ref_colors(
             anchorless_orphan,
             orphan_sites_missing,
             orphan_colors_missing,
+            orphan_owner_remap_differs,
         )
     };
     let anchorless_sites = anchorless_redundant + anchorless_orphan;
@@ -4598,9 +4620,8 @@ fn catch_target_extra_ref_colors(
     let mut anchored_pcs = 0usize;
     let mut widened_pcs = 0usize;
     let mut empty_refs_pcs = 0usize;
-    let catch_ref_colors = |anchor: usize| -> std::collections::BTreeSet<u16> {
-        catch_ref_colors_at(anchor + 1)
-    };
+    let catch_ref_colors =
+        |anchor: usize| -> std::collections::BTreeSet<u16> { catch_ref_colors_at(anchor + 1) };
     // `catch_exception` anchor -> label live-in, memoized: a try body of N PCs
     // can share one catch edge in the flattened stream.
     let mut anchor_refs: std::collections::HashMap<usize, std::collections::BTreeSet<u16>> =
@@ -4642,7 +4663,7 @@ fn catch_target_extra_ref_colors(
             "[catch-live-census] code={} catch_sites={} anchorless_sites={} \
              anchorless_redundant={} anchorless_orphan={} covered_pcs={} anchored_pcs={} \
              widened_pcs={} empty_refs_pcs={} orphan_sites_missing={} \
-             orphan_colors_missing={}",
+             orphan_colors_missing={} orphan_owner_remap_differs={}",
             code.obj_name,
             catch_sites,
             anchorless_sites,
@@ -4653,7 +4674,8 @@ fn catch_target_extra_ref_colors(
             widened_pcs,
             empty_refs_pcs,
             orphan_sites_missing,
-            orphan_colors_missing
+            orphan_colors_missing,
+            orphan_owner_remap_differs
         );
     }
     out
@@ -4811,6 +4833,7 @@ fn filter_liveness_in_place(
         ssarepr,
         &live_markers,
         &after_call_post_merge,
+        &first_insn_post_merge,
         &label2alive,
         code,
     );
@@ -16790,10 +16813,9 @@ mod tests {
     /// PC's marker.
     #[test]
     fn catch_target_extra_ref_colors_widens_an_orphaned_catch_site() {
-        let code = pyre_interpreter::compile_exec(
-            "try:\n    x = 1\nexcept Exception:\n    x = 2\n",
-        )
-        .expect("source must compile");
+        let code =
+            pyre_interpreter::compile_exec("try:\n    x = 1\nexcept Exception:\n    x = 2\n")
+                .expect("source must compile");
         let py_pc = (0..code.instructions.len())
             .find(|&pc| {
                 pyre_interpreter::pycode::lookup_exceptiontable(
@@ -16806,9 +16828,12 @@ mod tests {
 
         let landing = "handler";
         let mut ssarepr = SSARepr::new("orphan_catch");
-        ssarepr.insns.push(Insn::live(vec![Operand::Register(
-            Register::new(Kind::Ref, 1),
-        )]));
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                1,
+            ))]));
         ssarepr.insns.push(Insn::op(
             "int_is_true",
             vec![Operand::Register(Register::new(Kind::Int, 0))],
@@ -16821,6 +16846,8 @@ mod tests {
 
         let live_markers = vec![0; code.instructions.len()];
         let after_call_markers = vec![None; code.instructions.len()];
+        let mut first_insn_post_merge = vec![None; code.instructions.len()];
+        first_insn_post_merge[py_pc] = Some(2);
         let label2alive = std::collections::HashMap::from([(
             landing.to_string(),
             std::collections::HashSet::from([Register::new(Kind::Ref, 7)]),
@@ -16830,6 +16857,7 @@ mod tests {
             &ssarepr,
             &live_markers,
             &after_call_markers,
+            &first_insn_post_merge,
             &label2alive,
             &code,
         );
@@ -16837,6 +16865,99 @@ mod tests {
         assert_eq!(
             extra_refs.get(&0),
             Some(&std::collections::BTreeSet::from([7])),
+        );
+    }
+
+    /// Regression: this fails if the orphan owner table is built from
+    /// pre-merge positions instead of the caller's post-merge remap.
+    #[test]
+    fn catch_target_extra_ref_colors_uses_post_merge_owner_positions() {
+        let code =
+            pyre_interpreter::compile_exec("try:\n    x = 1\nexcept Exception:\n    x = 2\n")
+                .expect("source must compile");
+        assert!(
+            code.instructions.len() > 1,
+            "compiled try/except must have at least two PCs",
+        );
+
+        let earlier_pc = 0usize;
+        let right_pc = 1usize;
+        let landing = "handler";
+        let mut ssarepr = SSARepr::new("orphan_catch_remap");
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                1,
+            ))]));
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                2,
+            ))]));
+        ssarepr.insns.push(Insn::op(
+            "int_is_true",
+            vec![Operand::Register(Register::new(Kind::Int, 0))],
+        ));
+        ssarepr.insns.push(Insn::op(
+            "catch_exception",
+            vec![Operand::TLabel(TLabel::new(landing))],
+        ));
+        ssarepr.pc_first_insn_pos.push((earlier_pc as i64, 0));
+        ssarepr.pc_first_insn_pos.push((right_pc as i64, 5));
+
+        let mut live_markers = vec![0; code.instructions.len()];
+        live_markers[right_pc] = 1;
+        let after_call_markers = vec![None; code.instructions.len()];
+        let mut first_insn_post_merge = vec![None; code.instructions.len()];
+        first_insn_post_merge[earlier_pc] = Some(0);
+        first_insn_post_merge[right_pc] = Some(3);
+        let label2alive = std::collections::HashMap::from([(
+            landing.to_string(),
+            std::collections::HashSet::from([Register::new(Kind::Ref, 7)]),
+        )]);
+
+        // The fixture only discriminates if the two tables disagree about who
+        // owns the `catch_exception`: the stale pre-merge positions put it on
+        // the earlier PC, the remapped ones on the PC that actually owns it.
+        let catch_q = 3usize;
+        assert_eq!(
+            sparse_owner_pc(&sparse_pc_owner_table(&ssarepr), catch_q),
+            Some(earlier_pc),
+            "pre-merge positions must resolve the catch to the earlier PC",
+        );
+        let post_merge_pc_pos = {
+            let mut table: Vec<(usize, usize)> = first_insn_post_merge
+                .iter()
+                .enumerate()
+                .filter_map(|(pc, entry)| entry.map(|pos| (pos, pc)))
+                .collect();
+            table.sort_unstable();
+            table
+        };
+        assert_eq!(
+            sparse_owner_pc(&post_merge_pc_pos, catch_q),
+            Some(right_pc),
+            "post-merge positions must resolve the catch to its own PC",
+        );
+
+        let extra_refs = catch_target_extra_ref_colors(
+            &ssarepr,
+            &live_markers,
+            &after_call_markers,
+            &first_insn_post_merge,
+            &label2alive,
+            &code,
+        );
+
+        assert_eq!(
+            extra_refs.get(&1),
+            Some(&std::collections::BTreeSet::from([7])),
+        );
+        assert!(
+            !extra_refs.contains_key(&0),
+            "pre-merge ownership would widen the earlier PC's marker",
         );
     }
 
