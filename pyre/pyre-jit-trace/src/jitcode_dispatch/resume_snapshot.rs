@@ -2041,7 +2041,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // here (before the nested callee's body walk) — not at capture — places the
     // stores ahead of every in-callee guard, so `_number_virtuals` reads the
     // populated array when it numbers those guards' resume data.
-    if let Some(marker) = resume_marker_jit_pc {
+    if resume_marker_jit_pc.is_some() {
         if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > 1 {
             let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index as i32);
             let frame_red = (frame_reg != u16::MAX)
@@ -2058,9 +2058,10 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                 // `depth` is the operand-stack depth at the CALL return point,
                 // top slot = the pending nested-call result.
                 let pending_top_slot = nlocals + depth - 1;
-                // No Python coordinate here: `marker` is
-                // `inline_call_return_marker`'s `decode_op_at(..).next_pc`, a
-                // JitCode byte offset.
+                // No Python coordinate here. This slot used to carry
+                // `resume_marker_jit_pc`, which `inline_call_return_marker`
+                // mints as `decode_op_at(..).next_pc` — a JitCode byte offset,
+                // not a Python PC. It gates the block above and nothing else.
                 let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
                     jitcode_index as i32,
                     None,
@@ -2529,10 +2530,8 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     let mut recovered_regs_r = ctx.registers_r.to_vec();
     let code = unsafe { &*callee_pjc.code_ptr };
     let (stack_base, _) = crate::state::callee_layout_for_call_assembler(code);
-    let maps = crate::state::bridge_semantic_maps_from_jitcode_pc(
-        callee_jitcode_index,
-        callee_jitcode_pc,
-    );
+    let maps =
+        crate::state::bridge_semantic_maps_from_jitcode_pc(callee_jitcode_index, callee_jitcode_pc);
     // The kept-stack guard gate is certified by this callee frame's
     // operand-stack mirror.  Publish the same boxes into the carried
     // coordinate's Ref colors before collecting the frame snapshot, so the
