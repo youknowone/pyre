@@ -214,12 +214,22 @@ fn enabled_from_env(value: Option<&OsStr>) -> bool {
 /// stays reached until a major completes
 /// (`majit_gc::collector::set_deferred_major_request_probe`).
 ///
+/// `gc.disable()` is among the questions. This is the automatic path, the one
+/// `incminimark.py:831-832` returns from while the flag is clear; only an
+/// explicit `gc.collect()` carries `force_enabled` past it. The collection this
+/// safepoint runs is `do_collect_oldgen_nonmoving`, which drives a full cycle
+/// whatever the flag says, so the flag has to be read here or a
+/// `gc.disable()` region would still be collected.
+///
 /// Plain rather than `@dont_look_inside`: both callers are already outside
 /// traced code — [`safepoint`] is itself a residual, and the allocator reaches
-/// this through an installed `fn` pointer — and each of the three questions it
+/// this through an installed `fn` pointer — and each of the four questions it
 /// asks carries the attribute in its own right.
 pub fn would_collect() -> bool {
-    enabled() && collect_enabled() && at_outermost_activation()
+    enabled()
+        && collect_enabled()
+        && crate::gc_hook::try_gc_isenabled()
+        && at_outermost_activation()
 }
 
 /// Dispatch-loop safepoint: when the collector says it has reached the

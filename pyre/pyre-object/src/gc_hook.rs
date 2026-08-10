@@ -358,6 +358,37 @@ pub fn try_gc_set_enabled(enabled: bool) {
     }
 }
 
+/// Read side of [`try_gc_set_enabled`].
+pub type GcIsEnabledHookFn = fn() -> bool;
+
+majit_gc::global_hook!(static GC_ISENABLED_HOOK: GcIsEnabledHookFn);
+
+/// Install the automatic major-progress state query.
+pub fn register_gc_isenabled_hook(hook: GcIsEnabledHookFn) {
+    GC_ISENABLED_HOOK.set(Some(hook));
+}
+
+/// Remove the automatic major-progress state query.
+pub fn clear_gc_isenabled_hook() {
+    GC_ISENABLED_HOOK.set(None);
+}
+
+/// Whether automatic major-collection progress is enabled, via the installed
+/// hook. `true` when none is installed: nothing has been disabled, and the
+/// callers that ask reach a collection hook that is itself a no-op there.
+///
+/// Reads the runtime-mutable `GC_ISENABLED_HOOK` fn-pointer cell, not a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`, the [`try_gc_major_threshold_reached`] twin).
+/// The `-> bool` return fits a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_isenabled() -> bool {
+    match GC_ISENABLED_HOOK.get() {
+        Some(f) => f(),
+        None => true,
+    }
+}
+
 /// RPython `gc_fq_register` / `gc_fq_next_dead` hooks.  The trigger is the
 /// translated FinalizerQueue handler and only schedules interpreter work.
 pub type GcFinalizerTriggerFn = fn();

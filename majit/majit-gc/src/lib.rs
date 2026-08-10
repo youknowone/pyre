@@ -2883,6 +2883,15 @@ pub fn gc_set_enabled(enabled: bool) {
     gc_sync::gc_op(|gc| if enabled { gc.enable() } else { gc.disable() })
 }
 
+/// rgc.isenabled — read the flag [`gc_set_enabled`] writes.
+///
+/// `incminimark.py:831-832` is the only reader that matters: the automatic
+/// major-progress path returns early while it is clear, and an explicit
+/// `gc.collect()` passes `force_enabled` to get past it.
+pub fn gc_isenabled() -> bool {
+    gc_sync::gc_query_reentrant(|gc| gc.isenabled())
+}
+
 /// Process-global callback that performs a host-side write barrier through
 /// the currently active backend GC.
 pub type WriteBarrierFn = fn(obj: GcRef);
