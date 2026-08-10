@@ -5,7 +5,7 @@
 //! payloads, calling pure raw-payload helpers, and boxing the resulting payload
 //! with the same `W_LongObject` layout.
 
-use crate::rbigint::RBigInt as BigInt;
+use majit_rlib::rbigint::RBigInt as BigInt;
 
 use crate::pyobject::*;
 
@@ -42,7 +42,7 @@ impl crate::lltype::GcType for W_LongObject {
 }
 
 /// Payload size of a raw `rbigint` GC object.
-pub const BIGINT_PAYLOAD_SIZE: usize = crate::rbigint::RBIGINT_PAYLOAD_SIZE;
+pub const BIGINT_PAYLOAD_SIZE: usize = majit_rlib::rbigint::RBIGINT_PAYLOAD_SIZE;
 
 /// Translated rbigint GC-reference result ABI.
 ///
@@ -67,21 +67,21 @@ pub fn encode_jit_bigint_result(value: *mut BigInt) -> JitBigIntResult {
 }
 
 /// Payload size and traced-field offsets of the `tuple2` of two rbigints.
-pub const BIGINT_PAIR_SIZE: usize = crate::rbigint::RBIGINT_PAIR_SIZE;
-pub const BIGINT_PAIR_ITEM0_OFFSET: usize = crate::rbigint::RBIGINT_PAIR_ITEM0_OFFSET;
-pub const BIGINT_PAIR_ITEM1_OFFSET: usize = crate::rbigint::RBIGINT_PAIR_ITEM1_OFFSET;
+pub const BIGINT_PAIR_SIZE: usize = majit_rlib::rbigint::RBIGINT_PAIR_SIZE;
+pub const BIGINT_PAIR_ITEM0_OFFSET: usize = majit_rlib::rbigint::RBIGINT_PAIR_ITEM0_OFFSET;
+pub const BIGINT_PAIR_ITEM1_OFFSET: usize = majit_rlib::rbigint::RBIGINT_PAIR_ITEM1_OFFSET;
 
 /// Same GC-reference result ABI as [`JitBigIntResult`], for the `tuple2` a
 /// two-result elidable returns.
 #[cfg(not(target_arch = "wasm32"))]
-pub type JitBigIntPairResult = *mut crate::rbigint::RBigIntPair;
+pub type JitBigIntPairResult = *mut majit_rlib::rbigint::RBigIntPair;
 #[cfg(target_arch = "wasm32")]
 pub type JitBigIntPairResult = i64;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 pub fn encode_jit_bigint_pair_result(
-    value: *mut crate::rbigint::RBigIntPair,
+    value: *mut majit_rlib::rbigint::RBigIntPair,
 ) -> JitBigIntPairResult {
     value
 }
@@ -89,7 +89,7 @@ pub fn encode_jit_bigint_pair_result(
 #[cfg(target_arch = "wasm32")]
 #[inline]
 pub fn encode_jit_bigint_pair_result(
-    value: *mut crate::rbigint::RBigIntPair,
+    value: *mut majit_rlib::rbigint::RBigIntPair,
 ) -> JitBigIntPairResult {
     value as usize as i64
 }
@@ -97,7 +97,7 @@ pub fn encode_jit_bigint_pair_result(
 /// Record the GC type id registered for the `tuple2` of two rbigints (called
 /// once from `pyre-jit::eval` after `gc.register_type`).
 pub fn set_bigint_pair_gc_type_id(id: u32) {
-    crate::rbigint::set_rbigint_pair_gc_type_id(id);
+    majit_rlib::rbigint::set_rbigint_pair_gc_type_id(id);
 }
 
 /// Allocate the `tuple2` owning both halves of a divmod result.
@@ -105,8 +105,8 @@ pub fn set_bigint_pair_gc_type_id(id: u32) {
 pub fn alloc_bigint_pair_nursery_collecting(
     item0: BigInt,
     item1: BigInt,
-) -> *mut crate::rbigint::RBigIntPair {
-    crate::rbigint::alloc_rbigint_pair_nursery_collecting(item0, item1)
+) -> *mut majit_rlib::rbigint::RBigIntPair {
+    majit_rlib::rbigint::alloc_rbigint_pair_nursery_collecting(item0, item1)
 }
 
 /// Non-collecting `tuple2` over two already-reachable payloads, for the
@@ -115,8 +115,8 @@ pub fn alloc_bigint_pair_nursery_collecting(
 pub fn alloc_bigint_pair_no_collect(
     item0: *mut BigInt,
     item1: *mut BigInt,
-) -> *mut crate::rbigint::RBigIntPair {
-    crate::rbigint::alloc_rbigint_pair_no_collect(item0, item1)
+) -> *mut majit_rlib::rbigint::RBigIntPair {
+    majit_rlib::rbigint::alloc_rbigint_pair_no_collect(item0, item1)
 }
 
 /// GC type id for the raw `rbigint` payload, published at JitDriver init by
@@ -126,7 +126,7 @@ pub fn alloc_bigint_pair_no_collect(
 /// Record the GC type id registered for the `rbigint` payload (called once from
 /// `pyre-jit::eval` after `gc.register_type`).
 pub fn set_bigint_gc_type_id(id: u32) {
-    crate::rbigint::set_rbigint_gc_type_id(id);
+    majit_rlib::rbigint::set_rbigint_gc_type_id(id);
 }
 
 /// Reads the runtime-assigned rbigint type id (set once at init by
@@ -134,7 +134,7 @@ pub fn set_bigint_gc_type_id(id: u32) {
 /// JIT residualises the read instead of tracing into it (`@dont_look_inside`).
 #[majit_macros::dont_look_inside]
 pub fn bigint_gc_type_id() -> u32 {
-    crate::rbigint::rbigint_gc_type_id()
+    majit_rlib::rbigint::rbigint_gc_type_id()
 }
 
 /// Allocate `value` as a GC-managed `rbigint` in the nursery (no-collect host
@@ -145,7 +145,7 @@ pub fn bigint_gc_type_id() -> u32 {
 /// installed (bare unit tests, where the result is never traced).
 #[inline]
 pub fn alloc_bigint_nursery(value: BigInt) -> *mut BigInt {
-    crate::rbigint::alloc_rbigint_nursery(value)
+    majit_rlib::rbigint::alloc_rbigint_nursery(value)
 }
 
 /// Allocate `value` as a GC-managed `rbigint` through the collecting nursery.
@@ -161,7 +161,7 @@ pub fn alloc_bigint_nursery(value: BigInt) -> *mut BigInt {
 /// is needed.
 #[inline]
 pub fn alloc_bigint_nursery_collecting(value: BigInt) -> *mut BigInt {
-    crate::rbigint::alloc_rbigint_nursery_collecting(value)
+    majit_rlib::rbigint::alloc_rbigint_nursery_collecting(value)
 }
 
 /// Allocate `value` as a GC-managed `rbigint` at a stable (old-gen, non-moving)
@@ -170,7 +170,7 @@ pub fn alloc_bigint_nursery_collecting(value: BigInt) -> *mut BigInt {
 /// pre-init.
 #[inline]
 pub fn alloc_bigint_stable(value: BigInt) -> *mut BigInt {
-    crate::rbigint::alloc_rbigint_stable(value)
+    majit_rlib::rbigint::alloc_rbigint_stable(value)
 }
 
 /// Wrap an already heap-allocated `*mut BigInt` in a fresh W_LongObject
@@ -245,7 +245,7 @@ pub fn w_long_new(value: BigInt) -> PyObjectRef {
 pub fn w_long_new_fresh_rbigint_handle(value: BigInt) -> PyObjectRef {
     // No-collect host counterpart of `jit_bigint_clone`: rbigint.neg always
     // constructs a new handle, including for the prebuilt zero digit array.
-    w_long_from_raw(crate::rbigint::alloc_rbigint_nursery_impl(value, false))
+    w_long_from_raw(majit_rlib::rbigint::alloc_rbigint_clone_nursery(value))
 }
 
 /// Create a W_LongObject from an i64 value.
@@ -288,7 +288,7 @@ pub extern "C" fn jit_bigint_from_u64(value: u64) -> JitBigIntResult {
 pub extern "C" fn jit_bigint_clone(value: i64) -> JitBigIntResult {
     let value = value as *const BigInt;
     unsafe {
-        encode_jit_bigint_result(crate::rbigint::alloc_rbigint_clone_nursery_collecting(
+        encode_jit_bigint_result(majit_rlib::rbigint::alloc_rbigint_clone_nursery_collecting(
             (*value).clone(),
         ))
     }

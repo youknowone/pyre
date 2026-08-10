@@ -948,7 +948,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // int rather than a machine word.
             let (start, stop, step) = pyre_object::w_range_fields(obj);
             let step_is_one =
-                pyre_object::range_obj_to_bigint(step) == pyre_object::rbigint::RBigInt::from(1);
+                pyre_object::range_obj_to_bigint(step) == majit_rlib::rbigint::RBigInt::from(1);
             let mut out = Wtf8Buf::new();
             out.push_str("range(");
             out.push_wtf8(&py_repr_wtf8(start)?);

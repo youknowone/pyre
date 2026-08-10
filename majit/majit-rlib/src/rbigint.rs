@@ -15,12 +15,13 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use crate::object_array::{
+use crate::lltypesystem::rlist::{
     GC_INT_ARRAY_GC_TYPE_ID, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock,
     alloc_typed_items_block_immortal, alloc_typed_items_block_nursery,
     try_alloc_typed_items_block_nursery, typed_items_block_capacity, typed_items_block_clear,
     typed_items_block_items_base,
 };
+use majit_gc::GcAllocOutcome;
 
 pub const SUPPORT_INT128: bool = true;
 pub const BYTEORDER: &str = if cfg!(target_endian = "little") {
@@ -258,15 +259,15 @@ pub struct RBigInt {
 /// registered with MiniMark.
 pub struct RBigIntGcRoot {
     value: Box<RBigInt>,
-    slot: *mut *mut u8,
+    slot: *mut majit_ir::GcRef,
     registered: bool,
 }
 
 impl RBigIntGcRoot {
     pub fn new(value: RBigInt) -> Self {
         let mut value = Box::new(value);
-        let slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>();
-        let registered = unsafe { crate::gc_hook::try_gc_add_root(slot) };
+        let slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<majit_ir::GcRef>();
+        let registered = unsafe { majit_gc::gc_add_root(slot) };
         Self {
             value,
             slot,
@@ -292,7 +293,7 @@ impl std::ops::DerefMut for RBigIntGcRoot {
 impl Drop for RBigIntGcRoot {
     fn drop(&mut self) {
         if self.registered {
-            crate::gc_hook::try_gc_remove_root(self.slot);
+            majit_gc::gc_remove_root(self.slot);
         }
     }
 }
@@ -590,8 +591,8 @@ pub(crate) fn alloc_rbigint_nursery_impl(
     // request; `malloc_raw` below would then leave `_digits` — this payload's
     // one traced edge — unreachable to the collector.
     if tid != 0
-        && let Some(raw) = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-            crate::gc_hook::try_gc_alloc_fast_with_placement(
+        && let Some(raw) = GcAllocOutcome::classify(unsafe {
+            majit_gc::alloc_fast_nursery_typed_with_placement(
                 tid,
                 RBIGINT_PAYLOAD_SIZE,
                 &mut needs_write_barrier,
@@ -607,16 +608,24 @@ pub(crate) fn alloc_rbigint_nursery_impl(
         // nursery allocation. The no-collect allocator reports the exceptional
         // old-gen spill, where `_digits` can still be young.
         if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier(raw);
+            majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
         }
         return raw as *mut RBigInt;
     }
-    crate::lltype::malloc_raw(value)
+    crate::malloc_raw(value)
 }
 
 #[inline]
 pub fn alloc_rbigint_nursery(value: RBigInt) -> *mut RBigInt {
     alloc_rbigint_nursery_impl(value, true)
+}
+
+/// No-collect twin of [`alloc_rbigint_clone_nursery_collecting`]: allocate a
+/// fresh handle for a shallow copy whose digit array happens to be a prebuilt
+/// value's, without canonicalizing it back onto that prebuilt payload.
+#[inline]
+pub fn alloc_rbigint_clone_nursery(value: RBigInt) -> *mut RBigInt {
+    alloc_rbigint_nursery_impl(value, false)
 }
 
 #[inline]
@@ -639,15 +648,16 @@ fn alloc_rbigint_nursery_collecting_impl(
         // its one traced edge is `_digits` — so this malloc site is one of the
         // `malloc_fast` sites `gct_fv_gc_malloc` (`framework.py:820-838`)
         // selects.
-        let digit_slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>();
+        let digit_slot =
+            (&mut value._digits as *mut *mut TypedItemsBlock).cast::<majit_ir::GcRef>();
         let mut needs_write_barrier = true;
         // `NoRoute` falls through to the no-collect path below, which has its
         // own hook to try. A failure does not: this allocation already ran a
         // minor collection, so retrying the no-collect path would only reach
         // its `malloc_raw` fallback and hide the failure behind an untraced
         // payload.
-        let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-            crate::gc_hook::try_gc_alloc_fast_collecting_rooted(
+        let raw = GcAllocOutcome::classify(unsafe {
+            majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                 tid,
                 RBIGINT_PAYLOAD_SIZE,
                 digit_slot,
@@ -664,7 +674,7 @@ fn alloc_rbigint_nursery_collecting_impl(
             // nursery allocation. Retain it only for collectors that satisfy
             // the request in old-gen.
             if needs_write_barrier {
-                crate::gc_hook::try_gc_write_barrier(raw);
+                majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
             }
             return raw as *mut RBigInt;
         }
@@ -695,7 +705,11 @@ pub fn alloc_rbigint_stable(value: RBigInt) -> *mut RBigInt {
     }
     let tid = rbigint_gc_type_id();
     if tid != 0 {
-        let raw = crate::gc_hook::try_gc_alloc_stable_or_abort(tid, RBIGINT_PAYLOAD_SIZE);
+        // `NoRoute` leaves `raw` null and falls through to `malloc_raw`; a
+        // `Failed` aborts inside `allocated_or_abort`.
+        let raw = GcAllocOutcome::classify(majit_gc::alloc_oldgen_typed(tid, RBIGINT_PAYLOAD_SIZE))
+            .allocated_or_abort(RBIGINT_PAYLOAD_SIZE)
+            .unwrap_or(std::ptr::null_mut());
         if !raw.is_null() {
             unsafe {
                 std::ptr::write(raw as *mut RBigInt, value);
@@ -704,11 +718,11 @@ pub fn alloc_rbigint_stable(value: RBigInt) -> *mut RBigInt {
             // nursery GcArray(Signed).  Without this creation barrier a minor
             // collection never visits the payload and reclaims/moves the live
             // digit array behind W_LongObject.
-            crate::gc_hook::try_gc_write_barrier(raw);
+            majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
             return raw as *mut RBigInt;
         }
     }
-    crate::lltype::malloc_raw(value)
+    crate::malloc_raw(value)
 }
 
 /// RPython's `tuple2` of two `rbigint`s — the return type of `rbigint.divmod`
@@ -749,15 +763,15 @@ pub fn rbigint_pair_gc_type_id() -> u32 {
 /// each payload pointer registers its own slot; the collector forwards through
 /// it exactly as it would through a shadow-stack entry.
 struct PendingPairItemRoot {
-    slot: *mut *mut u8,
+    slot: *mut majit_ir::GcRef,
     registered: bool,
 }
 
 impl PendingPairItemRoot {
     /// `slot` must outlive the guard and must not move while it is registered.
     unsafe fn new(slot: *mut *mut RBigInt) -> Self {
-        let slot = slot.cast::<*mut u8>();
-        let registered = unsafe { crate::gc_hook::try_gc_add_root(slot) };
+        let slot = slot.cast::<majit_ir::GcRef>();
+        let registered = unsafe { majit_gc::gc_add_root(slot) };
         Self { slot, registered }
     }
 }
@@ -765,7 +779,7 @@ impl PendingPairItemRoot {
 impl Drop for PendingPairItemRoot {
     fn drop(&mut self) {
         if self.registered {
-            crate::gc_hook::try_gc_remove_root(self.slot);
+            majit_gc::gc_remove_root(self.slot);
         }
     }
 }
@@ -797,16 +811,14 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
         // pre-init heap reaches `malloc_raw`. An untraced pair would be an
         // invisible edge to two GC-managed payloads, so this chain must not end
         // in `malloc_raw` while the payloads themselves are GC-managed.
-        let raw = crate::gc_hook::GcAllocOutcome::from_hook(
-            crate::gc_hook::try_gc_alloc_collecting(tid, RBIGINT_PAIR_SIZE),
-        )
+        let raw = GcAllocOutcome::classify(majit_gc::alloc_nursery_collecting_typed(
+            tid,
+            RBIGINT_PAIR_SIZE,
+        ))
         .allocated_or_abort(RBIGINT_PAIR_SIZE)
         .or_else(|| {
-            crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
-                tid,
-                RBIGINT_PAIR_SIZE,
-            ))
-            .allocated_or_abort(RBIGINT_PAIR_SIZE)
+            GcAllocOutcome::classify(majit_gc::alloc_nursery_typed(tid, RBIGINT_PAIR_SIZE))
+                .allocated_or_abort(RBIGINT_PAIR_SIZE)
         });
         if let Some(raw) = raw {
             unsafe {
@@ -818,11 +830,11 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
             // both payloads stay young, so this is not the fresh fixed-size
             // initialization whose field barriers framework.py:28-61
             // `propagate_no_write_barrier_needed` removes.
-            crate::gc_hook::try_gc_write_barrier(raw);
+            majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
             return raw as *mut RBigIntPair;
         }
     }
-    crate::lltype::malloc_raw(RBigIntPair { item0, item1 })
+    crate::malloc_raw(RBigIntPair { item0, item1 })
 }
 
 /// Build the `tuple2` over two payloads that are already reachable.
@@ -835,19 +847,17 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
 pub fn alloc_rbigint_pair_no_collect(item0: *mut RBigInt, item1: *mut RBigInt) -> *mut RBigIntPair {
     let tid = rbigint_pair_gc_type_id();
     if tid != 0
-        && let Some(raw) = crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
-            tid,
-            RBIGINT_PAIR_SIZE,
-        ))
-        .allocated_or_abort(RBIGINT_PAIR_SIZE)
+        && let Some(raw) =
+            GcAllocOutcome::classify(majit_gc::alloc_nursery_typed(tid, RBIGINT_PAIR_SIZE))
+                .allocated_or_abort(RBIGINT_PAIR_SIZE)
     {
         unsafe {
             std::ptr::write(raw as *mut RBigIntPair, RBigIntPair { item0, item1 });
         }
-        crate::gc_hook::try_gc_write_barrier(raw);
+        majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
         return raw as *mut RBigIntPair;
     }
-    crate::lltype::malloc_raw(RBigIntPair { item0, item1 })
+    crate::malloc_raw(RBigIntPair { item0, item1 })
 }
 
 impl Clone for RBigInt {
@@ -4704,7 +4714,7 @@ struct PartsCacheBase {
 /// slot must be registered until either the shared list owns it or it is
 /// discarded after losing a concurrent append race.
 struct PendingPartsCacheDigitRoot {
-    slot: *mut *mut u8,
+    slot: *mut majit_ir::GcRef,
     registered: bool,
 }
 
@@ -4713,8 +4723,8 @@ impl PendingPartsCacheDigitRoot {
     /// guard's lifetime.
     unsafe fn new(value: &std::sync::Arc<RBigInt>) -> Self {
         let value = std::sync::Arc::as_ptr(value) as *mut RBigInt;
-        let slot = unsafe { std::ptr::addr_of_mut!((*value)._digits).cast::<*mut u8>() };
-        let registered = unsafe { crate::gc_hook::try_gc_add_root(slot) };
+        let slot = unsafe { std::ptr::addr_of_mut!((*value)._digits).cast::<majit_ir::GcRef>() };
+        let registered = unsafe { majit_gc::gc_add_root(slot) };
         Self { slot, registered }
     }
 }
@@ -4722,7 +4732,7 @@ impl PendingPartsCacheDigitRoot {
 impl Drop for PendingPartsCacheDigitRoot {
     fn drop(&mut self) {
         if self.registered {
-            crate::gc_hook::try_gc_remove_root(self.slot);
+            majit_gc::gc_remove_root(self.slot);
         }
     }
 }

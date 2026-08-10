@@ -1,8 +1,8 @@
 //! pypy/objspace/std/formatting.py — printf-style string formatting.
 #![allow(non_camel_case_types, non_snake_case)]
 
+use majit_rlib::rbigint::RBigInt as BigInt;
 use num_traits::ToPrimitive;
-use pyre_object::rbigint::RBigInt as BigInt;
 use rustpython_common::cformat::{
     CCharacterType, CConversionFlags, CFormatBytes, CFormatConversion, CFormatPart,
     CFormatPrecision, CFormatQuantity, CFormatSpec, CFormatSpecKeyed, CFormatType, CFormatWtf8,
@@ -258,9 +258,9 @@ fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> Result<String, PyError> 
         ),
     };
     let digits = match radix {
-        8 => pyre_object::rbigint::BASE8,
-        10 => pyre_object::rbigint::BASE10,
-        16 => pyre_object::rbigint::BASE16,
+        8 => majit_rlib::rbigint::BASE8,
+        10 => majit_rlib::rbigint::BASE10,
+        16 => majit_rlib::rbigint::BASE16,
         _ => unreachable!("percent integer formats use radix 8, 10, or 16"),
     };
     let negative = num.int_lt(0);
@@ -274,8 +274,8 @@ fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> Result<String, PyError> 
     let mut magnitude =
         num.format(digits, "", "", maxdigits as i64)
             .map_err(|error| match error {
-                pyre_object::rbigint::RBigIntError::Memory => PyError::memory_error(""),
-                pyre_object::rbigint::RBigIntError::MaxStrDigits => {
+                majit_rlib::rbigint::RBigIntError::Memory => PyError::memory_error(""),
+                majit_rlib::rbigint::RBigIntError::MaxStrDigits => {
                     crate::builtins::int_max_str_digits_error(maxdigits)
                 }
                 _ => unreachable!("validated radix formatting returned an unrelated error"),

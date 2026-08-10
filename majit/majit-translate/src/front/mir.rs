@@ -15331,7 +15331,7 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
-/// exact `pyre_object::rbigint::RBigInt` ADT. Guards the
+/// exact `majit_rlib::rbigint::RBigInt` ADT. Guards the
 /// RBigInt binary-operator retarget (`front::bigint_binop`) so a same-named
 /// operator (`BitAnd`/`Sub`/`Mul`/…) on any other type is never redirected to
 /// a `jit_bigint_*` residual that would misread its non-RBigInt pointer.
@@ -17260,12 +17260,12 @@ fn strip_crate_prefix(path: &str) -> String {
 /// receiver (see [`Lowering::is_items_block_base_ptr_add`]).  Matched on
 /// the module-qualified path so a leaf collision in another module
 /// cannot widen the gate, and crate-prefix-independent so the same
-/// accessor matches whether reached from `pyre_object`, `pyre_interpreter`,
-/// or `pyre_jit`'s monomorphized copy.
+/// accessor matches whether reached from `majit_rlib`, `pyre_object`,
+/// `pyre_interpreter`, or `pyre_jit`'s monomorphized copy.
 fn graph_is_items_block_base_accessor(name: &str) -> bool {
     name.ends_with("object_array::items_block_items_base")
         || name.ends_with("object_array::items_block_items_ptr")
-        || name.ends_with("object_array::typed_items_block_items_base")
+        || name.ends_with("rlist::typed_items_block_items_base")
 }
 
 /// One path segment, with a raw-identifier prefix removed.  `r#struct` and
@@ -20713,7 +20713,7 @@ mod tests {
             "pyre_jit::object_array::items_block_items_base"
         ));
         assert!(graph_is_items_block_base_accessor(
-            "pyre_object::object_array::typed_items_block_items_base"
+            "majit_rlib::lltypesystem::rlist::typed_items_block_items_base"
         ));
 
         // Bodies that dereference a `.add(NAMED_OFFSET)` interior pointer

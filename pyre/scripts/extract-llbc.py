@@ -38,6 +38,20 @@ SPECS: dict[str, CrateSpec] = {
         # for a cross target.
         layout_targets=(),
     ),
+    # `majit-rlib` gets its own artefact rather than riding along in
+    # `pyre-object`'s. Charon roots a translation at the crate being extracted
+    # and reaches a dependency's items only through a reference, which prunes
+    # exactly what the JIT needs from `rbigint`: its hint markers
+    # (`_elidable_function_*` and friends) are consts nothing calls, so the
+    # reachability walk never reaches them and every `@jit.elidable` on rbigint
+    # silently disappears. Extracted as its own crate, it is translated whole.
+    # (`--start-from majit_rlib::_` on `pyre-object` does not substitute: it
+    # changes opacity, not what cross-crate metadata offers up.)
+    "majit-rlib": CrateSpec(
+        name="majit-rlib",
+        crate_dir=ROOT / "majit" / "majit-rlib",
+        output_name="majit-rlib.ullbc",
+    ),
     "pyre-object": CrateSpec(
         name="pyre-object",
         crate_dir=ROOT / "pyre" / "pyre-object",
@@ -83,7 +97,7 @@ SPECS: dict[str, CrateSpec] = {
     ),
 }
 
-DEFAULT_CRATES = ["pyre-object", "pyre-interpreter", "pyre-jit"]
+DEFAULT_CRATES = ["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"]
 
 # Targets, besides the extraction host, that get a layout sidecar. The
 # wasm32 build reads the same `build/llbc` set as the native build, and its

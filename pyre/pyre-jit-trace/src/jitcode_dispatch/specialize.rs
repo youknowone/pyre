@@ -9143,7 +9143,7 @@ fn try_walker_specialize_builtin_divmod_long_int<Sym: WalkSym>(
     };
     let read_payload = |o: pyre_object::PyObjectRef| unsafe {
         *((o as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET) as *const i64)
-            as *mut pyre_object::rbigint::RBigInt
+            as *mut majit_rlib::rbigint::RBigInt
     };
     let long_payload = read_payload(long_obj) as i64;
     let (div_payload, mod_payload) = (read_payload(w_div), read_payload(w_mod));

@@ -1637,6 +1637,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "majit-rlib"
+version = "0.0.2"
+dependencies = [
+ "majit-gc",
+ "majit-ir",
+ "majit-macros",
+ "malachite-bigint",
+ "num-traits",
+]
+
+[[package]]
 name = "majit-trace"
 version = "0.0.2"
 dependencies = [
@@ -2192,6 +2203,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "majit-rlib",
  "malachite-bigint",
  "num-complex",
  "num-integer",
@@ -2232,6 +2244,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "majit-rlib",
  "majit-trace",
  "majit-translate",
  "num-traits",
@@ -2257,6 +2270,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "majit-rlib",
  "majit-trace",
  "majit-translate",
  "mimalloc",
@@ -2306,7 +2320,7 @@ dependencies = [
  "linkme",
  "majit-gc",
  "majit-macros",
- "malachite-bigint",
+ "majit-rlib",
  "num-traits",
  "parking_lot",
  "pyre-macros",

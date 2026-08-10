@@ -9,12 +9,10 @@ description = "Python object model for pyre interpreter"
 [dependencies]
 num-traits = { workspace = true }
 majit-gc = { workspace = true }
+majit-rlib = { workspace = true }
 parking_lot = { workspace = true }
 majit-macros = { workspace = true }
 pyre-macros = { workspace = true }
 indexmap = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 linkme = { workspace = true }
-
-[dev-dependencies]
-malachite-bigint = { workspace = true }

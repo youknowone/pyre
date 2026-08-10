@@ -463,8 +463,7 @@ mod tests {
             ]))
         );
         assert!(
-            pow_nomod_residual_path(&segs(&["pyre_object", "rbigint", "RBigInt", "pow",]))
-                .is_none()
+            pow_nomod_residual_path(&segs(&["majit_rlib", "rbigint", "RBigInt", "pow",])).is_none()
         );
         assert_eq!(
             pow_nomod_residual_path(&segs(&[
@@ -513,7 +512,7 @@ mod tests {
             ]))
         );
         assert!(
-            lshift_count_residual_path(&segs(&["pyre_object", "rbigint", "RBigInt", "lshift",]))
+            lshift_count_residual_path(&segs(&["majit_rlib", "rbigint", "RBigInt", "lshift",]))
                 .is_none()
         );
     }

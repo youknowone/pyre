@@ -17,8 +17,8 @@
 use super::cdata;
 use super::stginfo::{self, StgInfoData};
 use super::type_ns_store;
+use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_object::PyObjectRef;
-use pyre_object::rbigint::RBigInt as BigInt;
 use rustpython_host_env::ctypes as host_ctypes;
 use std::sync::OnceLock;
 

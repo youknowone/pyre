@@ -13,7 +13,7 @@
 // additional unsafe block adds noise without safety benefit.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use pyre_object::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

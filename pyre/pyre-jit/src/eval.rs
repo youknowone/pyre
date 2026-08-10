@@ -55,14 +55,6 @@ fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> *mut u8 {
     majit_gc::alloc_nursery_typed(type_id, size).0 as *mut u8
 }
 
-/// `malloc_fast` companion of [`pyre_object_gc_alloc_trampoline`].
-///
-/// # Safety
-/// `type_id` must name a type with no destructor and no weakref flag.
-unsafe fn pyre_object_gc_alloc_fast_trampoline(type_id: u32, size: usize) -> *mut u8 {
-    unsafe { majit_gc::alloc_fast_nursery_typed(type_id, size) }.0 as *mut u8
-}
-
 /// Placement-reporting companion of [`pyre_object_gc_alloc_trampoline`].
 ///
 /// # Safety
@@ -75,21 +67,6 @@ unsafe fn pyre_object_gc_alloc_with_placement_trampoline(
 ) -> *mut u8 {
     unsafe { majit_gc::alloc_nursery_typed_with_placement(type_id, size, needs_write_barrier) }.0
         as *mut u8
-}
-
-/// `malloc_fast` companion of
-/// [`pyre_object_gc_alloc_with_placement_trampoline`].
-///
-/// # Safety
-/// Same contract, plus `type_id` must name a type with no destructor and no
-/// weakref flag.
-unsafe fn pyre_object_gc_alloc_fast_with_placement_trampoline(
-    type_id: u32,
-    size: usize,
-    needs_write_barrier: *mut bool,
-) -> *mut u8 {
-    unsafe { majit_gc::alloc_fast_nursery_typed_with_placement(type_id, size, needs_write_barrier) }
-        .0 as *mut u8
 }
 
 /// Trampoline for stable-address host-side allocations.
@@ -125,29 +102,6 @@ unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
 ) -> *mut u8 {
     unsafe {
         majit_gc::alloc_nursery_collecting_typed_rooted(
-            type_id,
-            size,
-            root as *mut majit_ir::GcRef,
-            needs_write_barrier,
-        )
-        .0 as *mut u8
-    }
-}
-
-/// `malloc_fast` companion of
-/// [`pyre_object_gc_alloc_collecting_rooted_trampoline`].
-///
-/// # Safety
-/// Same contract, plus `type_id` must name a type with no destructor and no
-/// weakref flag.
-unsafe fn pyre_object_gc_alloc_fast_collecting_rooted_trampoline(
-    type_id: u32,
-    size: usize,
-    root: *mut *mut u8,
-    needs_write_barrier: *mut bool,
-) -> *mut u8 {
-    unsafe {
-        majit_gc::alloc_fast_nursery_collecting_typed_rooted(
             type_id,
             size,
             root as *mut majit_ir::GcRef,
@@ -2975,7 +2929,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // has no off-GC limb Vec, destructor, or external-memory accounting.
     let bigint_tid = gc.register_type(TypeInfo::with_gc_ptrs(
         pyre_object::longobject::BIGINT_PAYLOAD_SIZE,
-        vec![pyre_object::rbigint::RBIGINT_DIGITS_OFFSET],
+        vec![majit_rlib::rbigint::RBIGINT_DIGITS_OFFSET],
     ));
     pyre_object::longobject::set_bigint_gc_type_id(bigint_tid);
     // PyPy's FrameDebugData is a plain GC object. It owns three PyObjectRef
@@ -3922,7 +3876,7 @@ fn walk_immortal_exception_singleton_roots(visitor: &mut dyn FnMut(&mut majit_ir
 /// its raw `_digits` slots without depending on majit-ir; this adapter performs
 /// the `GcRef` conversion and writes back a forwarded address.
 fn walk_rbigint_parts_cache(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_object::rbigint::walk_rbigint_cache_digit_slots(|slot| {
+    majit_rlib::rbigint::walk_rbigint_cache_digit_slots(|slot| {
         let mut root = majit_ir::GcRef(*slot as usize);
         visitor(&mut root);
         *slot = root.0 as *mut u8;
@@ -4062,12 +4016,8 @@ fn register_thread_root_areas() {
 /// `Cell` slots and do not touch interpreter state.
 fn install_pyre_object_hooks() {
     pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
-    pyre_object::gc_hook::register_gc_alloc_fast_hook(pyre_object_gc_alloc_fast_trampoline);
     pyre_object::register_gc_alloc_with_placement_hook(
         pyre_object_gc_alloc_with_placement_trampoline,
-    );
-    pyre_object::gc_hook::register_gc_alloc_fast_with_placement_hook(
-        pyre_object_gc_alloc_fast_with_placement_trampoline,
     );
     pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
     pyre_object::gc_hook::register_gc_alloc_collecting_hook(
@@ -4075,9 +4025,6 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::gc_hook::register_gc_alloc_collecting_rooted_hook(
         pyre_object_gc_alloc_collecting_rooted_trampoline,
-    );
-    pyre_object::gc_hook::register_gc_alloc_fast_collecting_rooted_hook(
-        pyre_object_gc_alloc_fast_collecting_rooted_trampoline,
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
@@ -4210,7 +4157,7 @@ pub fn init_gc_subsystem() {
     // translated prebuilt equivalent before any collector root walk rather
     // than lazily manufacturing it from inside the walker. After registration,
     // because it allocates and so needs this thread to hold the GIL.
-    pyre_object::rbigint::initialize_rbigint_parts_cache();
+    majit_rlib::rbigint::initialize_rbigint_parts_cache();
     PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
 }
 

@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
+use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_object::PyObjectRef;
-use pyre_object::rbigint::RBigInt as BigInt;
 
 use crate::PyError;
 

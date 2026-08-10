@@ -1,6 +1,6 @@
 use crate::locals_w;
+use majit_rlib::rbigint::RBigInt as BigInt;
 use num_traits::ToPrimitive;
-use pyre_object::rbigint::RBigInt as BigInt;
 
 use crate::{
     make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
@@ -9617,9 +9617,9 @@ pub(crate) fn parse_int_from_str(
         crate::module::sys::state::int_max_str_digits()
     };
     let mut parser =
-        pyre_object::rbigint::NumberStringParser::new(s, base as i64, true, true, 0, None, 0, true)
+        majit_rlib::rbigint::NumberStringParser::new(s, base as i64, true, true, 0, None, 0, true)
             .map_err(|error| match error {
-                pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+                majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
                 _ => invalid_int_literal(w_source, base),
             })?;
 
@@ -9643,7 +9643,7 @@ pub(crate) fn parse_int_from_str(
     let mut machine_value = 0_i64;
     loop {
         let digit = parser.next_digit().map_err(|error| match error {
-            pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+            majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
             _ => invalid_int_literal(w_source, base),
         })?;
         if digit < 0 {
@@ -9661,8 +9661,8 @@ pub(crate) fn parse_int_from_str(
     }
 
     let value = BigInt::_from_numberstring_parser(&mut parser).map_err(|error| match error {
-        pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
-        pyre_object::rbigint::RBigIntError::MaxStrDigits => unreachable!("limit checked above"),
+        majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+        majit_rlib::rbigint::RBigIntError::MaxStrDigits => unreachable!("limit checked above"),
         _ => invalid_int_literal(w_source, base),
     })?;
     Ok(w_long_new(value))
@@ -9710,8 +9710,8 @@ pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, c
     // MaxIntError and MemoryError edges (and can turn either into a formatting
     // panic), so preserve the direct consumer contract.
     value.str(maxdigits as i64).map_err(|error| match error {
-        pyre_object::rbigint::RBigIntError::MaxStrDigits => too_long(maxdigits),
-        pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+        majit_rlib::rbigint::RBigIntError::MaxStrDigits => too_long(maxdigits),
+        majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
         _ => unreachable!("rbigint.str returned an unrelated error"),
     })
 }
@@ -12474,14 +12474,14 @@ pub(crate) fn _hash_int(a: i64) -> i64 {
 /// `2**61 - 1`, then apply the sign and the `-1 -> -2` sentinel rule.
 #[inline]
 pub(crate) fn _hash_long(v: &BigInt) -> i64 {
-    const HASH_SHIFT: i64 = pyre_object::rbigint::SHIFT % HASH_BITS;
+    const HASH_SHIFT: i64 = majit_rlib::rbigint::SHIFT % HASH_BITS;
     let mut i = v.numdigits();
     let mut x = 0_u64;
     while i > 0 {
         i -= 1;
         x = ((x << HASH_SHIFT) & HASH_MODULUS) + (x >> (HASH_BITS - HASH_SHIFT));
         x += v.udigit(i);
-        if pyre_object::rbigint::SHIFT > HASH_BITS {
+        if majit_rlib::rbigint::SHIFT > HASH_BITS {
             x = (x & HASH_MODULUS) + (x >> HASH_BITS);
         }
         if x >= HASH_MODULUS {
@@ -16434,14 +16434,14 @@ fn index_to_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
 fn format_int_radix(value: &BigInt, radix: u32, prefix: &str) -> Result<String, crate::PyError> {
     let digits = match radix {
         2 => "01",
-        8 => pyre_object::rbigint::BASE8,
-        16 => pyre_object::rbigint::BASE16,
+        8 => majit_rlib::rbigint::BASE8,
+        16 => majit_rlib::rbigint::BASE16,
         _ => unreachable!("hex/oct/bin use only power-of-two radices"),
     };
     value
         .format(digits, prefix, "", 0)
         .map_err(|error| match error {
-            pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+            majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
             _ => unreachable!("validated radix formatting returned an unrelated error"),
         })
 }

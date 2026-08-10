@@ -79,7 +79,7 @@ crate::py_module! {
 
 #[cfg(feature = "host_env")]
 mod imp {
-    use pyre_object::rbigint::RBigInt as BigInt;
+    use majit_rlib::rbigint::RBigInt as BigInt;
     use pyre_object::*;
     use rustpython_host_env::winreg::{self as host_reg, HKEY};
     use std::ffi::OsStr;

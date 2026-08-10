@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn test_arity2_long_long_fits_int_routes_to_specialised_ii() {
         use crate::longobject::w_long_new;
-        use crate::rbigint::RBigInt as BigInt;
+        use majit_rlib::rbigint::RBigInt as BigInt;
         let tup = w_tuple_new(vec![
             w_long_new(BigInt::from(7)),
             w_long_new(BigInt::from(11)),
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn test_arity2_overflow_long_falls_through_to_oo() {
         use crate::longobject::w_long_new;
-        use crate::rbigint::RBigInt as BigInt;
+        use majit_rlib::rbigint::RBigInt as BigInt;
         let huge = BigInt::from(i64::MAX) * BigInt::from(2);
         let tup = w_tuple_new(vec![w_long_new(huge), w_int_new(0)]);
         unsafe {

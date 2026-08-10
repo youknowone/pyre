@@ -87,23 +87,6 @@ pub type GcAllocHookFn = fn(type_id: u32, payload_size: usize) -> *mut u8;
 majit_gc::global_hook!(static GC_ALLOC_HOOK: GcAllocHookFn);
 majit_gc::global_hook!(static GC_ALLOC_STABLE_HOOK: GcAllocHookFn);
 
-/// `malloc_fast` companion of [`GcAllocHookFn`].
-///
-/// `gct_fv_gc_malloc` (`framework.py:820-838`) resolves the allocated type's
-/// finalizer and weakref properties while transforming the malloc site, and
-/// calls the `inline=True` copy of `malloc_fixedsize` annotated
-/// `s_False, s_False, s_False` (`framework.py:361-382`) whenever both are
-/// false — which folds incminimark.py:687-693's two registrations out of the
-/// body. A pyre call site with a statically known type id is in the same
-/// position, so it selects the folded entry point the same way.
-///
-/// # Safety
-/// The caller passes a `type_id` naming a type with no destructor and no
-/// weakref flag.
-pub type GcAllocFastHookFn = unsafe fn(type_id: u32, payload_size: usize) -> *mut u8;
-
-majit_gc::global_hook!(static GC_ALLOC_FAST_HOOK: GcAllocFastHookFn);
-
 /// Placement-reporting companion of [`GcAllocHookFn`] for no-collect
 /// allocations that may spill from the nursery to old-gen.
 pub type GcAllocWithPlacementHookFn =
@@ -111,10 +94,6 @@ pub type GcAllocWithPlacementHookFn =
 
 majit_gc::global_hook!(
     static GC_ALLOC_WITH_PLACEMENT_HOOK: GcAllocWithPlacementHookFn
-);
-
-majit_gc::global_hook!(
-    static GC_ALLOC_FAST_WITH_PLACEMENT_HOOK: GcAllocWithPlacementHookFn
 );
 
 /// Install the allocation callback. Overwrites any previously-installed hook.
@@ -136,94 +115,10 @@ pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<*mut u8> {
     GC_ALLOC_HOOK.get().map(|f| f(type_id, payload_size))
 }
 
-/// What an allocation hook answered, with the two non-pointer states kept
-/// apart.
-///
-/// `malloc_fixedsize` (incminimark.py:640-693) has neither state. The GC is a
-/// prebuilt constant (framework.py:254), so a route always exists, and a
-/// nursery that cannot satisfy the request reaches `collect_and_reserve`
-/// (incminimark.py:981-985), which raises MemoryError rather than handing a
-/// null back. Both states are pyre's own, and they are not interchangeable:
-///
-/// * [`NoRoute`](Self::NoRoute) — nothing owns the heap yet: a bare unit
-///   test, the pre-`init_gc_subsystem` bootstrap, or a build with no backend.
-///   The caller's `malloc_raw` path *is* the whole heap there, so taking it
-///   keeps the object graph consistent.
-/// * [`Failed`](Self::Failed) — a GC owns the heap and could not satisfy the
-///   request. `malloc_raw` is the wrong answer now: the object would hold
-///   managed references the collector never traces or forwards, and its
-///   missing header lets a type-id witness misread the words before it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GcAllocOutcome {
-    Allocated(*mut u8),
-    Failed,
-    NoRoute,
-}
-
-impl GcAllocOutcome {
-    /// Classify a hook result: `None` is [`NoRoute`](Self::NoRoute),
-    /// `Some(null)` is [`Failed`](Self::Failed).
-    #[inline]
-    pub fn from_hook(result: Option<*mut u8>) -> Self {
-        match result {
-            Some(raw) if !raw.is_null() => Self::Allocated(raw),
-            Some(_) => Self::Failed,
-            None => Self::NoRoute,
-        }
-    }
-
-    /// The allocated pointer, or `None` for [`NoRoute`](Self::NoRoute) so the
-    /// caller takes its own non-GC path. A [`Failed`](Self::Failed) does not
-    /// return: see [`gc_alloc_failed`].
-    #[inline]
-    pub fn allocated_or_abort(self, payload_size: usize) -> Option<*mut u8> {
-        match self {
-            Self::Allocated(raw) => Some(raw),
-            Self::Failed => gc_alloc_failed(payload_size),
-            Self::NoRoute => None,
-        }
-    }
-}
-
-/// A GC that owns the heap could not satisfy an allocation.
-///
-/// `collect_and_reserve` (incminimark.py:981-985) raises MemoryError at this
-/// point, so no caller of `malloc_fixedsize` observes a null. The pyre callers
-/// return a bare pointer and run under JIT frames that cannot unwind, so the
-/// failure aborts instead — the answer `alloc_typed_items_block_nursery`
-/// (`object_array.rs`) already gives for a digit array whose allocation fails.
-#[cold]
-#[inline(never)]
-pub fn gc_alloc_failed(payload_size: usize) -> ! {
-    let layout = std::alloc::Layout::from_size_align(payload_size, std::mem::align_of::<usize>())
-        .unwrap_or_else(|_| std::alloc::Layout::new::<usize>());
-    std::alloc::handle_alloc_error(layout)
-}
-
-/// Install the `malloc_fast` allocation callback.
-pub fn register_gc_alloc_fast_hook(hook: GcAllocFastHookFn) {
-    GC_ALLOC_FAST_HOOK.set(Some(hook));
-}
-
-/// Remove the `malloc_fast` allocation callback.
-pub fn clear_gc_alloc_fast_hook() {
-    GC_ALLOC_FAST_HOOK.set(None);
-}
-
-/// [`try_gc_alloc`] for a statically-known type that carries neither a
-/// finalizer nor the weakref flag. Falls back to the general hook when no
-/// backend installed the folded one — the general body is always a correct
-/// implementation of the folded one.
-///
-/// # Safety
-/// `type_id` must name a type with no destructor and no weakref flag.
-#[inline]
-pub unsafe fn try_gc_alloc_fast(type_id: u32, payload_size: usize) -> Option<*mut u8> {
-    if let Some(f) = GC_ALLOC_FAST_HOOK.get() {
-        return Some(unsafe { f(type_id, payload_size) });
-    }
-    try_gc_alloc(type_id, payload_size)
-}
+// The `NoRoute` / `Failed` split is the allocator's contract, not this hook
+// layer's, so it lives with the allocator (`majit_gc`). The hooks here answer
+// in `Option<*mut u8>` and classify with `GcAllocOutcome::from_hook`.
+pub use majit_gc::{GcAllocOutcome, gc_alloc_failed};
 
 pub fn register_gc_alloc_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
     GC_ALLOC_WITH_PLACEMENT_HOOK.set(Some(hook));
@@ -247,33 +142,6 @@ pub fn try_gc_alloc_with_placement(
     }
     *needs_write_barrier = true;
     try_gc_alloc(type_id, payload_size)
-}
-
-/// Install the `malloc_fast` placement-reporting allocation callback.
-pub fn register_gc_alloc_fast_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
-    GC_ALLOC_FAST_WITH_PLACEMENT_HOOK.set(Some(hook));
-}
-
-/// Remove the `malloc_fast` placement-reporting allocation callback.
-pub fn clear_gc_alloc_fast_with_placement_hook() {
-    GC_ALLOC_FAST_WITH_PLACEMENT_HOOK.set(None);
-}
-
-/// [`try_gc_alloc_with_placement`] for a statically-known type that carries
-/// neither a finalizer nor the weakref flag.
-///
-/// # Safety
-/// `type_id` must name a type with no destructor and no weakref flag.
-#[inline]
-pub unsafe fn try_gc_alloc_fast_with_placement(
-    type_id: u32,
-    payload_size: usize,
-    needs_write_barrier: &mut bool,
-) -> Option<*mut u8> {
-    if let Some(f) = GC_ALLOC_FAST_WITH_PLACEMENT_HOOK.get() {
-        return Some(unsafe { f(type_id, payload_size, needs_write_barrier as *mut bool) });
-    }
-    try_gc_alloc_with_placement(type_id, payload_size, needs_write_barrier)
 }
 
 /// Install the stable (old-gen) allocation callback for this thread.
@@ -315,19 +183,6 @@ pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
     try_gc_alloc_stable(type_id, payload_size).unwrap_or(core::ptr::null_mut())
 }
 
-/// [`try_gc_alloc_stable_raw`] for a caller whose fallback is `malloc_raw`.
-///
-/// Returns null only for [`GcAllocOutcome::NoRoute`]; a GC that owns the heap
-/// and then fails aborts rather than letting the caller substitute an untraced
-/// object. Keeps the raw return so the residualised call carries no
-/// discriminant, for the reason [`try_gc_alloc_stable_raw`] documents.
-#[majit_macros::dont_look_inside]
-pub fn try_gc_alloc_stable_or_abort(type_id: u32, payload_size: usize) -> *mut u8 {
-    GcAllocOutcome::from_hook(try_gc_alloc_stable(type_id, payload_size))
-        .allocated_or_abort(payload_size)
-        .unwrap_or(core::ptr::null_mut())
-}
-
 majit_gc::global_hook!(static GC_ALLOC_COLLECTING_HOOK: GcAllocHookFn);
 
 /// Install the *collecting* nursery allocation callback.
@@ -345,16 +200,6 @@ pub fn clear_gc_alloc_collecting_hook() {
     GC_ALLOC_COLLECTING_HOOK.set(None);
 }
 
-/// Attempt a collecting GC nursery allocation via the installed hook. Returns
-/// `None` when no collecting hook is installed (callers fall back to the
-/// no-collect [`try_gc_alloc`]).
-#[inline]
-pub fn try_gc_alloc_collecting(type_id: u32, payload_size: usize) -> Option<*mut u8> {
-    GC_ALLOC_COLLECTING_HOOK
-        .get()
-        .map(|f| f(type_id, payload_size))
-}
-
 /// Root-aware collecting allocation callback. `root` is a caller-owned slot
 /// containing the one GC child manufactured before its parent allocation.
 pub type GcAllocCollectingRootedHookFn = unsafe fn(
@@ -368,26 +213,12 @@ majit_gc::global_hook!(
     static GC_ALLOC_COLLECTING_ROOTED_HOOK: GcAllocCollectingRootedHookFn
 );
 
-majit_gc::global_hook!(
-    static GC_ALLOC_FAST_COLLECTING_ROOTED_HOOK: GcAllocCollectingRootedHookFn
-);
-
 pub fn register_gc_alloc_collecting_rooted_hook(hook: GcAllocCollectingRootedHookFn) {
     GC_ALLOC_COLLECTING_ROOTED_HOOK.set(Some(hook));
 }
 
 pub fn clear_gc_alloc_collecting_rooted_hook() {
     GC_ALLOC_COLLECTING_ROOTED_HOOK.set(None);
-}
-
-/// Install the `malloc_fast` rooted collecting allocation callback.
-pub fn register_gc_alloc_fast_collecting_rooted_hook(hook: GcAllocCollectingRootedHookFn) {
-    GC_ALLOC_FAST_COLLECTING_ROOTED_HOOK.set(Some(hook));
-}
-
-/// Remove the `malloc_fast` rooted collecting allocation callback.
-pub fn clear_gc_alloc_fast_collecting_rooted_hook() {
-    GC_ALLOC_FAST_COLLECTING_ROOTED_HOOK.set(None);
 }
 
 /// Attempt a collecting allocation while preserving `root`.
@@ -419,25 +250,6 @@ pub unsafe fn try_gc_alloc_collecting_rooted(
         try_gc_remove_root(root);
     }
     Some(result)
-}
-
-/// [`try_gc_alloc_collecting_rooted`] for a statically-known type that carries
-/// neither a finalizer nor the weakref flag.
-///
-/// # Safety
-/// Same contract as [`try_gc_alloc_collecting_rooted`], plus `type_id` must
-/// name a type with no destructor and no weakref flag.
-#[inline]
-pub unsafe fn try_gc_alloc_fast_collecting_rooted(
-    type_id: u32,
-    payload_size: usize,
-    root: *mut *mut u8,
-    needs_write_barrier: *mut bool,
-) -> Option<*mut u8> {
-    if let Some(f) = GC_ALLOC_FAST_COLLECTING_ROOTED_HOOK.get() {
-        return Some(unsafe { f(type_id, payload_size, root, needs_write_barrier) });
-    }
-    unsafe { try_gc_alloc_collecting_rooted(type_id, payload_size, root, needs_write_barrier) }
 }
 
 /// Signature of the host-side full-collection callback. Used by
@@ -995,23 +807,9 @@ mod tests {
     fn installed_hook_returning_null_classifies_as_failure_not_no_route() {
         let _hook_lock = hook_test_guard();
         register_gc_alloc_hook(null_hook);
-        let outcome = GcAllocOutcome::from_hook(unsafe { try_gc_alloc_fast(1, 8) });
+        let outcome = GcAllocOutcome::from_hook(try_gc_alloc(1, 8));
         clear_gc_alloc_hook();
         assert_eq!(outcome, GcAllocOutcome::Failed);
-    }
-
-    #[test]
-    fn managed_bigint_digits_do_not_fall_back_to_raw_after_hook_failure() {
-        let _hook_lock = hook_test_guard();
-        register_gc_alloc_hook(null_hook);
-        let block = unsafe {
-            crate::object_array::try_alloc_typed_items_block_nursery(
-                4,
-                crate::object_array::GC_INT_ARRAY_GC_TYPE_ID,
-            )
-        };
-        assert!(block.is_none());
-        clear_gc_alloc_hook();
     }
 
     // Per-thread for the same reason the allocation record is: while these

@@ -1766,6 +1766,106 @@ pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
     ACTIVE_ALLOC_NURSERY_TYPED.set(hook);
 }
 
+/// Whether a backend owns the heap.
+///
+/// The allocation entry points below answer both "no backend" and "the GC
+/// refused" with `GcRef(0)`, and the two are not interchangeable. Nothing owns
+/// the heap during a bare unit test or the pre-`init_gc_subsystem` bootstrap,
+/// so a caller's own `malloc(flavor='raw')` path *is* the whole heap there and
+/// taking it keeps the object graph consistent. Once a backend is installed
+/// that same fallback would leave a raw pointer in a field the collector traces
+/// as a GC reference, and the caller must fail instead.
+///
+/// `set_gc_allocator` publishes every allocation hook in one block
+/// (`majit-backend-dynasm/src/runner.rs:310-323` and its cranelift/wasm twins),
+/// so this one cell answers for all of them.
+///
+/// Upstream has neither state: the GC is a prebuilt constant
+/// (`rpython/memory/gctransform/framework.py:254`) and a nursery that cannot
+/// satisfy a request reaches `collect_and_reserve`
+/// (`rpython/memory/gc/incminimark.py:981-985`), which raises MemoryError.
+pub fn gc_allocator_installed() -> bool {
+    ACTIVE_ALLOC_NURSERY_TYPED.get().is_some()
+}
+
+/// What an allocation answered, with the two non-pointer states kept apart.
+///
+/// `malloc_fixedsize` (incminimark.py:640-693) has neither state. The GC is a
+/// prebuilt constant (framework.py:254), so a route always exists, and a
+/// nursery that cannot satisfy the request reaches `collect_and_reserve`
+/// (incminimark.py:981-985), which raises MemoryError rather than handing a
+/// null back. Both states are this port's own, and they are not
+/// interchangeable:
+///
+/// * [`NoRoute`](Self::NoRoute) — nothing owns the heap yet: a bare unit
+///   test, the pre-`init_gc_subsystem` bootstrap, or a build with no backend.
+///   The caller's `malloc_raw` path *is* the whole heap there, so taking it
+///   keeps the object graph consistent.
+/// * [`Failed`](Self::Failed) — a GC owns the heap and could not satisfy the
+///   request. `malloc_raw` is the wrong answer now: the object would hold
+///   managed references the collector never traces or forwards, and its
+///   missing header lets a type-id witness misread the words before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcAllocOutcome {
+    Allocated(*mut u8),
+    Failed,
+    NoRoute,
+}
+
+impl GcAllocOutcome {
+    /// Classify a hook result: `None` is [`NoRoute`](Self::NoRoute),
+    /// `Some(null)` is [`Failed`](Self::Failed).
+    #[inline]
+    pub fn from_hook(result: Option<*mut u8>) -> Self {
+        match result {
+            Some(raw) if !raw.is_null() => Self::Allocated(raw),
+            Some(_) => Self::Failed,
+            None => Self::NoRoute,
+        }
+    }
+
+    /// Classify what an allocation entry point in this module returned. Those
+    /// answer both states with `GcRef(0)`, so the null is read against
+    /// [`gc_allocator_installed`] to tell them apart.
+    #[inline]
+    pub fn classify(raw: GcRef) -> Self {
+        if raw.0 != 0 {
+            Self::Allocated(raw.0 as *mut u8)
+        } else if gc_allocator_installed() {
+            Self::Failed
+        } else {
+            Self::NoRoute
+        }
+    }
+
+    /// The allocated pointer, or `None` for [`NoRoute`](Self::NoRoute) so the
+    /// caller takes its own non-GC path. A [`Failed`](Self::Failed) does not
+    /// return: see [`gc_alloc_failed`].
+    #[inline]
+    pub fn allocated_or_abort(self, payload_size: usize) -> Option<*mut u8> {
+        match self {
+            Self::Allocated(raw) => Some(raw),
+            Self::Failed => gc_alloc_failed(payload_size),
+            Self::NoRoute => None,
+        }
+    }
+}
+
+/// A GC that owns the heap could not satisfy an allocation.
+///
+/// `collect_and_reserve` (incminimark.py:981-985) raises MemoryError at this
+/// point, so no caller of `malloc_fixedsize` observes a null. The callers here
+/// return a bare pointer and run under JIT frames that cannot unwind, so the
+/// failure aborts instead — the answer `alloc_typed_items_block_nursery`
+/// already gives for a digit array whose allocation fails.
+#[cold]
+#[inline(never)]
+pub fn gc_alloc_failed(payload_size: usize) -> ! {
+    let layout = std::alloc::Layout::from_size_align(payload_size, std::mem::align_of::<usize>())
+        .unwrap_or_else(|_| std::alloc::Layout::new::<usize>());
+    std::alloc::handle_alloc_error(layout)
+}
+
 /// Allocate through the active backend's GC. Returns `GcRef(0)` when
 /// no backend has installed a hook (callers treat this as a
 /// null pointer and fall back to their non-GC path).
@@ -2373,20 +2473,32 @@ pub fn set_active_root_hooks(add: Option<AddRootFn>, remove: Option<RemoveRootFn
 /// Register a stack slot as a GC root with the active backend. No-op
 /// when no backend has installed a hook.
 ///
+/// Returns whether the hook ran, so a guard that pairs this with
+/// [`gc_remove_root`] on drop can skip the removal of a root it never
+/// registered.
+///
 /// # Safety
 /// The caller must ensure the slot remains valid until
 /// [`gc_remove_root`] is called with the same pointer.
-pub unsafe fn gc_add_root(slot: *mut GcRef) {
-    if let Some(f) = ACTIVE_ADD_ROOT.get() {
-        unsafe { f(slot) }
+pub unsafe fn gc_add_root(slot: *mut GcRef) -> bool {
+    match ACTIVE_ADD_ROOT.get() {
+        Some(f) => {
+            unsafe { f(slot) };
+            true
+        }
+        None => false,
     }
 }
 
 /// Remove a previously-registered root slot from the active backend.
-/// No-op when no backend has installed a hook.
-pub fn gc_remove_root(slot: *mut GcRef) {
-    if let Some(f) = ACTIVE_REMOVE_ROOT.get() {
-        f(slot)
+/// No-op when no backend has installed a hook. Returns whether the hook ran.
+pub fn gc_remove_root(slot: *mut GcRef) -> bool {
+    match ACTIVE_REMOVE_ROOT.get() {
+        Some(f) => {
+            f(slot);
+            true
+        }
+        None => false,
     }
 }
 

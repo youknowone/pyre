@@ -183,7 +183,7 @@ mod tests {
             ("div", "jit_bigint_div"),
             ("rem", "jit_bigint_rem"),
         ] {
-            let path = bigint_binop_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", op]))
+            let path = bigint_binop_residual_path(&segs(&["majit_rlib", "rbigint", "<Impl>", op]))
                 .unwrap_or_else(|| panic!("{op} must map"));
             assert_eq!(path, desc(residual));
         }
@@ -192,24 +192,24 @@ mod tests {
     #[test]
     fn maps_each_shift_operator_to_its_residual() {
         for (op, residual) in [("shl", "jit_bigint_shl"), ("shr", "jit_bigint_shr")] {
-            let path = bigint_shift_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", op]))
+            let path = bigint_shift_residual_path(&segs(&["majit_rlib", "rbigint", "<Impl>", op]))
                 .unwrap_or_else(|| panic!("{op} must map"));
             assert_eq!(path, desc(residual));
         }
         // Shifts are not in the two-BigInt-operand map, and vice versa.
         assert!(
-            bigint_binop_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", "shr"]))
+            bigint_binop_residual_path(&segs(&["majit_rlib", "rbigint", "<Impl>", "shr"]))
                 .is_none()
         );
         assert!(
-            bigint_shift_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", "sub"]))
+            bigint_shift_residual_path(&segs(&["majit_rlib", "rbigint", "<Impl>", "sub"]))
                 .is_none()
         );
     }
 
     #[test]
     fn maps_unary_operations_to_their_residuals() {
-        let path = bigint_unop_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", "neg"]))
+        let path = bigint_unop_residual_path(&segs(&["majit_rlib", "rbigint", "<Impl>", "neg"]))
             .expect("neg must map");
         assert_eq!(path, desc("jit_bigint_neg"));
         assert_eq!(
@@ -217,13 +217,12 @@ mod tests {
             Some(desc("jit_bigint_invert"))
         );
         assert_eq!(
-            bigint_unop_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", "not"])),
+            bigint_unop_residual_path(&segs(&["majit_rlib", "rbigint", "<Impl>", "not"])),
             Some(desc("jit_bigint_invert"))
         );
         // Binary operators / shifts are not in the unary map.
         assert!(
-            bigint_unop_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", "add"]))
-                .is_none()
+            bigint_unop_residual_path(&segs(&["majit_rlib", "rbigint", "<Impl>", "add"])).is_none()
         );
         assert_eq!(
             bigint_unop_residual_path(&segs(&["rbigint", "RBigInt", "neg"])),
@@ -240,7 +239,7 @@ mod tests {
         );
         // An operator not in either retarget set.
         assert!(
-            bigint_binop_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", "pow"]))
+            bigint_binop_residual_path(&segs(&["majit_rlib", "rbigint", "<Impl>", "pow"]))
                 .is_none()
         );
         // Too short / no `<Impl>` segment.

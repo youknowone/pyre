@@ -123,7 +123,7 @@ jobs:
       # extraction) — so a translator-only edit reuses those two artefacts;
       # pyre-jit keeps majit-translate because its .ullbc embeds those types.
       run: |
-        for crate in pyre-object pyre-interpreter pyre-jit; do
+        for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
           value="$(scripts/extract-llbc.py --fingerprint "$crate")"
           echo "${crate//-/_}=${value}" >> "$GITHUB_OUTPUT"
         done
@@ -131,7 +131,7 @@ jobs:
     # bodies differ). Splitting the former single build/llbc entry lets the
     # unchanged crates restore while only the changed crate re-extracts; the
     # Extract step below refills any missed crate, so the downstream artefact
-    # always carries all three ullbc files.
+    # always carries the whole ullbc set.
     #
     # Each crate's entry also carries its `*.layouts.ullbc` sidecars — the
     # same crate re-extracted for a cross target and reduced to its type
@@ -139,6 +139,15 @@ jobs:
     # the extraction host's. They must restore alongside the artefact they
     # accompany: a cache hit skips extraction, and `pyre-jit-trace`'s build
     # script refuses a cross-target build whose sidecars are absent.
+    - name: Cache LLBC (majit-rlib)
+      id: llbc-cache-rlib
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/majit-rlib.ullbc
+          build/llbc/majit-rlib.ullbc.fingerprint
+          build/llbc/majit-rlib.*.layouts.ullbc
+        key: llbc-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
     - name: Cache LLBC (pyre-object)
       id: llbc-cache-object
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -170,11 +179,12 @@ jobs:
       # the crates whose .ullbc + matching .fingerprint stamp were restored
       # above, so only the changed crate(s) recompile.
       if: >-
+        steps.llbc-cache-rlib.outputs.cache-hit != 'true' ||
         steps.llbc-cache-object.outputs.cache-hit != 'true' ||
         steps.llbc-cache-interpreter.outputs.cache-hit != 'true' ||
         steps.llbc-cache-jit.outputs.cache-hit != 'true'
       shell: bash
-      run: scripts/extract-llbc.py pyre-object pyre-interpreter pyre-jit
+      run: scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-jit
     - name: Upload LLBC artifact
       # Hand the ullbc set (freshly extracted, or restored from the cache
       # above) to the downstream jobs as a run-scoped artifact. Unlike
@@ -253,6 +263,7 @@ jobs:
       shell: bash
       run: |
         test -d .pyre-build/charon
+        test -s build/llbc/majit-rlib.ullbc
         test -s build/llbc/pyre-object.ullbc
         test -s build/llbc/pyre-interpreter.ullbc
         test -s build/llbc/pyre-jit.ullbc
@@ -383,6 +394,7 @@ jobs:
       shell: bash
       run: |
         test -d .pyre-build/charon
+        test -s build/llbc/majit-rlib.ullbc
         test -s build/llbc/pyre-object.ullbc
         test -s build/llbc/pyre-interpreter.ullbc
         test -s build/llbc/pyre-jit.ullbc
@@ -600,6 +612,7 @@ jobs:
       shell: bash
       run: |
         test -d .pyre-build/charon
+        test -s build/llbc/majit-rlib.ullbc
         test -s build/llbc/pyre-object.ullbc
         test -s build/llbc/pyre-interpreter.ullbc
         test -s build/llbc/pyre-jit.ullbc
@@ -654,6 +667,7 @@ jobs:
       shell: bash
       run: |
         test -d .pyre-build/charon
+        test -s build/llbc/majit-rlib.ullbc
         test -s build/llbc/pyre-object.ullbc
         test -s build/llbc/pyre-interpreter.ullbc
         test -s build/llbc/pyre-jit.ullbc

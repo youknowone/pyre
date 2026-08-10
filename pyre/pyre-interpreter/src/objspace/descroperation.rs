@@ -7,8 +7,8 @@
 #![allow(non_camel_case_types, non_snake_case)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 use num_traits::ToPrimitive;
-use pyre_object::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 
 use pyre_object::unicodeobject::is_str;
 use pyre_object::*;
@@ -137,7 +137,7 @@ fn bigint_xor(a: BigInt, b: BigInt) -> BigInt {
 }
 
 #[majit_macros::elidable]
-fn bigint_lshift(a: &BigInt, shift: i64) -> Result<BigInt, pyre_object::rbigint::RBigIntError> {
+fn bigint_lshift(a: &BigInt, shift: i64) -> Result<BigInt, majit_rlib::rbigint::RBigIntError> {
     // longobject.py passes the result of rbigint.toint(), an RPython Signed.
     // Keep that word signed and pointer-width independent all the way to
     // rbigint.lshift; narrowing through usize truncates valid counts on wasm32.
@@ -202,7 +202,7 @@ fn bigint_int_pow_nomod(a: &BigInt, b: i64) -> Result<BigInt, PyError> {
 #[majit_macros::dont_look_inside]
 fn bigint_lshift_count(a: &BigInt, shift: i64) -> Result<BigInt, PyError> {
     a.lshift(shift).map_err(|error| match error {
-        pyre_object::rbigint::RBigIntError::Memory => PyError::memory_error(""),
+        majit_rlib::rbigint::RBigIntError::Memory => PyError::memory_error(""),
         _ => PyError::value_error("negative shift count"),
     })
 }
@@ -217,7 +217,7 @@ fn bigint_lshift_count(a: &BigInt, shift: i64) -> Result<BigInt, PyError> {
 #[majit_macros::dont_look_inside]
 fn bigint_lshift_int_int_result(iself: i64, shift: i64) -> Result<BigInt, PyError> {
     BigInt::lshift_int_int_bigint_result(iself, shift).map_err(|error| match error {
-        pyre_object::rbigint::RBigIntError::Memory => PyError::memory_error(""),
+        majit_rlib::rbigint::RBigIntError::Memory => PyError::memory_error(""),
         _ => PyError::value_error("negative shift count"),
     })
 }
@@ -241,7 +241,7 @@ fn bigint_checked_scalar(value: &BigInt, bit_count: bool) -> i64 {
     };
     match result {
         Ok(value) => value,
-        Err(pyre_object::rbigint::RBigIntError::Overflow) => {
+        Err(majit_rlib::rbigint::RBigIntError::Overflow) => {
             crate::runtime_ops::jit_publish_exception(
                 PyError::overflow_error("too many digits in integer").to_exc_object(),
             );
@@ -274,7 +274,7 @@ pub extern "C" fn jit_bigint_div(a: i64, b: i64) -> pyre_object::longobject::Jit
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
             pyre_object::longobject::alloc_bigint_nursery_collecting(
-                pyre_object::rbigint::_divrem(&*a, &*b)
+                majit_rlib::rbigint::_divrem(&*a, &*b)
                     .expect("division by zero")
                     .0,
             ),
@@ -293,7 +293,7 @@ pub extern "C" fn jit_bigint_rem(a: i64, b: i64) -> pyre_object::longobject::Jit
         }
         pyre_object::longobject::encode_jit_bigint_result(
             pyre_object::longobject::alloc_bigint_nursery_collecting(
-                pyre_object::rbigint::_divrem(&*a, &*b)
+                majit_rlib::rbigint::_divrem(&*a, &*b)
                     .expect("division by zero")
                     .1,
             ),
@@ -688,7 +688,7 @@ pub extern "C" fn jit_bigint_neg(a: i64) -> pyre_object::longobject::JitBigIntRe
         pyre_object::longobject::encode_jit_bigint_result(
             // rbigint.py:1299-1301 always constructs a fresh rbigint handle,
             // including for zero; only its immutable digits are shared.
-            pyre_object::rbigint::alloc_rbigint_clone_nursery_collecting((&*a).neg()),
+            majit_rlib::rbigint::alloc_rbigint_clone_nursery_collecting((&*a).neg()),
         )
     }
 }
@@ -810,13 +810,13 @@ fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
 #[majit_macros::elidable]
 fn bigint_truediv(a: &BigInt, b: &BigInt) -> Result<f64, PyError> {
     a.truediv(b).map_err(|error| match error {
-        pyre_object::rbigint::RBigIntError::DivisionByZero => {
+        majit_rlib::rbigint::RBigIntError::DivisionByZero => {
             PyError::zero_division(ZERO_DIVISION_MSG)
         }
-        pyre_object::rbigint::RBigIntError::FloatDivisionOverflow => {
+        majit_rlib::rbigint::RBigIntError::FloatDivisionOverflow => {
             PyError::overflow_error("integer division result too large for a float")
         }
-        pyre_object::rbigint::RBigIntError::Memory => PyError::memory_error(""),
+        majit_rlib::rbigint::RBigIntError::Memory => PyError::memory_error(""),
         _ => unreachable!("rbigint.truediv has no other exception edge"),
     })
 }
@@ -1335,7 +1335,7 @@ fn bigint_lshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
     }
     match bigint_lshift(a, shift) {
         Ok(value) => alloc_result_bigint(value, collecting),
-        Err(pyre_object::rbigint::RBigIntError::Memory) => {
+        Err(majit_rlib::rbigint::RBigIntError::Memory) => {
             crate::runtime_ops::jit_publish_exception(PyError::memory_error("").to_exc_object());
             0
         }
@@ -5678,7 +5678,7 @@ mod tests {
         );
 
         // `lshift` returns even a non-canonical zero handle unchanged.
-        let fresh_zero = pyre_object::rbigint::alloc_rbigint_clone_nursery_collecting(unsafe {
+        let fresh_zero = majit_rlib::rbigint::alloc_rbigint_clone_nursery_collecting(unsafe {
             (&*zero).clone()
         });
         assert_ne!(fresh_zero, zero);

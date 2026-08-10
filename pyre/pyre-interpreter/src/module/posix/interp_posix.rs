@@ -3615,7 +3615,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn w_time_ns(ns: i128) -> pyre_object::PyObjectRef {
         match i64::try_from(ns) {
             Ok(n) => pyre_object::w_int_new(n),
-            Err(_) => pyre_object::longobject::w_long_new(pyre_object::rbigint::RBigInt::from(ns)),
+            Err(_) => pyre_object::longobject::w_long_new(majit_rlib::rbigint::RBigInt::from(ns)),
         }
     }
 

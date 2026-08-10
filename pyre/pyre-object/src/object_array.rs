@@ -3,6 +3,18 @@ use std::ops::{Index, IndexMut};
 
 use crate::{PY_NULL, PyObjectRef};
 
+// The `GcArray(Float)` / `GcArray(Signed)` body and its no-collect allocation
+// live with `rbigint`, whose `_digits` is lowered to one
+// (`majit_rlib::lltypesystem::rlist`). The stable-tier constructors below are
+// this crate's, because they root through this crate's shadow stack.
+pub use majit_rlib::lltypesystem::rlist::{
+    GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
+    TYPED_ITEMS_BLOCK_LEN_OFFSET, TypedItemsBlock, alloc_typed_items_block_immortal,
+    alloc_typed_items_block_nursery, itemsblock_gc_enabled, try_alloc_typed_items_block_nursery,
+    try_typed_items_block_layout, typed_items_block_capacity, typed_items_block_clear,
+    typed_items_block_items_base, typed_items_block_layout,
+};
+
 /// GC type id for the variable-length backing block of
 /// `W_ListObject.items` / `W_TupleObject.wrappeditems` /
 /// `DictStorage.values`. Shape matches RPython's
@@ -13,17 +25,9 @@ use crate::{PY_NULL, PyObjectRef};
 /// Re-exported from `pyre_jit_trace::descr` for existing call sites.
 pub const PY_OBJECT_ARRAY_GC_TYPE_ID: u32 = 9;
 
-/// GC type id for `Ptr(GcArray(Signed))` blocks materialized by resume /
-/// blackhole paths. This is a distinct ARRAY identity from
-/// `GcArray(Float)` even though the collector trace shape is the same.
-/// Registered after the dictview (39) and getset-property (40) slots
-/// so `gc.register_type` returns 41 here.
-pub const GC_INT_ARRAY_GC_TYPE_ID: u32 = 41;
-
-/// GC type id for `Ptr(GcArray(Float))` blocks materialized by resume /
-/// blackhole paths. RPython gives each ARRAY lltype its own tid via
-/// `GcLLDescr_framework.init_array_descr`.
-pub const GC_FLOAT_ARRAY_GC_TYPE_ID: u32 = 42;
+// 41 is `Ptr(GcArray(Signed))` and 42 is `Ptr(GcArray(Float))`, re-exported
+// above: registered after the dictview (39) and getset-property (40) slots, so
+// `gc.register_type` returns those two here.
 
 /// GC type id for the `W_ObjectObject.storage` block — the mapdict instance
 /// attribute-value array (`mapdict.py:910` `self.storage`, a
@@ -306,30 +310,6 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
         return block;
     }
     unsafe { alloc_items_block(cap) }
-}
-
-/// Route object-strategy `ItemsBlock` allocations through the moving
-/// nursery (`PY_OBJECT_ARRAY_GC_TYPE_ID`) instead of `std::alloc`. Read
-/// once; default ON — the nursery path mirrors RPython's
-/// `GcArray(OBJECTPTR)` (rlist.py:84) and is validated identical to the
-/// `std::alloc` fallback (check.py 158 both backends, both gate states;
-/// fannkuch/nbody/spectral_norm timings unchanged). `PYRE_GC_ITEMSBLOCK=0`
-/// (or `off`/`false`) restores the `std::alloc` fallback to bisect a
-/// suspected block-GC regression.
-///
-/// Reads (and lazily initialises) the runtime-mutable `ENABLED` `OnceLock`,
-/// not a build-time constant, so the JIT residualizes the call instead of
-/// tracing into it (`@dont_look_inside`, the `gc_interp::enabled` sibling).
-/// The `-> bool` return fits a single word and it cannot raise.
-#[majit_macros::dont_look_inside]
-pub fn itemsblock_gc_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PYRE_GC_ITEMSBLOCK")
-            .map(|v| !matches!(v.trim(), "0" | "off" | "false" | ""))
-            .unwrap_or(true)
-    })
 }
 
 /// Phase L2 nursery allocation of a fresh `ItemsBlock` with `cap` slots,
@@ -625,38 +605,14 @@ unsafe fn grow_items_block(
 
 // ─── TypedItemsBlock: GcArray(Float)/GcArray(Signed) backing block ───────
 //
-// The Float / Integer list strategies (`listobject.py` FloatListStrategy /
-// IntegerListStrategy) store their unboxed items in a `Ptr(GcArray(Float))` /
-// `Ptr(GcArray(Signed))` — `erase([float])` / `erase([int])`. This block
-// mirrors that shape: an 8-byte capacity header (the GcArray length, rlist.py:251
-// `len(l.items)`) followed by inline 8-byte items (f64 or i64). The live list
-// length lives on the enclosing `FloatArray` / `IntArray` wrapper (rlist.py:116
-// `("length", Signed)`), so the header is the allocated capacity, fixed for the
-// block's lifetime (a `grow` allocates a fresh block).
+// The block itself is `majit_rlib::lltypesystem::rlist`, re-exported at the top
+// of this file: the Float / Integer list strategies (`listobject.py`
+// FloatListStrategy / IntegerListStrategy) and `rbigint._digits` are the same
+// `erase([float])` / `erase([int])` lowering, so one body serves all three.
 //
-// Items are non-pointer words, so the GC walker has no inner refs to trace —
-// unlike `ItemsBlock` (`GcArray(OBJECTPTR)`). STEPPING-STONE: like `ItemsBlock`,
-// allocation still uses `std::alloc` rather than MiniMark's nursery; the
-// matching `GC_FLOAT_ARRAY_GC_TYPE_ID` / `GC_INT_ARRAY_GC_TYPE_ID` are inactive
-// at collection time until the Phase L2 allocator cutover.
-
-/// `#[repr(C)] { capacity, items: [u64; 0] }` — the `GcArray(Float)` /
-/// `GcArray(Signed)` body backing `FloatArray` / `IntArray`. Layout: offset 0 =
-/// `capacity` (GcArray length header), offset 8 = items[0..capacity]. Items are
-/// 8-byte words read as `f64` / `i64` by the wrapper; the JIT-visible array
-/// descriptor carries the element type.
-#[repr(C)]
-pub struct TypedItemsBlock {
-    /// Allocated capacity — the GcArray length header (rlist.py:251).
-    pub capacity: usize,
-    /// Items inline after the header; size known only at allocation time.
-    items: [u64; 0],
-}
-
-pub const TYPED_ITEMS_BLOCK_ITEMS_OFFSET: usize = std::mem::offset_of!(TypedItemsBlock, items);
-
-/// Offset of the `capacity` header the collector reads as the GcArray length.
-pub const TYPED_ITEMS_BLOCK_LEN_OFFSET: usize = std::mem::offset_of!(TypedItemsBlock, capacity);
+// What remains here is the stable (old-gen) tier the list strategies allocate
+// in, which roots through this crate's shadow stack, plus the array tokens the
+// descr registry reads.
 
 /// `get_array_token(GcArray(Signed))` — [`GC_INT_ARRAY_GC_TYPE_ID`].
 pub const TYPED_ITEMS_BLOCK_INT_TOKEN: ArrayToken = ArrayToken {
@@ -681,34 +637,6 @@ const _: () = assert!(
     "TypedItemsBlock stores u64 words; another element width needs its own block",
 );
 
-/// Items base pointer (`&items[0]`) of a `TypedItemsBlock`. Null-safe.
-#[inline]
-pub unsafe fn typed_items_block_items_base(block: *mut TypedItemsBlock) -> *mut u8 {
-    if block.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe { (block as *mut u8).add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET) }
-}
-
-/// Allocated capacity (GcArray length header) of a `TypedItemsBlock`. 0 for null.
-#[inline]
-pub unsafe fn typed_items_block_capacity(block: *mut TypedItemsBlock) -> usize {
-    if block.is_null() {
-        return 0;
-    }
-    unsafe { (*block).capacity }
-}
-
-fn typed_items_block_layout(cap: usize) -> Layout {
-    try_typed_items_block_layout(cap).expect("TypedItemsBlock layout")
-}
-
-fn try_typed_items_block_layout(cap: usize) -> Option<Layout> {
-    let items_size = cap.checked_mul(std::mem::size_of::<u64>())?;
-    let total = TYPED_ITEMS_BLOCK_ITEMS_OFFSET.checked_add(items_size)?;
-    Layout::from_size_align(total, std::mem::align_of::<TypedItemsBlock>()).ok()
-}
-
 /// Allocate a fresh zero-filled `TypedItemsBlock` with the given capacity, as a
 /// `tid` (`GC_INT_ARRAY` / `GC_FLOAT_ARRAY`) varsize GcArray. Zero-fill matches
 /// `gc_malloc_array` (rlist.py:262-267 `_ll_list_resize_really`) and the
@@ -732,105 +660,6 @@ pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBl
     unsafe {
         try_alloc_typed_items_block(cap, tid)
             .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()))
-    }
-}
-
-/// Allocate a scalar GcArray in the no-collect moving nursery.
-///
-/// This is the RPython `rbigint._digits` allocation shape.  Bigint arithmetic
-/// may hold several unboxed Rust `RBigInt` handles at once, so the allocator
-/// must not trigger a collection while those raw digit pointers are live.
-/// The completed result's digit edge is explicitly rooted when its RBigInt
-/// payload is boxed by `alloc_rbigint_nursery_collecting`. Once the GC hook is
-/// installed, allocation failure must remain a failure: a raw fallback would
-/// leave `RBigInt._digits` pointing outside the managed heap even though its
-/// descriptor traces that field as `GcArray(Signed)`.
-pub unsafe fn alloc_typed_items_block_nursery(cap: usize, tid: u32) -> *mut TypedItemsBlock {
-    unsafe {
-        try_alloc_typed_items_block_nursery(cap, tid)
-            .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()))
-    }
-}
-
-/// Fallible companion of [`alloc_typed_items_block_nursery`].
-///
-/// `ll_newlist` (rlist.py:324-329) allocates the items array and writes the
-/// length header; the items keep whatever the nursery held, because
-/// `malloc_zero_filled` is false for incminimark (incminimark.py:211). Callers
-/// that need `[0] * n` clear it themselves with
-/// [`typed_items_block_clear`], which is what `ll_alloc_and_set` does
-/// (rtyper/rlist.py:494-503); callers building a list display write every slot.
-///
-/// # Safety
-/// `tid` must name a registered array type with no destructor and no weakref
-/// flag — the `GcArray(Signed)` / `GcArray(Float)` bodies this serves. Every
-/// item the caller reads must be one it has written.
-pub unsafe fn try_alloc_typed_items_block_nursery(
-    cap: usize,
-    tid: u32,
-) -> Option<*mut TypedItemsBlock> {
-    let cap = cap.max(1);
-    let layout = try_typed_items_block_layout(cap)?;
-    if itemsblock_gc_enabled() {
-        // `GcArray(Signed)` / `GcArray(Float)` bodies: no finalizer, not a
-        // WEAKREF, so `gct_fv_gc_malloc` (`framework.py:820-838`) reaches
-        // `malloc_fast`.
-        match unsafe { crate::gc_hook::try_gc_alloc_fast(tid, layout.size()) } {
-            Some(raw) if raw.is_null() => return None,
-            Some(raw) => {
-                let block = raw as *mut TypedItemsBlock;
-                unsafe { (*block).capacity = cap };
-                return Some(block);
-            }
-            None => {}
-        }
-    }
-    unsafe {
-        let raw = alloc(layout);
-        if raw.is_null() {
-            return None;
-        }
-        let block = raw as *mut TypedItemsBlock;
-        (*block).capacity = cap;
-        Some(block)
-    }
-}
-
-/// `rgc.ll_arrayclear(l.ll_items())` — zero every item of a freshly allocated
-/// block, the second half of `ll_alloc_and_set(LIST, count, 0)`
-/// (rtyper/rlist.py:494-503).
-///
-/// # Safety
-/// `block` must be a live items block.
-#[inline]
-pub unsafe fn typed_items_block_clear(block: *mut TypedItemsBlock) {
-    unsafe {
-        std::ptr::write_bytes(
-            typed_items_block_items_base(block),
-            0,
-            (*block).capacity * std::mem::size_of::<u64>(),
-        );
-    }
-}
-
-/// Allocate a headerless, process-lifetime `GcArray(Signed/Float)` body.
-///
-/// This is only for translated prebuilt objects whose module-global owner is
-/// itself immortal (not for ordinary arrays). The layout remains the exact
-/// `[length][items...]` GcArray shape seen by generated code, while the hybrid
-/// collector deliberately treats the address as non-managed. PyPy's prebuilt
-/// `rbigint` digit lists have the same process lifetime.
-pub unsafe fn alloc_typed_items_block_immortal(cap: usize) -> *mut TypedItemsBlock {
-    let cap = cap.max(1);
-    let layout = typed_items_block_layout(cap);
-    unsafe {
-        let raw = alloc_zeroed(layout);
-        if raw.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        let block = raw as *mut TypedItemsBlock;
-        (*block).capacity = cap;
-        block
     }
 }
 

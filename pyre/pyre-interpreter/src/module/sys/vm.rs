@@ -83,7 +83,7 @@ fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
         Ok(w_int_new(total as i64))
     } else {
         Ok(pyre_object::w_long_new(
-            pyre_object::rbigint::RBigInt::from_u128(total as u128),
+            majit_rlib::rbigint::RBigInt::from_u128(total as u128),
         ))
     }
 }

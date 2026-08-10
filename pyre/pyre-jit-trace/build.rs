@@ -137,7 +137,7 @@ fn emit_llbc_extraction_placeholders() {
 /// `.fingerprint` stamp are both named after the crate.  Pyre production
 /// configures the exact `eval::eval_loop_jit` portal, so unlike generic
 /// two-artefact consumers it requires `pyre-jit` too.
-const LLBC_CRATES: &[&str] = &["pyre-object", "pyre-interpreter", "pyre-jit"];
+const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"];
 
 /// Pre-flight the LLBC prerequisite, mirroring the resolution order in
 /// `majit-translate` (`build_semantic_program_via_active_frontend`):
@@ -911,7 +911,7 @@ fn llbc_layout_sidecars() -> Vec<String> {
     // spec for why), so only the object model gets cross-target layouts.
     // The naming convention lives in `majit_translate::layout` so it stays in
     // lockstep with `auto_discover_workspace_llbc_paths`.
-    ["pyre-object", "pyre-interpreter"]
+    ["majit-rlib", "pyre-object", "pyre-interpreter"]
         .iter()
         .map(|crate_name| majit_translate::layout::layout_sidecar_filename(crate_name, &target))
         .collect()

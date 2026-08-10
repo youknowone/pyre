@@ -18,8 +18,8 @@
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntSign as Sign};
 use pyre_object::PyObjectRef;
-use pyre_object::rbigint::{RBigInt as BigInt, RBigIntSign as Sign};
 
 use crate::PyError;
 

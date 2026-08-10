@@ -4,6 +4,7 @@
 //! `W_TextIOWrapper`.  In particular, the buffer and the
 //! ZERO/OK/DETACHED state are not instance-dict side data.
 
+use majit_rlib::rbigint::RBigInt;
 use pyre_object::*;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
