@@ -24050,16 +24050,16 @@ mod tests {
     /// Regression: `RBigInt::digits` uses `from_raw_parts(base, capacity)` — the
     /// block's own length — so its header alias IS sound and must STILL fold
     /// (the P1 fix removes only the object-list arm). The residual
-    /// `from_raw_parts` must be gone. Loads the pyre-object LLBC, ignored.
+    /// `from_raw_parts` must be gone. Loads the majit-rlib LLBC, ignored.
     #[test]
     #[ignore]
     fn rbigint_digits_still_folds_capacity_length_view() {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../build/llbc/majit-rlib.ullbc"
         );
-        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
         let graph = super::lower_function(&llbc, "rbigint::<Impl>::digits")
             .or_else(|_| super::lower_function(&llbc, "digits"))
             .expect("lower digits");

@@ -26,10 +26,37 @@ const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-interpreter.ullbc"
 );
+const RLIB_LLBC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/llbc/majit-rlib.ullbc"
+);
 const RBIGINT_RS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../pyre/pyre-object/src/rbigint.rs"
+    "/../../majit/majit-rlib/src/rbigint.rs"
 );
+
+/// rbigint's bodies and hints are in `majit-rlib.ullbc`, its callers
+/// (`longobject`) in `pyre-object.ullbc`. The front end merges both
+/// (`MANDATORY`), so a test reading either side loads the same pair, owner
+/// first — the per-type tables are first-writer-wins.
+///
+/// `None` means an artefact is missing and the caller skips, which is the
+/// pre-existing behaviour for a tree that has not been extracted.
+fn load_rbigint_llbcs() -> Option<Vec<Llbc>> {
+    for path in [RLIB_LLBC, OBJECT_LLBC] {
+        if !std::path::Path::new(path).is_file() {
+            eprintln!(
+                "skipping: {path} is missing; run \
+                 `python3 scripts/extract-llbc.py majit-rlib pyre-object`"
+            );
+            return None;
+        }
+    }
+    Some(vec![
+        Llbc::load(RLIB_LLBC).expect("load majit-rlib.ullbc"),
+        Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc"),
+    ])
+}
 
 fn assert_source_order(source: &str, fragments: &[&str]) {
     let mut cursor = 0;
@@ -287,16 +314,10 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
 
 #[test]
 fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file() {
-        eprintln!(
-            "skipping: {OBJECT_LLBC} is missing; run \
-             `python3 scripts/extract-llbc.py pyre-object`"
-        );
+    let Some(llbcs) = load_rbigint_llbcs() else {
         return;
-    }
-
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
-    let hints = harvest_hints_from_llbcs(&[llbc]);
+    };
+    let hints = harvest_hints_from_llbcs(&llbcs);
     // Exhaustive mapping of every `@jit.elidable` method in the pinned
     // rpython/rlib/rbigint.py.  This is a performance contract, not just
     // metadata: missing one changes whether callers residualize a pure bigint
@@ -524,17 +545,11 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
 
 #[test]
 fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file() {
-        eprintln!(
-            "skipping: {OBJECT_LLBC} is missing; run \
-             `python3 scripts/extract-llbc.py pyre-object`"
-        );
+    let Some(llbcs) = load_rbigint_llbcs() else {
         return;
-    }
-
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    };
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
-        &[llbc],
+        &llbcs,
         HostStaticAddrs::default(),
         &["rbigint", "longobject"],
     )
@@ -1682,17 +1697,11 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
 
 #[test]
 fn rbigint_operator_calls_retarget_to_gc_reference_residuals() {
-    if !std::path::Path::new(OBJECT_LLBC).is_file() {
-        eprintln!(
-            "skipping: {OBJECT_LLBC} is missing; run \
-             `python3 scripts/extract-llbc.py pyre-object`"
-        );
+    let Some(llbcs) = load_rbigint_llbcs() else {
         return;
-    }
-
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    };
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
-        &[llbc],
+        &llbcs,
         HostStaticAddrs::default(),
         &["longobject"],
     )
