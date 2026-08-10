@@ -11372,6 +11372,46 @@ fn fstring_mismatched_delimiter(source: &str) -> Option<(String, usize)> {
     None
 }
 
+/// Whether the parser's raw byte lies on a physical line containing an
+/// f-prefixed string token.  CPython's tokenizer retains that prefix when it
+/// specializes unterminated-string diagnostics; Ruff's unclosed-string error
+/// drops it.
+fn unclosed_error_is_fstring(source: &str, raw_index: usize) -> bool {
+    let bytes = source.as_bytes();
+    let raw_index = raw_index.min(bytes.len());
+    let line_start = bytes[..raw_index]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let line_end = bytes[raw_index..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |newline| raw_index + newline);
+    for quote in line_start..line_end {
+        if !matches!(bytes[quote], b'\'' | b'"') {
+            continue;
+        }
+        let mut prefix = quote;
+        while prefix > line_start && bytes[prefix - 1].is_ascii_alphabetic() {
+            prefix -= 1;
+        }
+        let token_head_end = quote
+            + if bytes[quote..].starts_with(&[bytes[quote], bytes[quote], bytes[quote]]) {
+                3
+            } else {
+                1
+            };
+        if bytes[prefix..quote]
+            .iter()
+            .any(|byte| byte.eq_ignore_ascii_case(&b'f'))
+            && (prefix..=token_head_end).contains(&raw_index)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
 /// private Python 3.14 `_IncompleteInputError` subclass for parser failures
 /// which end at an unfinished interactive input when
@@ -11496,6 +11536,27 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         e.to_string()
     };
+    let unterminated_fstring = match &e {
+        crate::compile::CompileError::Parse(parse_error) => {
+            unclosed_error_is_fstring(source, parse_error.raw_location.start().to_usize())
+        }
+        _ => false,
+    };
+    if unterminated_fstring {
+        if msg.starts_with("unterminated triple-quoted string literal") {
+            msg = msg.replacen(
+                "unterminated triple-quoted string literal",
+                "unterminated triple-quoted f-string literal",
+                1,
+            );
+        } else if msg.starts_with("unterminated string literal") {
+            msg = msg.replacen(
+                "unterminated string literal",
+                "unterminated f-string literal",
+                1,
+            );
+        }
+    }
     if let Some(unicode_error) = malformed_unicode_name_escape(source) {
         msg = unicode_error;
     }
@@ -11617,8 +11678,9 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         // newline like `e.text`.  Later compiler failures omit it for the
         // synthetic ``<string>`` input, while file compilation keeps the
         // decoded source line for the top-level error printer.
-        let text = if matches!(&e, crate::compile::CompileError::Parse(_)) || filename != "<string>"
-        {
+        let text = if unterminated_fstring {
+            source.lines().nth(lineno - 1)
+        } else if matches!(&e, crate::compile::CompileError::Parse(_)) || filename != "<string>" {
             source.split_inclusive('\n').nth(lineno - 1)
         } else {
             None
@@ -17923,6 +17985,14 @@ mod tests {
                 Some((message.to_owned(), index))
             );
         }
+    }
+
+    #[test]
+    fn unterminated_fstrings_retain_their_prefix() {
+        assert!(unclosed_error_is_fstring("f\"", 2));
+        assert!(unclosed_error_is_fstring("x = 1\nz = rf'''", 10));
+        assert!(!unclosed_error_is_fstring("x = 1\nz = '''", 10));
+        assert!(!unclosed_error_is_fstring(r#"f'{"x'"#, 3));
     }
 
     #[test]
