@@ -116,7 +116,7 @@ pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             args[1],
         ));
     }
-    let address = host_ctypes::lookup_function_symbol_addr(handle, name.as_bytes())
+    let address = super::interp_ctypes::lookup_symbol(handle, name.as_bytes())
         .map_err(|_| crate::PyError::value_error(format!("symbol '{name}' not found")))?;
     Ok(make_at_address(cls, address, size, args[1]))
 }

@@ -2,8 +2,8 @@
 //!
 //! With the `host_env` feature this provides a working end-to-end slice: the
 //! dynamic-linker primitives (`dlopen`/`dlsym`/`dlclose` on posix,
-//! `LoadLibrary`/`FreeLibrary` on Windows, over one shared library cache), the
-//! scalar data type (`_SimpleCData`, see [`super::cdata`]), the foreign
+//! `LoadLibrary`/`FreeLibrary` on Windows), the scalar data type
+//! (`_SimpleCData`, see [`super::cdata`]), the foreign
 //! function object (`CFuncPtr`, see [`super::funcptr`]), `sizeof`/`addressof`/
 //! `byref`/`alignment`/`resize`, and the import-time constants the package
 //! requires.  `Structure`/`Union`/`Array`/`_Pointer`/`CField` are real
@@ -11,7 +11,12 @@
 //! the buffer-view machinery aliases nested/pointed-to memory.
 //!
 //! All host/FFI work is delegated to `rustpython_host_env::ctypes`; the module
-//! contains no direct `libc::` FFI.
+//! contains no direct `libc::` FFI.  The one exception is the Windows loader,
+//! which calls `windows-sys` directly: `LoadLibrary` has to reach
+//! `LoadLibraryExW`'s flags argument, and that layer's Windows door is
+//! `libloading::Library::new`, which has none.  The handle is then the
+//! `HMODULE` rather than a key into its library cache, so `FreeLibrary` and
+//! [`lookup_symbol`] are the plain Win32 calls that go with one.
 
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -413,9 +418,62 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     );
 }
 
+/// Resolve `symbol` in the library a `_handle` names, for `CFuncPtr((name,
+/// dll))` and `in_dll`.
+///
+/// The two platforms disagree on what a `_handle` is. On posix it is a key
+/// into `host_env`'s library cache, which owns the `dlopen` handle and does
+/// the `dlsym`. On Windows it is the `HMODULE` `LoadLibrary` returned — that
+/// cache cannot take one, and `GetProcAddress` on the module is what
+/// `_ctypes.c` does with it anyway.
+#[cfg(all(unix, feature = "host_env"))]
+pub(super) fn lookup_symbol(
+    handle: usize,
+    symbol: &[u8],
+) -> Result<usize, rustpython_host_env::ctypes::LookupSymbolError> {
+    rustpython_host_env::ctypes::lookup_function_symbol_addr(handle, symbol)
+}
+
+#[cfg(all(windows, feature = "host_env"))]
+pub(super) fn lookup_symbol(
+    handle: usize,
+    symbol: &[u8],
+) -> Result<usize, rustpython_host_env::ctypes::LookupSymbolError> {
+    use rustpython_host_env::ctypes::LookupSymbolError as Error;
+    if handle == 0 {
+        return Err(Error::LibraryNotFound);
+    }
+    // `GetProcAddress` names the export in the module's own narrow spelling,
+    // and an embedded NUL would silently truncate the name it looks for.
+    let Ok(name) = std::ffi::CString::new(symbol) else {
+        return Err(Error::Load("symbol name contains a null byte".to_string()));
+    };
+    let address = unsafe {
+        windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+            handle as *mut core::ffi::c_void,
+            name.as_ptr().cast(),
+        )
+    };
+    match address {
+        Some(address) => Ok(address as usize),
+        None => Err(Error::Load(
+            rustpython_host_env::ctypes::format_error_message(None)
+                .unwrap_or_else(|| "symbol not found".to_string()),
+        )),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Windows surface — `_ctypes.c`'s `#ifdef MS_WIN32` module methods
 // ──────────────────────────────────────────────────────────────────────
+
+/// `PyErr_SetFromWindowsErr(GetLastError())` — the code lands in `.winerror`
+/// and the errmap picks the `.errno` its subclass comes from.
+#[cfg(all(windows, feature = "host_env"))]
+fn last_win32_error() -> crate::PyError {
+    let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    crate::PyError::os_error_win32_syscall2(code, pyre_object::PY_NULL, pyre_object::PY_NULL)
+}
 
 /// The names `ctypes/__init__.py` reaches for once `os.name == "nt"`.
 ///
@@ -434,7 +492,21 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "FUNCFLAG_STDCALL", pyre_object::w_int_new(0x0));
     crate::module_ns_store(ns, "FUNCFLAG_HRESULT", pyre_object::w_int_new(0x2));
 
-    // ── LoadLibrary(name, load_flags=0) → handle into the host libcache ──
+    // ── LoadLibrary(name, load_flags=0) → HMODULE ──
+    //
+    // `LoadLibraryExW(name, NULL, load_flags)`.  The flags are not optional
+    // decoration: `CDLL._load_library` (`ctypes/__init__.py:435-451`) defaults
+    // `winmode` to `nt._LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` and adds
+    // `_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` for a name carrying a separator, so
+    // *every* `CDLL` on this platform arrives with a search policy to apply.
+    // Dropping it would silently widen the search back to `LoadLibraryW`'s
+    // default order, which is what those flags exist to narrow.
+    //
+    // The handle is the `HMODULE` itself rather than a key into `host_env`'s
+    // library cache: that cache's Windows door is `Library::new`, which has no
+    // flags parameter, and its raw-handle door is unix-only.  Keeping the
+    // module handle is also what `_ctypes.c` stores, so `FreeLibrary` and the
+    // symbol lookup in [`lookup_symbol`] are the plain Win32 calls on it.
     crate::module_ns_store(
         ns,
         "LoadLibrary",
@@ -444,26 +516,53 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
                     "LoadLibrary() missing library name",
                 ));
             };
-            // A library name is a path, so it reaches the loader in the
-            // filesystem's own units rather than through a lossy decode.
-            let name = if unsafe { pyre_object::is_bytes(name) } {
-                crate::gateway::os_string_from_fs_bytes(unsafe {
-                    pyre_object::bytesobject::w_bytes_data(name)
-                })
-            } else if unsafe { pyre_object::is_str(name) } {
-                crate::gateway::os_string_from_fs_bytes(&crate::gateway::fsencode(name)?)
-            } else {
+            // `PyArg_ParseTuple(args, "U|i:LoadLibrary")` — a str, and the
+            // path reaches the loader in the filesystem's own units so a
+            // surrogate-bearing name round-trips instead of folding to U+FFFD.
+            if !unsafe { pyre_object::is_str(name) } {
                 return Err(crate::PyError::type_error(
-                    "LoadLibrary: name must be a string or bytes",
+                    "LoadLibrary() argument 1 must be str",
                 ));
+            }
+            let name = crate::gateway::os_string_from_fs_bytes(&crate::gateway::fsencode(name)?);
+            let load_flags = match args.get(1) {
+                Some(&flags) => crate::baseobjspace::int_w(flags)? as u32,
+                None => 0,
             };
-            let handle = host_ctypes::open_library(&name).map_err(|e| {
-                let mut msg = rustpython_wtf8::Wtf8Buf::from_string("LoadLibrary(".to_string());
+            let module = {
+                use std::os::windows::ffi::OsStrExt;
+                let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
+                unsafe {
+                    windows_sys::Win32::System::LibraryLoader::LoadLibraryExW(
+                        wide.as_ptr(),
+                        std::ptr::null_mut(),
+                        load_flags,
+                    )
+                }
+            };
+            if module.is_null() {
+                // ERROR_MOD_NOT_FOUND is answered with a plain
+                // FileNotFoundError naming the module rather than the winerror
+                // OSError every other failure gets, because the DLL that is
+                // missing is as often a dependency as the name asked for.
+                const ERROR_MOD_NOT_FOUND: i32 = 126;
+                let err = std::io::Error::last_os_error().raw_os_error();
+                if err != Some(ERROR_MOD_NOT_FOUND) {
+                    return Err(last_win32_error());
+                }
+                let mut msg =
+                    rustpython_wtf8::Wtf8Buf::from_string("Could not find module '".to_string());
                 msg.push_wtf8(&crate::gateway::fsdecode_os_str_wtf8(&name));
-                msg.push_str(&format!("): {e}"));
-                crate::PyError::os_error(msg)
-            })?;
-            Ok(pyre_object::w_int_new(handle as i64))
+                msg.push_str(
+                    "' (or one of its dependencies). Try using the full path with \
+                     constructor syntax.",
+                );
+                return Err(crate::PyError::new(
+                    crate::error::PyErrorKind::FileNotFoundError,
+                    msg,
+                ));
+            }
+            Ok(pyre_object::w_int_new(module as isize as i64))
         }),
     );
 
@@ -477,7 +576,13 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
                 let Some(&handle) = args.first() else {
                     return Err(crate::PyError::type_error("FreeLibrary() needs handle"));
                 };
-                host_ctypes::drop_library(crate::baseobjspace::int_w(handle)? as usize);
+                let module = crate::baseobjspace::int_w(handle)? as isize as *mut core::ffi::c_void;
+                let freed = unsafe {
+                    windows_sys::Win32::Foundation::FreeLibrary(module) != 0
+                };
+                if !freed {
+                    return Err(last_win32_error());
+                }
                 Ok(pyre_object::w_none())
             },
             1,
@@ -508,7 +613,9 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
     );
 
     // ── get_last_error / set_last_error — the ctypes-local copy, which is
-    //    separate from the thread's own Win32 last error ──
+    //    separate from the thread's own Win32 last error.  The setter answers
+    //    with the value it replaced, the same contract `set_errno` above
+    //    carries and the one the documented signature promises. ──
     crate::module_ns_store(
         ns,
         "get_last_error",

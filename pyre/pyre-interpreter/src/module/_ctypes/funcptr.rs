@@ -159,7 +159,7 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
         b"PyOS_snprintf" => return Ok(INTERNAL_PYOS_SNPRINTF),
         _ => {}
     }
-    host_ctypes::lookup_function_symbol_addr(handle, &name_bytes).map_err(|e| {
+    super::interp_ctypes::lookup_symbol(handle, &name_bytes).map_err(|e| {
         use host_ctypes::LookupSymbolError as L;
         if matches!(e, L::LibraryNotFound) {
             return crate::PyError::value_error("library not found");

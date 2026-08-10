@@ -105,9 +105,19 @@ mod process {
     ///
     /// `sysconfig._init_non_posix` calls it on `sys.dllhandle` to locate the
     /// install prefix, so it is on the path of every `import sysconfig` here.
-    /// The buffer is `MAX_PATH` because that is what the caller allocates: a
-    /// longer path comes back truncated rather than retried, and the result is
-    /// NUL-terminated in place before it is read.
+    ///
+    /// The `MAX_PATH` buffer is the interface, not a shortcut: this call is
+    /// specified to hand back one fixed-size buffer, so a longer path comes
+    /// back truncated rather than retried in a growing loop.  `initpath.py:308-315
+    /// _get_module_file_name` allocates exactly `_MAX_PATH` and gives up when
+    /// the result does not fit, and the module this shadows declares
+    /// `WCHAR filename[MAX_PATH]` and forces `filename[MAX_PATH - 1] = '\0'`
+    /// before returning it.  Growing the buffer here would be the deviation.
+    ///
+    /// The length is then the NUL scan rather than the count the call reported,
+    /// because on a truncation the call reports the whole buffer while the
+    /// loader has already terminated the string inside it — taking the reported
+    /// count would append that terminator to the path.
     pub fn get_module_file_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         const MAX_PATH: usize = 260;
         let module = handle_w(arg(args, 0, "GetModuleFileName")?)? as *mut core::ffi::c_void;
