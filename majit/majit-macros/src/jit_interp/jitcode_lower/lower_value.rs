@@ -553,11 +553,16 @@ impl<'c> Lowerer<'c> {
             .iter()
             .map(|(member, value)| {
                 let is_ref = matches!(value.kind, BindingKind::Ref);
+                // A struct literal names no sub-word integer field: the
+                // allocation's own field stores go through the int/ref banks,
+                // so the layout registers the machine-word default here.
                 quote! {
                     (
                         ::core::mem::offset_of!(#struct_path, #member),
                         #is_ref,
                         stringify!(#member),
+                        ::core::mem::size_of::<usize>(),
+                        true,
                     )
                 }
             })

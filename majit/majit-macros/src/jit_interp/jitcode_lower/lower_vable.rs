@@ -1,6 +1,36 @@
 use super::lower_value::struct_type_id_tokens;
 use super::*;
 
+/// The `(field_size, is_signed)` a struct-layout registration reports for one
+/// field, plus a compile-time check that the declaration matches the Rust
+/// struct.  `descr.py:218-239 get_field_descr` derives both from `FIELDTYPE`,
+/// but the macro sees only the field's name at the access site, so a sub-word
+/// integer field has to be named in `int_fields` to be registered as one.
+/// Anything undeclared keeps the machine-word default.
+pub(super) fn field_scalar_tokens(
+    config: &LowererConfig,
+    key: &str,
+    struct_path: &syn::Path,
+    member: &syn::Member,
+) -> (TokenStream, TokenStream, TokenStream) {
+    match config.int_fields.get(key) {
+        Some((ty, signed)) => (
+            quote! { ::core::mem::size_of::<#ty>() },
+            quote! { #signed },
+            // Fails to compile unless the field really has the declared type,
+            // so the declaration cannot drift from the struct it describes.
+            quote! {
+                const _: fn(&#struct_path) -> #ty = |__s| __s.#member;
+            },
+        ),
+        None => (
+            quote! { ::core::mem::size_of::<usize>() },
+            quote! { true },
+            quote! {},
+        ),
+    }
+}
+
 impl<'c> Lowerer<'c> {
     /// Read an immediate operand byte from the green bytecode array:
     /// `program[<index>]`.  Mirrors the dispatch-top opcode fetch
@@ -738,6 +768,8 @@ impl<'c> Lowerer<'c> {
             .map(|s| s.ident.to_string())
             .unwrap_or_default();
         let ref_field_key = format!("{}::{}", struct_last, member_name);
+        let (__fsize, __fsigned, __fcheck) =
+            field_scalar_tokens(config, &ref_field_key, &struct_path, &member);
         let ref_field_entry = config.ref_fields.get(&ref_field_key);
         let is_ref_field = ref_field_entry.is_some();
         // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, a
@@ -761,6 +793,7 @@ impl<'c> Lowerer<'c> {
                     vec![Register::ref_(result_reg)],
                 ),
                 quote! {
+                    #__fcheck
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
@@ -770,6 +803,8 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
                         )],
                     );
                     __builder.getfield_gc_r(
@@ -796,6 +831,7 @@ impl<'c> Lowerer<'c> {
                     vec![Register::int(result_reg)],
                 ),
                 quote! {
+                    #__fcheck
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
@@ -805,6 +841,8 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
                         )],
                     );
                     __builder.getfield_gc_i(
@@ -853,6 +891,8 @@ impl<'c> Lowerer<'c> {
             .map(|s| s.ident.to_string())
             .unwrap_or_default();
         let ref_field_key = format!("{}::{}", struct_last, member_name);
+        let (__fsize, __fsigned, __fcheck) =
+            field_scalar_tokens(config, &ref_field_key, &struct_path, &member);
         let ref_field_entry = config.ref_fields.get(&ref_field_key);
         let is_ref_field = ref_field_entry.is_some();
         let tid = struct_type_id_tokens(&struct_path, false);
@@ -866,6 +906,7 @@ impl<'c> Lowerer<'c> {
                     vec![Register::ref_(result_reg)],
                 ),
                 quote! {
+                    #__fcheck
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
@@ -875,6 +916,8 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
                         )],
                     );
                     __builder.getfield_gc_r(
@@ -900,6 +943,7 @@ impl<'c> Lowerer<'c> {
                     vec![Register::int(result_reg)],
                 ),
                 quote! {
+                    #__fcheck
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
@@ -909,6 +953,8 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
                         )],
                     );
                     __builder.getfield_gc_i(
@@ -1040,6 +1086,8 @@ impl<'c> Lowerer<'c> {
             .map(|s| s.ident.to_string())
             .unwrap_or_default();
         let ref_field_key = format!("{}::{}", struct_last, member_name);
+        let (__fsize, __fsigned, __fcheck) =
+            field_scalar_tokens(config, &ref_field_key, &struct_path, &member);
         let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
         // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, the
         // same id the matching getfield uses so this setfield invalidates it.
@@ -1063,6 +1111,7 @@ impl<'c> Lowerer<'c> {
                     vec![],
                 ),
                 quote! {
+                    #__fcheck
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
@@ -1072,6 +1121,8 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
                         )],
                     );
                     __builder.setfield_gc_r(
@@ -1096,6 +1147,7 @@ impl<'c> Lowerer<'c> {
                     vec![],
                 ),
                 quote! {
+                    #__fcheck
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
@@ -1105,6 +1157,8 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
                         )],
                     );
                     __builder.setfield_gc_i(
@@ -1149,6 +1203,8 @@ impl<'c> Lowerer<'c> {
             .map(|s| s.ident.to_string())
             .unwrap_or_default();
         let ref_field_key = format!("{}::{}", struct_last, member_name);
+        let (__fsize, __fsigned, __fcheck) =
+            field_scalar_tokens(config, &ref_field_key, &struct_path, &member);
         let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
         let tid = struct_type_id_tokens(&struct_path, false);
         let base_reg = binding.reg;
@@ -1165,6 +1221,7 @@ impl<'c> Lowerer<'c> {
                     vec![],
                 ),
                 quote! {
+                    #__fcheck
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
@@ -1174,6 +1231,8 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
                         )],
                     );
                     __builder.setfield_gc_r(
@@ -1197,6 +1256,7 @@ impl<'c> Lowerer<'c> {
                     vec![],
                 ),
                 quote! {
+                    #__fcheck
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
@@ -1206,6 +1266,8 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
+                            #__fsize,
+                            #__fsigned,
                         )],
                     );
                     __builder.setfield_gc_i(

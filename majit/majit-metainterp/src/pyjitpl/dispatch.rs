@@ -475,29 +475,32 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
 /// before `finish_setup_descrs` (jitcode assembly does), matching the
 /// non-trivial-raw-set construction-timing `call_descr` asserts.
 pub fn struct_fields_write_effect_info(
-    layouts: &[(usize, u64, bool, &[(usize, bool, &str)])],
+    layouts: &[(usize, u64, bool, &[(usize, bool, &str, usize, bool)])],
     can_raise: bool,
 ) -> majit_ir::EffectInfo {
     // Mirror `JitCodeBuilder::field_specs_from_layout`: sort by offset so
     // `index_in_parent` is the stable by-offset rank, scalar = one machine word.
     let mut fds = Vec::new();
     for &(struct_size, type_id, is_gc_managed, fields) in layouts {
-        let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
-        ordered.sort_by_key(|&(offset, _, _)| offset);
+        let mut ordered: Vec<(usize, bool, &str, usize, bool)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _, _, _)| offset);
         let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = ordered
             .iter()
             .enumerate()
-            .map(|(idx, &(offset, is_ref, name))| {
-                let (field_type, flag) = if is_ref {
+            .map(|(idx, &(offset, is_ref, name, decl_size, decl_signed))| {
+                let (field_type, field_size, flag) = if is_ref {
                     (
                         majit_ir::value::Type::Ref,
+                        jitcode::scalar_size(majit_ir::value::Type::Ref),
                         majit_ir::descr::ArrayFlag::Pointer,
                     )
                 } else {
-                    (
-                        majit_ir::value::Type::Int,
-                        majit_ir::descr::ArrayFlag::Signed,
-                    )
+                    let flag = if decl_signed {
+                        majit_ir::descr::ArrayFlag::Signed
+                    } else {
+                        majit_ir::descr::ArrayFlag::Unsigned
+                    };
+                    (majit_ir::value::Type::Int, decl_size, flag)
                 };
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: u32::MAX,
@@ -506,8 +509,9 @@ pub fn struct_fields_write_effect_info(
                     offset,
                     // Same width rule as the `field_specs_from_layout` twin
                     // this mirrors: a `Ref` field is one target word (4 on
-                    // wasm32), an `Int` field is its `i64` storage.
-                    field_size: jitcode::scalar_size(field_type),
+                    // wasm32); an `Int` field is its declared storage, which is
+                    // a machine word unless the emit site named it narrower.
+                    field_size,
                     field_type,
                     is_immutable: false,
                     is_quasi_immutable: false,
@@ -527,7 +531,7 @@ pub fn struct_fields_write_effect_info(
             &specs,
         );
         let struct_key = majit_ir::descr::LLType::Struct(type_id);
-        fds.extend(fields.iter().map(|(_, _, write_field)| {
+        fds.extend(fields.iter().map(|(_, _, write_field, _, _)| {
             majit_ir::descr::gc_cache()
                 .lock()
                 .unwrap()

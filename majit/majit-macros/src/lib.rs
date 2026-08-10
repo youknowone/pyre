@@ -34,6 +34,7 @@ struct JitInlineArgs {
     calls: Vec<jit_interp::CallEntry>,
     ref_params: Vec<(Ident, Path)>,
     ref_fields: Vec<jit_interp::RefFieldEntry>,
+    int_fields: Vec<jit_interp::IntFieldEntry>,
     native_int_binops: Vec<(Path, Ident)>,
     native_tag_small: Vec<Path>,
     struct_allocs: Vec<(Path, Path)>,
@@ -45,6 +46,7 @@ impl Parse for JitInlineArgs {
         let mut calls: Vec<jit_interp::CallEntry> = Vec::new();
         let mut ref_params: Vec<(Ident, Path)> = Vec::new();
         let mut ref_fields: Vec<jit_interp::RefFieldEntry> = Vec::new();
+        let mut int_fields: Vec<jit_interp::IntFieldEntry> = Vec::new();
         let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
         let mut native_tag_small: Vec<Path> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
@@ -91,6 +93,9 @@ impl Parse for JitInlineArgs {
                 "ref_fields" => {
                     ref_fields = jit_interp::parse_ref_fields_map(input)?;
                 }
+                "int_fields" => {
+                    int_fields = jit_interp::parse_int_fields_map(input)?;
+                }
                 "helpers" => {
                     let content;
                     syn::bracketed!(content in input);
@@ -126,6 +131,7 @@ impl Parse for JitInlineArgs {
             calls,
             ref_params,
             ref_fields,
+            int_fields,
             native_int_binops,
             native_tag_small,
             struct_allocs,
@@ -2365,6 +2371,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         &args.calls,
         &args.ref_params,
         &args.ref_fields,
+        &args.int_fields,
         &args.native_int_binops,
         &args.native_tag_small,
         &args.headerless_structs,

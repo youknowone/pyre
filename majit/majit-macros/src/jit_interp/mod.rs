@@ -137,6 +137,17 @@ pub struct JitInterpConfig {
     /// The `PointeeType` is recorded so subsequent field access on the
     /// returned ref can resolve its struct layout.
     pub ref_fields: Vec<RefFieldEntry>,
+    /// Sub-word integer field declarations, `int_fields = { Struct::field =>
+    /// u32, ... }`.  A field access lowers to `getfield_gc_i` /
+    /// `setfield_gc_i` either way; what this adds is the field's real width
+    /// and signedness, which the descr otherwise reports as a full signed
+    /// machine word.  `descr.py:218-239 get_field_descr` takes both from
+    /// `FIELDTYPE`, and `intbounds.py` narrows a load's range only when
+    /// `descr.is_integer_bounded()` — true exactly for a sub-word integer
+    /// field.  Undeclared fields keep the machine-word default, so this is
+    /// opt-in per field; a declaration that disagrees with the Rust struct
+    /// fails to compile (see the generated `const _` check).
+    pub int_fields: Vec<IntFieldEntry>,
     /// Struct type annotations for ref-returning call results.
     /// `call_returns = { func_path => StructType, ... }`.  When a
     /// `residual_ref` (or similar ref-returning) call result is bound,
@@ -383,6 +394,32 @@ pub struct RefFieldEntry {
     pub pointee_type: Path,
 }
 
+/// One entry in `int_fields = { Struct::field => u32, ... }`.
+#[derive(Clone)]
+pub struct IntFieldEntry {
+    /// The struct that owns the field (e.g. `Stack`).
+    pub struct_type: Path,
+    /// The field name within the struct (e.g. `size`).
+    pub field: Ident,
+    /// The field's Rust integer type, which supplies its width and sign.
+    pub int_type: Ident,
+}
+
+impl IntFieldEntry {
+    /// `descr.py:240-254 get_type_flag(FIELDTYPE)` — the signed/unsigned half,
+    /// read off the declared Rust type.
+    pub(crate) fn is_signed(&self) -> syn::Result<bool> {
+        match self.int_type.to_string().as_str() {
+            "i8" | "i16" | "i32" | "i64" | "isize" => Ok(true),
+            "u8" | "u16" | "u32" | "u64" | "usize" | "bool" => Ok(false),
+            other => Err(syn::Error::new_spanned(
+                &self.int_type,
+                format!("int_fields: `{other}` is not an integer type"),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
@@ -559,6 +596,7 @@ impl Parse for JitInterpConfig {
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
         let mut pool_arrays: Vec<PoolArrayEntry> = Vec::new();
         let mut ref_fields: Vec<RefFieldEntry> = Vec::new();
+        let mut int_fields: Vec<IntFieldEntry> = Vec::new();
         let mut call_returns: Vec<(Path, Path)> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
         let mut headerless_structs: Vec<Path> = Vec::new();
@@ -620,6 +658,9 @@ impl Parse for JitInterpConfig {
                 }
                 "ref_fields" => {
                     ref_fields = parse_ref_fields_map(input)?;
+                }
+                "int_fields" => {
+                    int_fields = parse_int_fields_map(input)?;
                 }
                 "call_returns" => {
                     call_returns = parse_call_returns_map(input)?;
@@ -688,6 +729,7 @@ impl Parse for JitInterpConfig {
             residual_writes,
             pool_arrays,
             ref_fields,
+            int_fields,
             call_returns,
             struct_allocs,
             headerless_structs,
@@ -832,6 +874,28 @@ fn split_struct_field_path(full_path: Path) -> syn::Result<(Path, Ident)> {
         segments: segments.into_iter().collect(),
     };
     Ok((struct_type, field))
+}
+
+/// Parse `int_fields = { Struct::field => u32, ... }`.  Split like
+/// `ref_fields`: the last segment of `Struct::field` is the field name.
+pub(crate) fn parse_int_fields_map(input: ParseStream) -> syn::Result<Vec<IntFieldEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let (struct_type, field) = split_struct_field_path(content.parse::<Path>()?)?;
+        content.parse::<Token![=>]>()?;
+        let int_type: Ident = content.parse()?;
+        let entry = IntFieldEntry {
+            struct_type,
+            field,
+            int_type,
+        };
+        entry.is_signed()?;
+        entries.push(entry);
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
 }
 
 pub(crate) fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {

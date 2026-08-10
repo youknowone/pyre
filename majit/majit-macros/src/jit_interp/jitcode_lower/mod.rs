@@ -194,6 +194,12 @@ pub struct LowererConfig {
     /// encounters a field access and the `(struct, field)` pair matches, it
     /// emits `getfield_gc_r` / `setfield_gc_r` (ref-kind) instead of `_gc_i`.
     pub(super) ref_fields: HashMap<String, (syn::Path, Ident, syn::Path)>,
+    /// Sub-word integer struct field declarations.  Key = `"StructType::field"`,
+    /// value = `(rust_int_type, is_signed)`.  Source:
+    /// `JitInterpConfig.int_fields`.  A field listed here registers its real
+    /// width and signedness with the struct layout instead of the machine-word
+    /// default, which is what makes `descr.is_integer_bounded()` true for it.
+    pub(super) int_fields: HashMap<String, (Ident, bool)>,
     /// Return struct type for ref-returning calls.  Key = canonical func
     /// path segments, value = struct type path.  When a `residual_ref` call
     /// result is bound, the lowerer sets `Binding.struct_type` from this map
@@ -851,9 +857,33 @@ pub(super) fn inferred_record_known_result_policy_check(result_kind: BindingKind
     }
 }
 
+/// Build the `int_fields` lookup: key = `"StructLastSegment::field"`.
+fn int_fields_map(
+    int_fields: &[crate::jit_interp::IntFieldEntry],
+) -> HashMap<String, (Ident, bool)> {
+    int_fields
+        .iter()
+        .map(|entry| {
+            let struct_name = entry
+                .struct_type
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            let key = format!("{}::{}", struct_name, entry.field);
+            // Validated at parse time.
+            (
+                key,
+                (entry.int_type.clone(), entry.is_signed().unwrap_or(true)),
+            )
+        })
+        .collect()
+}
+
 impl LowererConfig {
     pub fn inline_helper(
         ref_fields: &[crate::jit_interp::RefFieldEntry],
+        int_fields: &[crate::jit_interp::IntFieldEntry],
         native_int_binops: &[(syn::Path, syn::Ident)],
         native_tag_small: &[syn::Path],
         headerless_structs: &[syn::Path],
@@ -899,6 +929,7 @@ impl LowererConfig {
             residual_writes: Vec::new(),
             pool_arrays: Vec::new(),
             ref_fields: ref_fields_map,
+            int_fields: int_fields_map(int_fields),
             call_returns: HashMap::new(),
             headerless_structs: headerless_structs
                 .iter()
@@ -931,6 +962,7 @@ impl LowererConfig {
         residual_writes: &[crate::jit_interp::ResidualWriteEntry],
         pool_arrays: &[crate::jit_interp::PoolArrayEntry],
         ref_fields: &[crate::jit_interp::RefFieldEntry],
+        int_fields: &[crate::jit_interp::IntFieldEntry],
         call_returns: &[(Path, Path)],
         headerless_structs: &[Path],
         native_int_binops: &[(Path, Ident)],
@@ -1137,6 +1169,7 @@ impl LowererConfig {
             env_type_name: env_type.to_string(),
             residual_writes,
             ref_fields: ref_fields_map,
+            int_fields: int_fields_map(int_fields),
             call_returns: call_returns
                 .iter()
                 .map(|(func, ret_type)| (canonical_path_segments(func), ret_type.clone()))

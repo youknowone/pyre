@@ -564,7 +564,7 @@ impl JitCodeBuilder {
         size: usize,
         type_id: u64,
         headerless: bool,
-        fields: &[(usize, bool, &str)],
+        fields: &[(usize, bool, &str, usize, bool)],
     ) {
         self.touch_ref_reg(dest);
         // descr.py:108-120 get_size_descr + init_size_descr: cache the
@@ -622,7 +622,7 @@ impl JitCodeBuilder {
         type_id: u64,
         is_gc_managed: bool,
         headerless: bool,
-        fields: &[(usize, bool, &str)],
+        fields: &[(usize, bool, &str, usize, bool)],
     ) {
         // Every emit site re-registers the layout it accesses, so the same few
         // type_ids arrive hundreds of times.  When the spec already lists an
@@ -636,7 +636,7 @@ impl JitCodeBuilder {
             .struct_size_specs
             .get(&type_id)
             .is_some_and(|existing| {
-                fields.iter().all(|&(offset, _, _)| {
+                fields.iter().all(|&(offset, _, _, _, _)| {
                     existing
                         .all_fielddescrs
                         .iter()
@@ -701,25 +701,32 @@ impl JitCodeBuilder {
     /// literal of the same struct an identical, deterministic
     /// `all_fielddescrs` order so the `type_id`-keyed cache is not polluted
     /// and the optimizer's `FieldDescr.n()` indexing stays consistent.
-    fn field_specs_from_layout(fields: &[(usize, bool, &str)]) -> Vec<BhFieldSpec> {
-        let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
-        ordered.sort_by_key(|&(offset, _, _)| offset);
+    fn field_specs_from_layout(fields: &[(usize, bool, &str, usize, bool)]) -> Vec<BhFieldSpec> {
+        let mut ordered: Vec<(usize, bool, &str, usize, bool)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _, _, _)| offset);
         ordered
             .iter()
             .enumerate()
-            .map(|(idx, &(offset, is_ref, name))| {
-                let (field_type, field_flag, is_field_signed) = if is_ref {
+            .map(|(idx, &(offset, is_ref, name, decl_size, decl_signed))| {
+                // descr.py:240-254 `get_type_flag(FIELDTYPE)`: a pointer field
+                // is FLAG_POINTER; an integer field is FLAG_SIGNED or
+                // FLAG_UNSIGNED by its own type and carries its own width.
+                // The emit site supplies both for an integer field; a ref field
+                // is a pointer word by construction.
+                let (field_type, field_size, field_flag, is_field_signed) = if is_ref {
                     (
                         majit_ir::value::Type::Ref,
+                        scalar_size(majit_ir::value::Type::Ref),
                         majit_ir::descr::ArrayFlag::Pointer,
                         false,
                     )
                 } else {
-                    (
-                        majit_ir::value::Type::Int,
-                        majit_ir::descr::ArrayFlag::Signed,
-                        true,
-                    )
+                    let flag = if decl_signed {
+                        majit_ir::descr::ArrayFlag::Signed
+                    } else {
+                        majit_ir::descr::ArrayFlag::Unsigned
+                    };
+                    (majit_ir::value::Type::Int, decl_size, flag, decl_signed)
                 };
                 BhFieldSpec {
                     // descr.py:656 SimpleFieldDescr id is unset until the
@@ -729,7 +736,7 @@ impl JitCodeBuilder {
                     field_key: name.to_string(),
                     name: name.to_string(),
                     offset,
-                    field_size: scalar_size(field_type),
+                    field_size,
                     field_type,
                     field_flag,
                     is_field_signed,
@@ -810,10 +817,21 @@ impl JitCodeBuilder {
         // rather than the first of them.  A guessed NAME is the damaging half:
         // it becomes the descr's `_cache_field` key downstream, so naming the
         // aggregate hands the leaf's access the aggregate's descr.
-        let (index_in_parent, name) =
-            field_slot_in(&parent_spec.all_fielddescrs, field_name, offset)
-                .map(|idx| (idx, parent_spec.all_fielddescrs[idx].name.clone()))
-                .unwrap_or((0, String::new()));
+        let slot = field_slot_in(&parent_spec.all_fielddescrs, field_name, offset);
+        let (index_in_parent, name) = slot
+            .map(|idx| (idx, parent_spec.all_fielddescrs[idx].name.clone()))
+            .unwrap_or((0, String::new()));
+        // The registered layout is the record of what `descr.py:218-239
+        // get_field_descr` derives from FIELDTYPE, so a field it names supplies
+        // its own width and signedness.  The IR bank the access lands in
+        // cannot: every integer read arrives here as `Type::Int` whether the
+        // field is a byte or a word.
+        let (field_size, field_flag, is_field_signed) = slot
+            .map(|idx| {
+                let f = &parent_spec.all_fielddescrs[idx];
+                (f.field_size, f.field_flag, f.is_field_signed)
+            })
+            .unwrap_or((scalar_size(field_type), field_flag, is_field_signed));
         // Carry the scalars only.  `patch_field_descr_parents`, called
         // unconditionally from `try_finish` after the decline early-return,
         // replaces this snapshot with `struct_size_specs`' final merged spec
@@ -832,7 +850,7 @@ impl JitCodeBuilder {
         });
         self.add_bh_descr(CanonicalBhDescr::Field {
             offset,
-            field_size: scalar_size(field_type),
+            field_size,
             field_type,
             field_flag,
             is_field_signed,
@@ -1861,8 +1879,8 @@ impl JitCodeBuilder {
             true,
             false,
             &[
-                (length_offset, false, "length"),
-                (items_offset, true, "items"),
+                (length_offset, false, "length", scalar_size(majit_ir::value::Type::Int), true),
+                (items_offset, true, "items", scalar_size(majit_ir::value::Type::Ref), false),
             ],
         );
         let all_fielddescrs = self
@@ -6101,10 +6119,10 @@ mod tests {
         const TID: u64 = 0x5747_5F49_4458;
         let mut builder = JitCodeBuilder::new();
         // Site 1 registers only the HIGH offset, so the mint ranks it 0.
-        builder.register_struct_layout(24, TID, false, false, &[(16, false, "hi")]);
+        builder.register_struct_layout(24, TID, false, false, &[(16, false, "hi", 8, true)]);
         builder.getfield_gc_i(0, 1, 16, TID, "hi");
         // Site 2 registers the LOW offset; the merge re-indexes to {8→0, 16→1}.
-        builder.register_struct_layout(24, TID, false, false, &[(8, false, "lo")]);
+        builder.register_struct_layout(24, TID, false, false, &[(8, false, "lo", 8, true)]);
         builder.getfield_gc_i(2, 1, 8, TID, "lo");
         let jitcode = builder.finish();
 

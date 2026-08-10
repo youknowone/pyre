@@ -37,12 +37,23 @@ impl<'c> Lowerer<'c> {
                 .unwrap_or_default();
             let key = format!("{}::{}", struct_last, field);
             let is_ref = config.ref_fields.contains_key(&key);
+            // Same declared width the getfield/setfield lowering registers, so
+            // this write-EI rebuild mints the field descr the reads resolve to
+            // rather than a machine-word twin of it.
+            let member = syn::Member::Named(field.clone());
+            let (__fsize, __fsigned, __fcheck) =
+                super::lower_vable::field_scalar_tokens(config, &key, path, &member);
             fields.push(quote! {
-                (
-                    ::core::mem::offset_of!(#path, #field),
-                    #is_ref,
-                    stringify!(#field),
-                )
+                {
+                    #__fcheck
+                    (
+                        ::core::mem::offset_of!(#path, #field),
+                        #is_ref,
+                        stringify!(#field),
+                        #__fsize,
+                        #__fsigned,
+                    )
+                }
             });
         }
         let layouts: Vec<_> = layouts
