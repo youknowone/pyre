@@ -3334,14 +3334,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // `($module, fd=<unrepresentable>, /)` — the descriptor is
             // positional-only, so `fd=1` is a keyword this entry point does
             // not take rather than a binding.
-            let (bound, _kwargs) = bind_posonly_args(
-                args,
-                "get_terminal_size",
-                "posix.get_terminal_size",
-                1,
-                0,
-                &[],
-            )?;
+            // A keyword is refused against the module-qualified name, and this
+            // module answers to `nt` on Windows.
+            let qualname = if cfg!(windows) {
+                "nt.get_terminal_size"
+            } else {
+                "posix.get_terminal_size"
+            };
+            let (bound, _kwargs) =
+                bind_posonly_args(args, "get_terminal_size", qualname, 1, 0, &[])?;
             let fd = match bound[0] {
                 Some(w) => crate::baseobjspace::c_int_w(w)?,
                 None => 1,
@@ -4073,7 +4074,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `argument_unavailable` (`interp_posix.py:298-301`) — a modifier this
     /// platform has no call to apply, named together with the entry point that
     /// was asked to apply it.
-    #[cfg(all(unix, feature = "host_env"))]
+    #[cfg(feature = "host_env")]
     fn argument_unavailable(funcname: &str, arg: &str) -> crate::PyError {
         crate::PyError::not_implemented(format!("{funcname}: {arg} unavailable on this platform"))
     }
@@ -8996,25 +8997,180 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
-        // os.access(path, mode) -> bool.  Windows has no permission bits to
-        // consult beyond the read-only attribute, so `W_OK` is the only mode
-        // that can answer False for a name that exists (`os_access_impl`).
+        // os.access(path, mode, *, dir_fd=None, effective_ids=False,
+        //           follow_symlinks=True) -> bool
+        //
+        // Windows has no permission bits to consult beyond the read-only
+        // attribute, so `W_OK` is the only mode that can answer False for a
+        // name that exists (`os_access_impl`).  None of the three modifiers
+        // has a call to reach: `dir_fd` types as `dir_fd(requires='faccessat')`
+        // and the other two are the pair `os_access_impl` turns away without
+        // `faccessat`, so each is refused rather than answered as though it
+        // had been applied.
         crate::module_ns_store(
             ns,
             "access",
             crate::make_builtin_function("access", |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("access() requires 2 arguments"));
-                }
-                let path = crate::gateway::fsencode_path_named_w(args[0], "access", "path")?;
+                // The three modifiers are keyword-only, so a third positional
+                // is an error rather than a `dir_fd`.
+                let (bound, kwargs) = bind_path_args(
+                    args,
+                    "access",
+                    &["path", "mode"],
+                    2,
+                    &["dir_fd", "effective_ids", "follow_symlinks"],
+                )?;
+                // The parameters convert in declaration order and each of them
+                // can raise, so the order is observable: `path` reports before
+                // `mode`, and both before either flag's `__bool__` is called.
+                let path = crate::gateway::fsencode_path_named_w(
+                    bound[0].expect("path is required"),
+                    "access",
+                    "path",
+                )?;
                 // Only `W_OK` is read, so the byte holding it is the whole of
                 // the mode as far as the answer goes.
-                let mode = crate::baseobjspace::c_int_w(args[1])? as u8;
+                let mode = crate::baseobjspace::c_int_w(bound[1].expect("mode is required"))? as u8;
+                dir_fd_kwarg(kwargs, false)?;
+                if let Some(v) = crate::builtins::kwarg_get(kwargs, "effective_ids")
+                    && crate::baseobjspace::is_true(v)?
+                {
+                    return Err(argument_unavailable("access", "effective_ids"));
+                }
+                if let Some(v) = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                    && !crate::baseobjspace::is_true(v)?
+                {
+                    return Err(argument_unavailable("access", "follow_symlinks"));
+                }
                 Ok(pyre_object::w_bool_from(host_nt::access(
                     path_from_bytes(&path.as_bytes).as_ref(),
                     mode,
                 )))
             }),
+        );
+
+        // os.execv(path, argv) / os.execve(path, argv, env)
+        //
+        // `_wexecv` / `_wexecve` are the wide forms `os_execv_impl` reaches
+        // for; they return only on failure, because on success the calling
+        // process is gone by the time they would.
+        fn exec_argv_wide(
+            w_argv: PyObjectRef,
+            function: &str,
+        ) -> Result<Vec<widestring::WideCString>, crate::PyError> {
+            let items = crate::baseobjspace::unpackiterable(w_argv, -1).map_err(|error| {
+                if error.kind == crate::PyErrorKind::TypeError {
+                    crate::PyError::type_error(format!(
+                        "{function}() arg 2 must be an iterable of strings"
+                    ))
+                } else {
+                    error
+                }
+            })?;
+            if items.is_empty() {
+                return Err(crate::PyError::value_error(format!(
+                    "{function}() arg 2 must not be empty"
+                )));
+            }
+            let mut argv = Vec::with_capacity(items.len());
+            for item in items {
+                // An element is converted on the sequence's behalf, not as an
+                // argument of the call, so the caller-less message is the one
+                // it reports — the same for the environment below.
+                let value = extract_path(item)?;
+                argv.push(widestring::WideCString::from_os_str(&*os_str_from_bytes(&value))
+                    .map_err(|_| {
+                        crate::PyError::value_error(format!(
+                            "{function}() arg 2 contains an embedded null byte"
+                        ))
+                    })?);
+            }
+            if argv[0].is_empty() {
+                return Err(crate::PyError::value_error(format!(
+                    "{function}() arg 2 first element cannot be empty"
+                )));
+            }
+            Ok(argv)
+        }
+
+        fn exec_pointer_array_wide(values: &[widestring::WideCString]) -> Vec<*const u16> {
+            let mut pointers: Vec<_> = values.iter().map(|value| value.as_ptr()).collect();
+            pointers.push(std::ptr::null());
+            pointers
+        }
+
+        crate::module_ns_store(
+            ns,
+            "execv",
+            crate::make_builtin_function_with_arity(
+                "execv",
+                |args| {
+                    // The path names itself; the argv entries do not, because
+                    // each of those is converted on the sequence's behalf
+                    // rather than as an argument of its own.
+                    let command =
+                        crate::gateway::fsencode_path_named_w(args[0], "execv", "path")?.as_bytes;
+                    let command_w = wide_path(&command)?;
+                    let argv = exec_argv_wide(args[1], "execv")?;
+                    let argv_ptrs = exec_pointer_array_wide(&argv);
+                    unsafe { libc::wexecv(command_w.as_ptr(), argv_ptrs.as_ptr()) };
+                    // `wrap_oserror` names no file, so the path stays out of
+                    // the error.
+                    Err(io_err(std::io::Error::last_os_error(), ""))
+                },
+                2,
+            ),
+        );
+
+        crate::module_ns_store(
+            ns,
+            "execve",
+            crate::make_builtin_function_with_arity(
+                "execve",
+                |args| {
+                    let command =
+                        crate::gateway::fsencode_path_named_w(args[0], "execve", "path")?.as_bytes;
+                    let command_w = wide_path(&command)?;
+                    let argv = exec_argv_wide(args[1], "execve")?;
+                    let argv_ptrs = exec_pointer_array_wide(&argv);
+
+                    let keys_obj = crate::baseobjspace::call_method(args[2], "keys", &[]);
+                    if keys_obj.is_null() {
+                        return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                            crate::PyError::type_error("execve: env must be a mapping")
+                        }));
+                    }
+                    let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
+                    let mut env = Vec::with_capacity(keys.len());
+                    for key_obj in keys {
+                        let value_obj = crate::baseobjspace::getitem(args[2], key_obj)?;
+                        let key = extract_path(key_obj)?;
+                        let value = extract_path(value_obj)?;
+                        if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
+                            return Err(crate::PyError::value_error(
+                                "illegal environment variable name",
+                            ));
+                        }
+                        let mut entry = key;
+                        entry.push(b'=');
+                        entry.extend_from_slice(&value);
+                        env.push(
+                            widestring::WideCString::from_os_str(&*os_str_from_bytes(&entry))
+                                .map_err(|_| {
+                                    crate::PyError::value_error(
+                                        "execve() environment contains an embedded null byte",
+                                    )
+                                })?,
+                        );
+                    }
+                    let env_ptrs = exec_pointer_array_wide(&env);
+                    unsafe {
+                        libc::wexecve(command_w.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr())
+                    };
+                    Err(io_err(std::io::Error::last_os_error(), ""))
+                },
+                3,
+            ),
         );
 
         /// The mode bit Windows keeps: with the owner's write bit the
@@ -9185,27 +9341,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     CreateSymbolicLinkW, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
                     SYMBOLIC_LINK_FLAG_DIRECTORY,
                 };
-                let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                crate::builtins::kwarg_reject_unknown(
-                    kwargs,
-                    &["target_is_directory", "dir_fd"],
+                let (bound, kwargs) = bind_path_args(
+                    args,
                     "symlink",
+                    &["src", "dst", "target_is_directory"],
+                    2,
+                    &["dir_fd"],
                 )?;
-                if crate::builtins::kwarg_get(kwargs, "dir_fd")
-                    .is_some_and(|w| !unsafe { pyre_object::is_none(w) })
-                {
-                    return Err(dir_fd_unavailable());
-                }
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("symlink() requires 2 arguments"));
-                }
-                let src = crate::gateway::fsencode_path_named_w(args[0], "symlink", "src")?;
-                let dst = crate::gateway::fsencode_path_named_w(args[1], "symlink", "dst")?;
-                let target_is_directory = match args
-                    .get(2)
-                    .copied()
-                    .or_else(|| crate::builtins::kwarg_get(kwargs, "target_is_directory"))
-                {
+                // `symlink` types `dir_fd` as `DirFD(rposix.HAVE_SYMLINKAT)`,
+                // and `CreateSymbolicLinkW` resolves a relative name against
+                // the working directory alone.
+                dir_fd_kwarg(kwargs, false)?;
+                let src = crate::gateway::fsencode_path_named_w(
+                    bound[0].expect("src is required"),
+                    "symlink",
+                    "src",
+                )?;
+                let dst = crate::gateway::fsencode_path_named_w(
+                    bound[1].expect("dst is required"),
+                    "symlink",
+                    "dst",
+                )?;
+                let target_is_directory = match bound[2] {
                     Some(w) => crate::baseobjspace::is_true(w)?,
                     None => false,
                 };
