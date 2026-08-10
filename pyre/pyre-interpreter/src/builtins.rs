@@ -10923,6 +10923,52 @@ fn global_nonlocal_conflict_span(
     Some((format!("name '{name}' is nonlocal and global"), start, end))
 }
 
+/// `python.gram:invalid_expression` wins over `invalid_arguments` when an
+/// unparenthesized generator call is the right operand of a binary expression.
+/// CPython 3.14 selects the `for` token in that form rather than the complete
+/// generator range selected by Ruff.
+fn binary_call_generator_error_span(source: &str) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    'for_index: for for_index in 0..bytes.len().saturating_sub(2) {
+        if &bytes[for_index..for_index + 3] != b"for"
+            || bytes
+                .get(for_index.wrapping_sub(1))
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            || bytes
+                .get(for_index + 3)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            continue;
+        }
+        let Some(open) = bytes[..for_index].iter().rposition(|byte| *byte == b'(') else {
+            continue;
+        };
+        let mut cursor = open;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let name_end = cursor;
+        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_')
+        {
+            cursor -= 1;
+        }
+        if cursor == name_end {
+            continue;
+        }
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if !matches!(
+            bytes.get(cursor.wrapping_sub(1)),
+            Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'@' | b'|' | b'&' | b'^')
+        ) {
+            continue 'for_index;
+        }
+        return Some((for_index, for_index + 3));
+    }
+    None
+}
+
 /// `Parser/string_parser.c parse_string_literal` raises the non-ASCII bytes
 /// error at the token (`RAISE_SYNTAX_ERROR_KNOWN_LOCATION(t)`), not at the
 /// offending code point.  Ruff's diagnostic instead selects that code point;
@@ -11125,7 +11171,24 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         msg = replacement.clone();
     }
     let scope_span = scope_conflict.map(|(_, start, end)| (start, end));
-    let diagnostic_span = literal_span.or(fstring_span).or(scope_span);
+    let generator_span = match &e {
+        crate::compile::CompileError::Parse(parse_error)
+            if matches!(
+                &parse_error.error,
+                ParseErrorType::UnparenthesizedGeneratorExpression
+            ) =>
+        {
+            binary_call_generator_error_span(source)
+        }
+        _ => None,
+    };
+    if generator_span.is_some() {
+        msg = "invalid syntax".to_owned();
+    }
+    let diagnostic_span = literal_span
+        .or(fstring_span)
+        .or(scope_span)
+        .or(generator_span);
     let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
         (
             source_byte_location(source, start),
@@ -17470,6 +17533,26 @@ mod tests {
         let source = "def f():\n  global x\n  def g():\n    nonlocal x";
         let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
         assert_eq!(global_nonlocal_conflict_span(&error, source), None);
+    }
+
+    #[test]
+    fn binary_call_generator_error_selects_for_token() {
+        let source = "\"┬ó┬ó┬ó┬ó┬ó┬ó\" + f(4, x for x in range(1))\n";
+        let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::compile::CompileError::Parse(ref parse_error)
+                if matches!(
+                    &parse_error.error,
+                    rustpython_compiler::parser::ParseErrorType::UnparenthesizedGeneratorExpression
+                )
+        ));
+        let start = source.find("for").unwrap();
+        assert_eq!(
+            binary_call_generator_error_span(source),
+            Some((start, start + 3))
+        );
+        assert_eq!(binary_call_generator_error_span("f(4, x for x in y)"), None);
     }
 
     #[test]

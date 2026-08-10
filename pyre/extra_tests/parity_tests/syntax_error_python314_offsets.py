@@ -92,4 +92,13 @@ assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (2, 3
     error.end_offset,
 )
 
+error = syntax_error('"┬ó┬ó┬ó┬ó┬ó┬ó" + f(4, x for x in range(1))')
+assert error.msg == "invalid syntax", error.msg
+assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 25, 1, 28), (
+    error.lineno,
+    error.offset,
+    error.end_lineno,
+    error.end_offset,
+)
+
 print("syntax error Python 3.14 offsets ok")
