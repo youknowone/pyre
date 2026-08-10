@@ -11448,6 +11448,19 @@ fn handle<Sym: WalkSym>(
             // loop crossing. Skip exactly once. `take()` clears on the first
             // crossing regardless of pc, so a mid-body-resume bridge whose
             // first crossing is a DIFFERENT header is unaffected.
+            // pyjitpl.py:2940-2942 `_handle_guard_failure` pre-arms the flag
+            // when the source guard is a `ResumeAtPositionDescr` — the descr
+            // `inline_short_preamble` stamps onto the guards it replays
+            // (unroll.py:337 / :409). Those guards sit at the target loop's
+            // entry, so the bridge grown from one has to close at its very
+            // first merge point rather than record another iteration first.
+            // Arming here rather than at the bridge setup keeps the flag equal
+            // to the `jdindex` the assert below compares against.
+            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
+                && std::mem::take(&mut ctx.trace_ctx.bridge_resume_at_position)
+            {
+                ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+            }
             if ctx.is_top_level
                 && ctx.trace_ctx.seen_loop_header_for_jdindex < 0
                 && ctx.fbw_mode.bridge_entry_merge_pc.take() == Some(next_instr)

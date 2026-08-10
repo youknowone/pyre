@@ -435,6 +435,18 @@ pub struct TraceCtx {
     /// jump), consumed and reset by the following `jit_merge_point`
     /// (pyjitpl.py:1559-1562).  `-1` = not seen.
     pub seen_loop_header_for_jdindex: i32,
+    /// pyjitpl.py:2941-2942 `if isinstance(key, compile.ResumeAtPositionDescr):
+    /// self.seen_loop_header_for_jdindex = self.jitdriver_sd.index` — a bridge
+    /// grown from a guard `inline_short_preamble` replayed (unroll.py:337 /
+    /// :409) starts with the loop header already counted as seen, so its first
+    /// merge point closes instead of running the auto-stamp ladder.
+    ///
+    /// Upstream stores the driver index directly; pyre arms a request here
+    /// because the registered slot and the merge-point op's `jdindex` can
+    /// disagree (the `ensure_default_driver_sd` placeholder shift), and the
+    /// merge point asserts the flag equals its own `jdindex`. Consumed
+    /// (`take`) by the first merge point, which then stamps that `jdindex`.
+    pub bridge_resume_at_position: bool,
     /// pyjitpl.py:1570/1577 `saved_pc = self.pc` / `self.pc = saved_pc`.
     ///
     /// Upstream consults a merge point once per visit and then resumes the
@@ -1541,6 +1553,7 @@ impl TraceCtx {
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
+            bridge_resume_at_position: false,
             merge_point_resumed: false,
             callinfocollection: None,
             call_pure_results: indexmap::IndexMap::new(),
@@ -1626,6 +1639,7 @@ impl TraceCtx {
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
+            bridge_resume_at_position: false,
             merge_point_resumed: false,
             callinfocollection: None,
             call_pure_results: indexmap::IndexMap::new(),

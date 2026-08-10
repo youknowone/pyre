@@ -6509,6 +6509,38 @@ impl<S: JitState> JitDriver<S> {
         // can apply bridge-only behavior without overloading
         // `has_compiled_targets_fn` presence.
         ctx.is_bridge_trace = true;
+        // pyjitpl.py:2940-2942 `_handle_guard_failure`:
+        //
+        //     self.seen_loop_header_for_jdindex = -1
+        //     if isinstance(key, compile.ResumeAtPositionDescr):
+        //         self.seen_loop_header_for_jdindex = self.jitdriver_sd.index
+        //
+        // A `ResumeAtPositionDescr` is the descr `inline_short_preamble`
+        // stamps onto the guards it replays (unroll.py:337 / :409), so the
+        // guard sits at the target loop's entry and the bridge grown from it
+        // has to close at the very first merge point it reaches. Pre-arming
+        // the flag is what makes that happen: the merge point's own ladder
+        // (`if not any_operation` / `portal_call_depth` /
+        // `has_compiled_targets`, pyjitpl.py:1547-1555) is skipped and the
+        // close protocol runs. Without it the bridge records a whole extra
+        // iteration before it can close, and the `bridge_entry_merge_pc`
+        // skip-once below sends it past the crossing it was meant to take.
+        //
+        // The flag is one-shot on both sides: the merge point resets it to
+        // -1 (pyjitpl.py:1562) after consuming it, so only the FIRST crossing
+        // is forced. `compile_trace`'s sibling read of the same descr class
+        // (`inline_short_preamble = False`, compile.py:1040-1041) lives at
+        // `pyjitpl.rs`'s bridge compile entry.
+        //
+        // Upstream writes `self.jitdriver_sd.index` straight into the flag
+        // because that value IS the `jdindex` the following merge point
+        // carries. Pyre's registered slot and the op's build-time `jdindex`
+        // can differ by the `ensure_default_driver_sd` placeholder shift, and
+        // the merge point asserts the two agree, so arm a request instead and
+        // let the merge point stamp its own `jdindex`.
+        ctx.bridge_resume_at_position = descr_arc
+            .as_fail_descr()
+            .is_some_and(|fd| fd.is_resume_at_position());
         if let Some(ptr) = live_vable_ptr {
             ctx.set_virtualizable_heap_ptr(ptr);
         }

@@ -5144,6 +5144,18 @@ where
                     .driver_descriptor()
                     .map(|d| d.no_loop_header)
                     .unwrap_or_else(|| ctx.metainterp_sd().jitdrivers_sd[jdindex].no_loop_header);
+                // pyjitpl.py:2940-2942 `_handle_guard_failure` pre-arms the
+                // flag when the source guard is a `ResumeAtPositionDescr` (the
+                // descr `inline_short_preamble` stamps onto the guards it
+                // replays, unroll.py:337 / :409). Those guards sit at the
+                // target loop's entry, so the bridge grown from one closes at
+                // its very first merge point instead of recording another
+                // iteration; the pre-arm is what skips the ladder below.
+                if self.seen_loop_header_for_jdindex < 0
+                    && std::mem::take(&mut ctx.bridge_resume_at_position)
+                {
+                    self.seen_loop_header_for_jdindex = jdindex as i32;
+                }
                 if ctx.inline_depth() > 0
                     && self.seen_loop_header_for_jdindex < 0
                     && !no_loop_header
