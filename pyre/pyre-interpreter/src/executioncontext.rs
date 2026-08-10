@@ -2068,6 +2068,14 @@ pub trait AsyncActionOps {
     ) where
         Self: Sized + 'static,
     {
+        // `AsyncAction.__init__` runs once per action upstream. Here the call
+        // is a separate step, so a second one would leave the list entry made
+        // by the first pointing at an action whose `bitmask` has moved on.
+        debug_assert_eq!(
+            self.async_action()._action_index,
+            -1,
+            "register_nonperiodic_action called twice for one action"
+        );
         let action_ptr: *mut dyn AsyncActionOps = self;
         let index = actionflag.register_nonperiodic_action(action_ptr);
         let base = self.async_action_mut();
