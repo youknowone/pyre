@@ -2224,10 +2224,6 @@ impl majit_backend::Backend for WasmBackend {
                 || op.opcode.is_call_assembler()
         });
         let code_size = wasm_bytes.len();
-        // `asmmemmgr.py:37` counts the block a `materialize` handed out, which
-        // here is the module the host is about to take.
-        let block = self.asm_memory_stats.record_block(code_size, code_size);
-        self.asm_memory_blocks.push(block);
 
         // Instantiate via the host binding on wasm32, or store bytes for
         // testing on native (no wasm host available).
@@ -2257,6 +2253,14 @@ impl majit_backend::Backend for WasmBackend {
                     .to_string(),
             ));
         }
+
+        // `asmmemmgr.py:37` counts the block a `materialize` handed out, which
+        // here is the module the host has taken. Below the decline above, as
+        // `compile_bridge` does: a rejected module was never instantiated, and
+        // the token retained for it would charge its bytes for the backend's
+        // whole life.
+        let block = self.asm_memory_stats.record_block(code_size, code_size);
+        self.asm_memory_blocks.push(block);
 
         // A peeled loop carries real work before its (last) LABEL — the
         // unrolled first iteration. codegen emits the `loop` at that LABEL, so
