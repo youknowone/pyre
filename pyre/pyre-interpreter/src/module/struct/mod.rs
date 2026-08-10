@@ -1191,11 +1191,14 @@ impl W_Struct {
         self.ensure_ready()?;
         let format = majit_metainterp::jit::promote_string(self.format);
         let fmt = unsafe { w_str_get_value(format) };
-        let buf = unsafe { readbuf(buffer)? };
+        // Coerce `offset` before borrowing the buffer: `space_index_w` may run
+        // `__index__`, which can resize or free the backing store `readbuf`
+        // hands back as a raw slice.
         let offset = match offset {
             Some(o) => unsafe { crate::builtins::space_index_w(o)? },
             None => 0,
         };
+        let buf = unsafe { readbuf(buffer)? };
         do_unpack_from(fmt, buf, offset)
     }
 
@@ -1279,6 +1282,13 @@ fn pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn struct_pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let this = W_Struct::from_obj(args[0])
         .ok_or_else(|| crate::PyError::type_error("descriptor 'pack_into' got wrong receiver"))?;
+    // The binder pads an omitted `buffer` / `offset` with PY_NULL; report the
+    // missing argument before `space_index_w` reads a null slot.
+    if args[1].is_null() || args[2].is_null() {
+        return Err(crate::PyError::type_error(
+            "pack_into() missing buffer or offset argument",
+        ));
+    }
     this.ensure_ready()?;
     let format = majit_metainterp::jit::promote_string(this.format);
     let fmt = unsafe { w_str_get_value(format) };
@@ -1519,11 +1529,14 @@ crate::py_module! {
             offset: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
             let fmt = format_to_string(fmt_obj)?;
-            let buf = unsafe { readbuf(buffer)? };
+            // Coerce `offset` before borrowing the buffer: `space_index_w` may
+            // run `__index__`, which can resize or free the backing store
+            // `readbuf` hands back as a raw slice.
             let offset = match offset {
                 Some(o) => unsafe { crate::builtins::space_index_w(o)? },
                 None => 0,
             };
+            let buf = unsafe { readbuf(buffer)? };
             do_unpack_from(&fmt, buf, offset)
         }
     },

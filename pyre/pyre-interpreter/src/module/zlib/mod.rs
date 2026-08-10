@@ -243,8 +243,12 @@ fn init_decompress_type(ns: PyObjectRef) {
                 }
                 let id = get_id(args[0]);
                 let data = as_bytes(args[1])?;
+                // An omitted `max_length` is unlimited; a supplied value —
+                // including `None` — goes through `int_w`, which raises for
+                // `None`.  Zero also means unlimited here, and a negative
+                // value is rejected.
                 let max_length = match args.get(2).copied() {
-                    Some(o) if !unsafe { is_none(o) } => {
+                    Some(o) => {
                         let v = crate::baseobjspace::int_w(o)?;
                         if v < 0 {
                             return Err(crate::PyError::value_error(
@@ -253,7 +257,7 @@ fn init_decompress_type(ns: PyObjectRef) {
                         }
                         (v != 0).then_some(v as usize)
                     }
-                    _ => None,
+                    None => None,
                 };
                 let mut reg = DECOMPRESSORS.lock().unwrap();
                 let d = reg
@@ -378,9 +382,15 @@ fn zdecompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         return Err(crate::PyError::type_error("decompress() missing data"));
     }
     let data = as_bytes(data_obj)?;
+    // `max_length=-1` (the default) means unlimited; an omitted slot behaves
+    // the same.  Only PY_NULL selects that default: a supplied value —
+    // including `None` — goes through `int_w`, which raises for `None` and on
+    // ssize_t overflow.  A negative value is unlimited, zero caps the output
+    // at zero bytes.
     let max_length = match args.get(2).copied() {
-        Some(o) if !o.is_null() && !unsafe { is_none(o) } => {
-            usize::try_from(crate::baseobjspace::int_w(o)?).ok()
+        Some(o) if !o.is_null() => {
+            let v = crate::baseobjspace::int_w(o)?;
+            (v >= 0).then_some(v as usize)
         }
         _ => None,
     };

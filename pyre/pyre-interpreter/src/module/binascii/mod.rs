@@ -32,20 +32,22 @@ fn arg_required(
 
 /// A slot the `Signature` binder resolved: `PY_NULL` for an omitted optional
 /// argument, and `None` for one passed explicitly, both keep `default`.
-fn slot_bool(w: PyObjectRef, default: bool) -> bool {
-    if w.is_null() || unsafe { is_none(w) } {
-        return default;
-    }
-    crate::baseobjspace::is_true(w).unwrap_or(default)
-}
-
-/// An optional `oldcrc` slot: `PY_NULL`/`None` keeps `default`, otherwise the
-/// low 32 bits of the integer.  `truncatedint_w` in `interp_crc32.py`.
-fn slot_u32(w: PyObjectRef, default: u32) -> Result<u32, crate::PyError> {
+fn slot_bool(w: PyObjectRef, default: bool) -> Result<bool, crate::PyError> {
     if w.is_null() || unsafe { is_none(w) } {
         return Ok(default);
     }
-    Ok(crate::baseobjspace::int_w(w)? as u32)
+    crate::baseobjspace::is_true(w)
+}
+
+/// An optional `oldcrc` slot: an omitted slot (`PY_NULL`) keeps `default`;
+/// any supplied value — including `None` — goes through `truncatedint_w`
+/// (`interp_crc32.py` `oldcrc='truncatedint_w'`), which raises `TypeError`
+/// for `None` and keeps the low 32 bits of a wider integer.
+fn slot_u32(w: PyObjectRef, default: u32) -> Result<u32, crate::PyError> {
+    if w.is_null() {
+        return Ok(default);
+    }
+    Ok(crate::baseobjspace::truncatedint_w(w)? as u32)
 }
 
 /// `ascii_buffer_converter` — accept a str (ASCII) or any bytes-like and
@@ -199,7 +201,7 @@ crate::py_module! {
             #[default(w_none())] header: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             let data = as_bytes(arg_required(data, "a2b_qp", "data", 1)?)?;
-            let header = slot_bool(header, false);
+            let header = slot_bool(header, false)?;
             Ok(w_bytes_from_bytes(&transforms::a2b_qp(&data, header)))
         }
         fn b2a_qp(
@@ -209,9 +211,9 @@ crate::py_module! {
             #[default(w_none())] header: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             let data = as_buffer_bytes(arg_required(data, "b2a_qp", "data", 1)?)?;
-            let quotetabs = slot_bool(quotetabs, false);
-            let istext = slot_bool(istext, true);
-            let header = slot_bool(header, false);
+            let quotetabs = slot_bool(quotetabs, false)?;
+            let istext = slot_bool(istext, true)?;
+            let header = slot_bool(header, false)?;
             Ok(w_bytes_from_bytes(&transforms::b2a_qp(&data, quotetabs, istext, header)))
         }
         // `a2b_base64(data, /, *, strict_mode=False)` — `data` positional-only,
@@ -227,7 +229,7 @@ crate::py_module! {
             strict_mode: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             let data = as_bytes(arg_required(data, "a2b_base64", "data", 1)?)?;
-            let strict_mode = slot_bool(strict_mode, false);
+            let strict_mode = slot_bool(strict_mode, false)?;
             let out = transforms::a2b_base64(&data, strict_mode).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
         }
@@ -242,7 +244,7 @@ crate::py_module! {
             newline: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             let data = as_buffer_bytes(arg_required(data, "b2a_base64", "data", 1)?)?;
-            let newline = slot_bool(newline, true);
+            let newline = slot_bool(newline, true)?;
             Ok(w_bytes_from_bytes(&transforms::b2a_base64(&data, newline)))
         }
         // interp_uu.py:77 `b2a_uu(bin, __kwonly__, backtick=False)`.
@@ -254,7 +256,7 @@ crate::py_module! {
             backtick: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             let data = as_buffer_bytes(arg_required(data, "b2a_uu", "data", 1)?)?;
-            let backtick = slot_bool(backtick, false);
+            let backtick = slot_bool(backtick, false)?;
             let out = transforms::b2a_uu(&data, backtick).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
         }
@@ -361,7 +363,7 @@ fn crc_hqx(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         1,
     )?)?;
     let crc = arg_required(args.get(1).copied().unwrap_or(PY_NULL), "crc_hqx", "crc", 2)?;
-    let init = crate::baseobjspace::int_w(crc)? as u32;
+    let init = crate::baseobjspace::truncatedint_w(crc)? as u32;
     Ok(w_int_new(transforms::crc_hqx(&data, init) as i64))
 }
 
