@@ -189,6 +189,8 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
         // PyPy can use `_ff` here because its object space gives plain floats
         // value identity.  Pyre follows Python 3.14 pointer identity: `(x, x)`
         // must contain the exact `x` object, not two freshly boxed copies.
+        // Keep BUILD_TUPLE's existing Cls_oo shape; restoring Cls_ff for finite
+        // pairs is a separate JIT representation change.
         if unsafe { is_plain_float_strict(items[0]) && is_plain_float_strict(items[1]) } {
             return w_specialised_tuple_oo_new(items[0], items[1]);
         }
@@ -480,13 +482,18 @@ pub unsafe fn w_tuple_set_cached_hash(obj: PyObjectRef, hash: i64) {
 ///
 /// Predicates: `listobject.py:2390 is_plain_int1` accepts exact
 /// `W_IntObject` (not bool, not int subclass) AND fits-int
-/// `W_LongObject`; `type(w) is W_FloatObject` is strict identity.
+/// `W_LongObject`; `type(w) is W_FloatObject` is strict identity. NaNs are
+/// excluded because `Cls_ff` would lose their pointer identity when reboxing.
 pub fn makespecialisedtuple2(w_arg1: PyObjectRef, w_arg2: PyObjectRef) -> PyObjectRef {
     unsafe {
         if is_plain_int1(w_arg1) && is_plain_int1(w_arg2) {
             return w_specialised_tuple_ii_new(plain_int_w(w_arg1), plain_int_w(w_arg2));
         }
-        if is_plain_float_strict(w_arg1) && is_plain_float_strict(w_arg2) {
+        if is_plain_float_strict(w_arg1)
+            && is_plain_float_strict(w_arg2)
+            && !w_float_get_value(w_arg1).is_nan()
+            && !w_float_get_value(w_arg2).is_nan()
+        {
             return w_specialised_tuple_ff_new(
                 w_float_get_value(w_arg1),
                 w_float_get_value(w_arg2),
@@ -704,6 +711,40 @@ mod tests {
                 crate::floatobject::w_float_get_value(w_tuple_getitem(tup, 0).unwrap()),
                 1.5
             );
+        }
+    }
+
+    /// NaNs must decline the raw-f64 `Cls_ff` specialization.
+    #[test]
+    fn test_explicit_specialised_nan_pair_declines_ff() {
+        let nan = crate::floatobject::w_float_new(f64::NAN);
+        let tup = makespecialisedtuple2(nan, nan);
+        unsafe {
+            assert!(!is_specialised_tuple_ff(tup));
+            assert!(is_specialised_tuple_oo(tup));
+            assert_eq!(w_tuple_getitem(tup, 0).unwrap(), nan);
+            assert_eq!(w_tuple_getitem(tup, 1).unwrap(), nan);
+        }
+
+        // One NaN slot is enough — both slots are stored raw.
+        let finite = crate::floatobject::w_float_new(1.5);
+        let mixed = makespecialisedtuple2(finite, nan);
+        unsafe {
+            assert!(!is_specialised_tuple_ff(mixed));
+            assert_eq!(w_tuple_getitem(mixed, 0).unwrap(), finite);
+            assert_eq!(w_tuple_getitem(mixed, 1).unwrap(), nan);
+        }
+    }
+
+    #[test]
+    fn test_arity2_nan_pair_preserves_boxed_identity() {
+        let nan = crate::floatobject::w_float_new(f64::NAN);
+        let tup = w_tuple_new(vec![nan, nan]);
+        unsafe {
+            assert!(!is_specialised_tuple_ff(tup));
+            assert!(is_specialised_tuple_oo(tup));
+            assert_eq!(w_tuple_getitem(tup, 0).unwrap(), nan);
+            assert_eq!(w_tuple_getitem(tup, 1).unwrap(), nan);
         }
     }
 

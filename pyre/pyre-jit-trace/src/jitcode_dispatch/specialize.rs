@@ -3979,9 +3979,11 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 }
             }
             pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
-                // A non-float changes the slot to boxed storage and freezes further
-                // unboxing (mapdict.py), so retain setattr.
-                if !unsafe { pyre_object::pyobject::is_float(concrete_value) } {
+                // Match mapdict.py `_direct_write` exactly: subclasses and
+                // NaNs convert the slot to boxed storage.
+                if !unsafe {
+                    pyre_interpreter::objspace::std::mapdict::is_unboxable_float(concrete_value)
+                } {
                     return Ok(None);
                 }
             }
@@ -4015,6 +4017,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 let live_f = unsafe { pyre_object::w_float_get_value(concrete_value) };
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
+                walker_guard_float_not_nan(ctx, op_pc, raw)?;
                 (
                     crate::helpers::jit_mapdict_unboxed_write_f as *const (),
                     raw,
@@ -4464,9 +4467,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
             Emit::Int(vals)
         }
         ListStrategy::Float => {
-            // `all_floats` is strict `type(w) is W_FloatObject`, so every
-            // element is an exact `W_FloatObject` (`walker_unbox_float`'s
-            // `&FLOAT_TYPE` guard holds).
+            // `list_strategy_for` admits only exact, non-NaN floats here.
             let mut vals = Vec::with_capacity(len);
             for &p in &concretes {
                 vals.push(unsafe { pyre_object::w_float_get_value(p) });
@@ -4523,6 +4524,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
                 let raw = walker_unbox_float(ctx, op_pc, it, float_type_addr)?;
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(v));
+                walker_guard_float_not_nan(ctx, op_pc, raw)?;
                 raws.push(raw);
             }
             crate::helpers::emit_typed_list_inline(
@@ -9752,7 +9754,8 @@ unsafe fn orthodox_list_append_recognize(
         let int_ok = pyre_object::is_plain_int1(value)
             && !(pyre_object::tagged_int::CAN_BE_TAGGED
                 && pyre_object::tagged_int::is_tagged_int(value));
-        let float_ok = !value.is_null() && pyre_object::is_plain_float_strict(value);
+        // NaNs select Object storage to preserve identity.
+        let float_ok = pyre_object::is_float_strategy_item(value);
         // switch_to_correct_strategy routes `is_plain_int1` (exact int or
         // fits-in-word long) -> Integer with no tagged exclusion. Exclude any
         // plain-int / float from the object fallback so a tagged-int DECLINES
@@ -9760,7 +9763,7 @@ unsafe fn orthodox_list_append_recognize(
         // traced strategy from the concrete one the commit installs.
         let obj_ok = !value.is_null()
             && !pyre_object::is_plain_int1(value)
-            && !pyre_object::is_plain_float_strict(value);
+            && !pyre_object::is_float_strategy_item(value);
         if !int_ok && !float_ok && !obj_ok {
             return None;
         }
@@ -9782,14 +9785,10 @@ unsafe fn orthodox_list_append_recognize(
     // object items block — no unboxing, so the value carries no type
     // precondition.
     let obj_ok = pyre_object::w_list_uses_object_storage(inner_self) && !value.is_null();
-    // Float-storage specialization: a strict `W_FloatObject` stored
-    // unboxed. `FloatListStrategy.is_correct_type` (listobject.py) is
-    // `type(w_obj) is W_FloatObject`, the strict predicate the body's Float
-    // arm also uses. No fits-* long analogue (a float is never re-boxed
-    // across arithmetic, unlike a fits-int W_LongObject).
+    // Match `FloatListStrategy.is_correct_type`; NaNs take the residual path
+    // that converts the receiver to Object storage.
     let float_ok = pyre_object::w_list_uses_float_storage(inner_self)
-        && !value.is_null()
-        && pyre_object::is_plain_float_strict(value);
+        && pyre_object::is_float_strategy_item(value);
     if !int_ok && !obj_ok && !float_ok {
         return None;
     }
@@ -9886,7 +9885,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
                     && pyre_object::tagged_int::is_tagged_int(value));
             if int_ok {
                 ListStrategy::Integer
-            } else if !value.is_null() && pyre_object::is_plain_float_strict(value) {
+            } else if pyre_object::is_float_strategy_item(value) {
                 ListStrategy::Float
             } else {
                 ListStrategy::Object
@@ -11632,6 +11631,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         // route through the generic path — PyPy's IntegerListStrategy rejects a
         // W_BoolObject (`is_correct_type` is exact-type), switching the list to
         // object storage, so the int-storage fast path would drop the bool type.
+        // Float subclasses and NaNs switch the list to Object storage.
         // EXACT list only: a list SUBCLASS instance shares `ob_type ==
         // &LIST_TYPE` but retags `w_class` and may override `__setitem__`;
         // `is_exact_list` excludes it so it falls to the generic residual
@@ -11653,7 +11653,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         {
             1i64
         } else if pyre_object::w_list_uses_float_storage(list_obj)
-            && pyre_object::is_float(value_obj)
+            && pyre_object::is_float_strategy_item(value_obj)
         {
             2i64
         } else {
@@ -11748,6 +11748,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
+        walker_guard_float_not_nan(ctx, op_pc, raw)?;
         crate::state::trace_float_block_setitem_value(ctx.trace_ctx, block, raw_index, raw);
     }
 

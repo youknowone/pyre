@@ -147,6 +147,14 @@ pub fn generated_list_setitem_by_strategy<F: pyre_jit_trace::walker_frame_ops::W
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
                 crate::state::trace_unbox_float_with_resume(frame, value, float_type_addr)
             };
+            // NaNs side-exit to the boxed-storage path.
+            let is_nan = frame
+                .ctx_mut()
+                .record_op(majit_ir::OpCode::FloatNe, &[raw, raw]);
+            frame
+                .ctx_mut()
+                .set_opref_concrete(is_nan, majit_ir::Value::Int(0));
+            frame.generate_guard(majit_ir::OpCode::GuardFalse, &[is_nan]);
             crate::state::trace_float_block_setitem_value(frame.ctx_mut(), block, index, raw);
         }
         _ => unreachable!(),
@@ -593,8 +601,9 @@ unsafe fn detect_list_setitem_strategy(
         let unbox_long = pyre_object::pyobject::is_long(concrete_value);
         Some((1, unbox_long))
     } else if pyre_object::w_list_uses_float_storage(concrete_obj)
-        && pyre_object::pyobject::is_float(concrete_value)
+        && pyre_object::is_float_strategy_item(concrete_value)
     {
+        // Match `FloatListStrategy.is_correct_type` (listobject.py:2061).
         Some((2, false))
     } else {
         None
