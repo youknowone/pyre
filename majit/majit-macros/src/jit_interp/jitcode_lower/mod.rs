@@ -2569,6 +2569,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2593,6 +2594,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("jit_inline lowering should succeed")
         .expect("helper should lower");
@@ -2612,6 +2614,7 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            &[],
             &[],
             &[],
             &[],

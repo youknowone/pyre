@@ -23,8 +23,11 @@ pub(super) fn field_scalar_tokens(
                 const _: fn(&#struct_path) -> #ty = |__s| __s.#member;
             },
         ),
+        // `scalar_size`'s own default for a non-`Ref` field: the `i64` storage,
+        // which is 8 on every target and NOT the machine word (a `usize` here
+        // would report 4 on wasm32).
         None => (
-            quote! { ::core::mem::size_of::<usize>() },
+            quote! { ::core::mem::size_of::<i64>() },
             quote! { true },
             quote! {},
         ),

@@ -1879,8 +1879,20 @@ impl JitCodeBuilder {
             true,
             false,
             &[
-                (length_offset, false, "length", scalar_size(majit_ir::value::Type::Int), true),
-                (items_offset, true, "items", scalar_size(majit_ir::value::Type::Ref), false),
+                (
+                    length_offset,
+                    false,
+                    "length",
+                    scalar_size(majit_ir::value::Type::Int),
+                    true,
+                ),
+                (
+                    items_offset,
+                    true,
+                    "items",
+                    scalar_size(majit_ir::value::Type::Ref),
+                    false,
+                ),
             ],
         );
         let all_fielddescrs = self
@@ -6193,7 +6205,7 @@ mod tests {
                 TID,
                 false,
                 false,
-                &[(8, false, "agg"), (8, true, "leaf")],
+                &[(8, false, "agg", 8, true), (8, true, "leaf", 8, false)],
             );
             builder.getfield_gc_i(0, 1, 8, TID, name);
             // `finish` runs the postcondition under `cfg!(debug_assertions)`; a
@@ -6243,7 +6255,11 @@ mod tests {
     #[test]
     fn a_named_field_resolves_by_name_through_an_ambiguous_offset() {
         const TID: u64 = 0x4E41_4D45_4B59;
-        let fields = [(0, false, "head"), (8, false, "agg"), (8, true, "leaf")];
+        let fields = [
+            (0, false, "head", 8, false),
+            (8, false, "agg", 8, true),
+            (8, true, "leaf", 8, false),
+        ];
         assert_eq!(
             super::field_slot_in(&JitCodeBuilder::field_specs_from_layout(&fields), "leaf", 8,),
             Some(2),
