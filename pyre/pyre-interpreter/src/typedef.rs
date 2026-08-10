@@ -4959,10 +4959,14 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            ),
         )
     };
     unsafe {
@@ -5264,6 +5268,48 @@ fn init_list_type(ns: PyObjectRef) {
                 make_builtin_function_with_arity(name, func, 2),
             )
         };
+    }
+    // CPython 3.14 Argument Clinic metadata. The registrations above retain
+    // PyPy W_ListObject.typedef's source order and carrier kinds; only the
+    // Function metadata field is filled after all entries exist.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, index, /)"),
+        ("__setitem__", "($self, key, value, /)"),
+        ("__delitem__", "($self, key, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("__iadd__", "($self, value, /)"),
+        ("__imul__", "($self, value, /)"),
+        ("__reversed__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+        ("clear", "($self, /)"),
+        ("copy", "($self, /)"),
+        ("append", "($self, object, /)"),
+        ("insert", "($self, index, object, /)"),
+        ("extend", "($self, iterable, /)"),
+        ("pop", "($self, index=-1, /)"),
+        ("remove", "($self, value, /)"),
+        ("index", "($self, value, start=0, stop=sys.maxsize, /)"),
+        ("count", "($self, value, /)"),
+        ("reverse", "($self, /)"),
+        ("sort", "($self, /, *, key=None, reverse=False)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("list TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
 
