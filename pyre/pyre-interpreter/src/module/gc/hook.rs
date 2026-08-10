@@ -39,7 +39,9 @@ impl GcMinorHookAction {
     }
 
     fn do_perform(&mut self) -> Result<(), crate::PyError> {
-        let Some(hooks) = app_hooks() else {
+        // `self` is a field of this very allocation, so read the callback
+        // through the pointer rather than borrowing the whole singleton.
+        let Some(hooks) = app_hooks_ptr() else {
             return Ok(());
         };
         let count = self.count;
@@ -51,7 +53,7 @@ impl GcMinorHookAction {
         self.reset();
 
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(hooks.w_on_gc_minor);
+        pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_minor });
         let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let stats = new_minor_stats(
             count,
@@ -128,7 +130,9 @@ impl GcCollectStepHookAction {
     }
 
     fn do_perform(&mut self) -> Result<(), crate::PyError> {
-        let Some(hooks) = app_hooks() else {
+        // `self` is a field of this very allocation, so read the callback
+        // through the pointer rather than borrowing the whole singleton.
+        let Some(hooks) = app_hooks_ptr() else {
             return Ok(());
         };
         let count = self.count;
@@ -140,7 +144,7 @@ impl GcCollectStepHookAction {
         self.reset();
 
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(hooks.w_on_gc_collect_step);
+        pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_collect_step });
         let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let stats = new_collect_step_stats_full(
             count,
@@ -215,7 +219,9 @@ impl GcCollectHookAction {
     }
 
     fn do_perform(&mut self) -> Result<(), crate::PyError> {
-        let Some(hooks) = app_hooks() else {
+        // `self` is a field of this very allocation, so read the callback
+        // through the pointer rather than borrowing the whole singleton.
+        let Some(hooks) = app_hooks_ptr() else {
             return Ok(());
         };
         let count = self.count;
@@ -229,7 +235,7 @@ impl GcCollectHookAction {
         self.count = 0;
 
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(hooks.w_on_gc_collect);
+        pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_collect });
         let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let stats = new_collect_stats(
             count,
@@ -390,10 +396,21 @@ pub fn walk_hook_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     debug_assert_eq!(root.0, addr, "allocate_stable GcHooks moved");
 }
 
-fn app_hooks() -> Option<&'static mut W_AppLevelHooks> {
-    HOOKS_OBJECT
-        .get()
-        .and_then(|addr| W_AppLevelHooks::from_obj(*addr as PyObjectRef))
+/// The singleton as a raw pointer, without borrowing it.
+///
+/// The three hook actions are *fields* of `W_AppLevelHooks`, so every
+/// `AsyncActionOps::perform` already holds `&mut` over part of this
+/// allocation. `W_AppLevelHooks::from_obj` hands out `&'static mut Self`,
+/// which would overlap that borrow — and so would a shared `&`. Callers read
+/// and write through this pointer instead, narrowing any reference they do
+/// form to the single field they touch. Holding it across an allocating call
+/// is safe because `initialize` uses `allocate_stable`, which is what
+/// `walk_hook_roots`'s `debug_assert_eq!` above pins down.
+fn app_hooks_ptr() -> Option<*mut W_AppLevelHooks> {
+    let &addr = HOOKS_OBJECT.get()?;
+    let obj = addr as PyObjectRef;
+    unsafe { pyre_object::py_type_check(obj, &APPLEVELHOOKS_TYPE) }
+        .then_some(obj as *mut W_AppLevelHooks)
 }
 
 /// Create the space-owned singleton and bind its three actions to an
@@ -472,20 +489,20 @@ pub fn hooks_object() -> PyObjectRef {
 }
 
 fn is_gc_minor_enabled() -> bool {
-    app_hooks().is_some_and(|hooks| hooks.gc_minor_enabled)
+    app_hooks_ptr().is_some_and(|hooks| unsafe { (*hooks).gc_minor_enabled })
 }
 
 fn is_gc_collect_step_enabled() -> bool {
-    app_hooks().is_some_and(|hooks| hooks.gc_collect_step_enabled)
+    app_hooks_ptr().is_some_and(|hooks| unsafe { (*hooks).gc_collect_step_enabled })
 }
 
 fn is_gc_collect_enabled() -> bool {
-    app_hooks().is_some_and(|hooks| hooks.gc_collect_enabled)
+    app_hooks_ptr().is_some_and(|hooks| unsafe { (*hooks).gc_collect_enabled })
 }
 
 fn on_gc_minor(duration: f64, total_memory_used: usize, pinned_objects: usize) {
-    let Some(hooks) = app_hooks() else { return };
-    let action = &mut hooks.gc_minor;
+    let Some(hooks) = app_hooks_ptr() else { return };
+    let action = unsafe { &mut (*hooks).gc_minor };
     action.count += 1;
     action.duration += duration;
     action.duration_min = action.duration_min.min(duration);
@@ -496,8 +513,8 @@ fn on_gc_minor(duration: f64, total_memory_used: usize, pinned_objects: usize) {
 }
 
 fn on_gc_collect_step(duration: f64, oldstate: u8, newstate: u8) {
-    let Some(hooks) = app_hooks() else { return };
-    let action = &mut hooks.gc_collect_step;
+    let Some(hooks) = app_hooks_ptr() else { return };
+    let action = unsafe { &mut (*hooks).gc_collect_step };
     action.count += 1;
     action.duration += duration;
     action.duration_min = action.duration_min.min(duration);
@@ -517,8 +534,8 @@ fn on_gc_collect(
     rawmalloc_bytes_after: usize,
     pinned_objects: usize,
 ) {
-    let Some(hooks) = app_hooks() else { return };
-    let action = &mut hooks.gc_collect;
+    let Some(hooks) = app_hooks_ptr() else { return };
+    let action = unsafe { &mut (*hooks).gc_collect };
     action.count += 1;
     action.num_major_collects = num_major_collects;
     action.arenas_count_before = arenas_count_before;
