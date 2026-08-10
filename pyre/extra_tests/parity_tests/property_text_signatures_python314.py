@@ -24,4 +24,4 @@ assert str(inspect.signature(property.__get__)) == (
 assert str(inspect.signature(property.setter)) == "(self, object, /)"
 assert str(inspect.signature(property.__set_name__)) == "(self, owner, name, /)"
 
-print("property text signatures Python 3.14 parity: ok")
+print("OK")

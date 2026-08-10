@@ -31,4 +31,4 @@ assert str(inspect.signature(range.__getitem__)) == "(self, key, /)"
 assert str(inspect.signature(range.__contains__)) == "(self, key, /)"
 assert str(inspect.signature(range.count)) == "(self, object, /)"
 
-print("range text signatures Python 3.14 parity: ok")
+print("OK")

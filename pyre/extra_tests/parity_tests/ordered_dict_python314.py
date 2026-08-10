@@ -22,4 +22,4 @@ for view in (od.keys(), od.values(), od.items()):
     next(iterator)
     assert list(pickle.loads(pickle.dumps(iterator))) == expected
 
-print("OrderedDict Python 3.14 parity: ok")
+print("OK")

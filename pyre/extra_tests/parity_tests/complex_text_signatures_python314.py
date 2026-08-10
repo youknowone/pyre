@@ -35,4 +35,4 @@ assert str(inspect.signature(complex.from_number)) == "(number, /)"
 assert str(inspect.signature(complex.__pow__)) == "(self, value, mod=None, /)"
 assert str(inspect.signature(complex.conjugate)) == "(self, /)"
 
-print("complex text signatures Python 3.14 parity: ok")
+print("OK")

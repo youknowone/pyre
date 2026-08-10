@@ -65,4 +65,4 @@ assert str(inspect.signature(set.update)) == "(self, /, *others)"
 assert str(inspect.signature(frozenset.symmetric_difference)) == "(self, other, /)"
 assert str(inspect.signature(frozenset.__class_getitem__)) == "(object, /)"
 
-print("set/frozenset text signatures Python 3.14 parity: ok")
+print("OK")

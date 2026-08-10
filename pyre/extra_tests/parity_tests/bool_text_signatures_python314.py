@@ -22,4 +22,4 @@ for name, signature in EXPECTED.items():
 assert str(inspect.signature(bool.__repr__)) == "(self, /)"
 assert str(inspect.signature(bool.__and__)) == "(self, value, /)"
 
-print("bool text signatures Python 3.14 parity: ok")
+print("OK")

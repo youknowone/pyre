@@ -25,4 +25,4 @@ finally:
     if path is not None:
         os.unlink(path)
 
-print("script source encoding startup ok")
+print("OK")

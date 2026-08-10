@@ -62,4 +62,4 @@ assert str(inspect.signature(print)) == (
     "(*args, sep=' ', end='\\n', file=None, flush=False)"
 )
 
-print("builtin text signatures Python 3.14 parity: ok")
+print("OK")

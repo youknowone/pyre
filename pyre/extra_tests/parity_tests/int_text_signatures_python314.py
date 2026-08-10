@@ -46,4 +46,4 @@ assert str(inspect.signature(int.from_bytes)) == (
 )
 assert str(inspect.signature(int.__pow__)) == "(self, value, mod=None, /)"
 
-print("int text signatures Python 3.14 parity: ok")
+print("OK")

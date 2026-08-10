@@ -44,4 +44,4 @@ assert str(inspect.signature(memoryview.index)) == (
 )
 assert str(inspect.signature(memoryview._from_flags)) == "(object, flags)"
 
-print("memoryview text signatures Python 3.14 parity: ok")
+print("OK")

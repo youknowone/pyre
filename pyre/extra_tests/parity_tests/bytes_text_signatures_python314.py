@@ -82,4 +82,4 @@ assert str(inspect.signature(bytes.decode)) == (
 assert str(inspect.signature(bytes.replace)) == "(self, old, new, count=-1, /)"
 assert str(inspect.signature(bytes.fromhex)) == "(string, /)"
 
-print("bytes text signatures Python 3.14 parity: ok")
+print("OK")

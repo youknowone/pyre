@@ -29,4 +29,4 @@ assert str(inspect.signature(type.__call__)) == "(self, /, *args, **kwargs)"
 assert str(inspect.signature(type.__prepare__)) == "(name, bases, /, **kwds)"
 assert str(inspect.signature(type.__instancecheck__)) == "(self, instance, /)"
 
-print("type text signatures Python 3.14 parity: ok")
+print("OK")

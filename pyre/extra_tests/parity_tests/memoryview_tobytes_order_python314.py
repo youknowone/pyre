@@ -49,4 +49,4 @@ except TypeError as error:
 else:
     raise AssertionError("duplicate order accepted")
 
-print("memoryview.tobytes order Python 3.14 parity: ok")
+print("OK")

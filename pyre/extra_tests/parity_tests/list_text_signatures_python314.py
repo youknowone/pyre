@@ -52,4 +52,4 @@ assert str(inspect.signature(list.sort)) == (
 )
 assert str(inspect.signature(list.__class_getitem__)) == "(object, /)"
 
-print("list text signatures Python 3.14 parity: ok")
+print("OK")

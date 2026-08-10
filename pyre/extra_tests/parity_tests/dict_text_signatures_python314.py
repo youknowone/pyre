@@ -46,4 +46,4 @@ assert str(inspect.signature(dict.get)) == "(self, key, default=None, /)"
 assert str(inspect.signature(dict.fromkeys)) == "(iterable, value=None, /)"
 assert str(inspect.signature(dict.__class_getitem__)) == "(object, /)"
 
-print("dict text signatures Python 3.14 parity: ok")
+print("OK")

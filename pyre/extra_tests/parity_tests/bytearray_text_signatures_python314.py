@@ -98,4 +98,4 @@ assert str(inspect.signature(bytearray.decode)) == (
 assert str(inspect.signature(bytearray.resize)) == "(self, size, /)"
 assert str(inspect.signature(bytearray.fromhex)) == "(string, /)"
 
-print("bytearray text signatures Python 3.14 parity: ok")
+print("OK")

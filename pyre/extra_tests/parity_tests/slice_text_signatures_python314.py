@@ -24,4 +24,4 @@ assert str(inspect.signature(slice.__eq__)) == "(self, value, /)"
 assert str(inspect.signature(slice.indices)) == "(self, object, /)"
 assert str(inspect.signature(slice.__reduce__)) == "(self, /)"
 
-print("slice text signatures Python 3.14 parity: ok")
+print("OK")

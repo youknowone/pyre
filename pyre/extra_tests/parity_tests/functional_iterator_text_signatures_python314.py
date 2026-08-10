@@ -33,4 +33,4 @@ assert str(inspect.signature(enumerate.__next__)) == "(self, /)"
 assert str(inspect.signature(reversed.__setstate__)) == "(self, object, /)"
 assert str(inspect.signature(enumerate.__class_getitem__)) == "(object, /)"
 
-print("functional iterator text signatures Python 3.14 parity: ok")
+print("OK")

@@ -18,4 +18,4 @@ assert str(inspect.signature(super.__repr__)) == "(self, /)"
 assert str(inspect.signature(super.__getattribute__)) == "(self, name, /)"
 assert str(inspect.signature(super.__get__)) == "(self, instance, owner=None, /)"
 
-print("super text signatures Python 3.14 parity: ok")
+print("OK")

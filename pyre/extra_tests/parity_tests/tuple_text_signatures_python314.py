@@ -35,4 +35,4 @@ assert str(inspect.signature(tuple.index)) == (
 )
 assert str(inspect.signature(tuple.__class_getitem__)) == "(object, /)"
 
-print("tuple text signatures Python 3.14 parity: ok")
+print("OK")

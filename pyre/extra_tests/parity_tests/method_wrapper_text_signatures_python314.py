@@ -34,4 +34,4 @@ assert str(inspect.signature(classmethod.__get__)) == (
 )
 assert str(inspect.signature(classmethod.__class_getitem__)) == "(object, /)"
 
-print("method wrapper text signatures Python 3.14 parity: ok")
+print("OK")

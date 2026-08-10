@@ -15,4 +15,4 @@ for typ in (set, frozenset):
     assert typ(range(5)).__sizeof__() == 712
     assert typ(range(19)).__sizeof__() == 2248
 
-print("dict/set __sizeof__ Python 3.14 parity: ok")
+print("OK")

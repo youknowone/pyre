@@ -89,4 +89,4 @@ assert str(inspect.signature(str.encode)) == (
 assert str(inspect.signature(str.replace)) == "(self, old, new, /, count=-1)"
 assert str(inspect.signature(str.format)) == "(self, /, *args, **kwargs)"
 
-print("str text signatures Python 3.14 parity: ok")
+print("OK")

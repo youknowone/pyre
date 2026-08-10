@@ -40,4 +40,4 @@ assert str(inspect.signature(float.from_number)) == "(number, /)"
 assert str(inspect.signature(float.fromhex)) == "(string, /)"
 assert str(inspect.signature(float.__pow__)) == "(self, value, mod=None, /)"
 
-print("float text signatures Python 3.14 parity: ok")
+print("OK")

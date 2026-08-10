@@ -114,4 +114,4 @@ for operator, message in (
         error.end_offset,
     )
 
-print("syntax error Python 3.14 offsets ok")
+print("OK")
