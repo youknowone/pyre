@@ -3,4 +3,6 @@
 //! Provides the 'C' locale defaults so locale.py's `from _locale import *`
 //! succeeds and Lib/locale.py exposes working `localeconv` / `setlocale`.
 
+pub mod rlocale;
+
 crate::pyre_module_init!(interp_locale);

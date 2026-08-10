@@ -203,20 +203,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // `_w_copy_grouping` (`interp_locale.py:36-40`): every byte
                     // of the C grouping string up to its NUL is one group size
                     // (a `CHAR_MAX` element stays `127`), then a trailing `0`
-                    // is appended to a non-empty list. Read the grouping
-                    // straight from `localeconv()` because the host helper
-                    // stops at the first `CHAR_MAX`, dropping it.
+                    // is appended to a non-empty list. The bytes come from
+                    // `rlocale::charp2str`, the same read `numeric_formatting`
+                    // groups by, rather than from the host helper, which stops
+                    // at the first `CHAR_MAX` and drops it. The trailing `0` is
+                    // this function's own fixup and belongs to the app-level
+                    // list, never to the grouping the formatter walks.
                     let grouping_of = |ptr: *const libc::c_char| -> Vec<i64> {
-                        let mut v: Vec<i64> = Vec::new();
-                        if !ptr.is_null() {
-                            let mut cur = ptr;
-                            unsafe {
-                                while *cur != 0 {
-                                    v.push(*cur as u8 as i64);
-                                    cur = cur.add(1);
-                                }
-                            }
-                        }
+                        let mut v: Vec<i64> = super::rlocale::charp2str(ptr)
+                            .into_iter()
+                            .map(i64::from)
+                            .collect();
                         if !v.is_empty() {
                             v.push(0);
                         }
