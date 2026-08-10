@@ -16436,30 +16436,44 @@ fn property_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
 /// PyPy `W_Property.typedef`, extended only where Python 3.14's public
 /// surface differs (`__name__`, `__set_name__`, no PyPy-3.11 `__reduce__`).
 fn init_property_type(ns: PyObjectRef) {
+    let new_descr = make_new_descr(property_descr_new);
+    unsafe {
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
+    };
     let entries = [
-        ("__new__", make_new_descr(property_descr_new)),
+        ("__new__", new_descr),
         (
             "__init__",
-            make_builtin_function("__init__", property_descr_init),
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__init__",
+                property_descr_init,
+                "($self, /, *args, **kwargs)",
+            ),
         ),
         (
             "__get__",
-            make_builtin_function("__get__", crate::baseobjspace::property_descr_get_impl),
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__get__",
+                crate::baseobjspace::property_descr_get_impl,
+                "($self, instance, owner=None, /)",
+            ),
         ),
         (
             "__set__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__set__",
                 crate::baseobjspace::property_descr_set_impl,
                 3,
+                "($self, instance, value, /)",
             ),
         ),
         (
             "__delete__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__delete__",
                 crate::baseobjspace::property_descr_delete_impl,
                 2,
+                "($self, instance, /)",
             ),
         ),
         (
@@ -16513,26 +16527,29 @@ fn init_property_type(ns: PyObjectRef) {
         ),
         (
             "getter",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "getter",
                 crate::baseobjspace::property_getter_impl,
                 2,
+                "($self, object, /)",
             ),
         ),
         (
             "setter",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "setter",
                 crate::baseobjspace::property_setter_impl,
                 2,
+                "($self, object, /)",
             ),
         ),
         (
             "deleter",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "deleter",
                 crate::baseobjspace::property_deleter_impl,
                 2,
+                "($self, object, /)",
             ),
         ),
         (
@@ -16541,7 +16558,11 @@ fn init_property_type(ns: PyObjectRef) {
             // user-visible count without the bound receiver.  Let the
             // implementation parse the call so its exact 3.14 diagnostics
             // are not pre-empted by gateway's generic fixed-arity wording.
-            make_builtin_function("__set_name__", crate::baseobjspace::property_set_name_impl),
+            crate::gateway::make_builtin_function_with_text_signature(
+                "__set_name__",
+                crate::baseobjspace::property_set_name_impl,
+                "($self, owner, name, /)",
+            ),
         ),
     ];
     for (name, value) in entries {
