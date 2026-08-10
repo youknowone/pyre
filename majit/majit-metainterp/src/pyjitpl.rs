@@ -11011,6 +11011,31 @@ impl<M: Clone> MetaInterp<M> {
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
             return (false, owning_key);
         }
+        // `compile.py:950-953` `ResumeGuardForcedDescr.handle_fail` — "Failures
+        // of a GUARD_NOT_FORCED are never compiled, but always just
+        // blackholed."  Upstream expresses that by OVERRIDING `handle_fail`
+        // for the forced descr, so `must_compile` — and with it
+        // `jitcounter.tick`, `start_compiling`'s `ST_BUSY_FLAG` and
+        // `_trace_and_compile_from_bridge` — is never entered for one.
+        //
+        // Pyre has no descr-keyed `handle_fail` dispatch (`compile.rs`'s
+        // `ResumeGuardForcedDescr` is a tag-only subtype), so the same veto
+        // lands here, at the first shared step upstream skips. It already
+        // existed one call deeper, at `call_jit.rs`'s
+        // `trace_and_compile_from_bridge` entry; by then the tick was spent
+        // and, on the failure that fires the counter, the guard scope and the
+        // `force_plain_eval` install had already run for a result fixed at
+        // "resume in the blackhole".
+        //
+        // Returning `false` reaches that same blackhole resume through
+        // `compile.py:710-716`'s `else` arm, and the forced-virtuals cache the
+        // resume fishes (`compile.py:956-960`) is read on that side, so the
+        // outcome is unchanged — only the counter traffic and the wasted
+        // round-trip go away.
+        if descr_arc.is_guard_forced() {
+            crate::mc_diag_bump(60); // forced_never_compiled
+            return (false, owning_key);
+        }
         // `compile.py:741` `status = self.status` — direct field read on
         // the resume-guard descr.  `descr_fd` is the live `FailDescr`
         // we already resolved above; no backend round-trip.

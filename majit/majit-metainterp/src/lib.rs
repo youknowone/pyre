@@ -599,7 +599,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 60;
+pub const MC_DIAG_SLOTS: usize = 61;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -689,10 +689,7 @@ pub const MC_DIAG_SLOTS: usize = 60;
 /// a whole run.
 pub static MC_DIAG: [std::sync::atomic::AtomicU64; MC_DIAG_SLOTS] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    [
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-    ]
+    [Z; MC_DIAG_SLOTS]
 };
 
 /// Short label per [`MC_DIAG`] slot, in index order, so a tally cannot be added
@@ -758,6 +755,7 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     "retrace_arity_giveup",
     "ptp_push",
     "ptp_pop",
+    "forced_never_compiled",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.
