@@ -2786,10 +2786,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `W_UnicodeObject.descr_iter` into a fresh sequence iterator.  Pyre's
     // tagged `GetIter` call has the same no-user-dispatch property for an
     // exact string; subclasses retain the conservative decline.
-    // The wasm optimizer currently rejects the resulting longer trace as
-    // `InvalidLoop` (three compile aborts versus the conservative path's one
-    // trace-time decline).  Keep its prior admission boundary until that
-    // backend can consume this shape; interpreter semantics are identical.
+    // The wasm optimizer still rejects the resulting longer trace: dropping
+    // this gate and rebuilding the guest reads `abrt_bad_loop=1` on
+    // `str_search_index_bounds`, with `bridges_compiled` 7 -> 5 and
+    // `guard_failures` 2096 -> 7098 against 1897 for the native backends.
+    // Keep its prior admission boundary until that backend can consume this
+    // shape; interpreter semantics are identical.  Its own cost on that bench
+    // is one trace-time decline — the hazardous-callee arm of
+    // `fbw_abort_nested_unjournaled_residual`, reached because the `GetIter`
+    // sits inside the loop-bearing `fold` this comment's `str()` sibling names
+    // — and the 199 guard failures its unbridged guard re-fires one
+    // `trace_eagerness` cycle later.
     let native_exact_str_replay = !cfg!(target_arch = "wasm32");
     let observed_exact_str_iter = native_exact_str_replay
         && helper == majit_ir::PyreHelperKind::GetIter
