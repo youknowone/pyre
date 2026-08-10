@@ -434,9 +434,21 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_get_objects(Some(wasm_get_objects));
     majit_gc::set_active_get_referents(Some(wasm_get_referents));
     majit_gc::set_active_is_tracked(Some(wasm_is_tracked));
+    majit_gc::set_active_get_rpy_memory_usage(Some(wasm_get_rpy_memory_usage));
+    majit_gc::set_active_get_rpy_type_index(Some(wasm_get_rpy_type_index));
+    majit_gc::set_active_get_rpy_roots(Some(wasm_get_rpy_roots));
+    majit_gc::set_active_get_rpy_referents(Some(wasm_get_rpy_referents));
+    majit_gc::set_active_is_app_level_object(Some(wasm_is_app_level_object));
+    majit_gc::set_active_dump_rpy_heap(Some(wasm_dump_rpy_heap));
+    majit_gc::set_active_get_typeids_text(Some(wasm_get_typeids_text));
+    majit_gc::set_active_get_typeids_list(Some(wasm_get_typeids_list));
+    majit_gc::set_active_add_memory_pressure(Some(wasm_add_memory_pressure));
+    majit_gc::set_active_total_memory_pressure(Some(wasm_total_memory_pressure));
     majit_gc::set_active_collect_full(Some(wasm_collect_full));
+    majit_gc::set_active_collect_step(Some(wasm_collect_step));
     majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
+    majit_gc::set_active_gc_memory_stats(Some(active_gc_memory_stats));
     majit_gc::set_active_major_threshold_reached(Some(active_gc_major_threshold_reached));
     majit_gc::set_active_finalizer_hooks(
         Some(wasm_register_finalizer),
@@ -477,6 +489,10 @@ pub fn install_gc_standalone() {
 /// runner split GC-retained memory from host-heap growth.
 pub fn active_gc_heap_stats() -> (usize, usize) {
     with_wasm_active_gc(|gc| gc.heap_byte_stats()).unwrap_or((0, 0))
+}
+
+pub fn active_gc_memory_stats() -> majit_gc::GcMemoryStats {
+    with_wasm_active_gc(|gc| gc.gc_memory_stats()).unwrap_or_default()
 }
 
 /// Whether the GC owned by this thread's wasm backend wants a major collection
@@ -598,6 +614,13 @@ fn wasm_collect_full() {
     with_wasm_active_gc_mut(|gc| gc.collect_full());
 }
 
+fn wasm_collect_step() -> majit_gc::GcStepTransition {
+    with_wasm_active_gc_mut(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
+        old_state: majit_gc::GcStepTransition::SCANNING,
+        new_state: majit_gc::GcStepTransition::SCANNING,
+    })
+}
+
 /// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Drives the
 /// interpreter-safepoint non-moving old-gen major (`gc_interp::safepoint`,
 /// default-on on wasm) through the active GC. Needs mutable access, so it
@@ -620,6 +643,48 @@ fn wasm_get_referents(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
 
 fn wasm_is_tracked(obj: GcRef) -> bool {
     with_wasm_active_gc_mut(|gc| gc.is_tracked(obj)).unwrap_or(false)
+}
+
+fn wasm_get_rpy_memory_usage(obj: GcRef) -> Option<usize> {
+    with_wasm_active_gc_mut(|gc| gc.get_rpy_memory_usage(obj)).flatten()
+}
+
+fn wasm_get_rpy_type_index(obj: GcRef) -> Option<usize> {
+    with_wasm_active_gc_mut(|gc| gc.get_rpy_type_index(obj)).flatten()
+}
+
+fn wasm_get_rpy_roots(visitor: majit_gc::GetObjectsVisitorFn) -> bool {
+    let mut visit = visitor;
+    with_wasm_active_gc_mut(|gc| gc.get_rpy_roots(&mut visit)).unwrap_or(false)
+}
+
+fn wasm_get_rpy_referents(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) -> bool {
+    let mut visit = visitor;
+    with_wasm_active_gc_mut(|gc| gc.get_rpy_referents(obj, &mut visit)).unwrap_or(false)
+}
+
+fn wasm_is_app_level_object(obj: GcRef) -> bool {
+    with_wasm_active_gc_mut(|gc| gc.is_app_level_object(obj)).unwrap_or(false)
+}
+
+fn wasm_dump_rpy_heap(fd: i32) -> Result<bool, i32> {
+    with_wasm_active_gc_mut(|gc| gc.dump_rpy_heap(fd)).unwrap_or(Ok(false))
+}
+
+fn wasm_get_typeids_text() -> Option<Vec<u8>> {
+    with_wasm_active_gc(|gc| gc.get_typeids_text()).flatten()
+}
+
+fn wasm_get_typeids_list() -> Option<Vec<usize>> {
+    with_wasm_active_gc(|gc| gc.get_typeids_list()).flatten()
+}
+
+fn wasm_add_memory_pressure(size: isize, object: GcRef) {
+    with_wasm_active_gc_mut(|gc| gc.add_memory_pressure(size, object));
+}
+
+fn wasm_total_memory_pressure() -> isize {
+    with_wasm_active_gc_mut(|gc| gc.total_memory_pressure()).unwrap_or(0)
 }
 
 /// `minimark.py:1900-1915 id_or_identityhash` trampoline. The collector

@@ -1179,6 +1179,7 @@ pub unsafe fn walk_pyframe_roots_area(
 /// faulthandler's — so it registers once for the process.
 fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_global_prebuilt_roots(visitor);
+    crate::module::gc::hook::walk_hook_roots(visitor);
     crate::module::thread::walk_thread_roots(visitor);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     crate::module::faulthandler::handler::walk_faulthandler_roots(visitor);

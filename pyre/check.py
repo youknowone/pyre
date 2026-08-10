@@ -548,13 +548,13 @@ def pyre_env():
     # removes it on both native backends and does not in the guest, which reads
     # `recursive_call_frame_relocation` 638 and `closure_per_call` 420 against
     # their 636 and 414 — the same knife edge described above, one step along
-    # it. The two run different interpreter allocation models, so one program
-    # presents the collector with two different old-gen totals: `PYRE_GC_INTERP`
-    # (`pyre-object/src/gc_interp.rs`) is off natively, where `w_int_new` /
-    # `w_float_new` take an untracked `alloc_with_gc_header` that
-    # `threshold_reached` never sees, and on in the guest, where the same
-    # objects are collector-allocated and counted. So the guest reaches a
-    # threshold the native backends do not, from the same fixture.
+    # it. Historically the two ran different interpreter allocation models:
+    # `PYRE_GC_INTERP` was off natively and on in the guest, so only the guest
+    # counted interpreter-created int/float boxes toward the old-gen threshold.
+    # The gate is now default-on everywhere and the allocation model is shared;
+    # this note remains because the recorded wasm memory/counter boundary below
+    # predates that convergence and still explains why the 256MB floor was
+    # chosen instead of tuning a platform-specific overlay.
     #
     # Left where it is deliberately. 384MB and above does land the guest exactly
     # on the native counts, but it buys agreement with memory: `closure_per_call`

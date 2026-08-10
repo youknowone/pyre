@@ -279,6 +279,28 @@ pub fn try_gc_collect() {
     }
 }
 
+/// `incminimark.py:810-822 collect_step` callback. The pair is the encoded
+/// `(old_state, new_state)` transition; keeping the hook in primitive terms
+/// avoids making pyre-object depend on majit-gc.
+pub type GcCollectStepHookFn = fn() -> (u8, u8);
+
+majit_gc::global_hook!(static GC_COLLECT_STEP_HOOK: GcCollectStepHookFn);
+
+pub fn register_gc_collect_step_hook(hook: GcCollectStepHookFn) {
+    GC_COLLECT_STEP_HOOK.set(Some(hook));
+}
+
+pub fn clear_gc_collect_step_hook() {
+    GC_COLLECT_STEP_HOOK.set(None);
+}
+
+#[majit_macros::dont_look_inside]
+pub fn try_gc_collect_step() -> (u8, u8) {
+    GC_COLLECT_STEP_HOOK
+        .get()
+        .map_or((0, 0), |collect_step| collect_step())
+}
+
 /// Signature of the host-side non-moving old-gen-only major callback.
 /// Reclaims stable-allocated interp int/float without moving the nursery, so
 /// the interpreter safepoint can drive it under an active JIT (non-empty

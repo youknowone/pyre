@@ -40,6 +40,8 @@ pub struct OldGen {
     /// payload side table, it has no entry for ordinary arena survivors.
     rawmalloced_payloads: AddressSet,
     rawmalloced_total_size: usize,
+    /// incminimark.py:386,1073-1074 `rawmalloced_peak_size`.
+    rawmalloced_peak_size: usize,
     /// llarena debug-fill parity for old-generation allocations.  The same
     /// opt-in detector covers both recycled arena blocks and rawmalloc blocks.
     poison_on_alloc: bool,
@@ -59,6 +61,7 @@ impl OldGen {
             raw_malloc_might_sweep: Vec::new(),
             rawmalloced_payloads: AddressSet::default(),
             rawmalloced_total_size: 0,
+            rawmalloced_peak_size: 0,
             poison_on_alloc: std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some(),
         }
     }
@@ -84,7 +87,7 @@ impl OldGen {
     ) -> *mut u8 {
         self.try_alloc_with_card_header(total_size, card_header_bytes)
             .unwrap_or_else(|| {
-                let obj_size = round_up(total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE));
+                let obj_size = Self::allocation_size(total_size);
                 let alloc_size = round_up(
                     card_header_bytes
                         .checked_add(obj_size)
@@ -128,6 +131,8 @@ impl OldGen {
             self.rawmalloced_payloads
                 .insert(header_ptr as usize + GcHeader::SIZE);
             self.rawmalloced_total_size += alloc_size;
+            self.rawmalloced_peak_size =
+                self.rawmalloced_peak_size.max(self.rawmalloced_total_size);
             header_ptr
         };
         if self.poison_on_alloc {
@@ -137,6 +142,16 @@ impl OldGen {
             unsafe { ptr::write_bytes(header_ptr, 0xAA, obj_size) };
         }
         Some(header_ptr)
+    }
+
+    /// `raw_malloc_usage(totalsize)` for an object allocation.
+    ///
+    /// The collector's finalizer accounting needs the same rounded byte count
+    /// that `ArenaCollection.total_memory_used` / `rawmalloced_total_size`
+    /// record.  Keep that geometry owned by the allocator rather than
+    /// duplicating its minimum-size and alignment rules in `collector.rs`.
+    pub(crate) fn allocation_size(total_size: usize) -> usize {
+        round_up(total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE))
     }
 
     /// Allocate uninitialized space and overwrite the complete object from
@@ -150,6 +165,39 @@ impl OldGen {
     /// incminimark.py:1268: arena live bytes plus rawmalloced live bytes.
     pub fn total_bytes(&self) -> usize {
         self.ac.total_memory_used + self.rawmalloced_total_size
+    }
+
+    pub(crate) fn arenas_count(&self) -> usize {
+        self.ac.arenas_count
+    }
+
+    pub(crate) fn arenas_bytes(&self) -> usize {
+        self.ac.total_memory_used
+    }
+
+    pub(crate) fn rawmalloced_bytes(&self) -> usize {
+        self.rawmalloced_total_size
+    }
+
+    pub(crate) fn peak_rawmalloced_bytes(&self) -> usize {
+        self.rawmalloced_peak_size
+    }
+
+    /// incminimark.py:1270-1286 memory-stat helpers.
+    pub(crate) fn total_allocated_bytes(&self) -> usize {
+        self.ac.total_memory_alloced + self.rawmalloced_total_size
+    }
+
+    pub(crate) fn peak_allocated_bytes(&self) -> usize {
+        self.ac.peak_memory_alloced + self.rawmalloced_peak_size
+    }
+
+    pub(crate) fn peak_used_bytes(&self) -> usize {
+        self.ac.peak_memory_used.max(self.ac.total_memory_used) + self.rawmalloced_peak_size
+    }
+
+    pub(crate) fn peak_arena_bytes(&self) -> usize {
+        self.ac.peak_memory_used.max(self.ac.total_memory_used)
     }
 
     #[cfg(test)]
@@ -384,6 +432,8 @@ mod tests {
         assert!(oldgen.contains(dead_payload));
         oldgen.sweep();
         assert!(!oldgen.contains(dead_payload));
+        assert!(oldgen.peak_rawmalloced_bytes() >= round_up(size + 2 * WORD) + round_up(size));
+        assert!(oldgen.peak_allocated_bytes() >= oldgen.total_allocated_bytes());
     }
 
     #[test]

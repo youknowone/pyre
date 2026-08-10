@@ -393,11 +393,23 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
     majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
+    majit_gc::set_active_collect_step(Some(collect_step_via_active_runtime));
     majit_gc::set_active_get_objects(Some(get_objects_via_active_runtime));
     majit_gc::set_active_get_referents(Some(get_referents_via_active_runtime));
     majit_gc::set_active_is_tracked(Some(is_tracked_via_active_runtime));
+    majit_gc::set_active_get_rpy_memory_usage(Some(get_rpy_memory_usage_via_active_runtime));
+    majit_gc::set_active_get_rpy_type_index(Some(get_rpy_type_index_via_active_runtime));
+    majit_gc::set_active_get_rpy_roots(Some(get_rpy_roots_via_active_runtime));
+    majit_gc::set_active_get_rpy_referents(Some(get_rpy_referents_via_active_runtime));
+    majit_gc::set_active_is_app_level_object(Some(is_app_level_object_via_active_runtime));
+    majit_gc::set_active_dump_rpy_heap(Some(dump_rpy_heap_via_active_runtime));
+    majit_gc::set_active_get_typeids_text(Some(get_typeids_text_via_active_runtime));
+    majit_gc::set_active_get_typeids_list(Some(get_typeids_list_via_active_runtime));
+    majit_gc::set_active_add_memory_pressure(Some(add_memory_pressure_via_active_runtime));
+    majit_gc::set_active_total_memory_pressure(Some(total_memory_pressure_via_active_runtime));
     majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
     majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
+    majit_gc::set_active_gc_memory_stats(Some(gc_memory_stats_via_active_runtime));
     majit_gc::set_active_major_threshold_reached(Some(major_threshold_reached_via_active_runtime));
     majit_gc::set_active_root_hooks(
         Some(gc_add_root_via_active_runtime),
@@ -1723,6 +1735,13 @@ fn collect_full_via_active_runtime() {
     with_cranelift_gc(|gc| gc.collect_full());
 }
 
+fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {
+    with_cranelift_gc(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
+        old_state: majit_gc::GcStepTransition::SCANNING,
+        new_state: majit_gc::GcStepTransition::SCANNING,
+    })
+}
+
 fn get_objects_via_active_runtime(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
     with_cranelift_gc(|gc| gc.get_objects(generation, &mut visit));
@@ -1751,6 +1770,91 @@ fn is_tracked_via_active_runtime(obj: GcRef) -> bool {
     false
 }
 
+fn get_rpy_memory_usage_via_active_runtime(obj: GcRef) -> Option<usize> {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.get_rpy_memory_usage(obj)).flatten()
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_memory_usage(obj))
+    } else {
+        None
+    }
+}
+
+fn get_rpy_type_index_via_active_runtime(obj: GcRef) -> Option<usize> {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.get_rpy_type_index(obj)).flatten()
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_type_index(obj))
+    } else {
+        None
+    }
+}
+
+fn get_rpy_roots_via_active_runtime(visitor: majit_gc::GetObjectsVisitorFn) -> bool {
+    let mut visit = visitor;
+    with_cranelift_gc(|gc| gc.get_rpy_roots(&mut visit)).unwrap_or(false)
+}
+
+fn get_rpy_referents_via_active_runtime(
+    obj: GcRef,
+    visitor: majit_gc::GetObjectsVisitorFn,
+) -> bool {
+    let mut visit = visitor;
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.get_rpy_referents(obj, &mut visit)).unwrap_or(false)
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_referents(obj, &mut visit))
+    } else {
+        false
+    }
+}
+
+fn is_app_level_object_via_active_runtime(obj: GcRef) -> bool {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.is_app_level_object(obj)).unwrap_or(false)
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.is_app_level_object(obj))
+    } else {
+        false
+    }
+}
+
+fn dump_rpy_heap_via_active_runtime(fd: i32) -> Result<bool, i32> {
+    if gc_box::present() {
+        return with_cranelift_gc(|gc| gc.dump_rpy_heap(fd)).unwrap_or(Ok(false));
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|gc| gc.dump_rpy_heap(fd));
+    }
+    Ok(false)
+}
+
+fn get_typeids_text_via_active_runtime() -> Option<Vec<u8>> {
+    with_cranelift_gc(|gc| gc.get_typeids_text()).flatten()
+}
+
+fn get_typeids_list_via_active_runtime() -> Option<Vec<usize>> {
+    with_cranelift_gc(|gc| gc.get_typeids_list()).flatten()
+}
+
+fn add_memory_pressure_via_active_runtime(size: isize, object: GcRef) {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.add_memory_pressure(size, object));
+    } else if majit_gc::gc_sync::is_initialized() {
+        if object.is_null() {
+            majit_gc::gc_sync::gc_op(|gc| gc.add_memory_pressure(size, object));
+        } else {
+            majit_gc::gc_sync::gc_op_with_root(object, |gc, object| {
+                gc.add_memory_pressure(size, object)
+            });
+        }
+    }
+}
+
+fn total_memory_pressure_via_active_runtime() -> isize {
+    with_cranelift_gc(|gc| gc.total_memory_pressure()).unwrap_or(0)
+}
+
 /// Non-moving old-gen-only major trampoline — sweeps dead old-gen objects
 /// without moving the nursery, so the interpreter safepoint can drive it under
 /// an active JIT (non-empty nursery). Unlike [`collect_full_via_active_runtime`]
@@ -1774,6 +1878,10 @@ fn finalizer_next_dead_via_active_runtime(fq_index: usize) -> Option<GcRef> {
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
 fn heap_stats_via_active_runtime() -> (usize, usize) {
     with_cranelift_gc(|gc| gc.heap_byte_stats()).unwrap_or((0, 0))
+}
+
+fn gc_memory_stats_via_active_runtime() -> majit_gc::GcMemoryStats {
+    with_cranelift_gc(|gc| gc.gc_memory_stats()).unwrap_or_default()
 }
 
 /// Report whether the GC wants a major collection, for the interpreter GC

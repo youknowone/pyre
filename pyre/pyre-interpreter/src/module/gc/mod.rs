@@ -4,7 +4,12 @@
 //! RPython collection, then drains the finalizer queue synchronously.
 
 use pyre_object::*;
+use rustpython_wtf8::Wtf8;
+use std::io::Write;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+pub mod hook;
 
 /// `interp_gc.py` tracks a process-wide `enabled` flag on the GC
 /// frontend; pyre has no generational threshold knob, but
@@ -22,6 +27,565 @@ static GC_ENABLED: AtomicBool = AtomicBool::new(true);
 /// with.
 static GC_THRESHOLD: [AtomicI64; 2] = [AtomicI64::new(2000), AtomicI64::new(10)];
 
+const STATE_SCANNING: u8 = 0;
+const STATE_MARKING: u8 = 1;
+const STATE_SWEEPING: u8 = 2;
+const STATE_FINALIZING: u8 = 3;
+const STATE_USERDEL: u8 = 4;
+const EIO_ERRNO: i32 = 5;
+
+/// `interp_gc.py:91-130 StepCollector.finalizing`. `space.fromcache` owns one
+/// instance per object space upstream; pyre has one process-wide object space,
+/// so the corresponding state is shared rather than thread-local.
+static STEP_FINALIZING: AtomicBool = AtomicBool::new(false);
+
+/// `referents.py:11-15 W_GcRef(W_Root)`: an app-level handle for a raw GC
+/// object that is not itself a Python object.  The field is deliberately on
+/// the wrapper and participates in normal type tracing; a side table would
+/// neither keep the referent alive nor receive forwarding updates.
+pub mod gcref {
+    use super::*;
+
+    #[crate::pyre_class("GcRef")]
+    pub struct W_GcRef {
+        pub gcref: PyObjectRef,
+    }
+
+    #[crate::pyre_methods]
+    impl W_GcRef {
+        #[staticmethod]
+        fn __new__(
+            _cls: PyObjectRef,
+            _args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, crate::PyError> {
+            Err(crate::PyError::type_error("GcRef() takes no arguments"))
+        }
+    }
+
+    /// Allocate from a raw target already published at `target_slot` on the
+    /// shadow stack.  `type_object()` may allocate while it initializes the
+    /// TypeDef, so the target is re-read afterwards.
+    pub fn wrap_rooted(target_slot: usize) -> PyObjectRef {
+        let w_type = type_object();
+        let target = pyre_object::gc_roots::shadow_stack_get(target_slot);
+        let value = W_GcRef {
+            ob: PyObject {
+                ob_type: &GCREF_TYPE,
+                w_class: w_type,
+            },
+            gcref: target,
+        };
+        pyre_object::lltype::malloc_typed_managed(value) as PyObjectRef
+    }
+
+    pub fn unwrap(w_obj: PyObjectRef) -> majit_ir::GcRef {
+        W_GcRef::from_obj(w_obj)
+            .map(|wrapper| majit_ir::GcRef(wrapper.gcref as usize))
+            .unwrap_or(majit_ir::GcRef(w_obj as usize))
+    }
+}
+
+/// `referents.py:190-241 W_GcStats`.  These are native integer fields on the
+/// interpreter object, matching the upstream W_Root rather than a Python dict
+/// or a process-global side table.
+pub mod stats {
+    use super::*;
+
+    #[crate::pyre_class("GcStats")]
+    pub struct W_GcStats {
+        pub(super) total_memory_pressure: i64,
+        pub(super) total_gc_memory: i64,
+        pub(super) total_allocated_memory: i64,
+        pub(super) peak_memory: i64,
+        pub(super) peak_allocated_memory: i64,
+        pub(super) jit_backend_allocated: i64,
+        pub(super) jit_backend_used: i64,
+        pub(super) total_arena_memory: i64,
+        pub(super) total_rawmalloced_memory: i64,
+        pub(super) peak_arena_memory: i64,
+        pub(super) peak_rawmalloced_memory: i64,
+        pub(super) nursery_size: i64,
+        pub(super) total_gc_time: i64,
+    }
+
+    #[crate::pyre_methods]
+    impl W_GcStats {
+        #[staticmethod]
+        fn __new__(
+            _cls: PyObjectRef,
+            _args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, crate::PyError> {
+            Err(crate::PyError::type_error(
+                "object.__new__(GcStats) is not safe, use GcStats.__new__()",
+            ))
+        }
+
+        #[getter]
+        fn total_memory_pressure(&self) -> i64 {
+            self.total_memory_pressure
+        }
+        #[getter]
+        fn total_gc_memory(&self) -> i64 {
+            self.total_gc_memory
+        }
+        #[getter]
+        fn total_allocated_memory(&self) -> i64 {
+            self.total_allocated_memory
+        }
+        #[getter]
+        fn peak_memory(&self) -> i64 {
+            self.peak_memory
+        }
+        #[getter]
+        fn peak_allocated_memory(&self) -> i64 {
+            self.peak_allocated_memory
+        }
+        #[getter]
+        fn jit_backend_allocated(&self) -> i64 {
+            self.jit_backend_allocated
+        }
+        #[getter]
+        fn jit_backend_used(&self) -> i64 {
+            self.jit_backend_used
+        }
+        #[getter]
+        fn total_arena_memory(&self) -> i64 {
+            self.total_arena_memory
+        }
+        #[getter]
+        fn total_rawmalloced_memory(&self) -> i64 {
+            self.total_rawmalloced_memory
+        }
+        #[getter]
+        fn peak_arena_memory(&self) -> i64 {
+            self.peak_arena_memory
+        }
+        #[getter]
+        fn peak_rawmalloced_memory(&self) -> i64 {
+            self.peak_rawmalloced_memory
+        }
+        #[getter]
+        fn nursery_size(&self) -> i64 {
+            self.nursery_size
+        }
+        #[getter]
+        fn total_gc_time(&self) -> i64 {
+            self.total_gc_time
+        }
+    }
+
+    pub fn new(memory_pressure: bool) -> PyObjectRef {
+        // `#[pyre_class]::allocate` stamps `get_instantiate(PYTYPE)` into the
+        // header. Initialize the TypeDef first so that slot is the real class,
+        // not the macro static's pre-init name placeholder.
+        let _ = type_object();
+        let stats = majit_gc::active_gc_memory_stats();
+        let (jit_backend_allocated, jit_backend_used) = majit_gc::active_jit_backend_memory_stats();
+        // referents.py:192-195: the optional selector performs the collector's
+        // root-reachable `inspector.count_memory_pressure` walk; otherwise it
+        // preserves the public -1 sentinel.
+        let total_memory_pressure = if memory_pressure {
+            majit_gc::total_memory_pressure() as i64
+        } else {
+            -1
+        };
+        W_GcStats::allocate(W_GcStats {
+            ob: PyObject::default(),
+            total_memory_pressure,
+            total_gc_memory: stats.total_gc_memory as i64,
+            total_allocated_memory: stats.total_allocated_memory as i64,
+            peak_memory: stats.peak_memory as i64,
+            peak_allocated_memory: stats.peak_allocated_memory as i64,
+            jit_backend_allocated: jit_backend_allocated as i64,
+            jit_backend_used: jit_backend_used as i64,
+            total_arena_memory: stats.total_arena_memory as i64,
+            total_rawmalloced_memory: stats.total_rawmalloced_memory as i64,
+            peak_arena_memory: stats.peak_arena_memory as i64,
+            peak_rawmalloced_memory: stats.peak_rawmalloced_memory as i64,
+            nursery_size: stats.nursery_size as i64,
+            total_gc_time: stats.total_gc_time_ms as i64,
+        })
+    }
+}
+
+fn collect_step_stat_value(
+    args: &[PyObjectRef],
+    name: &'static str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let value = unsafe {
+        crate::objspace::std::mapdict::instance_node_getdictvalue(args[1], Wtf8::new(name))
+    };
+    value.ok_or_else(|| crate::PyError::attribute_error("uninitialized GcCollectStepStats"))
+}
+
+macro_rules! collect_step_stat_getter {
+    ($function:ident, $name:literal) => {
+        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            collect_step_stat_value(args, $name)
+        }
+    };
+}
+
+collect_step_stat_getter!(collect_step_count, "_count");
+collect_step_stat_getter!(collect_step_duration, "_duration");
+collect_step_stat_getter!(collect_step_duration_min, "_duration_min");
+collect_step_stat_getter!(collect_step_duration_max, "_duration_max");
+collect_step_stat_getter!(collect_step_oldstate, "_oldstate");
+collect_step_stat_getter!(collect_step_newstate, "_newstate");
+collect_step_stat_getter!(collect_step_major_is_done, "_major_is_done");
+
+fn collect_step_stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = crate::baseobjspace::text_w(args[1])?;
+    if matches!(
+        name,
+        "__dict__"
+            | "_count"
+            | "_duration"
+            | "_duration_min"
+            | "_duration_max"
+            | "_oldstate"
+            | "_newstate"
+            | "_major_is_done"
+    ) {
+        return Err(crate::PyError::attribute_error(format!(
+            "'GcCollectStepStats' object has no attribute '{name}'"
+        )));
+    }
+    crate::baseobjspace::object_getattribute(args[0], name)
+}
+
+fn collect_step_stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = crate::baseobjspace::text_w(args[1])?;
+    Err(crate::PyError::attribute_error(format!(
+        "readonly attribute '{name}'"
+    )))
+}
+
+fn gc_collect_step_stats_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("GcCollectStepStats", |ns| unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__getattribute__",
+                crate::make_builtin_function_with_arity(
+                    "__getattribute__",
+                    collect_step_stats_getattribute,
+                    2,
+                ),
+            );
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__setattr__",
+                crate::make_builtin_function_with_arity(
+                    "__setattr__",
+                    collect_step_stats_setattr,
+                    3,
+                ),
+            );
+            for (name, value) in [
+                ("STATE_SCANNING", STATE_SCANNING),
+                ("STATE_MARKING", STATE_MARKING),
+                ("STATE_SWEEPING", STATE_SWEEPING),
+                ("STATE_FINALIZING", STATE_FINALIZING),
+                ("STATE_USERDEL", STATE_USERDEL),
+            ] {
+                pyre_object::w_dict_setitem_str_no_proxy(ns, name, w_int_new(value as i64));
+            }
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "GC_STATES",
+                w_tuple_new(
+                    ["SCANNING", "MARKING", "SWEEPING", "FINALIZING", "USERDEL"]
+                        .into_iter()
+                        .map(w_str_new)
+                        .collect(),
+                ),
+            );
+            for (name, getter) in [
+                ("count", collect_step_count as crate::gateway::BuiltinCodeFn),
+                ("duration", collect_step_duration),
+                ("duration_min", collect_step_duration_min),
+                ("duration_max", collect_step_duration_max),
+                ("oldstate", collect_step_oldstate),
+                ("newstate", collect_step_newstate),
+                ("major_is_done", collect_step_major_is_done),
+            ] {
+                pyre_object::w_dict_setitem_str_no_proxy(
+                    ns,
+                    name,
+                    crate::typedef::make_getset_descriptor_named(
+                        crate::make_builtin_function_with_arity(name, getter, 2),
+                        name,
+                    ),
+                );
+            }
+        });
+        unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
+        tp as usize
+    }) as PyObjectRef
+}
+
+fn new_collect_step_stats(
+    oldstate: u8,
+    newstate: u8,
+    major_is_done: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    new_collect_step_stats_full(1, -1.0, -1.0, -1.0, oldstate, newstate, major_is_done)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_collect_step_stats_full(
+    count: i64,
+    duration: f64,
+    duration_min: f64,
+    duration_max: f64,
+    oldstate: u8,
+    newstate: u8,
+    major_is_done: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let stats = w_instance_new(gc_collect_step_stats_type());
+    for (name, value) in [
+        ("_count", w_int_new(count)),
+        ("_duration", w_float_new(duration)),
+        ("_duration_min", w_float_new(duration_min)),
+        ("_duration_max", w_float_new(duration_max)),
+        ("_oldstate", w_int_new(oldstate as i64)),
+        ("_newstate", w_int_new(newstate as i64)),
+        ("_major_is_done", w_bool_from(major_is_done)),
+    ] {
+        let stored = unsafe {
+            crate::objspace::std::mapdict::instance_node_setdictvalue(stats, Wtf8::new(name), value)
+        };
+        if !stored {
+            return Err(crate::PyError::attribute_error(
+                "cannot initialize GcCollectStepStats",
+            ));
+        }
+    }
+    Ok(stats)
+}
+
+fn readonly_stat_value(
+    args: &[PyObjectRef],
+    name: &'static str,
+    typename: &'static str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let value = unsafe {
+        crate::objspace::std::mapdict::instance_node_getdictvalue(args[1], Wtf8::new(name))
+    };
+    value.ok_or_else(|| crate::PyError::attribute_error(format!("uninitialized {typename}")))
+}
+
+macro_rules! readonly_stat_getter {
+    ($function:ident, $field:literal, $typename:literal) => {
+        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            readonly_stat_value(args, $field, $typename)
+        }
+    };
+}
+
+readonly_stat_getter!(minor_count, "_count", "GcMinorStats");
+readonly_stat_getter!(minor_duration, "_duration", "GcMinorStats");
+readonly_stat_getter!(minor_duration_min, "_duration_min", "GcMinorStats");
+readonly_stat_getter!(minor_duration_max, "_duration_max", "GcMinorStats");
+readonly_stat_getter!(
+    minor_total_memory_used,
+    "_total_memory_used",
+    "GcMinorStats"
+);
+readonly_stat_getter!(minor_pinned_objects, "_pinned_objects", "GcMinorStats");
+
+readonly_stat_getter!(collect_count, "_count", "GcCollectStats");
+readonly_stat_getter!(
+    collect_num_major_collects,
+    "_num_major_collects",
+    "GcCollectStats"
+);
+readonly_stat_getter!(
+    collect_arenas_count_before,
+    "_arenas_count_before",
+    "GcCollectStats"
+);
+readonly_stat_getter!(
+    collect_arenas_count_after,
+    "_arenas_count_after",
+    "GcCollectStats"
+);
+readonly_stat_getter!(collect_arenas_bytes, "_arenas_bytes", "GcCollectStats");
+readonly_stat_getter!(
+    collect_rawmalloc_bytes_before,
+    "_rawmalloc_bytes_before",
+    "GcCollectStats"
+);
+readonly_stat_getter!(
+    collect_rawmalloc_bytes_after,
+    "_rawmalloc_bytes_after",
+    "GcCollectStats"
+);
+readonly_stat_getter!(collect_pinned_objects, "_pinned_objects", "GcCollectStats");
+
+fn stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = crate::baseobjspace::text_w(args[1])?;
+    Err(crate::PyError::attribute_error(format!(
+        "readonly attribute '{name}'"
+    )))
+}
+
+fn stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = crate::baseobjspace::text_w(args[1])?;
+    if name == "__dict__" || name.starts_with('_') {
+        return Err(crate::PyError::attribute_error(format!(
+            "stats object has no attribute '{name}'"
+        )));
+    }
+    crate::baseobjspace::object_getattribute(args[0], name)
+}
+
+fn make_private_stats_type(
+    name: &'static str,
+    fields: &[(&'static str, crate::gateway::BuiltinCodeFn)],
+) -> PyObjectRef {
+    let tp = crate::typedef::make_builtin_type(name, |ns| unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getattribute__",
+            crate::make_builtin_function_with_arity("__getattribute__", stats_getattribute, 2),
+        );
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__setattr__",
+            crate::make_builtin_function_with_arity("__setattr__", stats_setattr, 3),
+        );
+        for &(field, getter) in fields {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                field,
+                crate::typedef::make_getset_descriptor_named(
+                    crate::make_builtin_function_with_arity(field, getter, 2),
+                    field,
+                ),
+            );
+        }
+    });
+    unsafe { typeobject::w_type_set_hasdict(tp, true) };
+    unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
+    tp
+}
+
+fn gc_minor_stats_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        make_private_stats_type(
+            "GcMinorStats",
+            &[
+                ("count", minor_count),
+                ("duration", minor_duration),
+                ("duration_min", minor_duration_min),
+                ("duration_max", minor_duration_max),
+                ("total_memory_used", minor_total_memory_used),
+                ("pinned_objects", minor_pinned_objects),
+            ],
+        ) as usize
+    }) as PyObjectRef
+}
+
+fn gc_collect_stats_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        make_private_stats_type(
+            "GcCollectStats",
+            &[
+                ("count", collect_count),
+                ("num_major_collects", collect_num_major_collects),
+                ("arenas_count_before", collect_arenas_count_before),
+                ("arenas_count_after", collect_arenas_count_after),
+                ("arenas_bytes", collect_arenas_bytes),
+                ("rawmalloc_bytes_before", collect_rawmalloc_bytes_before),
+                ("rawmalloc_bytes_after", collect_rawmalloc_bytes_after),
+                ("pinned_objects", collect_pinned_objects),
+            ],
+        ) as usize
+    }) as PyObjectRef
+}
+
+fn initialize_stats(
+    stats: PyObjectRef,
+    fields: Vec<(&'static str, PyObjectRef)>,
+    typename: &'static str,
+) -> Result<PyObjectRef, crate::PyError> {
+    for (name, value) in fields {
+        let stored = unsafe {
+            crate::objspace::std::mapdict::instance_node_setdictvalue(stats, Wtf8::new(name), value)
+        };
+        if !stored {
+            return Err(crate::PyError::attribute_error(format!(
+                "cannot initialize {typename}"
+            )));
+        }
+    }
+    Ok(stats)
+}
+
+fn new_minor_stats(
+    count: i64,
+    duration: f64,
+    duration_min: f64,
+    duration_max: f64,
+    total_memory_used: usize,
+    pinned_objects: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    initialize_stats(
+        w_instance_new(gc_minor_stats_type()),
+        vec![
+            ("_count", w_int_new(count)),
+            ("_duration", w_float_new(duration)),
+            ("_duration_min", w_float_new(duration_min)),
+            ("_duration_max", w_float_new(duration_max)),
+            ("_total_memory_used", w_int_new(total_memory_used as i64)),
+            ("_pinned_objects", w_int_new(pinned_objects as i64)),
+        ],
+        "GcMinorStats",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_collect_stats(
+    count: i64,
+    num_major_collects: usize,
+    arenas_count_before: usize,
+    arenas_count_after: usize,
+    arenas_bytes: usize,
+    rawmalloc_bytes_before: usize,
+    rawmalloc_bytes_after: usize,
+    pinned_objects: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    initialize_stats(
+        w_instance_new(gc_collect_stats_type()),
+        vec![
+            ("_count", w_int_new(count)),
+            ("_num_major_collects", w_int_new(num_major_collects as i64)),
+            (
+                "_arenas_count_before",
+                w_int_new(arenas_count_before as i64),
+            ),
+            ("_arenas_count_after", w_int_new(arenas_count_after as i64)),
+            ("_arenas_bytes", w_int_new(arenas_bytes as i64)),
+            (
+                "_rawmalloc_bytes_before",
+                w_int_new(rawmalloc_bytes_before as i64),
+            ),
+            (
+                "_rawmalloc_bytes_after",
+                w_int_new(rawmalloc_bytes_after as i64),
+            ),
+            ("_pinned_objects", w_int_new(pinned_objects as i64)),
+        ],
+        "GcCollectStats",
+    )
+}
+
 fn pin_object(object: majit_ir::GcRef) {
     pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
 }
@@ -38,6 +602,27 @@ fn pin_object(object: majit_ir::GcRef) {
 /// safely widen to.
 fn pin_referents(w_obj: PyObjectRef) {
     majit_gc::get_referents(majit_ir::GcRef(w_obj as usize), pin_object);
+}
+
+/// Wrap every raw collector node rooted in `[first, last)` as
+/// `referents.py:35-39 wrap`: app-level objects pass through, internal nodes
+/// become `W_GcRef`.  Results are rooted as they are made because constructing
+/// a later wrapper can initialize a type and allocate.
+fn wrap_raw_nodes(first: usize, last: usize) -> Vec<PyObjectRef> {
+    let result_first = pyre_object::gc_roots::shadow_stack_len();
+    for slot in first..last {
+        let raw = majit_ir::GcRef(pyre_object::gc_roots::shadow_stack_get(slot) as usize);
+        let wrapped = if majit_gc::is_app_level_object(raw) {
+            // The query can park behind a moving collection; reload the slot.
+            pyre_object::gc_roots::shadow_stack_get(slot)
+        } else {
+            gcref::wrap_rooted(slot)
+        };
+        pyre_object::gc_roots::pin_root(wrapped);
+    }
+    (result_first..pyre_object::gc_roots::shadow_stack_len())
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .collect()
 }
 
 fn user_del_action() -> Option<&'static mut crate::executioncontext::UserDelAction> {
@@ -83,6 +668,329 @@ fn disable_finalizers(action: &mut crate::executioncontext::UserDelAction) {
     }
 }
 
+fn run_finalizers_now() {
+    if let Some(action) = user_del_action() {
+        let temp_reenable = !action.enabled_at_app_level;
+        if temp_reenable {
+            enable_finalizers(action);
+        }
+        action._run_finalizers();
+        if temp_reenable {
+            disable_finalizers(action);
+        }
+    }
+}
+
+fn format_gc_stat(value: i64) -> String {
+    if value < 1_000_000 {
+        format!("{:.1}kB", value as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", value as f64 / 1024.0 / 1024.0)
+    }
+}
+
+fn gc_stats_public_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("GcStats", |ns| unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__init__",
+                crate::make_builtin_function_with_arity("__init__", gc_stats_public_init, 2),
+            );
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__repr__",
+                crate::make_builtin_function_with_arity("__repr__", gc_stats_repr, 1),
+            );
+            pyre_object::w_dict_setitem_str_no_proxy(ns, "__dict__", crate::typedef::dict_descr());
+        });
+        // app_referents.py:GcStats is an ordinary app-level class.
+        unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
+}
+
+fn gc_stats_public_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    populate_public_gc_stats(args[0], args[1])?;
+    Ok(w_none())
+}
+
+fn gc_stats_attr_string(self_slot: usize, name: &'static str) -> Result<String, crate::PyError> {
+    let value =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(self_slot), name)?;
+    Ok(unsafe { crate::display::py_str_wtf8(value)? }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let raw =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(self_slot), "_s")?;
+    pyre_object::gc_roots::pin_root(raw);
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let raw = stats::W_GcStats::from_obj(pyre_object::gc_roots::shadow_stack_get(raw_slot))
+        .ok_or_else(|| crate::PyError::type_error("GcStats._s is not a native GcStats"))?;
+    let total_memory_pressure = raw.total_memory_pressure;
+    let total_arena_allocated = format_gc_stat(
+        raw.total_allocated_memory - raw.total_rawmalloced_memory - raw.nursery_size,
+    );
+
+    // app_referents.py:76-120. Read the public attributes afresh: this class
+    // has a normal instance dict upstream, and user mutation affects repr.
+    let total_gc_memory = gc_stats_attr_string(self_slot, "total_gc_memory")?;
+    let peak_memory = gc_stats_attr_string(self_slot, "peak_memory")?;
+    let total_arena_memory = gc_stats_attr_string(self_slot, "total_arena_memory")?;
+    let peak_arena_memory = gc_stats_attr_string(self_slot, "peak_arena_memory")?;
+    let total_rawmalloced_memory = gc_stats_attr_string(self_slot, "total_rawmalloced_memory")?;
+    let peak_rawmalloced_memory = gc_stats_attr_string(self_slot, "peak_rawmalloced_memory")?;
+    let nursery_size = gc_stats_attr_string(self_slot, "nursery_size")?;
+    let jit_backend_used = gc_stats_attr_string(self_slot, "jit_backend_used")?;
+    let total_memory_pressure_text = gc_stats_attr_string(self_slot, "total_memory_pressure")?;
+    let memory_used_sum = gc_stats_attr_string(self_slot, "memory_used_sum")?;
+    let total_allocated_memory = gc_stats_attr_string(self_slot, "total_allocated_memory")?;
+    let peak_allocated_memory = gc_stats_attr_string(self_slot, "peak_allocated_memory")?;
+    let jit_backend_allocated = gc_stats_attr_string(self_slot, "jit_backend_allocated")?;
+    let memory_allocated_sum = gc_stats_attr_string(self_slot, "memory_allocated_sum")?;
+    let total_gc_time_obj = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        "total_gc_time",
+    )?;
+    pyre_object::gc_roots::pin_root(total_gc_time_obj);
+    let total_gc_time_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let total_gc_time =
+        crate::baseobjspace::float_w(pyre_object::gc_roots::shadow_stack_get(total_gc_time_slot))?
+            / 1000.0;
+    let extra = if total_memory_pressure != -1 {
+        format!("\n    memory pressure:         {total_memory_pressure_text}")
+    } else {
+        String::new()
+    };
+    Ok(w_str_new(&format!(
+        concat!(
+            "Total memory consumed:\n",
+            "    GC used:                 {total_gc_memory} (peak: {peak_memory})\n",
+            "       in arenas:            {total_arena_memory} (peak: {peak_arena_memory})\n",
+            "       rawmalloced:          {total_rawmalloced_memory} (peak: {peak_rawmalloced_memory})\n",
+            "       nursery:              {nursery_size}\n",
+            "    raw assembler used:      {jit_backend_used}{extra}\n",
+            "    -----------------------------\n",
+            "    Total:                   {memory_used_sum}\n\n",
+            "    Total memory allocated (includes freelists):\n",
+            "    GC allocated:            {total_allocated_memory} (peak: {peak_allocated_memory})\n",
+            "       in arenas:            {total_arena_allocated}\n",
+            "       rawmalloced:          {total_rawmalloced_memory}\n",
+            "       nursery:              {nursery_size}\n",
+            "    raw assembler allocated: {jit_backend_allocated}{extra}\n",
+            "    -----------------------------\n",
+            "    Total:                   {memory_allocated_sum}\n\n",
+            "    Total time spent in GC:  {total_gc_time}\n    "
+        ),
+        total_gc_memory = total_gc_memory,
+        peak_memory = peak_memory,
+        total_arena_memory = total_arena_memory,
+        peak_arena_memory = peak_arena_memory,
+        total_rawmalloced_memory = total_rawmalloced_memory,
+        peak_rawmalloced_memory = peak_rawmalloced_memory,
+        nursery_size = nursery_size,
+        jit_backend_used = jit_backend_used,
+        extra = extra,
+        memory_used_sum = memory_used_sum,
+        total_allocated_memory = total_allocated_memory,
+        peak_allocated_memory = peak_allocated_memory,
+        total_arena_allocated = total_arena_allocated,
+        jit_backend_allocated = jit_backend_allocated,
+        memory_allocated_sum = memory_allocated_sum,
+        total_gc_time = total_gc_time,
+    )))
+}
+
+fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(raw);
+    let raw = stats::W_GcStats::from_obj(pyre_object::gc_roots::shadow_stack_get(raw_slot))
+        .ok_or_else(|| crate::PyError::type_error("GcStats() requires a native GcStats"))?;
+    let memory_pressure_value = if raw.total_memory_pressure == -1 {
+        0
+    } else {
+        raw.total_memory_pressure
+    };
+    let formatted = [
+        ("total_gc_memory", raw.total_gc_memory),
+        ("jit_backend_used", raw.jit_backend_used),
+        ("total_memory_pressure", raw.total_memory_pressure),
+        ("total_allocated_memory", raw.total_allocated_memory),
+        ("jit_backend_allocated", raw.jit_backend_allocated),
+        ("peak_memory", raw.peak_memory),
+        ("peak_allocated_memory", raw.peak_allocated_memory),
+        ("total_arena_memory", raw.total_arena_memory),
+        ("total_rawmalloced_memory", raw.total_rawmalloced_memory),
+        ("nursery_size", raw.nursery_size),
+        ("peak_arena_memory", raw.peak_arena_memory),
+        ("peak_rawmalloced_memory", raw.peak_rawmalloced_memory),
+        (
+            "memory_used_sum",
+            raw.total_gc_memory + memory_pressure_value + raw.jit_backend_used,
+        ),
+        (
+            "memory_allocated_sum",
+            raw.total_allocated_memory + memory_pressure_value + raw.jit_backend_allocated,
+        ),
+    ];
+    let total_gc_time = raw.total_gc_time;
+    crate::baseobjspace::setattr_str(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "_s",
+        pyre_object::gc_roots::shadow_stack_get(raw_slot),
+    )?;
+    for (name, value) in formatted {
+        let text = w_str_new(&format_gc_stat(value));
+        pyre_object::gc_roots::pin_root(text);
+        let text_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(text_slot),
+        )?;
+    }
+    crate::baseobjspace::setattr_str(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "total_gc_time",
+        w_int_new(total_gc_time),
+    )?;
+    Ok(())
+}
+
+fn new_public_gc_stats(memory_pressure: bool) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let raw = stats::new(memory_pressure);
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(raw);
+    let public_type = gc_stats_public_type();
+    let obj = w_instance_new(public_type);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    populate_public_gc_stats(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        pyre_object::gc_roots::shadow_stack_get(raw_slot),
+    )?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+}
+
+fn gc_call_method(
+    obj: PyObjectRef,
+    name: &str,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let result = crate::baseobjspace::call_method(obj, name, args);
+    if result.is_null() {
+        Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::runtime_error("method call failed")))
+    } else {
+        Ok(result)
+    }
+}
+
+fn dump_rpy_heap_fd(fd: i32) -> Result<(), crate::PyError> {
+    match majit_gc::dump_rpy_heap(fd) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(crate::PyError::not_implemented(
+            "operation not implemented by this GC",
+        )),
+        Err(errno) => Err(crate::PyError::os_error_with_errno(
+            errno,
+            "raw_os_write failed",
+        )),
+    }
+}
+
+fn typeids_z_bytes() -> Result<Vec<u8>, crate::PyError> {
+    let text = majit_gc::get_typeids_text()
+        .ok_or_else(|| crate::PyError::not_implemented("operation not implemented by this GC"))?;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder
+        .write_all(&text)
+        .and_then(|_| encoder.finish())
+        .map_err(|error| crate::PyError::os_error(error.to_string()))
+}
+
+fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let file_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(file);
+    let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
+
+    if unsafe { is_str(file) } {
+        // app_referents.py:22-40: filename arm opens/truncates the binary
+        // dump, closes it, then materializes typeids.txt/.lst if absent.
+        let path = crate::gateway::fspath_buf(file)?;
+        let opened = crate::builtins::builtin_open(&[file, w_str_new("wb")])?;
+        pyre_object::gc_roots::pin_root(opened);
+        let opened_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let fileno = gc_call_method(
+            pyre_object::gc_roots::shadow_stack_get(opened_slot),
+            "fileno",
+            &[],
+        )?;
+        let fd = crate::baseobjspace::int_w(fileno)? as i32;
+        let dump_result = dump_rpy_heap_fd(fd);
+        let close_result = gc_call_method(
+            pyre_object::gc_roots::shadow_stack_get(opened_slot),
+            "close",
+            &[],
+        );
+        dump_result?;
+        close_result?;
+
+        let directory = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let typeids_txt = directory.join("typeids.txt");
+        if !typeids_txt.exists() {
+            let text = majit_gc::get_typeids_text().ok_or_else(|| {
+                crate::PyError::not_implemented("operation not implemented by this GC")
+            })?;
+            std::fs::write(&typeids_txt, text).map_err(|error| {
+                crate::PyError::os_error_syscall(error.raw_os_error().unwrap_or(EIO_ERRNO), file)
+            })?;
+        }
+        let typeids_lst = directory.join("typeids.lst");
+        if !typeids_lst.exists() {
+            let list = majit_gc::get_typeids_list().ok_or_else(|| {
+                crate::PyError::not_implemented("operation not implemented by this GC")
+            })?;
+            let data: String = list.into_iter().map(|value| format!("{value}\n")).collect();
+            std::fs::write(&typeids_lst, data).map_err(|error| {
+                crate::PyError::os_error_syscall(error.raw_os_error().unwrap_or(EIO_ERRNO), file)
+            })?;
+        }
+        return Ok(w_none());
+    }
+
+    let fd = if unsafe { is_int(file) } {
+        crate::baseobjspace::int_w(file)? as i32
+    } else {
+        // app_referents.py:44-49: flush only when the attribute exists, then
+        // ask for fileno. AttributeError is the only absence case upstream;
+        // a present flush method's exception propagates.
+        match crate::baseobjspace::getattr_str(file, "flush") {
+            Ok(flush) => {
+                crate::call::call_function_impl_result(flush, &[])?;
+            }
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => {}
+            Err(error) => return Err(error),
+        }
+        let fileno = gc_call_method(file, "fileno", &[])?;
+        crate::baseobjspace::int_w(fileno)? as i32
+    };
+    dump_rpy_heap_fd(fd)?;
+    Ok(w_none())
+}
+
 crate::py_module! {
     "gc",
     interpleveldefs: {
@@ -93,66 +1001,109 @@ crate::py_module! {
         "DEBUG_UNCOLLECTABLE" => w_int_new(4),
         "DEBUG_SAVEALL"       => w_int_new(32),
         "DEBUG_LEAK"          => w_int_new(38),
+        "GcCollectStepStats"  => gc_collect_step_stats_type(),
+        "GcRef"               => gcref::type_object(),
+        "hooks"               => hook::hooks_object(),
     },
     inline_functions: {
         fn collect(
-            #[default(w_int_new(2))] generation: PyObjectRef,
+            #[default(w_int_new(0))] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             // PyPy `interp_gc.py:7-26 collect` unwraps the optional generation
-            // as an int before entering the body.  CPython 3.14 gives it the
-            // default 2 and validates the three surviving generations.
-            let generation = crate::baseobjspace::int_w(
+            // as an int, but deliberately ignores its value.  In particular,
+            // unlike CPython's three-generation frontend, every integer is
+            // accepted and the default is 0.
+            let _generation = crate::baseobjspace::int_w(
                 crate::baseobjspace::space_index(generation)?,
             )?;
-            if !(0..=2).contains(&generation) {
-                return Err(crate::PyError::value_error("invalid generation"));
-            }
             crate::baseobjspace::clear_method_cache();
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
-            if let Some(action) = user_del_action() {
-                let temp_reenable = !action.enabled_at_app_level;
-                if temp_reenable {
-                    enable_finalizers(action);
-                }
-                action._run_finalizers();
-                if temp_reenable {
-                    disable_finalizers(action);
-                }
+            run_finalizers_now();
+            Ok(w_none())
+        }
+
+        fn collect_step() -> Result<PyObjectRef, crate::PyError> {
+            // interp_gc.py:91-130 StepCollector: the app-level finalizer drain
+            // is a virtual fifth state after the collector has returned to
+            // SCANNING.
+            if STEP_FINALIZING.load(Ordering::Acquire) {
+                run_finalizers_now();
+                STEP_FINALIZING.store(false, Ordering::Release);
+                return new_collect_step_stats(STATE_USERDEL, STATE_SCANNING, true);
             }
-            Ok(w_int_new(0))
+
+            let (oldstate, mut newstate) = pyre_object::gc_hook::try_gc_collect_step();
+            if newstate == STATE_SCANNING {
+                newstate = STATE_USERDEL;
+                STEP_FINALIZING.store(true, Ordering::Release);
+            }
+            new_collect_step_stats(oldstate, newstate, false)
         }
 
         fn get_objects(
             #[default(w_none())] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // CPython 3.14 `gc.get_objects(generation=None)`: -1/None means
-            // every generation; 0 through 2 select a generation.
-            let generation = if unsafe { is_none(generation) } {
-                -1
-            } else {
-                crate::baseobjspace::int_w(crate::baseobjspace::space_index(generation)?)?
-            };
-            if generation < -1 {
-                return Err(crate::PyError::value_error(
-                    "generation parameter cannot be negative",
-                ));
-            }
-            if generation > 2 {
-                return Err(crate::PyError::value_error(
-                    "generation parameter must be less than the number of available generations (3)",
+            // PyPy `referents.py:112-123`: the audit event precedes argument
+            // validation and always carries -1, even for a rejected argument.
+            let _generation_root = pyre_object::gc_roots::push_roots();
+            let generation_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(generation);
+            crate::module::sys::vm::audit("gc.get_objects", &[w_int_new(-1)])?;
+            let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
+            if !unsafe { is_none(generation) } {
+                return Err(crate::PyError::not_implemented(
+                    "get_objects(generation=None) accepts only None on PyPy",
                 ));
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(generation as i8, pin_object);
+            majit_gc::get_objects(-1, pin_object);
             let objects = (first..pyre_object::gc_roots::shadow_stack_len())
                 .map(pyre_object::gc_roots::shadow_stack_get)
                 .collect();
             Ok(w_list_new_object(objects))
         }
+
+        fn _get_stats(
+            #[default(w_bool_from(false))] memory_pressure: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            // referents.py:240-241 `@unwrap_spec(memory_pressure=bool)`.
+            Ok(stats::new(crate::baseobjspace::is_true(memory_pressure)?))
+        }
+
+        fn get_stats(
+            #[default(w_bool_from(false))] memory_pressure: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            new_public_gc_stats(crate::baseobjspace::is_true(memory_pressure)?)
+        }
+
+        fn dump_rpy_heap(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+            dump_rpy_heap_public(file)
+        }
     },
     functions: {
+        "disable_finalizers" / 0 = |_| {
+            // `interp_gc.py:85-89`: this lock is recursive and deliberately
+            // independent of gc.isenabled().
+            if let Some(action) = user_del_action() {
+                disable_finalizers(action);
+            }
+            Ok(w_none())
+        },
+        "enable_finalizers" / 0 = |_| {
+            // `interp_gc.py:72-84`: unlike gc.enable(), an unmatched public
+            // enable is an error rather than a no-op.
+            if let Some(action) = user_del_action() {
+                if action.finalizers_lock_count == 0 {
+                    return Err(crate::PyError::value_error(
+                        "finalizers are already enabled",
+                    ));
+                }
+                enable_finalizers(action);
+            }
+            Ok(w_none())
+        },
         "disable"       / 0 = |_| {
             pyre_object::gc_hook::try_gc_set_enabled(false);
             GC_ENABLED.store(false, Ordering::Relaxed);
@@ -188,6 +1139,10 @@ crate::py_module! {
             // An object referring to the same argument twice is reported once,
             // but one passed the same argument twice is reported twice.
             let _roots = pyre_object::gc_roots::push_roots();
+            let args_base = pyre_object::gc_roots::pin_roots(args);
+            let mut rooted_args = vec![std::ptr::null_mut(); args.len()];
+            pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
+            crate::module::sys::vm::audit("gc.get_referrers", &rooted_args)?;
             let all_first = pyre_object::gc_roots::shadow_stack_len();
             majit_gc::get_objects(-1, pin_object);
             let all_last = pyre_object::gc_roots::shadow_stack_len();
@@ -198,7 +1153,8 @@ crate::py_module! {
                 let refs_first = pyre_object::gc_roots::shadow_stack_len();
                 pin_referents(w_obj);
                 let refs_last = pyre_object::gc_roots::shadow_stack_len();
-                for &w_arg in args {
+                for index in 0..args.len() {
+                    let w_arg = pyre_object::gc_roots::shadow_stack_get(args_base + index);
                     if (refs_first..refs_last)
                         .any(|s| pyre_object::gc_roots::shadow_stack_get(s) == w_arg)
                     {
@@ -213,13 +1169,45 @@ crate::py_module! {
         "get_referents" / * = |args| {
             // referents.py:128-145 get_referents.
             let _roots = pyre_object::gc_roots::push_roots();
+            let args_base = pyre_object::gc_roots::pin_roots(args);
+            let mut rooted_args = vec![std::ptr::null_mut(); args.len()];
+            pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
+            crate::module::sys::vm::audit("gc.get_referents", &rooted_args)?;
             let first = pyre_object::gc_roots::shadow_stack_len();
-            for &w_obj in args {
+            for index in 0..args.len() {
+                let w_obj = pyre_object::gc_roots::shadow_stack_get(args_base + index);
                 pin_referents(w_obj);
             }
             let result = (first..pyre_object::gc_roots::shadow_stack_len())
                 .map(pyre_object::gc_roots::shadow_stack_get)
                 .collect();
+            Ok(w_list_new_object(result))
+        },
+        "get_rpy_roots" / 0 = |_| {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let first = pyre_object::gc_roots::shadow_stack_len();
+            if !majit_gc::get_rpy_roots(pin_object) {
+                return Err(crate::PyError::not_implemented(
+                    "operation not implemented by this GC",
+                ));
+            }
+            let last = pyre_object::gc_roots::shadow_stack_len();
+            let result = wrap_raw_nodes(first, last);
+            Ok(w_list_new_object(result))
+        },
+        "get_rpy_referents" / 1 = |args| {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(args[0]);
+            let raw = gcref::unwrap(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let first = pyre_object::gc_roots::shadow_stack_len();
+            if !majit_gc::get_rpy_referents(raw, pin_object) {
+                return Err(crate::PyError::not_implemented(
+                    "operation not implemented by this GC",
+                ));
+            }
+            let last = pyre_object::gc_roots::shadow_stack_len();
+            let result = wrap_raw_nodes(first, last);
             Ok(w_list_new_object(result))
         },
         // `set_threshold(threshold0, threshold1=None, threshold2=None)` — the
@@ -277,6 +1265,47 @@ crate::py_module! {
             // the collector really does follow, which the CPython objects have
             // no equivalent of.
             Ok(w_bool_from(majit_gc::is_tracked(majit_ir::GcRef(args[0] as usize))))
+        },
+        "get_rpy_memory_usage" / 1 = |args| {
+            // referents.py:97-104 / inspector.py:76-77.  The size is just the
+            // translated object itself: no GC header and no reachable
+            // internal storage.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(args[0]);
+            let raw = gcref::unwrap(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let size = majit_gc::get_rpy_memory_usage(raw).ok_or_else(|| {
+                    crate::PyError::not_implemented("operation not implemented by this GC")
+                })?;
+            Ok(w_int_new(size as i64))
+        },
+        "get_rpy_type_index" / 1 = |args| {
+            // referents.py:106-115: a positive index into the translated
+            // type-info group (index zero is the upstream dummy member).
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(args[0]);
+            let raw = gcref::unwrap(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let index = majit_gc::get_rpy_type_index(raw).ok_or_else(|| {
+                    crate::PyError::not_implemented("operation not implemented by this GC")
+                })?;
+            Ok(w_int_new(index as i64))
+        },
+        "_dump_rpy_heap" / 1 = |args| {
+            let fd = crate::baseobjspace::int_w(args[0])? as i32;
+            dump_rpy_heap_fd(fd)?;
+            Ok(w_none())
+        },
+        "get_typeids_z" / 0 = |_| {
+            Ok(pyre_object::bytesobject::w_bytes_from_bytes(&typeids_z_bytes()?))
+        },
+        "get_typeids_list" / 0 = |_| {
+            let list = majit_gc::get_typeids_list().ok_or_else(|| {
+                crate::PyError::not_implemented("operation not implemented by this GC")
+            })?;
+            Ok(w_list_new_object(
+                list.into_iter().map(|value| w_int_new(value as i64)).collect(),
+            ))
         },
         "is_finalized"  / 1 = |_| Ok(w_bool_from(false)),
         // CPython 3.14 `gc.freeze()` moves the surviving objects into a

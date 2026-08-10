@@ -16447,6 +16447,12 @@ impl<M: Clone> MetaInterp<M> {
         &self.backend
     }
 
+    /// `cpu.asmmemmgr.get_stats()` used by
+    /// `pypy/module/gc/referents.py:_get_stats`.
+    pub fn assembler_memory_stats(&self) -> (usize, usize) {
+        self.backend.assembler_memory_stats()
+    }
+
     /// Access the backend mutably (for advanced operations).
     pub fn backend_mut(&mut self) -> &mut BackendImpl {
         &mut self.backend

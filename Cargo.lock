@@ -2194,6 +2194,7 @@ version = "0.0.2"
 dependencies = [
  "base64",
  "crc32fast",
+ "flate2",
  "getrandom 0.4.3",
  "indexmap",
  "libc",

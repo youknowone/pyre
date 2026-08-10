@@ -55,6 +55,18 @@ fn set_contextvar_context(args: &[pyre_object::PyObjectRef]) -> crate::PyResult 
     Ok(pyre_object::w_none())
 }
 
+/// `interp_magic.py:161-165 add_memory_pressure`: report a raw allocation to
+/// incminimark so the next major collection is scheduled sooner. The public
+/// builtin has no owner object; translated internal callers use the same GC
+/// surface with an object when their type carries `special_memory_pressure`.
+fn add_memory_pressure(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let estimate = crate::baseobjspace::int_w(args[0])?;
+    let estimate = isize::try_from(estimate)
+        .map_err(|_| crate::PyError::overflow_error("integer does not fit in signed word"))?;
+    majit_gc::add_memory_pressure(estimate, majit_ir::GcRef::NULL);
+    Ok(pyre_object::w_none())
+}
+
 /// `interp_dict.py:43-45 / 79-81` `isinstance(w_obj, W_DictMultiObject)`:
 /// resolve the backing of an exact dict, module dict, or dict subclass,
 /// rejecting a read-only `mappingproxy` (a `W_Root`, not a `W_DictMultiObject`)
@@ -192,6 +204,7 @@ crate::py_module! {
     functions: {
         "get_contextvar_context" / 0 = get_contextvar_context,
         "set_contextvar_context" / 1 = set_contextvar_context,
+        "add_memory_pressure" / 1 = add_memory_pressure,
         "reversed_dict" / 1 = reversed_dict,
         "move_to_end" / * = move_to_end,
         "objects_in_repr" / 0 = objects_in_repr,

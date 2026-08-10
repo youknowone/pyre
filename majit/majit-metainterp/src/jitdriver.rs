@@ -5356,6 +5356,12 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_stats()
     }
 
+    /// Return `(total allocator capacity, live code bytes)` from this
+    /// driver's CPU-owned assembler memory manager.
+    pub fn assembler_memory_stats(&self) -> (usize, usize) {
+        self.meta.assembler_memory_stats()
+    }
+
     /// Read the `i`th reason-keyed abort tally, indexed as
     /// [`crate::jitprof::ABORT_COUNTER_KINDS`]. Breaks a `loops_aborted`
     /// total down by `Counters.ABORT_*` for a caller that cannot reach the

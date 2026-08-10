@@ -201,6 +201,10 @@ impl PyreFunctionEntry {
 /// reproducing upstream's `translator.annotate()` → `rtyper.specialize()` →
 /// `codewriter.make_jitcodes()` phase ordering (`driver.py:306/345/361`).
 pub struct TwoPhaseSubject {
+    /// The lifted subject graph itself. Phase B rtypes this graph in place;
+    /// retaining the `GraphRef` lets post-rtype consumers inspect the exact
+    /// low-level operations that succeeded.
+    pub graph: crate::flowspace::model::GraphRef,
     pub graph_key: crate::flowspace::model::GraphKey,
     pub value_to_var: crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
     pub value_to_var_candidates:
