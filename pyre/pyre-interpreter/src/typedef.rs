@@ -2692,7 +2692,7 @@ fn new_descr_class(args: &[PyObjectRef], type_name: &str) -> Result<PyObjectRef,
 /// arguments`); the body itself is variadic, so the trailing marker dict
 /// would otherwise arrive as one more translation-table argument.
 macro_rules! make_maketrans_descr {
-    ($owner:literal, $func:expr) => {{
+    ($owner:literal, $func:expr $(, $text_signature:literal)?) => {{
         fn maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
             if crate::builtins::has_real_kwargs(kwargs) {
@@ -2703,7 +2703,14 @@ macro_rules! make_maketrans_descr {
             }
             ($func)(args)
         }
-        pyre_object::w_staticmethod_new(make_builtin_function("maketrans", maketrans))
+        let function = make_builtin_function("maketrans", maketrans);
+        $(unsafe {
+            crate::function::fset_func_text_signature(
+                function,
+                w_str_new($text_signature),
+            )
+        };)?
+        pyre_object::w_staticmethod_new(function)
     }};
 }
 
@@ -6041,103 +6048,108 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "maketrans",
-            make_maketrans_descr!("str", |args: &[PyObjectRef]| {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error(
-                        "maketrans expected at least 1 argument, got 0",
-                    ));
-                }
-                if args.len() > 3 {
-                    return Err(crate::PyError::type_error(format!(
-                        "maketrans expected at most 3 arguments, got {}",
-                        args.len()
-                    )));
-                }
-
-                let d = pyre_object::w_dict_new();
-                if args.len() >= 2 {
-                    if !unsafe { pyre_object::is_str(args[0]) } {
+            make_maketrans_descr!(
+                "str",
+                |args: &[PyObjectRef]| {
+                    if args.is_empty() {
                         return Err(crate::PyError::type_error(
-                            "first maketrans argument must be a string if there is a second argument",
+                            "maketrans expected at least 1 argument, got 0",
                         ));
                     }
-                    if !unsafe { pyre_object::is_str(args[1]) } {
+                    if args.len() > 3 {
                         return Err(crate::PyError::type_error(format!(
-                            "maketrans() argument 2 must be str, not {}",
-                            crate::type_methods::arg_type_name(args[1])
-                        )));
-                    }
-                    if args.len() == 3 && !unsafe { pyre_object::is_str(args[2]) } {
-                        return Err(crate::PyError::type_error(format!(
-                            "maketrans() argument 3 must be str, not {}",
-                            crate::type_methods::arg_type_name(args[2])
+                            "maketrans expected at most 3 arguments, got {}",
+                            args.len()
                         )));
                     }
 
-                    let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-                    let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-                    if unsafe { pyre_object::w_str_len(args[0]) != pyre_object::w_str_len(args[1]) }
-                    {
-                        return Err(crate::PyError::value_error(
-                            "the first two maketrans arguments must have equal length",
-                        ));
-                    }
-                    for (xc, yc) in x.code_points().zip(y.code_points()) {
-                        unsafe {
-                            pyre_object::w_dict_store(
-                                d,
-                                pyre_object::w_int_new(xc.to_u32() as i64),
-                                pyre_object::w_int_new(yc.to_u32() as i64),
-                            );
+                    let d = pyre_object::w_dict_new();
+                    if args.len() >= 2 {
+                        if !unsafe { pyre_object::is_str(args[0]) } {
+                            return Err(crate::PyError::type_error(
+                                "first maketrans argument must be a string if there is a second argument",
+                            ));
                         }
-                    }
-                    if args.len() == 3 {
-                        let z = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
-                        for zc in z.code_points() {
+                        if !unsafe { pyre_object::is_str(args[1]) } {
+                            return Err(crate::PyError::type_error(format!(
+                                "maketrans() argument 2 must be str, not {}",
+                                crate::type_methods::arg_type_name(args[1])
+                            )));
+                        }
+                        if args.len() == 3 && !unsafe { pyre_object::is_str(args[2]) } {
+                            return Err(crate::PyError::type_error(format!(
+                                "maketrans() argument 3 must be str, not {}",
+                                crate::type_methods::arg_type_name(args[2])
+                            )));
+                        }
+
+                        let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+                        let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
+                        if unsafe {
+                            pyre_object::w_str_len(args[0]) != pyre_object::w_str_len(args[1])
+                        } {
+                            return Err(crate::PyError::value_error(
+                                "the first two maketrans arguments must have equal length",
+                            ));
+                        }
+                        for (xc, yc) in x.code_points().zip(y.code_points()) {
                             unsafe {
                                 pyre_object::w_dict_store(
                                     d,
-                                    pyre_object::w_int_new(zc.to_u32() as i64),
-                                    pyre_object::w_none(),
+                                    pyre_object::w_int_new(xc.to_u32() as i64),
+                                    pyre_object::w_int_new(yc.to_u32() as i64),
                                 );
                             }
                         }
-                    }
-                } else {
-                    if !unsafe { pyre_object::is_dict(args[0]) } {
-                        return Err(crate::PyError::type_error(
-                            "if you give only one argument to maketrans it must be a dict",
-                        ));
-                    }
-                    let src = args[0];
-                    unsafe {
-                        // `w_dict_items` dispatches through `is_module_dict`
-                        // so `str.maketrans(some_module.__dict__)` walks the
-                        // strategy storage when handed a W_ModuleDictObject.
-                        for (k, v) in pyre_object::w_dict_items(src) {
-                            let ord_key = if pyre_object::is_int(k) {
-                                k
-                            } else if pyre_object::is_str(k) {
-                                let s = pyre_object::w_str_get_wtf8(k);
-                                let mut cps = s.code_points();
-                                let cp = cps.next();
-                                if cp.is_none() || cps.next().is_some() {
-                                    return Err(crate::PyError::value_error(
-                                        "string keys in translate table must be of length 1",
-                                    ));
+                        if args.len() == 3 {
+                            let z = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
+                            for zc in z.code_points() {
+                                unsafe {
+                                    pyre_object::w_dict_store(
+                                        d,
+                                        pyre_object::w_int_new(zc.to_u32() as i64),
+                                        pyre_object::w_none(),
+                                    );
                                 }
-                                pyre_object::w_int_new(cp.unwrap().to_u32() as i64)
-                            } else {
-                                return Err(crate::PyError::type_error(
-                                    "keys in translate table must be strings or integers",
-                                ));
-                            };
-                            pyre_object::w_dict_store(d, ord_key, v);
+                            }
+                        }
+                    } else {
+                        if !unsafe { pyre_object::is_dict(args[0]) } {
+                            return Err(crate::PyError::type_error(
+                                "if you give only one argument to maketrans it must be a dict",
+                            ));
+                        }
+                        let src = args[0];
+                        unsafe {
+                            // `w_dict_items` dispatches through `is_module_dict`
+                            // so `str.maketrans(some_module.__dict__)` walks the
+                            // strategy storage when handed a W_ModuleDictObject.
+                            for (k, v) in pyre_object::w_dict_items(src) {
+                                let ord_key = if pyre_object::is_int(k) {
+                                    k
+                                } else if pyre_object::is_str(k) {
+                                    let s = pyre_object::w_str_get_wtf8(k);
+                                    let mut cps = s.code_points();
+                                    let cp = cps.next();
+                                    if cp.is_none() || cps.next().is_some() {
+                                        return Err(crate::PyError::value_error(
+                                            "string keys in translate table must be of length 1",
+                                        ));
+                                    }
+                                    pyre_object::w_int_new(cp.unwrap().to_u32() as i64)
+                                } else {
+                                    return Err(crate::PyError::type_error(
+                                        "keys in translate table must be strings or integers",
+                                    ));
+                                };
+                                pyre_object::w_dict_store(d, ord_key, v);
+                            }
                         }
                     }
-                }
-                Ok(d)
-            }),
+                    Ok(d)
+                },
+                "(x, y=<unrepresentable>, z=<unrepresentable>, /)"
+            ),
         )
     };
     for (name, func) in [
@@ -6174,6 +6186,83 @@ fn init_str_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Argument Clinic metadata for the PyPy unicode TypeDef
+    // callables. `maketrans` is stamped on the function inside its staticmethod
+    // carrier above; these entries are the remaining Function carriers.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__str__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__mod__", "($self, value, /)"),
+        ("__rmod__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__add__", "($self, value, /)"),
+        ("__mul__", "($self, value, /)"),
+        ("__rmul__", "($self, value, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("encode", "($self, /, encoding='utf-8', errors='strict')"),
+        ("replace", "($self, old, new, /, count=-1)"),
+        ("split", "($self, /, sep=None, maxsplit=-1)"),
+        ("rsplit", "($self, /, sep=None, maxsplit=-1)"),
+        ("join", "($self, iterable, /)"),
+        ("capitalize", "($self, /)"),
+        ("casefold", "($self, /)"),
+        ("title", "($self, /)"),
+        ("center", "($self, width, fillchar=' ', /)"),
+        ("count", "($self, sub[, start[, end]], /)"),
+        ("expandtabs", "($self, /, tabsize=8)"),
+        ("find", "($self, sub[, start[, end]], /)"),
+        ("partition", "($self, sep, /)"),
+        ("index", "($self, sub[, start[, end]], /)"),
+        ("ljust", "($self, width, fillchar=' ', /)"),
+        ("lower", "($self, /)"),
+        ("lstrip", "($self, chars=None, /)"),
+        ("rfind", "($self, sub[, start[, end]], /)"),
+        ("rindex", "($self, sub[, start[, end]], /)"),
+        ("rjust", "($self, width, fillchar=' ', /)"),
+        ("rstrip", "($self, chars=None, /)"),
+        ("rpartition", "($self, sep, /)"),
+        ("splitlines", "($self, /, keepends=False)"),
+        ("strip", "($self, chars=None, /)"),
+        ("swapcase", "($self, /)"),
+        ("translate", "($self, table, /)"),
+        ("upper", "($self, /)"),
+        ("startswith", "($self, prefix[, start[, end]], /)"),
+        ("endswith", "($self, suffix[, start[, end]], /)"),
+        ("removeprefix", "($self, prefix, /)"),
+        ("removesuffix", "($self, suffix, /)"),
+        ("isascii", "($self, /)"),
+        ("islower", "($self, /)"),
+        ("isupper", "($self, /)"),
+        ("istitle", "($self, /)"),
+        ("isspace", "($self, /)"),
+        ("isdecimal", "($self, /)"),
+        ("isdigit", "($self, /)"),
+        ("isnumeric", "($self, /)"),
+        ("isalpha", "($self, /)"),
+        ("isalnum", "($self, /)"),
+        ("isidentifier", "($self, /)"),
+        ("isprintable", "($self, /)"),
+        ("zfill", "($self, width, /)"),
+        ("format", "($self, /, *args, **kwargs)"),
+        ("format_map", "($self, mapping, /)"),
+        ("__format__", "($self, format_spec, /)"),
+        ("__sizeof__", "($self, /)"),
+        ("__getnewargs__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("str TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 // ── Dict TypeDef ─────────────────────────────────────────────────────
