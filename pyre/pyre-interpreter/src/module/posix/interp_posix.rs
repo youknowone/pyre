@@ -5967,6 +5967,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // `_run_forking_function(space, "P")`, so forkpty must use the same
         // before/parent/child hook and thread-reinitialization lifecycle as
         // fork above while returning the master descriptor as its second item.
+        #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
             "forkpty",
