@@ -656,6 +656,19 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // on wasm32, so its object-hierarchy slot is too.
     #[cfg(not(target_arch = "wasm32"))]
     (169, Some(0)),
+    // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
+    // extend the append-only native rclass tail; wasm omits the host TLS
+    // module and therefore the hierarchy entries as well.
+    #[cfg(not(target_arch = "wasm32"))]
+    (170, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (171, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (172, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (173, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (174, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

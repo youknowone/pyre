@@ -690,6 +690,34 @@ unsafe fn hashlib_hmac_destructor(obj_addr: usize) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn ssl_context_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_ssl::w_ssl_context_dealloc(obj_addr as pyre_object::PyObjectRef)
+    };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn memory_bio_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_ssl::w_memory_bio_dealloc(obj_addr as pyre_object::PyObjectRef)
+    };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn ssl_session_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_ssl::w_ssl_session_dealloc(obj_addr as pyre_object::PyObjectRef)
+    };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn ssl_socket_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_ssl::w_ssl_socket_dealloc(obj_addr as pyre_object::PyObjectRef)
+    };
+}
+
 /// Custom trace for objects carrying the `MapdictStorageMixin` prefix
 /// (`W_ObjectObject` and native-layout Python subclasses such as
 /// `W_Random`; instance `map`+`storage`,
@@ -743,6 +771,40 @@ unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
     unsafe { object_object_custom_trace(obj_addr, f) };
     let inst = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_random::W_Random) };
     f(std::ptr::addr_of_mut!(inst.rnd) as *mut majit_ir::GcRef);
+}
+
+/// `_ssl._SSLContext` has the native-layout mapdict prefix plus the three
+/// Python callback/path references owned by the context wrapper.
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { object_object_custom_trace(obj_addr, f) };
+    let context = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_ssl::W_SSLContext) };
+    f(std::ptr::addr_of_mut!(context.sni_callback) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(context.msg_callback) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(context.keylog_filename) as *mut majit_ir::GcRef);
+}
+
+/// `ssl.MemoryBIO` is subclassable and therefore carries mapdict storage even
+/// though its rustls transport state contains no Python references.
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn memory_bio_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { object_object_custom_trace(obj_addr, f) };
+}
+
+/// `_ssl._SSLSocket` owns its context, transport endpoints, cached unbound
+/// socket methods, public owner, and hostname directly on the typed object.
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let socket = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_ssl::W_SSLSocket) };
+    f(std::ptr::addr_of_mut!(socket.ob.w_class) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.context) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.socket) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.socket_send) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.socket_recv) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.incoming) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.outgoing) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.owner) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.server_hostname) as *mut majit_ir::GcRef);
 }
 
 /// Custom trace for `W_ModuleDictObject`
@@ -3558,6 +3620,103 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::posix::W_DirEntry
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `_ssl` keeps rustls objects behind opaque native pointers.  Context and
+    // MemoryBIO are subclassable native layouts, so their marker walks the
+    // mapdict prefix; Context additionally owns Python callbacks/path values.
+    // Their sweep destructors release the opaque rustls allocations.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let context_descr = <pyre_interpreter::module::_ssl::W_SSLContext
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let context_tid = gc.register_type(
+            TypeInfo::object_subclass_with_custom_trace(
+                context_descr.object_size,
+                object_tid,
+                ssl_context_custom_trace,
+            )
+            .with_destructor_fn(ssl_context_destructor),
+        );
+        context_descr.gc_type_id.set(context_tid);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            context_descr.pytype_ptr as usize,
+            context_tid,
+        );
+        pytype_to_tid.insert(context_descr.pytype_ptr as usize, context_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            context_descr.pytype_ptr as usize,
+            context_descr.ptr_offsets,
+        );
+
+        let bio_descr = <pyre_interpreter::module::_ssl::W_MemoryBIO
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let bio_tid = gc.register_type(
+            TypeInfo::object_subclass_with_custom_trace(
+                bio_descr.object_size,
+                object_tid,
+                memory_bio_custom_trace,
+            )
+            .with_destructor_fn(memory_bio_destructor),
+        );
+        bio_descr.gc_type_id.set(bio_tid);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            bio_descr.pytype_ptr as usize,
+            bio_tid,
+        );
+        pytype_to_tid.insert(bio_descr.pytype_ptr as usize, bio_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            bio_descr.pytype_ptr as usize,
+            bio_descr.ptr_offsets,
+        );
+
+        let session_descr = <pyre_interpreter::module::_ssl::W_SSLSession
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let session_tid = gc.register_type(
+            TypeInfo::object_subclass(session_descr.object_size, object_tid)
+                .with_destructor_fn(ssl_session_destructor),
+        );
+        session_descr.gc_type_id.set(session_tid);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            session_descr.pytype_ptr as usize,
+            session_tid,
+        );
+        pytype_to_tid.insert(session_descr.pytype_ptr as usize, session_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            session_descr.pytype_ptr as usize,
+            session_descr.ptr_offsets,
+        );
+
+        let socket_descr = <pyre_interpreter::module::_ssl::W_SSLSocket
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let socket_tid = gc.register_type(
+            TypeInfo::object_subclass_with_custom_trace(
+                socket_descr.object_size,
+                object_tid,
+                ssl_socket_custom_trace,
+            )
+            .with_destructor_fn(ssl_socket_destructor),
+        );
+        socket_descr.gc_type_id.set(socket_tid);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            socket_descr.pytype_ptr as usize,
+            socket_tid,
+        );
+        pytype_to_tid.insert(socket_descr.pytype_ptr as usize, socket_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            socket_descr.pytype_ptr as usize,
+            socket_descr.ptr_offsets,
+        );
+
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::_ssl::W_Certificate
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+    }
     // `rrandom.Random` — the Mersenne Twister `interp_random.py:21` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an
     // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a

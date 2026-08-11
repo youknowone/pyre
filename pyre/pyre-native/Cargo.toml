@@ -15,3 +15,12 @@ blake2b_simd = { workspace = true }
 blake2s_simd = { workspace = true }
 scrypt = { workspace = true }
 flate2 = { workspace = true, features = ["zlib-rs"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = { workspace = true }
+pem-rfc7468 = { workspace = true }
+der = { workspace = true }
+pkcs8 = { workspace = true }
+rustls-native-certs = { workspace = true }

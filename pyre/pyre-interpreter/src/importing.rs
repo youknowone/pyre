@@ -681,6 +681,8 @@ pub fn install_builtin_modules() {
         pyre_install_module!(termios);
         pyre_install_module!(_socket);
         #[cfg(not(target_arch = "wasm32"))]
+        pyre_install_module!(_ssl);
+        #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!(mmap);
         pyre_install_module!(_ctypes);
         #[cfg(not(target_arch = "wasm32"))]

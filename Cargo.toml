@@ -167,6 +167,16 @@ flate2 = { version = "1.1.9", default-features = false }
 base64 = "0.22"
 crc32fast = "1.4"
 
+# TLS backend (pyre-native only).  The interpreter sees opaque, non-inlined
+# entry points so rustls and its crypto provider stay outside Charon/LLBC.
+rustls = { version = "0.23.39", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+rustls-pemfile = "2.2"
+x509-parser = "0.18"
+pem-rfc7468 = { version = "1", features = ["alloc"] }
+der = { version = "0.8", features = ["alloc", "pem"] }
+pkcs8 = { version = "0.11", features = ["encryption", "pkcs5", "pem"] }
+rustls-native-certs = "0.8"
+
 # math
 pymath = { version = "0.2.0", features = ["malachite-bigint"] }
 

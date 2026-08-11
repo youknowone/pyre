@@ -46,6 +46,16 @@ struct HostentRaw {
     h_addr_list: *mut *mut libc::c_char,
 }
 
+/// Darwin's resolver may pack the pointer arrays owned by `hostent` at
+/// byte-aligned addresses (for example, immediately after a C string).
+/// C permits the resulting unaligned pointer loads; Rust references do not.
+/// Read each array slot as raw C storage, matching RPython's rffi access in
+/// `rsocket.gethost_common` without manufacturing an aligned reference.
+#[cfg(unix)]
+unsafe fn hostent_pointer_at(array: *mut *mut libc::c_char, index: usize) -> *mut libc::c_char {
+    unsafe { std::ptr::read_unaligned(array.add(index)) }
+}
+
 /// Minimal mirror of `struct servent` — we read `s_name` and `s_port`.
 #[cfg(unix)]
 #[repr(C)]
@@ -55,6 +65,15 @@ struct ServentRaw {
     s_aliases: *mut *mut libc::c_char,
     s_port: libc::c_int,
     s_proto: *const libc::c_char,
+}
+
+/// RPython `rsocket._get_netdb_lock_thread`: legacy gethostbyname/
+/// gethostbyaddr return pointers into one process-global static hostent.
+/// Keep lookup and copying under the same process-global lock.
+#[cfg(unix)]
+fn netdb_lock() -> std::sync::MutexGuard<'static, ()> {
+    static NETDB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    NETDB_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// _socket module — PyPy: pypy/module/_socket/.
@@ -852,6 +871,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let host_bytes = socket_idna_converter(args[0])?;
                     let c = std::ffi::CString::new(host_bytes.clone())
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    let _netdb = netdb_lock();
                     let he = unsafe { gethostbyname(c.as_ptr()) };
                     if he.is_null() {
                         let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
@@ -863,16 +883,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     unsafe {
                         let h = &*he;
-                        if h.h_length != 4 || (*h.h_addr_list).is_null() {
+                        let first_addr = hostent_pointer_at(h.h_addr_list, 0);
+                        if h.h_length != 4 || first_addr.is_null() {
                             return Err(socket_converted_error(
                                 "gaierror",
                                 None,
                                 "gethostbyname: no IPv4 address",
                             ));
                         }
-                        let addr_ptr = *h.h_addr_list;
                         let addr = libc::in_addr {
-                            s_addr: *(addr_ptr as *const u32),
+                            s_addr: std::ptr::read_unaligned(first_addr as *const u32),
                         };
                         let p = inet_ntoa(addr);
                         Ok(pyre_object::w_str_new(
@@ -901,6 +921,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let host_bytes = socket_idna_converter(args[0])?;
                     let c = std::ffi::CString::new(host_bytes.clone())
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    let _netdb = netdb_lock();
                     let he = unsafe { gethostbyname(c.as_ptr()) };
                     if he.is_null() {
                         let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
@@ -934,6 +955,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let host_bytes = socket_idna_converter(args[0])?;
                     let c = std::ffi::CString::new(host_bytes.clone())
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    let _netdb = netdb_lock();
                     // Try IPv4 first, then IPv6, then fall back to
                     // gethostbyname → hostent.h_addr to obtain a raw
                     // bytestring for gethostbyaddr.
@@ -994,7 +1016,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         }
                         unsafe {
                             let h = &*he;
-                            if (*h.h_addr_list).is_null() {
+                            let first_addr = hostent_pointer_at(h.h_addr_list, 0);
+                            if first_addr.is_null() {
                                 return Err(socket_converted_error(
                                     "herror",
                                     None,
@@ -1003,7 +1026,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             }
                             (
                                 h.h_addrtype as libc::c_int,
-                                *h.h_addr_list as *const libc::c_void,
+                                first_addr as *const libc::c_void,
                                 h.h_length as libc::socklen_t,
                             )
                         }
@@ -1582,31 +1605,45 @@ fn unpack_hostent(he: *mut HostentRaw) -> Result<pyre_object::PyObjectRef, crate
                 .to_string_lossy()
                 .into_owned()
         };
-        let mut aliases = Vec::new();
+        // Copy all resolver-owned storage while the process-global netdb lock
+        // is held, before allocating any Python objects.
+        let mut alias_strings = Vec::new();
         if !h.h_aliases.is_null() {
-            let mut p = h.h_aliases;
-            while !(*p).is_null() {
-                aliases.push(pyre_object::w_str_new(
-                    &std::ffi::CStr::from_ptr(*p).to_string_lossy(),
-                ));
-                p = p.add(1);
+            let mut index = 0;
+            loop {
+                let alias = hostent_pointer_at(h.h_aliases, index);
+                if alias.is_null() {
+                    break;
+                }
+                alias_strings.push(std::ffi::CStr::from_ptr(alias).to_string_lossy().into_owned());
+                index += 1;
             }
         }
-        let mut addrs = Vec::new();
+        let mut addr_strings = Vec::new();
         if !h.h_addr_list.is_null() {
-            let mut p = h.h_addr_list;
-            while !(*p).is_null() {
+            let mut index = 0;
+            loop {
+                let addr_ptr = hostent_pointer_at(h.h_addr_list, index);
+                if addr_ptr.is_null() {
+                    break;
+                }
                 let addr_str = if h.h_addrtype == libc::AF_INET && h.h_length == 4 {
                     let addr = libc::in_addr {
-                        s_addr: *(*p as *const u32),
+                        s_addr: std::ptr::read_unaligned(addr_ptr as *const u32),
                     };
                     let s = inet_ntoa(addr);
                     std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
                 } else if h.h_addrtype == libc::AF_INET6 && h.h_length == 16 {
+                    let mut packed_addr = [0u8; 16];
+                    std::ptr::copy_nonoverlapping(
+                        addr_ptr as *const u8,
+                        packed_addr.as_mut_ptr(),
+                        packed_addr.len(),
+                    );
                     let mut buf = [0u8; 64];
                     let q = inet_ntop(
                         libc::AF_INET6,
-                        *p as *const libc::c_void,
+                        packed_addr.as_ptr() as *const libc::c_void,
                         buf.as_mut_ptr() as *mut libc::c_char,
                         buf.len() as libc::socklen_t,
                     );
@@ -1618,10 +1655,18 @@ fn unpack_hostent(he: *mut HostentRaw) -> Result<pyre_object::PyObjectRef, crate
                 } else {
                     String::new()
                 };
-                addrs.push(pyre_object::w_str_new(&addr_str));
-                p = p.add(1);
+                addr_strings.push(addr_str);
+                index += 1;
             }
         }
+        let aliases = alias_strings
+            .iter()
+            .map(|alias| pyre_object::w_str_new(alias))
+            .collect();
+        let addrs = addr_strings
+            .iter()
+            .map(|addr| pyre_object::w_str_new(addr))
+            .collect();
         Ok(pyre_object::w_tuple_new(vec![
             pyre_object::w_str_new(&name),
             pyre_object::w_list_new(aliases),
@@ -1950,6 +1995,7 @@ fn socket_type() -> pyre_object::PyObjectRef {
     *SOCKET_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("socket", init_socket_type);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { pyre_object::w_type_set_hasuserdel(tp, true) };
         tp as usize
     }) as pyre_object::PyObjectRef
 }
@@ -1968,6 +2014,71 @@ fn socket_io_err(e: std::io::Error) -> crate::PyError {
         }
     };
     crate::PyError::os_error_errno_strerror(errno, strerror)
+}
+
+#[cfg(unix)]
+fn socket_io_err_for_operation(
+    obj: pyre_object::PyObjectRef,
+    e: std::io::Error,
+) -> crate::PyError {
+    let errno = e.raw_os_error().unwrap_or(0);
+    if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+        let d = crate::baseobjspace::getdict_native(obj);
+        if !d.is_null()
+            && let Some(timeout) = unsafe { pyre_object::w_dict_getitem_str(d, "_timeout") }
+            && unsafe { pyre_object::is_float(timeout) }
+            && unsafe { pyre_object::floatobject::w_float_get_value(timeout) } > 0.0
+        {
+            // RPython's RSocket._select() turns expiry of a positive timeout
+            // into SocketTimeout, which interp_socket maps to TimeoutError.
+            // This backend uses SO_RCVTIMEO/SO_SNDTIMEO, whose equivalent
+            // expiry signal is EAGAIN/EWOULDBLOCK.
+            return socket_converted_error("timeout", None, "timed out");
+        }
+    }
+    socket_io_err(e)
+}
+
+/// RPython `RSocket._select(False)` used by `RSocket.accept`: a positive
+/// Python timeout is enforced with poll before entering the libc operation.
+/// Darwin does not reliably apply SO_RCVTIMEO to accept(), so relying on that
+/// socket option leaves timeout-driven server loops blocked indefinitely.
+#[cfg(unix)]
+fn socket_wait_readable(
+    obj: pyre_object::PyObjectRef,
+    fd: libc::c_int,
+) -> Result<(), crate::PyError> {
+    let dict = crate::baseobjspace::getdict_native(obj);
+    let Some(timeout) = (!dict.is_null())
+        .then(|| unsafe { pyre_object::w_dict_getitem_str(dict, "_timeout") })
+        .flatten()
+        .filter(|timeout| unsafe { pyre_object::is_float(*timeout) })
+        .map(|timeout| unsafe { pyre_object::floatobject::w_float_get_value(timeout) })
+        .filter(|timeout| *timeout > 0.0)
+    else {
+        return Ok(());
+    };
+    let timeout_ms = (timeout * 1000.0 + 0.5).min(i32::MAX as f64) as i32;
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let (ready, errno) = crate::module::thread::call_external_function(|| unsafe {
+            libc::poll(&mut pollfd, 1, timeout_ms)
+        });
+        if ready > 0 {
+            return Ok(());
+        }
+        if ready == 0 {
+            return Err(socket_converted_error("timeout", None, "timed out"));
+        }
+        if errno != libc::EINTR {
+            return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+        }
+        crate::module::signal::interp_signal::checksignals_now()?;
+    }
 }
 
 #[cfg(unix)]
@@ -2269,12 +2380,19 @@ fn pack_inet_addr(
         sin.sin_family = libc::AF_INET as libc::sa_family_t;
         sin.sin_port = port;
         // inet_pton handles both "0.0.0.0" and dotted-quad.
-        let r = unsafe {
-            inet_pton(
-                libc::AF_INET,
-                c_host.as_ptr(),
-                &mut sin.sin_addr as *mut _ as *mut libc::c_void,
-            )
+        let r = if host.is_empty() {
+            // RSocket.makeipaddr('', result) uses the wildcard address for
+            // bind(), as required by socketserver and socket_helper.bind_port.
+            sin.sin_addr.s_addr = libc::INADDR_ANY;
+            1
+        } else {
+            unsafe {
+                inet_pton(
+                    libc::AF_INET,
+                    c_host.as_ptr(),
+                    &mut sin.sin_addr as *mut _ as *mut libc::c_void,
+                )
+            }
         };
         if r != 1 {
             // `rsocket.makeipaddr` resolves names through getaddrinfo and
@@ -2322,12 +2440,16 @@ fn pack_inet_addr(
         sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
         sin6.sin6_port = port;
         let mut buf = [0u8; 16];
-        let r = unsafe {
-            inet_pton(
-                libc::AF_INET6,
-                c_host.as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-            )
+        let r = if host.is_empty() {
+            1
+        } else {
+            unsafe {
+                inet_pton(
+                    libc::AF_INET6,
+                    c_host.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                )
+            }
         };
         if r != 1 {
             return Err(crate::PyError::os_error(format!(
@@ -2449,6 +2571,30 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 .unwrap_or_else(socket_type);
             Ok(pyre_object::w_instance_new(cls))
         }),
+    ) };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+        ns,
+        "__del__",
+        crate::make_builtin_function_with_arity(
+            "__del__",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = socket_get_attr_i64(obj, "_fd") as libc::c_int;
+                if fd >= 0 {
+                    if let Ok(repr) = unsafe { crate::display::py_repr_wtf8(obj) } {
+                        let _ = crate::warn::warn_category(
+                            &format!("unclosed {}", repr.to_string_lossy()),
+                            "ResourceWarning",
+                            1,
+                        );
+                    }
+                    let _ = unsafe { libc::close(fd) };
+                    socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                }
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
     ) };
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -2768,6 +2914,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             |args| {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let fd = socket_fd(obj)?;
+                socket_wait_readable(obj, fd)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 let ty = socket_get_attr_i64(obj, "_type") as libc::c_int;
                 let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
@@ -2781,7 +2928,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         break r;
                     }
                     if errno != libc::EINTR {
-                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                        return Err(socket_io_err_for_operation(
+                            obj,
+                            std::io::Error::from_raw_os_error(errno),
+                        ));
                     }
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
@@ -2814,6 +2964,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             |args| {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let fd = socket_fd(obj)?;
+                socket_wait_readable(obj, fd)?;
                 let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let cfd = loop {
@@ -2824,7 +2975,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         break r;
                     }
                     if errno != libc::EINTR {
-                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                        return Err(socket_io_err_for_operation(
+                            obj,
+                            std::io::Error::from_raw_os_error(errno),
+                        ));
                     }
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
@@ -2946,7 +3100,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         return Ok(r);
                     }
                     if errno != libc::EINTR {
-                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                        return Err(socket_io_err_for_operation(
+                            obj,
+                            std::io::Error::from_raw_os_error(errno),
+                        ));
                     }
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
@@ -2996,7 +3153,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                             crate::module::signal::interp_signal::checksignals_now()?;
                             continue;
                         }
-                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                        return Err(socket_io_err_for_operation(
+                            obj,
+                            std::io::Error::from_raw_os_error(errno),
+                        ));
                     }
                     off += n as usize;
                 }
@@ -3042,7 +3202,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     break r;
                 }
                 if errno != libc::EINTR {
-                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                    return Err(socket_io_err_for_operation(
+                        obj,
+                        std::io::Error::from_raw_os_error(errno),
+                    ));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).

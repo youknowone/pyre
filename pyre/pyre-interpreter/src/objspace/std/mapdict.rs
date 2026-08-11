@@ -556,6 +556,27 @@ unsafe fn is_generated_user_layout_family(obj: PyObjectRef) -> bool {
     }
 }
 
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[inline]
+unsafe fn is_ssl_mapdict_layout(obj: PyObjectRef) -> bool {
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &*<crate::module::_ssl::W_SSLContext as PyreClassPyTypeOf>::PYTYPE,
+        ) || pyre_object::py_type_check(
+            obj,
+            &*<crate::module::_ssl::W_MemoryBIO as PyreClassPyTypeOf>::PYTYPE,
+        )
+    }
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), not(feature = "sandbox"))))]
+#[inline]
+unsafe fn is_ssl_mapdict_layout(_obj: PyObjectRef) -> bool {
+    false
+}
+
 /// Whether `obj`'s physical allocation carries the slots supplied by
 /// `MapdictStorageMixin` (`mapdict.py:748-761, 905-910`). Ordinary instances
 /// and `_random.Random` keep the historical prefix. The generated tuple/int/str
@@ -575,6 +596,7 @@ pub unsafe fn has_mapdict_layout(obj: PyObjectRef) -> bool {
     }
     if (unsafe { pyre_object::is_instance(obj) })
         || unsafe { pyre_object::py_type_check(obj, &crate::module::_random::RANDOM_TYPE) }
+        || unsafe { is_ssl_mapdict_layout(obj) }
     {
         return true;
     }

@@ -58,6 +58,9 @@ pub mod _random;
 pub mod _socket;
 pub mod _sre;
 #[allow(non_snake_case)]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+pub mod _ssl;
+#[allow(non_snake_case)]
 pub mod _symtable;
 #[allow(non_snake_case)]
 pub mod _template;
