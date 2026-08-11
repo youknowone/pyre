@@ -375,7 +375,7 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
         unsafe { w_type_get_name(actual_type) }.to_string()
     };
     let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
-        return Ok(w_str_new(&format!("{name}(...)")));
+        return Ok(w_str_new_managed(&format!("{name}(...)")));
     };
     let dict = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(sp),
@@ -427,7 +427,7 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
         text.push_wtf8(part);
     }
     text.push_str(")");
-    Ok(pyre_object::w_str_from_wtf8(text))
+    Ok(pyre_object::w_str_from_wtf8_managed(text))
 }
 
 /// `_structseq.py:185 SimpleNamespace.__eq__` — structural over `__dict__`
