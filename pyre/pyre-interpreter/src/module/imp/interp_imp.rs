@@ -4,7 +4,9 @@
 
 use crate::importing::BUILTIN_MODULES;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
+use std::ffi::CString;
 use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
+use std::sync::OnceLock;
 
 struct FrozenModule {
     name: &'static str,
@@ -104,6 +106,75 @@ static FROZEN_MODULES: &[FrozenModule] = &[
         source: FrozenSource::Literal("initialized = True\n"),
     },
 ];
+
+/// The four-field prefix of CPython's public `struct _frozen` ABI consumed by
+/// `ctypes.POINTER(...).in_dll(pythonapi, "_PyImport_Frozen...")`.
+///
+/// Pyre's canonical frozen-module owner above stores source rather than
+/// marshalled CPython bytecode.  The ABI projection therefore exposes the
+/// source bytes as its non-empty payload while preserving the observable
+/// name/order/package table.  Import execution continues to go through
+/// `frozen_code`, so this compatibility view cannot become a second semantic
+/// owner of the modules.
+#[repr(C)]
+struct FrozenAbiEntry {
+    name: *const std::ffi::c_char,
+    code: *const u8,
+    size: i32,
+    is_package: i32,
+}
+
+fn build_frozen_abi_table(entries: &[FrozenModule]) -> usize {
+    let mut table = Vec::with_capacity(entries.len() + 1);
+    for entry in entries {
+        let name = CString::new(entry.name)
+            .expect("frozen module names contain no NUL bytes")
+            .into_raw();
+        let source = frozen_source(entry)
+            .map(|(source, _)| source.into_bytes())
+            .unwrap_or_else(|_| b"# frozen source unavailable\n".to_vec());
+        let source = Box::leak(source.into_boxed_slice());
+        let size = i32::try_from(source.len()).unwrap_or(i32::MAX);
+        table.push(FrozenAbiEntry {
+            name,
+            code: source.as_ptr(),
+            size,
+            is_package: i32::from(entry.is_package),
+        });
+    }
+    table.push(FrozenAbiEntry {
+        name: std::ptr::null(),
+        code: std::ptr::null(),
+        size: 0,
+        is_package: 0,
+    });
+
+    let table = Box::leak(table.into_boxed_slice());
+    Box::leak(Box::new(table.as_ptr() as usize)) as *mut usize as usize
+}
+
+/// Address of the stable pointer variable exported by CPython for each frozen
+/// table.  The split matches CPython's Bootstrap/Stdlib/Test ABI while the
+/// concatenated order remains exactly `FROZEN_MODULES`, the list returned by
+/// `_imp._frozen_module_names()`.
+pub(crate) fn frozen_abi_pointer_variable(name: &str) -> Option<usize> {
+    static BOOTSTRAP: OnceLock<usize> = OnceLock::new();
+    static STDLIB: OnceLock<usize> = OnceLock::new();
+    static TEST: OnceLock<usize> = OnceLock::new();
+
+    match name {
+        "_PyImport_FrozenBootstrap" => {
+            Some(*BOOTSTRAP.get_or_init(|| build_frozen_abi_table(&FROZEN_MODULES[..3])))
+        }
+        "_PyImport_FrozenStdlib" => {
+            Some(*STDLIB.get_or_init(|| build_frozen_abi_table(&FROZEN_MODULES[3..3])))
+        }
+        "_PyImport_FrozenTest" => {
+            Some(*TEST.get_or_init(|| build_frozen_abi_table(&FROZEN_MODULES[3..])))
+        }
+        _ => None,
+    }
+}
 
 static FROZEN_OVERRIDE: AtomicI64 = AtomicI64::new(0);
 

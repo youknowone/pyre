@@ -12,7 +12,7 @@ from ._support import (_CData, PyCStructType, UnionType,
                        Py_TPFLAGS_IMMUTABLETYPE)
 from struct import calcsize
 import contextlib
-from test.support import MS_WINDOWS
+from test.support import cpython_only, MS_WINDOWS
 
 
 class StructUnionTestBase:
@@ -77,6 +77,7 @@ class StructUnionTestBase:
         self.assertEqual(self.cls.mro(), [self.cls, _CData, object])
         self.assertEqual(type(self.metacls), type)
 
+    @cpython_only
     def test_type_flags(self):
         for cls in self.cls, self.metacls:
             with self.subTest(cls=cls):

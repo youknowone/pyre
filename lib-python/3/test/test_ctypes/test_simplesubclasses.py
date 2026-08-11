@@ -1,5 +1,6 @@
 import unittest
 from ctypes import Structure, CFUNCTYPE, c_int, _SimpleCData
+from test.support import cpython_only
 from ._support import (_CData, PyCSimpleType, Py_TPFLAGS_DISALLOW_INSTANTIATION,
                        Py_TPFLAGS_IMMUTABLETYPE)
 
@@ -20,6 +21,7 @@ class Test(unittest.TestCase):
 
         self.assertEqual(c_int.mro(), [c_int, _SimpleCData, _CData, object])
 
+    @cpython_only
     def test_type_flags(self):
         for cls in _SimpleCData, PyCSimpleType:
             with self.subTest(cls=cls):

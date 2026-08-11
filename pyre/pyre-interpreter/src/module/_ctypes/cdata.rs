@@ -104,17 +104,10 @@ pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             .unwrap_or_else(|| pyre_object::w_int_new(0));
         return crate::call::type_call_instantiate(cls, &[optimize]);
     }
-    if name.starts_with("_PyImport_Frozen") {
-        // Pyre has no frozen modules.  Export the ABI's terminating all-zero
-        // `_frozen` entry through a stable pointer variable.
-        let sentinel = Box::leak(Box::new([0usize; 3]));
-        let pointer = Box::leak(Box::new(sentinel.as_ptr() as usize));
-        return Ok(make_at_address(
-            cls,
-            pointer as *mut usize as usize,
-            size,
-            args[1],
-        ));
+    if let Some(pointer_variable) =
+        crate::module::imp::interp_imp::frozen_abi_pointer_variable(name)
+    {
+        return Ok(make_at_address(cls, pointer_variable, size, args[1]));
     }
     let address = super::interp_ctypes::lookup_symbol(handle, name.as_bytes())
         .map_err(|_| crate::PyError::value_error(format!("symbol '{name}' not found")))?;

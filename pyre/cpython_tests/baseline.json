@@ -286,7 +286,7 @@
       "dynasm": "PASS"
     },
     "test.test_ctypes": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_curses": {
       "dynasm": "IMPORTERROR"

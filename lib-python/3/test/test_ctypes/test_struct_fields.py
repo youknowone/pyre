@@ -1,6 +1,7 @@
 import unittest
 import sys
 from ctypes import Structure, Union, sizeof, c_byte, c_char, c_int, CField
+from test.support import cpython_only
 from ._support import Py_TPFLAGS_IMMUTABLETYPE, StructCheckMixin
 
 
@@ -163,6 +164,7 @@ class FieldsTestBase(StructCheckMixin):
 class StructFieldsTestCase(unittest.TestCase, FieldsTestBase):
     cls = Structure
 
+    @cpython_only
     def test_cfield_type_flags(self):
         self.assertTrue(CField.__flags__ & Py_TPFLAGS_IMMUTABLETYPE)
 
