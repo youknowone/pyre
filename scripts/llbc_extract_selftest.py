@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -89,8 +90,91 @@ def run(engine) -> int:
         shutil.rmtree(outside, ignore_errors=True)
 
 
+def run_fingerprint(engine) -> int:
+    """Exercise the complete source key against a synthetic Git working tree."""
+    root = pathlib.Path(tempfile.mkdtemp()).resolve()
+    try:
+        (root / "src").mkdir()
+        (root / "scripts").mkdir()
+        (root / "Cargo.toml").write_text("[package]\nname='probe'\nversion='0.0.0'\n")
+        (root / ".gitignore").write_text("src/ignored.rs\n")
+        (root / "src" / "lib.rs").write_text("pub fn answer() -> i64 { 42 }\n")
+        tool = root / "scripts" / "tool.py"
+        tool.write_text("# implementation detail\n")
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(
+            ["git", "add", ".gitignore", "Cargo.toml", "src/lib.rs", "scripts/tool.py"],
+            cwd=root,
+            check=True,
+        )
+
+        spec = engine.CrateSpec(
+            name="probe",
+            crate_dir=root,
+            output_name="probe.ullbc",
+            fingerprint_pathspecs=["src/"],
+            layout_targets=(),
+        )
+
+        def make_engine(*, extraction_abi="probe-1", rustflags=""):
+            return engine.Engine(
+                specs={"probe": spec},
+                default_crates=["probe"],
+                root=root,
+                out_dir=root / "out",
+                base_pathspecs=["Cargo.toml"],
+                charon_root=root,
+                cargo_features="",
+                extraction_abi=extraction_abi,
+                layout_target_rustflags=rustflags,
+            )
+
+        def fingerprint(eng):
+            return engine.source_fingerprint(eng, ["probe"], "")
+
+        failures = 0
+
+        def expect(name, condition):
+            nonlocal failures
+            if condition:
+                print(f"ok   {name}")
+            else:
+                failures += 1
+                print(f"FAIL {name}")
+
+        eng = make_engine()
+        base = fingerprint(eng)
+
+        tool.write_text("# diagnostics and comments changed\n")
+        expect("tool implementation is outside the source key", fingerprint(eng) == base)
+
+        untracked = root / "src" / "new.rs"
+        untracked.write_text("pub fn new_item() {}\n")
+        before_stage = fingerprint(eng)
+        expect("untracked source moves the source key", before_stage != base)
+        subprocess.run(["git", "add", "src/new.rs"], cwd=root, check=True)
+        expect("staging identical bytes preserves the source key", fingerprint(eng) == before_stage)
+
+        ignored = root / "src" / "ignored.rs"
+        ignored.write_text("build output\n")
+        expect("ignored file stays outside the source key", fingerprint(eng) == before_stage)
+
+        expect(
+            "extraction ABI moves the cache and staleness key",
+            fingerprint(make_engine(extraction_abi="probe-2")) != before_stage,
+        )
+        expect(
+            "effective layout configuration moves the key",
+            fingerprint(make_engine(rustflags="--cfg changed")) != before_stage,
+        )
+        return failures
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> None:
-    failures = run(load_engine())
+    engine = load_engine()
+    failures = run(engine) + run_fingerprint(engine)
     if failures:
         raise SystemExit(f"llbc_extract_selftest: {failures} failed")
     print("llbc_extract_selftest: all passed")

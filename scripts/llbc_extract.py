@@ -21,6 +21,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# Domain separator for the bytes hashed by `source_fingerprint`. Bump this
+# only when the fingerprint algorithm or the meaning of its input set changes.
+# Ordinary refactors, diagnostics and comments in this file do not change what
+# Charon compiles and must not invalidate every multi-minute LLBC artefact.
+FINGERPRINT_SCHEMA = "2"
+
+
 @dataclass
 class CrateSpec:
     """One extractable crate.
@@ -77,6 +84,7 @@ class Engine:
     base_pathspecs: list[str]
     charon_root: Path
     cargo_features: str
+    extraction_abi: str
     metadata_feature_crates: tuple[str, ...] = ()
     layout_targets: tuple[str, ...] = ()
     layout_target_rustflags: str = ""
@@ -190,13 +198,21 @@ def run_capture(args: list[str], *, cwd: Path) -> str:
     ).stdout
 
 
+_host_triple_cache: dict[Path, str] = {}
+
+
 def host_triple(root: Path) -> str:
     if value := os.environ.get("LLBC_TARGET_TRIPLE"):
+        return value
+    cache_key = root.resolve()
+    if value := _host_triple_cache.get(cache_key):
         return value
     rustc_info = run_capture(["rustc", "-vV"], cwd=root)
     for line in rustc_info.splitlines():
         if line.startswith("host: "):
-            return line.removeprefix("host: ")
+            value = line.removeprefix("host: ")
+            _host_triple_cache[cache_key] = value
+            return value
     raise SystemExit("extract-llbc.py: could not determine rustc host triple")
 
 
@@ -416,6 +432,15 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
                     continue
                 seen.add(package_id)
                 package = by_id[package_id]
+                # Apply the exclusion in the walk, not after it. This drops a
+                # package's exclusively-reached subtree as well as the named
+                # package. A node also reachable from a non-excluded parent is
+                # still pushed along that path and therefore remains present.
+                # The extracted artefact guard certifies the named package's
+                # absence; a subtree that has no path avoiding that package
+                # cannot occur without it.
+                if package["name"] in exclude:
+                    continue
                 closure.append(package)
 
                 for dep in resolve_nodes.get(package_id, {}).get("deps", []):
@@ -431,8 +456,6 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
                         stack.append(dep_package["id"])
 
             for package in closure:
-                if package["name"] in exclude:
-                    continue
                 package_dir = Path(package["manifest_path"]).resolve().parent
                 if package_dir.is_relative_to(root):
                     rel_dir = package_dir.relative_to(root).as_posix()
@@ -485,6 +508,41 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
 
 def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
     digest = hashlib.sha256()
+    # Keep the cache/staleness key tied to extraction semantics rather than to
+    # the implementation bytes of this driver. The driver-provided ABI covers
+    # repo-specific extraction behaviour; the remaining fields automatically
+    # cover the effective per-crate flags and target-layout configuration.
+    config_fields = [
+        ("fingerprint_schema", FINGERPRINT_SCHEMA),
+        ("extraction_abi", eng.extraction_abi),
+        ("cargo_features", cargo_features),
+        ("layout_target_rustflags", eng.layout_target_rustflags),
+    ]
+    for crate in sorted(crates):
+        spec = eng.spec(crate)
+        flags = crate_flags(spec, cargo_features)
+        config_fields.extend(
+            [
+                (f"{crate}.cargo_flags", "\x1f".join(flags)),
+                (
+                    f"{crate}.charon_flags",
+                    "\x1f".join(charon_crate_flags(spec, cargo_features)),
+                ),
+                (
+                    f"{crate}.layout_targets",
+                    "\x1f".join(crate_layout_targets(eng, spec)),
+                ),
+                (
+                    f"{crate}.layout_flags",
+                    "\x1f".join(crate_layout_flags(spec, cargo_features, flags)),
+                ),
+            ]
+        )
+    for key, value in config_fields:
+        digest.update(key.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\0")
     for path in fingerprint_inputs(eng, crates, cargo_features):
         digest.update(path.as_posix().encode("utf-8"))
         digest.update(b"\0")
@@ -587,6 +645,8 @@ def stamp_for(
             f"crate={crate}",
             f"platform={platform_key}",
             f"charon={charon_stamp}",
+            f"fingerprint_schema={FINGERPRINT_SCHEMA}",
+            f"extraction_abi={eng.extraction_abi}",
             f"features={cargo_features}",
             f"flags={' '.join(flags)}",
             f"charon_flags={' '.join(charon_flags)}",
@@ -607,6 +667,8 @@ def crate_layout_targets(eng: Engine, spec: CrateSpec) -> list[str]:
     the crate's own artefact.
     """
     extra = eng.layout_targets if spec.layout_targets is None else spec.layout_targets
+    if not extra:
+        return []
     host = host_triple(eng.root)
     return [t for t in extra if t != host]
 
@@ -885,6 +947,7 @@ def run_cli(
     *,
     root: Path,
     out_dir: Path,
+    extraction_abi: str,
     base_pathspecs: list[str] | None = None,
     charon_root: Path | None = None,
     metadata_feature_crates: tuple[str, ...] = (),
@@ -926,6 +989,7 @@ def run_cli(
         base_pathspecs=list(base_pathspecs) if base_pathspecs else ["Cargo.lock", "Cargo.toml"],
         charon_root=charon_root or root,
         cargo_features=cargo_features,
+        extraction_abi=extraction_abi,
         metadata_feature_crates=metadata_feature_crates,
         layout_targets=layout_targets,
         layout_target_rustflags=layout_target_rustflags,

@@ -110,15 +110,18 @@ LAYOUT_TARGETS = ("wasm32-unknown-unknown",)
 # backend refuses to build for `wasm32-unknown-unknown`.
 LAYOUT_TARGET_RUSTFLAGS = '--cfg getrandom_backend="custom"'
 
-# Base fingerprint inputs shared by every pyre crate: workspace manifests plus
-# the extraction tooling itself, so an edit to the engine/driver busts caches.
+# Bump only when pyre's extraction behaviour changes in a way not already
+# represented by the effective cargo/Charon/layout flags hashed by the engine.
+# The explicit ABI keeps comments, diagnostics, tests, the forwarding shim and
+# the Charon installer from invalidating every multi-minute artefact.
+EXTRACTION_ABI = "1"
+
+# Workspace resolution is a compiler input. Extraction-tool implementation
+# files are deliberately absent; FINGERPRINT_SCHEMA and EXTRACTION_ABI carry
+# their output-affecting semantics without coupling cache keys to every edit.
 BASE_PATHSPECS = [
     "Cargo.lock",
     "Cargo.toml",
-    "scripts/llbc_extract.py",
-    "scripts/extract-llbc.py",
-    "pyre/scripts/extract-llbc.py",
-    "scripts/install-charon.py",
 ]
 
 
@@ -128,6 +131,7 @@ def main() -> None:
         DEFAULT_CRATES,
         root=ROOT,
         out_dir=ROOT / "build" / "llbc",
+        extraction_abi=EXTRACTION_ABI,
         base_pathspecs=BASE_PATHSPECS,
         metadata_feature_crates=("pyre-interpreter", "pyre-jit"),
         layout_targets=LAYOUT_TARGETS,
