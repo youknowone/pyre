@@ -249,9 +249,9 @@ fn context_var_repr_string(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf,
 }
 
 fn context_var_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(pyre_object::w_str_from_wtf8(context_var_repr_string(
-        args[0],
-    )?))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        context_var_repr_string(args[0])?,
+    ))
 }
 
 fn token_type() -> PyObjectRef {
