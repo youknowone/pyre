@@ -71,6 +71,13 @@ jobs:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         persist-credentials: false
+    - name: Check the LLBC fingerprint input walk
+      # Ahead of the Charon install so a regression reports in seconds. An
+      # `include*!` spelling the walk cannot resolve widens no digest and fails
+      # nothing downstream — the artefact just reads as fresh — so this is the
+      # only place that behaviour is observable. Needs no cargo and no git.
+      shell: bash
+      run: scripts/llbc_extract_selftest.py
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:

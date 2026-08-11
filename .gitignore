@@ -8,6 +8,10 @@ rpaheui
 *.swp
 *.swo
 
+# macOS. The LLBC fingerprint enumerates untracked sources, so a Finder visit
+# to a crate's src/ would otherwise drop a .DS_Store into the digest.
+.DS_Store
+
 *.pyc
 *.pyo
 *~

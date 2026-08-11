@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -252,6 +253,107 @@ def metadata(
     return result
 
 
+_INCLUDE_CALL = re.compile(r"\binclude(?:_str|_bytes)?!\s*\(\s*")
+# A plain, escape-free string literal is the only spelling this resolves. A raw
+# literal or one carrying a `\` escape falls through to the refusal below rather
+# than being decoded wrongly.
+_INCLUDE_PATH = re.compile(r"\"([^\"\\]*)\"")
+
+
+def include_closure(root: Path, files: set[Path]) -> set[Path]:
+    """The files `include*!` reads that no crate pathspec covers.
+
+    `include!` / `include_str!` / `include_bytes!` resolve their argument
+    against the directory of the file holding the macro, so an argument that
+    climbs out of the crate is still a compiler input while sitting outside
+    every pathspec the enumeration builds. `majit-metainterp`'s `REAL_RULES`
+    is the live instance: it includes PyPy's `real.rules` out of the vendored
+    `rpython/` tree, and editing that file changes what the crate compiles
+    without moving a digest that never hashed it.
+
+    Only a plain string literal is resolvable from the text, so an argument in
+    any other spelling stops extraction instead of being skipped: a skip is
+    indistinguishable from a fresh artefact, which is the failure this walk
+    exists to remove. The two spellings in the tree today are allowed by shape
+    and each is checked below; a third has to be audited the same way before it
+    can pass.
+
+    An argument matched inside a comment or a string names either nothing or a
+    file the crate does not read; both only widen the digest, which costs a
+    re-extraction and never a wrong offset.
+
+    `#[path]` is the other way a crate compiles a file outside its own tree and
+    is deliberately not walked: of the four in the workspace, the only pair
+    whose `mod` file any crate enumerates redirects into `pyre-jit-trace/src/`,
+    which that same crate's closure already covers. Walk it when a redirection
+    appears that a pathspec does not reach.
+
+    A refusal raised here reaches whoever runs extraction and whoever runs
+    `--fingerprint` from CI, but not `pyre-jit-trace`'s build script: that one
+    collapses every non-answer from this driver to silence on purpose
+    (`pyre/pyre-jit-trace/build.rs` `llbc_fingerprint_output`).
+    """
+    extra: set[Path] = set()
+    pending = [path for path in files if path.suffix == ".rs"]
+    queued = set(pending)
+    while pending:
+        rel_source = pending.pop()
+        source = root / rel_source
+        if not source.is_file():
+            continue
+        text = source.read_text(encoding="utf-8", errors="replace")
+        for call in _INCLUDE_CALL.finditer(text):
+            line = text.count("\n", 0, call.start()) + 1
+            where = f"{rel_source.as_posix()}:{line}"
+            literal = _INCLUDE_PATH.match(text, call.end())
+            if literal is None:
+                _reject_unresolvable_include(where, text[call.end() : call.end() + 80])
+                continue
+            target = (source.parent / literal.group(1)).resolve()
+            if not target.is_file():
+                continue
+            try:
+                rel = target.relative_to(root)
+            except ValueError:
+                raise SystemExit(
+                    f"extract-llbc.py: {where} includes {target}, which is "
+                    "outside the repository. The digest is keyed by "
+                    "repo-relative paths, so that file cannot be hashed and "
+                    "the artefact would read as fresh across edits to it."
+                ) from None
+            if rel in files or rel in extra:
+                continue
+            extra.add(rel)
+            if rel.suffix == ".rs" and rel not in queued:
+                queued.add(rel)
+                pending.append(rel)
+    return extra
+
+
+def _reject_unresolvable_include(where: str, tail: str) -> None:
+    """Let through the spellings whose inputs are covered; refuse the rest."""
+    # `include!()` with no argument only occurs in prose about the macro.
+    if tail.startswith(")"):
+        return
+    # `concat!(env!("OUT_DIR"), ...)` names a file the build script generates
+    # into the cargo out dir, from sources this enumeration already carries.
+    if tail.startswith("concat!") and 'env!("OUT_DIR")' in tail:
+        return
+    # A `macro_rules!` parameter, resolved at each call site. The one instance
+    # is the `appleveldefs:` arm of `pyre_module_init!`, whose call sites pass
+    # sibling `app_*.py` names that the crate's own `src/` pathspec enumerates.
+    if tail.startswith("$"):
+        return
+    raise SystemExit(
+        f"extract-llbc.py: {where} includes `{tail.splitlines()[0].strip()}`, "
+        "which this fingerprint cannot resolve to a path. Whatever it names "
+        "would be a compiler input the digest never hashes, so the artefact "
+        "would read as fresh across edits to it. Either give it a plain "
+        "string literal or add its shape to _reject_unresolvable_include with "
+        "the reason its inputs are already enumerated."
+    )
+
+
 def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
     root = eng.root
     target_names: list[str] = []
@@ -346,8 +448,28 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
                         if "custom-build" not in kinds:
                             pathspecs.append(str(Path(rel_src).parent) + "/")
 
+    # git is the enumerator, but the index is not the input set: Charon and
+    # rustc read the working tree, so a source file that is on disk and not yet
+    # added belongs in the digest. `--cached` alone leaves it out, and a crate
+    # extracted while one of its files was untracked then fingerprints as fresh
+    # against sources the artefact was never built from — staging that same
+    # file later flips the identical bytes to STALE.
+    #
+    # `--exclude-standard` is what keeps the generated trees out. Everything it
+    # drops under these pathspecs today is produced by a build —
+    # `majit/charon-corpus/{target/,Cargo.lock}` and `pyre/check.snap/` — and
+    # nothing a crate compiles.
     result = subprocess.run(
-        ["git", "ls-files", "-z", "--", *pathspecs],
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            *pathspecs,
+        ],
         cwd=root,
         check=True,
         stdout=subprocess.PIPE,
@@ -357,6 +479,7 @@ def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> l
         for raw in result.stdout.split(b"\0")
         if raw
     }
+    files |= include_closure(root, files)
     return sorted(files, key=lambda path: path.as_posix())
 
 
@@ -369,9 +492,10 @@ def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> s
         if full_path.is_file():
             digest.update(full_path.read_bytes())
         else:
-            # `git ls-files` includes tracked paths deleted in the working
-            # tree. A deletion is part of the source state and must change the
-            # fingerprint instead of making extraction unusable until commit.
+            # The `--cached` half of the enumeration includes tracked paths
+            # deleted in the working tree. A deletion is part of the source
+            # state and must change the fingerprint instead of making
+            # extraction unusable until commit.
             digest.update(b"<deleted>")
         digest.update(b"\0")
     return digest.hexdigest()
