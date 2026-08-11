@@ -1487,10 +1487,14 @@ where
     /// One call can emit TWO: a vable array access whose symbolic frame box
     /// differs from the standard box but shares its pointer promotes the
     /// `isstandard` PTR_EQ and then the index, so every guard the call added is
-    /// stamped, not just the last.  Both take the same snapshot content, which
-    /// is what the two upstream `capture_resumedata` calls would produce here:
-    /// what runs between them is `replace_box`, and pyre's does not carry the
-    /// framestack walk (`TraceCtx::replace_box`).
+    /// stamped, not just the last. In pyre the two snapshots currently come
+    /// out identical because `TraceCtx::replace_box` updates the side tables
+    /// but not the live `MIFrame`s; this is a pre-existing gap, not parity:
+    /// upstream `MetaInterp.replace_box` walks the framestack via
+    /// `frame.replace_active_box_in_frame`, so its second capture sees the
+    /// standard box where the first saw the old one. The loop runs in emission
+    /// order because each capture leaves the root frame's in-flight result slot
+    /// cleared.
     ///
     /// `write` is the shadow slot a `vable_set*` overwrote. Upstream reaches
     /// `virtualizable_boxes[index] = valuebox` only after both promotes have
@@ -1524,7 +1528,7 @@ where
             ctx.swap_virtualizable_entry(w.index, w.prev_box, w.prev_value)
                 .map(|current| (w.index, current))
         });
-        for from_end in 0..minted {
+        for from_end in (0..minted).rev() {
             self.publish_last_guard_resume_snapshot(
                 ctx,
                 sym,

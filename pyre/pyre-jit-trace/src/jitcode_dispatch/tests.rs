@@ -1,7 +1,7 @@
 use super::*;
 use crate::jitcode_runtime::{insns_opname_to_byte, named_jitcode};
 use majit_ir::Type;
-use majit_metainterp::make_fail_descr;
+use majit_metainterp::{VableArrayStore, make_fail_descr};
 
 #[test]
 fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
@@ -570,16 +570,19 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
     let index0 = tc.const_int(0);
     let const_null = tc.const_null();
     let ops_before = tc.num_ops();
-    assert!(tc.vable_setarrayitem_indexed(
-        0,
-        vable,
-        index0,
-        0,
-        fdescr.clone(),
-        adescr.clone(),
-        const_null,
-        null,
-        true,
+    assert!(matches!(
+        tc.vable_setarrayitem_indexed(
+            0,
+            vable,
+            index0,
+            0,
+            fdescr.clone(),
+            adescr.clone(),
+            const_null,
+            null,
+            true,
+        ),
+        VableArrayStore::Stored(_)
     ));
     assert!(tc.virtualizable_slot_stored_live_null(flat_base));
     assert!(
@@ -598,37 +601,44 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
         "the side-table marker records no op"
     );
 
-    assert!(tc.vable_setarrayitem_indexed(
-        0,
-        vable,
-        index0,
-        0,
-        fdescr.clone(),
-        adescr.clone(),
-        const_null,
-        null,
-        false,
+    assert!(matches!(
+        tc.vable_setarrayitem_indexed(
+            0,
+            vable,
+            index0,
+            0,
+            fdescr.clone(),
+            adescr.clone(),
+            const_null,
+            null,
+            false,
+        ),
+        VableArrayStore::Stored(_)
     ));
     assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
 
     let index1 = tc.const_int(1);
     let non_null = tc.const_ref(2);
-    assert!(tc.vable_setarrayitem_indexed(
-        0,
-        vable,
-        index1,
-        1,
-        fdescr.clone(),
-        adescr.clone(),
-        non_null,
-        Value::Ref(majit_ir::GcRef(2)),
-        true,
+    assert!(matches!(
+        tc.vable_setarrayitem_indexed(
+            0,
+            vable,
+            index1,
+            1,
+            fdescr.clone(),
+            adescr.clone(),
+            non_null,
+            Value::Ref(majit_ir::GcRef(2)),
+            true,
+        ),
+        VableArrayStore::Stored(_)
     ));
     assert!(!tc.virtualizable_slot_stored_live_null(flat_base + 1));
 
-    assert!(
-        tc.vable_setarrayitem_indexed(0, vable, index0, 0, fdescr, adescr, const_null, null, true,)
-    );
+    assert!(matches!(
+        tc.vable_setarrayitem_indexed(0, vable, index0, 0, fdescr, adescr, const_null, null, true,),
+        VableArrayStore::Stored(_)
+    ));
     assert!(tc.virtualizable_slot_stored_live_null(flat_base));
     tc.set_virtualizable_entry_at(flat_base, const_null, null);
     assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
