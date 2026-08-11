@@ -6,7 +6,12 @@ import sys
 import tempfile
 
 
-source = '# -*- coding: cp437 -*-\nvalue = "┬ó"\nprint(value)\n'
+source = (
+    '# -*- coding: cp437 -*-\n'
+    'value = "┬ó"\n'
+    'assert tuple(map(ord, value)) == (0x252c, 0xf3)\n'
+    'print("OK")\n'
+)
 path = None
 try:
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as script:
@@ -19,7 +24,7 @@ try:
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.decode().strip() == "┬ó", result.stdout
+    assert result.stdout.strip() == b"OK", result.stdout
     assert b"panicked at" not in result.stderr, result.stderr
 finally:
     if path is not None:
