@@ -1,0 +1,13 @@
+[package]
+name = "pyre-compiler-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustpython-compiler-core-upstream = { package = "rustpython-compiler-core", git = "https://github.com/RustPython/RustPython.git", rev = "1613741f861b4f289da59ffc78a20ead4b4444fc" }
+itertools = "0.15"
+malachite-bigint.workspace = true
+num-complex.workspace = true
+rustpython-wtf8.workspace = true

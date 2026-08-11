@@ -138,6 +138,43 @@ pub unsafe fn w_tuple_object_items_ptr_len(
     Some((base as *const PyObjectRef, cap))
 }
 
+/// CPython 3.14 `r_object()` tuple construction: fill one slot of an
+/// array-backed tuple that was allocated with null elements and published in
+/// the marshal reference table before its children were read.
+///
+/// This is deliberately not a general tuple mutator.  The caller must use it
+/// only during initial construction, before the tuple escapes to Python code
+/// or has its hash observed.  Run the old-to-young barrier before the store,
+/// matching `w_tuple_new_array_backed_impl`, and root both operands across the
+/// barrier's possible collection.
+///
+/// # Safety
+/// `obj` must be a general array-backed tuple and `index` must name an
+/// uninitialised slot.
+pub unsafe fn w_tuple_setitem_initializing(
+    obj: PyObjectRef,
+    index: usize,
+    value: PyObjectRef,
+) -> bool {
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    roots.pin_root(obj);
+    roots.pin_root(value);
+    crate::gc_hook::try_gc_write_barrier_managed(roots.get(base) as *mut u8);
+    let obj = roots.get(base);
+    let value = roots.get(base + 1);
+    let Some((items, len)) = w_tuple_object_items_ptr_len(obj) else {
+        return false;
+    };
+    if index >= len {
+        return false;
+    }
+    let slot = (items as *mut PyObjectRef).add(index);
+    debug_assert!((*slot).is_null());
+    *slot = value;
+    true
+}
+
 /// Walk, in place, every element `PyObjectRef` slot of any tuple — general
 /// `W_TupleObject` or a specialised arity-2 variant — for GC root forwarding.
 /// `is_tuple` reports all four layouts as `tuple`, but only the general variant

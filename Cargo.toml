@@ -39,6 +39,7 @@ members = [
     # pyre
     "pyre/pyre-object",
     "pyre/pyre-macros",
+    "pyre/pyre-compiler-core",
     "pyre/pyre-native",
     "pyre/pyre-interpreter",
     "pyre/pyre-sandbox",

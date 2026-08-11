@@ -431,7 +431,27 @@ impl wire::Read for FileReader {
 }
 
 #[derive(Clone, Copy)]
-struct PyreMarshalBag;
+struct PyreMarshalBag {
+    pending_error: *mut Option<PyError>,
+}
+
+impl PyreMarshalBag {
+    fn new(pending_error: &mut Option<PyError>) -> Self {
+        Self { pending_error }
+    }
+
+    fn remember_python_error(&self, error: PyError) -> wire::MarshalError {
+        // The pointer names the stack-owned slot of the synchronous loads/load
+        // call.  `MarshalBag: Copy` copies only this borrow; no state escapes
+        // the deserialize call and no TLS side channel is involved.
+        unsafe {
+            if (*self.pending_error).is_none() {
+                *self.pending_error = Some(error);
+            }
+        }
+        wire::MarshalError::BadType
+    }
+}
 
 impl wire::MarshalBag for PyreMarshalBag {
     type Value = Rooted;
@@ -479,6 +499,24 @@ impl wire::MarshalBag for PyreMarshalBag {
         Rooted::new(w_tuple_new(elements.map(Rooted::get).collect()))
     }
 
+    fn make_tuple_placeholder(&self, len: usize) -> Option<Rooted> {
+        Some(Rooted::new(tupleobject::w_tuple_new_array_backed(vec![
+            PY_NULL;
+            len
+        ])))
+    }
+
+    fn set_tuple_item(
+        &self,
+        tuple: &Rooted,
+        index: usize,
+        value: Rooted,
+    ) -> Result<(), wire::MarshalError> {
+        unsafe { tupleobject::w_tuple_setitem_initializing(tuple.get(), index, value.get()) }
+            .then_some(())
+            .ok_or(wire::MarshalError::BadType)
+    }
+
     fn make_code(&self, code: CodeObject<ConstantData>) -> Rooted {
         Rooted::new(crate::pycode::box_code_constant(&code))
     }
@@ -496,6 +534,24 @@ impl wire::MarshalBag for PyreMarshalBag {
         Ok(Rooted::new(w_list_new(elements.map(Rooted::get).collect())))
     }
 
+    fn make_list_placeholder(&self, len: usize) -> Option<Rooted> {
+        Some(Rooted::new(listobject::w_list_new_object(vec![
+            PY_NULL;
+            len
+        ])))
+    }
+
+    fn set_list_item(
+        &self,
+        list: &Rooted,
+        index: usize,
+        value: Rooted,
+    ) -> Result<(), wire::MarshalError> {
+        unsafe { listobject::w_list_setitem(list.get(), index as i64, value.get()) }
+            .then_some(())
+            .ok_or(wire::MarshalError::BadType)
+    }
+
     fn make_set(
         &self,
         elements: impl Iterator<Item = Rooted>,
@@ -503,11 +559,26 @@ impl wire::MarshalBag for PyreMarshalBag {
         let set = Rooted::new(setobject::w_set_new());
         for item in elements {
             let hash = crate::baseobjspace::hash_w_strict(item.get())
-                .map_err(|_| wire::MarshalError::BadType)?;
-            unsafe { setobject::w_set_add_hashed_checked(set.get(), item.get(), hash) }
-                .map_err(|_| wire::MarshalError::BadType)?;
+                .map_err(|error| self.remember_python_error(error))?;
+            unsafe { setobject::w_set_add_hashed_checked(set.get(), item.get(), hash) }.map_err(
+                |error| {
+                    self.remember_python_error(crate::baseobjspace::map_set_update_error(error))
+                },
+            )?;
         }
         Ok(set)
+    }
+
+    fn make_set_placeholder(&self) -> Option<Rooted> {
+        Some(Rooted::new(setobject::w_set_new()))
+    }
+
+    fn insert_set_item(&self, set: &Rooted, item: Rooted) -> Result<(), wire::MarshalError> {
+        let hash = crate::baseobjspace::hash_w_strict(item.get())
+            .map_err(|error| self.remember_python_error(error))?;
+        unsafe { setobject::w_set_add_hashed_checked(set.get(), item.get(), hash) }.map_err(
+            |error| self.remember_python_error(crate::baseobjspace::map_set_update_error(error)),
+        )
     }
 
     fn make_frozenset(
@@ -517,9 +588,12 @@ impl wire::MarshalBag for PyreMarshalBag {
         let set = Rooted::new(setobject::w_frozenset_new());
         for item in elements {
             let hash = crate::baseobjspace::hash_w_strict(item.get())
-                .map_err(|_| wire::MarshalError::BadType)?;
-            unsafe { setobject::w_set_add_hashed_checked(set.get(), item.get(), hash) }
-                .map_err(|_| wire::MarshalError::BadType)?;
+                .map_err(|error| self.remember_python_error(error))?;
+            unsafe { setobject::w_set_add_hashed_checked(set.get(), item.get(), hash) }.map_err(
+                |error| {
+                    self.remember_python_error(crate::baseobjspace::map_set_update_error(error))
+                },
+            )?;
         }
         Ok(set)
     }
@@ -530,10 +604,28 @@ impl wire::MarshalBag for PyreMarshalBag {
     ) -> Result<Rooted, wire::MarshalError> {
         let dict = Rooted::new(w_dict_new());
         for (key, value) in elements {
-            unsafe { w_dict_store_checked(dict.get(), key.get(), value.get()) }
-                .map_err(|_| wire::MarshalError::BadType)?;
+            unsafe { w_dict_store_checked(dict.get(), key.get(), value.get()) }.map_err(|_| {
+                self.remember_python_error(crate::baseobjspace::take_pending_dict_key_error(
+                    key.get(),
+                ))
+            })?;
         }
         Ok(dict)
+    }
+
+    fn make_dict_placeholder(&self) -> Option<Rooted> {
+        Some(Rooted::new(w_dict_new()))
+    }
+
+    fn insert_dict_item(
+        &self,
+        dict: &Rooted,
+        key: Rooted,
+        value: Rooted,
+    ) -> Result<(), wire::MarshalError> {
+        unsafe { w_dict_store_checked(dict.get(), key.get(), value.get()) }.map_err(|_| {
+            self.remember_python_error(crate::baseobjspace::take_pending_dict_key_error(key.get()))
+        })
     }
 
     fn make_slice(
@@ -601,7 +693,12 @@ fn marshal_to_bytes(
 fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let mut reader: &[u8] = data;
-    let result = wire::deserialize_value(&mut reader, PyreMarshalBag).map_err(marshal_error)?;
+    let mut pending_error = None;
+    let result = match wire::deserialize_value(&mut reader, PyreMarshalBag::new(&mut pending_error))
+    {
+        Ok(result) => result,
+        Err(error) => return Err(pending_error.unwrap_or_else(|| marshal_error(error))),
+    };
     let result = result.get();
     if !allow_code {
         reject_code(result)?;
@@ -738,7 +835,8 @@ crate::py_module! {
             let allow_code = resolve_allow_code(allow_code)?;
             let _roots = pyre_object::gc_roots::push_roots();
             let mut reader = FileReader::new(file);
-            let result = match wire::deserialize_value(&mut reader, PyreMarshalBag) {
+            let bag = PyreMarshalBag::new(&mut reader.pending_error);
+            let result = match wire::deserialize_value(&mut reader, bag) {
                 Ok(result) => result,
                 Err(error) => {
                     if let Some(error) = reader.pending_error.take() {

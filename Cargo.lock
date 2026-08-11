@@ -2680,6 +2680,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyre-compiler-core"
+version = "0.0.2"
+dependencies = [
+ "itertools 0.15.0",
+ "malachite-bigint",
+ "num-complex",
+ "rustpython-compiler-core",
+ "rustpython-wtf8",
+]
+
+[[package]]
 name = "pyre-interpreter"
 version = "0.0.2"
 dependencies = [
@@ -2703,13 +2714,13 @@ dependencies = [
  "parking_lot",
  "paste",
  "pymath",
+ "pyre-compiler-core",
  "pyre-macros",
  "pyre-native",
  "pyre-object",
  "pyre-sandbox",
  "rustpython-common",
  "rustpython-compiler",
- "rustpython-compiler-core",
  "rustpython-host_env",
  "rustpython-literal",
  "rustpython-ruff_text_size",

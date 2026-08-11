@@ -62,7 +62,7 @@ majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
 stacker = { workspace = true }
 rustpython-compiler = { workspace = true }
-rustpython-compiler-core = { workspace = true }
+rustpython-compiler-core = { package = "pyre-compiler-core", path = "../pyre-compiler-core" }
 ruff-text-size = { workspace = true }
 num-complex = { workspace = true }
 malachite-bigint = { workspace = true }
