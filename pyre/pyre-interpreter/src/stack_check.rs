@@ -55,14 +55,29 @@ pub use crate::module::sys::state::{DEFAULT_RECURSION_LIMIT, MAX_RECURSION_LIMIT
 ///
 /// stack.h picks the constant per architecture for exactly one reason:
 /// 768 KB "is only enough for 406 levels on ppc64", so platforms whose
-/// frames are bigger get the larger budget instead. Rust interpreter
-/// frames are bigger than RPython's translated-C frames in the same way
-/// — 768 KB bottoms out around 476 Python call levels here — so pyre
-/// applies the same rule and takes `11 << 18` on the platforms that
-/// have room for it. That keeps the byte budget above the recursion
-/// limit's own cutoff, so `sys.setrecursionlimit(N)` is what bounds
-/// Python call depth and the byte budget stays the hard-stack guard it
-/// is upstream.
+/// frames are bigger get the larger budget instead. pyre applies the
+/// same rule to its own frames. The budget is scaled by `recursionlimit
+/// / 1000` ([`pyre_stack_set_length_fraction`]), so this constant is
+/// exactly "bytes for 1000 Python call levels" and has to cover the
+/// most expensive level pyre can produce.
+///
+/// A level the interpreter runs costs ~1.7 KB of native stack
+/// (`funccall_valuestack` → `OpcodeStepExecutor::call` → `eval_loop_jit`
+/// → `eval_with_jit`). A level that enters compiled code and leaves it
+/// through a guard failure costs ~6.3 KB, because the resume chain
+/// nests on the native stack once per level:
+/// `call_assembler_helper_trampoline` → `jit_blackhole_resume_from_guard`
+/// → `blackhole_resume_via_rd_numb` → `BlackholeInterpreter::run` →
+/// `handler_residual_call_r_r` → `bh_call_fn`. `48 << 18` is twice what
+/// 1000 such levels need, which keeps the byte budget above the
+/// recursion limit's own cutoff: `sys.setrecursionlimit(N)` is what
+/// bounds Python call depth and the byte budget stays the hard-stack
+/// guard it is upstream.
+///
+/// Sized against the interpreter alone (`11 << 18`), the guard fired at
+/// 458 levels as soon as a recursive function went hot — under half the
+/// default limit of 1000, and reached by nothing more than calling the
+/// same recursive function five times.
 ///
 /// `wasm32` keeps `3 << 18`: its linear-memory stack is sized at link
 /// time (1 MB by default) with no guard page and no `getrlimit` for
@@ -71,14 +86,33 @@ pub use crate::module::sys::state::{DEFAULT_RECURSION_LIMIT, MAX_RECURSION_LIMIT
 #[cfg(target_arch = "wasm32")]
 pub const MAX_STACK_SIZE: usize = 3 << 18;
 #[cfg(not(target_arch = "wasm32"))]
-pub const MAX_STACK_SIZE: usize = 11 << 18;
+pub const MAX_STACK_SIZE: usize = 48 << 18;
 
-/// Default native stack for Python-created threads.  Rust's platform default
-/// can be as small as 2 MiB, which cannot hold pyre's translated Rust frame
-/// shape even for stdlib recursion such as `functools.lru_cache`'s `fib(100)`.
-/// `_thread.stack_size()` still reports/configures the Python-visible value;
-/// zero selects this implementation default.
-pub const DEFAULT_RUNTIME_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// Native stack every thread that runs Python code is budgeted against.
+///
+/// Rust's platform default can be as small as 2 MiB, which cannot hold pyre's
+/// translated Rust frame shape even for stdlib recursion such as
+/// `functools.lru_cache`'s `fib(100)`.  `_thread.stack_size()` still
+/// reports/configures the Python-visible value; zero selects this
+/// implementation default.
+///
+/// [`effective_stack_length`] leaves a quarter of the stack to the Rust/C
+/// frames between the probe and the guard page, so 64 MiB buys a 48 MiB
+/// ceiling — four times [`MAX_STACK_SIZE`], i.e. `sys.setrecursionlimit` is
+/// honoured up to about 4000 before the clamp starts deciding instead.  At
+/// 8 MiB the clamp cut a thread's budget below what the *default* limit is
+/// worth, so the guard, not the limit, decided how deep a thread could
+/// recurse.
+///
+/// The interpreter thread announces this too, though its own stack is much
+/// larger (`pyrex::INTERPRETER_THREAD_STACK_SIZE`).  `stack_length` is
+/// process-global — the JIT's inline probe reads its address as an immediate
+/// (`pyre_stack_get_length_adr`) — so whatever a thread stores there is what
+/// every other thread's fast path reads until one of them takes the slow
+/// path.  A single figure for all Python-running threads keeps that shared
+/// word meaningful; upstream gets the same uniformity for free because
+/// `_ll_stack_os_limit` reads `getrlimit`, which is process-wide.
+pub const DEFAULT_RUNTIME_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Process-wide requested byte budget, corresponding to RPython's
 /// `MAX_STACK_SIZE * recursionlimit / 1000`.  This is semantic configuration
@@ -808,12 +842,25 @@ mod tests {
         }
     }
 
+    /// The requested byte budget, before [`effective_stack_length`]'s clamp.
+    ///
+    /// Budget assertions read this rather than `pyre_stack_get_length()`: the
+    /// clamp is three quarters of whatever stack the running thread has, so on
+    /// a host whose `RLIMIT_STACK` is smaller than the budget under test the
+    /// stored length says nothing about what was requested. What the recursion
+    /// limit controls is the request.
+    fn requested_budget() -> usize {
+        REQUESTED_STACK_LENGTH.load(Ordering::Relaxed)
+    }
+
     #[test]
     fn default_recursion_limit_matches_python() {
         let _g = lock_tests();
         reset_all();
         assert_eq!(get_recursion_limit(), DEFAULT_RECURSION_LIMIT);
-        assert_eq!(pyre_stack_get_length(), MAX_STACK_SIZE);
+        assert_eq!(requested_budget(), MAX_STACK_SIZE);
+        assert_eq!(pyre_stack_get_length(), effective_stack_length());
+        reset_all();
     }
 
     #[test]
@@ -824,12 +871,12 @@ mod tests {
         // underneath the currently-running interpreter stack.
         set_recursion_limit(500).expect("500 is positive");
         assert_eq!(get_recursion_limit(), 500);
-        assert_eq!(pyre_stack_get_length(), MAX_STACK_SIZE);
+        assert_eq!(requested_budget(), MAX_STACK_SIZE);
 
         // Raising the limit grows both the logical limit and native budget.
         set_recursion_limit(2000).expect("2000 is positive");
         assert_eq!(get_recursion_limit(), 2000);
-        assert!(pyre_stack_get_length() > MAX_STACK_SIZE);
+        assert_eq!(requested_budget(), 2 * MAX_STACK_SIZE);
 
         reset_all();
     }
@@ -869,6 +916,30 @@ mod tests {
             "one quarter of the configured native stack must remain reserved"
         );
         reset_all();
+    }
+
+    #[test]
+    fn configured_thread_stack_replaces_the_rlimit_fallback() {
+        let _g = lock_tests();
+        reset_all();
+        // The clamp describes the stack the *running* thread was given.
+        // `getrlimit(RLIMIT_STACK)` is only the fallback for a thread that
+        // never announced one, and it reports the process's original thread —
+        // typically 8 MiB, less than the budget a thread pyre spawns with a
+        // large explicit stack is entitled to. Announcing the real size must
+        // therefore be able to raise the clamp, not just lower it.
+        //
+        // Both stores are process-global, so keep the window to the two calls
+        // and restore at once (see small_recursion_limit_triggers_overflow_sooner).
+        configure_current_thread_stack_size(8 * MAX_STACK_SIZE);
+        pyre_stack_set_length_fraction(4.0);
+        let length = pyre_stack_get_length();
+        reset_all();
+        assert_eq!(
+            length,
+            4 * MAX_STACK_SIZE,
+            "an announced stack far above RLIMIT_STACK must carry the full request"
+        );
     }
 
     #[test]
@@ -1133,11 +1204,16 @@ mod tests {
         // Store via FFI, read via raw pointer — confirms the atomic
         // storage is bit-compatible with a plain usize load.
         pyre_stack_set_length_fraction(0.5);
+        // What the fraction scales is the request; what lands in the word is
+        // that request after the OS clamp, which depends on this host's
+        // RLIMIT_STACK. Assert the two separately so neither reading needs a
+        // host with a stack larger than the budget under test.
+        assert_eq!(requested_budget(), MAX_STACK_SIZE / 2);
         let length_adr = pyre_stack_get_length_adr();
         let loaded = unsafe { *(length_adr as *const usize) };
         assert_eq!(
             loaded,
-            (MAX_STACK_SIZE as f64 * 0.5) as usize,
+            effective_stack_length(),
             "raw load through adr must observe the FFI store"
         );
         reset_all();

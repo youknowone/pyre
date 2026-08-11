@@ -382,6 +382,14 @@ fn read_stdin_source() -> std::io::Result<String> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stdin not utf-8"))
 }
 
+/// Native stack for the interpreter thread spawned by [`main_entry`].
+///
+/// Well above the byte budget `sys.setrecursionlimit` can buy
+/// (`stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE`): `stack_check` gates
+/// Python call levels, and the native recursion it does not gate — nested
+/// container `repr`, the parser, GC tracing — draws on the rest.
+const INTERPRETER_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
+
 pub fn main_entry(binary_name: &'static str) {
     configure_root_only_jit_stats();
     // The sandboxed child runs single-threaded like pypy-c-sandbox: it neither
@@ -409,8 +417,23 @@ pub fn main_entry(binary_name: &'static str) {
     {
         pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
         std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
+            .stack_size(INTERPRETER_THREAD_STACK_SIZE)
             .spawn(|| {
+                // Same first statement `_thread`'s worker runs
+                // (`module/thread/mod.rs`): announce the stack this thread is
+                // budgeted against, and capture the base here at the outermost
+                // interpreter entry. Left out, `effective_stack_length` falls
+                // back to `getrlimit(RLIMIT_STACK)`, which describes the
+                // process's original thread and not this one, and the byte
+                // guard — not the recursion limit — ends up deciding how deep
+                // Python can recurse.
+                //
+                // The announced figure is the shared one, not
+                // INTERPRETER_THREAD_STACK_SIZE: the budget it sizes is stored
+                // in a process-global word every thread's inline probe reads.
+                pyre_interpreter::stack_check::configure_current_thread_stack_size(
+                    pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE,
+                );
                 real_main(binary_name);
                 post_run_diagnostics();
             })
