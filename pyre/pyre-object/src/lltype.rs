@@ -359,8 +359,8 @@ pub fn malloc_typed_stable<T: GcType>(value: T) -> *mut T {
             // nursery would be dropped.  Run the barrier once so the object
             // joins the remembered set and the first minor GC forwards its
             // young children, mirroring the hand-written barrier every other
-            // stable allocator runs after its raw write (`w_list_new`,
-            // `w_generator_new`, `tupleobject`).
+            // stable allocator runs after its raw write (`w_generator_new`,
+            // `tupleobject`).
             crate::gc_hook::try_gc_write_barrier_managed(raw);
             raw as *mut T
         }

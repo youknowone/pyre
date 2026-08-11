@@ -325,11 +325,10 @@ assert result == 126, result
 }
 
 /// Storing a *young* (nursery) value into an object-strategy `W_ListObject`
-/// keeps it alive across a minor GC. The list body is old-gen
-/// (`try_gc_alloc_stable`); its elements live in an off-GC `ItemsBlock` reached
-/// only via `list_object_custom_trace`. A minor collection forwards an old-gen
-/// container's young refs ONLY when the container sits in the remembered set,
-/// populated exclusively by the write barrier (`try_gc_write_barrier`).
+/// keeps it alive across a minor GC. Once the list body has survived and moved
+/// to old-gen, a minor collection forwards its later young refs ONLY when the
+/// container sits in the remembered set, populated by the write barrier
+/// (`try_gc_write_barrier`).
 /// Regression for the missing list write barriers in `w_list_append` /
 /// `w_list_setitem` / `w_list_insert` / `w_list_setslice` and
 /// `w_list_new_with_strategy` creation. Proven non-vacuous: without the
@@ -338,8 +337,8 @@ assert result == 126, result
 ///
 /// Each `{}` is a nursery `W_DICT` reachable only through its list. The four
 /// list mutators that store a ref — append, literal creation, setitem, insert —
-/// must each barrier the old-gen list so the next minor GC forwards the young
-/// dict. The checksum is recoverable only if every stored dict survived the 200
+/// must each barrier a promoted list so the next minor GC forwards the young
+/// dict. The checksum is recoverable only if every stored dict survives the 200
 /// collections.
 #[test]
 fn young_dict_list_elements_survive_minor_collection() {

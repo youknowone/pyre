@@ -59,7 +59,11 @@ type ListGuard = parking_lot::lock_api::ReentrantMutexGuard<
 /// operation instead of specializing the strategy dispatch.
 #[majit_macros::dont_look_inside]
 unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
-    let lock = LIST_LOCKS[(obj as usize >> 4) & (LIST_LOCKS.len() - 1)].get();
+    // A nursery list can move while its guard is held.  Stripe on its stable
+    // class identity, not the movable instance address, so every operation on
+    // one list continues to acquire the same lock after collection.
+    let w_class = (*obj).w_class;
+    let lock = LIST_LOCKS[(w_class as usize >> 4) & (LIST_LOCKS.len() - 1)].get();
     if let Some(guard) = lock.try_lock() {
         return guard;
     }
@@ -210,30 +214,40 @@ impl W_ListObject {
     /// Grow `items` to accommodate at least `min_cap` slots. Upstream
     /// `_ll_list_resize_really` (rlist.py:262-267) — allocate fresh,
     /// copy, swap, free.
-    unsafe fn object_grow(&mut self, min_cap: usize) {
-        let current_cap = self.object_items_capacity();
+    unsafe fn object_grow(obj: PyObjectRef, min_cap: usize) -> PyObjectRef {
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(obj);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &mut *(obj as *mut W_ListObject);
+        let current_cap = list.object_items_capacity();
         let target_cap = min_cap.max(current_cap.saturating_mul(2).max(4));
         // The GC rewrite emits COND_CALL_GC_WB before SETFIELD_GC. Keep that
         // ordering on the host path too: under free-threading a post-store
         // barrier can park behind a collector after publishing the new
         // pointer but before remembering this old object.
-        list_write_barrier(self as *mut W_ListObject as PyObjectRef);
+        list_write_barrier(obj);
         // Phase L2: a GC-managed grow allocates the new block in the moving
         // nursery and may collect; `grow_list_items_block_gc` roots the old
         // block's live items across that allocation. Callers that hold an
         // incoming `value` across this call root it themselves before grow.
-        let _roots = crate::gc_roots::push_roots();
         let new_items_slot = crate::gc_roots::shadow_stack_len();
-        let new_items = grow_list_items_block_gc(self.items, target_cap, self.length);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &mut *(obj as *mut W_ListObject);
+        let new_items = grow_list_items_block_gc(list.items, target_cap, list.length);
         crate::gc_roots::pin_root(new_items as PyObjectRef);
         // framework.py's GC transform places the owner write barrier directly
         // before SETFIELD_GC. Keep the old block installed while the barrier
         // runs, then swap without another safepoint: a post-store barrier may
         // park behind a foreign collection that would miss the fresh edge.
-        list_write_barrier(self as *mut W_ListObject as PyObjectRef);
-        let old_items = self.items;
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        list_write_barrier(obj);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &mut *(obj as *mut W_ListObject);
+        let old_items = list.items;
+        list.items = crate::gc_roots::shadow_stack_get(new_items_slot) as *mut ItemsBlock;
         dealloc_list_items_block(old_items);
-        self.items = crate::gc_roots::shadow_stack_get(new_items_slot) as *mut ItemsBlock;
+        crate::gc_roots::shadow_stack_get(obj_slot)
     }
 
     /// Upstream list.append equivalent for the object strategy.
@@ -248,38 +262,56 @@ impl W_ListObject {
     /// # Safety
     /// `self` must be an Object-strategy list.
     pub unsafe fn object_push(&mut self, value: PyObjectRef) {
+        let _roots = crate::gc_roots::push_roots();
+        let root_base = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::publish_roots(&[self as *mut W_ListObject as PyObjectRef, value]);
+        crate::gc_roots::normalize_roots(root_base, 2);
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
         // At capacity, route the grow through the `dont_look_inside`
         // boundary: it roots `value` across the (collecting) resize and
         // returns it relocated. The in-place store below stays outside the
         // boundary so the spare-capacity fold still lowers it. No-op grow
         // under the std::alloc fallback.
-        let value = if self.length == self.object_items_capacity() {
-            w_list_grow_items_block(self as *mut W_ListObject as PyObjectRef, value)
+        let value = if list.length == list.object_items_capacity() {
+            w_list_grow_items_block(obj, crate::gc_roots::shadow_stack_get(root_base + 1))
         } else {
-            value
+            crate::gc_roots::shadow_stack_get(root_base + 1)
         };
-        let value = prepare_list_ref_store(self as *mut W_ListObject as PyObjectRef, value);
-        let base = items_block_items_base(self.items);
-        *base.add(self.length) = value;
-        self.length += 1;
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let value = prepare_list_ref_store(obj, value);
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
+        let base = items_block_items_base(list.items);
+        *base.add(list.length) = value;
+        list.length += 1;
     }
 
     unsafe fn object_insert(&mut self, index: usize, value: PyObjectRef) {
-        assert!(index <= self.length);
+        let _roots = crate::gc_roots::push_roots();
+        let root_base = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::publish_roots(&[self as *mut W_ListObject as PyObjectRef, value]);
+        crate::gc_roots::normalize_roots(root_base, 2);
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
+        assert!(index <= list.length);
         // Same grow-then-store shape as `object_push`: at capacity, route the
         // grow through the `dont_look_inside` boundary, which roots `value`
         // across the (collecting) resize and returns it relocated.
-        let value = if self.length == self.object_items_capacity() {
-            w_list_grow_items_block(self as *mut W_ListObject as PyObjectRef, value)
+        let value = if list.length == list.object_items_capacity() {
+            w_list_grow_items_block(obj, crate::gc_roots::shadow_stack_get(root_base + 1))
         } else {
-            value
+            crate::gc_roots::shadow_stack_get(root_base + 1)
         };
-        let value = prepare_list_ref_store(self as *mut W_ListObject as PyObjectRef, value);
-        let base = items_block_items_base(self.items);
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let value = prepare_list_ref_store(obj, value);
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
+        let base = items_block_items_base(list.items);
         let p = base.add(index);
-        std::ptr::copy(p, p.add(1), self.length - index);
+        std::ptr::copy(p, p.add(1), list.length - index);
         *p = value;
-        self.length += 1;
+        list.length += 1;
     }
 
     unsafe fn object_remove(&mut self, index: usize) -> PyObjectRef {
@@ -343,24 +375,37 @@ impl W_ListObject {
         // write them from the relocated slots. No-op under the std::alloc
         // fallback; covers both the grow and no-grow branches uniformly.
         let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::publish_roots(&[self as *mut W_ListObject as PyObjectRef]);
         let save = crate::gc_roots::shadow_stack_len();
-        for &v in new_values {
-            crate::gc_roots::pin_root(v);
-        }
-        list_write_barrier(self as *mut W_ListObject as PyObjectRef);
+        crate::gc_roots::publish_roots(new_values);
+        crate::gc_roots::normalize_roots(obj_slot, new_values.len() + 1);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        list_write_barrier(obj);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &mut *(obj as *mut W_ListObject);
         if len2 > slicelength {
-            if new_len > self.object_items_capacity() {
-                self.object_grow(new_len);
+            if new_len > list.object_items_capacity() {
+                let obj = W_ListObject::object_grow(obj, new_len);
+                let list = &mut *(obj as *mut W_ListObject);
+                let base = items_block_items_base(list.items);
+                std::ptr::copy(
+                    base.add(s + slicelength),
+                    base.add(s + len2),
+                    old_len - s - slicelength,
+                );
+                list.length = new_len;
+            } else {
+                let base = items_block_items_base(list.items);
+                std::ptr::copy(
+                    base.add(s + slicelength),
+                    base.add(s + len2),
+                    old_len - s - slicelength,
+                );
+                list.length = new_len;
             }
-            let base = items_block_items_base(self.items);
-            std::ptr::copy(
-                base.add(s + slicelength),
-                base.add(s + len2),
-                old_len - s - slicelength,
-            );
-            self.length = new_len;
         } else if slicelength > len2 {
-            let base = items_block_items_base(self.items);
+            let base = items_block_items_base(list.items);
             std::ptr::copy(
                 base.add(s + slicelength),
                 base.add(s + len2),
@@ -370,10 +415,12 @@ impl W_ListObject {
             for i in new_len..old_len {
                 *base.add(i) = PY_NULL;
             }
-            self.length = new_len;
+            list.length = new_len;
         }
         if len2 > 0 {
-            let base = items_block_items_base(self.items);
+            let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+            let list = &mut *(obj as *mut W_ListObject);
+            let base = items_block_items_base(list.items);
             for i in 0..len2 {
                 *base.add(s + i) = crate::gc_roots::shadow_stack_get(save + i);
             }
@@ -389,11 +436,11 @@ impl W_ListObject {
     unsafe fn set_object_items_from_vec(&mut self, values: Vec<PyObjectRef>) {
         let _roots = crate::gc_roots::push_roots();
         let root_base = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(self as *mut W_ListObject as PyObjectRef);
-        for &value in &values {
-            crate::gc_roots::pin_root(value);
-        }
-        list_write_barrier(self as *mut W_ListObject as PyObjectRef);
+        crate::gc_roots::publish_roots(&[self as *mut W_ListObject as PyObjectRef]);
+        crate::gc_roots::publish_roots(&values);
+        crate::gc_roots::normalize_roots(root_base, values.len() + 1);
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        list_write_barrier(obj);
         // The pre-store barrier may wait behind a moving collection.  The
         // shadow slots are authoritative afterwards; the input Vec still
         // contains the pre-collection copies.
@@ -408,11 +455,14 @@ impl W_ListObject {
         // through SETFIELD_GC.  Run the owner barrier before publishing the
         // edge: a post-store barrier can itself park behind a foreign
         // collection, which would otherwise miss the new nursery block.
-        list_write_barrier(self as *mut W_ListObject as PyObjectRef);
-        let old_items = self.items;
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        list_write_barrier(obj);
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
+        let old_items = list.items;
+        list.items = crate::gc_roots::shadow_stack_get(new_items_slot) as *mut ItemsBlock;
+        list.length = rooted_values.len();
         dealloc_list_items_block(old_items);
-        self.items = crate::gc_roots::shadow_stack_get(new_items_slot) as *mut ItemsBlock;
-        self.length = rooted_values.len();
     }
 
     /// Drop the object-strategy backing (used when switching to a typed
@@ -454,7 +504,7 @@ pub unsafe fn w_list_grow_items_block(obj: PyObjectRef, value: PyObjectRef) -> P
     crate::gc_roots::pin_root(value);
     let obj = crate::gc_roots::shadow_stack_get(save);
     let list = &mut *(obj as *mut W_ListObject);
-    list.object_grow(list.length + 1);
+    W_ListObject::object_grow(obj, list.length + 1);
     crate::gc_roots::shadow_stack_get(save + 1)
 }
 
@@ -686,22 +736,36 @@ fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
 /// whole cold transition via the registered fnaddr so the hot append/setitem
 /// paths that call it stay traceable.
 #[majit_macros::dont_look_inside]
-pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
+pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef {
     if list.strategy == ListStrategy::Object {
-        return;
+        return list as *mut W_ListObject as PyObjectRef;
     }
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(list as *mut W_ListObject as PyObjectRef);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
     let seed: Vec<PyObjectRef> = match list.strategy {
         ListStrategy::Integer => boxed_from_ints(list.int_items.as_slice()),
         ListStrategy::IntOrFloat => boxed_from_int_or_float(list.int_items.as_slice()),
         ListStrategy::Float => boxed_from_floats(list.float_items.as_slice()),
         ListStrategy::Object | ListStrategy::Empty => Vec::new(),
     };
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
     list.set_object_items_from_vec(seed);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
     // Object strategy reads neither typed array again, so drop both to the
     // empty form instead of installing two fresh single-slot blocks.
     list.int_items.install(IntArray::empty());
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
     list.float_items.install(FloatArray::empty());
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
     list.strategy = ListStrategy::Object;
+    crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
 /// listobject.py:1154-1168 EmptyListStrategy.switch_to_correct_strategy
@@ -709,17 +773,37 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
 /// First append on an empty list picks the typed strategy that matches
 /// the appended item, then installs an empty typed storage. Caller is
 /// expected to perform the actual append immediately afterward.
-unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRef) {
+unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::publish_roots(&[list as *mut W_ListObject as PyObjectRef, w_item]);
+    crate::gc_roots::normalize_roots(root_base, 2);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let w_item = crate::gc_roots::shadow_stack_get(root_base + 1);
+    let list = &mut *(obj as *mut W_ListObject);
     if is_plain_int1(w_item) {
-        list.int_items.install(IntArray::from_vec(Vec::new()));
+        let fresh = IntArray::from_vec(Vec::new());
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
+        list.int_items.install(fresh);
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
         list.strategy = ListStrategy::Integer;
     } else if is_float_strategy_item(w_item) {
-        list.float_items.install(FloatArray::from_vec(Vec::new()));
+        let fresh = FloatArray::from_vec(Vec::new());
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
+        list.float_items.install(fresh);
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
         list.strategy = ListStrategy::Float;
     } else {
         list.set_object_items_from_vec(Vec::new());
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
         list.strategy = ListStrategy::Object;
     }
+    crate::gc_roots::shadow_stack_get(root_base)
 }
 
 /// The strategy `w_list_new` picks for a given item set.
@@ -762,6 +846,10 @@ pub extern "C" fn list_write_barrier(obj: PyObjectRef) {
 }
 
 fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     if managed {
         crate::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
     } else {
@@ -773,6 +861,7 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
     // would be missed. Barrier the block too so its varsize walker re-runs; the
     // collector no-ops the barrier on a still-young block (`TRACK_YOUNG_PTRS`
     // unset). Inert while the block stays std::alloc (`try_gc_owns_object` false).
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = unsafe { &*(obj as *const W_ListObject) };
     if list.strategy == ListStrategy::Object
         && !list.items.is_null()
@@ -781,6 +870,7 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
         // The ownership query is a safepoint.  Reload the field it may have
         // forwarded instead of handing the following rooted barrier the
         // pre-collection array address.
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let items = unsafe { (*(obj as *const W_ListObject)).items };
         crate::gc_hook::try_gc_write_barrier(items as *mut u8);
     }
@@ -816,10 +906,23 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
 #[majit_macros::dont_look_inside]
 pub fn prepare_list_ref_store(obj: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
     let _roots = crate::gc_roots::push_roots();
-    let value_slot = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(value);
-    list_write_barrier(obj);
-    crate::gc_roots::shadow_stack_get(value_slot)
+    let root_base = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::publish_roots(&[obj, value]);
+    crate::gc_roots::normalize_roots(root_base, 2);
+    list_write_barrier(crate::gc_roots::shadow_stack_get(root_base));
+    crate::gc_roots::shadow_stack_get(root_base + 1)
+}
+
+/// Resolve a GC reference after a residual safepoint may have moved it.
+/// RPython's GC transform reloads every livevar from the shadow stack; this is
+/// the one-word residual form used by the descended list-append body.
+#[majit_macros::dont_look_inside]
+pub fn current_gc_ref(obj: *mut PyObject) -> *mut PyObject {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    crate::gc_hook::try_gc_current_object_address(obj as *mut u8) as *mut PyObject
 }
 
 /// Allocate a new W_ListObject from a Vec of items.
@@ -827,7 +930,7 @@ pub fn prepare_list_ref_store(obj: *mut PyObject, value: *mut PyObject) -> *mut 
 /// Residualized: the storage construction below
 /// (`w_list_new_with_strategy`) drives the moving collector through
 /// `push_roots` / `pin_root` / `alloc_list_items_block_gc` /
-/// `try_gc_alloc_stable` — shadow-stack and `box_assume_init` plumbing
+/// the collecting header allocator — shadow-stack and `box_assume_init` plumbing
 /// the tracer cannot model. The JIT leaves the call as a residual
 /// returning the fresh object pointer rather than tracing into the GC
 /// allocator.
@@ -934,7 +1037,7 @@ impl ListStorage {
 fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     // pin every PyObjectRef in `items` before the GC malloc paths
-    // below (`alloc_list_items_block`, `try_gc_alloc_stable`) so the
+    // below (`alloc_list_items_block_gc`, the collecting header allocation) so the
     // shadow stack walker sees them if a collection fires inside the
     // allocator. The Empty / Integer / Float strategies still hold
     // PyObjectRef pointers in `items` until each element is unboxed
@@ -946,14 +1049,14 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
     }
 
     // The nursery `items_block` is allocated last and pinned across the
-    // `try_gc_alloc_stable` header alloc — the only allocation that can
+    // collecting header allocation — the only later allocation that can
     // relocate it, since the typed-block allocs precede it.  The typed blocks
     // carry their own pins out of `build_list_storage`.
     let mut storage = unsafe { build_list_storage(&items, strategy) };
     let (length, mut items_block) = (storage.length, storage.block);
     // Phase L2: pin the (possibly young, GC-managed) items block across the
-    // W_ListObject header allocation below — `try_gc_alloc_stable` may trigger a
-    // collection that relocates the nursery block, so re-read its moved address
+    // W_ListObject header allocation below may trigger a collection that
+    // relocates the nursery block, so re-read its moved address
     // before storing it into the wrapper. Inert for a null or std::alloc block.
     let block_root: Option<usize> = if !items_block.is_null() {
         let s = crate::gc_roots::shadow_stack_len();
@@ -966,12 +1069,36 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
         ob_type: &LIST_TYPE as *const PyType,
         w_class: get_instantiate(&LIST_TYPE),
     };
-    // Allocate body via GC old-gen (mark-sweep, non-moving). `items` (Object
-    // strategy) points at a moving nursery block forwarded by
-    // `list_object_custom_trace` and remembered by `list_write_barrier` below;
-    // `int_items.block` / `float_items.block` are old-gen leaf arrays the same
-    // trace marks live.
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE);
+    // rlist.py:116 `LIST = GcStruct(...)`: the list header is an ordinary
+    // movable GC allocation, just like its `GcArray` items block.  Keeping the
+    // header in old-gen would put every short-lived Object-strategy list in
+    // `old_objects_pointing_to_young`; a minor collection must conservatively
+    // trace those old headers and promote their item blocks, so a loop such as
+    // `d = ["0"]` accumulates both allocations until the next major cycle.
+    //
+    // The items/typed block is the one GC child manufactured before its parent.
+    // Pass it through the rooted collecting allocator, which performs
+    // framework.py:853-856's collect-and-reserve bracket if the nursery is
+    // full.  The surrounding shadow-stack roots remain authoritative for all
+    // item values and reload every block below; `allocation_root` supplies the
+    // allocator's direct translated-livevar slot as well.
+    let mut allocation_root = match strategy {
+        ListStrategy::Object => items_block as *mut u8,
+        ListStrategy::Integer | ListStrategy::IntOrFloat => storage.int_items.block as *mut u8,
+        ListStrategy::Float => storage.float_items.block as *mut u8,
+        ListStrategy::Empty => std::ptr::null_mut(),
+    };
+    let mut needs_write_barrier = true;
+    let raw = unsafe {
+        crate::gc_hook::try_gc_alloc_collecting_rooted(
+            W_LIST_GC_TYPE_ID,
+            W_LIST_OBJECT_SIZE,
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    }
+    .filter(|p| !p.is_null())
+    .unwrap_or(std::ptr::null_mut());
     // `pop_roots` for the two typed blocks: this was the last allocation they
     // had to survive, and both take their heap edge from the struct built below.
     storage.reload_typed_blocks();
@@ -980,6 +1107,11 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
         float_items,
         ..
     } = storage;
+    // Re-read the (possibly relocated) nursery items block before either the
+    // GC-owned or std::alloc fallback header takes ownership of the edge.
+    if let Some(s) = block_root {
+        items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
+    }
     if raw.is_null() {
         let boxed = Box::new(W_ListObject {
             ob_header: header,
@@ -992,10 +1124,6 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
             w_slots: PY_NULL,
         });
         return Box::into_raw(boxed) as PyObjectRef;
-    }
-    // Re-read the (possibly relocated) nursery items block after the header alloc.
-    if let Some(s) = block_root {
-        items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
     }
     unsafe {
         std::ptr::write(
@@ -1012,14 +1140,11 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
             },
         );
     }
-    // Object-strategy creation seeds the nursery `items` block with the (possibly
-    // young) initial elements; remember the old-gen list so the next minor GC
-    // forwards them. Integer/Float blocks are old-gen — no young pointer to track.
-    if strategy == ListStrategy::Object {
-        // `raw` came directly from `try_gc_alloc_stable_raw`; skip the
-        // defensive mixed-heap ownership query for the list itself.  The
-        // backing block retains its own check because its allocator can still
-        // fall back to `std::alloc`.
+    // A nursery header needs no creation barrier. The collecting allocator can
+    // spill to old-gen (for example around pinned nursery gaps); only that
+    // placement needs remembering for its young Object-strategy items edge.
+    // Integer/Float blocks are old-gen leaf arrays and need no barrier.
+    if strategy == ListStrategy::Object && needs_write_barrier {
         list_write_barrier_impl(raw as PyObjectRef, true);
     }
     raw as PyObjectRef
@@ -1273,8 +1398,8 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
 pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -> bool {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(obj);
-    crate::gc_roots::pin_root(value);
+    crate::gc_roots::publish_roots(&[obj, value]);
+    crate::gc_roots::normalize_roots(root_base, 2);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
@@ -1290,6 +1415,8 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 return false;
             }
             let value = prepare_list_ref_store(obj, value);
+            let obj = crate::gc_roots::shadow_stack_get(root_base);
+            let list = &mut *(obj as *mut W_ListObject);
             let items = list.object_items_slice_mut();
             items[idx as usize] = value;
             true
@@ -1305,10 +1432,18 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 ll_list_int_setitem_fast(list, idx as usize, plain_int_w(value));
                 true
             } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
-                w_list_setitem(obj, index, value)
+                w_list_setitem(
+                    crate::gc_roots::shadow_stack_get(root_base),
+                    index,
+                    crate::gc_roots::shadow_stack_get(root_base + 1),
+                )
             } else {
                 switch_to_object_strategy(list);
-                w_list_setitem(obj, index, value)
+                w_list_setitem(
+                    crate::gc_roots::shadow_stack_get(root_base),
+                    index,
+                    crate::gc_roots::shadow_stack_get(root_base + 1),
+                )
             }
         }
         ListStrategy::IntOrFloat => {
@@ -1322,7 +1457,11 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 true
             } else {
                 switch_to_object_strategy(list);
-                w_list_setitem(obj, index, value)
+                w_list_setitem(
+                    crate::gc_roots::shadow_stack_get(root_base),
+                    index,
+                    crate::gc_roots::shadow_stack_get(root_base + 1),
+                )
             }
         }
         ListStrategy::Float => {
@@ -1338,10 +1477,18 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 && int_or_float_encode_int(plain_int_w(value)).is_some()
                 && float_to_int_or_float(list)
             {
-                w_list_setitem(obj, index, value)
+                w_list_setitem(
+                    crate::gc_roots::shadow_stack_get(root_base),
+                    index,
+                    crate::gc_roots::shadow_stack_get(root_base + 1),
+                )
             } else {
                 switch_to_object_strategy(list);
-                w_list_setitem(obj, index, value)
+                w_list_setitem(
+                    crate::gc_roots::shadow_stack_get(root_base),
+                    index,
+                    crate::gc_roots::shadow_stack_get(root_base + 1),
+                )
             }
         }
     }
@@ -1375,8 +1522,8 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
     // before entering the lock-free strategy body.
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(obj);
-    crate::gc_roots::pin_root(value);
+    crate::gc_roots::publish_roots(&[obj, value]);
+    crate::gc_roots::normalize_roots(root_base, 2);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
@@ -1384,6 +1531,8 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     let old_size = list.live_len();
     w_list_append_inner(obj, value);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
     list.sync_allocated(old_size);
 }
 
@@ -1393,8 +1542,8 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
 pub unsafe fn w_list_append_preallocated(obj: PyObjectRef, value: PyObjectRef) {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(obj);
-    crate::gc_roots::pin_root(value);
+    crate::gc_roots::publish_roots(&[obj, value]);
+    crate::gc_roots::normalize_roots(root_base, 2);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
@@ -1403,6 +1552,8 @@ pub unsafe fn w_list_append_preallocated(obj: PyObjectRef, value: PyObjectRef) {
     let old_size = list.live_len();
     let old_allocated = list.allocated;
     w_list_append_inner(obj, value);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
     if old_allocated > old_size as isize {
         list.allocated = old_allocated;
     } else {
@@ -1421,7 +1572,8 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         // listobject.py:1170 EmptyListStrategy.append: pick the matching
         // typed strategy first, then fall through to its append.
         ListStrategy::Empty => {
-            switch_to_correct_strategy(list, value);
+            let obj = switch_to_correct_strategy(list, value);
+            let value = current_gc_ref(value);
             w_list_append_inner(obj, value);
         }
         // AbstractUnwrappedStrategy.append (listobject.py:1695):
@@ -1438,6 +1590,8 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
             let length = ll_list_obj_length(list);
             if length < ll_list_obj_capacity(list) {
                 let value = prepare_list_ref_store(obj, value);
+                let obj = current_gc_ref(obj);
+                let list = &mut *(obj as *mut W_ListObject);
                 ll_list_obj_set_len(list, length + 1);
                 ll_list_obj_setitem_fast(list, length, value);
             } else {
@@ -1460,9 +1614,13 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                     list.int_items.push(item);
                 }
             } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
+                let obj = current_gc_ref(obj);
+                let value = current_gc_ref(value);
                 w_list_append_inner(obj, value);
             } else {
-                switch_to_object_strategy(list);
+                let obj = switch_to_object_strategy(list);
+                let value = current_gc_ref(value);
+                let list = &mut *(obj as *mut W_ListObject);
                 list.object_push(value);
             }
         }
@@ -1491,9 +1649,13 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 && int_or_float_encode_int(plain_int_w(value)).is_some()
                 && float_to_int_or_float(list)
             {
+                let obj = current_gc_ref(obj);
+                let value = current_gc_ref(value);
                 w_list_append_inner(obj, value);
             } else {
-                switch_to_object_strategy(list);
+                let obj = switch_to_object_strategy(list);
+                let value = current_gc_ref(value);
+                let list = &mut *(obj as *mut W_ListObject);
                 list.object_push(value);
             }
         }
@@ -1501,7 +1663,9 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
             if let Some(item) = int_or_float_encode_item(value) {
                 list.int_items.push(item);
             } else {
-                switch_to_object_strategy(list);
+                let obj = switch_to_object_strategy(list);
+                let value = current_gc_ref(value);
+                let list = &mut *(obj as *mut W_ListObject);
                 list.object_push(value);
             }
         }
@@ -1847,6 +2011,12 @@ fn normalize_insert_index(index: i64, len: usize) -> usize {
 /// Strategy-preserving: inserts on typed storage when type matches,
 /// switches to Object only when incompatible.
 pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::publish_roots(&[obj, value]);
+    crate::gc_roots::normalize_roots(root_base, 2);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let value = crate::gc_roots::shadow_stack_get(root_base + 1);
     let list = &mut *(obj as *mut W_ListObject);
     let old_size = list.live_len();
     match list.strategy {
@@ -1855,7 +2025,11 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
         // via append. Mirror by switching first then re-dispatching.
         ListStrategy::Empty => {
             switch_to_correct_strategy(list, value);
-            w_list_insert(obj, index, value);
+            w_list_insert(
+                crate::gc_roots::shadow_stack_get(root_base),
+                index,
+                crate::gc_roots::shadow_stack_get(root_base + 1),
+            );
         }
         ListStrategy::Integer => {
             if is_plain_int1(value) {
@@ -1865,10 +2039,18 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
                 return;
             }
             if is_float_strategy_item(value) && integer_to_int_or_float(list) {
-                w_list_insert(obj, index, value);
+                w_list_insert(
+                    crate::gc_roots::shadow_stack_get(root_base),
+                    index,
+                    crate::gc_roots::shadow_stack_get(root_base + 1),
+                );
             } else {
                 switch_to_object_strategy(list);
-                w_list_insert(obj, index, value);
+                w_list_insert(
+                    crate::gc_roots::shadow_stack_get(root_base),
+                    index,
+                    crate::gc_roots::shadow_stack_get(root_base + 1),
+                );
             }
         }
         ListStrategy::IntOrFloat => {
@@ -1879,7 +2061,11 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
                 return;
             }
             switch_to_object_strategy(list);
-            w_list_insert(obj, index, value);
+            w_list_insert(
+                crate::gc_roots::shadow_stack_get(root_base),
+                index,
+                crate::gc_roots::shadow_stack_get(root_base + 1),
+            );
         }
         ListStrategy::Float => {
             if is_float_strategy_item(value) {
@@ -1892,16 +2078,27 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
                 && int_or_float_encode_int(plain_int_w(value)).is_some()
                 && float_to_int_or_float(list)
             {
-                w_list_insert(obj, index, value);
+                w_list_insert(
+                    crate::gc_roots::shadow_stack_get(root_base),
+                    index,
+                    crate::gc_roots::shadow_stack_get(root_base + 1),
+                );
             } else {
                 switch_to_object_strategy(list);
-                w_list_insert(obj, index, value);
+                w_list_insert(
+                    crate::gc_roots::shadow_stack_get(root_base),
+                    index,
+                    crate::gc_roots::shadow_stack_get(root_base + 1),
+                );
             }
         }
         ListStrategy::Object => {
             let idx = normalize_insert_index(index, list.length);
             list.object_insert(idx, value);
+            let obj = crate::gc_roots::shadow_stack_get(root_base);
             list_write_barrier(obj);
+            let obj = crate::gc_roots::shadow_stack_get(root_base);
+            let list = &mut *(obj as *mut W_ListObject);
             list.sync_allocated(old_size);
         }
     }
@@ -2460,9 +2657,16 @@ pub unsafe fn w_list_setslice(
     end: usize,
     w_other: PyObjectRef,
 ) -> Result<(), &'static str> {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::publish_roots(&[obj, w_other]);
+    crate::gc_roots::normalize_roots(root_base, 2);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let w_other = crate::gc_roots::shadow_stack_get(root_base + 1);
     let old_size = (&*(obj as *const W_ListObject)).live_len();
     let result = w_list_setslice_inner(obj, start, end, w_other);
     if result.is_ok() {
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
         if list.live_len() != old_size {
             list.sync_allocated(old_size);
@@ -2515,6 +2719,8 @@ unsafe fn w_list_setslice_inner(
                 }
                 ListStrategy::Object => {
                     list.set_object_items_from_vec(other.object_to_vec());
+                    let obj = crate::gc_roots::shadow_stack_get(root_base);
+                    let list = &mut *(obj as *mut W_ListObject);
                     list.strategy = ListStrategy::Object;
                     list_write_barrier(obj);
                     return Ok(());
@@ -2648,19 +2854,23 @@ unsafe fn w_list_setslice_inner(
     };
     let _new_item_roots = crate::gc_roots::push_roots();
     let new_item_base = crate::gc_roots::shadow_stack_len();
-    for &item in &new_items {
-        crate::gc_roots::pin_root(item);
-    }
+    crate::gc_roots::publish_roots(&new_items);
+    crate::gc_roots::normalize_roots(new_item_base, new_items.len());
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
     switch_to_object_strategy(list);
     let mut rooted_new_items = Vec::with_capacity(new_items.len());
     for i in 0..new_items.len() {
         rooted_new_items.push(crate::gc_roots::shadow_stack_get(new_item_base + i));
     }
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
     let mut v = list.object_to_vec();
     let s = start.min(v.len());
     let e = end.min(v.len());
     v.splice(s..e, rooted_new_items);
     rebuild_object_items(list, v);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
     list_write_barrier(obj);
     Ok(())
 }

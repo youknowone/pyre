@@ -13127,8 +13127,8 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
         return Ok(true);
     }
     // `emit_module_dict_cell_fold` returns `false` for BOTH an absent name and
-    // a present-but-unfoldable one (`IntMutableCell` / movable / strategy
-    // switched).  Only an ABSENT name may fall through to the builtins fold — a
+    // a present-but-unfoldable one (`IntMutableCell` / strategy switched).
+    // Only an ABSENT name may fall through to the builtins fold — a
     // present global shadows the builtin, so keep the residual (which reads the
     // live globals slot) when the slot still exists.
     if crate::state::module_dict_cell_slot_direct(w_globals, &name).is_some() {

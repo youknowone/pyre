@@ -1069,7 +1069,7 @@
       "dynasm": "PASS"
     },
     "test.test_struct": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_structseq": {
       "dynasm": "PASS"
@@ -1145,7 +1145,7 @@
       "dynasm": "PASS"
     },
     "test.test_threading": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_threading_local": {
       "dynasm": "PASS"

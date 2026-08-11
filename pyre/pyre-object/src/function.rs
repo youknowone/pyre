@@ -56,13 +56,23 @@ pub fn w_method_new(
         w_class: get_instantiate(&METHOD_TYPE),
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE);
-    // Re-read the pinned roots after the allocation; a minor collection
-    // inside the GC malloc may have relocated them.
-    let w_function = crate::gc_roots::shadow_stack_get(save_point);
-    let w_self = crate::gc_roots::shadow_stack_get(save_point + 1);
-    let w_class = crate::gc_roots::shadow_stack_get(save_point + 2);
     let w_module = PY_NULL;
     if !raw.is_null() {
+        // Remember the old-gen shell before publishing nursery members. The
+        // barrier may park behind a collection; running it after the stores
+        // would leave a movable `w_self` (notably a list) untraced during that
+        // window. This is the same pre-store shape as tupleobject's stable
+        // shell plus young items block.
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        for slot in save_point..save_point + 3 {
+            let root = crate::gc_roots::shadow_stack_get(slot);
+            let current =
+                crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+            crate::gc_roots::shadow_stack_set(slot, current);
+        }
+        let w_function = crate::gc_roots::shadow_stack_get(save_point);
+        let w_self = crate::gc_roots::shadow_stack_get(save_point + 1);
+        let w_class = crate::gc_roots::shadow_stack_get(save_point + 2);
         unsafe {
             std::ptr::write(
                 raw as *mut Method,
@@ -75,9 +85,11 @@ pub fn w_method_new(
                 },
             );
         }
-        crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
+    let w_function = crate::gc_roots::shadow_stack_get(save_point);
+    let w_self = crate::gc_roots::shadow_stack_get(save_point + 1);
+    let w_class = crate::gc_roots::shadow_stack_get(save_point + 2);
     Method::allocate(Method {
         ob: PyObject {
             ob_type: std::ptr::null(),
