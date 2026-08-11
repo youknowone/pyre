@@ -8583,7 +8583,7 @@ enum WalkerStoreAttrSpecialization {
 ///
 /// # Safety
 /// `obj` must be a non-null, untagged heap object.
-unsafe fn walker_exact_builtin_class(
+pub(crate) unsafe fn walker_exact_builtin_class(
     obj: pyre_object::PyObjectRef,
 ) -> Option<pyre_object::PyObjectRef> {
     unsafe {

@@ -4467,9 +4467,16 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
             Emit::Int(vals)
         }
         ListStrategy::Float => {
-            // `list_strategy_for` admits only exact, non-NaN floats here.
+            // `list_strategy_for` admits only exact, non-NaN floats here.  Its
+            // subclass term is enforced on replay by pinning each element's
+            // `w_class`; `is_plain_float_strict` also admits the null spelling
+            // of "exact float", which no pin can express, so decline such an
+            // element rather than emit a guard it would fail itself.
             let mut vals = Vec::with_capacity(len);
             for &p in &concretes {
+                if unsafe { walker_exact_builtin_class(p) }.is_none() {
+                    return Ok(None);
+                }
                 vals.push(unsafe { pyre_object::w_float_get_value(p) });
             }
             Emit::Float(vals)
@@ -4524,6 +4531,16 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
                 let raw = walker_unbox_float(ctx, op_pc, it, float_type_addr)?;
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(v));
+                // `walker_unbox_float` guards `ob_type` only, which a float
+                // SUBCLASS instance shares; pin `w_class` so it side-exits
+                // instead of being unboxed into Float storage the interpreter
+                // would have declined (`all_floats` is strict).
+                walker_guard_exact_w_class(
+                    ctx,
+                    op_pc,
+                    it,
+                    pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE),
+                )?;
                 walker_guard_float_not_nan(ctx, op_pc, raw)?;
                 raws.push(raw);
             }
@@ -11655,6 +11672,14 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         } else if pyre_object::w_list_uses_float_storage(list_obj)
             && pyre_object::is_float_strategy_item(value_obj)
         {
+            // The subclass term of that predicate is enforced on replay by
+            // pinning `w_class` below.  `is_plain_float_strict` also admits the
+            // null spelling of "exact float", which no pin can express, so
+            // decline such an operand here rather than emit a guard it would
+            // fail itself (see `walker_guard_exact_w_class`).
+            if walker_exact_builtin_class(value_obj).is_none() {
+                return Ok(None);
+            }
             2i64
         } else {
             return Ok(None);
@@ -11748,6 +11773,18 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
+        // A float SUBCLASS instance shares `ob_type == &FLOAT_TYPE` (so it
+        // passes the unbox guard) but retags `w_class`;
+        // `FloatListStrategy.is_correct_type` rejects it, so the interpreter
+        // switches the list to Object storage instead of writing raw f64.
+        // Pin the canonical class the same way the list operand is pinned
+        // above, so such an instance side-exits to the generic residual.
+        walker_guard_exact_w_class(
+            ctx,
+            op_pc,
+            value_op,
+            pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE),
+        )?;
         walker_guard_float_not_nan(ctx, op_pc, raw)?;
         crate::state::trace_float_block_setitem_value(ctx.trace_ctx, block, raw_index, raw);
     }
