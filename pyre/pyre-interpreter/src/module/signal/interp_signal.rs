@@ -8,6 +8,7 @@ use crate::executioncontext::{
 };
 use crate::pyframe::PyFrame;
 use pyre_object::PyObjectRef;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// executioncontext.py:436-441 `space.getexecutioncontext().checksignals()`
 /// — deliver a signal that may have arrived during a syscall.  Resolves
@@ -77,29 +78,29 @@ fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
     err
 }
 
-thread_local! {
-    /// interp_signal.py:157-167 `Handlers.handlers_w` — signum → handler
-    /// (a callable, or the SIG_DFL/SIG_IGN ints).  A real Python dict so
-    /// the GC traces the handler callables; pinned for the process
-    /// lifetime.  Missing keys mean SIG_DFL (the pre-fill in PyPy's
-    /// `Handlers.__init__`).
-    static HANDLERS: std::cell::Cell<PyObjectRef> = const { std::cell::Cell::new(pyre_object::PY_NULL) };
-    /// moduledef.py:15 `default_int_handler` — cached so
-    /// `getsignal(SIGINT) is signal.default_int_handler` holds after the
-    /// startup install.
-    static DEFAULT_INT_HANDLER: std::cell::Cell<PyObjectRef> = const { std::cell::Cell::new(pyre_object::PY_NULL) };
-}
+/// interp_signal.py:157-167 `Handlers.handlers_w` — the single `Handlers`
+/// instance returned by `space.fromcache(Handlers)`.  Pyre has one interpreter
+/// per process, so this is process-global just like that object-space cache.
+/// It must not be TLS: a signal received by a worker is dispatched later by
+/// the main thread through this same table.
+static HANDLERS: AtomicUsize = AtomicUsize::new(0);
+
+/// moduledef.py:15 `default_int_handler`, likewise one object-space-owned
+/// callable.  The handler dict owns it after startup; this cell preserves the
+/// public identity used by both the module attribute and `getsignal(SIGINT)`.
+static DEFAULT_INT_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 fn handlers_dict() -> PyObjectRef {
-    HANDLERS.with(|cell| {
-        let mut d = cell.get();
-        if d.is_null() {
-            d = pyre_object::w_dict_new();
-            pyre_object::gc_roots::pin_root(d);
-            cell.set(d);
+    let mut d = HANDLERS.load(Ordering::Acquire) as PyObjectRef;
+    if d.is_null() {
+        d = pyre_object::w_dict_new();
+        pyre_object::gc_roots::pin_root(d);
+        match HANDLERS.compare_exchange(0, d as usize, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {}
+            Err(installed) => d = installed as PyObjectRef,
         }
-        d
-    })
+    }
+    d
 }
 
 /// interp_signal.py:196-209 `handlers_w[n]` lookup.  Returns `PY_NULL`
@@ -125,30 +126,22 @@ pub fn set_handler(signum: i32, handler: PyObjectRef) {
 /// walked so handler callables reachable only through this dict survive
 /// collection.
 pub fn walk_signal_handler_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    HANDLERS.with(|cell| {
-        let mut d = cell.get();
-        if d.is_null() {
-            return;
-        }
-        // Visit the dict pointer itself as a root.  If the GC
-        // relocates the dict, `visitor` updates `d` in place;
-        // write the (possibly new) address back to the Cell.
-        let old = d;
-        visitor(&mut d);
-        if !std::ptr::eq(d, old) {
-            cell.set(d);
-        }
-        unsafe {
-            let strategy = pyre_object::dictmultiobject::w_dict_get_strategy(d);
-            strategy.walk_gc_refs(d, &mut |slot: *mut PyObjectRef| {
-                visitor(&mut *slot);
-            });
-        }
-    });
+    let mut d = HANDLERS.load(Ordering::Acquire) as PyObjectRef;
+    if d.is_null() {
+        return;
+    }
+    visitor(&mut d);
+    HANDLERS.store(d as usize, Ordering::Release);
+    unsafe {
+        let strategy = pyre_object::dictmultiobject::w_dict_get_strategy(d);
+        strategy.walk_gc_refs(d, &mut |slot: *mut PyObjectRef| {
+            visitor(&mut *slot);
+        });
+    }
 }
 
 pub fn capture_signal_handler_root_area() -> *const () {
-    HANDLERS.with(|handlers| handlers as *const _ as *const ())
+    &HANDLERS as *const AtomicUsize as *const ()
 }
 
 /// # Safety
@@ -158,13 +151,13 @@ pub unsafe fn walk_signal_handler_roots_area(
     data: *const (),
     mut visitor: impl FnMut(&mut PyObjectRef),
 ) {
-    let handlers = unsafe { &*(data as *const std::cell::Cell<PyObjectRef>) };
-    let mut dict = handlers.get();
+    let handlers = unsafe { &*(data as *const AtomicUsize) };
+    let mut dict = handlers.load(Ordering::Acquire) as PyObjectRef;
     if dict.is_null() {
         return;
     }
     visitor(&mut dict);
-    handlers.set(dict);
+    handlers.store(dict as usize, Ordering::Release);
     unsafe {
         let strategy = pyre_object::dictmultiobject::w_dict_get_strategy(dict);
         strategy.walk_gc_refs(dict, &mut |slot: *mut PyObjectRef| {
@@ -197,10 +190,19 @@ fn check_signum_in_range(signum: i64) -> Result<(), crate::PyError> {
 }
 
 /// interp_signal.py:291-326 `signal(signum, handler) -> previous`.
-fn signal_signal(w_signum: PyObjectRef, w_handler: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn signal_signal(
+    w_signum: PyObjectRef,
+    w_handler: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let signum = signum_arg(w_signum)?;
-    // interp_signal.py:307-310 — `signals_enabled()` is always true in
-    // single-threaded pyre, so the main-thread guard is omitted.
+    // interp_signal.py:307-310 — only the main/signal-enabled execution
+    // context may install process signal handlers.
+    let ec = crate::call::getexecutioncontext() as *const ExecutionContext;
+    if ec.is_null() || unsafe { (*ec).signals_enabled == 0 } {
+        return Err(crate::PyError::value_error(
+            "signal only works in main thread or with _signals_enabled",
+        ));
+    }
     check_signum_in_range(signum)?;
     // The range check bounds it to `1..NSIG`, so the narrowing is exact.
     let signum = signum as i32;
@@ -254,25 +256,31 @@ fn signal_getsignal(w_signum: PyObjectRef) -> Result<PyObjectRef, crate::PyError
 /// KeyboardInterrupt`.  Cached so the module attribute and the SIGINT
 /// handler-dict entry share one identity.
 pub fn default_int_handler_obj() -> PyObjectRef {
-    DEFAULT_INT_HANDLER.with(|cell| {
-        let mut h = cell.get();
-        if h.is_null() {
-            h = crate::make_builtin_function(
-                "default_int_handler",
-                // issue #2780: accept and ignore any non-keyword arguments.
-                |_| {
-                    let cls = crate::builtins::lookup_exc_class("KeyboardInterrupt")
-                        .expect("KeyboardInterrupt must be installed");
-                    let exc = crate::builtins::exc_exception_new(&[cls])
-                        .expect("exc_exception_new is infallible for empty args");
-                    Err(unsafe { crate::PyError::from_exc_object(exc) })
-                },
-            );
-            pyre_object::gc_roots::pin_root(h);
-            cell.set(h);
+    let mut h = DEFAULT_INT_HANDLER.load(Ordering::Acquire) as PyObjectRef;
+    if h.is_null() {
+        h = crate::make_builtin_function(
+            "default_int_handler",
+            // issue #2780: accept and ignore any non-keyword arguments.
+            |_| {
+                let cls = crate::builtins::lookup_exc_class("KeyboardInterrupt")
+                    .expect("KeyboardInterrupt must be installed");
+                let exc = crate::builtins::exc_exception_new(&[cls])
+                    .expect("exc_exception_new is infallible for empty args");
+                Err(unsafe { crate::PyError::from_exc_object(exc) })
+            },
+        );
+        pyre_object::gc_roots::pin_root(h);
+        match DEFAULT_INT_HANDLER.compare_exchange(
+            0,
+            h as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(installed) => h = installed as PyObjectRef,
         }
-        h
-    })
+    }
+    h
 }
 
 /// interp_signal.py:54-152 `CheckSignalAction` — a periodic action run
@@ -281,9 +289,12 @@ pub fn default_int_handler_obj() -> PyObjectRef {
 /// which for SIGINT (default) raises `KeyboardInterrupt`.
 pub struct CheckSignalAction {
     base: PeriodicAsyncAction,
-    /// interp_signal.py:65 — a signal seen but not yet reported (used by
-    /// the threaded fire-in-another-thread path; always -1 in pyre).
+    /// interp_signal.py:65 — a signal seen on a worker but not yet reported by
+    /// the signal-enabled main execution context.
     pending_signal: i32,
+    /// interp_signal.py:66/82-91 — a worker found a pending signal and left it
+    /// for the signal-enabled main execution context.
+    fire_in_another_thread: bool,
     /// interp_signal.py:66/103 — re-entrancy guard so a handler that
     /// itself triggers a checkpoint does not recurse into polling.
     in_poll: bool,
@@ -297,6 +308,7 @@ impl CheckSignalAction {
                 base: AsyncAction::new_periodic_base(space),
             },
             pending_signal: -1,
+            fire_in_another_thread: false,
             in_poll: false,
         })
     }
@@ -313,10 +325,8 @@ impl CheckSignalAction {
         result
     }
 
-    /// interp_signal.py:111-141 `_poll_for_signals_unlocked`.  pyre is
-    /// single-threaded, so `signals_enabled()` is always true and the
-    /// fire-in-another-thread branch is unreachable; the remote-debugger
-    /// arm is not surfaced.
+    /// interp_signal.py:111-141 `_poll_for_signals_unlocked`; the
+    /// remote-debugger arm is not surfaced.
     fn poll_for_signals_unlocked(
         &mut self,
         ec: &mut ExecutionContext,
@@ -332,11 +342,23 @@ impl CheckSignalAction {
             n = signalstate::signal_poll();
         }
         while n >= 0 {
-            self.pending_signal = -1;
-            report_signal(ec, n)?;
-            n = self.pending_signal;
-            if n < 0 {
-                n = signalstate::signal_poll();
+            if ec.signals_enabled != 0 {
+                // The main thread reports the signal and continues polling.
+                self.pending_signal = -1;
+                self.fire_in_another_thread = false;
+                report_signal(ec, n)?;
+                n = self.pending_signal;
+                if n < 0 {
+                    n = signalstate::signal_poll();
+                }
+            } else {
+                // interp_signal.py:135-140 — do not consume a process signal
+                // on a worker.  Keep it on the shared CheckSignalAction and
+                // arm the main EC's registered ticker for prompt delivery.
+                self.pending_signal = n;
+                self.fire_in_another_thread = true;
+                signalstate::rearm_ticker();
+                break;
             }
         }
         Ok(())

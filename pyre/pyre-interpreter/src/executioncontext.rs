@@ -269,6 +269,11 @@ pub struct ExecutionContext {
     pub w_profilefuncarg: PyObjectRef,
     pub thread_disappeared: bool,
     pub w_async_exception_type: PyObjectRef,
+    /// `threadlocals.py:9,95-97 ExecutionContext._signals_enabled` — only the
+    /// execution context owned by `OSThreadLocals._mainthreadident` may run
+    /// app-level signal handlers.  A fork from another thread promotes that
+    /// thread's EC in `thread::after_fork_child`.
+    pub signals_enabled: i32,
     /// Last process-wide all-threads hook generations applied by this EC.
     /// Only the owning OS thread writes these fields.
     pub trace_all_generation: usize,
@@ -391,6 +396,7 @@ impl ExecutionContext {
             w_profilefuncarg: pyre_object::PY_NULL,
             thread_disappeared: false,
             w_async_exception_type: pyre_object::PY_NULL,
+            signals_enabled: 0,
             trace_all_generation: 0,
             profile_all_generation: 0,
             thread_local_refs: Vec::new(),
@@ -424,6 +430,10 @@ impl ExecutionContext {
         ec.w_profilefuncarg = pyre_object::PY_NULL;
         ec.thread_disappeared = false;
         ec.w_async_exception_type = pyre_object::PY_NULL;
+        // threadlocals.py:9 — a fresh worker EC starts disabled.  `_set_ec`
+        // enables only the process main thread, and reinit_threads promotes
+        // the surviving EC after a fork.
+        ec.signals_enabled = 0;
         ec.trace_all_generation = 0;
         ec.profile_all_generation = 0;
         ec.thread_local_refs.clear();

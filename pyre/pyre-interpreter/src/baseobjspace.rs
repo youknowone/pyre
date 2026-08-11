@@ -14459,7 +14459,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                         not_iterable_type_name(obj)
                     )));
                 }
-                let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                let w_iter = get_and_call_function(method, obj, w_type, &[])?;
                 return iter_check_is_iterator(w_iter);
             }
             // descroperation.py:333-334 — `__getitem__` fallback only when
@@ -16564,7 +16564,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             if let Some(method) = lookup_in_type_where(w_type, "__next__") {
-                return crate::call::call_function_impl_result(method, &[obj]);
+                return get_and_call_function(method, obj, w_type, &[]);
             }
         }
         // PyPy `space.next(w_obj)` performs a type-MRO `__next__` lookup for
@@ -18372,7 +18372,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                 if is_none(method) {
                     return Err(not_container_error(haystack));
                 }
-                let result = crate::builtins::call_and_check(method, &[haystack, needle])?;
+                let result = get_and_call_function(method, haystack, w_type, &[needle])?;
                 return is_true(result);
             }
         }

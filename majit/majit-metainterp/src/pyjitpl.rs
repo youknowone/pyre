@@ -16064,15 +16064,26 @@ impl<M: Clone> MetaInterp<M> {
             if let Some(ctx) = self.tracing.as_mut() {
                 ctx.heapcache_invalidate_caches_varargs(opnum1, Some(effectinfo), &opref_args);
             }
-            // pyjitpl.py:2074-2077: handle resbox void / make_result_of_lastop
-            // — make_result_of_lastop's target_index plumbing is not
-            // wired here yet; documented above on miframe_execute_varargs.
+            // pyjitpl.py:2074-2077: handle resbox void / make_result_of_lastop.
+            // The result must be installed before vable_after_residual_call
+            // and GUARD_NOT_FORCED capture their resume snapshot.  Otherwise
+            // a reused destination register still contains its pre-call
+            // value, and blackhole resume returns that stale value after an
+            // asynchronous force.
             let resbox_pair = match resbox {
                 Some(opref) if descr_view.result_type() != majit_ir::Type::Void => {
                     Some((opref, c_result))
                 }
                 _ => None,
             };
+            if let (Some((opref, concrete)), Some((kind, target_index))) = (resbox_pair, dst) {
+                self.framestack.current_mut().make_result_of_lastop(
+                    kind,
+                    target_index,
+                    opref,
+                    concrete,
+                );
+            }
             // pyjitpl.py:2078: vable_after_residual_call(funcbox)
             // SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)
             // surfaces here when the virtualizable escaped during the
@@ -19032,6 +19043,10 @@ mod metainterp_static_data_tests {
         a + b * 1000
     }
 
+    extern "C" fn execute_varargs_ref_helper() -> i64 {
+        0xcafe
+    }
+
     extern "C" fn execute_varargs_void_helper() {}
 
     extern "C" fn execute_varargs_float_concrete_helper(a: i64) -> i64 {
@@ -19768,6 +19783,67 @@ mod metainterp_static_data_tests {
                 .any(|op| op.opcode == OpCode::GuardNotForced),
             "GUARD_NOT_FORCED must follow CALL_MAY_FORCE",
         );
+    }
+
+    #[test]
+    fn force_virtual_residual_call_installs_result_before_guard_snapshot() {
+        // pyjitpl.py:2074-2079 — make_result_of_lastop(resbox) precedes
+        // vable_after_residual_call and GUARD_NOT_FORCED.  The dispatch
+        // walker captures the guard's resume snapshot after this helper
+        // returns, so the destination register must already name the call
+        // result rather than its stale pre-call value.
+        use crate::BackEdgeAction;
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let action =
+            meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(majit_ir::GcRef(0xdead))]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        // Give make_result_of_lastop a real ref-typed destination at the
+        // frame's current post-call pc, matching the dispatcher's state on
+        // entry to do_residual_call_full.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, 0);
+        builder.inline_call_irf_r(0, &[], &[], &[], Some(0));
+        let post_call_pc = builder.current_pos();
+        let mut frame =
+            crate::pyjitpl::MIFrame::new(std::sync::Arc::new(builder.finish()), post_call_pc);
+        frame.ref_regs[0] = Some(OpRef::input_arg_ref(0));
+        frame.ref_values[0] = Some(0xdead);
+        meta.framestack.push(frame);
+
+        let mut effect = majit_ir::EffectInfo::default();
+        effect.extraeffect = majit_ir::effectinfo::ExtraEffect::ForcesVirtualOrVirtualizable;
+        let descr_view = StubCallDescr {
+            arg_types: vec![],
+            result_type: majit_ir::Type::Ref,
+            effect: effect.clone(),
+        };
+        let descr_ref = majit_ir::descr::make_call_descr(vec![], majit_ir::Type::Ref, effect);
+        let fnaddr = execute_varargs_ref_helper as *const () as i64;
+        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
+
+        let (result_op, result_value) = meta
+            .do_residual_call_full(
+                funcbox,
+                &[],
+                descr_ref,
+                &descr_view,
+                post_call_pc,
+                false,
+                None,
+                Some((JitArgKind::Ref, 0)),
+            )
+            .expect("residual call must not abort")
+            .expect("ref call must produce a result");
+
+        assert_eq!(result_value, 0xcafe);
+        let frame = meta.framestack.current_mut();
+        assert_eq!(frame.ref_regs[0], Some(result_op));
+        assert_eq!(frame.ref_values[0], Some(0xcafe));
     }
 
     #[test]

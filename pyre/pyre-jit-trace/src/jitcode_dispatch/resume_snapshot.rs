@@ -2539,7 +2539,20 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // guard.  RPython reads these values directly from the active MIFrame's
     // register bank; the assignment below is pyre's slot-to-color lowering of
     // that one-red-frame state, not a lookup through the outer portal frame.
-    if ctx.vstack_valid && ctx.vstack_depth <= ctx.vstack_boxes.len() {
+    // Only a branch guard needs the kept-stack mirror overlay.  At every
+    // other guard, and especially at an after-residual guard, the active
+    // MIFrame register bank is authoritative (`pyjitpl.py
+    // get_list_of_active_boxes`).  The residual result was installed in that
+    // bank before `handle_possible_exception`; overlaying the still-pre-call
+    // vstack mirror here replaced the result color with the stale operand and
+    // made the innermost resume frame return the call's input.  Branch guards
+    // are the exceptional shape: their not-taken edge has not executed its
+    // color moves, so the certified per-frame vstack is the source for kept
+    // stack slots.
+    if scope.branch_guard_jitcode_pc.is_some()
+        && ctx.vstack_valid
+        && ctx.vstack_depth <= ctx.vstack_boxes.len()
+    {
         for &(bank, color, slot) in &maps.pcdep_entries {
             if bank != 1 {
                 continue;

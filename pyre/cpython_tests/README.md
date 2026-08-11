@@ -51,10 +51,12 @@ Key flags: `--backend dynasm|cranelift`, `--no-jit` (`PYRE_NO_JIT=1`),
 - `script` (default): `pyre <path>/test_xxx.py` — runs the file directly as
   `__main__`, firing its `unittest.main()`. The most robust mode today; it
   bypasses `runpy` / `importlib.util.find_spec`.
-- `module`: `pyre -m test.<module>` — same entry via `runpy`. Blocked until
-  `importlib.util.find_spec` is wired to pyre's importer (see backlog).
+- `module`: `pyre -m test.<module>` — the same module entry via `runpy`,
+  without libregrtest's process setup and result protocol.
 - `regrtest`: `pyre -m test -v <module>` — CPython's libregrtest, the
-  PyPy/RustPython form, for once libregrtest imports cleanly.
+  PyPy/RustPython form. Libregrtest imports cleanly and `test_regrtest` passes;
+  use this mode when the runner-owned setup and canonical module identity are
+  part of the behavior under test.
 
 ## Result classes
 
@@ -77,10 +79,11 @@ not even be imported/run — an interpreter or stdlib-compat gap) · `CRASH`
 
 ## Current state and backlog (Phase 0)
 
-The baseline currently records **32 `PASS`**, 381 `IMPORTERROR`, 20 `SKIP`,
-1 `CRASH` (434 modules, stdlib 3.14.6). The `PASS` set grows as the gaps
-below are closed; the rest still hit an interpreter or stdlib-compat gap
-before their tests can run. (It was 0 `PASS` / 414 `IMPORTERROR` before the
+The baseline currently records **205 `PASS`**, 165 `IMPORTERROR`, 22 `FAIL`,
+22 `SKIP`, 14 `CRASH`, and 6 `TIMEOUT` (434 modules, stdlib 3.14.6). The
+`PASS` set grows as the gaps below are closed; non-passing modules include both
+import/stdlib gaps and tests that reach semantic failures, crashes, or timeouts.
+(It was 0 `PASS` / 414 `IMPORTERROR` before the
 `-m`/`STORE_SLICE`/submodule-binding/`_ast`/PEP-709-hidden-locals fixes
 below.)
 
@@ -118,14 +121,11 @@ first:
    fails when `support` isn't already an attribute; IMPORT_FROM must fall back
    to importing the submodule. Also `from unittest import mock`
    (`unittest.mock` submodule).
-2. **`importlib.util.find_spec` returns `None`.** pyre's native importer is
-   not wired into importlib's `meta_path`, so `runpy` (`-m`) can't locate
-   modules. Blocks `--mode module`/`regrtest`.
-3. **Compiler gap (external `rustpython-codegen`): `class_decorator` symbol
+2. **Compiler gap (external `rustpython-codegen`): `class_decorator` symbol
    missing from the symbol table** — `compile error: the symbol
    'class_decorator' must be present in the symbol table` (hit by
    `test_grammar`). Lives in the git-pinned compiler dependency, not pyre's
    tree.
-4. **Assorted stdlib-compat gaps** surfaced per module (e.g. `datetime.date`,
+3. **Assorted stdlib-compat gaps** surfaced per module (e.g. `datetime.date`,
    `genericpath._splitext`, `typing`'s `_idfunc`, complex `re` patterns). Run
    `--full --report` to enumerate the current set.

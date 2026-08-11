@@ -463,7 +463,7 @@
       "dynasm": "PASS"
     },
     "test.test_fork1": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_format": {
       "dynasm": "PASS"
@@ -740,16 +740,16 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_multiprocessing_fork": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP"
     },
     "test.test_multiprocessing_forkserver": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_multiprocessing_main_handling": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_multiprocessing_spawn": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_named_expressions": {
       "dynasm": "FAIL"
@@ -935,7 +935,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_regrtest": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_remote_pdb": {
       "dynasm": "IMPORTERROR"
@@ -1151,7 +1151,7 @@
       "dynasm": "PASS"
     },
     "test.test_threadsignals": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_time": {
       "dynasm": "PASS"
@@ -1253,7 +1253,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_unittest": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_univnewlines": {
       "dynasm": "PASS"

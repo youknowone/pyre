@@ -2942,7 +2942,15 @@ unsafe fn try_instance_unaryop(
     if is_instance(a)
         && let Some(method) = lookup(a, dunder)
     {
-        return Ok(Some(crate::call::call_function_impl_result(method, &[a])?));
+        let Some(w_type) = crate::typedef::r#type(a) else {
+            return Ok(None);
+        };
+        return Ok(Some(crate::baseobjspace::get_and_call_function(
+            method,
+            a,
+            w_type.as_ptr(),
+            &[],
+        )?));
     }
     Ok(None)
 }
@@ -3940,13 +3948,23 @@ pub(crate) unsafe fn lookup_type_special(obj: PyObjectRef, dunder: &str) -> Opti
     crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp.as_ptr(), dunder))
 }
 
-/// Call a special method and treat NotImplemented as "no result", per
-/// descroperation.py `_check_notimplemented`.
+/// Call a raw type-MRO special-method descriptor and treat NotImplemented as
+/// "no result", per descroperation.py `_invoke_binop` and
+/// `_check_notimplemented`.  `args[0]` is the receiver; custom descriptors
+/// must bind through `space.get_and_call_function` rather than receiving that
+/// object as an explicitly injected argument.
 pub(crate) fn try_call_special(
     method: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<Option<PyObjectRef>, PyError> {
-    let result = crate::call::call_function_impl_result(method, args)?;
+    debug_assert!(!args.is_empty());
+    let receiver = args[0];
+    let Some(w_type) = crate::typedef::r#type(receiver) else {
+        return Ok(None);
+    };
+    let result = unsafe {
+        crate::baseobjspace::get_and_call_function(method, receiver, w_type.as_ptr(), &args[1..])?
+    };
     if unsafe { is_not_implemented(result) } {
         Ok(None)
     } else {
@@ -4771,6 +4789,26 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     unsafe {
         if let Some(result) = try_compare_override(a, b, op)? {
             return Ok(result);
+        }
+        // PyPy `descroperation.py:_make_comparison_impl` swaps the operands
+        // whenever the right-hand type is a proper subtype, before invoking
+        // the inherited comparison implementation.  `try_compare_override`
+        // already performs that ordering for generic instances and genuine
+        // builtin overrides; this is the corresponding path for a builtin
+        // subclass which inherits (rather than overrides) its comparison
+        // slot, such as unittest.mock's `_CallList(list)`.
+        // Keep generic instances out of this slot-only path: PyPy preserves
+        // `w_orig_obj1` / `w_orig_obj2` when subtype-first methods all return
+        // NotImplemented, so the final ordering TypeError still names the
+        // original operator and operand order.
+        if !is_instance(a)
+            && !is_instance(b)
+            && let (Some(a_type), Some(b_type)) =
+                (crate::typedef::r#type(a), crate::typedef::r#type(b))
+        {
+            if a_type != b_type && issubtype_cached(b_type.as_ptr(), a_type.as_ptr()) {
+                return compare_slot(b, a, reverse_compare_op(op));
+            }
         }
     }
     compare_slot(a, b, op)

@@ -3586,7 +3586,12 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // Propagate a raised `__bool__` instead of dropping its
                 // stashed error and falling through to `is_true`, which would
                 // dispatch a second time and leave the first copy pending.
-                let result = crate::builtins::call_and_check(method, &[w_obj])?;
+                let result = crate::baseobjspace::get_and_call_function(
+                    method,
+                    w_obj,
+                    w_type.as_ptr(),
+                    &[],
+                )?;
                 if !pyre_object::is_bool(result) {
                     // A tagged immediate is always an exact `int`; name it
                     // without derefing its (non-pointer) tagged bits as
@@ -3614,7 +3619,8 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
                 // __len__ returning negative → ValueError. Propagate a raised
                 // `__len__` rather than dropping its stashed error.
-                let len_result = crate::builtins::call_and_check(len_m, &[w_obj])?;
+                let len_result =
+                    crate::baseobjspace::get_and_call_function(len_m, w_obj, w_type.as_ptr(), &[])?;
                 if pyre_object::is_int(len_result) {
                     let v = pyre_object::w_int_get_value(len_result);
                     if v < 0 {

@@ -3688,15 +3688,19 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                             "sendmsg: ancillary level/type must be integers",
                         ));
                     }
-                    if !unsafe { pyre_object::bytesobject::is_bytes_like(data_o) } {
+                    // interp_socket.py:811-816 acquires a BUF_SIMPLE view,
+                    // just like the ordinary data items above.  This includes
+                    // array.array payloads used by multiprocessing's
+                    // SCM_RIGHTS fd transfer, not only bytes/bytearray.
+                    let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(data_o)? else {
                         return Err(crate::PyError::type_error(
                             "sendmsg: ancillary data must be bytes-like",
                         ));
-                    }
+                    };
                     let level = unsafe { pyre_object::w_int_get_value(level_o) } as libc::c_int;
                     let ty = unsafe { pyre_object::w_int_get_value(type_o) } as libc::c_int;
-                    let data =
-                        unsafe { pyre_object::bytesobject::bytes_like_data(data_o).to_vec() };
+                    let data = buffer.as_bytes().to_vec();
+                    buffer.release();
                     cmsgs.push((level, ty, data));
                 }
             }

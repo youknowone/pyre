@@ -20,6 +20,10 @@ static THREAD_COUNT: AtomicI64 = AtomicI64::new(0);
 static STACK_SIZE: AtomicUsize = AtomicUsize::new(0);
 static FINALIZING: AtomicBool = AtomicBool::new(false);
 static FINALIZING_THREAD: AtomicI64 = AtomicI64::new(0);
+// `threadlocals.py:64 OSThreadLocals._mainthreadident`.  This belongs to the
+// process/interpreter-owned OSThreadLocals object, not TLS: workers consult the
+// same identity to decide whether their EC may dispatch app-level signals.
+static MAIN_THREAD_IDENT: AtomicI64 = AtomicI64::new(0);
 // Number of EC-owned `w_async_exception_type` slots which are non-null.
 // This keeps the process eval breaker armed until the targeted free-threaded
 // EC observes its own pending exception; another EC must not clear the shared
@@ -228,9 +232,20 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 }
 
 pub(crate) fn register_execution_context(ec: *const crate::PyExecutionContext) {
-    EXECUTION_CONTEXTS
-        .lock()
-        .insert(current_ident(), ec as usize);
+    let ident = current_ident();
+    let mut main_ident = MAIN_THREAD_IDENT.load(Ordering::Acquire);
+    if main_ident == 0 {
+        match MAIN_THREAD_IDENT.compare_exchange(0, ident, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => main_ident = ident,
+            Err(installed) => main_ident = installed,
+        }
+    }
+    if main_ident == ident {
+        // threadlocals.py:95-97 `_set_ec`: the first/native main thread is
+        // enabled for signals.  Each EC is written only by its owning thread.
+        unsafe { (*(ec as *mut crate::PyExecutionContext)).signals_enabled = 1 };
+    }
+    EXECUTION_CONTEXTS.lock().insert(ident, ec as usize);
 }
 
 pub(crate) fn unregister_execution_context() {
@@ -390,6 +405,16 @@ pub(crate) fn after_fork_child() {
     let ident = current_ident();
     {
         let mut contexts = EXECUTION_CONTEXTS.lock();
+        // threadlocals.py:161-171 `reinit_threads`: a fork can leave a worker
+        // as the sole surviving thread.  Preserve explicit enable/disable
+        // nesting while promoting that EC to the new main thread.
+        if let Some(&ec) = contexts.get(&ident) {
+            let ec = unsafe { &mut *(ec as *mut crate::PyExecutionContext) };
+            let old_main = MAIN_THREAD_IDENT.load(Ordering::Acquire);
+            let old_signals = ec.signals_enabled;
+            MAIN_THREAD_IDENT.store(ident, Ordering::Release);
+            ec.signals_enabled = old_signals + i32::from(ident != old_main);
+        }
         contexts.retain(|thread_ident, _| *thread_ident == ident);
         if let Some(&ec) = contexts.get(&ident) {
             for &wref in unsafe { &(*(ec as *const crate::PyExecutionContext)).thread_local_refs } {
@@ -2091,6 +2116,11 @@ crate::py_module! {
             unsafe { pyre_object::w_type_set_acceptable_as_base_class(ty, false) };
             ty
         },
+        // CPython 3.14 publishes the canonical type name as a module
+        // attribute as well as through the historical LockType alias.
+        // multiprocessing pickles synchronization factories containing this
+        // class by `_thread.lock`, so the canonical binding is load-bearing.
+        "lock"          => lock_class::type_object(),
         "RLock"         => rlock_class::type_object(),
         "_ThreadHandle" => handle_class::type_object(),
         "_local"        => local_type(),

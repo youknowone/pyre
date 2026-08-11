@@ -11,16 +11,14 @@ Each module is launched one of three ways, selectable with `--mode`:
 
   * script (default): `pyre <path>/test_xxx.py` — runs the test file directly
     as `__main__` so its `if __name__ == "__main__": unittest.main()` block
-    fires. Needs only `unittest` plus the module's own imports; bypasses
-    `runpy` / `importlib.util.find_spec` (which pyre's native importer does
-    not yet feed), so it is the most robust mode today. Runner metadata gives
+    fires. Needs only `unittest` plus the module's own imports, so it remains
+    the most robust mode today. Runner metadata gives
     resource-heavy or dotted-identity-sensitive modules the corresponding
     libregrtest bootstrap without changing this default.
   * module: `pyre -m test.<module>` — same unittest entry but via `runpy`
-    (currently blocked until `importlib.util.find_spec` is wired to pyre's
-    importer).
+    and the canonical dotted module identity.
   * regrtest: `pyre -m test -v <module>` — CPython's own libregrtest, the
-    PyPy/RustPython form (used once libregrtest imports cleanly).
+    PyPy/RustPython form. Libregrtest and `test_regrtest` run cleanly.
 
 A (module, backend) result is classified as:
 
@@ -109,6 +107,11 @@ KNOWN_SKIPS = {
 # so do not inject it into those modules or any subprocesses they spawn.
 STATS_STDERR_INCOMPATIBLE = {
     "test.test_inspect",
+    # test_regrtest exercises both line-oriented `--list-*` output and the
+    # worker JSON protocol through several generations of child interpreters.
+    # Its subprocess helpers intentionally sanitize their environments, so the
+    # root-only ancestry marker cannot keep MAJIT_STATS out of every child.
+    "test.test_regrtest",
 }
 
 # ── classification ───────────────────────────────────────────────────
@@ -296,10 +299,10 @@ _RESOURCE_DRIVER = (
 
 # test_descr and test_enum assert fully qualified class/enum names. Running
 # their files as __main__ changes those names even on CPython, so preserve the
-# dotted identity that libregrtest gives them.  The thread suites repeatedly
-# spawn child interpreters and import their canonical `test.test_*` modules;
-# running the parent as a second `__main__` module would test a different
-# module identity from both libregrtest and those children.
+# dotted identity that libregrtest gives them.  test_regrtest and the thread
+# suites repeatedly spawn child interpreters and import/filter their canonical
+# `test.test_*` modules; running the parent as a second `__main__` module would
+# test a different module identity from both libregrtest and those children.
 #
 # test_runpy's file as __main__ does not run test_runpy at all — it starts
 # libregrtest over the whole suite (measured: 491 modules on CPython 3.14,
@@ -307,6 +310,7 @@ _RESOURCE_DRIVER = (
 DOTTED_IDENTITY_MODULES = {
     "test.test_descr",
     "test.test_enum",
+    "test.test_regrtest",
     "test.test_runpy",
     "test.test_thread",
     "test.test_threading",
@@ -359,6 +363,15 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
         if module in STATS_STDERR_INCOMPATIBLE:
             module_env = env.copy()
             module_env.pop("MAJIT_STATS", None)
+        if mode == "script" and module == "test.test_regrtest":
+            # libregrtest/setup.py:88-96 `setup_process` keeps a non-ASCII
+            # environment value present for every test process.  Script mode
+            # deliberately bypasses that setup, but test_regrtest verifies the
+            # runner-owned invariant itself, so reproduce the same environment
+            # rather than grading the runner test outside its contract.
+            if module_env is env:
+                module_env = env.copy()
+            module_env.setdefault("PYTHONREGRTEST_UNICODE_GUARD", "æ")
         try:
             proc = subprocess.run(
                 cmd, cwd=cwd, env=module_env, capture_output=True, text=True,
