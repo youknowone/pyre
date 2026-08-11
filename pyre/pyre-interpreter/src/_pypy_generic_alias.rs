@@ -215,7 +215,9 @@ fn self_alias(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `GenericAlias.__repr__` (`_pypy_generic_alias.py:57`).
 fn ga_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
-    Ok(pyre_object::w_str_from_wtf8(unsafe { repr(self_)? }))
+    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+        repr(self_)?
+    }))
 }
 
 /// `GenericAlias.__hash__` (`_pypy_generic_alias.py:82`).
