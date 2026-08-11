@@ -1794,9 +1794,9 @@ pub(crate) fn sre_pattern_repr_str(
 
 fn sre_pattern_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let pat = sre_pattern_self(args)?;
-    Ok(pyre_object::w_str_from_wtf8(sre_pattern_repr_str(
-        pat as PyObjectRef,
-    )?))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        sre_pattern_repr_str(pat as PyObjectRef)?,
+    ))
 }
 
 /// `descr_eq` (interp_sre.py:180-190): compare flags, compiled code, and
