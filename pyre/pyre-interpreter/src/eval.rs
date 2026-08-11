@@ -3893,7 +3893,27 @@ impl OpcodeStepExecutor for PyFrame {
                 // evaluates with `format=1` when the runtime dict is
                 // requested; stored on the function's typed
                 // `w_annotate` slot (CPython 3.14 `func_annotate`).
-                unsafe { crate::function::function_set_annotate_unchecked(func, attr) };
+                // CPython 3.14's annotations compile scope is qualified as
+                // `<target>.__annotate__`.  The external compiler currently
+                // supplies only the enclosing scope, so finish the compiler
+                // metadata at the bytecode operation that binds the annotate
+                // function to its target.
+                let roots = pyre_object::gc_roots::push_roots();
+                let func_slot = roots.base();
+                roots.pin_root(func);
+                let attr_slot = func_slot + 1;
+                roots.pin_root(attr);
+                let mut qualname =
+                    unsafe { crate::function::function_get_qualname(roots.get(func_slot)) };
+                qualname.push_str(".__annotate__");
+                let w_qualname = pyre_object::w_str_from_wtf8(qualname);
+                unsafe {
+                    crate::function::function_set_qualname(roots.get(attr_slot), w_qualname);
+                    crate::function::function_set_annotate_unchecked(
+                        roots.get(func_slot),
+                        roots.get(attr_slot),
+                    );
+                }
             }
             // `MakeFunctionFlag::TypeParams` (oparg.rs:356) carries the
             // tuple of TypeVar / ParamSpec / TypeVarTuple bound by a
