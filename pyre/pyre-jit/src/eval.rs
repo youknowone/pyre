@@ -6793,11 +6793,35 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     // admitted only when the body performs no CALL: a per-element call
     // that enters a user Python frame (a class ctor / user function)
     // bumps the eval-loop entry odometer, and a subsequent mid-body
-    // abort routes through `fbw_foriter_inflight_take`, which REFUSES
-    // delivery to avoid a double-apply — dropping the trace-attempt
-    // iteration's item. That user-frame in-flight-delivery gap is a
-    // separate concern (single-executor tracing, gh#73/#34); decline
-    // call-bearing bodies to interpretation until it is closed.
+    // abort routes through `fbw_foriter_inflight_take`, whose R1
+    // body-effect guard REFUSES delivery to avoid a double-apply. The
+    // refusal leaves the live frame untouched, so the
+    // `ContinueRunningNormally` re-entry takes the legacy
+    // drop-on-abort and the consumed item is lost.
+    //
+    // This decline is load-bearing and was MEASURED, not argued: an
+    // earlier revision admitted call-bearing bodies on the theory that
+    // the append always sits past the resume coordinate.  It does not.
+    // `[random.randrange(25) for i in range(size)]` returned 22 items
+    // for size=23, `PYRE_FORITER_INFLIGHT_CENSUS` reported
+    // `DELIVERED=0 REFUSED=1` for that body pc on the same run, and
+    // `test.test_heapq`'s `test_heapsort` failed on the shortened list.
+    // The shape is pinned by
+    // `extra_tests/parity_tests/for_iter_call_bearing_comprehension.py`.
+    //
+    // Convergence path (do not re-widen without it): the store family
+    // is already exact-resume safe because a mid-body abort routes
+    // through `try_commit_midbody_abort`.  A call-bearing body instead
+    // reaches `MidBodyDecline::AfterRun` — the callee already ran, so no
+    // rewinding leg is eligible — and falls back to the legacy
+    // replay-from-entry, which is exactly what the R1 guard must refuse
+    // against.  Retiring that replay is gh#493 (the FBW always-commit
+    // epic), whose P4 names this machinery as what the protocol change
+    // deletes: "the FOR_ITER in-flight refusal machinery, the store-
+    // journal rollback, and the sticky flag lose their reason to exist".
+    // Its S5 slice is the one that removes this decline; #467 is the
+    // same root seen as a double-applied store.  Until S5 lands, a
+    // call-bearing body stays interpreted.
     //
     // A value-producing but call-free body — arithmetic, subscript, or
     // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
@@ -12633,9 +12657,13 @@ mod tests {
 
     #[test]
     fn for_iter_call_bearing_list_append_comprehension_is_unsafe_for_entry_trace() {
-        // A per-element CALL enters a user Python frame; a mid-body abort then
-        // refuses the in-flight FOR_ITER delivery (a separate user-frame gap,
-        // gh#73/#34), so a call-bearing LIST_APPEND body stays interpreter-only.
+        // A per-element CALL enters a user Python frame and commits body
+        // effects, so a mid-body abort hits the R1 body-effect guard in
+        // `fbw_foriter_inflight_take`, which refuses the in-flight FOR_ITER
+        // delivery and lets the legacy drop-on-abort lose the item.  A
+        // call-bearing LIST_APPEND body therefore stays interpreter-only until
+        // gh#493's S5 retires replay-from-entry; see
+        // `for_iter_body_is_jit_safe_at` for the measurement that pins this.
         use pyre_interpreter::compile_exec;
         for source in [
             "def f(n):\n    return [str(i) for i in range(n)]\n",

@@ -2081,8 +2081,8 @@ pub enum DispatchError {
     /// (past the strategy switch + `is_plain_int1`, descr-pool resolved) and
     /// the trace compiles, but the guards it records resume through side-exit
     /// bridges whose reconstruction is wrong — executing the compiled loop
-    /// jumps to garbage.  This is the sub-walk guard resume/faillocs epic
-    /// (#62/#73/#34) the hand-rolled fold sidesteps with explicit
+    /// jumps to garbage.  This is the sub-walk guard resume/faillocs gap the
+    /// hand-rolled fold sidesteps with explicit
     /// `walker_capture_snapshot_for_last_guard` snapshots.  Surfaced here to
     /// abort the trace gracefully (interpreter fallback) instead of committing
     /// a trace that SIGSEGVs on its first side exit.  Default OFF.
@@ -2603,6 +2603,20 @@ thread_local! {
     /// per call. Keyed by the stable `CodeObject` pointer.
     static FRAME_SHAPE_DECLINE_SEEN: std::cell::RefCell<std::collections::BTreeSet<usize>> =
         const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+
+    /// The same once-per-code-object dedup for the frame-level FOR_ITER gate.
+    /// Deliberately a SEPARATE set from [`FRAME_SHAPE_DECLINE_SEEN`]: the two
+    /// record different census families, and sharing one set makes the first
+    /// family to reach a given code object silence the other for that object
+    /// forever.  That also silences the `PYRE_FOR_ITER_GATE_DIAG` print, since
+    /// [`census_record_for_iter_gate_decline`] gates it on the insert result —
+    /// a census whose own dedup can drop entries cannot be used to measure the
+    /// gate.  The two families are near-disjoint in practice today (a frame the
+    /// gate declines is never traced, so it reaches neither the shape decline
+    /// nor `Resume::ForeignInnermostLastInstr`), so this is a latent hazard
+    /// rather than a witnessed miscount; nothing enforces that disjointness.
+    static FOR_ITER_GATE_DECLINE_SEEN: std::cell::RefCell<std::collections::BTreeSet<usize>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
 
 /// Record — once per distinct code object — the frame-shape decline of a frame
@@ -2635,7 +2649,7 @@ pub fn census_record_for_iter_gate_decline(code_ptr: usize, kind: &'static str) 
     }) {
         return false;
     }
-    let first = FRAME_SHAPE_DECLINE_SEEN.with(|s| s.borrow_mut().insert(code_ptr));
+    let first = FOR_ITER_GATE_DECLINE_SEEN.with(|s| s.borrow_mut().insert(code_ptr));
     if first {
         census_record(kind);
     }
@@ -5845,9 +5859,14 @@ thread_local! {
     /// lifecycle as [`FBW_LIST_EFFECT_JOURNAL`]: a committed walk keeps the typed
     /// strategy, while a replayed walk restores the list to Empty so replay
     /// can execute the append from the original shape.  This exists only for
-    /// pyre's speculative-replay walk and can be removed when
-    /// single-executor tracing lands (gh#73/#34).  Entries are GC roots via
-    /// [`fbw_store_journal_root_walker`].
+    /// pyre's speculative-replay walk.  Its stated precondition for removal —
+    /// single-executor tracing — has since landed (`is_full_body_walk`,
+    /// `PYRE_FULL_BODY_WALK` and the `OpcodeHandler`-on-`MIFrame` twin are all
+    /// deleted; the walker is the sole trace-time executor), but the journal
+    /// outlives it because replay-from-entry does: gh#493 P4 lists the journal
+    /// rollback among what the always-commit protocol deletes, and its S5 slice
+    /// has not landed.  Removal is blocked on that, not on the executor count.
+    /// Entries are GC roots via [`fbw_store_journal_root_walker`].
     static FBW_APPEND_PROMOTE_JOURNAL: std::cell::RefCell<Vec<pyre_object::PyObjectRef>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
