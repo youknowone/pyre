@@ -621,7 +621,7 @@ pub(crate) fn str_from_utf8(data: &[u8]) -> Result<PyObjectRef, PyError> {
     // surrogates are valid pickle payloads and are represented internally as
     // WTF-8, while malformed byte sequences must still be rejected.
     let s = rustpython_wtf8::Wtf8Buf::from_bytes(data.to_vec()).map_err(utf8_decode_error)?;
-    Ok(pyre_object::unicodeobject::w_str_from_wtf8(s))
+    Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(s))
 }
 
 /// Construct Python's UTF-8 decode error details from Rust's `Utf8Error`.
