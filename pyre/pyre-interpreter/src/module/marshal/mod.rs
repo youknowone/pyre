@@ -52,6 +52,32 @@ fn bytes_like(obj: PyObjectRef, function: &str) -> Result<Vec<u8>, PyError> {
     )))
 }
 
+/// PyPy `marshal_impl.py:104-120 marshal` buffer fallback.
+///
+/// Heap types bypass all builtin marshallers, then any object satisfying a
+/// simple contiguous buffer request is written as `TYPE_STRING`.  Keep the
+/// acquired bytes in a Rust `Vec`: unlike materialising a Python `bytes`, this
+/// cannot move objects while `write_object` holds raw traversal locals.
+fn marshal_buffer_bytes(obj: PyObjectRef) -> Result<Option<Vec<u8>>, PyError> {
+    if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
+        return marshal_buffer_bytes(target?);
+    }
+    unsafe {
+        if bytesobject::is_bytes_like(obj) {
+            return Ok(Some(bytesobject::bytes_like_data(obj).to_vec()));
+        }
+        if interp_array::is_array(obj) {
+            return Ok(Some(interp_array::w_array_bytes(obj).to_vec()));
+        }
+        if memoryview::is_w_memoryview(obj) {
+            crate::builtins::memoryview_check_released(obj)?;
+            crate::typedef::require_contiguous_buffer(obj)?;
+            return Ok(Some(crate::builtins::memoryview_gather_bytes(obj)));
+        }
+    }
+    Ok(None)
+}
+
 /// Transient equivalent of PyPy's `Marshaller.all_refs` dict.  A VecMap is
 /// sufficient because marshal streams normally contain few shared objects;
 /// each entry is a shadow-stack slot so a collection updates object identity.
@@ -121,28 +147,34 @@ fn write_object(
         refs.as_mut().unwrap().reserve(obj)?;
     }
 
+    // PyPy `marshal`: instances of user heap types skip the builtin
+    // marshaller table completely.  They may still reach the buffer fallback
+    // below (notably bytes/bytearray subclasses).
+    let is_heap_type = crate::typedef::r#type(obj)
+        .is_some_and(|w_type| unsafe { typeobject::w_type_is_heaptype(w_type.as_ptr()) });
+
     unsafe {
-        if is_none(obj) {
+        if !is_heap_type && is_none(obj) {
             out.write_u8(b'N');
-        } else if crate::builtins::lookup_exc_class("StopIteration") == Some(obj) {
+        } else if !is_heap_type && crate::builtins::lookup_exc_class("StopIteration") == Some(obj) {
             out.write_u8(b'S');
-        } else if is_bool(obj) {
+        } else if !is_heap_type && is_bool(obj) {
             out.write_u8(if w_bool_get_value(obj) { b'T' } else { b'F' });
-        } else if is_ellipsis(obj) {
+        } else if !is_heap_type && is_ellipsis(obj) {
             out.write_u8(b'.');
-        } else if is_int_or_long(obj) {
+        } else if !is_heap_type && is_int_or_long(obj) {
             let value = crate::builtins::obj_to_bigint(obj);
             let value = crate::rbigint_to_compiler_bigint(&value);
             wire::serialize_value::<_, ConstantData>(out, DumpableValue::Integer(&value))
                 .unwrap_or_else(|never| match never {});
-        } else if is_float(obj) {
+        } else if !is_heap_type && is_float(obj) {
             out.write_u8(b'g');
             out.write_u64(w_float_get_value(obj).to_bits());
-        } else if is_complex(obj) {
+        } else if !is_heap_type && is_complex(obj) {
             out.write_u8(b'y');
             out.write_u64(w_complex_get_real(obj).to_bits());
             out.write_u64(w_complex_get_imag(obj).to_bits());
-        } else if is_str(obj) {
+        } else if !is_heap_type && is_str(obj) {
             let value = w_str_get_wtf8(obj).as_bytes();
             out.write_u8(b'u');
             out.write_u32(
@@ -152,8 +184,7 @@ fn write_object(
                     .map_err(|_| PyError::value_error("object too large to marshal"))?,
             );
             out.write_slice(value);
-        } else if bytesobject::is_bytes_like(obj) {
-            let value = bytesobject::bytes_like_data(obj);
+        } else if let Some(value) = marshal_buffer_bytes(obj)? {
             out.write_u8(b's');
             out.write_u32(
                 value
@@ -161,8 +192,8 @@ fn write_object(
                     .try_into()
                     .map_err(|_| PyError::value_error("object too large to marshal"))?,
             );
-            out.write_slice(value);
-        } else if is_tuple(obj) {
+            out.write_slice(&value);
+        } else if !is_heap_type && is_tuple(obj) {
             let len = w_tuple_len(obj);
             out.write_u8(if version >= 4 && len < 256 {
                 b')'
@@ -182,7 +213,7 @@ fn write_object(
                     .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
                 write_object(out, item, refs, version, depth - 1)?;
             }
-        } else if is_list(obj) {
+        } else if !is_heap_type && is_list(obj) {
             let len = w_list_len(obj);
             out.write_u8(b'[');
             out.write_u32(
@@ -194,14 +225,14 @@ fn write_object(
                     .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
                 write_object(out, item, refs, version, depth - 1)?;
             }
-        } else if is_dict(obj) {
+        } else if !is_heap_type && is_dict(obj) {
             out.write_u8(b'{');
             for (key, value) in dictmultiobject::w_dict_items(obj) {
                 write_object(out, key, refs, version, depth - 1)?;
                 write_object(out, value, refs, version, depth - 1)?;
             }
             out.write_u8(b'0');
-        } else if setobject::is_set_or_frozenset(obj) {
+        } else if !is_heap_type && setobject::is_set_or_frozenset(obj) {
             out.write_u8(if setobject::is_frozenset(obj) {
                 b'>'
             } else {
@@ -217,14 +248,14 @@ fn write_object(
             for item in items {
                 write_object(out, item, refs, version, depth - 1)?;
             }
-        } else if crate::pycode::is_code(obj) {
+        } else if !is_heap_type && crate::pycode::is_code(obj) {
             let ptr = crate::pycode::w_code_get_ptr(obj) as *const crate::CodeObject;
             if ptr.is_null() {
                 return Err(PyError::value_error("unmarshallable object"));
             }
             out.write_u8(b'c');
             wire::serialize_code(out, &*ptr);
-        } else if is_slice(obj) && version >= 5 {
+        } else if !is_heap_type && is_slice(obj) && version >= 5 {
             out.write_u8(b':');
             write_object(
                 out,
