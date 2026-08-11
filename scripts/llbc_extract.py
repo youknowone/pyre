@@ -19,6 +19,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -591,6 +592,74 @@ def _package_closure(
     return closure
 
 
+def nested_repo_entries(entries: list[str]) -> list[str]:
+    """`--others` entries git reported as directories instead of descending.
+
+    `git ls-files --others` walks an ordinary untracked directory and lists the
+    FILES in it. At a directory holding its own `.git` it stops, and emits the
+    DIRECTORY, with a trailing slash. So a trailing slash in that output is
+    git's own statement that it did not look inside.
+
+    Keyed on the slash rather than on an `is_dir()` probe because the slash is
+    the producer's record of what it did, where a filesystem call re-derives a
+    guess about it — and the two can disagree while a build runs.
+
+    Measured, git 2.50.1, all under one covered pathspec: a nested repo with
+    commits and one freshly `git init`ed both carry the slash; an ordinary
+    untracked directory of sources, a directory whose files are all ignored, an
+    empty directory, and an ignored nested repo produce no directory entry at
+    all. The benign shapes are the ones that matter here — this refusal is
+    fail-closed, so a predicate that flagged any new module directory would
+    stop every extraction in the repository.
+    """
+    return sorted(entry for entry in entries if entry.endswith("/"))
+
+
+def refuse_nested_repos(entries: list[str]) -> None:
+    """Refuse when a nested repository sits under a fingerprinted pathspec.
+
+    Not a conservative over-hash like the untracked leg above it: this is the
+    one shape where the fingerprint is WRONG rather than merely wide. The
+    directory entry enters the input list, `source_fingerprint` finds it is not
+    a file, and it hashes through the `<deleted>` branch — one constant token.
+    Measured on a synthetic tree: editing a file inside the nested repo, adding
+    a new `.rs` to it, and deleting the entire subtree all leave the digest
+    byte-identical. The stamp then claims to cover a path whose contents cannot
+    move it, and that digest is also the CI cache key.
+
+    Refusing rather than recursing is the direction the untracked leg's own
+    argument points: it prefers a cost that is always a re-extraction over an
+    answer that is sometimes wrong. Recursing would mean deciding what a nested
+    repository's commit means for a source hash, which is a larger question
+    than this guard needs to answer.
+    """
+    nested = nested_repo_entries(entries)
+    if not nested:
+        return
+    lines = [
+        "extract-llbc.py: a nested git repository sits under a fingerprinted"
+        " pathspec:",
+        *(f"    {entry}" for entry in nested),
+        "",
+        "`git ls-files --others` does not descend into one, so every file"
+        " inside is",
+        "absent from `source=` while the directory itself hashes to a single"
+        " constant",
+        "token — the digest does not move when those contents change, grow, or"
+        " are",
+        "deleted outright. The stamp would claim a coverage it does not have.",
+        "",
+        "Move it outside the fingerprinted pathspecs, or add it to"
+        " `.gitignore`",
+        "(an ignored nested repo is excluded here and is not compiled either).",
+        "Registering it as a SUBMODULE does not fix this: a gitlink arrives on"
+        " the",
+        "tracked leg, carries no trailing slash, and hashes through the same"
+        " branch.",
+    ]
+    raise SystemExit("\n".join(lines))
+
+
 def _collect_inputs(
     eng: Engine, crates: list[str], cargo_features: str
 ) -> tuple[list[str], list[Path]]:
@@ -742,37 +811,28 @@ def _collect_inputs(
                         if "custom-build" not in kinds:
                             external.append(src_path.parent)
 
-    # git is the enumerator, but the index is not the input set: Charon and
-    # rustc read the working tree, so a source file that is on disk and not yet
-    # added belongs in the digest. `--cached` alone leaves it out, and a crate
-    # extracted while one of its files was untracked then fingerprints as fresh
-    # against sources the artefact was never built from — staging that same
-    # file later flips the identical bytes to STALE.
+    def ls_files_raw(*extra_flags: str) -> list[str]:
+        result = subprocess.run(
+            ["git", "ls-files", "-z", *extra_flags, "--", *pathspecs],
+            cwd=root,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        return [raw.decode("utf-8") for raw in result.stdout.split(b"\0") if raw]
+
+    def ls_files(*extra_flags: str) -> set[Path]:
+        # `Path()` normalises the trailing slash away, so a caller that needs to
+        # tell a directory entry from a file entry must read `ls_files_raw`.
+        # That erasure is why the nested-repo blindness was invisible here.
+        return {Path(entry) for entry in ls_files_raw(*extra_flags)}
+
+    # Charon reads the working tree, so include untracked, non-ignored files.
+    # Keep the raw spelling until nested repositories have been rejected:
+    # converting a directory entry to `Path` erases its trailing slash.
     #
-    # `--exclude-standard` is what keeps the generated trees out. Everything it
-    # drops under these pathspecs today is produced by a build —
-    # `majit/charon-corpus/{target/,Cargo.lock}` and `pyre/check.snap/` — and
-    # nothing a crate compiles.
-    result = subprocess.run(
-        [
-            "git",
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            *pathspecs,
-        ],
-        cwd=root,
-        check=True,
-        stdout=subprocess.PIPE,
-    )
-    files = {
-        Path(raw.decode("utf-8"))
-        for raw in result.stdout.split(b"\0")
-        if raw
-    }
+    others = ls_files_raw("--others", "--exclude-standard")
+    refuse_nested_repos(others)
+    files = ls_files() | {Path(entry) for entry in others}
     files |= include_closure(root, files)
     return sorted(files, key=lambda path: path.as_posix()), external
 
@@ -987,6 +1047,19 @@ def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> s
         full_path = eng.root / path
         if full_path.is_file():
             digest.update(full_path.read_bytes())
+        elif full_path.exists():
+            # A directory in the input list is never a source file. Hashing it
+            # below would fold it to one constant token that no edit inside it
+            # can move — the nested-repo defect, and equally a registered
+            # submodule, which `refuse_nested_repos` cannot see because a
+            # gitlink arrives tracked and unslashed.
+            raise SystemExit(
+                "extract-llbc.py: a fingerprint input is a DIRECTORY, not a"
+                f" file:\n    {path.as_posix()}\n"
+                "Hashing it would record one constant token for the whole"
+                " subtree.\nIf it is a submodule or a nested repository, move"
+                " it out of the\nfingerprinted pathspecs or ignore it."
+            )
         else:
             # The `--cached` half of the enumeration includes tracked paths
             # deleted in the working tree. A deletion is part of the source
@@ -2388,6 +2461,103 @@ def self_test_provenance_rendering() -> None:
         raise SystemExit(1)
 
 
+def self_test_nested_repo_detection() -> None:
+    """Drive the nested-repo refusal on a synthetic tree, BOTH arms.
+
+    `self_test` below draws its probe from `fingerprint_inputs`, i.e. from a
+    directory the fingerprint already covers, so it can never place one where
+    coverage fails — it would keep passing whatever this guard did. Hence a
+    separate case with its own tree.
+
+    Runs real `git` against a real nested repository rather than handing
+    `nested_repo_entries` a list of strings: the load-bearing fact is what git
+    DOES with a nested repo, and a list written here would only ever agree with
+    what its author believed. If a future git stops emitting the trailing
+    slash, this fails; a string fixture would not.
+
+    The BENIGN arm carries as much weight as the hazard one. This refusal is
+    fail-closed, so a predicate that flagged every untracked directory would
+    satisfy a detection-only test and then stop every extraction that follows a
+    new module directory.
+
+    Everything happens inside a temporary directory. `self_test` writes its
+    probe into the shared worktree, a brief real mutation; doing that with a
+    nested repo would be a worse one, because a peer extracting in that instant
+    would take this very refusal instead of merely seeing a moved hash.
+    """
+    def ls_others(root: Path) -> list[str]:
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--others", "--exclude-standard", "--", "covered"],
+            cwd=root,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        return [raw.decode("utf-8") for raw in result.stdout.split(b"\0") if raw]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        def git(*args: str, cwd: Path | None = None) -> None:
+            subprocess.run(
+                ["git", *args],
+                cwd=cwd or root,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        git("init", "-q", ".")
+        git("config", "user.email", "self-test@example.invalid")
+        git("config", "user.name", "llbc self-test")
+        (root / "covered").mkdir()
+        (root / "covered" / "tracked.rs").write_text("// tracked\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+
+        # Benign: an ordinary untracked directory holding a new module. This is
+        # also the liveness control — the leg must LIST it, so a git that
+        # returned nothing at all cannot pass this test by being empty.
+        (root / "covered" / "plain").mkdir()
+        (root / "covered" / "plain" / "new_module.rs").write_text("// new\n")
+        benign_entries = ls_others(root)
+        benign_flagged = nested_repo_entries(benign_entries)
+
+        # Hazard: a nested repository under the same covered path.
+        nested = root / "covered" / "nested"
+        nested.mkdir()
+        git("init", "-q", ".", cwd=nested)
+        (nested / "inside.rs").write_text("// invisible to the outer repo\n")
+        hazard_entries = ls_others(root)
+        hazard_flagged = nested_repo_entries(hazard_entries)
+
+    print("    benign tree    " + " ".join(benign_entries))
+    print(f"      flagged      {benign_flagged}")
+    print("    + nested repo  " + " ".join(hazard_entries))
+    print(f"      flagged      {hazard_flagged}")
+
+    failures = []
+    if "covered/plain/new_module.rs" not in benign_entries:
+        failures.append(
+            "the untracked leg did not list a new module — the test measured nothing"
+        )
+    if benign_flagged:
+        failures.append(
+            f"an ordinary untracked directory was flagged {benign_flagged} —"
+            " this refusal would stop every extraction after a new module dir"
+        )
+    if hazard_flagged != ["covered/nested/"]:
+        failures.append(
+            f"a nested repository was not flagged: got {hazard_flagged} —"
+            " the fingerprint would hash its whole subtree as one constant"
+        )
+    if failures:
+        sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
+        for line in failures:
+            print(f"self-test FAILED: {line}", file=sys.stderr)
+        raise SystemExit(1)
+    print("\nself-test passed: nested-repo refusal (hazard flagged, benign not)")
+
+
 def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
     """A/B/A the fingerprint against a new untracked `.rs` under a covered path.
 
@@ -2548,6 +2718,9 @@ def run_cli(
         # run and exercises neither of its conditional lines, because no sidecar
         # this tree has written is anything but steady and untruncated.
         self_test_provenance_rendering()
+        # Same reason again: this one builds its own repository in a
+        # temporary directory and never touches the worktree.
+        self_test_nested_repo_detection()
         self_test(eng, crates, cargo_features)
         return
     if args.check:
