@@ -864,7 +864,7 @@ fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
             .ok_or_else(|| PyError::value_error("character out of range"))?;
         wb.push(point);
     }
-    Ok(pyre_object::unicodeobject::w_str_from_wtf8(wb))
+    Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(wb))
 }
 
 fn array_fromunicode_method(args: &[PyObjectRef]) -> PyResult {
