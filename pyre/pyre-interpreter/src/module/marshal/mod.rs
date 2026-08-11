@@ -304,6 +304,94 @@ impl Rooted {
     }
 }
 
+/// PyPy `interp_marshal.py:70-101 FileReader`, with CPython 3.14's
+/// `readinto()` validation when that method is available.
+///
+/// `wire::Read` requires the returned bytes to borrow from the reader, so each
+/// exact read is copied into this reusable Rust buffer.  Python exceptions are
+/// parked separately and restored by `load_impl` after the wire reader stops.
+struct FileReader {
+    file: Rooted,
+    scratch: Vec<u8>,
+    pending_error: Option<PyError>,
+}
+
+impl FileReader {
+    fn new(file: PyObjectRef) -> Self {
+        Self {
+            file: Rooted::new(file),
+            scratch: Vec::new(),
+            pending_error: None,
+        }
+    }
+
+    fn python_error<T>(&mut self, error: PyError) -> Result<T, wire::MarshalError> {
+        self.pending_error = Some(error);
+        Err(wire::MarshalError::BadType)
+    }
+
+    fn read_with_read(&mut self, n: u32) -> Result<Vec<u8>, wire::MarshalError> {
+        let roots = pyre_object::gc_roots::push_roots();
+        let file_slot = roots.base();
+        roots.pin_root(self.file.get());
+        let result = match call_method(roots.get(file_slot), "read", &[w_int_new(n as i64)]) {
+            Ok(result) => result,
+            Err(error) => return self.python_error(error),
+        };
+        let result_slot = file_slot + 1;
+        roots.pin_root(result);
+        let bytes = match bytes_like(roots.get(result_slot), "load") {
+            Ok(bytes) => bytes,
+            Err(error) => return self.python_error(error),
+        };
+        if bytes.len() < n as usize {
+            return Err(wire::MarshalError::Eof);
+        }
+        if bytes.len() > n as usize {
+            return self.python_error(PyError::value_error(format!(
+                "read() returned too much data: {n} bytes requested, {} returned",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
+impl wire::Read for FileReader {
+    fn read_slice(&mut self, n: u32) -> Result<&[u8], wire::MarshalError> {
+        let roots = pyre_object::gc_roots::push_roots();
+        let file_slot = roots.base();
+        roots.pin_root(self.file.get());
+        let buffer_slot = file_slot + 1;
+        roots.pin_root(bytearrayobject::w_bytearray_new(n as usize));
+
+        let bytes = match call_method(roots.get(file_slot), "readinto", &[roots.get(buffer_slot)]) {
+            Ok(count) => {
+                let count = match crate::baseobjspace::int_w(count) {
+                    Ok(count) => count,
+                    Err(error) => return self.python_error(error),
+                };
+                if count < 0 || count as u64 > n as u64 {
+                    return self
+                        .python_error(PyError::value_error("readinto() returned invalid length"));
+                }
+                if count as u32 != n {
+                    return Err(wire::MarshalError::Eof);
+                }
+                unsafe { bytearrayobject::w_bytearray_data(roots.get(buffer_slot)).to_vec() }
+            }
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => {
+                drop(roots);
+                self.read_with_read(n)?
+            }
+            Err(error) => return self.python_error(error),
+        };
+
+        self.scratch = bytes;
+        Ok(&self.scratch)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PyreMarshalBag;
 
@@ -610,18 +698,17 @@ crate::py_module! {
             allow_code: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
             let allow_code = resolve_allow_code(allow_code)?;
-            let before = crate::baseobjspace::int_w(call_method(file, "tell", &[])?)?;
-            let bytes_obj = call_method(file, "read", &[])?;
-            let data = bytes_like(bytes_obj, "load")?;
             let _roots = pyre_object::gc_roots::push_roots();
-            let mut reader = wire::Cursor {
-                data: data.as_slice(),
-                position: 0,
+            let mut reader = FileReader::new(file);
+            let result = match wire::deserialize_value(&mut reader, PyreMarshalBag) {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(error) = reader.pending_error.take() {
+                        return Err(error);
+                    }
+                    return Err(marshal_error(error));
+                }
             };
-            let result =
-                wire::deserialize_value(&mut reader, PyreMarshalBag).map_err(marshal_error)?;
-            let new_position = w_int_new(before.saturating_add(reader.position as i64));
-            call_method(file, "seek", &[new_position])?;
             let result = result.get();
             if !allow_code {
                 reject_code(result)?;
