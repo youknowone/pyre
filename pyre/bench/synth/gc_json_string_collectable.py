@@ -40,4 +40,28 @@ if json.encoder.c_make_encoder is None:
     chunk = "gc-json-chunk-" + ("x" * 37)
 assert any(obj is chunk for obj in gc.get_objects())
 
+float_key = 1.2345678901234567e123
+float_key_managed = []
+
+
+def observe_key(key):
+    if key.startswith("1.234567890123456") and key.endswith("e+123"):
+        float_key_managed.append(any(obj is key for obj in gc.get_objects()))
+    return json.encoder.encode_basestring_ascii(key)
+
+
+if json.encoder.c_make_encoder is None:
+    # Keep the ownership assertion meaningful on a PyPy without its optional
+    # accelerator: float.__repr__ returns the same kind of managed text that
+    # _pypyjson._coerce_dict_key creates with space.newtext().
+    key_text = repr(float_key)
+    float_key_managed.append(any(obj is key_text for obj in gc.get_objects()))
+else:
+    encoder = json.encoder.c_make_encoder(
+        {}, lambda obj: None, observe_key, None, ": ", ", ", False, False, True
+    )
+    assert encoder({float_key: None}, 0) == ['{"1.2345678901234567e+123": null}']
+
+assert float_key_managed == [True]
+
 print("json runtime strings are collectable")

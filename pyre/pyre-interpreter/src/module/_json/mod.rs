@@ -1065,7 +1065,7 @@ fn coerce_key(self_obj: PyObjectRef, key: PyObjectRef) -> Result<Option<PyObject
         if is_instance(key, &pyre_object::FLOAT_TYPE) {
             let mut out = rustpython_wtf8::Wtf8Buf::new();
             encode_float(self_obj, &mut out, key)?;
-            return Ok(Some(pyre_object::w_str_from_wtf8(out)));
+            return Ok(Some(pyre_object::w_str_from_wtf8_managed(out)));
         }
     }
     if crate::baseobjspace::is_true(encoder_attr(self_obj, "skipkeys")?)? {
