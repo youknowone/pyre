@@ -836,7 +836,12 @@ fn subject_span_bytes(subj: Subject, span: (i64, i64)) -> Option<&'static [u8]> 
 /// the (valid UTF-8) builder, or `bytes` (subx result, interp_sre.py:541-548).
 fn finish_output(subj: Subject, out: Vec<u8>) -> PyObjectRef {
     match subj {
-        Subject::Str(_) => w_str_from_wtf8(Wtf8Buf::from_bytes(out).unwrap_or_default()),
+        // interp_sre.py:567 returns `space.newutf8(...)`: substitution and
+        // expansion results are ordinary runtime strings, not bootstrap
+        // structural strings that may live outside the managed heap.
+        Subject::Str(_) => {
+            w_str_from_wtf8_managed(Wtf8Buf::from_bytes(out).unwrap_or_default())
+        }
         Subject::Bytes(_) => pyre_object::bytesobject::w_bytes_from_bytes(&out),
     }
 }
@@ -1220,8 +1225,12 @@ fn sre_pattern_sub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `subn_w` (interp_sre.py:415-419) — returns `(new_string, count)`.
 fn sre_pattern_subn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     let (w_item, n) = subx(args)?;
-    Ok(w_tuple_new(vec![w_item, w_int_new(n)]))
+    pyre_object::gc_roots::pin_root(w_item);
+    let w_n = w_int_new(n);
+    pyre_object::gc_roots::pin_root(w_n);
+    Ok(w_tuple_new(vec![w_item, w_n]))
 }
 
 /// `subx` (interp_sre.py:421-558) — the shared sub/subn body.  `repl` is a
