@@ -4779,6 +4779,22 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `len(x)` on an exact canonical list: inline the strategy-guarded
+    // length read (guard_value callable + guard_class + exact w_class +
+    // guard_value strategy + length getfield + wrapint) instead of the
+    // opaque `bh_call_fn(len_builtin, NULL, x)` residual — the shape the
+    // meta-tracer produces upstream (descroperation.py `_len` →
+    // `W_ListObject.length()`).  Read-only like the SUBSCR fold, so no
+    // sub-walk restriction; any non-matching shape falls through to the
+    // generic residual (SAFE).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_builtin_len(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
     // user-function-only full-body walk below.
@@ -5319,22 +5335,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && try_walker_specialize_builtin_dict_get(ctx, code, op, &r_args, dst)?.is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // `len(x)` on an exact canonical list: inline the strategy-guarded
-    // length read (guard_value callable + guard_class + exact w_class +
-    // guard_value strategy + length getfield + wrapint) instead of the
-    // opaque `bh_call_fn(len_builtin, NULL, x)` residual — the shape the
-    // meta-tracer produces upstream (descroperation.py `_len` →
-    // `W_ListObject.length()`).  Read-only like the SUBSCR fold, so no
-    // sub-walk restriction; any non-matching shape falls through to the
-    // generic residual (SAFE).
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && try_walker_specialize_builtin_len(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
