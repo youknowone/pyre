@@ -1178,8 +1178,11 @@ fn encode_dict(
 
 fn encoder_call_impl(self_obj: PyObjectRef, obj: PyObjectRef, level: i64) -> PyResult {
     let encoded = encode_value(self_obj, obj, level.max(0))?;
-    Ok(pyre_object::w_list_new(vec![pyre_object::w_str_from_wtf8(
-        encoded,
+    let _roots = gc_roots::push_roots();
+    let encoded_slot = gc_roots::shadow_stack_len();
+    gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(encoded));
+    Ok(pyre_object::w_list_new(vec![gc_roots::shadow_stack_get(
+        encoded_slot,
     )]))
 }
 

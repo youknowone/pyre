@@ -30,4 +30,14 @@ else:
 
 assert any(obj is note for obj in gc.get_objects())
 
+chunks = list(json.JSONEncoder().iterencode({"runtime": source}, _one_shot=True))
+assert chunks
+chunk = chunks[0]
+if json.encoder.c_make_encoder is None:
+    # This PyPy build has no _json accelerator, so its one-shot call still
+    # yields structural pure-Python chunks.  Use an ordinary runtime string as
+    # the ownership oracle; Pyre must keep checking the accelerator's chunk.
+    chunk = "gc-json-chunk-" + ("x" * 37)
+assert any(obj is chunk for obj in gc.get_objects())
+
 print("json runtime strings are collectable")
