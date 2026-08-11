@@ -682,6 +682,25 @@ impl Subject {
     }
 }
 
+/// One translated live GCREF in the shadow stack.  RPython's GC transform
+/// inserts the equivalent push/reload around allocations automatically;
+/// Rust collections otherwise retain the pre-move pointer while `_sre`
+/// builds tuples, lists, and dictionaries of freshly sliced strings.
+#[derive(Clone, Copy)]
+struct RootedObject(usize);
+
+impl RootedObject {
+    fn pin(obj: PyObjectRef) -> Self {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(obj);
+        Self(slot)
+    }
+
+    fn get(self) -> PyObjectRef {
+        pyre_object::gc_roots::shadow_stack_get(self.0)
+    }
+}
+
 /// `is_known_bytes` (interp_sre.py:208-212) — the pattern was compiled from
 /// a bytes-like object (a `None` pattern is unknown, accepting either).
 fn pattern_is_known_bytes(pat: PyObjectRef) -> bool {
@@ -806,7 +825,9 @@ unsafe fn subject_of(string: PyObjectRef, w_buffer: PyObjectRef) -> Subject {
 fn slice_subject(subj: Subject, span: (i64, i64), w_default: PyObjectRef) -> PyObjectRef {
     match subj {
         Subject::Str(s) => char_slice(s, span.0, span.1)
-            .map(|s| w_str_from_wtf8(s.to_owned()))
+            // interp_sre.py:68/76 uses `space.newutf8`: a captured slice is
+            // an ordinary runtime string and must participate in the GC.
+            .map(|s| w_str_from_wtf8_managed(s.to_owned()))
             .unwrap_or(w_default),
         Subject::Bytes(b) => byte_slice(b, span.0, span.1)
             .map(pyre_object::bytesobject::w_bytes_from_bytes)
@@ -1143,6 +1164,7 @@ fn required_arg_kw(
 /// with two or more a tuple of the groups.  Unmatched groups become the
 /// empty string (`w_emptystr`, :344-347).
 fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let pat = args
         .first()
@@ -1163,22 +1185,26 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         Subject::Str(s) => collect_matches(s, pos, endpos, code, pat),
         Subject::Bytes(b) => collect_matches(b, pos, endpos, code, pat),
     };
-    let mut results = Vec::with_capacity(matches.len());
+    // `matchlist_w = []` in interp_sre.py:341 is a GC-managed list.  Build
+    // that same shape here instead of retaining every result in an off-heap
+    // Rust Vec (which would require an O(number of matches) shadow stack).
+    let results = RootedObject::pin(w_list_new_empty());
     for snap in &matches {
+        let _item_roots = pyre_object::gc_roots::push_roots();
         let spans = &snap.spans;
         let w_item = if num_groups == 0 {
-            slice_subject(subj, spans[0], w_empty)
+            RootedObject::pin(slice_subject(subj, spans[0], w_empty))
         } else if num_groups == 1 {
-            slice_subject(subj, spans[1], w_empty)
+            RootedObject::pin(slice_subject(subj, spans[1], w_empty))
         } else {
-            let grps: Vec<PyObjectRef> = (1..=num_groups)
-                .map(|g| slice_subject(subj, spans[g], w_empty))
+            let grps: Vec<RootedObject> = (1..=num_groups)
+                .map(|g| RootedObject::pin(slice_subject(subj, spans[g], w_empty)))
                 .collect();
-            w_tuple_new(grps)
+            RootedObject::pin(w_tuple_new(grps.into_iter().map(RootedObject::get).collect()))
         };
-        results.push(w_item);
+        unsafe { w_list_append(results.get(), w_item.get()) };
     }
-    Ok(w_list_new(results))
+    Ok(results.get())
 }
 
 /// `finditer_w` (interp_sre.py:368-376) — returns the lazy
@@ -1227,10 +1253,9 @@ fn sre_pattern_sub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn sre_pattern_subn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let (w_item, n) = subx(args)?;
-    pyre_object::gc_roots::pin_root(w_item);
-    let w_n = w_int_new(n);
-    pyre_object::gc_roots::pin_root(w_n);
-    Ok(w_tuple_new(vec![w_item, w_n]))
+    let w_item = RootedObject::pin(w_item);
+    let w_n = RootedObject::pin(w_int_new(n));
+    Ok(w_tuple_new(vec![w_item.get(), w_n.get()]))
 }
 
 /// `subx` (interp_sre.py:421-558) — the shared sub/subn body.  `repl` is a
@@ -1375,6 +1400,7 @@ fn is_exact_str_or_bytes(w: PyObjectRef) -> bool {
 /// (0 = unlimited) caps the number of splits; the unsplit remainder is the
 /// final item.
 fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let pat = args
         .first()
@@ -1388,19 +1414,26 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let w_empty = empty_subject(subj);
 
     let endpos = subj.len();
-    let mut results: Vec<PyObjectRef> = Vec::new();
+    // `splitlist = []` in interp_sre.py:383 is itself the long-lived root;
+    // keep only the item currently being appended on the shadow stack.
+    let results = RootedObject::pin(w_list_new_empty());
     let mut last = 0i64;
+    let append_slice = |span, w_default| {
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let w_item = RootedObject::pin(slice_subject(subj, span, w_default));
+        unsafe { w_list_append(results.get(), w_item.get()) };
+    };
     // interp_sre.py:387 `while not maxsplit or n < maxsplit` — 0 is unlimited,
     // a negative cap performs no splits; matching streams so `maxsplit` bounds
     // the scan rather than discarding already-found matches.
     let on_match = |snap: &MatchSnapshot| -> Result<(), crate::PyError> {
         let (mstart, mend) = snap.spans[0];
         // interp_sre.py:393 — the slice preceding this match.
-        results.push(slice_subject(subj, (last, mstart), w_empty));
+        append_slice((last, mstart), w_empty);
         // interp_sre.py:396-399 — interleave each group's capture; an
         // unmatched group span `(-1, -1)` becomes None via slice_subject.
         for g in 1..=num_groups {
-            results.push(slice_subject(subj, snap.spans[g], w_none()));
+            append_slice(snap.spans[g], w_none());
         }
         last = mend;
         Ok(())
@@ -1410,8 +1443,8 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         Subject::Bytes(b) => stream_matches(b, 0, endpos, code, pat, maxsplit, on_match)?,
     };
     // interp_sre.py:405 — the trailing remainder after the last match.
-    results.push(slice_subject(subj, (last, endpos as i64), w_empty));
-    Ok(w_list_new(results))
+    append_slice((last, endpos as i64), w_empty);
+    Ok(results.get())
 }
 
 // ── Replacement-template parser (`re._parser.parse_template`) ──────────
@@ -1573,52 +1606,86 @@ fn sre_match_group(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let span = do_span(m, group_args.first().copied())?;
         return Ok(unsafe { slice_w(m, span, w_none()) });
     }
-    let mut results = Vec::with_capacity(group_args.len());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let m = RootedObject::pin(m as PyObjectRef);
+    let mut results: Vec<RootedObject> = Vec::with_capacity(group_args.len());
     for &w_arg in group_args {
-        let span = do_span(m, Some(w_arg))?;
-        results.push(unsafe { slice_w(m, span, w_none()) });
+        let span = do_span(m.get() as *const W_SRE_Match, Some(w_arg))?;
+        results.push(RootedObject::pin(unsafe {
+            slice_w(m.get() as *const W_SRE_Match, span, w_none())
+        }));
     }
-    Ok(w_tuple_new(results))
+    Ok(w_tuple_new(
+        results.into_iter().map(RootedObject::get).collect(),
+    ))
 }
 
 /// `groups_w` (interp_sre.py:728-732) — pyre reads the flattened span
 /// table directly; unmatched groups (span `(-1, -1)`) take the optional
 /// `default` argument.
 fn sre_match_groups(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let m = sre_match_self(args)?;
-    let w_default = args.get(1).copied().unwrap_or_else(w_none);
-    let n = unsafe { (*m).spans_len };
-    let mut groups = Vec::new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let m = RootedObject::pin(sre_match_self(args)? as PyObjectRef);
+    let w_default = RootedObject::pin(args.get(1).copied().unwrap_or_else(w_none));
+    let n = unsafe { (*(m.get() as *const W_SRE_Match)).spans_len };
+    let mut groups: Vec<RootedObject> = Vec::new();
     for gi in 1..n {
-        let span = unsafe { w_sre_match_get_span(m as PyObjectRef, gi) }.unwrap_or((-1, -1));
-        groups.push(unsafe { slice_w(m, span, w_default) });
+        let span = unsafe { w_sre_match_get_span(m.get(), gi) }.unwrap_or((-1, -1));
+        groups.push(RootedObject::pin(unsafe {
+            slice_w(
+                m.get() as *const W_SRE_Match,
+                span,
+                w_default.get(),
+            )
+        }));
     }
-    Ok(w_tuple_new(groups))
+    Ok(w_tuple_new(
+        groups.into_iter().map(RootedObject::get).collect(),
+    ))
 }
 
 /// `groupdict_w` (interp_sre.py:735-751) — name→group-text map built by
 /// iterating `srepat.w_groupindex`; unmatched groups take `default`.
 fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let m = sre_match_self(args)?;
-    let w_default = args.get(1).copied().unwrap_or_else(w_none);
-    let w_groupindex = unsafe { (*(*m).w_srepat.cast::<W_SRE_Pattern>()).w_groupindex };
-    let w_dict = w_dict_new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let m = RootedObject::pin(sre_match_self(args)? as PyObjectRef);
+    let w_default = RootedObject::pin(args.get(1).copied().unwrap_or_else(w_none));
+    let w_groupindex = RootedObject::pin(unsafe {
+        (*(*(m.get() as *const W_SRE_Match))
+            .w_srepat
+            .cast::<W_SRE_Pattern>())
+        .w_groupindex
+    });
+    let w_dict = RootedObject::pin(w_dict_new());
     // interp_sre.py:735-751 groupdict_w — walk `w_groupindex` through the
     // object-space iterator / item protocol, resolving each value with
     // `do_span` so a duck-typed group number works.
-    let w_iterator = crate::baseobjspace::iter(w_groupindex)?;
+    let w_iterator = RootedObject::pin(crate::baseobjspace::iter(w_groupindex.get())?);
     loop {
-        let w_key = match crate::baseobjspace::next(w_iterator) {
-            Ok(k) => k,
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let w_key = match crate::baseobjspace::next(w_iterator.get()) {
+            Ok(k) => RootedObject::pin(k),
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         };
-        let w_value = crate::baseobjspace::getitem(w_groupindex, w_key)?;
-        let span = do_span(m, Some(w_value))?;
-        let w_grp = unsafe { slice_w(m, span, w_default) };
-        crate::baseobjspace::setitem(w_dict, w_key, w_grp)?;
+        let w_value = RootedObject::pin(crate::baseobjspace::getitem(
+            w_groupindex.get(),
+            w_key.get(),
+        )?);
+        let span = do_span(
+            m.get() as *const W_SRE_Match,
+            Some(w_value.get()),
+        )?;
+        let w_grp = RootedObject::pin(unsafe {
+            slice_w(
+                m.get() as *const W_SRE_Match,
+                span,
+                w_default.get(),
+            )
+        });
+        crate::baseobjspace::setitem(w_dict.get(), w_key.get(), w_grp.get())?;
     }
-    Ok(w_dict)
+    Ok(w_dict.get())
 }
 
 /// `fget_regs` (interp_sre.py:853-864) — `((start, end), ...)` for group
@@ -1701,12 +1768,17 @@ fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 pub(crate) fn sre_match_repr_str(
     m: PyObjectRef,
 ) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
-    let mp = m as *const W_SRE_Match;
-    let span = unsafe { w_sre_match_get_span(m, 0) }.unwrap_or((-1, -1));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let m = RootedObject::pin(m);
+    let mp = m.get() as *const W_SRE_Match;
+    let span = unsafe { w_sre_match_get_span(m.get(), 0) }.unwrap_or((-1, -1));
     let (start, end) = span;
     let subj = unsafe { subject_of((*mp).w_string, (*mp).w_buffer) };
-    let w_match_str = slice_subject(subj, span, w_none());
-    let matchrepr = truncate_code_points(unsafe { crate::display::py_repr_wtf8(w_match_str) }?, 50);
+    let w_match_str = RootedObject::pin(slice_subject(subj, span, w_none()));
+    let matchrepr = truncate_code_points(
+        unsafe { crate::display::py_repr_wtf8(w_match_str.get()) }?,
+        50,
+    );
     Ok(crate::display::wtf8_format!(
         format!("<re.Match object; span=({start}, {end}), match="),
         matchrepr,
