@@ -60,9 +60,9 @@ struct HeapDumpWriter {
     buffer: Vec<isize>,
 }
 
-// POSIX EIO. `libc`'s wasm32-unknown-unknown surface exposes no errno
-// constants, but inspector.py uses EIO for a short raw write on every target.
-const HEAP_DUMP_EIO: i32 = 5;
+// Some targets and host-seam failures provide no OS errno. Use the POSIX EIO
+// value for those cases so every heap-dump failure still carries an error code.
+pub const HEAP_DUMP_EIO: i32 = 5;
 
 impl HeapDumpWriter {
     const BUFSIZE: usize = 8192;
@@ -94,48 +94,58 @@ impl HeapDumpWriter {
             return Ok(());
         }
         let byte_len = self.buffer.len() * std::mem::size_of::<isize>();
-        // Neither `write` nor `_write` exists here, so no call was made and
-        // `errno` still names some unrelated earlier one. Report the dump's own
-        // failure code instead of reading a stale `errno`.
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (byte_len, self.fd);
+        // SAFETY: the initialized `isize` elements occupy exactly `byte_len`
+        // bytes and remain borrowed for the duration of the write.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), byte_len) };
+        let write_result = if let Some(result) = crate::try_heap_dump_write(self.fd, bytes) {
+            result
+        } else {
+            // Neither `write` nor `_write` exists here, so no call was made and
+            // `errno` still names some unrelated earlier one. Report the dump's own
+            // failure code instead of reading a stale `errno`.
+            #[cfg(not(any(unix, windows)))]
+            {
+                Err(HEAP_DUMP_EIO)
+            }
+            #[cfg(any(unix, windows))]
+            {
+                #[cfg(unix)]
+                let written: isize = unsafe {
+                    libc::write(
+                        self.fd,
+                        self.buffer.as_ptr().cast::<libc::c_void>(),
+                        byte_len,
+                    )
+                };
+                // The CRT entry point is `_write`, but `libc` exports it under the
+                // POSIX name with a `#[link_name = "_write"]` alias, so the Rust
+                // path is `libc::write` on this target as well. It takes a
+                // `c_uint` count and returns `c_int`, unlike the `size_t`/`ssize_t`
+                // unix signature above.
+                #[cfg(windows)]
+                let written: isize = unsafe {
+                    libc::write(
+                        self.fd,
+                        self.buffer.as_ptr().cast::<libc::c_void>(),
+                        byte_len as libc::c_uint,
+                    ) as isize
+                };
+                if written < 0 {
+                    Err(std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(HEAP_DUMP_EIO))
+                } else {
+                    Ok(written)
+                }
+            }
+        };
+        let written = write_result?;
+        if written as usize != byte_len {
             return Err(HEAP_DUMP_EIO);
         }
-        #[cfg(any(unix, windows))]
-        {
-            #[cfg(unix)]
-            let written: isize = unsafe {
-                libc::write(
-                    self.fd,
-                    self.buffer.as_ptr().cast::<libc::c_void>(),
-                    byte_len,
-                )
-            };
-            // The CRT entry point is `_write`, but `libc` exports it under the
-            // POSIX name with a `#[link_name = "_write"]` alias, so the Rust
-            // path is `libc::write` on this target as well. It takes a
-            // `c_uint` count and returns `c_int`, unlike the `size_t`/`ssize_t`
-            // unix signature above.
-            #[cfg(windows)]
-            let written: isize = unsafe {
-                libc::write(
-                    self.fd,
-                    self.buffer.as_ptr().cast::<libc::c_void>(),
-                    byte_len as libc::c_uint,
-                ) as isize
-            };
-            if written < 0 {
-                return Err(std::io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(HEAP_DUMP_EIO));
-            }
-            if written as usize != byte_len {
-                return Err(HEAP_DUMP_EIO);
-            }
-            self.buffer.clear();
-            Ok(())
-        }
+        self.buffer.clear();
+        Ok(())
     }
 }
 

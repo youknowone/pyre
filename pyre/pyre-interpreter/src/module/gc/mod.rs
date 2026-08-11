@@ -981,7 +981,21 @@ fn gc_call_method(
     }
 }
 
+#[cfg(feature = "sandbox")]
+fn heap_dump_write_via_host(fd: i32, bytes: &[u8]) -> Result<isize, i32> {
+    crate::host_seam::ops::write(fd, bytes)
+        .map(|written| written as isize)
+        // A non-OS seam failure still needs an errno. Use the collector's code
+        // for targets and failure modes that cannot supply one.
+        .map_err(|error| match error {
+            crate::host_seam::SeamError::Os(errno) => errno,
+            _ => majit_gc::HEAP_DUMP_EIO,
+        })
+}
+
 fn dump_rpy_heap_fd(fd: i32) -> Result<(), crate::PyError> {
+    #[cfg(feature = "sandbox")]
+    majit_gc::set_heap_dump_write(Some(heap_dump_write_via_host));
     match majit_gc::dump_rpy_heap(fd) {
         Ok(true) => Ok(()),
         Ok(false) => Err(crate::PyError::not_implemented(
