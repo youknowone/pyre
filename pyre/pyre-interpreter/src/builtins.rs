@@ -4447,6 +4447,15 @@ pub fn is_builtin_ord_function(callable: PyObjectRef) -> bool {
     }
 }
 
+/// True iff `callable` is the canonical builtin `isinstance` function object.
+///
+/// The JIT replay-safety check combines this identity with the non-overridable
+/// paths through `abstractinst.py`; a rebound global must not inherit that
+/// classification merely because it is still named `isinstance`.
+pub fn is_builtin_isinstance_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, __pyre_wrap_builtin_isinstance)
+}
+
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -18068,6 +18077,22 @@ mod tests {
         assert!(is_builtin_ord_function(ord));
         assert!(!is_builtin_ord_function(renamed_ord));
         assert!(!is_builtin_ord_function(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn builtin_isinstance_identity_uses_manual_gateway_wrapper() {
+        crate::typedef::init_typeobjects();
+        let isinstance = make_module_builtin_function_with_arity(
+            "isinstance",
+            __pyre_wrap_builtin_isinstance,
+            2,
+        );
+        let renamed_isinstance =
+            make_module_builtin_function_with_arity("isinstance", builtin_repr, 2);
+
+        assert!(is_builtin_isinstance_function(isinstance));
+        assert!(!is_builtin_isinstance_function(renamed_isinstance));
+        assert!(!is_builtin_isinstance_function(std::ptr::null_mut()));
     }
 
     #[test]
