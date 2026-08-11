@@ -1631,7 +1631,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
             *c.borrow_mut() = stack_overrides;
         });
-        return Err(DispatchError::callee_inline_unsupported(pc));
+        return Err(DispatchError::callee_inline_blackhole_required(pc));
     }
     Ok(())
 }

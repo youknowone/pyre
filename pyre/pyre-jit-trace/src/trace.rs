@@ -2003,6 +2003,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 let stop_op = match e {
                     crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
                         pc,
+                        ..
                     }
                     | crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached {
                         pc,
@@ -4006,13 +4007,17 @@ fn run_perfn_walk<Sym: WalkSym>(
         // pyjitpl` (`blackhole.py:1799`) finishes the frames instead, which is
         // what the latch staged.
         //
-        // Four classes keep their own, more precise recovery and are excluded
+        // Three classes keep their own, more precise recovery and are excluded
         // so this general leg cannot pre-empt them:
         // `VableEscapedDuringResidualCall` latches a narrower resume-marker
         // image and has an escape-pc fallback (arm below);
-        // `AbortPermanentMarkerReached` / `LoopBearingCalleeInlineUnsupported`
-        // route to the gh#467 CALL-forward carrier, which resumes the OUTER
-        // frame at its CALL rather than inside the discarded callee attempt;
+        // `LoopBearingCalleeInlineUnsupported { blackhole_required: false }`
+        // and `AbortPermanentMarkerReached` are not in
+        // `leaves_complete_image`: they route to the gh#467 CALL-forward
+        // carrier, which resumes the OUTER frame at its CALL rather than
+        // inside the discarded callee attempt.  The exact nested-residual
+        // variant marked `blackhole_required: true` instead owns a complete
+        // per-frame image and deliberately reaches this PyPy-style handoff;
         // `ForceQuasiImmutable` resumes AT the forcing opcode via
         // `flush_qmut_abort_state` (arm below), which re-runs the write the
         // walk stopped in front of instead of finishing the frame past it.
@@ -4032,14 +4037,13 @@ fn run_perfn_walk<Sym: WalkSym>(
         // shape whose caller banks are incomplete and dies on an unwired
         // blackhole opcode.
         let walk_abort_adopted = !trace_too_long_adopted
-            && matches!(&walk_result, Err(error) if error.leaves_complete_image() && !matches!(
-                error,
-                crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
-                    | crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
-                    | crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { .. }
-                    | crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported { .. }
-                    | crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
-            ))
+            && matches!(&walk_result, Err(error) if error.leaves_complete_image()
+                && !matches!(
+                    error,
+                    crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+                        | crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
+                        | crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
+                ))
             && walk_abort_leg_enabled()
             && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::WalkAbort);
         if walk_abort_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -4140,6 +4144,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
             Err(crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
                 pc,
+                ..
             }) => Some((*pc, false, false)),
             Err(
                 crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
@@ -4152,7 +4157,9 @@ fn run_perfn_walk<Sym: WalkSym>(
             _ => None,
         };
         let mut committed_entry_carrier_call_py_pc = None;
-        if let Some((abort_jit_pc, is_marker_abort, entry_carrier_only)) = call_forward_abort {
+        if !walk_abort_adopted
+            && let Some((abort_jit_pc, is_marker_abort, entry_carrier_only)) = call_forward_abort
+        {
             // gh#467: a supported abort fired inside a TOP-level inline
             // sub-walk whose callee executed no concrete effect
             // (`try_walker_inline_user_call` latched the carrier only under
@@ -4319,6 +4326,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         }
         if let Err(crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
             pc,
+            ..
         }) = &walk_result
         {
             let abort_jit_pc = *pc;

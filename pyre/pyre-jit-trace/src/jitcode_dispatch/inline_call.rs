@@ -4453,7 +4453,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             Err(DispatchError::AbortPermanentMarkerReached { pc }) => {
                 Some((*pc, MidBodyAbortKind::Marker))
             }
-            Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc })
+            Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc, .. })
                 if fbw_structural_abort_opcode_is_effect_free(*pc) =>
             {
                 Some((*pc, MidBodyAbortKind::Structural))
@@ -5402,7 +5402,10 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
             (norm, live_norm)
         } else {
             let Some(concrete_result) = concrete_result else {
-                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                return Err(DispatchError::LoopBearingCalleeInlineUnsupported {
+                    pc: op.pc,
+                    blackhole_required: false,
+                });
             };
             let raw = crate::helpers::emit_trace_call_int_typed(
                 ctx.trace_ctx,
