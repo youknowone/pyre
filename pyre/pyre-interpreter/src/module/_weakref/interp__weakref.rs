@@ -1528,9 +1528,7 @@ pub fn proxy_trunc(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 pub fn proxy_str(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    Ok(pyre_object::w_str_from_wtf8(unsafe {
-        crate::display::py_str_wtf8(w_obj0)?
-    }))
+    crate::builtins::builtin_str(&[w_obj0])
 }
 
 pub fn proxy_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
