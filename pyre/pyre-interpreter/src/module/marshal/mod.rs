@@ -82,31 +82,52 @@ fn marshal_buffer_bytes(obj: PyObjectRef) -> Result<Option<Vec<u8>>, PyError> {
 /// sufficient because marshal streams normally contain few shared objects;
 /// each entry is a shadow-stack slot so a collection updates object identity.
 struct WriterRefs {
-    slots: Vec<usize>,
+    entries: Vec<WriterRefEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct WriterRefEntry {
+    slot: usize,
+    incomplete: bool,
 }
 
 impl WriterRefs {
     fn new() -> Self {
-        Self { slots: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
-    fn find(&self, obj: PyObjectRef) -> Option<u32> {
+    fn find(&self, obj: PyObjectRef) -> Option<(u32, bool)> {
         let obj =
             pyre_object::gc_hook::try_gc_current_object_address(obj as *mut u8) as PyObjectRef;
-        self.slots
+        self.entries
             .iter()
-            .position(|&slot| std::ptr::eq(pyre_object::gc_roots::shadow_stack_get(slot), obj))
-            .and_then(|index| u32::try_from(index).ok())
+            .position(|entry| {
+                std::ptr::eq(pyre_object::gc_roots::shadow_stack_get(entry.slot), obj)
+            })
+            .and_then(|index| {
+                u32::try_from(index)
+                    .ok()
+                    .map(|index| (index, self.entries[index as usize].incomplete))
+            })
     }
 
-    fn reserve(&mut self, obj: PyObjectRef) -> Result<(), PyError> {
-        if self.slots.len() >= i32::MAX as usize {
+    fn reserve(&mut self, obj: PyObjectRef, incomplete: bool) -> Result<u32, PyError> {
+        if self.entries.len() >= i32::MAX as usize {
             return Err(PyError::value_error("too many objects to marshal"));
         }
+        let index = self.entries.len() as u32;
         let slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(obj);
-        self.slots.push(slot);
-        Ok(())
+        self.entries.push(WriterRefEntry { slot, incomplete });
+        Ok(index)
+    }
+
+    fn complete(&mut self, index: u32) {
+        let entry = &mut self.entries[index as usize];
+        debug_assert!(entry.incomplete);
+        entry.incomplete = false;
     }
 }
 
@@ -134,8 +155,17 @@ fn write_object(
 
     if !is_singleton(obj)
         && let Some(table) = refs.as_ref()
-        && let Some(index) = table.find(obj)
+        && let Some((index, incomplete)) = table.find(obj)
     {
+        // CPython 3.14 `w_ref`: code and slice entries retain the high-bit
+        // incomplete marker until `w_complete`, because their immutable
+        // representation cannot be reconstructed from a recursive reference.
+        if incomplete {
+            return Err(PyError::value_error(format!(
+                "cannot marshal recursion {} objects",
+                unsafe { pyre_object::type_name_of(obj) }
+            )));
+        }
         out.write_u8(b'r');
         out.write_u32(index);
         return Ok(());
@@ -143,9 +173,14 @@ fn write_object(
 
     let type_pos = out.len();
     let use_ref = refs.is_some() && !is_singleton(obj);
-    if use_ref {
-        refs.as_mut().unwrap().reserve(obj)?;
-    }
+    // CPython 3.14 `w_ref` marks only code and slice objects incomplete and
+    // clears that marker in `w_complete` after their contents are written.
+    let requires_completion = unsafe { crate::pycode::is_code(obj) || is_slice(obj) };
+    let ref_index = if use_ref {
+        Some(refs.as_mut().unwrap().reserve(obj, requires_completion)?)
+    } else {
+        None
+    };
 
     // PyPy `marshal`: instances of user heap types skip the builtin
     // marshaller table completely.  They may still reach the buffer fallback
@@ -285,6 +320,9 @@ fn write_object(
 
     if use_ref {
         out[type_pos] |= wire::FLAG_REF;
+    }
+    if requires_completion && let (Some(table), Some(index)) = (refs.as_mut(), ref_index) {
+        table.complete(index);
     }
     Ok(())
 }
