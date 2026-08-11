@@ -172,7 +172,7 @@ fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         out.push_wtf8(&unsafe { crate::py_repr_wtf8(item)? });
     }
     out.push_str(")");
-    Ok(pyre_object::w_str_from_wtf8(out))
+    Ok(pyre_object::w_str_from_wtf8_managed(out))
 }
 
 /// `lib_pypy/_structseq.py structseq_reduce` — `return type(self),
