@@ -35,16 +35,24 @@
 //! turns it off where the env is readable.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Tri-state: 0 = not yet read from env, 1 = disabled, 2 = enabled.
 static STATE: AtomicU8 = AtomicU8::new(0);
 
+/// A semantic old-gen collection requested by a fork child callback.
+///
+/// This is process-global because the request belongs to the post-fork
+/// interpreter, not to the native thread that happened to execute the hook.
+/// Keep it outside the eval-breaker word while a re-entrant callback is too
+/// deep to expose a complete root set; [`note_eval_activation_exit`] re-arms
+/// the breaker once that callback has unwound.
+static EXPLICIT_OLDGEN_REQUEST: AtomicBool = AtomicBool::new(false);
+
 thread_local! {
     /// Number of interpreter eval-loop activations currently on this
     /// thread's call stack (both the plain `eval_loop` and the JIT
-    /// `eval_loop_jit`). Maintained only while the flag is on, via
-    /// [`EvalActivationGuard`]. The dispatch-loop safepoint consults it so
+    /// `eval_loop_jit`). The dispatch-loop safepoint consults it so
     /// a collection only fires at the OUTERMOST activation — see
     /// [`at_outermost_activation`].
     static EVAL_NESTING: Cell<u32> = const { Cell::new(0) };
@@ -52,8 +60,10 @@ thread_local! {
 
 /// RAII guard that counts one interpreter eval-loop activation. Construct it
 /// at the top of `eval_loop` / `eval_loop_jit`; the matching `Drop` rewinds
-/// the depth on every exit path (normal return, `?`, unwind). A no-op when
-/// the flag is off, so the un-gated interpreter pays nothing.
+/// the depth on every exit path (normal return, `?`, unwind). `armed` records
+/// whether the ordinary interpreter-allocation GC integration is enabled;
+/// nesting itself is always tracked because an explicit post-fork request must
+/// obey the same root-completeness rule when that feature is off.
 pub struct EvalActivationGuard {
     armed: bool,
 }
@@ -73,16 +83,21 @@ pub fn note_eval_activation_enter() {
 /// same residual contract.
 #[majit_macros::dont_look_inside]
 pub fn note_eval_activation_exit() {
-    EVAL_NESTING.with(|d| d.set(d.get().saturating_sub(1)));
+    let depth = EVAL_NESTING.with(|d| {
+        let depth = d.get().saturating_sub(1);
+        d.set(depth);
+        depth
+    });
+    if depth <= 2 && EXPLICIT_OLDGEN_REQUEST.load(Ordering::Acquire) {
+        majit_gc::collector::request_deferred_major_collection();
+    }
 }
 
 impl EvalActivationGuard {
     #[inline]
     pub fn enter() -> Self {
         let armed = enabled();
-        if armed {
-            note_eval_activation_enter();
-        }
+        note_eval_activation_enter();
         Self { armed }
     }
 
@@ -95,9 +110,7 @@ impl EvalActivationGuard {
 impl Drop for EvalActivationGuard {
     #[inline]
     fn drop(&mut self) {
-        if self.armed {
-            note_eval_activation_exit();
-        }
+        note_eval_activation_exit();
     }
 }
 
@@ -265,14 +278,24 @@ pub fn would_collect() -> bool {
 /// residual adds no hot-path cost the un-residualized form did not already pay.
 #[majit_macros::dont_look_inside]
 pub fn safepoint() {
-    if !enabled() {
-        return;
-    }
     // Take any request the old-gen allocator armed, and take it before the
     // decision below: the bit is a compiled loop's deopt trigger, so one left
     // armed by a safepoint that declined to collect fires again on the next
     // back edge, and the next.
     let requested = majit_gc::collector::take_deferred_major_request();
+    if EXPLICIT_OLDGEN_REQUEST.load(Ordering::Acquire) {
+        if !at_outermost_activation() {
+            // Leave the semantic request pending outside the breaker word.
+            // Re-arming here would deopt every compiled back edge until the
+            // native callback unwinds; the activation guard does it once on
+            // the eligible transition instead.
+            return;
+        }
+        if EXPLICIT_OLDGEN_REQUEST.swap(false, Ordering::AcqRel) {
+            crate::gc_hook::try_gc_collect_oldgen();
+            return;
+        }
+    }
     if !would_collect() {
         return;
     }
@@ -283,6 +306,15 @@ pub fn safepoint() {
     if requested || (poll_due() && crate::gc_hook::try_gc_major_threshold_reached()) {
         crate::gc_hook::try_gc_collect_oldgen();
     }
+}
+
+/// Ask the next root-complete bytecode dispatch to run a non-moving old-gen
+/// collection.  Unlike [`majit_gc::collect_full`], this cannot relocate a
+/// nursery reference held by the caller while it unwinds back to the loop.
+#[majit_macros::dont_look_inside]
+pub fn request_oldgen_collection() {
+    EXPLICIT_OLDGEN_REQUEST.store(true, Ordering::Release);
+    majit_gc::collector::request_deferred_major_collection();
 }
 
 /// Whether the safepoint actually collects. Off via `PYRE_GC_INTERP_COLLECT=0`

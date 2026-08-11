@@ -67,6 +67,13 @@ pub fn take_deferred_major_request() -> bool {
     majit_ir::eval_breaker_word::take_gc()
 }
 
+/// Arm a major collection request for the next root-complete interpreter
+/// dispatch.  Hosts use this when collection is required for semantics rather
+/// than because an allocation crossed the collector's threshold.
+pub fn request_deferred_major_collection() {
+    majit_ir::eval_breaker_word::set_gc();
+}
+
 /// Configuration for the MiniMarkGC.
 pub struct GcConfig {
     /// Nursery size in bytes.

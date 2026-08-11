@@ -1144,7 +1144,7 @@
       "dynasm": "PASS"
     },
     "test.test_threading": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_threading_local": {
       "dynasm": "PASS"

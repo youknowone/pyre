@@ -5927,23 +5927,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         Ok(0) => {
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
-                            // rposix.py `_exit` from the fork wrapper returns
-                            // directly after `gc_thread_after_fork` and the
-                            // registered child hooks.  Do not introduce a
-                            // full collection/finalizer drain here: arbitrary
-                            // inherited Python objects may be mid-lifecycle,
-                            // and PyPy only runs app-level finalizers at their
-                            // ordinary safe points after the child resumes.
-                            //
-                            // What a collection here would buy is the stale
-                            // `_MainThread` that `threading._after_fork` drops
-                            // on return: a refcounting collector clears its
-                            // `_dangling` weakref before `os.fork()` returns, a
-                            // tracing one does not.  That is not a defect to
-                            // repair — pypy3 7.3.20 prints the same two
-                            // `MainThread` entries this arm leaves behind, so
-                            // `test_main_thread_after_fork_from_foreign_thread`
-                            // and its dummy-thread twin fail there too.
+                            // CPython's refcounting drops the replaced
+                            // `_MainThread` before os.fork() returns, so its
+                            // weakref has disappeared from `_dangling` when
+                            // child Python code next runs.  A tracing GC needs
+                            // an explicit reachability pass for the same
+                            // observable result.  Defer a non-moving old-gen
+                            // pass to the next bytecode boundary: collecting
+                            // here would run while this native builtin still
+                            // owns unregistered Rust-stack temporaries, and a
+                            // moving full collection would be unsafe.
+                            pyre_object::gc_interp::request_oldgen_collection();
                             drop(fork_serial);
                             Ok(pyre_object::w_int_new(0))
                         }

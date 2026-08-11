@@ -7855,7 +7855,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // pyframe root walker; no bytecode handler holds a Rust-stack temporary
         // here. A no-op unless the flag is on and enough interpreter objects
         // have accumulated to warrant a collection.
-        if dispatch_breaker & majit_ir::eval_breaker_word::EB_GC_INTERP != 0 {
+        if dispatch_breaker
+            & (majit_ir::eval_breaker_word::EB_GC_INTERP | majit_ir::eval_breaker_word::EB_GC)
+            != 0
+        {
             pyre_object::gc_interp::safepoint();
         }
 

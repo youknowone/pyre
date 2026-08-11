@@ -2149,7 +2149,10 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // the flag is on and enough interpreter objects have accumulated.
         // Without it, a JIT-off run reclaims interpreter-routed old-gen
         // allocations only at explicit `gc.collect`, so RSS grows unbounded.
-        if dispatch_breaker & majit_ir::eval_breaker_word::EB_GC_INTERP != 0 {
+        if dispatch_breaker
+            & (majit_ir::eval_breaker_word::EB_GC_INTERP | majit_ir::eval_breaker_word::EB_GC)
+            != 0
+        {
             pyre_object::gc_interp::safepoint();
         }
         // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
