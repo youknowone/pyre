@@ -391,7 +391,10 @@ _RESOURCE_DRIVER = (
     "from test import support\n"
     'if __name__ == "__main__":\n'
     "    support.use_resources = {{}}\n"
-    "    runpy.run_path({path!r}, run_name='__main__')\n"
+    "    try:\n"
+    "        runpy.run_path({path!r}, run_name='__main__')\n"
+    "    except support.ResourceDenied as exc:\n"
+    "        print('skipped: %s' % exc)\n"
 )
 
 # test_descr and test_enum assert fully qualified class/enum names. Running
@@ -413,12 +416,27 @@ DOTTED_IDENTITY_MODULES = {
     "test.test_threading",
 }
 
+# These suites create many child interpreters or threads of their own.  Running
+# them inside the module-level worker pool can exhaust process/thread resources
+# and turn an otherwise 20-second pass into a five-minute timeout.
+SERIAL_MODULES = {
+    "test.test_regrtest",
+    "test.test_thread",
+    "test.test_threading",
+}
+
 # Modules whose resource-gated tests are ruinous when test.support.use_resources
 # is left as None: test_datetime's load_tests then appends an exhaustive test
-# class for every installed system timezone, and test_zipimport's Zip64 arms
-# build archives past 4 GiB, which cost 290s and over 6 GB of RSS.
-# libregrtest and PyPy's conftest use an empty default resource set.
-DEFAULT_RESOURCE_MODULES = {"test.test_datetime", "test.test_zipimport"}
+# class for every installed system timezone, test_urllibnet performs live
+# external HTTP requests, and test_zipimport's Zip64 arms build archives past
+# 4 GiB, which cost 290s and over 6 GB of RSS.  libregrtest and PyPy's conftest
+# use an empty default resource set; the driver also turns a module-level
+# ResourceDenied into a clean skip.
+DEFAULT_RESOURCE_MODULES = {
+    "test.test_datetime",
+    "test.test_urllibnet",
+    "test.test_zipimport",
+}
 
 
 def build_cmd(binary: Path, module: str, mode: str) -> list[str]:
@@ -659,26 +677,37 @@ def main() -> int:
           f"timeout={args.timeout}s\n")
 
     results: dict[str, tuple[str, str]] = {}
+    done = 0
+
+    def record_result(module: str, result: tuple[str, str]) -> None:
+        nonlocal done
+        status, detail = result
+        results[module] = (status, detail)
+        done += 1
+        # Every member of STATUSES needs a mark, SKIP included: a module
+        # that runs and bails with SkipTest is classified SKIP (:229),
+        # which is a different event from a module deselected before the
+        # run, and without its own mark it printed as "?" — the character
+        # reserved for a status this table does not know.
+        mark = {"PASS": "·", "FAIL": "F", "CRASH": "C", "TIMEOUT": "T",
+                "IMPORTERROR": "i", "SKIP": "s"}.get(status, "?")
+        sys.stdout.write(mark)
+        sys.stdout.flush()
+        if done % 80 == 0:
+            sys.stdout.write(f" {done}/{len(to_run)}\n")
+
+    parallel_modules = [m for m in to_run if m not in SERIAL_MODULES]
+    serial_modules = [m for m in to_run if m in SERIAL_MODULES]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futs = {pool.submit(run_module, binary, m, args.mode, args.timeout, env): m
-                for m in to_run}
-        done = 0
+        futs = {
+            pool.submit(run_module, binary, m, args.mode, args.timeout, env): m
+            for m in parallel_modules
+        }
         for fut in concurrent.futures.as_completed(futs):
             m = futs[fut]
-            status, detail = fut.result()
-            results[m] = (status, detail)
-            done += 1
-            # Every member of STATUSES needs a mark, SKIP included: a module
-            # that runs and bails with SkipTest is classified SKIP (:229),
-            # which is a different event from a module deselected before the
-            # run, and without its own mark it printed as "?" — the character
-            # reserved for a status this table does not know.
-            mark = {"PASS": "·", "FAIL": "F", "CRASH": "C", "TIMEOUT": "T",
-                    "IMPORTERROR": "i", "SKIP": "s"}.get(status, "?")
-            sys.stdout.write(mark)
-            sys.stdout.flush()
-            if done % 80 == 0:
-                sys.stdout.write(f" {done}/{len(to_run)}\n")
+            record_result(m, fut.result())
+    for m in serial_modules:
+        record_result(m, run_module(binary, m, args.mode, args.timeout, env))
     print()
 
     # Summary by status.
