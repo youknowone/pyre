@@ -825,7 +825,7 @@ fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) ->
     gc_roots::pin_root(exc);
     // The note quotes a key the caller supplied, which may hold a lone
     // surrogate, so it is carried as the WTF-8 it is.
-    let note = pyre_object::w_str_from_wtf8(note.into());
+    let note = pyre_object::w_str_from_wtf8_managed(note.into());
     let note_slot = gc_roots::shadow_stack_len();
     gc_roots::pin_root(note);
     if let Ok(add_note) =
