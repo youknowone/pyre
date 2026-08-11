@@ -1376,7 +1376,9 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // is not valid WTF-8; fall back to surrogateescape rather than raising,
         // mirroring str_decode_locale_surrogateescape.
         let result = match rustpython_wtf8::Wtf8Buf::from_bytes(rendered) {
-            Ok(wtf8) => pyre_object::w_str_from_wtf8(wtf8),
+            // interp_time.py:1188 returns `space.newutf8(decoded, size)`:
+            // strftime's formatted value is an ordinary runtime string.
+            Ok(wtf8) => pyre_object::w_str_from_wtf8_managed(wtf8),
             Err(bytes) => crate::typedef::charp2uni(&bytes),
         };
         Ok(result)
@@ -1411,7 +1413,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     // surrogateescape rather than raising.
                     let rendered = buf[..n].to_vec();
                     return Ok(match rustpython_wtf8::Wtf8Buf::from_bytes(rendered) {
-                        Ok(wtf8) => w_str_from_wtf8(wtf8),
+                        Ok(wtf8) => w_str_from_wtf8_managed(wtf8),
                         Err(bytes) => crate::typedef::charp2uni(&bytes),
                     });
                 }
