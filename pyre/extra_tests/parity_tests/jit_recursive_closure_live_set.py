@@ -29,3 +29,5 @@ for base in (2, 5):
         for limit in (1, 11):
             for width in range(250, 550):
                 expected_powers(width, base, limit, need_hi)
+
+print("OK")
