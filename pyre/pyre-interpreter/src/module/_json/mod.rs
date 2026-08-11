@@ -115,10 +115,17 @@ fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyRes
         json_decode_error("Unterminated string starting at".to_owned(), doc, start)
     })?;
     match machinery::scan_string(rest, start, strict) {
-        Ok((decoded, next, _)) => Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_from_wtf8(decoded),
-            pyre_object::w_int_new(next as i64),
-        ])),
+        Ok((decoded, next, _)) => {
+            let _roots = gc_roots::push_roots();
+            let decoded_slot = gc_roots::shadow_stack_len();
+            gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(decoded));
+            let next_slot = gc_roots::shadow_stack_len();
+            gc_roots::pin_root(pyre_object::w_int_new(next as i64));
+            Ok(pyre_object::w_tuple_new(vec![
+                gc_roots::shadow_stack_get(decoded_slot),
+                gc_roots::shadow_stack_get(next_slot),
+            ]))
+        }
         Err(err) => Err(json_decode_error(err.msg, doc, err.pos)),
     }
 }
