@@ -19,6 +19,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1555,6 +1556,81 @@ def ensure_charon_std(charon_bin: Path, targets: list[str], root: Path) -> None:
             )
 
 
+def touch_and_note(target: Path, own_writes: dict[tuple[int, int], int]) -> None:
+    """`touch` a path and record the mtime that touch produced.
+
+    Every touch of a closure input must go through this rather than
+    `Path.touch()`. `window_writes` tells the extractor's own writes from a
+    peer's by comparing against the exact mtime recorded here, so a touch that
+    is not recorded is reported as a candidate on every clean run — and a
+    reviewer who sees four false alarms per run stops reading the output.
+
+    Pairing the write with its record in ONE call is what keeps them from
+    drifting. There are already two touch sites (the crate root before the
+    charon build, and again before each cross-target layout build), the second
+    is easy to miss, and the failure it causes is a permanent false positive
+    rather than an error.
+
+    Keyed by `(st_dev, st_ino)` rather than by path so it cannot be defeated by
+    two spellings of one file, and in nanoseconds because `st_mtime` is a float
+    whose rounding makes exact equality unreliable.
+    """
+    target.touch()
+    st = target.stat()
+    own_writes[(st.st_dev, st.st_ino)] = st.st_mtime_ns
+
+
+def window_writes(
+    inputs: list[Path],
+    root: Path,
+    lo_ns: int,
+    hi_ns: int,
+    own_writes: dict[tuple[int, int], int],
+) -> tuple[list[tuple[int, Path]], int, list[str]]:
+    """Closure inputs written while this crate was being extracted.
+
+    The stamp comparison beside this one is an ENDPOINT check: it hashes the
+    tree before the build and again after. That is blind to the write that
+    matters most — an edit that opens and closes INSIDE the build re-converges,
+    so both hashes agree, `git status` and `git diff` are clean, and the
+    artefact is stamped over a tree that briefly was not the one it names.
+
+    A restore is itself a write, so mtime lands inside the window even when the
+    bytes came back. That is the only channel that retains the event, and it
+    retains it for a short time: mtime holds ONE value, so the next ordinary
+    write destroys it. That is why this runs here, in the producer, at the
+    moment the window closes — a sweep run later is not a weaker version of
+    this check, it silently answers a different question.
+
+    Returns `(candidates, covered, unresolved)`. `candidates` is the word on
+    purpose: this names files, never an author.
+
+    KNOWN LIMITS, printed by the caller rather than filed elsewhere:
+      * An mtime-preserving restore (`cp -p`) defeats it completely.
+      * A write that landed before this crate's own `touch` of the same file is
+        overwritten by that touch and cannot be seen.
+      * It has never produced a real-world true positive; it is proven to fire
+        on a constructed edit-and-restore only.
+    """
+    candidates: list[tuple[int, Path]] = []
+    unresolved: list[str] = []
+    for rel in inputs:
+        try:
+            st = (root / rel).stat()
+        except OSError as exc:
+            # Reported, never skipped silently: an input the sweep could not
+            # read is a hole in its own denominator.
+            unresolved.append(f"{rel.as_posix()} ({exc.strerror})")
+            continue
+        if not lo_ns <= st.st_mtime_ns <= hi_ns:
+            continue
+        if own_writes.get((st.st_dev, st.st_ino)) == st.st_mtime_ns:
+            continue  # our own touch, to the nanosecond
+        candidates.append((st.st_mtime_ns, rel))
+    candidates.sort()
+    return candidates, len(inputs) - len(unresolved), unresolved
+
+
 def extract(eng: Engine, args: argparse.Namespace) -> None:
     cargo_features = eng.cargo_features
     platform_key, charon_dest, charon_bin = charon_paths(eng.charon_root)
@@ -1660,6 +1736,11 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # that is about to run for minutes. See `provenance_for`.
         head_before = git_head(eng.root)
         started = datetime.datetime.now().isoformat(timespec="seconds")
+        # The window is opened from THIS process's clock, not from an
+        # argument: a bound supplied by a caller is a bound nobody can
+        # check, and a guessed one reads exactly like a measured one.
+        window_lo_ns = time.time_ns()
+        own_writes: dict[tuple[int, int], int] = {}
         dirty_status_before, dirty_entries_before = git_dirty(eng.root)
         dirty_before = (
             len(dirty_entries_before) if dirty_status_before == "ok" else None
@@ -1678,7 +1759,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         crate_root = path / "src" / "lib.rs"
         if not crate_root.exists():
             crate_root = path / "src" / "main.rs"
-        crate_root.touch()
+        touch_and_note(crate_root, own_writes)
 
         host_env = {**env, **host_config_env}
         command = [
@@ -1723,7 +1804,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     layout_env.get("RUSTFLAGS", "") + " " + eng.layout_target_rustflags
                 ).strip()
             full = sidecar.with_suffix(sidecar.suffix + ".full")
-            crate_root.touch()
+            touch_and_note(crate_root, own_writes)
             subprocess.run(
                 [
                     str(charon_bin),
@@ -1812,6 +1893,31 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # built from other sources. Re-stamping with the post-build value would
         # be equally untrue: the artefact straddles both trees and belongs to
         # neither, and a stamp that looks authoritative is worse than none.
+        # Sited BEFORE the stamp decision so it reports on both branches:
+        # when the stamp is refused, "the tree moved" is exactly when a reader
+        # wants the file names, and when it is accepted this is the only check
+        # that saw the middle of the window at all.
+        moved, covered, unresolved = window_writes(
+            fingerprint_inputs(eng, [crate], cargo_features),
+            eng.root,
+            window_lo_ns,
+            time.time_ns(),
+            own_writes,
+        )
+        print(
+            f"    window writes: {len(moved)} candidate(s) over {covered} of"
+            f" {covered + len(unresolved)} closure inputs"
+        )
+        for _, rel in moved:
+            print(f"        {rel.as_posix()}")
+        for line in unresolved:
+            print(f"        UNRESOLVED {line}")
+        if moved:
+            print(
+                "      Those paths were written while this artefact was being"
+                " built. Candidates, not an accusation, and blind to an"
+                " mtime-preserving restore."
+            )
         if source_fingerprint(eng, [crate], cargo_features) != parse_stamp(stamp)["source"]:
             stamp_path.unlink(missing_ok=True)
             unstamped.append(crate)
