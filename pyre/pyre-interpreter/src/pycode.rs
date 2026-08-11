@@ -1677,7 +1677,15 @@ unsafe fn read_code_units(v: PyObjectRef) -> Result<crate::bytecode::CodeUnits, 
     Ok(crate::bytecode::CodeUnits::from(units))
 }
 
-/// A `tuple` `co_consts` field → the compiler `Constants` table.
+/// A `tuple` `co_consts` field → the compiler `Constants` backing table.
+///
+/// PyPy stores the supplied wrapped objects directly in `co_consts_w`
+/// (`pycode.py:126`).  Pyre's compiler table still needs one entry per wrapped
+/// object so bytecode indices remain valid, but it is not the semantic owner:
+/// values the compiler enum cannot represent use `None` only as an unobserved
+/// shape placeholder.  `w_code_fill_consts_from_tuple` immediately installs
+/// every supplied object in the authoritative wrapped slots, and LOAD_CONST
+/// plus marshal both read those slots.
 unsafe fn read_code_consts(
     v: PyObjectRef,
 ) -> Result<crate::bytecode::Constants<crate::bytecode::ConstantData>, crate::PyError> {
@@ -1688,17 +1696,15 @@ unsafe fn read_code_consts(
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let e = pyre_object::w_tuple_getitem(v, i as i64).unwrap_or_else(pyre_object::w_none);
-        out.push(unsafe { obj_to_constant_data(e)? });
+        out.push(unsafe { obj_to_constant_data(e) }.unwrap_or(crate::bytecode::ConstantData::None));
     }
     Ok(out.into_iter().collect())
 }
 
-/// Convert a Python object into the compiler `ConstantData` a code object
-/// stores.  Covers None/Ellipsis/bool/int/float/str/bytes/tuple and nested
-/// code; `complex` and `frozenset` constants (rare in a replaced
-/// `co_consts`) and any object that is not a valid code constant raise
-/// `ValueError` (pyre's constant table cannot hold an arbitrary object the
-/// way a CPython `co_consts` tuple can).
+/// Convert a Python object into compiler `ConstantData` when that enum can
+/// represent it.  Callers that need a literal compiler constant propagate the
+/// `ValueError`; `read_code_consts` instead supplies a shape placeholder and
+/// retains the arbitrary object in PyPy's authoritative `co_consts_w` slot.
 pub(crate) unsafe fn obj_to_constant_data(
     obj: PyObjectRef,
 ) -> Result<crate::bytecode::ConstantData, crate::PyError> {

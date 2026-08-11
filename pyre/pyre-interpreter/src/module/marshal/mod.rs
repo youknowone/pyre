@@ -136,6 +136,111 @@ fn is_singleton(obj: PyObjectRef) -> bool {
         || crate::builtins::lookup_exc_class("StopIteration") == Some(obj)
 }
 
+fn write_len(out: &mut Vec<u8>, len: usize) -> Result<(), PyError> {
+    out.write_u32(
+        len.try_into()
+            .map_err(|_| PyError::value_error("object too large to marshal"))?,
+    );
+    Ok(())
+}
+
+fn write_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), PyError> {
+    out.write_u8(b's');
+    write_len(out, value.len())?;
+    out.write_slice(value);
+    Ok(())
+}
+
+fn write_marshal_str(out: &mut Vec<u8>, value: &str) -> Result<(), PyError> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 256 && bytes.is_ascii() {
+        out.write_u8(b'z');
+        out.write_u8(bytes.len() as u8);
+    } else {
+        out.write_u8(b'u');
+        write_len(out, bytes.len())?;
+    }
+    out.write_slice(bytes);
+    Ok(())
+}
+
+fn write_name_tuple<N: AsRef<str>>(out: &mut Vec<u8>, names: &[N]) -> Result<(), PyError> {
+    out.write_u8(b'(');
+    write_len(out, names.len())?;
+    for name in names {
+        write_marshal_str(out, name.as_ref())?;
+    }
+    Ok(())
+}
+
+/// CPython 3.14 `w_code` / PyPy `marshal_pycode`, in compiler-core's 3.14
+/// field order.  The one deliberate boundary from `wire::serialize_code` is
+/// co_consts: PyPy writes `x.co_consts_w`, so recurse through the wrapped
+/// objects owned by this exact PyCode instead of the compiler backing enum.
+unsafe fn write_code(
+    out: &mut Vec<u8>,
+    w_code: PyObjectRef,
+    code: &CodeObject,
+    refs: &mut Option<WriterRefs>,
+    version: i32,
+    depth: usize,
+) -> Result<(), PyError> {
+    out.write_u32(code.arg_count);
+    out.write_u32(code.posonlyarg_count);
+    out.write_u32(code.kwonlyarg_count);
+    out.write_u32(code.max_stackdepth);
+    out.write_u32(code.flags.bits());
+
+    write_bytes(out, &code.instructions.original_bytes())?;
+
+    out.write_u8(b'(');
+    write_len(out, code.constants.len())?;
+    // Realizing one constant may collect and move the wrapper. Keep a shadow
+    // slot and reload it just like PyPy keeps `x` live throughout w_code.
+    let code_root = Rooted::new(w_code);
+    for index in 0..code.constants.len() {
+        let constant = crate::pycode::w_code_const(code_root.get(), index);
+        if constant.is_null() {
+            return Err(PyError::value_error("unmarshallable object"));
+        }
+        write_object(out, constant, refs, version, depth - 1)?;
+    }
+
+    write_name_tuple(out, &code.names)?;
+
+    let cell_only_names: Vec<&str> = code
+        .cellvars
+        .iter()
+        .filter(|cell| !code.varnames.iter().any(|local| local == *cell))
+        .map(|cell| cell.as_ref())
+        .collect();
+    out.write_u8(b'(');
+    write_len(
+        out,
+        code.varnames.len() + cell_only_names.len() + code.freevars.len(),
+    )?;
+    for name in &code.varnames {
+        write_marshal_str(out, name.as_ref())?;
+    }
+    for name in cell_only_names {
+        write_marshal_str(out, name)?;
+    }
+    for name in &code.freevars {
+        write_marshal_str(out, name.as_ref())?;
+    }
+
+    write_bytes(out, &code.localspluskinds)?;
+    write_marshal_str(out, code.source_path.as_ref())?;
+    write_marshal_str(out, code.obj_name.as_ref())?;
+    write_marshal_str(out, code.qualname.as_ref())?;
+    out.write_u32(
+        unsafe { (*(code_root.get() as *const crate::pycode::PyCode)).co_firstlineno_raw } as u32,
+    );
+    write_bytes(out, &code.linetable)?;
+    write_bytes(out, &code.exceptiontable)?;
+    Ok(())
+}
+
 fn write_object(
     out: &mut Vec<u8>,
     obj: PyObjectRef,
@@ -302,7 +407,7 @@ fn write_object(
                 return Err(PyError::value_error("unmarshallable object"));
             }
             out.write_u8(b'c');
-            wire::serialize_code(out, &*ptr);
+            write_code(out, obj, &*ptr, refs, version, depth)?;
         } else if !is_heap_type && is_slice(obj) && version >= 5 {
             out.write_u8(b':');
             write_object(
