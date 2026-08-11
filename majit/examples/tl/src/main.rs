@@ -1,6 +1,3 @@
-// `roll` keeps the Vec-based stack signature from the RPython parity example.
-#![allow(clippy::empty_line_after_doc_comments, clippy::ptr_arg)]
-
 /// Rust port of rpython/jit/tl/tl.py — TL (Toy Language).
 ///
 /// Stack-based interpreter with virtualizable stack.

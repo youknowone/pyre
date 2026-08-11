@@ -15,10 +15,6 @@
 //! and asserts structural properties (checkgraph, copygraph, iter*,
 //! mkentrymap, block attributes, variable renaming).
 
-// Variable identity is the behavior under test, so the mapping deliberately
-// uses the same interior-mutable graph keys as the translated implementation.
-#![allow(clippy::mutable_key_type)]
-//!
 //! Deviation from upstream, per CLAUDE.md parity rule #1:
 //!
 //! * RPython uses module-level `graph = pieces.graph` shared by all

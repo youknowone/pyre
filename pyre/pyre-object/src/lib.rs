@@ -1,22 +1,3 @@
-// PyObjectRef intentionally carries the translated runtime's raw object
-// handle. Public slot wrappers and `#[pyre_class]` expansions validate object
-// kinds internally while preserving the safe interpreter-facing API; changing
-// every generated wrapper to `unsafe` would alter that contract. The remaining
-// shapes below mirror PyPy object APIs and line-by-line control flow.
-#![allow(
-    clippy::approx_constant,
-    clippy::arc_with_non_send_sync,
-    clippy::assertions_on_constants,
-    clippy::doc_lazy_continuation,
-    clippy::len_without_is_empty,
-    clippy::missing_safety_doc,
-    clippy::needless_range_loop,
-    clippy::not_unsafe_ptr_arg_deref,
-    clippy::result_unit_err,
-    clippy::too_many_arguments,
-    clippy::while_let_loop
-)]
-
 // `extern crate self as pyre_object;` lets `#[pyre_class]`'s emitted
 // `::pyre_object::lltype::*` / `::pyre_object::PyObject` paths resolve
 // to *this* crate when the macro is consumed from inside pyre-object

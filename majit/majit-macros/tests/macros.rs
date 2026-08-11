@@ -1,5 +1,3 @@
-#![allow(clippy::assertions_on_constants)]
-
 mod driver {
     use majit_macros::{
         dont_look_inside, elidable, elidable_cannot_raise, elidable_or_memerror, jit_driver,

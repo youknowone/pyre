@@ -1,5 +1,3 @@
-#![allow(clippy::empty_line_after_doc_comments)]
-
 /// Rust port of rpython/jit/tl/tlr.py — TLR (Toy Language Register).
 ///
 /// Byte-level encoding identical to the RPython version:

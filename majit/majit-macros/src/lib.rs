@@ -1,7 +1,3 @@
-// Macro lowering constructors deliberately spell out each independent input;
-// preserving those boundaries is clearer than an opaque configuration tuple.
-#![allow(clippy::too_many_arguments)]
-
 /// Proc macros for the majit JIT framework.
 ///
 /// rpython/rlib/jit.py decorator equivalents:

@@ -1,5 +1,3 @@
-#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
-
 //! cel-majit de-risk probes (issue #357) — one binary gathering the
 //! meta-tracing kill-tests / prototypes that used to be separate examples
 //! (celprobe / celpolicy / celcolumn / celcolscalar / celfloat).

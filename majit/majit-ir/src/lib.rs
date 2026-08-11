@@ -1,12 +1,3 @@
-// Descriptor constructors preserve the argument-for-attribute shape of the
-// corresponding RPython APIs; grouping them would obscure structural parity.
-#![allow(
-    clippy::absurd_extreme_comparisons,
-    clippy::approx_constant,
-    clippy::mutable_key_type,
-    clippy::too_many_arguments
-)]
-
 pub mod bitstring;
 pub mod debug;
 pub mod descr;

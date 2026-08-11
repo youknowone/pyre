@@ -1,15 +1,3 @@
-// Wasm trace assembly follows the backend's stage boundaries directly. The
-// wide builder interface, returned layout tuple, and incremental parameter
-// population make those boundaries explicit; the AtomicU64 const is used only
-// to initialize independent array elements.
-#![allow(
-    clippy::declare_interior_mutable_const,
-    clippy::field_reassign_with_default,
-    clippy::manual_checked_ops,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
-
 /// WebAssembly backend for majit.
 ///
 /// Generates wasm bytecodes via wasm-encoder. On wasm32 targets,

@@ -1,6 +1,3 @@
-// GC rewrite helpers retain the signatures of RPython's rewrite assembler.
-#![allow(clippy::too_many_arguments)]
-
 pub use gcreftracer::{GcTable, install_gc_table_walker};
 /// GC traits and interfaces for the JIT.
 ///

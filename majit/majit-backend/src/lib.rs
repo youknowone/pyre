@@ -1,13 +1,3 @@
-// Low-level backend entry points mirror RPython's raw CPU API: callers uphold
-// their pointer contracts, and speculative-protection hooks use `Err(())` as
-// the upstream failure sentinel. The descriptor cache type likewise preserves
-// the direct upstream ownership shape.
-#![allow(
-    clippy::missing_safety_doc,
-    clippy::result_unit_err,
-    clippy::type_complexity
-)]
-
 /// Backend abstraction trait for JIT code generation.
 ///
 /// Translated from rpython/jit/backend/model.py (AbstractCPU).

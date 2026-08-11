@@ -1,7 +1,3 @@
-// `Result<_, ()>` matches the tiny-language oracle's simple type mismatch
-// sentinel; the example intentionally has no richer runtime error object.
-#![allow(clippy::empty_line_after_doc_comments, clippy::result_unit_err)]
-
 /// Rust port of rpython/jit/tl/tiny2_hotpath.py — word-based language.
 ///
 /// Boxed values (IntBox/StrBox), integer-specialized JIT trace.
