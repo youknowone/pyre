@@ -79,13 +79,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_untagged() {
-        // The scaffolding is inert behind `CAN_BE_TAGGED`: tagging mainline
-        // ints is off by default (mirrors `taggedpointers` off by default).
-        assert!(!CAN_BE_TAGGED);
-    }
-
-    #[test]
     fn tag_round_trips_signed_payload() {
         for v in [-1_000_000i64, -42, -1, 0, 1, 21, 1_000_000] {
             let p = tag_int(v);

@@ -93,6 +93,10 @@ struct Opportunity {
 ///
 /// Opportunities with any `Constant` link arg are dropped — upstream
 /// routes them to `opportunities_with_const`, which `complete()` skips.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn compute_variable_families(
     graph: &FunctionGraph,
     entrymap: &EntryMap,
@@ -169,6 +173,10 @@ fn compute_variable_families(
 
 /// RPython `variables_created_in(block)` (`ssa.py:128-132`): inputargs
 /// plus every op result.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn variables_created_in(graph: &FunctionGraph, id: BlockId) -> HashSet<Variable> {
     let b = graph.block(id);
     let mut s: HashSet<Variable> = HashSet::with_capacity(b.inputargs.len() + b.operations.len());
@@ -222,6 +230,10 @@ fn renamevariables(graph: &mut FunctionGraph, id: BlockId, v: &Variable, w: &Var
 /// allocator (`regalloc.rs`) assumes.  Idempotent on graphs already in
 /// SSI form: their per-block used-set is a subset of the created-set, so
 /// `pending` starts empty.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn ssa_to_ssi(graph: &mut FunctionGraph) {
     let entrymap = build_entrymap(graph);
     let mut families = compute_variable_families(graph, &entrymap);

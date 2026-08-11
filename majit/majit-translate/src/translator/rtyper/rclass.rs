@@ -501,7 +501,7 @@ pub fn attr_reverse_size((_, lltype): &(String, LowLevelType)) -> Option<i64> {
     lowleveltype_size_hint(lltype).map(|size| -(size as i64))
 }
 
-fn sort_llfields(llfields: &mut Vec<(String, LowLevelType)>) {
+fn sort_llfields(llfields: &mut [(String, LowLevelType)]) {
     llfields.sort_by(|left, right| left.0.cmp(&right.0));
     llfields.sort_by_key(attr_reverse_size);
 }
@@ -771,10 +771,18 @@ pub struct ClassRepr {
     /// RPython `self.clsfields = clsfields` (rclass.py:281). `{name:
     /// (mangled_name, r)}` dict holding the class-level attribute
     /// reprs, populated by `_setup_repr`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     clsfields: RefCell<HashMap<String, (String, Arc<dyn Repr>)>>,
     /// RPython `self.pbcfields = pbcfields` (rclass.py:282).
     /// Upstream keys by `(access_set, attr)`; Rust stores the
     /// access-set identity pointer alongside `attr`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pbcfields: RefCell<HashMap<(usize, String), (String, Arc<dyn Repr>)>>,
     /// RPython `self.allmethods = allmethods` (rclass.py:283).
     /// `{name: True}` set-as-dict upstream; Rust keeps the dict shape
@@ -845,6 +853,10 @@ impl ClassRepr {
 
     /// Read-only view of the class-level `clsfields` dict populated by
     /// `_setup_repr`. RPython `self.clsfields` (rclass.py:281).
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub fn clsfields(&self) -> std::cell::Ref<'_, HashMap<String, (String, Arc<dyn Repr>)>> {
         self.clsfields.borrow()
     }
@@ -959,6 +971,10 @@ impl ClassRepr {
         let classdesc_key = classdesc.borrow().identity;
 
         // upstream: `for fldname in r_parentcls.clsfields`.
+        #[expect(
+            clippy::type_complexity,
+            reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+        )]
         let clsfields_snapshot: Vec<(String, (String, Arc<dyn Repr>))> = r_parentcls
             .clsfields
             .borrow()
@@ -975,6 +991,10 @@ impl ClassRepr {
 
         // upstream: extra PBC attributes —
         // `for (access_set, attr), (mangled_name, r) in r_parentcls.pbcfields.items()`.
+        #[expect(
+            clippy::type_complexity,
+            reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+        )]
         let pbcfields_snapshot: Vec<((usize, String), (String, Arc<dyn Repr>))> = r_parentcls
             .pbcfields
             .borrow()
@@ -1117,10 +1137,7 @@ impl ClassRepr {
         // allocation (see [`_ptr::setattr_at_path`]).
         let mut path: Vec<&str> = Vec::new();
         let mut r_parentcls: ClassReprArc = ClassReprArc::Inst(self.clone());
-        loop {
-            let ClassReprArc::Inst(parent_inst) = &r_parentcls else {
-                break;
-            };
+        while let ClassReprArc::Inst(parent_inst) = &r_parentcls {
             // Receiver is `self` (the leaf class) — values come from
             // `self.classdef.classdesc` while the field shape comes from
             // `r_parentcls.clsfields`. Upstream rclass.py:302 reads
@@ -1997,8 +2014,8 @@ impl RootClassRepr {
     /// (the only target pyre supports today) that is `i64::MAX`. The
     /// `rtti` slot is populated via `getinstancerepr(rtyper, None)`
     /// + `getRuntimeTypeInfo(rinstance.object_type)`. The `name` slot
-    /// is the upstream `"object"` string; `instantiate` is deferred
-    /// until the `Ptr(FuncType([], OBJECTPTR))` cycle is resolved.
+    ///   is the upstream `"object"` string; `instantiate` is deferred
+    ///   until the `Ptr(FuncType([], OBJECTPTR))` cycle is resolved.
     pub fn fill_vtable_root(&self, vtable: &mut _ptr) -> Result<(), TyperError> {
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
             TyperError::message("RootClassRepr.fill_vtable_root: RPythonTyper weak ref expired")
@@ -2268,11 +2285,19 @@ pub struct InstanceRepr {
     /// RPython `self.fields = fields` (rclass.py:557). Instance-level
     /// attributes keyed by unmangled attr name; populated by
     /// `_setup_repr`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     fields: RefCell<HashMap<String, (String, Arc<dyn Repr>)>>,
     /// RPython `self.rbase = getinstancerepr(...)` (rclass.py:517).
     rbase: RefCell<Option<Arc<InstanceRepr>>>,
     /// RPython `self.allinstancefields = allinstancefields`
     /// (rclass.py:558). Accumulates rbase.allinstancefields ∪ fields.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     allinstancefields: RefCell<HashMap<String, (String, Arc<dyn Repr>)>>,
     /// RPython `self.immutable_field_set = set()` (rclass.py:493) for
     /// classdef=None, overwritten by `_check_for_immutable_hints` for
@@ -2372,12 +2397,20 @@ impl InstanceRepr {
 
     /// Read-only view of the instance-level `fields` dict populated by
     /// `_setup_repr`. RPython `self.fields` (rclass.py:557).
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub fn fields(&self) -> std::cell::Ref<'_, HashMap<String, (String, Arc<dyn Repr>)>> {
         self.fields.borrow()
     }
 
     /// Read-only view of the `allinstancefields` dict. RPython
     /// `self.allinstancefields` (rclass.py:558).
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub fn allinstancefields(
         &self,
     ) -> std::cell::Ref<'_, HashMap<String, (String, Arc<dyn Repr>)>> {
@@ -2801,6 +2834,10 @@ impl InstanceRepr {
         if let Some(classdef) = &self.classdef {
             let classdesc = classdef.borrow().classdesc.clone();
             // upstream `flds.sort()` — deterministic field order.
+            #[expect(
+                clippy::type_complexity,
+                reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+            )]
             let mut flds: Vec<(String, (String, Arc<dyn Repr>))> = self
                 .allinstancefields()
                 .iter()
@@ -2995,6 +3032,10 @@ impl InstanceRepr {
             // (`get_reusable_prebuilt_instance` with `_value = None`)
             // skips the `instance_get` lookup entirely and goes
             // straight to `read_attribute` / `_defl`.
+            #[expect(
+                clippy::type_complexity,
+                reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+            )]
             let fields_snapshot: Vec<(String, (String, Arc<dyn Repr>))> = self
                 .fields
                 .borrow()
@@ -4190,6 +4231,10 @@ pub fn getclassrepr(
 /// typed [`ClassReprArc`] enum so [`ClassRepr::_setup_repr`] can read
 /// `rbase.vtable_type` directly without upcasting through
 /// `Arc<dyn Repr>`.
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+)]
 pub(crate) fn getclassrepr_arc(
     rtyper: &Rc<RPythonTyper>,
     classdef: Option<&Rc<RefCell<ClassDef>>>,
@@ -4262,6 +4307,10 @@ pub(crate) fn getclassrepr_arc(
 /// `gcref=True` arm (rmodel.py:422-424) routes through
 /// `lltypesystem.rgcref.GCRefRepr.make`, matching upstream's generic
 /// GCREF storage for GC pointer items in containers.
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub(crate) fn externalvsinternal(
     rtyper: &Rc<RPythonTyper>,
     item_repr: Arc<dyn Repr>,
@@ -4290,6 +4339,10 @@ pub(crate) fn externalvsinternal(
     Ok((external, item_repr))
 }
 
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+)]
 pub fn getinstancerepr(
     rtyper: &Rc<RPythonTyper>,
     classdef: Option<&Rc<RefCell<ClassDef>>>,

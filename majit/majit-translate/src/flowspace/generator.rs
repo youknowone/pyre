@@ -212,6 +212,10 @@ fn insert_reads(block: &BlockRef, varnames: &[String]) -> Result<(), FlowContext
     Ok(())
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn get_new_name(
     value: &Hlvalue,
     vars_produced_in_new_block: &[Variable],
@@ -233,6 +237,10 @@ fn get_new_name(
     }
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn split_block(block: &BlockRef, index: usize) -> Result<LinkRef, FlowContextError> {
     let mut varmap: HashMap<Variable, Variable> = HashMap::new();
     let mut vars_produced_in_new_block: Vec<Variable> = Vec::new();
@@ -305,6 +313,10 @@ fn split_block(block: &BlockRef, index: usize) -> Result<LinkRef, FlowContextErr
     Ok(link)
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
     for link_ref in graph.iterlinks() {
         loop {

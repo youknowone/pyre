@@ -103,28 +103,26 @@ pub fn serialize_optimizer_knowledge(
     // when super-instruction GEN widens the live register set.
     let mut bitfield: i32 = 0;
     let mut shifts = 0;
-    for livebox in liveboxes {
-        if let Some(opref) = livebox {
-            let livebox_tp = numb_state
-                .livebox_types
-                .get(opref)
-                .copied()
-                .unwrap_or_else(|| env.get_type(*opref));
-            if livebox_tp != majit_ir::Type::Ref {
-                continue;
-            }
-            bitfield <<= 1;
-            // bridgeopt.py:79-80: info = getptrinfo(box)
-            // known_class = info is not None and info.get_known_class(cpu) is not None
-            if env.has_known_class(*opref) {
-                bitfield |= 1;
-            }
-            shifts += 1;
-            if shifts == 6 {
-                numb_state.append_int(bitfield as i64);
-                bitfield = 0;
-                shifts = 0;
-            }
+    for opref in liveboxes.iter().flatten() {
+        let livebox_tp = numb_state
+            .livebox_types
+            .get(opref)
+            .copied()
+            .unwrap_or_else(|| env.get_type(*opref));
+        if livebox_tp != majit_ir::Type::Ref {
+            continue;
+        }
+        bitfield <<= 1;
+        // bridgeopt.py:79-80: info = getptrinfo(box)
+        // known_class = info is not None and info.get_known_class(cpu) is not None
+        if env.has_known_class(*opref) {
+            bitfield |= 1;
+        }
+        shifts += 1;
+        if shifts == 6 {
+            numb_state.append_int(bitfield as i64);
+            bitfield = 0;
+            shifts = 0;
         }
     }
     if shifts > 0 {
@@ -204,6 +202,10 @@ pub fn serialize_optimizer_knowledge(
 /// `cpu`: `optimizer.cpu` (model.py:39 `AbstractCPU`).  Dispatches
 ///   `cpu.cls_of_box(frontend_boxes[i])` for bridgeopt.py:145-146
 ///   `make_constant_class`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 pub fn deserialize_optimizer_knowledge(
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],

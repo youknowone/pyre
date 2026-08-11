@@ -482,13 +482,13 @@ fn constant_result_values_agree(rv: &ConstValue, s_const: &ConstValue) -> bool {
 /// Rust carries that Python union explicitly.
 #[derive(Clone, Debug)]
 pub(crate) enum AnnotateHelperArg {
-    Annotation(SomeValue),
+    Annotation(Box<SomeValue>),
     LlType(LowLevelType),
 }
 
 impl From<SomeValue> for AnnotateHelperArg {
     fn from(value: SomeValue) -> Self {
-        AnnotateHelperArg::Annotation(value)
+        AnnotateHelperArg::Annotation(Box::new(value))
     }
 }
 
@@ -500,7 +500,7 @@ impl From<LowLevelType> for AnnotateHelperArg {
 
 fn annotate_helper_arg_to_annotation(s: AnnotateHelperArg) -> SomeValue {
     match s {
-        AnnotateHelperArg::Annotation(s) => s,
+        AnnotateHelperArg::Annotation(s) => *s,
         AnnotateHelperArg::LlType(t) => lltype_to_annotation(t),
     }
 }
@@ -554,6 +554,10 @@ impl RPythonTyper {
     /// declarations; callers must invoke this exactly once after
     /// `new()` so the `__init__`-complete invariant (`rootclass_repr`
     /// and `exceptiondata` are both `Some`) is restored.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     pub fn initialize_exceptiondata(self: &Rc<Self>) -> Result<(), TyperError> {
         // Populate the self-weak backref first so any downstream
         // `rtyper_makerepr` arm that needs `Rc<Self>` (e.g.
@@ -1185,6 +1189,10 @@ impl RPythonTyper {
     ///                                             op.result))
     /// ```
     ///
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn translate_hl_to_ll(
         self: &Rc<Self>,
         hop: &HighLevelOp,
@@ -1691,6 +1699,10 @@ impl RPythonTyper {
     /// reason. A `Some(None)` inner value (the `False` sentinel from
     /// annrpython) skips the fixed_graphs update to match upstream's
     /// defensive behavior when `graph.getreturnvar()` would crash.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn specialize_block(self: &Rc<Self>, block: &BlockRef) -> Result<(), TyperError> {
         // RPython `transform.py:36-50` applies `transform_allocate`
         // as part of `default_extra_passes` (`transform.py:246-251`)
@@ -1807,13 +1819,13 @@ impl RPythonTyper {
             }
         }
 
-        if extrablock.is_none() {
-            self.insert_link_conversions(block, 0)?;
-        } else {
+        if let Some(extrablock) = &extrablock {
             // skip the extrablock as a link target, handle it as source
             // below.
             self.insert_link_conversions(block, 1)?;
-            self.insert_link_conversions(extrablock.as_ref().unwrap(), 0)?;
+            self.insert_link_conversions(extrablock, 0)?;
+        } else {
+            self.insert_link_conversions(block, 0)?;
         }
 
         Ok(())

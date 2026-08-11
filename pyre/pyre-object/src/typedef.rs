@@ -161,6 +161,9 @@ pub unsafe fn w_getset_set_name(obj: PyObjectRef, value: PyObjectRef) {
 /// `__self__`/`__doc__` GetSetProperty descriptors after the
 /// W_TypeObject for BuiltinFunction is materialised.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_getset_set_reqcls(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GetSetProperty)).reqcls = value }
 }
@@ -431,16 +434,25 @@ pub fn w_member_new_direct_with_doc(
 
 /// Check if an object is a Member descriptor.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_member(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &MEMBER_TYPE) }
 }
 
 /// Get the Member's slot name.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_member_get_name(obj: PyObjectRef) -> &'static str {
     unsafe { &*(*(obj as *const W_MemberDescr)).name }
 }
 
 /// Get the optional CPython `PyMemberDef.doc`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_member_get_doc(obj: PyObjectRef) -> Option<&'static str> {
     let doc = unsafe { (*(obj as *const W_MemberDescr)).doc };
     if doc.is_null() {
@@ -451,6 +463,9 @@ pub unsafe fn w_member_get_doc(obj: PyObjectRef) -> Option<&'static str> {
 }
 
 /// Get the Member's owning class.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_member_get_cls(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_MemberDescr)).w_cls }
 }
@@ -462,6 +477,9 @@ pub unsafe fn w_member_get_cls(obj: PyObjectRef) -> PyObjectRef {
 /// managed-allocation hooks and so fell back to `malloc_typed`, and the write
 /// barrier covers the ordinary `allocate_stable` case, where an old descriptor
 /// gaining a young or unmarked `w_cls` must re-enter the collector's worklist.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
     crate::gc_roots::mark_prebuilt_roots_dirty();
     unsafe { (*(obj as *mut W_MemberDescr)).w_cls = w_cls };
@@ -471,16 +489,25 @@ pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
 /// `typedef.py:446 Member.index` — the slot index (`base_nslots + position`),
 /// used by the LOAD_ATTR/STORE_ATTR cache to form the `SLOTS_STARTING_FROM +
 /// index` attrkind (mapdict.py:1520).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_member_get_index(obj: PyObjectRef) -> u32 {
     unsafe { (*(obj as *const W_MemberDescr)).index }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_member_is_direct(obj: PyObjectRef) -> bool {
     unsafe { w_member_get_index(obj) & MEMBER_DIRECT_FLAG != 0 }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_member_get_direct_kind(obj: PyObjectRef) -> u32 {
     let kind = unsafe { w_member_get_index(obj) };
     debug_assert_ne!(kind & MEMBER_DIRECT_FLAG, 0);

@@ -1399,11 +1399,17 @@ pub unsafe fn w_exception_set_written(obj: PyObjectRef, value: i64) {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_blocking_written_arg(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_BaseException)).blocking_written_arg }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_blocking_written_arg(obj: PyObjectRef) {
     unsafe { (*(obj as *mut W_BaseException)).blocking_written_arg = true };
 }
@@ -1567,12 +1573,18 @@ pub unsafe fn w_exception_set_import_msg(obj: PyObjectRef, value: PyObjectRef) {
 
 /// `interp_exceptions.py:827 W_SyntaxError.w_filename` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_filename(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_syntax_filename }
 }
 
 /// `interp_exceptions.py:827 W_SyntaxError.w_filename` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_filename(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_filename = value;
@@ -1582,12 +1594,18 @@ pub unsafe fn w_exception_set_syntax_filename(obj: PyObjectRef, value: PyObjectR
 
 /// `interp_exceptions.py:828 W_SyntaxError.w_lineno` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_lineno(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_syntax_lineno }
 }
 
 /// `interp_exceptions.py:828 W_SyntaxError.w_lineno` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_lineno(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_lineno = value;
@@ -1597,12 +1615,18 @@ pub unsafe fn w_exception_set_syntax_lineno(obj: PyObjectRef, value: PyObjectRef
 
 /// `interp_exceptions.py:829 W_SyntaxError.w_offset` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_offset(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_syntax_offset }
 }
 
 /// `interp_exceptions.py:829 W_SyntaxError.w_offset` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_offset(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_offset = value;
@@ -1612,12 +1636,18 @@ pub unsafe fn w_exception_set_syntax_offset(obj: PyObjectRef, value: PyObjectRef
 
 /// `interp_exceptions.py:830 W_SyntaxError.w_text` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_text(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_syntax_text }
 }
 
 /// `interp_exceptions.py:830 W_SyntaxError.w_text` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_text(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_text = value;
@@ -1627,12 +1657,18 @@ pub unsafe fn w_exception_set_syntax_text(obj: PyObjectRef, value: PyObjectRef) 
 
 /// `interp_exceptions.py:831 W_SyntaxError.w_msg` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_msg(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_syntax_msg }
 }
 
 /// `interp_exceptions.py:831 W_SyntaxError.w_msg` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_msg(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_msg = value;
@@ -1642,12 +1678,18 @@ pub unsafe fn w_exception_set_syntax_msg(obj: PyObjectRef, value: PyObjectRef) {
 
 /// `interp_exceptions.py:832 W_SyntaxError.w_print_file_and_line` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_print_file_and_line(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_syntax_print_file_and_line }
 }
 
 /// `interp_exceptions.py:832 W_SyntaxError.w_print_file_and_line` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_print_file_and_line(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_print_file_and_line = value;
@@ -1657,12 +1699,18 @@ pub unsafe fn w_exception_set_syntax_print_file_and_line(obj: PyObjectRef, value
 
 /// `interp_exceptions.py:833 W_SyntaxError.w_end_lineno` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_end_lineno(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_syntax_end_lineno }
 }
 
 /// `interp_exceptions.py:833 W_SyntaxError.w_end_lineno` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_end_lineno(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_end_lineno = value;
@@ -1672,12 +1720,18 @@ pub unsafe fn w_exception_set_syntax_end_lineno(obj: PyObjectRef, value: PyObjec
 
 /// `interp_exceptions.py:834 W_SyntaxError.w_end_offset` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_end_offset(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_syntax_end_offset }
 }
 
 /// `interp_exceptions.py:834 W_SyntaxError.w_end_offset` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_end_offset(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_end_offset = value;
@@ -1687,12 +1741,18 @@ pub unsafe fn w_exception_set_syntax_end_offset(obj: PyObjectRef, value: PyObjec
 
 /// CPython 3.14 `SyntaxError._metadata` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_metadata(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_syntax_metadata }
 }
 
 /// CPython 3.14 `SyntaxError._metadata` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_metadata(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_metadata = value;
@@ -1702,12 +1762,18 @@ pub unsafe fn w_exception_set_syntax_metadata(obj: PyObjectRef, value: PyObjectR
 
 /// `interp_group.py:19` `exc.w_message` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_group_message(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_group_message }
 }
 
 /// `interp_group.py:19` `exc.w_message` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_group_message(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_group_message = value;
@@ -1717,12 +1783,18 @@ pub unsafe fn w_exception_set_group_message(obj: PyObjectRef, value: PyObjectRef
 
 /// `interp_group.py:20` `exc.w_exceptions` reader.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_group_exceptions(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_group_exceptions }
 }
 
 /// `interp_group.py:20` `exc.w_exceptions` writer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_group_exceptions(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_group_exceptions = value;
@@ -1732,12 +1804,18 @@ pub unsafe fn w_exception_set_group_exceptions(obj: PyObjectRef, value: PyObject
 
 /// Constructor-time `repr` of the sequence `descr_new` received.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_group_exceptions_repr(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BaseException)).w_group_exceptions_repr }
 }
 
 /// Constructor-time `repr` of the sequence `descr_new` received.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_group_exceptions_repr(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_group_exceptions_repr = value;
@@ -1911,6 +1989,10 @@ pub unsafe fn w_exception_kind_checked(obj: PyObjectRef) -> Option<ExcKind> {
 /// by qualified path in `jit_trace_fnaddrs`.  A non-inline standalone graph
 /// (unlike the `#[inline]` accessor) is what the census residualises.
 #[majit_macros::dont_look_inside]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn exc_kind_discriminant(evalue: PyObjectRef) -> i64 {
     // Safety: `evalue` is a valid `W_BaseException` (the caught exception).
     unsafe { w_exception_get_kind(evalue) as i64 }

@@ -70,6 +70,10 @@ pub fn remove_same_as(graph: &FunctionGraph) {
 
 /// RPython `remove_duplicate_casts(graph, translator)` at
 /// `removenoops.py:50-101`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn remove_duplicate_casts(graph: &FunctionGraph, translator: &TranslationContext) -> usize {
     simplify::join_blocks(graph);
     let mut num_removed = 0;

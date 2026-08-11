@@ -110,7 +110,7 @@ impl IntBoundMakeGuards for IntBound {
             let op_pos = op.pos.get();
             guards.push(op);
             let arg_op = ctx.materialize_operand_at(op_pos);
-            guards.push(Op::new(OpCode::GuardTrue, &[arg_op.clone()]));
+            guards.push(Op::new(OpCode::GuardTrue, std::slice::from_ref(&arg_op)));
         }
         if self.upper < i64::MAX {
             let bound = alloc_const(Value::Int(self.upper));
@@ -122,7 +122,7 @@ impl IntBoundMakeGuards for IntBound {
             let op_pos = op.pos.get();
             guards.push(op);
             let arg_op = ctx.materialize_operand_at(op_pos);
-            guards.push(Op::new(OpCode::GuardTrue, &[arg_op.clone()]));
+            guards.push(Op::new(OpCode::GuardTrue, std::slice::from_ref(&arg_op)));
         }
         if !self.are_knownbits_implied() {
             let mask = alloc_const(Value::Int(!self.tmask as i64));

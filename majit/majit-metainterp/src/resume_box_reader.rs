@@ -262,6 +262,10 @@ pub fn materialize_bridge_virtual(
     /// resume.py:591-603 AbstractVirtualStructInfo.setfields helper.
     /// Walks fielddescrs in lock-step with fieldnums, decoding each
     /// fieldnum and emitting SETFIELD_GC.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn setfields(
         ctx: &mut crate::TraceCtx,
         struct_op: OpRef,
@@ -504,7 +508,7 @@ pub fn materialize_bridge_virtual(
             // longer one leaves its tail unread.
             let mut p = 0;
             for i in 0..*size {
-                for j in 0..num_fields {
+                for fielddescr in fielddescrs.iter().take(num_fields) {
                     let fnum = fieldnums[p];
                     p += 1;
                     if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -519,7 +523,7 @@ pub fn materialize_bridge_virtual(
                     ctx.record_op_with_descr(
                         OpCode::SetinteriorfieldGc,
                         &[new_op, idx_ref, value],
-                        fielddescrs[j].clone(),
+                        fielddescr.clone(),
                     );
                 }
             }

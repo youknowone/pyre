@@ -378,6 +378,10 @@ pub struct BoolOption {
     pub _requires: Option_<Vec<DependencyEdge>>,
     pub _suggests: Option_<Vec<DependencyEdge>>,
     pub negation: bool,
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub _validator: Option_<Rc<dyn Fn(&Config)>>,
 }
 

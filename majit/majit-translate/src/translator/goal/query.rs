@@ -400,6 +400,10 @@ pub fn check_methods_qgen(t: &TranslationContext) -> Vec<String> {
 
     // Upstream `:69-76`: build `withmeths` — pairs of (classdef,
     // [attr ...]) where attr.s_value is a MethodDesc PBC.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     let mut withmeths: Vec<(Rc<RefCell<ClassDef>>, Vec<(String, SomeValue)>)> = Vec::new();
     for clsdef in classdefs.iter() {
         let mut meths: Vec<(String, SomeValue)> = Vec::new();
@@ -443,12 +447,10 @@ pub fn check_methods_qgen(t: &TranslationContext) -> Vec<String> {
                 let classdesc = subcls.borrow().classdesc.clone();
                 // Upstream `:88-89`: `if not
                 // subcls.classdesc.find_source_for(name): continue`.
-                let has_source =
-                    match crate::annotator::classdesc::ClassDesc::find_source_for(&classdesc, name)
-                    {
-                        Ok(Some(_)) => true,
-                        _ => false,
-                    };
+                let has_source = matches!(
+                    crate::annotator::classdesc::ClassDesc::find_source_for(&classdesc, name),
+                    Ok(Some(_))
+                );
                 if !has_source {
                     continue;
                 }

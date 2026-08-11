@@ -62,8 +62,8 @@ impl PyGraph {
         let mut locals: Vec<Option<Hlvalue>> = vec![None; code.co_nlocals as usize];
         // upstream: `for i in range(code.formalargcount):
         //                locals[i] = Variable(code.co_varnames[i])`.
-        for i in 0..code.formalargcount() {
-            locals[i] = Some(Hlvalue::Variable(Variable::named(&code.co_varnames[i])));
+        for (i, slot) in locals.iter_mut().enumerate().take(code.formalargcount()) {
+            *slot = Some(Hlvalue::Variable(Variable::named(&code.co_varnames[i])));
         }
         // upstream: `state = FrameState(locals, [], None, [], 0)`.
         let state = FrameState::new(locals, Vec::new(), None, Vec::new(), 0);

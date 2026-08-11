@@ -2083,17 +2083,14 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// stub staged into `jf_guard_exc`, handed to the blackhole resume per
 /// `blackhole.py:1794 _prepare_resume_from_failure`.  `0` = no pending
 /// exception.
-static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
-    fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>,
-> = OnceLock::new();
+type CallAssemblerBlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>;
+static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<CallAssemblerBlackholeFn> = OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
 /// The trailing `i64` is `cpu.grab_exc_value(deadframe)` (llmodel.py:240):
 /// the callee's `jf_guard_exc` slot, forwarded so the blackhole resume can
 /// seed `_prepare_resume_from_failure` (blackhole.py:1647).
-pub fn register_call_assembler_blackhole(
-    f: fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>,
-) {
+pub fn register_call_assembler_blackhole(f: CallAssemblerBlackholeFn) {
     let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
 }
 
@@ -2127,15 +2124,15 @@ static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(*const i64, usize, usize) -> bool> 
 /// Returns `false` for synthetic FINISH / external-JUMP / Done* descrs
 /// without a downcastable `ResumeGuardDescr` — callers fall back to
 /// the recovery_layout walker.
-static RESUMEDATA_DEOPT_FN: OnceLock<fn(usize, &mut Vec<i64>, &[Type], usize) -> bool> =
-    OnceLock::new();
+type ResumeDataDeoptFn = fn(usize, &mut Vec<i64>, &[Type], usize) -> bool;
+static RESUMEDATA_DEOPT_FN: OnceLock<ResumeDataDeoptFn> = OnceLock::new();
 
 /// Register the on-demand resume callback for cranelift deopt
 /// materialisation.  pyre-jit calls this during JIT
 /// boot alongside `register_call_assembler_blackhole` so the
 /// callback is reachable when cranelift consumers migrate off the
 /// `ExitRecoveryLayout` cache.
-pub fn register_resumedata_deopt(f: fn(usize, &mut Vec<i64>, &[Type], usize) -> bool) {
+pub fn register_resumedata_deopt(f: ResumeDataDeoptFn) {
     let _ = RESUMEDATA_DEOPT_FN.set(f);
 }
 
@@ -2155,16 +2152,13 @@ pub fn register_resumedata_deopt(f: fn(usize, &mut Vec<i64>, &[Type], usize) -> 
 /// (synthetic FINISH / external-JUMP) or when the StoredExitLayout
 /// lookup fails (descr not in metainterp cache, e.g. overlay
 /// synthetics).  Callers must handle `None`.
-static RECOVERY_LAYOUT_FN: OnceLock<
-    fn(usize, Option<&ExitRecoveryLayout>) -> Option<ExitRecoveryLayout>,
-> = OnceLock::new();
+type RecoveryLayoutFn = fn(usize, Option<&ExitRecoveryLayout>) -> Option<ExitRecoveryLayout>;
+static RECOVERY_LAYOUT_FN: OnceLock<RecoveryLayoutFn> = OnceLock::new();
 
 /// Register the on-demand layout reconstruction callback for the
 /// Path 1 epic.  pyre-jit calls this during JIT boot alongside
 /// `register_resumedata_deopt`.
-pub fn register_recovery_layout(
-    f: fn(usize, Option<&ExitRecoveryLayout>) -> Option<ExitRecoveryLayout>,
-) {
+pub fn register_recovery_layout(f: RecoveryLayoutFn) {
     let _ = RECOVERY_LAYOUT_FN.set(f);
 }
 
@@ -5183,8 +5177,8 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
                     }
                 }
                 let mut changed = false;
-                for i in 0..arity {
-                    if keep[i] {
+                for (i, keep_arg) in keep.iter_mut().enumerate().take(arity) {
+                    if *keep_arg {
                         continue;
                     }
                     let escaped = label_args
@@ -5192,7 +5186,7 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
                         .map(|a| escapes.contains(&a.to_opref().raw()))
                         .unwrap_or(false);
                     if escaped {
-                        keep[i] = true;
+                        *keep_arg = true;
                         changed = true;
                     }
                 }
@@ -7638,7 +7632,6 @@ fn run_compiled_code_inner(
     // retrieves it via get_latest_descr() — no index lookup needed.
     // We extract both the integer fail_index (for sentinel checks) and
     // the Arc pointer (for direct descr propagation).
-    let result_jf = result_jf;
     let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
     // compile.py:1085-1098 `PropagateExceptionDescr.handle_fail`:
@@ -15359,11 +15352,7 @@ fn collect_guards(
                             fieldnums,
                             ..
                         } => {
-                            let fpe = if *size > 0 {
-                                fieldnums.len() / *size
-                            } else {
-                                0
-                            };
+                            let fpe = fieldnums.len().checked_div(*size).unwrap_or(0);
                             ExitVirtualLayout::ArrayStruct {
                                 arraydescr: arraydescr.clone(),
                                 fielddescrs: fielddescrs.clone(),
@@ -17043,7 +17032,7 @@ impl majit_backend::Backend for CraneliftBackend {
             && !ptr.is_null()
         {
             unsafe {
-                *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
+                *(ptr.add(vt_off) as *mut usize) = vtable;
             }
         }
         ptr as i64
@@ -17593,15 +17582,15 @@ mod tests {
         finish.pos.set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
-        let ops = vec![
+        let ops = [
             word,
             armed,
             std::rc::Rc::new(guard),
             std::rc::Rc::new(finish),
         ];
-        let mut token = JitCellToken::new(trace_id);
+        let token = JitCellToken::new(trace_id);
         backend
-            .compile_loop(&[], &ops, &mut token)
+            .compile_loop(&[], &ops, &token)
             .expect("compile eval-breaker poll IR");
         (backend, token)
     }
@@ -18143,10 +18132,8 @@ mod tests {
         expected_detail: &str,
     ) {
         let mut backend = CraneliftBackend::new();
-        let mut token = JitCellToken::new(token_number);
-        let err = backend
-            .compile_loop(&inputargs, &ops, &mut token)
-            .unwrap_err();
+        let token = JitCellToken::new(token_number);
+        let err = backend.compile_loop(&inputargs, &ops, &token).unwrap_err();
         match err {
             BackendError::Unsupported(msg) => {
                 assert!(msg.contains(&format!("{opcode:?}")));
@@ -18173,7 +18160,7 @@ mod tests {
         // TODO mirroring `make_constant`'s op-position
         // inline-constant path; that part of the fixture is left alone.
         let ia0 = OpRef::input_arg_int(0);
-        let ops = vec![
+        let ops = [
             mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
             mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
             mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
@@ -18186,8 +18173,8 @@ mod tests {
         constants.insert(101, 1_000_000i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(0);
-        let info = backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(0);
+        let info = backend.compile_loop(&inputargs, &ops, &token).unwrap();
         assert!(info.code_addr != 0);
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -18199,7 +18186,7 @@ mod tests {
         let carried = OpRef::ref_op(1);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(carried)]);
-        let ops = vec![
+        let ops = [
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
             mk_op(OpCode::Label, &[carried], OpRef::NONE.raw()),
             guard,
@@ -18218,7 +18205,7 @@ mod tests {
         let carried = OpRef::ref_op(1);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(carried)]);
-        let ops = vec![
+        let ops = [
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
             mk_op(OpCode::SameAsR, &[carried], OpRef::ref_op(2).raw()),
             mk_op(OpCode::Label, &[carried], OpRef::NONE.raw()),
@@ -18238,7 +18225,7 @@ mod tests {
         let carried = OpRef::ref_op(1);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(carried)]);
-        let ops = vec![
+        let ops = [
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
             mk_op_with_descr(
                 OpCode::Label,
@@ -18300,9 +18287,9 @@ mod tests {
         let constants = indexmap::IndexMap::new();
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1700);
+        let token = JitCellToken::new(1700);
         backend
-            .compile_loop(&[InputArg::new_ref(0)], &ops, &mut token)
+            .compile_loop(&[InputArg::new_ref(0)], &ops, &token)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         let moved = backend.get_ref_value(&frame, 0);
@@ -18346,13 +18333,9 @@ mod tests {
             mk_op(OpCode::Jump, &[carried, next_count], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1703);
+        let token = JitCellToken::new(1703);
         backend
-            .compile_loop(
-                &[InputArg::new_ref(0), InputArg::new_int(1)],
-                &ops,
-                &mut token,
-            )
+            .compile_loop(&[InputArg::new_ref(0), InputArg::new_int(1)], &ops, &token)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(2)]);
         let moved = backend.get_ref_value(&frame, 0);
@@ -18403,9 +18386,9 @@ mod tests {
         let constants = indexmap::IndexMap::new();
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1701);
+        let token = JitCellToken::new(1701);
         backend
-            .compile_loop(&[InputArg::new_ref(0)], &ops, &mut token)
+            .compile_loop(&[InputArg::new_ref(0)], &ops, &token)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         let moved = backend.get_ref_value(&frame, 0);
@@ -18478,8 +18461,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1704);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1704);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
         let failed = backend.execute_token(&token, &[Value::Ref(root), Value::Int(1)]);
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("entry guard should fail");
@@ -18519,7 +18502,7 @@ mod tests {
         let other = OpRef::ref_op(3);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(inv)]);
-        let ops = vec![
+        let ops = [
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], inv.raw()),
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(1)], other.raw()),
             mk_op(OpCode::Label, &[other, inv], OpRef::NONE.raw()),
@@ -18556,8 +18539,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(40), Value::Int(2)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
@@ -18581,8 +18564,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1000);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1000);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Float(3.5), Value::Ref(GcRef(0x1234))]);
         assert_eq!(backend.get_float_value(&frame, 0), 3.5);
@@ -18608,8 +18591,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(2);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(2);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(100), Value::Int(58)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
@@ -18634,8 +18617,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(3);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(3);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(6), Value::Int(7)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
@@ -18660,8 +18643,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(3);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(3);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42), Value::Int(6)]);
         assert_eq!(backend.get_int_value(&frame, 0), 7);
@@ -18700,8 +18683,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(4);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(4);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0xFF00), Value::Int(0x0FF0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 0x0F00);
@@ -18742,8 +18725,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(5);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(5);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(-16), Value::Int(2)]);
         assert_eq!(backend.get_int_value(&frame, 0), -64);
@@ -18807,8 +18790,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(6);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(6);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
@@ -18845,8 +18828,8 @@ mod tests {
         constants.insert(101, 1i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(7);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(7);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(10)]);
         assert_eq!(backend.get_int_value(&frame, 0), 0);
@@ -18883,8 +18866,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(70001);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(70001);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
     }
 
     #[test]
@@ -18901,8 +18884,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(8);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(8);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
         let descr = backend.get_latest_descr(&frame);
@@ -18940,8 +18923,8 @@ mod tests {
 
         backend.set_next_trace_id(76);
         backend.set_next_header_pc(1234);
-        let mut token = JitCellToken::new(8008);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(8008);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let layouts = backend
             .compiled_fail_descr_layouts(&token)
@@ -18983,8 +18966,8 @@ mod tests {
 
         backend.set_next_trace_id(77);
         backend.set_next_header_pc(1234);
-        let mut token = JitCellToken::new(8009);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(8009);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let layouts = backend
             .compiled_terminal_exit_layouts(&token)
@@ -19039,8 +19022,8 @@ mod tests {
 
         backend.set_next_trace_id(79);
         backend.set_next_header_pc(5678);
-        let mut token = JitCellToken::new(8011);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(8011);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let layouts = backend
             .compiled_terminal_exit_layouts(&token)
@@ -19087,8 +19070,8 @@ mod tests {
 
         backend.set_next_trace_id(78);
         backend.set_next_header_pc(1000);
-        let mut token = JitCellToken::new(8010);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(8010);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let patched = majit_backend::ExitRecoveryLayout {
             vable_array: Vec::new(),
@@ -19140,10 +19123,8 @@ mod tests {
 
         backend.set_next_trace_id(90);
         backend.set_next_header_pc(1000);
-        let mut token = JitCellToken::new(8012);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(8012);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let bridge_inputargs = vec![InputArg::new_int(0)];
         let bridge_ops = vec![
@@ -19235,10 +19216,8 @@ mod tests {
 
         backend.set_next_trace_id(190);
         backend.set_next_header_pc(1000);
-        let mut token = JitCellToken::new(8013);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(8013);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let source_layout = majit_backend::ExitRecoveryLayout {
             vable_array: Vec::new(),
@@ -19374,10 +19353,8 @@ mod tests {
 
         backend.set_next_trace_id(290);
         backend.set_next_header_pc(1000);
-        let mut token = JitCellToken::new(8014);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(8014);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let root_layout = majit_backend::ExitRecoveryLayout {
             vable_array: Vec::new(),
@@ -19605,8 +19582,8 @@ mod tests {
         constants.insert(101, 0i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(9);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(9);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(100), Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
@@ -19646,8 +19623,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(10);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(10);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(7)]);
         assert_eq!(backend.get_int_value(&frame, 0), 3);
@@ -19691,8 +19668,8 @@ mod tests {
         constants.insert(100, add_two as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(20);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(20);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(40), Value::Int(2)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
@@ -19731,8 +19708,8 @@ mod tests {
         constants.insert(100, multiply as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(21);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(21);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(6), Value::Int(7)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
@@ -19775,8 +19752,8 @@ mod tests {
         constants.insert(100, increment_counter as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(22);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(22);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(10)]);
         assert_eq!(backend.get_int_value(&frame, 0), 10);
@@ -19816,8 +19793,8 @@ mod tests {
         constants.insert(100, add_doubles as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(23);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(23);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Float(1.5), Value::Float(2.5)]);
         let result = backend.get_float_value(&frame, 0);
@@ -19852,8 +19829,8 @@ mod tests {
         constants.insert(101, 100i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(24);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(24);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 99);
@@ -19923,8 +19900,8 @@ mod tests {
         constants.insert(104, 3);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(24_001);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(24_001);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 2);
@@ -19964,8 +19941,8 @@ mod tests {
         constants.insert(101, 0x1111);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(25);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(25);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         // GUARD_EXCEPTION matched — Finish returns the exception ref (fake object)
@@ -20012,8 +19989,8 @@ mod tests {
         constants.insert(101, 0x1111);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(26);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(26);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
@@ -20056,8 +20033,8 @@ mod tests {
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(27);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(27);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
@@ -20107,8 +20084,8 @@ mod tests {
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(27_001);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(27_001);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let raw = backend.execute_token_ints_raw(&token, &[1]);
         assert!(!raw.is_finish);
@@ -20173,8 +20150,8 @@ mod tests {
         constants.insert(103, 0);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(28);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(28);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         // GUARD_EXCEPTION matched — Finish returns the exception ref (fake object)
@@ -20234,8 +20211,8 @@ mod tests {
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(29);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(29);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         with_cranelift_gc_required(|gc| gc.collect_nursery());
@@ -20262,8 +20239,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(31);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(31);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(0x1234))]);
         assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0x1234));
@@ -20284,12 +20261,12 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::float_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(32);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(32);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
-        let frame = backend.execute_token(&token, &[Value::Float(3.14)]);
+        let frame = backend.execute_token(&token, &[Value::Float(3.25)]);
         let result = backend.get_float_value(&frame, 0);
-        assert!((result - 3.14).abs() < 1e-10);
+        assert!((result - 3.25).abs() < 1e-10);
     }
 
     // ── Compile bridge test ──
@@ -20341,8 +20318,8 @@ mod tests {
         constants.insert(100, set_value as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(40);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(40);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1), Value::Int(99)]);
         assert_eq!(backend.get_int_value(&frame, 0), 99);
@@ -20394,8 +20371,8 @@ mod tests {
         constants.insert(100, set_value2 as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(41);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(41);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(99)]);
         assert_eq!(backend.get_int_value(&frame, 0), 99);
@@ -20435,8 +20412,8 @@ mod tests {
         constants.insert(100, compute as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(42);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(42);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1), Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 50);
@@ -20475,8 +20452,8 @@ mod tests {
         constants.insert(100, compute2 as *const () as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(43);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(43);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 0);
@@ -20504,8 +20481,8 @@ mod tests {
         constants.insert(100, 1i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(44);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(44);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // i0=5->i1=4, i0=4->i1=3, ..., i0=1->i1=0 (guard fails).
         // Guard saves the loop inputarg (i0), so saved value is 1.
@@ -20532,8 +20509,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(45);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(45);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 0);
@@ -20558,8 +20535,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(46);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(46);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
@@ -20589,8 +20566,8 @@ mod tests {
         constants.insert(100, 42i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(47);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(47);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
         let descr = backend.get_latest_descr(&frame);
@@ -20602,8 +20579,8 @@ mod tests {
         constants2.insert(100, 42i64);
         backend.set_constants(constants2);
 
-        let mut token2 = JitCellToken::new(48);
-        backend.compile_loop(&inputargs, &ops, &mut token2).unwrap();
+        let token2 = JitCellToken::new(48);
+        backend.compile_loop(&inputargs, &ops, &token2).unwrap();
         let frame2 = backend.execute_token(&token2, &[Value::Int(99)]);
         let descr2 = backend.get_latest_descr(&frame2);
         assert_eq!(descr2.fail_index(), 0); // guard failure
@@ -20884,8 +20861,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(60);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(60);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // 1.5 < 2.5
         let frame = backend.execute_token(&token, &[Value::Float(1.5), Value::Float(2.5)]);
@@ -20940,10 +20917,10 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(61);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(61);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
-        let frame = backend.execute_token(&token, &[Value::Float(3.14), Value::Float(3.14)]);
+        let frame = backend.execute_token(&token, &[Value::Float(3.25), Value::Float(3.25)]);
         assert_eq!(backend.get_int_value(&frame, 0), 1); // eq
         assert_eq!(backend.get_int_value(&frame, 1), 0); // ne
         assert_eq!(backend.get_int_value(&frame, 2), 1); // le
@@ -20967,8 +20944,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(70);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(70);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Allocate a fake struct on the heap
         let mut data: Vec<i64> = vec![0xDEAD, 42];
@@ -21004,8 +20981,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(71);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(71);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data: Vec<i64> = vec![0, 0];
         let ptr = data.as_mut_ptr() as usize;
@@ -21028,8 +21005,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(72);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(72);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Write -1i32 into the buffer
         let mut data: Vec<u8> = vec![0; 8];
@@ -21066,8 +21043,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(73);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(73);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Layout: 16 bytes header + items
         // Total: 16 + 3*8 = 40 bytes = 5 i64s
@@ -21117,8 +21094,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(74);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(74);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data: Vec<i64> = vec![0, 0, 0, 0, 0]; // header(2) + items(3)
         let ptr = data.as_mut_ptr() as usize;
@@ -21145,8 +21122,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(75);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(75);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // header: [type_id, length=5]
         let mut data: Vec<i64> = vec![0xAAAA, 5, 10, 20, 30, 40, 50];
@@ -21181,8 +21158,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(50)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(76_001);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(76_001);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
@@ -21220,8 +21197,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(76_102);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(76_102);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(41), Value::Int(1)]);
         assert_eq!(backend.get_int_value(&frame, 0), 41);
@@ -21251,8 +21228,8 @@ mod tests {
         constants.insert(100, 0xCAFE_BABEu64 as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(76_002);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(76_002);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut object_words = vec![0xCAFE_BABEu64 as i64, 123];
         let ptr = object_words.as_mut_ptr() as usize;
@@ -21291,8 +21268,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(80);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(80);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // 10 + 20 = 30 (no overflow)
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(20)]);
@@ -21321,8 +21298,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(81);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(81);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // i64::MAX + 1 overflows
         let frame = backend.execute_token(&token, &[Value::Int(i64::MAX), Value::Int(1)]);
@@ -21350,8 +21327,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(82);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(82);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // i64::MIN - 1 overflows
         let frame = backend.execute_token(&token, &[Value::Int(i64::MIN), Value::Int(1)]);
@@ -21379,8 +21356,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(83);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(83);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(100), Value::Int(58)]);
         let descr = backend.get_latest_descr(&frame);
@@ -21408,8 +21385,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(84);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(84);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(6), Value::Int(7)]);
         let descr = backend.get_latest_descr(&frame);
@@ -21437,8 +21414,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(85);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(85);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // i64::MAX * 2 overflows
         let frame = backend.execute_token(&token, &[Value::Int(i64::MAX), Value::Int(2)]);
@@ -21466,8 +21443,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(86);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(86);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // With overflow: guard_overflow passes (continues)
         let frame = backend.execute_token(&token, &[Value::Int(i64::MAX), Value::Int(1)]);
@@ -21475,8 +21452,8 @@ mod tests {
         assert!(descr.is_finish()); // Finish (overflow happened, guard passed)
 
         // Without overflow: guard_overflow fails (side-exits)
-        let mut token2 = JitCellToken::new(87);
-        backend.compile_loop(&inputargs, &ops, &mut token2).unwrap();
+        let token2 = JitCellToken::new(87);
+        backend.compile_loop(&inputargs, &ops, &token2).unwrap();
         let frame2 = backend.execute_token(&token2, &[Value::Int(1), Value::Int(2)]);
         let descr2 = backend.get_latest_descr(&frame2);
         assert_eq!(descr2.fail_index(), 0); // guard failure (no overflow)
@@ -21498,17 +21475,17 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::float_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(90);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(90);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
-        let val: f64 = 3.14;
+        let val: f64 = 3.25;
         let mut data = vec![0u8; 8];
         data.copy_from_slice(&val.to_ne_bytes());
         let ptr = data.as_mut_ptr() as usize;
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
         let result = backend.get_float_value(&frame, 0);
-        assert!((result - 3.14).abs() < 1e-10);
+        assert!((result - 3.25).abs() < 1e-10);
     }
 
     // ── Getfield ref (pure) test ──
@@ -21527,8 +21504,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(91);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(91);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data: Vec<i64> = vec![0, 0x42424242];
         let ptr = data.as_mut_ptr() as usize;
@@ -21562,8 +21539,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(92);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(92);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data: Vec<i64> = vec![0];
         let ptr = data.as_mut_ptr() as usize;
@@ -21614,8 +21591,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(93);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(93);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data: Vec<i64> = vec![0, 0, 0, 0];
         let ptr = data.as_mut_ptr() as usize;
@@ -21651,8 +21628,8 @@ mod tests {
         constants.insert(101, -4);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(94);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(94);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data = vec![0u8; 8];
         let val: i32 = -7;
@@ -21694,8 +21671,8 @@ mod tests {
         constants.insert(102, 8);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(95);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(95);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data: Vec<u64> = vec![0xAAAA, 0xBBBB, 0x1111_1111, 0xDEAD_BEEF];
         let ptr = data.as_mut_ptr() as usize;
@@ -21737,8 +21714,8 @@ mod tests {
         constants.insert(101, 8);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(96);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(96);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data: Vec<u64> = vec![0, 0];
         let ptr = data.as_mut_ptr() as usize;
@@ -21799,8 +21776,8 @@ mod tests {
         constants.insert(102, 4);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(97);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(97);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data = vec![0u8; 24];
         let ptr = data.as_mut_ptr() as usize;
@@ -21837,8 +21814,8 @@ mod tests {
         constants.insert(100, 0);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(98);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(98);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data = vec![0xFFu8];
         let ptr = data.as_mut_ptr() as usize;
@@ -21882,8 +21859,8 @@ mod tests {
         constants.insert(100, 2);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(99);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(99);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // 8-byte f64 write at offset 2 needs at least 10 bytes; round up so
         // the buffer also satisfies stricter heap-block layouts on Windows.
@@ -21939,8 +21916,8 @@ mod tests {
         constants.insert(101, 8);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(100);
-        let _ = backend.compile_loop(&inputargs, &ops, &mut token);
+        let token = JitCellToken::new(100);
+        let _ = backend.compile_loop(&inputargs, &ops, &token);
     }
 
     #[test]
@@ -21964,8 +21941,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(101);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(101);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data = vec![0u8; 40];
         let val: i32 = -11;
@@ -22016,8 +21993,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(102);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(102);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data = vec![0u8; 40];
         let ptr = data.as_mut_ptr() as usize;
@@ -22068,8 +22045,8 @@ mod tests {
         constants.insert(101, 2i64); // x * 2
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(200);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(200);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // First: verify guard fails when x = -5
         let frame = backend.execute_token(&token, &[Value::Int(-5)]);
@@ -22151,8 +22128,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(201);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(201);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Execute with x = 0 (guard fails) multiple times
         for i in 1..=5 {
@@ -22213,8 +22190,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(203);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(203);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Without bridge: guard fails on x=0, y=42
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(42)]);
@@ -22310,8 +22287,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1001);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1001);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(
             &token,
@@ -22363,8 +22340,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1005);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1005);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let compiled = token
             .compiled
@@ -22414,8 +22391,8 @@ mod tests {
         constants.insert(103, 1);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1002);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1002);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data: Vec<u8> = vec![
             0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
@@ -22473,8 +22450,8 @@ mod tests {
         constants.insert(101, 4);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1003);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1003);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data = vec![
             0xEEu8, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, // header
@@ -22510,10 +22487,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1004);
-        let err = backend
-            .compile_loop(&inputargs, &ops, &mut token)
-            .unwrap_err();
+        let token = JitCellToken::new(1004);
+        let err = backend.compile_loop(&inputargs, &ops, &token).unwrap_err();
         match err {
             BackendError::Unsupported(msg) => assert!(msg.contains("CallMayForceN")),
             other => panic!("expected unsupported error, got {other:?}"),
@@ -22570,8 +22545,8 @@ mod tests {
         );
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1500_400);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1_500_400);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
@@ -22646,8 +22621,8 @@ mod tests {
         );
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1500_404);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1_500_404);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let raw = backend.execute_token_ints_raw(&token, &[10, 1]);
         assert!(!raw.is_finish);
@@ -22719,10 +22694,8 @@ mod tests {
         );
         let mut backend = CraneliftBackend::new();
         backend.set_constants(constants);
-        let mut token = JitCellToken::new(1500_410);
-        let err = backend
-            .compile_loop(&inputargs, &ops, &mut token)
-            .unwrap_err();
+        let token = JitCellToken::new(1_500_410);
+        let err = backend.compile_loop(&inputargs, &ops, &token).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("expected guard_not_forced(_2) at +1") && msg.contains("SameAsI"),
@@ -22774,8 +22747,8 @@ mod tests {
         constants.insert(100, maybe_force_and_return_int as *const () as usize as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1500_401);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1_500_401);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
@@ -22848,8 +22821,8 @@ mod tests {
         );
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1500_402);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1_500_402);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
@@ -22892,9 +22865,9 @@ mod tests {
         callee_constants.insert(100, 2);
         backend.set_constants(callee_constants);
 
-        let mut callee_token = JitCellToken::new(1500_200);
+        let callee_token = JitCellToken::new(1_500_200);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .unwrap();
 
         let caller_inputargs = vec![InputArg::new_int(0)];
@@ -22910,9 +22883,9 @@ mod tests {
         ];
         backend.set_constants(indexmap::IndexMap::new());
 
-        let mut caller_token = JitCellToken::new(1500_201);
+        let caller_token = JitCellToken::new(1_500_201);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
             .unwrap();
 
         let frame = backend.execute_token(&caller_token, &[Value::Int(40)]);
@@ -22924,8 +22897,8 @@ mod tests {
     fn test_call_assembler_compiles_before_target_is_registered() {
         let mut backend = make_call_assembler_backend();
 
-        let mut deferred_target = JitCellToken::new(1500_240);
-        backend.set_next_trace_id(1500_241);
+        let deferred_target = JitCellToken::new(1_500_240);
+        backend.set_next_trace_id(1_500_241);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -22937,12 +22910,12 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut caller = JitCellToken::new(1500_241);
+        let caller = JitCellToken::new(1_500_241);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller)
             .unwrap();
 
-        backend.set_next_trace_id(1500_240);
+        backend.set_next_trace_id(1_500_240);
         let callee_inputargs = vec![InputArg::new_int(0)];
         let callee_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -22957,7 +22930,7 @@ mod tests {
         constants.insert(100, 7);
         backend.set_constants(constants);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
+            .compile_loop(&callee_inputargs, &callee_ops, &deferred_target)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -22970,7 +22943,7 @@ mod tests {
     fn test_call_assembler_late_bound_ref_result_supports_plain_ref_finish() {
         let mut backend = make_call_assembler_backend();
 
-        let mut deferred_target = JitCellToken::new(1500_245);
+        let deferred_target = JitCellToken::new(1_500_245);
         let caller_inputargs = vec![InputArg::new_ref(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
@@ -22982,12 +22955,12 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-        let mut caller = JitCellToken::new(1500_246);
+        let caller = JitCellToken::new(1_500_246);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller)
             .unwrap();
 
-        backend.set_next_trace_id(1500_245);
+        backend.set_next_trace_id(1_500_245);
         let callee_inputargs = vec![InputArg::new_ref(0)];
         let callee_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
@@ -22999,7 +22972,7 @@ mod tests {
         ];
         backend.set_constants(indexmap::IndexMap::new());
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
+            .compile_loop(&callee_inputargs, &callee_ops, &deferred_target)
             .unwrap();
 
         let root = GcRef(0xCAFE);
@@ -23021,7 +22994,7 @@ mod tests {
         constants.insert(101, 0);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1500_250);
+        let token = JitCellToken::new(1_500_250);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -23044,7 +23017,7 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
             mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let compiled = token
             .compiled
@@ -23093,7 +23066,7 @@ mod tests {
     #[test]
     #[ignore = "bodyless/later-bound CALL_ASSEMBLER backend target path retired; production uses compile_tmp_callback"]
     fn test_call_assembler_reused_token_resets_stale_pending_dispatch_slot() {
-        let token_number = 1500_252;
+        let token_number = 1_500_252;
 
         {
             let mut backend = make_call_assembler_backend();
@@ -23103,7 +23076,7 @@ mod tests {
             constants.insert(101, 0);
             backend.set_constants(constants);
 
-            let mut token = JitCellToken::new(token_number);
+            let token = JitCellToken::new(token_number);
             let ops = vec![
                 mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
                 mk_op(
@@ -23126,7 +23099,7 @@ mod tests {
                 mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
                 mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
             ];
-            backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+            backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
             let failed = backend.execute_token(&token, &[Value::Int(0)]);
             let guard_descr = get_latest_descr_from_deadframe(&failed)
@@ -23149,7 +23122,7 @@ mod tests {
         }
 
         let mut backend = make_call_assembler_backend();
-        let mut deferred_target = JitCellToken::new(token_number);
+        let deferred_target = JitCellToken::new(token_number);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -23161,9 +23134,9 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut caller = JitCellToken::new(1500_253);
+        let caller = JitCellToken::new(1_500_253);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller)
             .unwrap();
 
         let callee_inputargs = vec![InputArg::new_int(0)];
@@ -23180,7 +23153,7 @@ mod tests {
         constants.insert(100, 7);
         backend.set_constants(constants);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
+            .compile_loop(&callee_inputargs, &callee_ops, &deferred_target)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -23191,7 +23164,7 @@ mod tests {
     #[test]
     fn test_call_assembler_requires_gc_runtime_for_rewrite_parity() {
         let mut backend = CraneliftBackend::new();
-        let mut callee_token = JitCellToken::new(1500_352);
+        let callee_token = JitCellToken::new(1_500_352);
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -23205,7 +23178,7 @@ mod tests {
         ];
 
         let err = backend
-            .compile_loop(&inputargs, &ops, &mut callee_token)
+            .compile_loop(&inputargs, &ops, &callee_token)
             .unwrap_err();
         assert!(
             err.to_string().contains("requires a configured GC runtime"),
@@ -23216,7 +23189,7 @@ mod tests {
     #[test]
     fn test_execute_bridge_follows_external_jump_to_compiled_target() {
         let mut backend = CraneliftBackend::new();
-        let loop_descr = make_label_descr(1500_260);
+        let loop_descr = make_label_descr(1_500_260);
 
         let inputargs = vec![InputArg::new_int(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
@@ -23245,10 +23218,8 @@ mod tests {
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
-        let mut token = JitCellToken::new(1500_261);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(1_500_261);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
         let guard_descr =
@@ -23290,7 +23261,7 @@ mod tests {
     #[test]
     fn test_bridge_executes_ops_before_first_label_before_external_jump() {
         let mut backend = CraneliftBackend::new();
-        let loop_descr = make_label_descr(1500_259);
+        let loop_descr = make_label_descr(1_500_259);
 
         let inputargs = vec![InputArg::new_int(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
@@ -23319,10 +23290,8 @@ mod tests {
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
-        let mut token = JitCellToken::new(1500_258);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(1_500_258);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
         let guard_descr =
@@ -23361,8 +23330,8 @@ mod tests {
     #[test]
     fn test_execute_bridge_updates_later_ref_input_slots_for_external_jump() {
         let mut backend = CraneliftBackend::new();
-        let loop_descr = make_label_descr(1500_262);
-        let int_size = make_size_descr(16, 1500_263);
+        let loop_descr = make_label_descr(1_500_262);
+        let int_size = make_size_descr(16, 1_500_263);
         let int_field = make_field_descr(0, 8, Type::Int, true);
 
         let inputargs = vec![
@@ -23402,10 +23371,8 @@ mod tests {
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
-        let mut token = JitCellToken::new(1500_264);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(1_500_264);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let mut old_box = Vec::with_capacity(1);
         old_box.push(0i64);
@@ -23466,8 +23433,8 @@ mod tests {
     #[test]
     fn test_execute_bridge_external_jump_to_second_label_skips_preamble() {
         let mut backend = CraneliftBackend::new();
-        let start_descr = make_label_descr(1500_265);
-        let body_descr = make_label_descr(1500_266);
+        let start_descr = make_label_descr(1_500_265);
+        let body_descr = make_label_descr(1_500_266);
 
         let inputargs = vec![InputArg::new_int(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
@@ -23510,10 +23477,8 @@ mod tests {
         root_constants.insert(101, 10);
         backend.set_constants(root_constants);
 
-        let mut token = JitCellToken::new(1500_267);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(1_500_267);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
         let guard_descr =
@@ -23550,9 +23515,9 @@ mod tests {
     #[test]
     fn test_execute_bridge_external_jump_to_middle_label_uses_label_selector() {
         let mut backend = CraneliftBackend::new();
-        let start_descr = make_label_descr(1500_268);
-        let middle_descr = make_label_descr(1500_269);
-        let final_descr = make_label_descr(1500_270);
+        let start_descr = make_label_descr(1_500_268);
+        let middle_descr = make_label_descr(1_500_269);
+        let final_descr = make_label_descr(1_500_270);
 
         let inputargs = vec![InputArg::new_int(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
@@ -23609,10 +23574,8 @@ mod tests {
         root_constants.insert(102, 20);
         backend.set_constants(root_constants);
 
-        let mut token = JitCellToken::new(1500_271);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(1_500_271);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
         let guard_descr =
@@ -23663,9 +23626,9 @@ mod tests {
         unsafe { std::env::set_var("PYRE_CL_NO_CLOSING_JUMP", "1") };
 
         let mut backend = CraneliftBackend::new();
-        let start_descr = make_label_descr(1500_280);
-        let middle_descr = make_label_descr(1500_281);
-        let final_descr = make_label_descr(1500_282);
+        let start_descr = make_label_descr(1_500_280);
+        let middle_descr = make_label_descr(1_500_281);
+        let final_descr = make_label_descr(1_500_282);
 
         let inputargs = vec![InputArg::new_int(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
@@ -23722,10 +23685,8 @@ mod tests {
         root_constants.insert(102, 20);
         backend.set_constants(root_constants);
 
-        let mut token = JitCellToken::new(1500_283);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(1_500_283);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
         let guard_descr =
@@ -23782,8 +23743,8 @@ mod tests {
         unsafe { std::env::set_var("PYRE_CL_NO_CLOSING_JUMP", "1") };
 
         let mut backend = CraneliftBackend::new();
-        let start_descr = make_label_descr(1500_290);
-        let final_descr = make_label_descr(1500_291);
+        let start_descr = make_label_descr(1_500_290);
+        let final_descr = make_label_descr(1_500_291);
 
         let inputargs = vec![InputArg::new_int(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
@@ -23826,10 +23787,8 @@ mod tests {
         root_constants.insert(101, 10);
         backend.set_constants(root_constants);
 
-        let mut token = JitCellToken::new(1500_292);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
+        let token = JitCellToken::new(1_500_292);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(-1000)]);
         let guard_descr =
@@ -23870,8 +23829,8 @@ mod tests {
     #[test]
     fn test_jump_to_mismatched_local_label_lowers_as_external_jump() {
         let mut backend = CraneliftBackend::new();
-        let start_descr = majit_ir::make_loop_target_descr(1500_360, true);
-        let body_descr = make_label_descr(1500_361);
+        let start_descr = majit_ir::make_loop_target_descr(1_500_360, true);
+        let body_descr = make_label_descr(1_500_361);
 
         let inputargs = vec![
             InputArg::new_int(0),
@@ -23921,9 +23880,9 @@ mod tests {
         constants.insert(100, 1);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1500_362);
+        let token = JitCellToken::new(1_500_362);
         backend
-            .compile_loop(&inputargs, &ops, &mut token)
+            .compile_loop(&inputargs, &ops, &token)
             .expect("mismatched local-label jump should compile via external jump lowering");
     }
 
@@ -24030,8 +23989,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1500);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1500);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         let obj = backend.get_ref_value(&frame, 0);
@@ -24089,8 +24048,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1501);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1501);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         let obj0 = backend.get_ref_value(&frame, 0);
@@ -24142,8 +24101,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1502);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1502);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(3)]);
         let obj = backend.get_ref_value(&frame, 0);
@@ -24182,8 +24141,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1503);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1503);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(3)]);
         let obj = backend.get_ref_value(&frame, 0);
@@ -24218,8 +24177,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1503);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1503);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         assert!(unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
         backend.execute_token(&token, &[Value::Ref(obj)]);
@@ -24291,8 +24250,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1505);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1505);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Snapshot nursery free pointer before execution.
         let nf_before = with_cranelift_gc_required(|gc| gc.nursery_free() as usize);
@@ -24355,12 +24314,12 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1505_1);
+        let token = JitCellToken::new(15_051);
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, 111);
         constants.insert(101, 222);
         backend.set_constants(constants);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         let obj0 = backend.get_ref_value(&frame, 0);
@@ -24429,8 +24388,8 @@ mod tests {
         constants.insert(100, 777);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1505_2);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(15_052);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         let moved_root = backend.get_ref_value(&frame, 0);
@@ -24487,8 +24446,8 @@ mod tests {
         constants.insert(202, b'c' as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1512);
-        backend.compile_loop(&[], &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1512);
+        backend.compile_loop(&[], &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         assert_eq!(backend.get_int_value(&frame, 0), b'b' as i64);
@@ -24543,8 +24502,8 @@ mod tests {
         constants.insert(201, b'y' as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1513);
-        backend.compile_loop(&[], &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1513);
+        backend.compile_loop(&[], &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         assert_eq!(backend.get_int_value(&frame, 0), b'y' as i64);
@@ -24581,8 +24540,8 @@ mod tests {
         constants.insert(200, 0x2603);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1514);
-        backend.compile_loop(&[], &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1514);
+        backend.compile_loop(&[], &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         assert_eq!(backend.get_int_value(&frame, 0), 0x2603);
@@ -24616,8 +24575,8 @@ mod tests {
         constants.insert(100, 1);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1515);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1515);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut raw = vec![0usize; 3];
         let ptr = raw.as_mut_ptr() as *mut u8;
@@ -24662,8 +24621,8 @@ mod tests {
         constants.insert(100, 0);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1516);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1516);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut raw = vec![0usize; 3];
         let ptr = raw.as_mut_ptr() as *mut u8;
@@ -24723,8 +24682,8 @@ mod tests {
         constants.insert(101, 0);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1506);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1506);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         let moved_root = backend.get_ref_value(&frame, 0);
@@ -24780,8 +24739,8 @@ mod tests {
         constants.insert(102, 1);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1507);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1507);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         let moved_root = backend.get_ref_value(&frame, 0);
@@ -24818,8 +24777,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1508);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1508);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         with_cranelift_gc_required(|gc| gc.collect_nursery());
@@ -24852,8 +24811,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1509);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1509);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         drop(backend);
@@ -24883,8 +24842,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(100);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(100);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Not invalidated -> guard passes -> Finish returns 10 + 32 = 42
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(32)]);
@@ -24922,8 +24881,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(101);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(101);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Before invalidation: guard passes, Finish is reached.
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(32)]);
@@ -24973,8 +24932,8 @@ mod tests {
         constants.insert(101, 1_000_000i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(102);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(102);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Without invalidation: runs to completion (i reaches 1000000,
         // GuardTrue fails).
@@ -25015,8 +24974,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(103);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(103);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         // Before invalidation
         let frame = backend.execute_token(&token, &[Value::Int(99)]);
@@ -25034,15 +24993,13 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), 99);
     }
 
-    /// Guard-bearing callee: guard passes -> finish result propagated.
-    /// Guard-bearing callee: guard fails  -> deadframe propagated.
-
-    /// Guard-bearing callee with multiple guards: first guard passes, second
-    /// guard fails -> correct fail_index propagated.
-
-    /// Guard-bearing callee with force_token finish shape:
-    /// Callee has ForceToken + GuardNotForced2 + Finish(force_token).
-    /// Caller uses CallAssemblerR and gets the force_token result.
+    // Guard-bearing callee: guard passes -> finish result propagated.
+    // Guard-bearing callee: guard fails  -> deadframe propagated.
+    // Guard-bearing callee with multiple guards: first guard passes, second
+    // guard fails -> correct fail_index propagated.
+    // Guard-bearing callee with force_token finish shape:
+    // Callee has ForceToken + GuardNotForced2 + Finish(force_token).
+    // Caller uses CallAssemblerR and gets the force_token result.
 
     #[test]
     fn test_all_guards_have_recovery_layout() {
@@ -25083,8 +25040,8 @@ mod tests {
 
         backend.set_next_trace_id(500);
         backend.set_next_header_pc(2000);
-        let mut token = JitCellToken::new(9001);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(9001);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let layouts = backend
             .compiled_fail_descr_layouts(&token)
@@ -25148,8 +25105,8 @@ mod tests {
 
         backend.set_next_trace_id(501);
         backend.set_next_header_pc(3000);
-        let mut token = JitCellToken::new(9002);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(9002);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let layouts = backend
             .compiled_fail_descr_layouts(&token)
@@ -25197,8 +25154,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(99_999);
-        let result = backend.compile_loop(&inputargs, &ops, &mut token);
+        let token = JitCellToken::new(99_999);
+        let result = backend.compile_loop(&inputargs, &ops, &token);
         assert!(
             result.is_ok(),
             "representative trace should compile: {:?}",

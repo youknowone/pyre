@@ -516,17 +516,17 @@ impl GuardStrengthenOpt {
         let others = strongest_guards.entry(key).or_default();
         if !others.is_empty() {
             let mut replaced = false;
-            for i in 0..others.len() {
-                if guard.implies(&others[i], None) {
+            for other in others.iter_mut() {
+                if guard.implies(other, None) {
                     // guard.py:204-210: strengthened
-                    let old = others[i].clone();
+                    let old = other.clone();
                     guards.insert(guard.index, None); // mark new as 'do not emit'
                     let mut new_guard = guard.clone();
                     new_guard.inhert_attributes(&old);
                     guards.insert(old.index, Some(new_guard.clone()));
-                    others[i] = new_guard;
+                    *other = new_guard;
                     replaced = true;
-                } else if others[i].implies(&guard, None) {
+                } else if other.implies(&guard, None) {
                     // guard.py:211-215: implied
                     guards.insert(guard.index, None);
                     replaced = true;
@@ -834,7 +834,7 @@ mod tests {
 
         // Producer ops carry their result positions (base 100) so they do not
         // collide with the inputarg slots `[0, num_inputs)`.
-        let guard_true = std::rc::Rc::new(Op::new(OpCode::GuardTrue, &[i1.clone()]));
+        let guard_true = std::rc::Rc::new(Op::new(OpCode::GuardTrue, std::slice::from_ref(&i1)));
         let sub = std::rc::Rc::new(Op::new(OpCode::IntSubOvf, &[i0.clone(), i2.clone()]));
         let guard_ovf1 = std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
         let mul = std::rc::Rc::new(Op::new(OpCode::IntMulOvf, &[i2.clone(), i1.clone()]));

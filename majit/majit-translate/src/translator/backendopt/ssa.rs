@@ -160,6 +160,10 @@ impl DataFlowFamilyBuilder {
     ///         any_progress_at_all |= progress
     ///     return any_progress_at_all
     /// ```
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn complete(&mut self) -> bool {
         let mut any_progress_at_all = false;
         let mut progress = true;
@@ -223,6 +227,10 @@ impl DataFlowFamilyBuilder {
 
     /// RPython `DataFlowFamilyBuilder.merge_identical_phi_nodes(self)`
     /// (ssa.py:65-86).
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn merge_identical_phi_nodes(&mut self) -> bool {
         let mut any_progress_at_all = false;
         let mut progress = true;
@@ -359,6 +367,10 @@ fn rewrite_variables_in_block(block: &BlockRef, rename: &HashMap<u64, (String, i
 ///         result.add(op.result)
 ///     return result
 /// ```
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn variables_created_in(block: &BlockRef) -> HashSet<Hlvalue> {
     let mut result: HashSet<Hlvalue> = HashSet::new();
     let b = block.borrow();
@@ -526,6 +538,10 @@ pub fn ssi_to_ssa(graph: &FunctionGraph) {
 /// preserves that shape: `_annotator: Option<&RPythonAnnotator>`
 /// matches upstream's `annotator=None` default so callers don't have
 /// to pick between two signatures.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn ssa_to_ssi(
     graph: &FunctionGraph,
     _annotator: Option<&crate::annotator::annrpython::RPythonAnnotator>,

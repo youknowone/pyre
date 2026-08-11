@@ -711,6 +711,10 @@ mod tests {
         assert_ne!(Operand::none(), Operand::const_(Const::Int(0)));
 
         // Hash agrees with Eq: a clone resolves the same bucket/membership.
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "Operand hashing follows immutable OpRef/constant identity; interior mutation belongs to the referenced JIT box and is excluded from Eq and Hash"
+        )]
         let mut set = HashSet::new();
         set.insert(Operand::from_bound_op(&op));
         assert!(set.contains(&Operand::from_bound_op(&op)));

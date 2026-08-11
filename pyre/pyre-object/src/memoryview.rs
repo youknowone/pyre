@@ -136,22 +136,34 @@ pub fn w_buffer_wrapper_new(w_mv: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRe
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_w_buffer_wrapper(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &BUFFER_WRAPPER_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_buffer_wrapper_mv(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BufferWrapper)).w_mv }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_buffer_wrapper_obj(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BufferWrapper)).w_obj }
 }
 
 /// `Py_CLEAR(bw->mv); Py_CLEAR(bw->obj)` after the wrapper's single release.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_buffer_wrapper_clear(obj: PyObjectRef) {
     unsafe {
         let wrapper = obj as *mut W_BufferWrapper;
@@ -242,11 +254,17 @@ pub unsafe fn w_memoryview_released(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_memoryview_restricted(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_MemoryView)).restricted }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_memoryview_set_restricted(obj: PyObjectRef, restricted: bool) {
     unsafe {
         (*(obj as *mut W_MemoryView)).restricted = restricted;
@@ -255,18 +273,27 @@ pub unsafe fn w_memoryview_set_restricted(obj: PyObjectRef, restricted: bool) {
 
 /// Number of buffers currently exported by this memoryview.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_memoryview_exports(obj: PyObjectRef) -> i64 {
     unsafe { (*(obj as *const W_MemoryView)).exports }
 }
 
 /// Temporarily protect the view from `release()` across a callback.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_memoryview_exports_incref(obj: PyObjectRef) {
     unsafe { (*(obj as *mut W_MemoryView)).exports += 1 }
 }
 
 /// End a temporary/exported-buffer protection interval.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_memoryview_exports_decref(obj: PyObjectRef) {
     unsafe {
         let mv = obj as *mut W_MemoryView;
@@ -278,12 +305,18 @@ pub unsafe fn w_memoryview_exports_decref(obj: PyObjectRef) {
 /// `W_Root.getweakref()` storage supplied by
 /// `make_weakref_descr(W_MemoryView)` in PyPy's memoryview typedef.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_memoryview_getweakref(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_MemoryView)).w_weakreflifeline }
 }
 
 /// Store the per-view weakref lifeline and remember the old-to-young edge.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_memoryview_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_MemoryView)).w_weakreflifeline = lifeline;

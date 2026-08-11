@@ -172,7 +172,7 @@ pub(crate) struct TracePlan {
 
 impl TracePlan {
     pub(crate) fn build(inputargs: &[InputArg], ops: &[Op]) -> Self {
-        let lowered: Vec<LirOp> = ops.iter().map(|op| lower_op(op)).collect();
+        let lowered: Vec<LirOp> = ops.iter().map(lower_op).collect();
         let live_points = compute_live_points(&lowered);
         let max_live = live_points
             .iter()
@@ -478,11 +478,11 @@ fn remove_ref(live: &mut Vec<OpRef>, opref: OpRef) {
 }
 
 trait TypeIsVoid {
-    fn is_void(self) -> bool;
+    fn is_void(&self) -> bool;
 }
 
 impl TypeIsVoid for majit_ir::Type {
-    fn is_void(self) -> bool {
+    fn is_void(&self) -> bool {
         matches!(self, majit_ir::Type::Void)
     }
 }

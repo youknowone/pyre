@@ -10912,7 +10912,7 @@ fn global_nonlocal_conflict_span(
     let error_index = source_byte_index(source, lineno, offset)?;
     let parsed = crate::compile::parser::parse_module(source).ok()?;
 
-    fn innermost_scope<'a>(body: &'a [ast::Stmt], index: usize) -> Option<&'a [ast::Stmt]> {
+    fn innermost_scope(body: &[ast::Stmt], index: usize) -> Option<&[ast::Stmt]> {
         for statement in body {
             let range = statement.range();
             if !(range.start().to_usize() <= index && index <= range.end().to_usize()) {
@@ -18273,7 +18273,7 @@ mod tests {
             1.5,
             -1.5,
             2.0,
-            3.14,
+            3.25,
             123.456,
             9.999e15,
             1e16,

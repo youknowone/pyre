@@ -24,6 +24,10 @@ fn rfloat_function(name: &str) -> HostObject {
 }
 
 /// RPython `_register` from `extfuncregistry.py`.
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub const _REGISTER: &[(&str, &[(&str, &[&str], &str)])] = &[
     ("rpython.rlib.rfloat", &[("isfinite", &["float"], "bool")]),
     (

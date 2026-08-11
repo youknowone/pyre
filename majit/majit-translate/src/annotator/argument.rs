@@ -260,9 +260,7 @@ impl ArgumentsForTranslation {
         // through to the callee's startblock binding (`description.py:
         // 283-305`, `annrpython.py:315-336`).
         let take = num_args.min(co_argcount);
-        for i in 0..take {
-            scope_w[i] = args_w[i].clone();
-        }
+        scope_w[..take].clone_from_slice(&args_w[..take]);
         let input_argcount = take;
 
         // `if signature.has_vararg(): ...`
@@ -371,20 +369,25 @@ impl ArgumentsForTranslation {
         let mut missing = 0usize;
         if input_argcount < co_argcount {
             let def_first = co_argcount - defaults_w.map_or(0, |d| d.len());
-            for i in input_argcount..co_argcount {
+            for (i, slot) in scope_w
+                .iter_mut()
+                .enumerate()
+                .take(co_argcount)
+                .skip(input_argcount)
+            {
                 let name = &signature.argnames[i];
                 if let Some(v) = self.keywords.get(name) {
                     // upstream `argument.py:62-63 scope_w[i] = kwds_w[name]`
                     // — `kwds_w[name]` may be `None` (unbound caller
                     // arg), and `scope_w` is the `Vec<Option<SomeValue>>`
                     // carrier that propagates the lattice node forward.
-                    scope_w[i] = v.clone();
+                    *slot = v.clone();
                     continue;
                 }
                 let defnum = i as isize - def_first as isize;
                 if defnum >= 0 {
                     if let Some(defaults) = defaults_w {
-                        scope_w[i] = Some(defaults[defnum as usize].clone());
+                        *slot = Some(defaults[defnum as usize].clone());
                     } else {
                         missing += 1;
                     }
@@ -408,6 +411,10 @@ impl ArgumentsForTranslation {
     /// RPython `unpack()` (argument.py:122-124).  Positional and
     /// keyword slots both preserve `Option<SomeValue>` (None = unbound
     /// caller arg, mirroring `annotator.annotation(v) is None`).
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub fn unpack(
         &self,
     ) -> Result<(Vec<Option<SomeValue>>, HashMap<String, Option<SomeValue>>), ArgErr> {

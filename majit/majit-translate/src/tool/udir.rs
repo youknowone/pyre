@@ -182,9 +182,7 @@ fn get_repo_version_info() -> Option<(String, String)> {
         for line in branch_text.lines() {
             if let Some(rest) = line.strip_prefix("* ") {
                 let rest = rest.trim();
-                let branch = if rest == "(no branch)" {
-                    "pypy-HEAD"
-                } else if rest.starts_with("(HEAD detached") {
+                let branch = if rest == "(no branch)" || rest.starts_with("(HEAD detached") {
                     "pypy-HEAD"
                 } else {
                     rest

@@ -101,6 +101,10 @@ use crate::translator::rtyper::rtyper::{ConvertedTo, HighLevelOp, RPythonTyper};
 /// [`Arc::ptr_eq`]-based identity on [`HostObject`]).
 static BUILTIN_TYPER: OnceLock<Mutex<HashMap<HostObject, BuiltinTyperFn>>> = OnceLock::new();
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
     BUILTIN_TYPER.get_or_init(|| {
         let mut map = HashMap::new();
@@ -197,6 +201,10 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 /// Each batch is a natural stand-alone commit once its dependent
 /// infra (HOST_ENV entry, helper-graph registration hook, `Repr`
 /// trait method, or inputarg coercion primitive) lands.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
     let entries: &[(&str, BuiltinTyperFn)] = &[
         // rbuiltin.py:172-176
@@ -840,6 +848,10 @@ pub fn call_args_expand(
 /// The trailing `del hop.args_v[...]` truncates only `args_v` upstream
 /// (asymmetry is upstream-faithful: `args_r` / `args_s` keep their
 /// original lengths after keyword consumption).
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub fn parse_kwds(
     hop: &HighLevelOp,
     argspec_i_r: &[(Option<usize>, Option<Arc<dyn Repr>>)],
@@ -1068,6 +1080,10 @@ impl Repr for BuiltinMethodRepr {
 ///
 /// `methodname` is a non-optional `String` in the Rust port, so the
 /// `assert self.methodname is not None` is structurally enforced.
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+)]
 pub fn somebuiltinmethod_rtyper_makerepr(
     s_method: &SomeBuiltinMethod,
     rtyper: &RPythonTyper,
@@ -2674,6 +2690,10 @@ pub fn rtype_cast_weakrefptr_to_ptr(
 /// `ConstValue::Bool(true)`, which would collapse the wrapped value
 /// and lose the structural distinction between a Constant and a
 /// Variable carrier.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rmodel::impossible_repr;
@@ -2861,6 +2881,10 @@ pub fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RType
 ///
 /// `i_flavor` is the required keyword index; absent or non-`'raw'`
 /// flavor surfaces a `TyperError` matching the upstream assertion.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rmodel::impossible_repr;
@@ -2952,6 +2976,10 @@ pub fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeRe
 /// The `flags` Python dict is lowered to `ConstValue::Dict` keyed on
 /// the byte-string `"flavor"` with the `Flavor::llflavor()` byte-string
 /// as value, matching the runtime shape the `free` llop-handler reads.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn rtype_free_non_gc_object(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,

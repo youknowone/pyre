@@ -88,9 +88,9 @@ fn test_simple_arithmetic() {
     // Compile directly without optimizer (RPython test_compile_linear_loop parity)
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(0);
+    let token = JitCellToken::new(0);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // Execute
@@ -127,9 +127,9 @@ fn test_sum_loop() {
     // Compile
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(1);
+    let token = JitCellToken::new(1);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // Execute: i=100, sum=0
@@ -201,9 +201,9 @@ fn test_guard_failure_path() {
     // Compile
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(3);
+    let token = JitCellToken::new(3);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // Execute with x=5: guard passes, result = 5 * 2 = 10
@@ -273,9 +273,9 @@ fn test_bridge_end_to_end() {
     // `trace_id()` trait method (which forwards through the test's
     // TestFailDescr meta_descr, default 0).
     backend.set_next_trace_id(0);
-    let mut token = JitCellToken::new(10);
+    let token = JitCellToken::new(10);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // Execute without bridge: i=5, sum=0
@@ -401,9 +401,9 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     (backend, token)
@@ -435,9 +435,9 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     (backend, token)
@@ -469,9 +469,9 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     (backend, token)
@@ -659,9 +659,9 @@ fn test_vec_int_add_simd() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(300);
+    let token = JitCellToken::new(300);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // a=10, b=20, c=3, d=7 -> r0 = 10+3 = 13, r1 = 20+7 = 27
@@ -716,9 +716,9 @@ fn test_vec_int_sub_simd() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(301);
+    let token = JitCellToken::new(301);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // a=10, b=20, c=3, d=7 -> r0 = 10-3 = 7, r1 = 20-7 = 13
@@ -760,9 +760,9 @@ fn test_vec_int_mul_simd() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(302);
+    let token = JitCellToken::new(302);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // a=5, b=6, c=7, d=8 -> r0 = 5*7 = 35, r1 = 6*8 = 48
@@ -808,9 +808,9 @@ fn test_vec_expand_add_simd() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(303);
+    let token = JitCellToken::new(303);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // a=10, b=20, s=100 -> r0 = 10+100 = 110, r1 = 20+100 = 120
@@ -864,9 +864,9 @@ fn test_vec_float_add_simd() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(304);
+    let token = JitCellToken::new(304);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // Pass f64 values as i64 bit patterns
@@ -938,9 +938,9 @@ fn test_vec_chained_add_mul_simd() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(305);
+    let token = JitCellToken::new(305);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // a=2, b=3, c=4, d=5, e=10, f=20
@@ -964,8 +964,6 @@ fn test_vec_chained_add_mul_simd() {
 // ===========================================================================
 // Stress tests: multi-pass optimizer pipeline integration
 // ===========================================================================
-
-/// Helper: create a full 8-pass default optimizer pipeline.
 
 /// Minimal field descriptor for optimizer-level tests.
 #[derive(Debug)]
@@ -1246,9 +1244,9 @@ fn test_threadlocalref_get_basic() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(500);
+    let token = JitCellToken::new(500);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -1295,9 +1293,9 @@ fn test_threadlocalref_get_multiple_slots() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(501);
+    let token = JitCellToken::new(501);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -1331,9 +1329,9 @@ fn test_threadlocalref_set_and_read_roundtrip() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(502);
+    let token = JitCellToken::new(502);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     for value in [0i64, 1, -1, 0x544C, i64::MAX, i64::MIN] {
@@ -1373,8 +1371,8 @@ fn test_threadlocalref_thread_isolation() {
         // We can't easily run compiled code on the child thread
         // (JitCellToken/backend not Send), but we can verify via the shim.
         let base = majit_backend_cranelift::compiler::jit_threadlocalref_base();
-        let val = if base.is_null() { 0 } else { unsafe { *base } };
-        val
+
+        if base.is_null() { 0 } else { unsafe { *base } }
     });
 
     barrier.wait();
@@ -1464,9 +1462,9 @@ fn test_call_release_gil_i_compiles_and_executes() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(600);
+    let token = JitCellToken::new(600);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("CallReleaseGilI should compile");
 
     // Execute with a=10, b=32 -> expected result 42
@@ -1509,9 +1507,9 @@ fn test_call_release_gil_i_no_args() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(601);
+    let token = JitCellToken::new(601);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("CallReleaseGilI with no args should compile");
 
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -1547,9 +1545,9 @@ fn test_call_release_gil_n_void_return() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(602);
+    let token = JitCellToken::new(602);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("CallReleaseGilN should compile");
 
     FFI_SINK_VALUE.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -1585,9 +1583,9 @@ fn test_call_release_gil_result_flows_through_trace() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(603);
+    let token = JitCellToken::new(603);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("trace with CallReleaseGilI + IntAdd should compile");
 
     // x=7 -> ffi_add(7, 10)=17 -> 17+5=22
@@ -1612,7 +1610,7 @@ fn test_call_release_gil_hooks_are_callable() {
 
     // set_gil_hooks uses OnceLock, so it may fail silently if already set
     // by another test. That's fine; we just verify the function is callable.
-    let _ = set_gil_hooks(|| {}, || {});
+    set_gil_hooks(|| {}, || {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,9 +1693,9 @@ fn test_raw_store_load_int_roundtrip() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(600);
+    let token = JitCellToken::new(600);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("raw int roundtrip compilation should succeed");
 
     // Allocate a buffer and execute
@@ -1734,17 +1732,17 @@ fn test_raw_store_load_float_roundtrip() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(601);
+    let token = JitCellToken::new(601);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("raw float roundtrip compilation should succeed");
 
     let mut buf = vec![0u8; 16];
     let ptr = buf.as_mut_ptr() as usize;
 
-    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Float(3.14159)]);
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Float(3.25)]);
     assert!(
-        (backend.get_float_value(&frame, 0) - 3.14159).abs() < 1e-10,
+        (backend.get_float_value(&frame, 0) - 3.25).abs() < 1e-10,
         "raw_store then raw_load_f should roundtrip the float value"
     );
 }
@@ -1780,9 +1778,9 @@ fn test_raw_ops_different_offsets_no_interference() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(602);
+    let token = JitCellToken::new(602);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("multi-offset raw ops should compile");
 
     let mut buf = vec![0u8; 32];
@@ -1824,9 +1822,9 @@ fn test_raw_load_unsigned_byte() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(603);
+    let token = JitCellToken::new(603);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("unsigned byte raw load should compile");
 
     let mut data = vec![0xFFu8];
@@ -1929,9 +1927,9 @@ fn test_call_release_gil_with_guard_not_forced() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(700);
+    let token = JitCellToken::new(700);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("CallMayForceI + GuardNotForced should compile");
 
     // Not forced: guard passes, finish returns result = x * 2
@@ -1987,9 +1985,9 @@ fn test_call_may_force_with_forcing_semantics() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(701);
+    let token = JitCellToken::new(701);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("CallMayForceI + GuardNotForced (forced) should compile");
 
     // flag=0 -> not forced -> reaches Finish
@@ -2060,9 +2058,9 @@ fn test_ffi_call_exception_propagation() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(702);
+    let token = JitCellToken::new(702);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("CallReleaseGilI + GuardNotForced + GuardNoException should compile");
 
     // collect_guards: GuardNotForced=0, GuardNoException=1, Finish=2
@@ -2117,9 +2115,9 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(900);
+    let token = JitCellToken::new(900);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // x=50: guard passes (55 < 100), reaches Finish
@@ -2178,9 +2176,9 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
 
     backend.set_next_trace_id(910);
     backend.set_next_header_pc(1000);
-    let mut token = JitCellToken::new(902);
+    let token = JitCellToken::new(902);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("main loop compilation should succeed");
 
     // Set up recovery layout on the guard with 2 frames so the bridge
@@ -2315,9 +2313,9 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
 
     backend.set_next_trace_id(920);
     backend.set_next_header_pc(3000);
-    let mut callee_token = JitCellToken::new(903);
+    let callee_token = JitCellToken::new(903);
     backend
-        .compile_loop(&callee_inputargs, &callee_ops_rc, &mut callee_token)
+        .compile_loop(&callee_inputargs, &callee_ops_rc, &callee_token)
         .expect("callee compilation should succeed");
 
     // x=20: guard passes, finish
@@ -2370,23 +2368,23 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
 
     backend.set_next_trace_id(930);
     backend.set_next_header_pc(5000);
-    let mut token = JitCellToken::new(904);
+    let token = JitCellToken::new(904);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
 
     // x_int=10, x_float=3.14: guard passes, finish returns 10
-    let frame = backend.execute_token(&token, &[Value::Int(10), Value::Float(3.14)]);
+    let frame = backend.execute_token(&token, &[Value::Int(10), Value::Float(3.25)]);
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 10);
 
-    // x_int=-5, x_float=2.718: guard fails (-5 > 0 is false)
-    let frame = backend.execute_token(&token, &[Value::Int(-5), Value::Float(2.718)]);
+    // x_int=-5, x_float=2.5: guard fails (-5 > 0 is false)
+    let frame = backend.execute_token(&token, &[Value::Int(-5), Value::Float(2.5)]);
     let descr = backend.get_latest_descr(&frame);
     assert_eq!(descr.fail_index(), 0);
     assert_eq!(backend.get_int_value(&frame, 0), -5);
     assert!(
-        (backend.get_float_value(&frame, 1) - 2.718).abs() < 1e-10,
+        (backend.get_float_value(&frame, 1) - 2.5).abs() < 1e-10,
         "float fail arg should be preserved"
     );
 
@@ -2473,9 +2471,9 @@ fn test_ffi_exchange_buffer_pattern() {
 
     let mut backend = CraneliftBackend::new();
 
-    let mut token = JitCellToken::new(950);
+    let token = JitCellToken::new(950);
     backend
-        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("FFI exchange buffer pattern should compile");
 
     // Allocate a 48-byte exchange buffer (matching RPython's exbuf allocation)

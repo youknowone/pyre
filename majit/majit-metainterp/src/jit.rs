@@ -883,8 +883,8 @@ pub fn _jit_record_known_result<T>(_known_result: T, _func_result: T) {
     // No-op at runtime; the codewriter emits RecordKnownResult.
 }
 
-/// Implemented as a variadic macro in `majit-metainterp/src/lib.rs` since
-/// Rust lacks `*args`; see `record_known_result!`.
+// Implemented as a variadic macro in `majit-metainterp/src/lib.rs` since
+// Rust lacks `*args`; see `record_known_result!`.
 
 // ── record_known_result ──
 // rlib/jit.py:1224-1239

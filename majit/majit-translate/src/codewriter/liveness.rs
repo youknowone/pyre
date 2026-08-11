@@ -438,6 +438,10 @@ pub fn encode_liveness(live: &[u8]) -> Vec<u8> {
 /// Each returned tuple is `(live_i, live_r, live_f, offset)`, with the sets in
 /// the sorted/deduped form `encode_liveness` canonicalises to — the same shape
 /// upstream's `frozenset` key has.
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub fn decode_liveness_records(all_liveness: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>, usize)> {
     let mut records = Vec::new();
     let mut pos = 0usize;
@@ -573,7 +577,7 @@ mod tests {
             name: "test".into(),
             insns: vec![
                 FlatOp::Label(Label(0)),
-                FlatOp::Op(SpaceOperation {
+                FlatOp::op(SpaceOperation {
                     result: Some(v0.clone()),
                     kind: OpKind::Input {
                         name: "a".into(),
@@ -581,11 +585,11 @@ mod tests {
                         class_root: None,
                     },
                 }),
-                FlatOp::Op(SpaceOperation {
+                FlatOp::op(SpaceOperation {
                     result: Some(v1.clone()),
                     kind: OpKind::ConstInt(42),
                 }),
-                FlatOp::Op(SpaceOperation {
+                FlatOp::op(SpaceOperation {
                     result: Some(v2),
                     kind: OpKind::BinOp {
                         op: "add".into(),

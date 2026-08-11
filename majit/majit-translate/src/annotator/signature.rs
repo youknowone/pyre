@@ -91,7 +91,7 @@ pub enum AnnotationSpec {
     Tuple(Vec<AnnotationSpec>),
     /// Already-computed `SomeValue` — upstream `isinstance(t,
     /// SomeObject)` short-circuit (signature.py:57-58).
-    Already(SomeValue),
+    Already(Box<SomeValue>),
 }
 
 /// RPython `class SignatureError(AnnotatorError)` (signature.py:149-150).
@@ -150,7 +150,7 @@ fn compute_annotation(
     validate_annotation_size(spec)?;
     match spec {
         // upstream: `if isinstance(t, SomeObject): return t`.
-        AnnotationSpec::Already(sv) => Ok(sv.clone()),
+        AnnotationSpec::Already(sv) => Ok(sv.as_ref().clone()),
         // upstream: `elif isinstance(t, list): return SomeList(
         //     ListDef(bookkeeper, annotation(t[0]), mutated=True, resized=True))`.
         AnnotationSpec::List(inner) => {
@@ -297,6 +297,10 @@ pub enum SigArgType {
     /// resolve the real argtype at call time. The Rust port models
     /// the callable as a Rust closure that receives the inputcells
     /// and returns the resolved [`SigArgType`].
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     DynamicCallable(Rc<dyn Fn(&[SomeValue]) -> Result<SigArgType, SignatureError>>),
     /// `lltype.Void` — upstream requires the inputcell to be a
     /// constant `SomePBC` / `SomeNone`; passes the inputcell through
@@ -513,7 +517,7 @@ pub enum TypeMarker {
 pub enum ParamType {
     /// Already a `SomeObject` instance — upstream `isinstance(paramtype,
     /// SomeObject)` branch.
-    Annotation(SomeValue),
+    Annotation(Box<SomeValue>),
     /// `SelfTypeMarker` / `AnyTypeMarker`.
     Marker(TypeMarker),
     /// A callable that takes the bookkeeper and returns a SomeValue.
@@ -543,7 +547,7 @@ pub fn finish_type(
     func_name: &str,
 ) -> Result<Option<SomeValue>, SignatureError> {
     match paramtype {
-        ParamType::Annotation(sv) => Ok(Some(sv.clone())),
+        ParamType::Annotation(sv) => Ok(Some(sv.as_ref().clone())),
         ParamType::Marker(TypeMarker::SelfType) => Err(SignatureError(format!(
             "{func_name:?} argument declared as annotation.types.self(); class needs decorator \
              rlib.signature.finishsigs()"
@@ -728,7 +732,7 @@ mod tests {
     fn annotation_passes_through_already_somevalue() {
         // upstream: `if isinstance(t, SomeObject): return t`.
         let existing = SomeValue::Integer(SomeInteger::new(true, false));
-        let s = annotation(&AnnotationSpec::Already(existing.clone()), None).unwrap();
+        let s = annotation(&AnnotationSpec::Already(Box::new(existing.clone())), None).unwrap();
         assert_eq!(s, existing);
     }
 
@@ -792,7 +796,7 @@ mod tests {
 
         // ParamType::Annotation
         let sv = SomeValue::Integer(SomeInteger::default());
-        let out = finish_type(&ParamType::Annotation(sv.clone()), &bk, "f").unwrap();
+        let out = finish_type(&ParamType::Annotation(Box::new(sv.clone())), &bk, "f").unwrap();
         assert_eq!(out, Some(sv));
 
         // ParamType::Marker(AnyType)
@@ -815,9 +819,9 @@ mod tests {
     fn enforce_signature_args_rejects_mismatched_param() {
         // Declared: Integer. Actual: String. → SignatureError.
         let bk = bk();
-        let paramtypes = vec![ParamType::Annotation(SomeValue::Integer(
+        let paramtypes = vec![ParamType::Annotation(Box::new(SomeValue::Integer(
             SomeInteger::default(),
-        ))];
+        )))];
         let mut actualtypes = vec![SomeValue::String(super::super::model::SomeString::default())];
         let err = enforce_signature_args("f", &bk, &paramtypes, &mut actualtypes).unwrap_err();
         assert!(err.0.contains("argument 1"));
@@ -833,9 +837,9 @@ mod tests {
         // To avoid SomeInteger containment detail dependence, use a
         // container that unambiguously contains the actual: unspec
         // Integer contains nonneg Integer.
-        let paramtypes = vec![ParamType::Annotation(SomeValue::Integer(
+        let paramtypes = vec![ParamType::Annotation(Box::new(SomeValue::Integer(
             SomeInteger::default(),
-        ))];
+        )))];
         let mut actualtypes = vec![SomeValue::Integer(nonneg.clone())];
         let _ = signed;
         enforce_signature_args("f", &bk, &paramtypes, &mut actualtypes).unwrap();
@@ -856,7 +860,7 @@ mod tests {
     #[test]
     fn enforce_signature_return_rejects_mismatched() {
         let bk = bk();
-        let sigtype = ParamType::Annotation(SomeValue::Integer(SomeInteger::default()));
+        let sigtype = ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default())));
         let inferred = SomeValue::String(super::super::model::SomeString::default());
         let err = enforce_signature_return("f", &bk, &sigtype, &inferred).unwrap_err();
         assert!(err.0.contains("return value"));

@@ -175,6 +175,9 @@ pub unsafe fn is_int_mutable_cell(obj: PyObjectRef) -> bool {
 
 /// `isinstance(w, MutableCell)`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_mutable_cell(obj: PyObjectRef) -> bool {
     is_object_mutable_cell(obj) || is_int_mutable_cell(obj)
 }
@@ -620,6 +623,9 @@ impl GlobalCache {
     /// unwrapped value, or `None` if the cache holds `None` (key
     /// absent at install time).
     #[inline]
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn getvalue(&self) -> Option<PyObjectRef> {
         // A cached cell whose unwrapped value is null is a stale/empty binding:
         // treat it as a cache miss rather than surfacing `Some(null)`.
@@ -812,6 +818,10 @@ impl ModuleDictStrategy {
     /// stays a live `space.finditem_str(frame.w_builtin.w_dict, name)`
     /// at every call (see `load_global_via_cache` final fallback in
     /// `pyre-interpreter/src/eval.rs`).
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     pub fn get_global_cache(
         &mut self,
         storage: &ModuleDictStorage,
@@ -960,6 +970,10 @@ impl ModuleDictStrategy {
     /// the cell kind — reaches `mutated()`.  That is what keeps a hot
     /// module-level counter increment from invalidating every loop that
     /// folded a module-global.
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+    )]
     pub fn _setitem_str_cell_known(
         &mut self,
         cell: Option<PyObjectRef>,

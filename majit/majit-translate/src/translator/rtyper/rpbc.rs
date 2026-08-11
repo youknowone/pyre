@@ -102,8 +102,14 @@ pub struct LLCallTable {
     pub uniquerows: Vec<ConcreteCallTableRowRef>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallTableLookupError;
+
 impl LLCallTable {
-    pub fn lookup(&self, row: &ConcreteCallTableRow) -> Result<(usize, ConcreteCallTableRow), ()> {
+    pub fn lookup(
+        &self,
+        row: &ConcreteCallTableRow,
+    ) -> Result<(usize, ConcreteCallTableRow), CallTableLookupError> {
         for (existingindex, existingrow) in self.uniquerows.iter().enumerate() {
             let existingrow = existingrow.borrow();
             if row.fntype != existingrow.fntype {
@@ -135,12 +141,12 @@ impl LLCallTable {
                 return Ok((existingindex, merged));
             }
         }
-        Err(())
+        Err(CallTableLookupError)
     }
 
     pub fn add(&mut self, row: ConcreteCallTableRow) {
         match self.lookup(&row) {
-            Err(()) => self.uniquerows.push(Rc::new(RefCell::new(row))),
+            Err(CallTableLookupError) => self.uniquerows.push(Rc::new(RefCell::new(row))),
             Ok((index, merged)) => {
                 if merged == *self.uniquerows[index].borrow() {
                     return;
@@ -760,8 +766,13 @@ pub(crate) mod tests {
             None,
             None,
         );
-        FunctionDesc::consider_call_site(&[fd.clone()], &args, &SomeValue::Impossible, None)
-            .unwrap();
+        FunctionDesc::consider_call_site(
+            std::slice::from_ref(&fd),
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
         let s_pbc = SomePBC::new(vec![DescEntry::function(fd.clone())], false);
         let callfamily = fd.borrow().base.getcallfamily().unwrap();
 
@@ -2405,6 +2416,10 @@ pub struct SmallFunctionSetPBCRepr {
     /// `Constant` produced by [`SmallFunctionSetPBCRepr::dispatcher`].
     /// Each entry holds the function pointer at the dispatcher graph's
     /// `getfunctionptr` typed result.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub _dispatch_cache:
         RefCell<HashMap<(CallShape, usize, Vec<LowLevelType>, LowLevelType), Constant>>,
     /// RPython `self._compression_function = None` (rpbc.py:401).
@@ -2433,6 +2448,10 @@ pub struct SmallFunctionSetPBCRepr {
 impl SmallFunctionSetPBCRepr {
     /// RPython `SmallFunctionSetPBCRepr.__init__(self, rtyper, s_pbc)`
     /// (rpbc.py:394-402).
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
         // upstream rpbc.py:395 — `FunctionReprBase.__init__(...)`.
         let base = FunctionReprBase::new(rtyper, s_pbc.clone())?;
@@ -4760,6 +4779,10 @@ pub struct MultipleFrozenPBCRepr {
     /// RPython `self.fieldmap` populated by `_setup_repr_fields`
     /// (rpbc.py:757). Maps each tracked attrname to its mangled struct
     /// field name + the per-attr Repr for the value type.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     fieldmap: RefCell<HashMap<String, (String, Arc<dyn Repr>)>>,
     state: ReprState,
 }
@@ -6142,7 +6165,7 @@ impl Repr for ClassesPBCRepr {
     ///   `convert_desc` walks `getuniqueclassdef` → `getclassrepr_arc`
     ///   → `getruntime(self.lowleveltype)` to materialise the vtable
     ///   pointer constant.
-    /// RPython `ClassesPBCRepr.rtype_getattr(self, hop)` (rpbc.py:970-987):
+    ///   RPython `ClassesPBCRepr.rtype_getattr(self, hop)` (rpbc.py:970-987):
     ///
     /// ```python
     /// def rtype_getattr(self, hop):
@@ -6422,6 +6445,10 @@ impl Repr for ClassesPBCRepr {
 /// access set = None" and routes to the `None`-access `MultipleFrozenPBCRepr`
 /// arm.
 #[allow(non_snake_case)]
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+)]
 pub fn getFrozenPBCRepr(
     rtyper: &Rc<RPythonTyper>,
     s_pbc: &SomePBC,
@@ -6777,6 +6804,10 @@ impl MethodsPBCRepr {
     ///     # now hop2 looks like simple_call(function, self, args...)
     ///     return hop2.dispatch()
     /// ```
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     pub fn redispatch_call(
         &self,
         hop: &crate::translator::rtyper::rtyper::HighLevelOp,
@@ -7124,6 +7155,10 @@ impl Repr for MethodsPBCRepr {
 /// `MissingRTypeOperation` paths are scoped to specific edge cases
 /// documented at each repr (e.g. `getFrozenPBCRepr` `None`-access
 /// arm, `FunctionsPBCRepr` multi-row `setup_specfunc` corners).
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+)]
 pub fn somepbc_rtyper_makerepr(
     s_pbc: &SomePBC,
     rtyper: &Rc<RPythonTyper>,
@@ -9022,8 +9057,13 @@ mod pbc_repr_tests {
             None,
         );
         let shape = args.rawshape();
-        FunctionDesc::consider_call_site(&[fd.clone()], &args, &SomeValue::Impossible, None)
-            .expect("consider_call_site should populate the calltable");
+        FunctionDesc::consider_call_site(
+            std::slice::from_ref(&fd),
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .expect("consider_call_site should populate the calltable");
         (fd, shape, pygraph)
     }
 
@@ -9626,7 +9666,7 @@ mod pbc_repr_tests {
             .borrow_mut()
             .insert(GraphCacheKey::None, super::tests::make_pygraph("f_graph"));
         FunctionDesc::consider_call_site(
-            &[fd_rc.clone()],
+            std::slice::from_ref(&fd_rc),
             &ArgumentsForTranslation::new(
                 vec![Some(SomeValue::Integer(SomeInteger::default()))],
                 None,

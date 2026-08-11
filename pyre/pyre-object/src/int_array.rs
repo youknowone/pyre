@@ -199,6 +199,11 @@ impl IntArray {
         self.len
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn as_slice(&self) -> &[i64] {
         unsafe { std::slice::from_raw_parts(self.base(), self.len) }
     }

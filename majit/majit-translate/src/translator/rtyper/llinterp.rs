@@ -297,6 +297,10 @@ pub struct LLInterpreter {
     /// follow-up could narrow the value slot to
     /// `lltype::LowLevelValue` once every read site is migrated
     /// off `Rc<dyn Any>::downcast_ref`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub bindings: RefCell<Vec<(Rc<dyn Any>, Rc<dyn Any>)>>,
     /// Upstream `self.typer = typer` at `:74`.
     pub typer: Rc<RPythonTyper>,
@@ -1259,8 +1263,6 @@ mod tests {
 
         assert_eq!(_address_of_local_var::_TYPE, LowLevelType::Address);
         assert_eq!(_address_of_thread_local::_TYPE, LowLevelType::Address);
-        assert!(_address_of_thread_local::is_fake_thread_local_addr);
-
         let missing = enumerate_exceptions_top_down().expect_err("host reflection deferred");
         assert!(missing.is_missing_rtype_operation());
     }

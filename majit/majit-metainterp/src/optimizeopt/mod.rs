@@ -5,6 +5,12 @@
 /// The optimizer chains multiple passes, each implementing the Optimization trait.
 /// Operations flow through the chain: IntBounds → Rewrite → Virtualize → String →
 /// Pure → Guard → Simplify → Heap (configurable).
+#[expect(
+    clippy::collapsible_if,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::manual_range_contains,
+    reason = "this module is generated verbatim from real.rules; local rewrites would fail the freshness check, so lint cleanup belongs in the generator before the artifact can change"
+)]
 pub mod autogenintrules;
 pub mod bridgeopt;
 pub mod dependency;
@@ -409,6 +415,10 @@ impl ImportedShortPureOp {
     /// (`materialize_operand_at`) — shortpreamble.py:425 seeds the replay
     /// `preamble_op` with the SAME Box objects the body sees, so the
     /// operands must carry producer identity, not a position-only echo.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn new(
         ctx: &mut OptContext,
         opcode: OpCode,
@@ -657,7 +667,7 @@ pub struct OptContext {
     /// ShortBoxes object lives) to `export_state_with_bounds` through the
     /// same channel as `exported_short_boxes` (measured identical to the
     /// export-site `label_args + virtuals` recompute across the corpus,
-    /// 2026-06-11).
+    ///   2026-06-11).
     pub exported_short_inputargs: Vec<OpRef>,
     /// Rooted `InputArgRc` carriers for `exported_short_inputargs`, index-
     /// aligned with that vector. Keeping the strong Rc alive here preserves
@@ -5773,8 +5783,8 @@ impl OptContext {
     ///   - heap.rs `lookup_cached` `cached_index is indexbox` (heap.py:322):
     ///     a hit on an equal constant index is valid (the var-index cache is
     ///     write-invalidated, so no stale hit can survive).
-    /// A future `is`-site that must treat equal-valued *distinct* constants
-    /// as DISTINCT cannot use `box_is` as-is.
+    ///     A future `is`-site that must treat equal-valued *distinct* constants
+    ///     as DISTINCT cannot use `box_is` as-is.
     pub fn box_is(&self, a: OpRef, b: OpRef) -> bool {
         self.get_replacement_opref(a) == self.get_replacement_opref(b)
     }
@@ -6699,7 +6709,7 @@ impl OptContext {
     ///    plain `()` function).
     ///  - Helper-internal `Ok(None)` for OVF/shift/divide-by-zero/
     ///    non-finite cast (see `pure.rs:993`).
-    /// Every other path panics (caller-invariant, NotImplemented).
+    ///    Every other path panics (caller-invariant, NotImplemented).
     pub fn constant_fold(&self, op: &Op) -> Option<Value> {
         // optimizer.py:822-825: "if cpu.supports_guard_gc_type is
         // false, we can't really do this check at all, but then we
@@ -6743,7 +6753,7 @@ impl OptContext {
             op.result_type(),
         ) {
             Ok(folded) => folded,
-            Err(()) => panic!(
+            Err(crate::executor::NoConstExecutor) => panic!(
                 "execute_nonspec_const: no helper registered for opcode {:?} \
                  (executor.py:610 NotImplementedError)",
                 op.opcode
@@ -7600,7 +7610,7 @@ impl OptContext {
     /// Reads at `struct_ptr + array.base_size() + i * array.item_size()
     /// + field.offset()` per `InteriorFieldDescr.array_descr()` +
     /// `field_descr()`. Matches the backend Cpu::bh_getinteriorfield_gc_*
-    /// shape (struct + element_index + interior-field).
+    ///   shape (struct + element_index + interior-field).
     ///
     /// Concrete-Ref extractor routes through `runtime_value_of`; see
     /// `get_runtime_field` docstring.
@@ -8813,7 +8823,7 @@ mod boxref_forwarding_tests {
         // PtrInfo applies to ref-typed boxes.
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, _ia) = bound_inputarg_operand(Type::Ref, 0);
-        ctx.seed_boxes_canonical(&[b.clone()]);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&b));
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
         ctx.set_ptr_info(&b, info);
         match &b.get_forwarded() {
@@ -8832,7 +8842,7 @@ mod boxref_forwarding_tests {
         use majit_ir::GcRef;
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, _ia) = bound_inputarg_operand(Type::Ref, 0);
-        ctx.seed_boxes_canonical(&[b.clone()]);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&b));
         ctx.make_constant_arg(&b, Value::Ref(GcRef(0xdead_beef)));
         match &b.get_forwarded() {
             BoxForwarded::Const(majit_ir::Const::Ref(g)) => {
@@ -9188,7 +9198,7 @@ mod boxref_forwarding_tests {
     fn ctx_with_one_ref_box() -> (OptContext, Operand) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, ia) = bound_inputarg_operand(Type::Ref, 0);
-        ctx.seed_boxes_canonical(&[b.clone()]);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&b));
         // Keep the InputArgRc alive in ctx so the Weak<InputArg> in
         // `b.inputarg_handle` upgrades across the test body.
         ctx.inputarg_refs = vec![ia];
@@ -9705,7 +9715,7 @@ mod boxref_forwarding_tests {
     fn clear_forwarded_drops_int_bound() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (old_box, ia) = bound_inputarg_operand(Type::Int, 0);
-        ctx.seed_boxes_canonical(&[old_box.clone()]);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&old_box));
         ctx.inputarg_refs = vec![ia];
         ctx.setintbound(
             &old_box,

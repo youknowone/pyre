@@ -28,6 +28,10 @@ fn copy_base(full: &[u8], base: i64, isz: usize, out: &mut Vec<u8>) {
 /// `_copy_rec` — recursive C-order copy of dimension `idim`.  The innermost
 /// dimension walks `shape[ndim-1]` elements by `strides[ndim-1]`; an outer
 /// dimension recurses `shape[idim]` times, advancing `off` by `strides[idim]`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 fn copy_rec(
     full: &[u8],
     shape: &[i64],

@@ -42,6 +42,9 @@ pub type CountGuard = parking_lot::lock_api::ReentrantMutexGuard<
 >;
 
 #[majit_macros::dont_look_inside]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_count_lock(obj: PyObjectRef) -> CountGuard {
     let lock = COUNT_LOCKS[(obj as usize >> 4) & (COUNT_LOCKS.len() - 1)].get();
     if let Some(guard) = lock.try_lock() {
@@ -721,6 +724,9 @@ pub fn w_groupby_new(w_iterator: PyObjectRef, w_keyfunc: PyObjectRef) -> PyObjec
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_groupby(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &GROUPBY_TYPE) }
 }
@@ -751,6 +757,9 @@ pub fn w_groupby_iterator_new(groupby: PyObjectRef, w_tgtkey: PyObjectRef) -> Py
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_groupby_iterator(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &GROUPBY_ITERATOR_TYPE) }
 }
@@ -779,6 +788,9 @@ pub fn w_tee_chained_list_node_new() -> PyObjectRef {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_tee_dataobject(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &TEE_DATAOBJECT_TYPE) }
 }
@@ -806,6 +818,9 @@ pub fn w_tee_iterable_new(w_iterator: PyObjectRef, w_chained_list: PyObjectRef) 
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_tee_iterable(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &TEE_ITERABLE_TYPE) }
 }
@@ -936,11 +951,17 @@ pub fn w_accumulate_new(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_accumulate(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &ACCUMULATE_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_accumulate_set_total(obj: PyObjectRef, w_value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Accumulate)).w_total = w_value;
@@ -949,6 +970,9 @@ pub unsafe fn w_accumulate_set_total(obj: PyObjectRef, w_value: PyObjectRef) {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_accumulate_set_initial(obj: PyObjectRef, w_value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Accumulate)).w_initial = w_value;
@@ -986,6 +1010,9 @@ pub fn w_zip_longest_new(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_zip_longest(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &ZIP_LONGEST_TYPE) }
 }

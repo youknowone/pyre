@@ -1,6 +1,6 @@
 //! RPython `rpython/rtyper/rfloat.py` — `FloatRepr` + `SingleFloatRepr`
 //! + `LongFloatRepr` + singleton + `SomeFloat/SingleFloat/LongFloat`
-//! dispatch.
+//!   dispatch.
 //!
 //! Upstream rfloat.py (174 LOC) covers three Reprs:
 //!
@@ -1031,9 +1031,9 @@ mod tests {
         };
         assert_eq!(f64::from_bits(bits), 1.0);
 
-        let c_float = r.convert_const(&ConstValue::Float(3.14_f64.to_bits()));
+        let c_float = r.convert_const(&ConstValue::Float(3.25_f64.to_bits()));
         let c = c_float.unwrap();
-        assert_eq!(c.value, ConstValue::Float(3.14_f64.to_bits()));
+        assert_eq!(c.value, ConstValue::Float(3.25_f64.to_bits()));
         assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Float));
     }
 

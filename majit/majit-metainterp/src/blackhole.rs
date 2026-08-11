@@ -167,7 +167,7 @@ pub enum DispatchError {
     RaiseException(i64),
     /// blackhole.py:1068-1069: raise ContinueRunningNormally(*args)
     /// Bottommost blackhole reached the merge point — restart portal.
-    ContinueRunningNormally(MergePointArgs),
+    ContinueRunningNormally(Box<MergePointArgs>),
 }
 
 /// Jitcode-based blackhole interpreter.
@@ -599,6 +599,10 @@ impl BlackholeInterpreter {
     /// not optional, so reaching this point with zero means `jdindex` named the
     /// wrong slot of `jitdrivers_sd`.  Report the coordinates instead of
     /// faulting at PC 0.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn portal_runner_call_args(
         &self,
         jdindex: usize,
@@ -630,6 +634,10 @@ impl BlackholeInterpreter {
     ///   fnptr, calldescr = self.get_portal_runner(jdindex)
     ///   return self.cpu.bh_call_r(fnptr, greens_i+reds_i, greens_r+reds_r,
     ///                             greens_f+reds_f, calldescr)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn bhimpl_recursive_call_r(
         &self,
         jdindex: usize,
@@ -869,14 +877,16 @@ impl BlackholeInterpreter {
         // ContinueRunningNormally; it propagates out to `_run_forever`
         // and then to `handle_jitexception` (warmspot.py:961).
         if let Some(args) = self.run() {
-            return Err(JitException::ContinueRunningNormally {
-                green_int: args.green_int,
-                green_ref: args.green_ref,
-                green_float: args.green_float,
-                red_int: args.red_int,
-                red_ref: args.red_ref,
-                red_float: args.red_float,
-            });
+            return Err(JitException::ContinueRunningNormally(Box::new(
+                crate::jitexc::ContinueRunningNormallyArgs {
+                    green_int: args.green_int,
+                    green_ref: args.green_ref,
+                    green_float: args.green_float,
+                    red_int: args.red_int,
+                    red_ref: args.red_ref,
+                    red_float: args.red_float,
+                },
+            )));
         }
 
         // Check for exception during execution
@@ -1073,14 +1083,16 @@ impl BlackholeInterpreter {
         if self.nextblackholeinterp.is_none() {
             // blackhole.py:1068-1069: bottommost level.
             //   raise ContinueRunningNormally(*args)
-            return Err(DispatchError::ContinueRunningNormally(MergePointArgs {
-                green_int: gi,
-                green_ref: gr,
-                green_float: gf,
-                red_int: ri,
-                red_ref: rr,
-                red_float: rf,
-            }));
+            return Err(DispatchError::ContinueRunningNormally(Box::new(
+                MergePointArgs {
+                    green_int: gi,
+                    green_ref: gr,
+                    green_float: gf,
+                    red_int: ri,
+                    red_ref: rr,
+                    red_float: rf,
+                },
+            )));
         }
         // blackhole.py:1074-1093: recursive portal level.
         //   sd = self.builder.metainterp_sd
@@ -1536,7 +1548,7 @@ impl BlackholeInterpreter {
                             &format!("ContinueRunningNormally at pos={pos_before}"),
                         );
                     }
-                    return Some(args);
+                    return Some(*args);
                 }
                 Err(DispatchError::RaiseException(exc)) => {
                     // blackhole.py:359-361: except Exception → handle_exception_in_frame
@@ -1904,6 +1916,10 @@ impl BlackholeInterpreter {
     // The remaining three follow the same pattern for parity.
 
     /// blackhole.py:1102-1108
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn bhimpl_recursive_call_i(
         &self,
         jdindex: usize,
@@ -1922,6 +1938,10 @@ impl BlackholeInterpreter {
     }
 
     /// blackhole.py:1117-1124
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn bhimpl_recursive_call_f(
         &self,
         jdindex: usize,
@@ -1940,6 +1960,10 @@ impl BlackholeInterpreter {
     }
 
     /// blackhole.py:1125-1132
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn bhimpl_recursive_call_v(
         &self,
         jdindex: usize,
@@ -1966,7 +1990,7 @@ impl BlackholeInterpreter {
 /// 1. Interpreter pool management (acquire/release/release_chain).
 /// 2. Codewriter-orthodox dispatch setup (`setup_insns` → dispatch table
 ///    + `dispatch_loop`). Phase D incrementally wires this up as
-///    `bhimpl_*` methods are ported from RPython.
+///      `bhimpl_*` methods are ported from RPython.
 pub struct BlackholeInterpBuilder {
     pool: Vec<BlackholeInterpreter>,
     /// RPython `blackhole.py:56` `self.cpu = codewriter.cpu`.
@@ -2387,6 +2411,10 @@ impl BlackholeInterpBuilder {
 /// For ContinueRunningNormally, calls portal_runner to re-enter the
 /// portal function. The portal_runner may itself raise a JitException,
 /// which is returned as Err for the caller to re-dispatch (while loop).
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 fn handle_jitexception_dispatch(
     exc: JitException,
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
@@ -2405,7 +2433,7 @@ fn handle_jitexception_dispatch(
         // warmspot.py:998-1005
         JitException::ExitFrameWithExceptionRef(_) => Err(exc),
         // warmspot.py:970-983
-        JitException::ContinueRunningNormally { .. } => {
+        JitException::ContinueRunningNormally(_) => {
             // warmspot.py:976-978: result = portal_ptr(*args)
             // May raise JitException → Err propagated for re-dispatch.
             let runner = portal_runner.expect("ContinueRunningNormally requires portal_runner");
@@ -2424,6 +2452,10 @@ fn handle_jitexception_dispatch(
 /// Returns Ok(()) on success (return value set in bhcaller),
 /// or Err(exc_value) if the exception should be propagated as a
 /// regular exception (ExitFrameWithExceptionRef).
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 fn handle_jitexception_in_portal(
     bhcaller: &mut BlackholeInterpreter,
     exc: JitException,
@@ -2495,6 +2527,10 @@ impl BlackholeTerminalImage {
 /// Walks up the chain until a portal frame is found. If the portal
 /// is the bottommost frame, the exception propagates out. Otherwise
 /// it's handled at the recursive portal level.
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 fn handle_jitexception(
     builder: &mut BlackholeInterpBuilder,
     mut bh: BlackholeInterpreter,
@@ -2567,6 +2603,10 @@ pub fn run_forever(
 /// `terminal_out` receives the [`BlackholeTerminalImage`] of the bottommost
 /// frame when its exception propagates out, so the caller can read the banks
 /// the release would otherwise recycle.
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub fn run_forever_with_portal(
     builder: &mut BlackholeInterpBuilder,
     mut bh: BlackholeInterpreter,
@@ -2868,9 +2908,11 @@ mod tests {
     fn handler_state_field_moves_between_register_slots() {
         // Two scalars: slot 0, slot 1. load_state_field copies a scalar slot
         // into a working register; store_state_field copies back.
-        let mut bh = BlackholeInterpreter::default();
-        bh.state_field_layout = StateFieldLayout::new(2, vec![], 0, 0);
-        bh.registers_i = vec![10, 20, 0, 0];
+        let mut bh = BlackholeInterpreter {
+            state_field_layout: StateFieldLayout::new(2, vec![], 0, 0),
+            registers_i: vec![10, 20, 0, 0],
+            ..BlackholeInterpreter::default()
+        };
 
         // load_state_field/di: field_idx=1 (u16 LE) → dest reg 2.
         let next = handler_load_state_field_di(&mut bh, &[1, 0, 2], 0).unwrap();
@@ -2890,9 +2932,11 @@ mod tests {
         // arg keeps r0). load_state_field_ref copies a ref slot into a
         // working ref register; store_state_field_ref copies back. Raw
         // pointer bits round-trip.
-        let mut bh = BlackholeInterpreter::default();
-        bh.state_field_layout = StateFieldLayout::with_ref_scalars(0, vec![], 0, 2, 1, 0);
-        bh.registers_r = vec![0x9999, 0xAAAA, 0xBBBB, 0, 0];
+        let mut bh = BlackholeInterpreter {
+            state_field_layout: StateFieldLayout::with_ref_scalars(0, vec![], 0, 2, 1, 0),
+            registers_r: vec![0x9999, 0xAAAA, 0xBBBB, 0, 0],
+            ..BlackholeInterpreter::default()
+        };
 
         // load_state_field_ref/dr: field_idx=1 (u16 LE) → dest ref reg 3.
         let next = handler_load_state_field_ref_dr(&mut bh, &[1, 0, 3], 0).unwrap();
@@ -2914,10 +2958,12 @@ mod tests {
     #[test]
     fn handler_state_array_indexes_flattened_slots() {
         // 1 scalar (slot 0) + 1 fixed array of len 4 (slots 1..5).
-        let mut bh = BlackholeInterpreter::default();
-        bh.state_field_layout = StateFieldLayout::new(1, vec![4], 0, 0);
-        // [scalar, a0, a1, a2, a3, idx_reg, dest_reg]
-        bh.registers_i = vec![0, 100, 101, 102, 103, 0, 0];
+        let mut bh = BlackholeInterpreter {
+            state_field_layout: StateFieldLayout::new(1, vec![4], 0, 0),
+            // [scalar, a0, a1, a2, a3, idx_reg, dest_reg]
+            registers_i: vec![0, 100, 101, 102, 103, 0, 0],
+            ..BlackholeInterpreter::default()
+        };
 
         // load_state_array/dii: array_idx=0, index_reg=5 (holds 2), dest=6.
         bh.registers_i[5] = 2;
@@ -3090,7 +3136,7 @@ mod tests {
     fn test_executor_float_unary() {
         let fb = |v: f64| f64::to_bits(v) as i64;
         let fr = |r: i64| f64::from_bits(r as u64);
-        assert_eq!(fr(exec_unop(OpCode::FloatNeg, fb(3.14))), -3.14);
+        assert_eq!(fr(exec_unop(OpCode::FloatNeg, fb(3.25))), -3.25);
         assert_eq!(fr(exec_unop(OpCode::FloatAbs, fb(-2.5))), 2.5);
         assert_eq!(fr(exec_unop(OpCode::FloatAbs, fb(2.5))), 2.5);
     }
@@ -3401,7 +3447,7 @@ mod tests {
     fn test_executor_convert_float_bytes_roundtrip() {
         // ConvertFloatBytesToLonglong is identity (f64 bits as i64)
         // ConvertLonglongBytesToFloat is identity (i64 bits as f64)
-        let val = f64::to_bits(3.14) as i64;
+        let val = f64::to_bits(3.25) as i64;
         let ll = exec_unop(OpCode::ConvertFloatBytesToLonglong, val);
         assert_eq!(ll, val);
         let back = exec_unop(OpCode::ConvertLonglongBytesToFloat, ll);
@@ -4209,7 +4255,7 @@ mod tests {
             sub.float_return(0);
             let sub_jitcode = sub.finish();
 
-            let bits = f64::to_bits(3.14_f64) as i64;
+            let bits = f64::to_bits(3.25_f64) as i64;
             let mut b = JitCodeBuilder::default();
             b.load_const_f_value(0, bits);
             let sub_idx = b.add_sub_jitcode(sub_jitcode);
@@ -4474,7 +4520,7 @@ mod tests {
         /// `aborted = true` to the caller via the handler's
         /// `if callee.aborted { bh.aborted = true; LeaveFrame }` arm.
         /// `bhimpl_abort_permanent` (blackhole.rs:1714) sets aborted
-        /// + returns LeaveFrame when no `BH_LAST_EXC_VALUE` is pending,
+        /// and returns LeaveFrame when no `BH_LAST_EXC_VALUE` is pending,
         /// which is the case for a clean callee spawned via
         /// `BlackholeInterpreter::for_inline_callee(parent)` (TLS reset
         /// between tests via thread isolation).
@@ -4834,12 +4880,12 @@ mod tests {
             super::wire_bhimpl_handlers(&mut builder);
 
             let placeholder = super::unwired_handler_placeholder as *const () as usize;
-            for slot in 0usize..fake_opnames.len() {
+            for (slot, opname) in fake_opnames.iter().enumerate() {
                 assert_eq!(
                     builder.dispatch_table[slot] as *const () as usize, placeholder,
                     "slot {slot} ({}) must stay unwired; mixed ref/int int \
                      opnames should be fixed at the codewriter/rtyper source",
-                    fake_opnames[slot],
+                    opname,
                 );
             }
         }
@@ -5004,11 +5050,11 @@ fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
 ///     overflow to `INT_MIN` in two's-complement; PyPy
 ///     `intobject.py:316/491/804` routes this case through
 ///     `ovf2long` to long arithmetic).
-/// Other negative operand combinations are valid: PyPy
-/// `intobject.py:316 _floordiv` only handles `ZeroDivisionError`,
-/// and the no-branch floor correction
-/// (`(a ^ b) < 0 && d * b != a -> d - 1`) yields Python-floor
-/// semantics for every legal sign combination of `(a, b)`.
+///     Other negative operand combinations are valid: PyPy
+///     `intobject.py:316 _floordiv` only handles `ZeroDivisionError`,
+///     and the no-branch floor correction
+///     (`(a ^ b) < 0 && d * b != a -> d - 1`) yields Python-floor
+///     semantics for every legal sign combination of `(a, b)`.
 ///
 /// `wrapping_div(0)` panics (Rust integer division by zero is always
 /// a panic, in both debug and release builds), and
@@ -7869,9 +7915,9 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
 ///   - A1-A8 canonical-encoded: every `JitCodeBuilder`-emitted BC_*
 ///     now pushes 1-byte register operands matching the canonical
 ///     RPython argcode contract; no `_pyre_u16` width adapters remain.
-/// The pyre-jit production thread-locals (`BH_BUILDER3`,
-/// `BH_BUILDER_RD`) and inline-call unit fixtures share this builder
-/// shape.
+///     The pyre-jit production thread-locals (`BH_BUILDER3`,
+///     `BH_BUILDER_RD`) and inline-call unit fixtures share this builder
+///     shape.
 ///
 /// See `pyre-jit-trace/src/jitcode_dispatch.rs:5988-5996` for the
 /// `pipeline.insns` ↔ `wellknown_bh_insns` table-unification epic
@@ -11288,7 +11334,7 @@ fn handler_inline_call_pyre_nested(
     // propagating the JitException.
     if let Some(args) = callee.run() {
         bh.position = p;
-        return Err(DispatchError::ContinueRunningNormally(args));
+        return Err(DispatchError::ContinueRunningNormally(Box::new(args)));
     }
 
     // RPython `blackhole.py:171` invariant: after the handler has
@@ -11367,6 +11413,10 @@ fn decode_return_slot_at(code: &[u8], cursor: &mut usize) -> Option<usize> {
 /// ```
 /// Read recursive_call args and merge greens+reds per kind.
 /// Returns (jdindex, all_i, all_r, all_f, next_position).
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 fn read_recursive_call_args(
     bh: &BlackholeInterpreter,
     code: &[u8],

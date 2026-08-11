@@ -660,7 +660,7 @@ mod tests {
     /// `virtualref.py:168-173`: when `virtual_token != TOKEN_NONE`
     /// and != `TOKEN_TRACING_RESCALL`, `force_virtual` invokes
     /// `force_now`, which (mirroring upstream's `cpu.force(token)`
-    /// + `handle_async_forcing`) must mutate the vref so that
+    /// and `handle_async_forcing`) must mutate the vref so that
     /// `virtual_token` becomes `TOKEN_NONE` and `forced` becomes
     /// the materialised object.  pyre's closure receives the
     /// `*mut JitVirtualRef` and performs the writeback in-place.

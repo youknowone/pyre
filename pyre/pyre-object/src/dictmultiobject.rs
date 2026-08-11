@@ -112,6 +112,9 @@ unsafe fn key_as_utf8(key: PyObjectRef) -> Option<&'static str> {
 /// recoverable state, so [`missing_hash_hook`](crate::dict_eq_hook::missing_hash_hook)
 /// fails loud rather than substituting a divergent structural hash.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     // `hash_w` runs the key's `__hash__` and is therefore a collection point,
     // while this key caches the pointer — the hazard [`object_key_hashed`]
@@ -546,6 +549,9 @@ unsafe fn object_key_for_new_str(key: &str) -> ObjectKey {
 /// returns `Err(DictKeyError)`.  The caller retrieves the concrete
 /// error from the interpreter-side error slot.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, DictKeyError> {
     // Same publication as [`object_key_for`]: `hash_w` can collect and this
     // key caches the pointer, so key on the reloaded address.
@@ -577,6 +583,9 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
 /// have invoked, or the key lands in a different bucket than an equal one
 /// stored through that path.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn object_key_hashed(obj: PyObjectRef, hash: i64) -> ObjectKey {
     // Clean slate for the bucket probe that follows in the caller, as in
     // `object_key_for_checked`.
@@ -585,6 +594,9 @@ pub unsafe fn object_key_hashed(obj: PyObjectRef, hash: i64) -> ObjectKey {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn hash_key_checked(obj: PyObjectRef) -> Result<(), DictKeyError> {
     let _ = crate::dict_eq_hook::try_hash_w(obj);
     if crate::dict_eq_hook::take_hash_error() {
@@ -602,6 +614,9 @@ fn strategy_is(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn key_compares_by_identity(key: PyObjectRef) -> bool {
     // A tagged immediate is an `int`, which compares by value, never by
     // identity; short-circuit before the `w_class` deref. Gated on
@@ -1358,6 +1373,9 @@ pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
 ///
 /// Used by pyre-side side table walkers whose dict object is not itself
 /// GC-managed but whose contained PyObjectRef values still need relocation.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(&mut PyObjectRef)) {
     let entries = w_dict_object_storage_mut(obj);
     for (key, value) in entries.iter_mut() {
@@ -1379,6 +1397,9 @@ pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(
 /// function. It is used when an immortal/prebuilt owner must descend through
 /// an already-old dict during a minor collection; merely visiting the dict
 /// object itself does not rescan that old object's storage.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     if obj.is_null() {
         return;
@@ -1667,6 +1688,9 @@ pub struct DictOperationGuard {
 }
 
 impl DictOperationGuard {
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn new(obj: PyObjectRef, refs: &[PyObjectRef]) -> Self {
         let roots = crate::gc_roots::push_roots();
         // The dictionary and its operands become visible in one write phase,
@@ -2017,6 +2041,9 @@ pub unsafe fn w_dict_strategy_id(obj: PyObjectRef) -> usize {
 /// same length.  Pyre's `IndexMap::shift_remove` compacts immediately, so the
 /// equivalent state lives on the dictionary object itself.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_keys_version(obj: PyObjectRef) -> usize {
     if is_module_dict(obj) {
         return (*(obj as *const W_ModuleDictObject)).keys_version;
@@ -2028,6 +2055,9 @@ pub unsafe fn w_dict_keys_version(obj: PyObjectRef) -> usize {
 /// Value-only replacement must not call this: both PyPy and Python 3.14 allow
 /// replacing a value while iterating over the dictionary.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_bump_keys_version(obj: PyObjectRef) {
     if is_module_dict(obj) {
         let dict = &mut *(obj as *mut W_ModuleDictObject);
@@ -2064,6 +2094,9 @@ pub unsafe fn w_module_dict_setitem_str(obj: PyObjectRef, key: &str, w_value: Py
 }
 
 /// Compatibility spelling retained until the remaining callers are collapsed.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_module_dict_setitem_str_no_proxy(
     obj: PyObjectRef,
     key: &str,
@@ -2201,6 +2234,9 @@ pub unsafe fn w_module_dict_delitem_str(obj: PyObjectRef, key: &str) -> Option<P
 }
 
 /// Compatibility spelling retained until the remaining callers are collapsed.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_module_dict_delitem_str_no_proxy(
     obj: PyObjectRef,
     key: &str,
@@ -2407,6 +2443,9 @@ pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObje
 /// hash the key: it returns the provided default, or raises KeyError
 /// when no default was passed (`dictmultiobject.py:783-787`).
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_is_empty_strategy(obj: PyObjectRef) -> bool {
     if is_module_dict(obj) {
         return false;
@@ -2425,6 +2464,9 @@ pub unsafe fn w_dict_is_empty_strategy(obj: PyObjectRef) -> bool {
 ///
 /// `dictmultiobject.py:93-95 W_DictMultiObject.getitem` — the
 /// strategy's `getitem` calls `space.hash_w(w_key)` which may raise.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_lookup_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -2668,6 +2710,9 @@ pub unsafe fn w_dict_lookup_object_strategy(
     w_dict_lookup_object_strategy_checked(obj, key).unwrap_or(None)
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_lookup_object_strategy_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -2697,8 +2742,8 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
 ///     `w_module_dict_getitem_str`.
 ///   * non-str + never-eq-str: fast-return None.
 ///   * non-str otherwise: promote then walk entries.
-/// Called only from the strategy trait impl to avoid recursion
-/// through `w_dict_lookup`.
+///     Called only from the strategy trait impl to avoid recursion
+///     through `w_dict_lookup`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
@@ -2746,6 +2791,9 @@ pub unsafe fn w_module_dict_lookup_object_entries(
     entries.get(&object_key_for(key)).copied()
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_module_dict_lookup_inner_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -2801,6 +2849,9 @@ pub unsafe fn w_dict_store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRe
 ///
 /// `dictmultiobject.py:97-99 W_DictMultiObject.setitem` — the
 /// strategy's `setitem` calls `space.hash_w(w_key)` which may raise.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_store_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -2814,6 +2865,9 @@ pub unsafe fn w_dict_store_checked(
 /// already holds — see [`object_key_hashed`] for why hashing moves out to the
 /// caller.  Only the object strategy consults `hash`; the typed strategies key
 /// on the unwrapped payload and never reach `space.hash_w`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_store_hashed_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -3097,7 +3151,7 @@ pub unsafe fn w_dict_pop_checked(
                 }
                 Ok(Some(val))
             }
-            Err(()) => {
+            Err(DictPopError) => {
                 if take_dict_key_error() {
                     return Err(DictKeyError);
                 }
@@ -3120,6 +3174,9 @@ pub unsafe fn w_dict_store_object_strategy(obj: PyObjectRef, key: PyObjectRef, v
     let _ = w_dict_store_object_strategy_checked(obj, key, value);
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_store_object_strategy_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -3211,8 +3268,8 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
 ///   * str keys on a fresh ModuleDictStrategy → `setitem_str`
 ///   * non-str keys OR already-promoted → `switch_to_object_strategy`
 ///     and write into the unified dstorage Vec.
-/// Called only from the strategy trait impl to avoid recursion
-/// through `w_dict_store`.
+///     Called only from the strategy trait impl to avoid recursion
+///     through `w_dict_store`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
@@ -3240,6 +3297,9 @@ pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, valu
     dict_write_barrier(obj);
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_module_dict_store_inner_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -3280,6 +3340,9 @@ pub unsafe fn w_module_dict_store_inner_checked(
 /// polymorphic item-loop path.
 ///
 /// Mirrors the destination test in `dictmultiobject.py:1401 update1_dict_dict`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_is_regular_empty(obj: PyObjectRef) -> bool {
     if is_module_dict(obj) {
         return false;
@@ -3297,6 +3360,9 @@ pub unsafe fn w_dict_is_regular_empty(obj: PyObjectRef) -> bool {
 /// placeholder storage allocated, so this helper drops that placeholder,
 /// installs the copy's strategy/storage/len, and fires the explicit GC
 /// write barrier that RPython field stores would get from the GC.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_copy: PyObjectRef) {
     debug_assert!(!is_module_dict(dst));
     debug_assert!(!is_module_dict(w_copy));
@@ -3325,11 +3391,17 @@ pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_cop
 /// into a `W_IntObject` and dispatches through `w_dict_lookup` so the
 /// strategy-slot path applies uniformly to W_DictObject and
 /// W_ModuleDictObject.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_getitem(obj: PyObjectRef, key: i64) -> Option<PyObjectRef> {
     w_dict_lookup(obj, crate::w_int_new(key))
 }
 
 /// Set a value by int key (convenience wrapper).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_setitem(obj: PyObjectRef, key: i64, value: PyObjectRef) {
     w_dict_store(obj, crate::w_int_new(key), value)
 }
@@ -3339,6 +3411,9 @@ pub unsafe fn w_dict_setitem(obj: PyObjectRef, key: i64, value: PyObjectRef) {
 /// through the polymorphic strategy slot so module dicts go through
 /// `ModuleDictStrategy::getitem_str` and regular dicts through
 /// `ObjectDictStrategy::getitem_str`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj);
     w_dict_get_strategy(obj).getitem_str(obj, key)
@@ -3398,6 +3473,9 @@ pub unsafe fn w_dict_getitem_str_object_strategy(
 /// `rlib/jit.py:139`): the strategy dispatch it wraps mutates
 /// runtime-mutable dict storage the tracer cannot model.
 #[majit_macros::dont_look_inside]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_setitem_str(obj: PyObjectRef, key: &str, value: PyObjectRef) {
     lock_dict_refs!(_dict_guard, obj, value);
     w_dict_get_strategy(obj).setitem_str(obj, key, value)
@@ -3598,6 +3676,9 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
 /// through `w_dict_delitem(obj, w_str_new(key))` for parity.
 ///
 /// Returns `true` when the key was present in the strategy storage.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_delitem_str(obj: PyObjectRef, key: &str) -> bool {
     let w_key = crate::w_str_new(key);
     w_dict_delitem(obj, w_key)
@@ -3627,6 +3708,9 @@ pub unsafe fn w_dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> bool {
 ///
 /// `dictmultiobject.py:101-102 W_DictMultiObject.delitem` — the
 /// strategy's `delitem` calls `space.hash_w(w_key)` which may raise.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_delitem_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -3691,6 +3775,9 @@ pub unsafe fn w_dict_delitem_checked(
 /// / `rordereddict.py:863 ll_dict_delitem_if_value_is`: perform one key probe
 /// and remove the matched entry only when its current value is pointer-identical
 /// to `value`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_delitem_if_value_is_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -3985,6 +4072,9 @@ pub unsafe fn w_dict_delitem_object_strategy(obj: PyObjectRef, key: PyObjectRef)
     w_dict_delitem_object_strategy_checked(obj, key).unwrap_or(false)
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_delitem_object_strategy_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -4032,8 +4122,8 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
 ///   * str fast path on fresh ModuleDictStrategy → delitem_str.
 ///   * non-str + never-eq-str: fast-return false.
 ///   * non-str otherwise: switch_to_object_strategy then walk.
-/// Called only from the strategy trait impl to avoid recursion
-/// through `w_dict_delitem`.
+///     Called only from the strategy trait impl to avoid recursion
+///     through `w_dict_delitem`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
@@ -4066,6 +4156,9 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
     false
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_module_dict_delitem_inner_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -4111,6 +4204,9 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
 /// `pypy/objspace/std/dictmultiobject.py:148-152 W_DictMultiObject.descr_clear`
 /// — `w_dict.get_strategy().clear(w_dict)`.  Dispatches through the
 /// polymorphic strategy slot.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_clear(obj: PyObjectRef) {
     lock_dict_refs!(_dict_guard, obj);
     w_dict_get_strategy(obj).clear(obj);
@@ -4176,6 +4272,9 @@ pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
 /// `rlib/jit.py:139`): the strategy dispatch it wraps reads
 /// runtime-mutable dict storage the tracer cannot model.
 #[majit_macros::dont_look_inside]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
     lock_dict_refs!(_dict_guard, obj);
     w_dict_get_strategy(obj).length(obj)
@@ -4197,6 +4296,9 @@ pub unsafe fn w_dict_length_object_strategy(obj: PyObjectRef) -> usize {
 
 /// Iterate over all (key, value) pairs without type assumptions.
 ///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
     w_dict_get_strategy(obj).items(obj)
@@ -4273,6 +4375,9 @@ pub unsafe fn w_dict_nth_hashed_key(obj: PyObjectRef, index: usize) -> Option<Ob
 /// strategies preserve their backing shape (`:1152
 /// AbstractTypedStrategy.copy` → fresh W_DictObject with same strategy
 /// + cloned typed dstorage).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_copy(obj: PyObjectRef) -> PyObjectRef {
     lock_dict_refs!(_dict_guard, obj);
     w_dict_get_strategy(obj).copy(obj)
@@ -4854,6 +4959,9 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
 /// surrogate key, so skipping them here avoids the [`w_str_get_value`]
 /// panic.  The keyword-argument ABI no longer uses this helper — it
 /// threads the byte-ish key through [`w_dict_str_entries_wtf8`].
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)> {
     w_dict_items(obj)
         .into_iter()
@@ -4881,6 +4989,9 @@ pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)>
 /// `TypeError("keywords must be strings, not '%T'")` on a non-str key rather
 /// than skipping it, so a caller on that path (`CALL_FUNCTION_EX`) must enforce
 /// the TypeError itself — this helper does not.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_str_entries_wtf8(
     obj: PyObjectRef,
 ) -> Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> {
@@ -5120,6 +5231,9 @@ pub unsafe fn w_dict_view_iterator_get_kind(obj: PyObjectRef) -> DictViewKind {
 
 /// Direction selected by the concrete iterator class.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_view_iterator_get_reverse(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_BaseDictMultiIterObject)).reverse }
 }
@@ -5133,6 +5247,9 @@ pub unsafe fn w_dict_view_iterator_get_startlen(obj: PyObjectRef) -> usize {
 
 /// Key-set mutation state captured with the source strategy iterator.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_view_iterator_get_start_keys_version(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_BaseDictMultiIterObject)).start_keys_version }
 }
@@ -5338,6 +5455,9 @@ pub enum StrategyKind {
     Map,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DictPopError;
+
 pub trait DictStrategy {
     /// Discriminate strategies by concrete impl — see [`StrategyKind`]
     /// for the rationale.  Required because pointer comparison on the
@@ -5475,18 +5595,18 @@ pub trait DictStrategy {
         w_dict: PyObjectRef,
         w_key: PyObjectRef,
         w_default: Option<PyObjectRef>,
-    ) -> Result<PyObjectRef, ()> {
+    ) -> Result<PyObjectRef, DictPopError> {
         // dictmultiobject.py:624-634
         let w_item = self.getitem(w_dict, w_key);
         if let Some(val) = w_item {
             if !self.delitem(w_dict, w_key) {
-                return Err(());
+                return Err(DictPopError);
             }
             Ok(val)
         } else if let Some(d) = w_default {
             Ok(d)
         } else {
-            Err(())
+            Err(DictPopError)
         }
     }
 
@@ -6127,11 +6247,11 @@ impl DictStrategy for EmptyDictStrategy {
         _w_dict: PyObjectRef,
         _w_key: PyObjectRef,
         w_default: Option<PyObjectRef>,
-    ) -> Result<PyObjectRef, ()> {
+    ) -> Result<PyObjectRef, DictPopError> {
         if let Some(d) = w_default {
             Ok(d)
         } else {
-            Err(())
+            Err(DictPopError)
         }
     }
 
@@ -6541,6 +6661,10 @@ impl DictStrategy for BytesDictStrategy {
     /// `dictmultiobject.py:1268-1269 listview_bytes` — `self.unerase
     /// (w_dict.dstorage).keys()`.  Returns the native `Vec<Vec<u8>>`
     /// of keys directly from the typed storage.
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+    )]
     fn listview_bytes(&self, w_dict: PyObjectRef) -> Option<Vec<Vec<u8>>> {
         let entries = unsafe { crate::dictmultiobject::w_dict_bytes_storage(w_dict) };
         Some(entries.keys().cloned().collect())
@@ -6953,6 +7077,10 @@ impl DictStrategy for IntDictStrategy {
     /// `dictmultiobject.py:1366-1367 IntDictStrategy.listview_int` —
     /// `self.unerase(w_dict.dstorage).keys()`.  Returns the native
     /// `Vec<i64>` of keys directly from the typed storage.
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+    )]
     fn listview_int(&self, w_dict: PyObjectRef) -> Option<Vec<i64>> {
         let entries = unsafe { crate::dictmultiobject::w_dict_int_storage(w_dict) };
         Some(entries.keys().copied().collect())

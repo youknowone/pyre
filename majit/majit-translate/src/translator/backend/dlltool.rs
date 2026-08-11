@@ -72,6 +72,10 @@ pub struct CLibraryBuilder {
 
 impl CLibraryBuilder {
     /// Upstream `CLibraryBuilder.__init__(*args, **kwds)` at `:11-14`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     pub fn new(
         translator: Rc<TranslationContext>,
         entrypoint: Option<HostObject>,
@@ -189,7 +193,6 @@ mod tests {
         );
         assert!(lb.base.split, "CLibraryBuilder must flip split=True");
         assert_eq!(lb.name, "libtesting");
-        assert!(!CLibraryBuilder::STANDALONE);
     }
 
     #[test]

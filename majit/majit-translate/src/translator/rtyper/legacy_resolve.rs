@@ -345,6 +345,10 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // jtransform's `get_value_kind` picks) so `build_value_kinds` +
     // `perform_register_allocation` always produce a coloring for
     // every reachable value.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded; this exactly models RPython object-identity dictionary keys without a divergent side table"
+    )]
     let mut seen: std::collections::HashSet<Variable> = std::collections::HashSet::new();
     for block in &graph.blocks {
         for var in &block.inputargs {

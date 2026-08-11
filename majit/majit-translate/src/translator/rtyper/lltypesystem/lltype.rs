@@ -3620,6 +3620,10 @@ impl _ptr {
         }
         Err(format!("{:?} instance has no length attribute", self._TYPE))
     }
+
+    pub fn is_empty(&self) -> Result<bool, String> {
+        self.len().map(|len| len == 0)
+    }
 }
 
 impl _interior_ptr {
@@ -3800,6 +3804,10 @@ impl _interior_ptr {
             ));
         };
         Ok(obj.getlength())
+    }
+
+    pub fn is_empty(&self) -> Result<bool, String> {
+        self.len().map(|len| len == 0)
     }
 
     pub fn call(&self, _args: &[LowLevelValue]) -> LowLevelValue {
@@ -4342,9 +4350,9 @@ impl Array {
     /// Raw `Array(OF, hints={...})`. Upstream
     /// `rpython/rtyper/lltypesystem/lltype.py:428-439 Array.__init__`
     /// + `_install_extras` forwards the `hints` kwarg to
-    /// `self._hints`. Used by
-    /// `SmallFunctionSetPBCRepr._setup_repr` (rpbc.py:416-418) which
-    /// builds `Array(self.pointer_repr.lowleveltype,
+    ///   `self._hints`. Used by
+    ///   `SmallFunctionSetPBCRepr._setup_repr` (rpbc.py:416-418) which
+    ///   builds `Array(self.pointer_repr.lowleveltype,
     ///                hints={'nolength': True, 'immutable': True,
     ///                       'static_immutable': True})`.
     pub fn with_hints(of: ConcretetypePlaceholder, hints: Vec<(String, ConstValue)>) -> Self {
@@ -5376,12 +5384,9 @@ impl _ptr_obj {
             return o._normalizedcontainer();
         }
         let mut container = self.clone();
-        loop {
+        while let Some(parentable) = parentable_of_obj(&container) {
             // `parent = container._parentstructure(check); if parent is None:
             //  break; index = container._parent_index; T = typeOf(parent)`.
-            let Some(parentable) = parentable_of_obj(&container) else {
-                break;
-            };
             let Some(parent) = parentable.parentstructure(true) else {
                 break;
             };

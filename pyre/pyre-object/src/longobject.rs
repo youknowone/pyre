@@ -334,6 +334,9 @@ bigint_scalar_residual!(jit_bigint_hash, |value: &BigInt| value.hash());
 /// True if the value fits in a machine-word integer (i64 on 64-bit).
 /// Used by `is_plain_int1` to accept long objects that are in the int range.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_long_fits_int(obj: PyObjectRef) -> bool {
     unsafe {
         let big = w_long_get_value(obj);
@@ -372,6 +375,9 @@ pub unsafe fn w_long_get_value(obj: PyObjectRef) -> &'static BigInt {
 /// that same payload. Consumers implementing that path need the stored
 /// reference itself, not a Rust `Clone` that translates to a fresh GC payload.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_long_get_raw_value(obj: PyObjectRef) -> *mut BigInt {
     unsafe { (*(obj as *const W_LongObject)).value }
 }

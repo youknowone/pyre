@@ -948,6 +948,10 @@ impl LowererConfig {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+    )]
     pub fn new(
         io_shims: &[(Path, Ident)],
         calls: &[crate::jit_interp::CallEntry],

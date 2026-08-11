@@ -1397,6 +1397,10 @@ fn expand_pyre_class(
             /// must convert that to a Python `TypeError`.
             #[allow(dead_code)]
             #[inline]
+            #[expect(
+                clippy::not_unsafe_ptr_arg_deref,
+                reason = "PyObjectRef is pyre's GC-rooted VM handle; this generated object-space downcast checks the runtime type before dereferencing and intentionally provides the safe boundary used by Python operations"
+            )]
             pub fn from_obj(obj: ::pyre_object::PyObjectRef)
                 -> ::std::option::Option<&'static mut Self>
             {

@@ -65,7 +65,7 @@ const CALL_FRAME_SIZE: u32 = 64;
 const SAVED_THREADLOCAL_OFS: u32 = 48;
 
 const _: () = assert!(
-    CALL_FRAME_SIZE % 16 == 0,
+    CALL_FRAME_SIZE.is_multiple_of(16),
     "aarch64 SP stays 16-byte aligned"
 );
 
@@ -1072,21 +1072,20 @@ impl<'a> AssemblerARM64<'a> {
         if matches!(
             opcode,
             OpCode::IntAdd | OpCode::IntSub | OpCode::NurseryPtrIncrement
-        ) {
-            if let Some(im) = Self::addsub_imm12(src) {
-                let l = self.load_loc_to_reg(lhs, 17);
-                let d = dst_reg;
-                // Rd/Rn take the SP-form register family for the `#imm12`
-                // encoding; `XSP(r)` encodes identically to `X(r)` for the
-                // non-SP registers the allocator hands out here.
-                match opcode {
-                    OpCode::IntSub => {
-                        dynasm!(self.mc ; .arch aarch64 ; sub XSP(d), XSP(l), im as u32)
-                    }
-                    _ => dynasm!(self.mc ; .arch aarch64 ; add XSP(d), XSP(l), im as u32),
+        ) && let Some(im) = Self::addsub_imm12(src)
+        {
+            let l = self.load_loc_to_reg(lhs, 17);
+            let d = dst_reg;
+            // Rd/Rn take the SP-form register family for the `#imm12`
+            // encoding; `XSP(r)` encodes identically to `X(r)` for the
+            // non-SP registers the allocator hands out here.
+            match opcode {
+                OpCode::IntSub => {
+                    dynasm!(self.mc ; .arch aarch64 ; sub XSP(d), XSP(l), im as u32)
                 }
-                return;
+                _ => dynasm!(self.mc ; .arch aarch64 ; add XSP(d), XSP(l), im as u32),
             }
+            return;
         }
         let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
         let d = dst_reg;
@@ -1153,7 +1152,6 @@ impl<'a> AssemblerARM64<'a> {
             }
             _ => {}
         }
-        return;
     }
 
     /// Emit: CMP loc0, loc1
@@ -1183,18 +1181,16 @@ impl<'a> AssemblerARM64<'a> {
         // `opassembler.py:129 emit_int_comp_op` takes `CMP_ri` when the
         // right-hand side is an immediate; `codebuilder.py:389 CMP_ri` holds
         // a 12-bit unsigned field, so anything wider still needs a register.
-        if let Loc::Immed(i) = loc1 {
-            if let Ok(imm) = u32::try_from(i.value) {
-                if imm <= MAX_CMP_IMM12 {
-                    // dynasm's `cmp Xn|SP, #uimm` form cannot take a dynamic
-                    // register operand, so encode it the way
-                    // `codebuilder.py:389 CMP_ri` does: SUBS with Rd = xzr.
-                    let word: u32 =
-                        (0b1111000100u32 << 22) | (imm << 10) | ((r0 as u32) << 5) | 0b11111;
-                    dynasm!(self.mc ; .arch aarch64 ; .u32 word);
-                    return;
-                }
-            }
+        if let Loc::Immed(i) = loc1
+            && let Ok(imm) = u32::try_from(i.value)
+            && imm <= MAX_CMP_IMM12
+        {
+            // dynasm's `cmp Xn|SP, #uimm` form cannot take a dynamic
+            // register operand, so encode it the way
+            // `codebuilder.py:389 CMP_ri` does: SUBS with Rd = xzr.
+            let word: u32 = (0b1111000100u32 << 22) | (imm << 10) | ((r0 as u32) << 5) | 0b11111;
+            dynasm!(self.mc ; .arch aarch64 ; .u32 word);
+            return;
         }
         let r1 = match loc1 {
             Loc::Reg(s) => s.value,
@@ -1209,7 +1205,6 @@ impl<'a> AssemblerARM64<'a> {
             _ => return,
         };
         dynasm!(self.mc ; .arch aarch64 ; cmp X(r0 as u8), X(r1 as u8));
-        return;
     }
 
     /// Emit: TEST loc, loc (for guard_true/guard_false)
@@ -1227,7 +1222,6 @@ impl<'a> AssemblerARM64<'a> {
             _ => return,
         };
         dynasm!(self.mc ; .arch aarch64 ; tst X(r as u8), X(r as u8));
-        return;
     }
 
     /// Maximum unsigned immediate for `ldr/str X, [base, #imm]` (64-bit).
@@ -1237,7 +1231,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Emit `str Xsrc, [x29, #offset]`, using x16 as scratch when the
     /// offset exceeds the unsigned-immediate range of the instruction.
     fn emit_str_fp(&mut self, src: u8, offset: i32) {
-        if offset >= 0 && offset <= Self::MAX_LDR_STR_UIMM {
+        if (0..=Self::MAX_LDR_STR_UIMM).contains(&offset) {
             dynasm!(self.mc ; .arch aarch64
                 ; str X(src), [x29, offset as u32]
             );
@@ -1254,7 +1248,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Emit `str Dsrc, [x29, #offset]` (float/double), using x16 as scratch
     /// when the offset exceeds the unsigned-immediate range.
     fn emit_str_fp_d(&mut self, src: u8, offset: i32) {
-        if offset >= 0 && offset <= Self::MAX_LDR_STR_UIMM {
+        if (0..=Self::MAX_LDR_STR_UIMM).contains(&offset) {
             dynasm!(self.mc ; .arch aarch64
                 ; str D(src), [x29, offset as u32]
             );
@@ -1270,7 +1264,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Emit `ldr Ddst, [x29, #offset]` (float/double), using x16 as scratch
     /// when the offset exceeds the unsigned-immediate range.
     fn emit_ldr_fp_d(&mut self, dst: u8, offset: i32) {
-        if offset >= 0 && offset <= Self::MAX_LDR_STR_UIMM {
+        if (0..=Self::MAX_LDR_STR_UIMM).contains(&offset) {
             dynasm!(self.mc ; .arch aarch64
                 ; ldr D(dst), [x29, offset as u32]
             );
@@ -1286,7 +1280,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Emit `ldr Xdst, [x29, #offset]`, using x16 as scratch when the
     /// offset exceeds the unsigned-immediate range of the instruction.
     fn emit_ldr_fp(&mut self, dst: u8, offset: i32) {
-        if offset >= 0 && offset <= Self::MAX_LDR_STR_UIMM {
+        if (0..=Self::MAX_LDR_STR_UIMM).contains(&offset) {
             dynasm!(self.mc ; .arch aarch64
                 ; ldr X(dst), [x29, offset as u32]
             );
@@ -1422,56 +1416,57 @@ impl<'a> AssemblerARM64<'a> {
             ; mov x29, x0
         );
         let propagate_descr = self.propagate_exception_descr_ptr();
-        if propagate_descr != 0 {
-            if let Some(addrs) = crate::stack_check_addresses() {
-                let continue_label = self.mc.new_dynamic_label();
-                let exc_value_addr = crate::jit_exc_value_addr() as i64;
-                let exc_type_addr = crate::jit_exc_type_addr() as i64;
-                // Fast path: load end, subtract sp, compare with length.
-                self.emit_mov_imm64(30, addrs.end_adr as i64); // lr holds end addr
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x30, [x30]                  // x30 = *end_adr
-                );
-                self.emit_mov_imm64(16, addrs.length_adr as i64); // ip0 holds length addr
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x16, [x16]                  // x16 = *length_adr
-                    ; mov x17, sp                     // x17 = sp (can't SUB sp directly)
-                    ; sub x30, x30, x17               // x30 = ofs = end - sp
-                    ; cmp x30, x16
-                    ; b.ls =>continue_label           // fast path OK: ofs <= length
-                    // Slow path: call pyre_stack_too_big_slowpath(sp).
-                    ; mov x0, sp
-                );
-                self.emit_mov_imm64(17, addrs.slowpath_addr as i64);
-                dynasm!(self.mc ; .arch aarch64
-                    ; blr x17
-                    ; cbz w0, =>continue_label        // slowpath says OK
-                );
-                // aarch64/assembler.py `_build_stack_check_slowpath` jumps
-                // into the same propagate-exception path as x86: move
-                // pos_exc_value into jf_guard_exc, clear pos_exception, stamp
-                // propagate_exception_descr, then return the incoming jf_ptr.
-                self.emit_mov_imm64(16, exc_value_addr);
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x0, [x16]
-                    ; str xzr, [x16]
-                    ; str x0, [x29, JF_GUARD_EXC_OFS as u32]
-                );
-                self.emit_mov_imm64(16, exc_type_addr);
-                dynasm!(self.mc ; .arch aarch64
-                    ; str xzr, [x16]
-                );
-                self.emit_mov_imm64(0, propagate_descr);
-                dynasm!(self.mc ; .arch aarch64
-                    ; str x0, [x29, JF_DESCR_OFS as u32]
-                    // Overflow fallthrough: return x29 as jf_ptr.
-                    ; mov x0, x29
-                    ; ldp x19, x20, [sp, #16]
-                    ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
-                    ; ret
-                    ; =>continue_label
-                );
-            }
+        if propagate_descr != 0
+            && let Some(addrs) = crate::stack_check_addresses()
+        {
+            let continue_label = self.mc.new_dynamic_label();
+            let exc_value_addr = crate::jit_exc_value_addr() as i64;
+            let exc_type_addr = crate::jit_exc_type_addr() as i64;
+            // Fast path: load end, subtract sp, compare with length.
+            self.emit_mov_imm64(30, addrs.end_adr as i64); // lr holds end addr
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x30, [x30]                  // x30 = *end_adr
+            );
+            self.emit_mov_imm64(16, addrs.length_adr as i64); // ip0 holds length addr
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x16, [x16]                  // x16 = *length_adr
+                ; mov x17, sp                     // x17 = sp (can't SUB sp directly)
+                ; sub x30, x30, x17               // x30 = ofs = end - sp
+                ; cmp x30, x16
+                ; b.ls =>continue_label           // fast path OK: ofs <= length
+                // Slow path: call pyre_stack_too_big_slowpath(sp).
+                ; mov x0, sp
+            );
+            self.emit_mov_imm64(17, addrs.slowpath_addr as i64);
+            dynasm!(self.mc ; .arch aarch64
+                ; blr x17
+                ; cbz w0, =>continue_label        // slowpath says OK
+            );
+            // aarch64/assembler.py `_build_stack_check_slowpath` jumps
+            // into the same propagate-exception path as x86: move
+            // pos_exc_value into jf_guard_exc, clear pos_exception, stamp
+            // propagate_exception_descr, then return the incoming jf_ptr.
+            self.emit_mov_imm64(16, exc_value_addr);
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x0, [x16]
+                ; str xzr, [x16]
+                ; str x0, [x29, JF_GUARD_EXC_OFS as u32]
+            );
+            self.emit_mov_imm64(16, exc_type_addr);
+            dynasm!(self.mc ; .arch aarch64
+                ; str xzr, [x16]
+            );
+            self.emit_mov_imm64(0, propagate_descr);
+            dynasm!(self.mc ; .arch aarch64
+                ; str x0, [x29, JF_DESCR_OFS as u32]
+                // Overflow fallthrough: return x29 as jf_ptr.
+                ; mov x0, x29
+                ; ldp x19, x20, [sp, #16]
+                ; ldp x21, x22, [sp, #32]
+                ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
+                ; ret
+                ; =>continue_label
+            );
         }
         // When addresses are not registered (tests / early startup), no
         // stack check is emitted — aarch64/assembler.py:1094-1095 parity.
@@ -1855,10 +1850,10 @@ impl<'a> AssemblerARM64<'a> {
         let frame_depth = self.frame_depth.saturating_sub(JITFRAME_FIXED_SIZE);
         let gcmap = allocate_gcmap(frame_depth, JITFRAME_FIXED_SIZE);
         for (tp, loc) in fail_arg_types.iter().zip(fail_arg_locs.iter()) {
-            if *tp == Type::Ref {
-                if let Some(position) = loc {
-                    gcmap_set_bit(gcmap, *position);
-                }
+            if *tp == Type::Ref
+                && let Some(position) = loc
+            {
+                gcmap_set_bit(gcmap, *position);
             }
         }
         gcmap
@@ -2519,30 +2514,30 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             OpCode::UintMulHigh => {
-                if let Some(Loc::Reg(dst)) = result_loc {
-                    if arglocs.len() >= 2 {
-                        let lhs = match arglocs[0] {
-                            Loc::Reg(r) => r.value,
-                            _ => {
-                                self.regalloc_mov(
-                                    &arglocs[0],
-                                    &Loc::Reg(crate::regloc::RegLoc::new(16, false)),
-                                );
-                                16
-                            }
-                        };
-                        let rhs = match arglocs[1] {
-                            Loc::Reg(r) => r.value,
-                            _ => {
-                                self.regalloc_mov(
-                                    &arglocs[1],
-                                    &Loc::Reg(crate::regloc::RegLoc::new(17, false)),
-                                );
-                                17
-                            }
-                        };
-                        dynasm!(self.mc ; .arch aarch64 ; umulh X(dst.value), X(lhs), X(rhs));
-                    }
+                if let Some(Loc::Reg(dst)) = result_loc
+                    && arglocs.len() >= 2
+                {
+                    let lhs = match arglocs[0] {
+                        Loc::Reg(r) => r.value,
+                        _ => {
+                            self.regalloc_mov(
+                                &arglocs[0],
+                                &Loc::Reg(crate::regloc::RegLoc::new(16, false)),
+                            );
+                            16
+                        }
+                    };
+                    let rhs = match arglocs[1] {
+                        Loc::Reg(r) => r.value,
+                        _ => {
+                            self.regalloc_mov(
+                                &arglocs[1],
+                                &Loc::Reg(crate::regloc::RegLoc::new(17, false)),
+                            );
+                            17
+                        }
+                    };
+                    dynasm!(self.mc ; .arch aarch64 ; umulh X(dst.value), X(lhs), X(rhs));
                 }
             }
             OpCode::IntForceGeZero => {
@@ -2645,7 +2640,7 @@ impl<'a> AssemblerARM64<'a> {
                     let a = if let Loc::Reg(a) = a_loc {
                         *a
                     } else {
-                        let scratch = if b_reg.map_or(false, |b| b.value == 15 && b.is_xmm) {
+                        let scratch = if b_reg.is_some_and(|b| b.value == 15 && b.is_xmm) {
                             crate::regloc::RegLoc::new(14, true)
                         } else {
                             crate::regloc::RegLoc::new(15, true)
@@ -3011,16 +3006,16 @@ impl<'a> AssemblerARM64<'a> {
                         "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
                     ),
                 };
-                if crate::majit_log_enabled() {
-                    if let Loc::Immed(i) = ofs_loc {
-                        let input0_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE);
-                        let input1_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE + 1);
-                        if i.value as i32 == input0_ofs || i.value as i32 == input1_ofs {
-                            eprintln!(
-                                "[dynasm][gcstore-input] ofs={} value_loc={:?} base_loc={:?} size={}",
-                                i.value, value_loc, base_loc, size
-                            );
-                        }
+                if crate::majit_log_enabled()
+                    && let Loc::Immed(i) = ofs_loc
+                {
+                    let input0_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE);
+                    let input1_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE + 1);
+                    if i.value as i32 == input0_ofs || i.value as i32 == input1_ofs {
+                        eprintln!(
+                            "[dynasm][gcstore-input] ofs={} value_loc={:?} base_loc={:?} size={}",
+                            i.value, value_loc, base_loc, size
+                        );
                     }
                 }
                 // aarch64/opassembler.py:368: self._write_to_mem(value_loc, base_loc, ofs_loc, scale)
@@ -3380,11 +3375,11 @@ impl<'a> AssemblerARM64<'a> {
             // aarch64/regalloc.py:958 + assembler.py:682 malloc_cond parity
             OpCode::CallMallocNursery => {
                 self.genop_call_malloc_nursery(op);
-                if let Some(Loc::Reg(r)) = result_loc {
-                    if r.value != 0 {
-                        let rv = r.value;
-                        dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
-                    }
+                if let Some(Loc::Reg(r)) = result_loc
+                    && r.value != 0
+                {
+                    let rv = r.value;
+                    dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
                 }
                 if !op.pos.get().is_none() {
                     self.store_rax_to_result(op.pos.get());
@@ -3392,11 +3387,11 @@ impl<'a> AssemblerARM64<'a> {
             }
             OpCode::CallMallocNurseryHeaderless => {
                 self.genop_call_malloc_nursery_headerless(op);
-                if let Some(Loc::Reg(r)) = result_loc {
-                    if r.value != 0 {
-                        let rv = r.value;
-                        dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
-                    }
+                if let Some(Loc::Reg(r)) = result_loc
+                    && r.value != 0
+                {
+                    let rv = r.value;
+                    dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
                 }
                 if !op.pos.get().is_none() {
                     self.store_rax_to_result(op.pos.get());
@@ -3577,7 +3572,7 @@ impl<'a> AssemblerARM64<'a> {
             }
             // aarch64/opassembler.py:912 _write_barrier_fastpath parity.
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                self.emit_write_barrier_fastpath(op, &arglocs);
+                self.emit_write_barrier_fastpath(op, arglocs);
             }
             // aarch64/opassembler.py:755 emit_op_zero_array.  This is a
             // result-less operation, but it is the initialization contract
@@ -4160,13 +4155,12 @@ impl<'a> AssemblerARM64<'a> {
         // routing the writes through the trait at codegen time lets readers
         // consume the canonical metainterp identity before
         // `build_guard_metadata` (`compile.rs:232`) re-stamps.
-        if let Some(d) = op.getdescr() {
-            if d.is_resume_guard() || d.is_resume_guard_copied() {
-                if let Some(fd) = d.as_fail_descr() {
-                    fd.set_fail_index_per_trace(fail_index);
-                    fd.set_trace_id(self.trace_id);
-                }
-            }
+        if let Some(d) = op.getdescr()
+            && (d.is_resume_guard() || d.is_resume_guard_copied())
+            && let Some(fd) = d.as_fail_descr()
+        {
+            fd.set_fail_index_per_trace(fail_index);
+            fd.set_trace_id(self.trace_id);
         }
         let descr: majit_ir::DescrRef = if let Some(pre) = self.pending_force_descr.take() {
             pre
@@ -4181,10 +4175,10 @@ impl<'a> AssemblerARM64<'a> {
             // (`guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), ...)`)
             // reads back through the descr, so a stale empty list would
             // under-report `Type::Ref` slots and miss live roots.
-            if let Some(fd) = d.as_fail_descr() {
-                if fd.fail_arg_types() != fail_arg_types.as_slice() {
-                    fd.set_fail_arg_types(fail_arg_types);
-                }
+            if let Some(fd) = d.as_fail_descr()
+                && fd.fail_arg_types() != fail_arg_types.as_slice()
+            {
+                fd.set_fail_arg_types(fail_arg_types);
             }
             d
         } else {
@@ -4272,17 +4266,17 @@ impl<'a> AssemblerARM64<'a> {
         // bridge every `trace_eagerness` failures, without bound.  The index is
         // a fail-arg position because `must_compile_with_values` reads the value
         // back out of `fail_values`.
-        if op.opcode == majit_ir::OpCode::GuardValue {
-            if let Some(fa) = op.getfailargs() {
-                let arg0 = op.arg(0).to_opref();
-                if let Some(idx) = fa.iter().position(|r| r.to_opref() == arg0) {
-                    let type_tag = match descr_fd.fail_arg_types().get(idx) {
-                        Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
-                        Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
-                        _ => majit_backend::STATUS_TY_INT,
-                    };
-                    descr_fd.make_a_counter_per_value(idx as u32, type_tag);
-                }
+        if op.opcode == majit_ir::OpCode::GuardValue
+            && let Some(fa) = op.getfailargs()
+        {
+            let arg0 = op.arg(0).to_opref();
+            if let Some(idx) = fa.iter().position(|r| r.to_opref() == arg0) {
+                let type_tag = match descr_fd.fail_arg_types().get(idx) {
+                    Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
+                    Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
+                    _ => majit_backend::STATUS_TY_INT,
+                };
+                descr_fd.make_a_counter_per_value(idx as u32, type_tag);
             }
         }
         if crate::majit_log_enabled() {
@@ -4913,12 +4907,11 @@ impl<'a> AssemblerARM64<'a> {
     /// Infer fail_arg_types from `op.type_` (via `opref_type`) or
     /// `op.fail_arg_types`.
     fn infer_fail_arg_types(&self, op: &Op, op_index: Option<usize>) -> Vec<Type> {
-        if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-            if let Some(descr_types) = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()) {
-                if !descr_types.is_empty() {
-                    return descr_types;
-                }
-            }
+        if (op.opcode == OpCode::Finish || op.opcode == OpCode::Jump)
+            && let Some(descr_types) = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec())
+            && !descr_types.is_empty()
+        {
+            return descr_types;
         }
         let descr_arc = op.getdescr();
         if let Some(fd) = descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
@@ -5069,23 +5062,22 @@ impl<'a> AssemblerARM64<'a> {
         // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
         // here so `append_guard_token_with_faillocs` does not need a second
         // pass through `unsafe { Arc::as_ptr as *mut }`.
-        if let Some(d) = next_op.getdescr() {
-            if d.is_resume_guard() || d.is_resume_guard_copied() {
-                if let Some(fd) = d.as_fail_descr() {
-                    fd.set_fail_index_per_trace(fail_index);
-                    fd.set_trace_id(self.trace_id);
-                }
-            }
+        if let Some(d) = next_op.getdescr()
+            && (d.is_resume_guard() || d.is_resume_guard_copied())
+            && let Some(fd) = d.as_fail_descr()
+        {
+            fd.set_fail_index_per_trace(fail_index);
+            fd.set_trace_id(self.trace_id);
         }
         let descr: majit_ir::DescrRef = if let Some(d) = next_op.getdescr() {
             // Same staleness guard as the main guard-emission path: keep
             // descriptor `fail_arg_types` in sync with the inferred list
             // so downstream GC-map / rd_locs readers see the right Ref
             // slots.
-            if let Some(fd) = d.as_fail_descr() {
-                if fd.fail_arg_types() != fail_arg_types.as_slice() {
-                    fd.set_fail_arg_types(fail_arg_types);
-                }
+            if let Some(fd) = d.as_fail_descr()
+                && fd.fail_arg_types() != fail_arg_types.as_slice()
+            {
+                fd.set_fail_arg_types(fail_arg_types);
             }
             d
         } else {
@@ -5241,18 +5233,14 @@ impl<'a> AssemblerARM64<'a> {
 
         while pending > 0 {
             let mut progress = false;
-            for i in 0..n {
-                let dst = moves[i].1;
+            for &(src, dst, is_const, const_val) in moves.iter().take(n) {
                 if srccount.get(&dst).copied().unwrap_or(-1) == 0 {
                     *srccount.get_mut(&dst).unwrap() = -1; // done
                     pending -= 1;
-                    if !moves[i].2 {
-                        let src = moves[i].0;
-                        if let Some(cnt) = srccount.get_mut(&src) {
-                            *cnt -= 1;
-                        }
+                    if !is_const && let Some(cnt) = srccount.get_mut(&src) {
+                        *cnt -= 1;
                     }
-                    self.emit_slot_move(moves[i].0, dst, moves[i].2, moves[i].3);
+                    self.emit_slot_move(src, dst, is_const, const_val);
                     progress = true;
                 }
             }
@@ -5920,13 +5908,10 @@ impl<'a> AssemblerARM64<'a> {
         if fnloc_in_ip1 {
             dynasm!(self.mc ; .arch aarch64 ; blr x17);
         } else {
-            match fnloc {
-                Some(Loc::Immed(i)) => {
-                    let val = i.value;
-                    self.emit_mov_imm64(8, val);
-                    dynasm!(self.mc ; .arch aarch64 ; blr x8);
-                }
-                _ => {}
+            if let Some(Loc::Immed(i)) = fnloc {
+                let val = i.value;
+                self.emit_mov_imm64(8, val);
+                dynasm!(self.mc ; .arch aarch64 ; blr x8);
             }
         }
 
@@ -5999,10 +5984,8 @@ impl<'a> AssemblerARM64<'a> {
         let can_collect = op
             .with_call_descr(|descr| descr.get_extra_info().check_can_collect())
             .unwrap_or(false);
-        if can_collect {
-            if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
-                self.push_gcmap(gcmap as *mut usize);
-            }
+        if can_collect && let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+            self.push_gcmap(gcmap as *mut usize);
         }
         self._genop_call_with_arglocs(op, arglocs);
         if can_collect {
@@ -6417,12 +6400,12 @@ impl<'a> AssemblerARM64<'a> {
 
     /// Load byte at [base + signed_byteofs] into w16 (ip0).
     fn emit_ldrb_signed_offset(&mut self, base: &crate::regloc::RegLoc, byteofs: i32) {
-        if byteofs >= 0 && byteofs < 4096 {
+        if (0..4096).contains(&byteofs) {
             let ofs = byteofs as u32;
             dynasm!(self.mc ; .arch aarch64
                 ; ldrb W(16), [X(base.value), ofs]
             );
-        } else if byteofs >= -256 && byteofs < 0 {
+        } else if (-256..0).contains(&byteofs) {
             dynasm!(self.mc ; .arch aarch64
                 ; ldurb W(16), [X(base.value), byteofs]
             );
@@ -6816,11 +6799,11 @@ impl<'a> AssemblerARM64<'a> {
             self.emit_mov_imm64(1, vtable);
             dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]);
         }
-        if let Some((w_class_offset, w_class)) = w_class_init {
-            if w_class != 0 {
-                self.emit_mov_imm64(1, w_class);
-                dynasm!(self.mc ; .arch aarch64 ; str x1, [x0, w_class_offset as u32]);
-            }
+        if let Some((w_class_offset, w_class)) = w_class_init
+            && w_class != 0
+        {
+            self.emit_mov_imm64(1, w_class);
+            dynasm!(self.mc ; .arch aarch64 ; str x1, [x0, w_class_offset as u32]);
         }
         if !op.pos.get().is_none() {
             self.store_rax_to_result(op.pos.get());
@@ -7779,7 +7762,7 @@ mod tests {
     ) -> (DynasmBackend, JitCellToken) {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut token = JitCellToken::new(trace_id);
+        let token = JitCellToken::new(trace_id);
 
         let (word, armed, guard) = eval_breaker_poll_ops(word_addr, 0);
 
@@ -7790,7 +7773,7 @@ mod tests {
 
         let ops = vec![word, armed, guard, Rc::new(finish)];
         backend
-            .compile_loop(&[], &ops, &mut token)
+            .compile_loop(&[], &ops, &token)
             .expect("compile eval-breaker poll IR");
         (backend, token)
     }
@@ -7853,12 +7836,12 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
-        let mut target_token = JitCellToken::new(520);
+        let target_token = JitCellToken::new(520);
         backend
             .compile_loop(
                 &[],
                 &[Rc::new(label), word, armed, guard, Rc::new(finish)],
-                &mut target_token,
+                &target_token,
             )
             .expect("compile cross-trace bitmask target");
 
@@ -7869,9 +7852,9 @@ mod tests {
         let jump = Op::new(OpCode::Jump, &[]);
         jump.pos.set(OpRef::void_op(0));
         jump.setdescr(target_descr);
-        let mut source_token = JitCellToken::new(521);
+        let source_token = JitCellToken::new(521);
         backend
-            .compile_loop(&[], &[Rc::new(jump)], &mut source_token)
+            .compile_loop(&[], &[Rc::new(jump)], &source_token)
             .expect("compile external JUMP source");
 
         let frame = backend.execute_token(&target_token, &[]);
@@ -7916,12 +7899,12 @@ mod tests {
             let jump = Op::new(OpCode::Jump, &[]);
             jump.pos.set(OpRef::void_op(4));
             jump.setdescr(target_descr);
-            let mut token = JitCellToken::new(522);
+            let token = JitCellToken::new(522);
             backend
                 .compile_loop(
                     &[],
                     &[Rc::new(label), word, armed, guard, Rc::new(jump)],
-                    &mut token,
+                    &token,
                 )
                 .expect("compile polling loop on worker");
 
@@ -8028,9 +8011,9 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
-        let mut token = JitCellToken::new(trace_id);
+        let token = JitCellToken::new(trace_id);
         backend
-            .compile_loop(&inputargs, &[Rc::new(barrier), Rc::new(finish)], &mut token)
+            .compile_loop(&inputargs, &[Rc::new(barrier), Rc::new(finish)], &token)
             .expect("compile COND_CALL_GC_WB_ARRAY trace");
         let frame = backend.execute_token(&token, &values);
         assert!(

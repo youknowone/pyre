@@ -68,6 +68,10 @@ impl Layout {
     ///           hasdict, weakrefable)
     ///
     /// Two types have compatible layouts iff their expand() tuples are equal.
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+    )]
     pub fn expands_equal(
         a: *const Layout,
         a_hasdict: bool,
@@ -448,6 +452,9 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
 
 /// typeobject.py:1507-1508 in setup_user_defined_type — copy
 /// `flag_map_or_seq` from the first base whose flag is non-`?`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
     if w_self.is_null() || bases.is_null() || !is_type(w_self) {
         return;
@@ -600,6 +607,9 @@ pub unsafe fn w_type_set_compares_by_identity_status(w_type: PyObjectRef, status
 /// typeobject.py:169 — `flag_map_or_seq` accessor on a `W_TypeObject`.
 /// Returns `'?'` if `w_type` is null, not a type object, or never had
 /// the marker assigned.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_flag_map_or_seq(w_type: PyObjectRef) -> u8 {
     if w_type.is_null() || !is_type(w_type) {
         return b'?';
@@ -611,6 +621,9 @@ pub unsafe fn w_type_get_flag_map_or_seq(w_type: PyObjectRef) -> u8 {
 /// typeobject.py:169 — `flag_map_or_seq` setter.  Used by
 /// `init_typeobjects` to mark dict / list / tuple W_TypeObjects at
 /// registration time (objspace.py:104-108).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_flag_map_or_seq(w_type: PyObjectRef, flag: u8) {
     if w_type.is_null() || !is_type(w_type) {
         return;
@@ -708,11 +721,17 @@ pub unsafe fn w_type_set_abstract(w_type: PyObjectRef, abstract_: bool) {
 // ── Layout accessors ─────────────────────────────────────────────────
 
 /// Set the Layout pointer on a type object.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_layout(obj: PyObjectRef, layout: *const Layout) {
     (*(obj as *mut W_TypeObject)).layout = layout;
 }
 
 /// Get the Layout pointer from a type object.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_layout_ptr(obj: PyObjectRef) -> *const Layout {
     (*(obj as *const W_TypeObject)).layout
 }
@@ -721,6 +740,9 @@ pub unsafe fn w_type_get_layout_ptr(obj: PyObjectRef) -> *const Layout {
 /// Returns the Layout.typedef pointer (the PyType describing instance struct).
 /// For backward-compat with existing code that compares PyType pointers.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_layout(obj: PyObjectRef) -> *const PyType {
     let layout = (*(obj as *const W_TypeObject)).layout;
     if layout.is_null() {
@@ -731,6 +753,9 @@ pub unsafe fn w_type_get_layout(obj: PyObjectRef) -> *const PyType {
 }
 
 /// Get nslots from the Layout.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_nslots(obj: PyObjectRef) -> u32 {
     let layout = (*(obj as *const W_TypeObject)).layout;
     if layout.is_null() {
@@ -741,6 +766,9 @@ pub unsafe fn w_type_get_nslots(obj: PyObjectRef) -> u32 {
 }
 
 /// Get newslotnames from the Layout.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_newslotnames(obj: PyObjectRef) -> &'static [String] {
     let layout = (*(obj as *const W_TypeObject)).layout;
     if layout.is_null() {
@@ -751,6 +779,9 @@ pub unsafe fn w_type_get_newslotnames(obj: PyObjectRef) -> &'static [String] {
 }
 
 /// Get base_layout pointer for identity comparison.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_base_layout(obj: PyObjectRef) -> *const Layout {
     let layout = (*(obj as *const W_TypeObject)).layout;
     if layout.is_null() {
@@ -762,17 +793,29 @@ pub unsafe fn w_type_get_base_layout(obj: PyObjectRef) -> *const Layout {
 
 /// typeobject.py:197 `flag_method_descriptor` getter/setter
 /// (callmethod.py:66 `space.type(w_descr).flag_method_descriptor`).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_flag_method_descriptor(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).flag_method_descriptor
 }
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_flag_method_descriptor(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).flag_method_descriptor = v;
 }
 
 /// typeobject.py:179 `hasdict` getter/setter.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_hasdict(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).hasdict
 }
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_hasdict(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).hasdict = v;
 }
@@ -782,6 +825,9 @@ pub unsafe fn w_type_set_hasdict(obj: PyObjectRef, v: bool) {
 /// `we_are_jitted()` / `_pure_version_tag` (`@elidable_promote`) split of
 /// `version_tag()` (typeobject.py:293-301) lives in the interpreter layer
 /// (`baseobjspace::w_type_version_tag`), which has the JIT intrinsics.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_version_tag(obj: PyObjectRef) -> u64 {
     (*(obj as *const W_TypeObject))
         .version_tag
@@ -794,6 +840,9 @@ pub unsafe fn w_type_get_version_tag(obj: PyObjectRef) -> u64 {
 /// `_version_tag?` invalidation here covers every way the tag can change —
 /// `mutated()`'s fresh identity and the two demotions to `0`
 /// (uncacheable) alike — rather than leaving each caller to remember it.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
     w_type_notify_quasi_immut_watchers(obj);
     (*(obj as *const W_TypeObject))
@@ -883,6 +932,9 @@ pub unsafe fn w_type_notify_quasi_immut_watchers(obj: PyObjectRef) {
 /// typeobject.py:183-185 `uses_object_getattribute` reader.  Returns the
 /// conservative `false` for a null / non-type pointer (matches the class
 /// default before any lookup confirms the flag).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_uses_object_getattribute(obj: PyObjectRef) -> bool {
     if obj.is_null() || !is_type(obj) {
         return false;
@@ -899,6 +951,9 @@ pub unsafe fn w_type_get_uses_object_getattribute(obj: PyObjectRef) -> bool {
 /// the call rather than tracing into it (`@dont_look_inside`,
 /// `rlib/jit.py:139`), the [`w_type_set_uses_object_setattr`] twin.
 #[majit_macros::dont_look_inside]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_uses_object_getattribute(obj: PyObjectRef, v: bool) {
     if obj.is_null() || !is_type(obj) {
         return;
@@ -910,6 +965,9 @@ pub unsafe fn w_type_set_uses_object_getattribute(obj: PyObjectRef, v: bool) {
 
 /// typeobject.py:186 `uses_object_setattr` reader (see
 /// [`w_type_get_uses_object_getattribute`]).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_uses_object_setattr(obj: PyObjectRef) -> bool {
     if obj.is_null() || !is_type(obj) {
         return false;
@@ -926,6 +984,9 @@ pub unsafe fn w_type_get_uses_object_setattr(obj: PyObjectRef) -> bool {
 /// the call rather than tracing into it (`@dont_look_inside`,
 /// `rlib/jit.py:139`).
 #[majit_macros::dont_look_inside]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_uses_object_setattr(obj: PyObjectRef, v: bool) {
     if obj.is_null() || !is_type(obj) {
         return;
@@ -937,25 +998,43 @@ pub unsafe fn w_type_set_uses_object_setattr(obj: PyObjectRef, v: bool) {
 
 /// typeobject.py:179 `terminator` getter/setter. The stored value is an
 /// erased `*const MapNode`; the `pyre-interpreter` mapdict layer casts it.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_terminator(obj: PyObjectRef) -> *const u8 {
     (*(obj as *const W_TypeObject)).terminator
 }
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_terminator(obj: PyObjectRef, terminator: *const u8) {
     (*(obj as *mut W_TypeObject)).terminator = terminator;
 }
 
 /// typeobject.py:181 `weakrefable` getter/setter.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_weakrefable(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).weakrefable
 }
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_weakrefable(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).weakrefable = v;
 }
 
 /// typeobject.py:210 `hasuserdel` getter/setter.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_hasuserdel(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).hasuserdel
 }
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_hasuserdel(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).hasuserdel = v;
 }
@@ -963,11 +1042,17 @@ pub unsafe fn w_type_set_hasuserdel(obj: PyObjectRef, v: bool) {
 // ── Other accessors ──────────────────────────────────────────────────
 
 /// Get the class name.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_name(obj: PyObjectRef) -> &'static str {
     &*(*(obj as *const W_TypeObject)).name
 }
 
 /// Return the stable app-level `type.__name__` object.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
     let t = &mut *(obj as *mut W_TypeObject);
     if t.w_name.is_null() {
@@ -990,6 +1075,9 @@ pub unsafe fn w_type_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
 /// The tracer reads it this way: materialising here would allocate a string
 /// while the walker holds raw pointers into the heap, and a class whose name
 /// has never been asked for is not one a hot loop is reading it from.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_peek_name_obj(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_TypeObject)).w_name
 }
@@ -998,6 +1086,9 @@ pub unsafe fn w_type_peek_name_obj(obj: PyObjectRef) -> PyObjectRef {
 /// `w_type.name = name`).  `name` is an owned `String` behind a raw
 /// pointer (`malloc_raw` = boxed); assigning through it drops the old
 /// name and installs the new one, leaving the slot itself unchanged.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     let t = &mut *(obj as *mut W_TypeObject);
     *t.name = crate::w_str_get_value(w_name).to_string();
@@ -1007,11 +1098,17 @@ pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
 
 /// `typeobject.py:223-235` / `getqualname`: the class qualified name lives
 /// on `W_TypeObject`, not in its namespace after type creation.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_qualname(obj: PyObjectRef) -> &'static str {
     &*(*(obj as *const W_TypeObject)).qualname
 }
 
 /// Return the stable app-level `type.__qualname__` object.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
     let t = &mut *(obj as *mut W_TypeObject);
     if t.w_qualname.is_null() {
@@ -1021,6 +1118,9 @@ pub unsafe fn w_type_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
     t.w_qualname
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_qualname(obj: PyObjectRef, w_qualname: PyObjectRef) {
     let t = &mut *(obj as *mut W_TypeObject);
     // `qualname` is the `&str` view display and error messages read, so a name
@@ -1034,6 +1134,9 @@ pub unsafe fn w_type_set_qualname(obj: PyObjectRef, w_qualname: PyObjectRef) {
 }
 
 /// typeobject.py:1220-1230 `type_get_text_signature` backing field.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_text_signature(obj: PyObjectRef) -> Option<&'static str> {
     let signature = (*(obj as *const W_TypeObject)).text_signature;
     if signature.is_null() {
@@ -1044,6 +1147,9 @@ pub unsafe fn w_type_get_text_signature(obj: PyObjectRef) -> Option<&'static str
 }
 
 /// Set the initialization-time TypeDef `_text_signature_` value.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_text_signature(obj: PyObjectRef, signature: &str) {
     let type_obj = &mut *(obj as *mut W_TypeObject);
     debug_assert!(type_obj.text_signature.is_null());
@@ -1051,12 +1157,18 @@ pub unsafe fn w_type_set_text_signature(obj: PyObjectRef, signature: &str) {
 }
 
 /// Get the bases tuple.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_bases(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_TypeObject)).bases
 }
 
 /// Replace the bases tuple (`type.__bases__` setter).  The caller is
 /// responsible for validating layout compatibility and recomputing the MRO.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_bases(obj: PyObjectRef, bases: PyObjectRef) {
     crate::gc_roots::pin_root(bases);
     crate::gc_roots::mark_prebuilt_roots_dirty();
@@ -1065,11 +1177,17 @@ pub unsafe fn w_type_set_bases(obj: PyObjectRef, bases: PyObjectRef) {
 }
 
 /// Get the class namespace pointer (as *mut u8).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
     (*(obj as *const W_TypeObject)).dict
 }
 
 /// Get the cached MRO block, or null if not yet set.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut crate::object_array::FixedObjectArray {
     (*(obj as *const W_TypeObject)).mro_w
 }
@@ -1086,6 +1204,9 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut crate::object_array::Fixe
 /// is the equivalent boundary: the JIT residualises the call instead of
 /// tracing the per-type MRO read the tracer cannot model.
 #[majit_macros::dont_look_inside]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_issubtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     let mro_ptr = w_type_get_mro(w_type);
     if mro_ptr.is_null() {
@@ -1139,6 +1260,9 @@ unsafe fn find_best_base(w_type: PyObjectRef) -> PyObjectRef {
 /// PyPy `typeobject.py:1164-1166 descr__base` — return the base whose
 /// instance layout this type extends.  This is not necessarily the first
 /// entry in `__bases__` for multiple inheritance.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_best_base(w_type: PyObjectRef) -> PyObjectRef {
     find_best_base(w_type)
 }
@@ -1150,6 +1274,9 @@ pub unsafe fn w_type_get_best_base(w_type: PyObjectRef) -> PyObjectRef {
 /// (typeobject.py:244-250) is applied here too: a type whose MRO is
 /// not purely made of types keeps `_version_tag = None` (tag `0`,
 /// uncacheable) — `mutated()` then never refreshes it.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     let purely_of_types = is_mro_purely_of_types(&mro);
     (*(obj as *mut W_TypeObject)).mro_w = crate::object_array::alloc_mro_block_gc(&mro);
@@ -1164,6 +1291,9 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
 /// `typeobject.py:1090-1153 mro_subclasses` keeps the old MRO value and may
 /// restore `None` when a reentrant `__bases__` update fails while a type is
 /// still being constructed.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_clear_mro(obj: PyObjectRef) {
     (*(obj as *mut W_TypeObject)).mro_w = std::ptr::null_mut();
     w_type_set_version_tag(obj, 0);
@@ -1171,6 +1301,9 @@ pub unsafe fn w_type_clear_mro(obj: PyObjectRef) {
 }
 
 /// typeobject.py:1615-1619 `is_mro_purely_of_types(mro_w)`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_mro_purely_of_types(mro_w: &[PyObjectRef]) -> bool {
     for &w_class in mro_w {
         if !is_type(w_class) {
@@ -1182,23 +1315,35 @@ pub unsafe fn is_mro_purely_of_types(mro_w: &[PyObjectRef]) -> bool {
 
 /// Check if an object is a type (user-defined class).
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_type(obj: PyObjectRef) -> bool {
     py_type_check(obj, &TYPE_TYPE)
 }
 
 /// typeobject.py:543-544 `is_heaptype(self)`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_is_heaptype(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).flag_heaptype
 }
 
 /// Set the CPython/PyPy heap-type ownership bit during type construction.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_heaptype(obj: PyObjectRef, value: bool) {
     (*(obj as *mut W_TypeObject)).flag_heaptype = value;
 }
 
 /// typeobject.py `W_TypeObject.get_flags` — compute PyPy's public type flags
 /// from their canonical fields on `W_TypeObject`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     if obj.is_null() || !is_type(obj) {
         return 0;
@@ -1232,6 +1377,9 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
 
 /// typedef.py:43 `acceptable_as_base_class` — read from Layout level.
 /// typeobject.py:1116: w_bestbase.layout.typedef.acceptable_as_base_class
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_acceptable_as_base_class(obj: PyObjectRef) -> bool {
     let layout = (*(obj as *const W_TypeObject)).layout;
     if layout.is_null() {
@@ -1243,6 +1391,9 @@ pub unsafe fn w_type_get_acceptable_as_base_class(obj: PyObjectRef) -> bool {
 
 /// typedef.py:40 `hasdict` — read from Layout level.
 /// typeobject.py:255 `typedef = self.layout.typedef; ... not typedef.hasdict`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_typedef_hasdict(obj: PyObjectRef) -> bool {
     let layout = (*(obj as *const W_TypeObject)).layout;
     if layout.is_null() {
@@ -1255,6 +1406,9 @@ pub unsafe fn w_type_get_typedef_hasdict(obj: PyObjectRef) -> bool {
 /// typedef.py:742,765,664 explicit overrides after initial creation.
 /// Layouts may be shared (reused from parent), so we clone to avoid
 /// corrupting the parent type's flag.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
     let old_layout = (*(obj as *const W_TypeObject)).layout;
     if old_layout.is_null() {
@@ -1369,13 +1523,13 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
     // is None: self.weak_subclasses[i] = newref; return;
     // else: self.weak_subclasses.append(newref)`.
     let newref = crate::weakref::w_weakref_new(w_subclass);
-    for i in 0..subs.len() {
-        let existing = crate::weakref::w_weakref_deref(subs[i]);
+    for slot in subs.iter_mut() {
+        let existing = crate::weakref::w_weakref_deref(*slot);
         if existing == w_subclass {
             return;
         }
         if existing.is_null() {
-            subs[i] = newref;
+            *slot = newref;
             note_weak_subclass_store(w_parent);
             return;
         }

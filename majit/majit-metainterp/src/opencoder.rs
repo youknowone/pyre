@@ -412,6 +412,10 @@ impl<'a> TraceIterator<'a> {
     /// IS the cached box object: a later arg referencing this op's raw
     /// trace position resolves (via `_untag` → `_get`) to a clone of the
     /// same `Rc` handle, matching RPython's `_cache[i] is res` identity.
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "This is the direct opencoder.py TraceIterator.next port; it returns RPython operation identity handles and is consumed by explicit parity control flow rather than Rust iterator adapters"
+    )]
     pub fn next(&mut self) -> Option<majit_ir::OpRc> {
         if self.done() {
             return None;
@@ -2094,6 +2098,10 @@ impl Trace {
     ///
     /// `in_a_call` is forced to `false` at the topmost frame — the
     /// RPython invariant at opencoder.py:769.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub(crate) fn create_top_snapshot_from_frame(
         &mut self,
         frame: &mut crate::pyjitpl::MIFrame,
@@ -2176,6 +2184,10 @@ impl Trace {
     /// snapshot, then walks parent frames via
     /// `_ensure_parent_resumedata`. Returns the snapshot_index of
     /// the top snapshot (matches RPython `return result`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub(crate) fn capture_resumedata(
         &mut self,
         framestack: &mut [crate::pyjitpl::MIFrame],
@@ -2741,8 +2753,7 @@ impl Trace {
         debug_assert_eq!(deadranges.len(), liveranges.len() + 2);
         // opencoder.py:879-882 — skip inputargs (i < _start), insert
         // live end-points with linear probing.
-        for i in (self._start as usize)..liveranges.len() {
-            let elem = liveranges[i];
+        for (i, &elem) in liveranges.iter().enumerate().skip(self._start as usize) {
             if elem != 0 {
                 // opencoder.py:865-871 nested insert(ranges, pos, v).
                 let mut pos = elem + 1;
@@ -3215,7 +3226,7 @@ mod tests {
     }
 
     /// Phase B8: `get_live_ranges` walks `_ops` + `_snapshot_data`
-    /// + `_snapshot_array_data` and produces RPython-parity
+    /// and `_snapshot_array_data`, producing RPython-parity
     /// `liveranges[v] = last_use_index` output, with guards driving
     /// the snapshot-chain walk via `update_liveranges`.
     #[test]
@@ -3984,7 +3995,7 @@ mod tests {
     /// Step 2b: inline-Const OpRef (Float) must resolve to `Box::ConstFloat`.
     #[test]
     fn test_record_op_oprefs_const_float_2b() {
-        let raw = (3.14_f64).to_bits() as i64;
+        let raw = (3.25_f64).to_bits() as i64;
         let c = OpRef::const_float(f64::from_bits(raw as u64));
         assert!(c.is_constant());
         let mut expected = TraceRecordBuffer::new(1, empty_sd());

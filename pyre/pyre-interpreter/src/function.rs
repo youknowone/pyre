@@ -658,6 +658,9 @@ pub fn function_new_with_fixed_code(
 ///
 /// The payload and GC layout are unchanged: `METHOD_DESCRIPTOR_TYPE` is an
 /// alias of the `Function` GC type, just as `SLOT_WRAPPER_TYPE` is.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_mark_method_descriptor(function: PyObjectRef) {
     unsafe {
         (*function).ob_type = &METHOD_DESCRIPTOR_TYPE;
@@ -697,6 +700,9 @@ pub fn function_new_slot_wrapper(code: *const (), name: String) -> PyObjectRef {
 /// Retag a freshly materialised `FunctionWithFixedCode` as the public
 /// method-descriptor carrier. TypeDef builds its namespace before the owner
 /// type exists, so this is deliberately performed during materialisation.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_retag_method_descriptor(obj: PyObjectRef) {
     unsafe {
         (*obj).ob_type = &METHOD_DESCRIPTOR_TYPE as *const PyType;
@@ -737,6 +743,9 @@ pub fn function_new_method_descriptor(code: *const (), name: String) -> PyObject
 ///         raise oefmt(self.space.w_AttributeError,
 ///                     "Cannot change %s attribute of builtin functions", attr)
 /// ```
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _check_code_mutable(func: PyObjectRef, attr: &str) -> Result<(), crate::PyError> {
     unsafe {
         if (*(func as *const Function)).can_change_code {
@@ -754,6 +763,9 @@ pub unsafe fn _check_code_mutable(func: PyObjectRef, attr: &str) -> Result<(), c
 /// Only valid when `can_change_code == false`.
 #[majit_macros::elidable_promote]
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _get_immutable_code(func: PyObjectRef) -> *const () {
     // function.py:25
     debug_assert!(
@@ -778,11 +790,17 @@ pub unsafe fn is_function(obj: PyObjectRef) -> bool {
 
 /// Whether `obj` is a CPython-compatible slot-wrapper descriptor.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_slot_wrapper(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SLOT_WRAPPER_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_method_descriptor(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &METHOD_DESCRIPTOR_TYPE) }
 }
@@ -864,6 +882,9 @@ pub fn is_classmethod_descriptor(obj: PyObjectRef) -> bool {
 /// Keep this separate from [`is_function`]: wrapper descriptors must not
 /// expose Python-function metadata such as `__code__` or `__globals__`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_function_carrier(obj: PyObjectRef) -> bool {
     unsafe { is_function(obj) || is_slot_wrapper(obj) || is_method_descriptor(obj) }
 }
@@ -873,6 +894,9 @@ pub unsafe fn is_function_carrier(obj: PyObjectRef) -> bool {
 /// but CPython-only function metadata such as PEP 649 `__annotate__` must not
 /// leak onto their public surface.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_has_builtin_code(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
@@ -910,6 +934,9 @@ pub unsafe fn builtin_function_set_module(obj: PyObjectRef, w_module: PyObjectRe
 /// CPython 3.14 `PyCFunctionObject.m_module` member assignment. Unlike
 /// PyPy's shared Function getset, builtin `__module__` is a writable direct
 /// member and accepts any object; deletion stores `None`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn builtin_function_set_module_attr(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
@@ -1018,6 +1045,9 @@ pub unsafe fn builtin_function_repr_text(name: &str, w_self: PyObjectRef) -> Str
 
 /// CPython 3.14 `meth_reduce`: type-bound builtins reconstruct through
 /// `getattr(__self__, __name__)`; module-level builtins reduce by qualname.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult {
     let w_self = unsafe { function_get_self_or_none(obj) };
     if !w_self.is_null()
@@ -1042,6 +1072,9 @@ pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult
 /// PyPy represents these descriptors as `FunctionWithFixedCode`; its
 /// `w_objclass` field is stamped by `TypeCache.build`, so use that existing
 /// owner instead of inventing a descriptor side table.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_fixed_code_reduce(obj: PyObjectRef) -> crate::PyResult {
     let owner = unsafe { fget_func_objclass(obj)? };
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1112,6 +1145,9 @@ pub unsafe fn is_function_with_fixed_code(obj: PyObjectRef) -> bool {
 ///   - JIT + mutable code  → promote(self.code)
 ///   - interpreter         → self.code
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn getcode(obj: PyObjectRef) -> *const () {
     unsafe {
         let func = obj as *const Function;
@@ -1273,6 +1309,9 @@ pub unsafe fn fget_func_qualname(obj: PyObjectRef) -> PyObjectRef {
 /// verbatim; `argument.py` builds its TypeErrors from the same string. So the
 /// text a lone surrogate is set into has to come back out of here intact --
 /// every consumer either mints a `str` from it or puts it in `e.args[0]`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_get_qualname(obj: PyObjectRef) -> Wtf8Buf {
     unsafe { pyre_object::w_str_get_wtf8(fget_func_qualname(obj)).to_wtf8_buf() }
 }
@@ -1327,6 +1366,9 @@ pub unsafe fn function_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _eq(_obj: PyObjectRef, other: PyObjectRef) -> bool {
     _obj == other
 }
@@ -1338,6 +1380,9 @@ pub unsafe fn _eq(_obj: PyObjectRef, other: PyObjectRef) -> bool {
 /// pointer for fast internal `&str` users and mirrors the application-level
 /// owner with `w_name`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fget_func_name(obj: PyObjectRef) -> PyObjectRef {
     unsafe { function_get_name_obj(obj) }
 }
@@ -1381,6 +1426,9 @@ pub unsafe fn function_get_globals_obj(obj: PyObjectRef) -> PyObjectRef {
 /// CPython 3.14 `PyFunctionObject.func_builtins`, resolved once during
 /// construction. Returns `PY_NULL` for globals-less builtin carriers.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_get_builtins(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const Function)).w_builtins }
 }
@@ -1409,12 +1457,18 @@ pub unsafe fn function_set_closure(obj: PyObjectRef, closure: PyObjectRef) {
 
 /// Get defaults tuple.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_get_defaults(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const Function)).defs_w }
 }
 
 /// Set defaults tuple.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_set_defaults(obj: PyObjectRef, defaults: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
@@ -1424,12 +1478,18 @@ pub unsafe fn function_set_defaults(obj: PyObjectRef, defaults: PyObjectRef) {
 
 /// Get kwdefaults dict.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_get_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const Function)).w_kw_defs }
 }
 
 /// Set kwdefaults dict.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
@@ -1439,6 +1499,9 @@ pub unsafe fn function_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef)
 
 /// PyPy-compatible `__dict__` storage field alias.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let func = obj as *mut Function;
@@ -1461,6 +1524,9 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
 /// `setdict` (the wholesale dict replacement), not `setattr_str(obj,
 /// "__dict__", ..)` which would store a literal `"__dict__"` dict entry.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
     if !unsafe { crate::baseobjspace::isinstance_w(value, w_dict_type) } {
@@ -1476,6 +1542,9 @@ pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(
 }
 
 /// CPython 3.14 `function.__annotate__` getter.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_get_annotate(obj: PyObjectRef) -> PyObjectRef {
     let value = unsafe { (*(obj as *const Function)).w_annotate };
     if value.is_null() {
@@ -1486,6 +1555,9 @@ pub unsafe fn function_get_annotate(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// CPython 3.14 `function.__annotate__` setter.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_set_annotate(
     obj: PyObjectRef,
     value: PyObjectRef,
@@ -1509,6 +1581,9 @@ pub unsafe fn function_set_annotate(
 /// barrier is still required: Function objects are old-generation carriers
 /// and the annotate function may be in the nursery.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_set_annotate_unchecked(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
@@ -1521,6 +1596,9 @@ pub unsafe fn function_set_annotate_unchecked(obj: PyObjectRef, value: PyObjectR
 }
 
 /// CPython 3.14 `function.__type_params__` getter.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_get_typeparams(obj: PyObjectRef) -> PyObjectRef {
     let value = unsafe { (*(obj as *const Function)).w_typeparams };
     if value.is_null() {
@@ -1532,6 +1610,9 @@ pub unsafe fn function_get_typeparams(obj: PyObjectRef) -> PyObjectRef {
 
 /// CPython 3.14 `function.__type_params__` setter and
 /// `_Py_set_function_type_params` opcode helper.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_set_typeparams(
     obj: PyObjectRef,
     value: PyObjectRef,
@@ -1550,12 +1631,18 @@ pub unsafe fn function_set_typeparams(
 
 /// PyPy-compatible `getdict()` descriptor helper.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe { function_getdict(obj) }
 }
 
 /// PyPy-compatible `setdict()` helper.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe { function_setdict(obj, value) }
 }
@@ -1636,6 +1723,9 @@ fn code_getdocstring(obj: PyObjectRef) -> PyObjectRef {
 ///     self._check_code_mutable("__doc__")
 ///     self.w_doc = w_doc
 /// ```
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         _check_code_mutable(obj, "__doc__")?; // function.py:452
@@ -1659,6 +1749,9 @@ pub unsafe fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) -> Result<(
 /// Stamps `w_none()` so the next `function_get_doc` short-circuits
 /// the lazy `code.getdocstring(space)` fallback — `w_doc` is no
 /// longer null, so the cache hit returns `w_none()` directly.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         _check_code_mutable(obj, "__doc__")?; // function.py:456
@@ -1815,6 +1908,9 @@ pub unsafe fn fdel_func_annotations(obj: PyObjectRef) -> Result<(), crate::PyErr
 
 /// PyPy `fget_func_defaults` accessor.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fget_func_defaults(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let value = function_get_defaults(obj);
@@ -1840,6 +1936,9 @@ pub unsafe fn fget_func_defaults(obj: PyObjectRef) -> PyObjectRef {
 ///     self.defs_w = space.fixedview(w_defaults)
 /// ```
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fset_func_defaults(
     obj: PyObjectRef,
     value: PyObjectRef,
@@ -1868,6 +1967,9 @@ pub unsafe fn fset_func_defaults(
 ///     self.defs_w = []
 /// ```
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fdel_func_defaults(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         _check_code_mutable(obj, "__defaults__")?; // function.py:419
@@ -1878,6 +1980,9 @@ pub unsafe fn fdel_func_defaults(obj: PyObjectRef) -> Result<(), crate::PyError>
 
 /// PyPy `fget_func_kwdefaults` accessor.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fget_func_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let value = function_get_kwdefaults(obj);
@@ -1904,6 +2009,9 @@ pub unsafe fn fget_func_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
 /// PyPy intentionally omits `_check_code_mutable` here — `__kwdefaults__`
 /// is settable on builtins too.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fset_func_kwdefaults(
     obj: PyObjectRef,
     value: PyObjectRef,
@@ -1931,6 +2039,9 @@ pub unsafe fn fset_func_kwdefaults(
 /// PyPy intentionally omits `_check_code_mutable` here — symmetric
 /// with `fset_func_kwdefaults` at function.py:427-433.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fdel_func_kwdefaults(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         function_set_kwdefaults(obj, pyre_object::PY_NULL);
@@ -1941,12 +2052,18 @@ pub unsafe fn fdel_func_kwdefaults(obj: PyObjectRef) -> Result<(), crate::PyErro
 /// function.py:435-436 — `fget_func_code(self, space): return self.getcode()`
 /// Uses getcode() for JIT elidable_promote / promote path.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_get_func_code(obj: PyObjectRef) -> *const () {
     unsafe { getcode(obj) }
 }
 
 /// PyPy-compatible `__code__` setter.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_set_func_code(obj: PyObjectRef, code: *const ()) {
     unsafe {
         function_write_barrier(obj);
@@ -1956,6 +2073,9 @@ pub unsafe fn function_set_func_code(obj: PyObjectRef, code: *const ()) {
 
 /// PyPy-compatible `__name__` getter alias.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_get_func_name(obj: PyObjectRef) -> &'static str {
     unsafe { function_get_name(obj) }
 }
@@ -1988,6 +2108,9 @@ unsafe fn name_utf8_mirror(w_name: PyObjectRef) -> String {
 /// an immortal `malloc_raw` name was never collector-freed — so the box tid's
 /// drop glue stays the sole reclaimer.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(name) {
@@ -2238,12 +2361,18 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
 
 /// PyPy-compatible `__closure__` getter alias.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_get_func_closure(obj: PyObjectRef) -> PyObjectRef {
     unsafe { function_get_closure(obj) }
 }
 
 /// PyPy-compatible `fget_func_closure`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fget_func_closure(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let value = function_get_func_closure(obj);
@@ -2257,6 +2386,9 @@ pub unsafe fn fget_func_closure(obj: PyObjectRef) -> PyObjectRef {
 
 /// PyPy-compatible `__closure__` setter alias.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fset_func_closure(obj: PyObjectRef, closure: PyObjectRef) {
     unsafe {
         function_set_closure(obj, closure);
@@ -2287,6 +2419,9 @@ pub unsafe fn fset_func_closure(obj: PyObjectRef, closure: PyObjectRef) {
 /// user sees via `__globals__`) and dispatches `dict.get` so dict
 /// subclasses that override `get` are observed.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let func = obj as *mut Function;
@@ -2321,6 +2456,9 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
 
 /// PyPy-compatible `descr_function__new__` helper.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_function__new__(
     code: *const (),
     w_globals: PyObjectRef,
@@ -2360,6 +2498,9 @@ pub unsafe fn descr_function__new__(
 ///     self.w_module = w_module
 /// ```
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fset___module__(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         _check_code_mutable(obj, "__module__")?; // function.py:512
@@ -2377,6 +2518,9 @@ pub unsafe fn fset___module__(obj: PyObjectRef, value: PyObjectRef) -> Result<()
 ///     self.w_module = space.w_None
 /// ```
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fdel___module__(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         _check_code_mutable(obj, "__module__")?; // function.py:516
@@ -2389,11 +2533,17 @@ pub unsafe fn fdel___module__(obj: PyObjectRef) -> Result<(), crate::PyError> {
 
 /// PyPy-compatible `descr_function__new__` overload.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _cleanup_(_obj: PyObjectRef) -> bool {
     true
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_builtinfunction__new__(
     code: *const (),
     w_globals: PyObjectRef,
@@ -2507,18 +2657,27 @@ pub fn add_to_table() {}
 
 /// PyPy-compatible `__doc__` getter.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fget_func_doc(obj: PyObjectRef) -> PyObjectRef {
     function_get_doc(obj)
 }
 
 /// function.py:400 — `fset_func_doc` descriptor.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fset_func_doc(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe { function_set_doc(obj, value) }
 }
 
 /// function.py:404 — `fdel_func_doc` descriptor.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fdel_func_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe { function_del_doc(obj) }
 }
@@ -2673,6 +2832,9 @@ fn is_builtin_code(obj: PyObjectRef) -> bool {
 pub fn descr_init() {}
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_classmethod__new__(
     _subtype: PyObjectRef,
     w_function: PyObjectRef,
@@ -2686,6 +2848,9 @@ pub unsafe fn descr_classmethod__new__(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_classmethod_get(
     w_obj: PyObjectRef,
     obj: PyObjectRef,
@@ -2708,6 +2873,9 @@ pub unsafe fn descr_classmethod_get(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_staticmethod__new__(
     _subtype: PyObjectRef,
     w_function: PyObjectRef,
@@ -2721,6 +2889,9 @@ pub unsafe fn descr_staticmethod__new__(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_staticmethod_get(
     obj: PyObjectRef,
     _obj: PyObjectRef,
@@ -2737,6 +2908,9 @@ pub unsafe fn descr_staticmethod_get(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method__new__(
     _subtype: PyObjectRef,
     w_function: PyObjectRef,
@@ -2772,6 +2946,9 @@ pub fn require_method(method: PyObjectRef, name: &str) -> Result<PyObjectRef, cr
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method_get(
     method: PyObjectRef,
     obj: PyObjectRef,
@@ -2816,6 +2993,9 @@ pub fn descr_method_call(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method_eq(
     this: PyObjectRef,
     other: PyObjectRef,
@@ -2834,6 +3014,9 @@ pub unsafe fn descr_method_eq(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method_ne(
     this: PyObjectRef,
     other: PyObjectRef,
@@ -2850,6 +3033,9 @@ pub unsafe fn descr_method_ne(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let obj = require_method(obj, "__repr__")?;
     let function = unsafe { pyre_object::w_method_get_func(obj) };
@@ -2879,6 +3065,9 @@ pub unsafe fn descr_method_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method_getattribute(
     obj: PyObjectRef,
     name: PyObjectRef,
@@ -2953,6 +3142,9 @@ fn object_class_method_name(function: PyObjectRef) -> Option<&'static str> {
 
 /// Python 3.14's dynamic qualname for the two METH_CLASS methods inherited
 /// from `object`; `None` for every ordinary bound method.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn method_class_bound_qualname(
     obj: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
@@ -2981,6 +3173,9 @@ pub unsafe fn method_class_bound_qualname(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     let obj = require_method(obj, "__hash__")?;
     let function = unsafe { pyre_object::w_method_get_func(obj) };
@@ -2992,6 +3187,9 @@ pub unsafe fn descr_method_hash(obj: PyObjectRef) -> Result<i64, crate::PyError>
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method__reduce__(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let obj = require_method(obj, "__reduce__")?;
     let function = unsafe { pyre_object::w_method_get_func(obj) };
@@ -3004,6 +3202,9 @@ pub unsafe fn descr_method__reduce__(obj: PyObjectRef) -> Result<PyObjectRef, cr
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_w(_obj: PyObjectRef, _other: PyObjectRef) -> bool {
     _obj == _other
 }
@@ -3020,6 +3221,9 @@ pub fn descr_function_call(args: &[PyObjectRef]) -> PyObjectRef {
 
 /// PyPy-compatible `descr_function_get` helper.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_function_get(
     _func: PyObjectRef,
     obj: PyObjectRef,
@@ -3035,6 +3239,9 @@ pub unsafe fn descr_function_get(
 
 /// PyPy-compatible `descr_function_repr` helper.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_function_repr(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let name = function_get_name(obj);
@@ -3044,6 +3251,9 @@ pub unsafe fn descr_function_repr(obj: PyObjectRef) -> PyObjectRef {
 
 /// PyPy-compatible `__code__` getter for direct descriptors.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fget_func_code(obj: PyObjectRef) -> *const () {
     unsafe { function_get_code(obj) }
 }

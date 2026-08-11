@@ -448,6 +448,10 @@ impl fmt::Display for EmulatedWeakRefRepr {
 // ─── rtyper_makerepr dispatch ────────────────────────────────────────
 
 /// rweakref.py:13-17 `SomeWeakRef.rtyper_makerepr`.
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+)]
 pub(crate) fn weakref_makerepr(rtyper: &RPythonTyper) -> Result<Arc<dyn Repr>, TyperError> {
     let rweakref = rtyper
         .getconfig()

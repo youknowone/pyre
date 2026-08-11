@@ -40,8 +40,8 @@ pub use crate::optimizeopt::schedule::{
 /// It saves:
 /// - Instruction count reduction (N scalar ops -> 1 vector op)
 /// - Memory bandwidth (packed loads/stores)
-/// vector.py: GenericCostModel — per-opcode cost estimation.
-/// Maps opcodes to their estimated cost in abstract units.
+///   vector.py: GenericCostModel — per-opcode cost estimation.
+///   Maps opcodes to their estimated cost in abstract units.
 pub struct GenericCostModel {
     /// Per-opcode cost overrides: opcode -> cost.
     per_opcode_cost: indexmap::IndexMap<OpCode, i32>,
@@ -471,8 +471,8 @@ impl PackSet {
             if self.contains_pair(lnode, rnode) {
                 return Ok(None);
             }
-            if origin_pack.is_some() {
-                return Ok(self.accumulates_pair(state, lnode, rnode, origin_pack.unwrap(), graph));
+            if let Some(origin_pack) = origin_pack {
+                return Ok(self.accumulates_pair(state, lnode, rnode, origin_pack, graph));
             }
         }
 
@@ -611,11 +611,8 @@ impl PackSet {
         }
 
         // vector.py:799-812: bytesize must equal word size
-        let size: i32 = if left.opcode.result_type() == majit_ir::Type::Float {
-            8 // FLOAT_WORD
-        } else {
-            8 // INT_WORD on 64-bit
-        };
+        // FLOAT_WORD and INT_WORD are both 8 on this 64-bit backend.
+        let size: i32 = 8;
         let l_bs = state.forwarded_vecinfo(left).getbytesize() as i32;
         let r_bs = state.forwarded_vecinfo(right).getbytesize() as i32;
         if !(l_bs == r_bs && l_bs == size) {
@@ -790,6 +787,10 @@ impl VectorLoop {
         if let Some(jcell) = jitcell_token {
             // vector.py:64-72
             if reset_label_token {
+                #[expect(
+                    clippy::arc_with_non_send_sync,
+                    reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
+                )]
                 let token = std::sync::Arc::new(crate::history::TargetToken::new_loop(0));
                 let descr = token.as_jump_target_descr();
                 jcell.target_tokens.lock().push(descr.clone());
@@ -802,6 +803,10 @@ impl VectorLoop {
             // vector.py:73-77: prefix_label gets its own TargetToken, and
             // the jump is rebound to point at it.
             if let Some(ref prefix_label) = self.prefix_label {
+                #[expect(
+                    clippy::arc_with_non_send_sync,
+                    reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
+                )]
                 let pre_token = std::sync::Arc::new(crate::history::TargetToken::new_loop(0));
                 let pre_descr = pre_token.as_jump_target_descr();
                 jcell.target_tokens.lock().push(pre_descr.clone());

@@ -1,6 +1,6 @@
-/// Interpreter for TL — direct translation of rpython/jit/tl/tl.py.
-///
-/// Stack-based interpreter with integer values and virtualizable stack.
+//! Interpreter for TL — direct translation of rpython/jit/tl/tl.py.
+//!
+//! Stack-based interpreter with integer values and virtualizable stack.
 
 const NOP: u8 = 1;
 const PUSH: u8 = 2;
@@ -144,7 +144,7 @@ pub fn interpret_at(code: &[u8], mut pc: usize, inputarg: i64) -> i64 {
     stack.pop().unwrap()
 }
 
-fn roll(stack: &mut Vec<i64>, r: i64) {
+fn roll(stack: &mut [i64], r: i64) {
     let len = stack.len();
     if r < -1 {
         let i = (len as i64 + r) as usize;

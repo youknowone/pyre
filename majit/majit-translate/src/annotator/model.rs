@@ -2393,8 +2393,8 @@ impl SomeValue {
             // `noneify(self)` returns `self`.
             SomeValue::StringBuilder(_) | SomeValue::UnicodeBuilder(_) => Ok(self.clone()),
             _ => Err(UnionError {
-                lhs: self.clone(),
-                rhs: s_none(),
+                lhs: Box::new(self.clone()),
+                rhs: Box::new(s_none()),
                 msg: "RPython noneify() not supported for this annotation".into(),
             }),
         }
@@ -2437,8 +2437,8 @@ impl SomeValue {
                 true,
             ))),
             _ => Err(UnionError {
-                lhs: self.clone(),
-                rhs: self.clone(),
+                lhs: Box::new(self.clone()),
+                rhs: Box::new(self.clone()),
                 msg: "RPython nonnulify() not supported for this annotation".into(),
             }),
         }
@@ -2858,8 +2858,8 @@ pub(crate) fn bind_callables_under(
 /// A4.6 populates the payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnionError {
-    pub lhs: SomeValue,
-    pub rhs: SomeValue,
+    pub lhs: Box<SomeValue>,
+    pub rhs: Box<SomeValue>,
     pub msg: String,
 }
 
@@ -3098,8 +3098,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                 if matches!(t2, KnownType::Int) {
                     if !int2.nonneg {
                         return Err(UnionError {
-                            lhs: s1.clone(),
-                            rhs: s2.clone(),
+                            lhs: Box::new(s1.clone()),
+                            rhs: Box::new(s2.clone()),
                             msg:
                                 "RPython cannot prove that these integers are of the same signedness"
                                     .into(),
@@ -3109,8 +3109,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                 } else if matches!(t1, KnownType::Int) {
                     if !int1.nonneg {
                         return Err(UnionError {
-                            lhs: s1.clone(),
-                            rhs: s2.clone(),
+                            lhs: Box::new(s1.clone()),
+                            rhs: Box::new(s2.clone()),
                             msg:
                                 "RPython cannot prove that these integers are of the same signedness"
                                     .into(),
@@ -3119,8 +3119,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                     t2
                 } else {
                     return Err(UnionError {
-                        lhs: s1.clone(),
-                        rhs: s2.clone(),
+                        lhs: Box::new(s1.clone()),
+                        rhs: Box::new(s2.clone()),
                         msg: "RPython cannot unify these integer types".into(),
                     });
                 }
@@ -3254,8 +3254,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         (SomeValue::Tuple(a), SomeValue::Tuple(b)) => {
             if a.items.len() != b.items.len() {
                 return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
+                    lhs: Box::new(s1.clone()),
+                    rhs: Box::new(s2.clone()),
                     msg: format!(
                         "SomeTuple length mismatch ({} vs {})",
                         a.items.len(),
@@ -3303,8 +3303,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                         // class" phrase is preserved verbatim so the
                         // dual-gate skip classifier still matches.
                         return Err(UnionError {
-                            lhs: s1.clone(),
-                            rhs: s2.clone(),
+                            lhs: Box::new(s1.clone()),
+                            rhs: Box::new(s2.clone()),
                             msg: format!(
                                 "RPython cannot unify instances with no \
                                  common base class: {} ∪ {}",
@@ -3382,8 +3382,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         (SomeValue::Iterator(a), SomeValue::Iterator(b)) => {
             if a.variant != b.variant || a.enumerate_start != b.enumerate_start {
                 return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
+                    lhs: Box::new(s1.clone()),
+                    rhs: Box::new(s2.clone()),
                     msg: "RPython cannot unify incompatible iterator variants".into(),
                 });
             }
@@ -3400,8 +3400,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         (SomeValue::Ptr(a), SomeValue::Ptr(b)) => {
             if a.ll_ptrtype != b.ll_ptrtype {
                 return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
+                    lhs: Box::new(s1.clone()),
+                    rhs: Box::new(s2.clone()),
                     msg: "RPython cannot unify distinct low-level pointer types".into(),
                 });
             }
@@ -3410,8 +3410,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         (SomeValue::InteriorPtr(a), SomeValue::InteriorPtr(b)) => {
             if a.ll_ptrtype != b.ll_ptrtype {
                 return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
+                    lhs: Box::new(s1.clone()),
+                    rhs: Box::new(s2.clone()),
                     msg: "RPython cannot unify distinct low-level pointer types".into(),
                 });
             }
@@ -3431,8 +3431,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         (SomeValue::TypedAddressAccess(a), SomeValue::TypedAddressAccess(b)) => {
             if a.access_type != b.access_type {
                 return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
+                    lhs: Box::new(s1.clone()),
+                    rhs: Box::new(s2.clone()),
                     msg: "cannot unify typed address accesses of distinct types".into(),
                 });
             }
@@ -3445,8 +3445,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         (SomeValue::BuiltinMethod(a), SomeValue::BuiltinMethod(b)) => {
             if a.analyser_name != b.analyser_name || a.methodname != b.methodname {
                 return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
+                    lhs: Box::new(s1.clone()),
+                    rhs: Box::new(s2.clone()),
                     msg: "RPython cannot unify distinct builtin methods".into(),
                 });
             }
@@ -3472,8 +3472,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             // as `UnionError` here.
             let unpack = |s: &SomePBC, orig: &SomeValue| -> Result<DescKind, UnionError> {
                 s.get_kind().map_err(|e| UnionError {
-                    lhs: orig.clone(),
-                    rhs: orig.clone(),
+                    lhs: Box::new(orig.clone()),
+                    rhs: Box::new(orig.clone()),
                     msg: e
                         .msg
                         .unwrap_or_else(|| "mixing several kinds of PBCs".into()),
@@ -3483,8 +3483,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             let b_kind = unpack(b, s2)?;
             if a_kind != b_kind {
                 return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
+                    lhs: Box::new(s1.clone()),
+                    rhs: Box::new(s2.clone()),
                     msg: format!("mixing several kinds of PBCs: {a_kind:?} and {b_kind:?}"),
                 });
             }
@@ -3508,8 +3508,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                     Some(base) => Some(base),
                     None => {
                         return Err(UnionError {
-                            lhs: s1.clone(),
-                            rhs: s2.clone(),
+                            lhs: Box::new(s1.clone()),
+                            rhs: Box::new(s2.clone()),
                             msg: format!(
                                 "RPython cannot unify weakrefs with no \
                                      common base class: {} ∪ {}",
@@ -3533,8 +3533,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // SomeAddress family, ...). Until then we raise UnionError
         // so the annotator surfaces the gap loudly.
         _ => Err(UnionError {
-            lhs: s1.clone(),
-            rhs: s2.clone(),
+            lhs: Box::new(s1.clone()),
+            rhs: Box::new(s2.clone()),
             // Name the two colliding operands, for the same reason the
             // `SomeInstance` arm above names its classdefs: both sides
             // often render as the bare `<other>` `KnownType`, which makes
@@ -3899,6 +3899,10 @@ pub fn read_can_only_throw(
 /// `case` exit, these variables have annotation `s_obj`". RPython keys
 /// by the `link.exitcase` value, which for a bool exitswitch is
 /// `True`/`False` and for an integer exitswitch is the case constant.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn add_knowntypedata(
     ktd: &mut KnownTypeData,
     case: ExitCaseKey,

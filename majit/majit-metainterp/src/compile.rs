@@ -608,10 +608,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 // the innermost frame slots here.
                 for frame in frames.iter() {
                     builder.push_frame(frame.jitcode_index, frame.pc as u64, frame.py_pc);
-                    let mut slot_idx = 0usize;
-                    for val in &frame.values {
+                    for (slot_idx, val) in frame.values.iter().enumerate() {
                         add_slot(&mut builder, slot_idx, val);
-                        slot_idx += 1;
                     }
                 }
             } else {
@@ -864,11 +862,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                                     fieldnums,
                                     ..
                                 } => {
-                                    let fpe = if *size > 0 {
-                                        fieldnums.len() / *size
-                                    } else {
-                                        0
-                                    };
+                                    let fpe = fieldnums.len().checked_div(*size).unwrap_or(0);
                                     let element_fields = (0..*size)
                                         .map(|ei| {
                                             let s = ei * fpe;
@@ -2000,7 +1994,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
         let new_opref = OpRef::op_typed(next_opref, field.field_type);
         next_opref += 1;
-        let mut op = Op::new(opcode, &[vable_box.clone()]);
+        let mut op = Op::new(opcode, std::slice::from_ref(&vable_box));
         op.pos.set(new_opref);
         op.setdescr(descr);
         let op = std::rc::Rc::new(op);
@@ -2021,7 +2015,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         // GETFIELD_GC_R(vable_box, array_field_descr) → array pointer (Ref-typed).
         let array_opref = OpRef::ref_op(next_opref);
         next_opref += 1;
-        let mut arr_load = Op::new(OpCode::GetfieldGcR, &[vable_box.clone()]);
+        let mut arr_load = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&vable_box));
         arr_load.pos.set(array_opref);
         arr_load.setdescr(array_field_descr.clone());
         let arr_load = std::rc::Rc::new(arr_load);
@@ -2095,7 +2089,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 // RPython's flat GC-array layout — out of scope.
                 let ptr_opref = OpRef::int_op(next_opref);
                 next_opref += 1;
-                let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[array_box.clone()]);
+                let mut ptr_load = Op::new(OpCode::GetfieldGcI, std::slice::from_ref(&array_box));
                 ptr_load.pos.set(ptr_opref);
                 ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
@@ -5178,19 +5172,11 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
     make_compile_loop_version_descr_with_payload(types, payload)
 }
 
-/// Resume data for a guard now lives on `StoredExitLayout.resume_layout`
-/// (per-guard `ResumeLayoutSummary`) rather than a separate trace-side
-/// `HashMap<u32, ResumeData>`.  See `pyjitpl.rs CompiledTrace`.
-/// `enrich_guard_resume_layouts_for_trace` and
-/// `attach_resume_data_to_trace` are the two producers; readers go
-/// through `exit_layout.resume_layout.{reconstruct_state,
-/// materialize_virtuals, resolve_pending_field_writes}` in
-/// `handle_guard_failure_in_trace_with_savedata` and the blackhole
-/// fallback paths.  This collapses the prior two-store model
-/// (`CompiledTrace.resume_data` + `StoredExitLayout.resume_layout`)
-/// onto the descr-owned layer, mirroring RPython where
-/// `ResumeGuardDescr` (`compile.py:855`) is the single guard-owned
-/// resume container.
+// Resume data for a guard now lives on `StoredExitLayout.resume_layout`
+// (per-guard `ResumeLayoutSummary`) rather than a separate trace-side
+// `HashMap<u32, ResumeData>`. See `pyjitpl.rs CompiledTrace` and the
+// producers/readers below. This mirrors RPython's single guard-owned
+// `ResumeGuardDescr` container (`compile.py:855`).
 
 //
 // These are the **compile role** of `TraceCtx`, mirroring RPython's

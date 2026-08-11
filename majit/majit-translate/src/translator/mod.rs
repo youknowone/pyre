@@ -24,5 +24,9 @@ pub mod targetspec;
 pub mod timing;
 pub mod tool;
 pub mod transform;
+#[expect(
+    clippy::module_inception,
+    reason = "module names mirror the corresponding RPython package and file layout for line-by-line parity"
+)]
 pub mod translator;
 pub mod unsimplify;

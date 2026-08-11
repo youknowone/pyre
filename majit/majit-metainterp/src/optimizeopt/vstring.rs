@@ -75,6 +75,10 @@ pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand
 ///
 /// Emits either inline STRGETITEM/STRSETITEM (for small constant lengths)
 /// or a single COPYSTRCONTENT/COPYUNICODECONTENT operation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 pub fn copy_str_content(
     ctx: &mut OptContext,
     srcbox: &Operand,

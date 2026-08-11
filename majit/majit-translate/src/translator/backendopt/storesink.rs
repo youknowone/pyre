@@ -60,6 +60,10 @@ enum CacheKey {
 type Cache = HashMap<CacheKey, Hlvalue>;
 
 /// RPython `storesink_graph(graph)` (`storesink.py:19-49`).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn storesink_graph(graph: &FunctionGraph) {
     let entrymap = mkentrymap(graph);
     let start_key = BlockKey::of(&graph.startblock);
@@ -135,6 +139,10 @@ pub fn storesink_graph(graph: &FunctionGraph) {
 /// fresh inputarg + a corresponding link arg so the cache survives
 /// the rename. `local_versions` upstream is the per-call mapping;
 /// we materialise it as `HashMap<Variable, Variable>`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn _translate_cache(cache: &Cache, link: &LinkRef) -> Cache {
     let target = match link.borrow().target.clone() {
         Some(t) => t,
@@ -236,6 +244,10 @@ fn _translate_cache(cache: &Cache, link: &LinkRef) -> Cache {
 /// the case", so the cache-side port is complete on its own:
 /// constfold catches the constant pointer reads, storesink catches
 /// the redundant-load elimination across SSA pointers.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn _storesink_block(block: &BlockRef, cache: &mut Cache) -> bool {
     let mut replacements: HashMap<Hlvalue, Hlvalue> = HashMap::new();
     let mut added_some_same_as = false;
@@ -359,6 +371,10 @@ fn _storesink_block(block: &BlockRef, cache: &mut Cache) -> bool {
 /// anchor has the same concrete pointer-type AND the same field
 /// name, since a `setfield` on `concretetype.field` may have
 /// invalidated it.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn clear_cache_for(
     cache: &mut Cache,
     concretetype: Option<&ConcretetypePlaceholder>,

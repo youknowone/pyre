@@ -26,6 +26,10 @@ pub(crate) mod j2plan;
 pub use majit_backend::jitframe;
 pub use majit_backend::llmodel;
 pub mod jump;
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the register-allocation entry points preserve RPython's explicit state-threading signatures; bundling those arguments would diverge from the audited line-by-line backend port"
+)]
 pub mod regalloc;
 pub mod regloc;
 pub mod runner;
@@ -404,6 +408,10 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
 ///
 /// The callee jitframe is GC-managed by the rewriter's
 /// `handle_call_assembler` path, so the helper must not free it here.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "this C-ABI trampoline is called only by generated machine code, which guarantees that the embedded CPU handle and jitframe pointers remain live; making the symbol unsafe does not express that foreign-call contract"
+)]
 pub extern "C" fn call_assembler_helper_trampoline(
     cpu_handle: *const std::sync::RwLock<guard::CpuDescrAttachments>,
     callee_jf_ptr: *mut jitframe::JitFrame,
@@ -796,6 +804,10 @@ pub fn call_assembler_helper_addr() -> usize {
 ///
 /// Input:  arg0 = callee jf_ptr, arg1 = callee entry address
 /// Output: callee's returned jf_ptr
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "this C-ABI trampoline is entered only from generated code with a live jitframe and compiled entry address; its safe Rust signature is the exact addressable ABI consumed by the assembler"
+)]
 pub extern "C" fn call_assembler_execute_trampoline(
     jf_ptr: *mut jitframe::JitFrame,
     callee_addr: usize,

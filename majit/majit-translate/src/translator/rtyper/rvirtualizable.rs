@@ -174,7 +174,11 @@ mod tests {
             Some("force".to_string()),
         );
 
-        let count = replace_force_virtualizable_with_call(&[graph.clone()], &VTYPEPTR, &funcptr);
+        let count = replace_force_virtualizable_with_call(
+            std::slice::from_ref(&graph),
+            &VTYPEPTR,
+            &funcptr,
+        );
 
         assert_eq!(count, 1);
         let graph_ref = graph.borrow();
@@ -202,7 +206,11 @@ mod tests {
             Some("force".to_string()),
         );
 
-        let count = replace_force_virtualizable_with_call(&[graph.clone()], &VTYPEPTR, &funcptr);
+        let count = replace_force_virtualizable_with_call(
+            std::slice::from_ref(&graph),
+            &VTYPEPTR,
+            &funcptr,
+        );
 
         assert_eq!(count, 0);
         assert!(graph.borrow().startblock.borrow().operations.is_empty());

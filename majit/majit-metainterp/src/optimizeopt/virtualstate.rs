@@ -43,6 +43,12 @@ impl VirtualStatesCantMatch {
     }
 }
 
+impl Default for VirtualStatesCantMatch {
+    fn default() -> Self {
+        Self::new("virtual states cannot match")
+    }
+}
+
 /// virtualstate.py:24-37 `GenerateGuardState` line-by-line port.
 ///
 /// ```python
@@ -716,7 +722,7 @@ impl VirtualState {
     ///     return boxes
     /// ```
     ///
-    /// Returns `Err(())` to mirror RPython's `raise VirtualStatesCantMatch`
+    /// Returns `Err(VirtualStatesCantMatch::default())` to mirror RPython's `raise VirtualStatesCantMatch`
     /// thrown from `enum_forced_boxes`. The `optimizer.optearlyforce`
     /// redirection is implicit in majit: `Optimizer::force_box` already
     /// dispatches through `OptEarlyForce` via `optearlyforce_idx`, so the
@@ -727,7 +733,7 @@ impl VirtualState {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<Vec<OpRef>, ()> {
+    ) -> Result<Vec<OpRef>, VirtualStatesCantMatch> {
         // boxes = [None] * self.numnotvirtuals
         let mut boxes = vec![OpRef::NONE; self.num_boxes()];
         // virtualstate.py:664-667 — first pass with `force_boxes=True`.
@@ -772,7 +778,7 @@ impl VirtualState {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<(Vec<OpRef>, Vec<OpRef>), ()> {
+    ) -> Result<(Vec<OpRef>, Vec<OpRef>), VirtualStatesCantMatch> {
         let inputargs = self.make_inputargs(concrete_refs, optimizer, ctx, force_boxes)?;
         let virtuals: Vec<OpRef> = self
             .state
@@ -792,13 +798,17 @@ impl VirtualState {
     /// Top-level virtual entries are skipped, so a LABEL arg produced by a
     /// virtual field maps to that field's concrete live-value slot when it is
     /// present in `concrete_refs`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub fn make_inputargs_and_virtuals_with_source_positions(
         &self,
         concrete_refs: &[OpRef],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<(Vec<OpRef>, Vec<OpRef>, Vec<usize>), ()> {
+    ) -> Result<(Vec<OpRef>, Vec<OpRef>, Vec<usize>), VirtualStatesCantMatch> {
         let (inputargs, virtuals) =
             self.make_inputargs_and_virtuals(concrete_refs, optimizer, ctx, force_boxes)?;
         let label_source_positions = self
@@ -850,7 +860,7 @@ impl VirtualState {
     /// The Virtual / VStruct / VArray / VArrayStruct branches mirror
     /// the line `if info is None or not info.is_virtual(): raise
     /// VirtualStatesCantMatch()` (virtualstate.py:185, 266, 336):
-    /// returning `Err(())` is the majit equivalent of raising
+    /// returning `Err(VirtualStatesCantMatch::default())` is the majit equivalent of raising
     /// `VirtualStatesCantMatch`.
     ///
     /// The leaf branch mirrors virtualstate.py:412-425 — when the
@@ -870,7 +880,7 @@ impl VirtualState {
         ctx: &mut OptContext,
         boxes: &mut [OpRef],
         force_boxes: bool,
-    ) -> Result<(), ()> {
+    ) -> Result<(), VirtualStatesCantMatch> {
         match &node.info {
             VirtualStateInfo::Constant(_) => Ok(()),
             VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
@@ -889,7 +899,7 @@ impl VirtualState {
                     .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().is_some_and(|pi| pi.is_virtual());
                 if !is_virtual {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 // virtualstate.py:192-198: walk min(len(fielddescrs),
                 // len(info._fields)) entries — RPython explicitly comments
@@ -942,7 +952,7 @@ impl VirtualState {
                     .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().is_some_and(|pi| pi.is_virtual());
                 if !is_virtual {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 // virtualstate.py:268-269: explicit length check.
                 //     if len(self.fieldstate) > info.getlength():
@@ -955,7 +965,7 @@ impl VirtualState {
                     })
                     .unwrap_or(0);
                 if items.len() > array_len {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 for (index, item_state) in items.iter().enumerate() {
                     let item_ref = info_snapshot
@@ -1007,10 +1017,10 @@ impl VirtualState {
                         .iter()
                         .map(|row| row.iter().map(|(i, b)| (*i, b.to_opref())).collect())
                         .collect(),
-                    _ => return Err(()),
+                    _ => return Err(VirtualStatesCantMatch::default()),
                 };
                 if runtime_fields.len() != element_fields.len() {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 for (elem_idx, fields) in element_fields.iter().enumerate() {
                     let runtime_elem = &runtime_fields[elem_idx];
@@ -1020,7 +1030,7 @@ impl VirtualState {
                     // is the equivalent mismatch.
                     for (rt_field_idx, _) in runtime_elem {
                         if !fields.iter().any(|(fdidx, _)| fdidx == rt_field_idx) {
-                            return Err(());
+                            return Err(VirtualStatesCantMatch::default());
                         }
                     }
                     for (field_idx, field_state) in fields {
@@ -1074,7 +1084,7 @@ impl VirtualState {
                     Some(PtrInfo::Virtualizable(_)) => resolved,
                     Some(ptr_info) if ptr_info.is_virtual() => {
                         if !force_boxes {
-                            return Err(());
+                            return Err(VirtualStatesCantMatch::default());
                         }
                         optimizer.force_box(resolved, ctx)
                     }
@@ -1113,7 +1123,7 @@ impl VirtualState {
                             slot, expected, actual, opref, resolved_for_store
                         );
                     }
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 if let Some(dst) = boxes.get_mut(slot) {
                     *dst = resolved_for_store;
@@ -1187,7 +1197,7 @@ impl VirtualState {
     ///
     /// Generate guards to bridge from `other` state to `self` state.
     /// Returns `Ok(guards)` if the incoming state can be accepted with
-    /// runtime guards, `Err(())` if fundamentally incompatible
+    /// runtime guards, `Err(VirtualStatesCantMatch::default())` if fundamentally incompatible
     /// (`VirtualStatesCantMatch`).
     ///
     /// `boxes`: the actual OpRefs at each position (the guard's first
@@ -1208,9 +1218,9 @@ impl VirtualState {
         runtime_boxes: &[OpRef],
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<Vec<GuardRequirement>, ()> {
+    ) -> Result<Vec<GuardRequirement>, VirtualStatesCantMatch> {
         if self.state.len() != other.state.len() {
-            return Err(());
+            return Err(VirtualStatesCantMatch::default());
         }
         // virtualstate.py:646-648 `assert (len(self.state) == len(other.state)
         // == len(boxes) == len(runtime_boxes))`. The state-length pair is
@@ -1281,14 +1291,16 @@ impl VirtualState {
             // at the top level it is always present.
             let box_opref = boxes[i];
             let runtime_box = Some(runtime_boxes[i]);
-            if let Err(()) = Self::generate_guards_for_entry_recursive(
+            if Self::generate_guards_for_entry_recursive(
                 i,
                 expected,
                 incoming,
                 box_opref,
                 runtime_box,
                 &mut state,
-            ) {
+            )
+            .is_err()
+            {
                 if crate::log_jtet_enabled() {
                     let runtime_value = runtime_box.and_then(|rb| {
                         state
@@ -1300,7 +1312,7 @@ impl VirtualState {
                         "[jit][jte] virtualstate mismatch index={i} box={box_opref:?} runtime={runtime_box:?} runtime_value={runtime_value:?} expected={expected:?} incoming={incoming:?}"
                     );
                 }
-                return Err(());
+                return Err(VirtualStatesCantMatch::default());
             }
         }
 
@@ -1311,9 +1323,9 @@ impl VirtualState {
     ///
     /// Mirrors `AbstractVirtualStateInfo.generate_guards` (virtualstate.py:72-101)
     /// + the per-subclass `_generate_guards` dispatch. The alias-consistency
-    /// check (virtualstate.py:84-94) lives at the entry of every recursive
-    /// call so nested virtual fields/items participate in the same renum
-    /// namespace.
+    ///   check (virtualstate.py:84-94) lives at the entry of every recursive
+    ///   call so nested virtual fields/items participate in the same renum
+    ///   namespace.
     ///
     /// `runtime_box`: when Some, non-permanent guard emission is possible.
     /// When None (generalization_of path, or no runtime guidance), only
@@ -1363,7 +1375,7 @@ impl VirtualState {
         box_opref: OpRef,
         runtime_box: Option<OpRef>,
         state: &mut GenerateGuardState,
-    ) -> Result<(), ()> {
+    ) -> Result<(), VirtualStatesCantMatch> {
         // virtualstate.py:83 `assert self.position != -1`. Pyre assigns
         // positions in `enum_top_level`; sentinel -1 means a node was
         // never enumerated, which is a constructor bug. RPython's
@@ -1391,7 +1403,7 @@ impl VirtualState {
                          prior_incoming={prev} current_incoming={inc_pos}"
                     );
                 }
-                return Err(());
+                return Err(VirtualStatesCantMatch::default());
             }
             Some(_) => return Ok(()),
             None => {
@@ -1429,7 +1441,7 @@ impl VirtualState {
             // never null, so only the type need be checked.
             return match expected_info {
                 // :566-568 LEVEL_CONSTANT → cannot unify a constant with a virtual.
-                VirtualStateInfo::Constant(_) => Err(()),
+                VirtualStateInfo::Constant(_) => Err(VirtualStatesCantMatch::default()),
                 // :570-571 LEVEL_KNOWNCLASS → known_class.same_constant(other.known_class).
                 VirtualStateInfo::KnownClass { class_ptr } => match incoming_info {
                     VirtualStateInfo::Virtual { known_class, .. }
@@ -1437,7 +1449,7 @@ impl VirtualState {
                     {
                         Ok(())
                     }
-                    _ => Err(()),
+                    _ => Err(VirtualStatesCantMatch::default()),
                 },
                 // LEVEL_NONNULL / LEVEL_UNKNOWN(Ref) → pass, no guard.
                 _ => Ok(()),
@@ -1453,7 +1465,7 @@ impl VirtualState {
         // (virtualstate.py:522-524) — the expected-non-virtual, incoming-
         // virtual branch handled directly above. A Virtual target with a
         // non-virtual incoming therefore falls through to the structural
-        // match below and is rejected by its `_ => Err(())` arm.
+        // match below and is rejected by its `_ => Err(VirtualStatesCantMatch::default())` arm.
 
         // virtualstate.py:392-394 NotVirtualStateInfo._generate_guards:
         //
@@ -1481,7 +1493,7 @@ impl VirtualState {
             && let Some(expected_type) = expected_info.info_type()
             && !info_type_matches(expected_type, incoming_info)
         {
-            return Err(());
+            return Err(VirtualStatesCantMatch::default());
         }
 
         // virtualstate.py:96-101 try/except VirtualStatesCantMatch wrapper.
@@ -1495,7 +1507,7 @@ impl VirtualState {
         //         ...
         //         raise e
         //
-        // pyre returns Err(()) instead of raising; the wrapper below
+        // pyre returns Err(VirtualStatesCantMatch::default()) instead of raising; the wrapper below
         // populates `state.bad` on Err before propagating. Per-arm
         // pointer-identity keys (`expected as *const _`) match Python
         // object-identity dict keying.
@@ -1523,7 +1535,9 @@ impl VirtualState {
             // history.py:292).
             (VirtualStateInfo::Constant(a), VirtualStateInfo::Constant(b)) if a == b => Ok(()),
             // virtualstate.py:399 `raise VirtualStatesCantMatch("different constants")`.
-            (VirtualStateInfo::Constant(_), VirtualStateInfo::Constant(_)) => Err(()),
+            (VirtualStateInfo::Constant(_), VirtualStateInfo::Constant(_)) => {
+                Err(VirtualStatesCantMatch::default())
+            }
             (VirtualStateInfo::Constant(val), _) => {
                 // virtualstate.py:400-405: emit GUARD_VALUE only when the
                 // concrete runtime box already equals the target constant.
@@ -1541,7 +1555,7 @@ impl VirtualState {
                     });
                     Ok(())
                 } else {
-                    Err(())
+                    Err(VirtualStatesCantMatch::default())
                 }
             }
 
@@ -1568,15 +1582,15 @@ impl VirtualState {
             (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::Unknown(_)) => {
                 // virtualstate.py:600-606 LEVEL_UNKNOWN branch.
                 let Some(rb) = runtime_box else {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 };
                 // virtualstate.py:601 `cpu.cls_of_box(runtime_box)` reads the
                 // runtime box's own ref (getref_base), no _forwarded walk.
                 let Some(runtime_cls) = state.ctx.runtime_cls_of(rb) else {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 };
                 if runtime_cls != *class_ptr {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 state
                     .extra_guards
@@ -1590,15 +1604,15 @@ impl VirtualState {
             (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::NonNull) => {
                 // virtualstate.py:607-613 LEVEL_NONNULL branch.
                 let Some(rb) = runtime_box else {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 };
                 // virtualstate.py:608 `cpu.cls_of_box(runtime_box)` reads the
                 // runtime box's own ref (getref_base), no _forwarded walk.
                 let Some(runtime_cls) = state.ctx.runtime_cls_of(rb) else {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 };
                 if runtime_cls != *class_ptr {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 state.extra_guards.push(GuardRequirement::GuardClass {
                     arg_index: arg_idx,
@@ -1620,7 +1634,7 @@ impl VirtualState {
                 if const_cls.as_ref() == Some(class_ptr) {
                     Ok(())
                 } else {
-                    Err(())
+                    Err(VirtualStatesCantMatch::default())
                 }
             }
 
@@ -1628,7 +1642,11 @@ impl VirtualState {
             (VirtualStateInfo::NonNull, VirtualStateInfo::NonNull)
             | (VirtualStateInfo::NonNull, VirtualStateInfo::KnownClass { .. }) => Ok(()),
             (VirtualStateInfo::NonNull, VirtualStateInfo::Constant(Value::Ref(r))) => {
-                if !r.is_null() { Ok(()) } else { Err(()) }
+                if !r.is_null() {
+                    Ok(())
+                } else {
+                    Err(VirtualStatesCantMatch::default())
+                }
             }
             (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown(_)) => {
                 // virtualstate.py:578-584 _generate_guards_nonnull, LEVEL_UNKNOWN:
@@ -1647,7 +1665,7 @@ impl VirtualState {
                     });
                     Ok(())
                 } else {
-                    Err(())
+                    Err(VirtualStatesCantMatch::default())
                 }
             }
             // NonNull accepts any virtual (virtual is always nonnull).
@@ -1714,7 +1732,7 @@ impl VirtualState {
                         });
                         Ok(())
                     } else {
-                        Err(())
+                        Err(VirtualStatesCantMatch::default())
                     }
                 }
             }
@@ -1754,14 +1772,14 @@ impl VirtualState {
                 // fielddescrs `is` checks alone. Object identity (Arc::as_ptr)
                 // per virtualstate.py:159 `is not` shape.
                 if descr_identity(ed) != descr_identity(id) {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 // known_class.same_constant(other.known_class) is True only for
                 // two equal ConstInts; an absent (None) class on either side
                 // rejects, mirroring same_constant's isinstance gate.
                 match (ekc, ikc) {
                     (Some(c1), Some(c2)) if c1 == c2 => {}
-                    _ => return Err(()),
+                    _ => return Err(VirtualStatesCantMatch::default()),
                 }
                 // virtualstate.py:149-151: opinfo = getptrinfo(box) +
                 // assert opinfo.is_virtual() AND isinstance(opinfo,
@@ -1807,7 +1825,7 @@ impl VirtualState {
                 // `self.typedescr is other.typedescr`. Object identity
                 // (Arc::as_ptr).
                 if descr_identity(ed) != descr_identity(id) {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 // virtualstate.py:309-310 (VStructStateInfo path):
                 // `opinfo = getptrinfo(box)` + isinstance check, then read
@@ -1853,7 +1871,7 @@ impl VirtualState {
                 // virtualstate.py:244 `self.arraydescr is not other.arraydescr`.
                 // Object identity (Arc::as_ptr).
                 if descr_identity(ed) != descr_identity(id) || ei.len() != ii.len() {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 // virtualstate.py:251-256: `opinfo = getptrinfo(box)`,
                 // `fieldbox = opinfo._items[i]`, `fieldbox_runtime =
@@ -1930,10 +1948,10 @@ impl VirtualState {
                 // virtualstate.py:295 `self.arraydescr is not other.arraydescr`.
                 // Object identity (Arc::as_ptr).
                 if descr_identity(ed) != descr_identity(id) || eef.len() != ief.len() {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 if efd.len() != ifd.len() {
-                    return Err(());
+                    return Err(VirtualStatesCantMatch::default());
                 }
                 for (a, b) in efd.iter().zip(ifd.iter()) {
                     // virtualstate.py:303-305 VArrayStructStateInfo:
@@ -1945,7 +1963,7 @@ impl VirtualState {
                     // minted field descrs (descr.rs:506), so an index
                     // compare would collapse distinct descrs.
                     if descr_identity(a) != descr_identity(b) {
-                        return Err(());
+                        return Err(VirtualStatesCantMatch::default());
                     }
                 }
                 for (elem_idx, (e_fields, i_fields)) in eef.iter().zip(ief.iter()).enumerate() {
@@ -1994,7 +2012,7 @@ impl VirtualState {
             }
 
             // Fundamentally incompatible: VirtualStatesCantMatch.
-            _ => Err(()),
+            _ => Err(VirtualStatesCantMatch::default()),
         };
         if result.is_err() {
             // virtualstate.py:98: `state.bad[self] = state.bad[other] = None`.
@@ -2026,6 +2044,10 @@ impl VirtualState {
     /// `field_descrs` positionally, match by RPython `is`-identity
     /// (Arc::as_ptr via `descr_identity`), then resolve each
     /// (fielddescr, fieldstate) pair via the parent-local slot index.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn generate_guards_recurse_positional_fields(
         arg_idx: usize,
         expected_field_descrs: &[DescrRef],
@@ -2044,10 +2066,10 @@ impl VirtualState {
         // (virtualstate.py:163-164).
         element_idx: Option<usize>,
         state: &mut GenerateGuardState,
-    ) -> Result<(), ()> {
+    ) -> Result<(), VirtualStatesCantMatch> {
         // virtualstate.py:155: len check, raises "field descrs don't match".
         if expected_field_descrs.len() != incoming_field_descrs.len() {
-            return Err(());
+            return Err(VirtualStatesCantMatch::default());
         }
         for i in 0..expected_field_descrs.len() {
             // virtualstate.py:159: `other.fielddescrs[i] is not self.fielddescrs[i]`.
@@ -2060,7 +2082,7 @@ impl VirtualState {
             if descr_identity(&expected_field_descrs[i])
                 != descr_identity(&incoming_field_descrs[i])
             {
-                return Err(());
+                return Err(VirtualStatesCantMatch::default());
             }
             // virtualstate.py:162: `opinfo._fields[self.fielddescrs[i].get_index()]`.
             // `get_index()` is the parent-local field slot index, not
@@ -2130,7 +2152,7 @@ impl VirtualState {
             // None → VirtualStatesCantMatch.
             match (expected_child, incoming_child) {
                 (None, _) => continue,
-                (Some(_), None) => return Err(()),
+                (Some(_), None) => return Err(VirtualStatesCantMatch::default()),
                 (Some(e), Some(i)) => {
                     Self::generate_guards_for_entry_recursive(
                         arg_idx,

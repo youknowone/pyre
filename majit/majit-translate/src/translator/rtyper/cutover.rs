@@ -126,10 +126,10 @@ pub(crate) fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType
     }
 }
 
-/// Seed every cached callee PyGraph's blocks into the annotator's
-/// `annotated`/`all_blocks` so the rtyper's specialize walk reaches
-/// them.
-///
+// Seed every cached callee PyGraph's blocks into the annotator's
+// `annotated`/`all_blocks` so the rtyper's specialize walk reaches
+// them.
+
 // There is no callee-block pre-seed.  The orthodox path
 // `pycall -> recursivecall -> addpendingblock` from
 // description.py:283-305 / annrpython.py:315-336 is reachable
@@ -537,6 +537,10 @@ fn unpoison_failed_subject_callees(
 /// Used by both [`dual_gate_check_with_registry`] (via
 /// [`compare_real_against_legacy`]) and the [`dual_gate_check`]
 /// anchor-test helper to diff the real path against the legacy walker.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn project_value_to_var(
     value_to_var: &LegacyToTyped,
     constant_concretetypes: &HashMap<Variable, LowLevelType>,
@@ -569,6 +573,10 @@ fn project_value_to_var(
 /// successor representative live and rtyped. Repoint the projection map to a
 /// live representative after Phase B; this is identity reconciliation, not a
 /// kind backfill—the rtyper must have positively assigned the lltype.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn select_rtyped_representatives(
     value_to_var: &mut LegacyToTyped,
     candidates: &LegacyToTypedCandidates,
@@ -625,6 +633,10 @@ fn select_rtyped_representatives(
 /// dropped and would otherwise diff as a false `real=Unknown`.  Entry
 /// (`startblock`) inputargs are the function signature and are kept even
 /// when unread, matching `transform_dead_op_vars`'s signature exemption.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
     // Id-keyed lookup, not the dense `blocks[id.0]` projection — block ids
     // need not be index-aligned (`flowspace_adapter::reachable_block_ids`).
@@ -711,6 +723,10 @@ fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Vari
 /// 1-arg return arm emits `void_return` without coloring when the kind
 /// is void (`flatten.py:135-136`), which is exactly the sound dropped-unit
 /// case the refinement targets.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn colored_operand_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
     let mut operands = std::collections::HashSet::new();
     for block in &graph.blocks {
@@ -760,6 +776,10 @@ fn colored_operand_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variab
 /// divergence, since the value IS emitted through the surviving
 /// representative (same kind).  This mirrors the dead-phi exemption
 /// [`reachable_defined_vars`] already documents, for the dedup case.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn duplicate_inputarg_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
     let mut dups = std::collections::HashSet::new();
     for block in &graph.blocks {
@@ -793,6 +813,10 @@ fn duplicate_inputarg_vars(graph: &LegacyGraph) -> std::collections::HashSet<Var
 /// `ArrayWrite`/`FieldWrite` value operand — a written-back read is live and
 /// excluded here) and the exitswitch (Value / fused compare).  `Link.args`
 /// forwarding is deliberately NOT counted, matching `reachable_defined_vars`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn dead_op_result_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
     use crate::model::{BlockId, ExitSwitch, LinkArg};
 
@@ -979,6 +1003,10 @@ fn dead_op_result_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variabl
 /// graph types its own tag `Signed` and emits the switch from it.  This is the
 /// same rebuilt-identity artifact as [`duplicate_inputarg_vars`] /
 /// [`dead_op_result_vars`], scoped to the switch-feeding discriminant read.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn switch_discriminant_read_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
     use crate::model::OpKind;
     // Vars a block exitswitch reads (Value or the fused-compare args).
@@ -1028,6 +1056,10 @@ fn switch_discriminant_read_vars(graph: &LegacyGraph) -> std::collections::HashS
 /// `FieldWrite` keeps this from over-reaching a payload the arm actually
 /// consumes (a non-identity `match` that transforms the value flows the read
 /// into some other op, so it is excluded).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn repack_payload_read_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
     use crate::model::OpKind;
     // For each candidate FieldRead result, the field name it reads.
@@ -1136,6 +1168,10 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
 /// aligns the two paths by Variable identity, so the legacy kind is
 /// read straight off each Variable's `concretetype` cell.  Returns
 /// every divergence; the caller decides first-only versus all.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn collect_divergences(
     real_state: &HashMap<Variable, ConcreteType>,
     legacy_graph: &LegacyGraph,
@@ -1301,6 +1337,10 @@ fn collect_divergences(
     divergences
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn compare_real_against_legacy(
     value_to_var: &LegacyToTyped,
     constants: &HashMap<Variable, LowLevelType>,
@@ -2376,6 +2416,10 @@ fn valuetype_to_lltype(vt: &crate::model::ValueType) -> Option<LowLevelType> {
 /// `None` if any arg lacks a startblock `Input` op or an unprojectable
 /// ValueType, or the return token is unrecognised — the fn-const
 /// materialisation fallback then declines (fail-closed).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn declared_funcptr_type_from_legacy(
     legacy: &LegacyGraph,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
@@ -2402,10 +2446,10 @@ fn declared_funcptr_type_from_legacy(
 /// Each entry is wrapped through [`residual_return_shell`] +
 /// [`build_stub_pygraph_with_result_shell`]
 /// + [`PyreCallRegistry::register_callee`], so subsequent
-/// `flowspace_adapter::translate_op` lookups via
-/// `call_registry.lookup_with_leaf_match` find a registered entry and
-/// the dual gate no longer Skips with "not registered in
-/// PyreCallRegistry" for these paths.
+///   `flowspace_adapter::translate_op` lookups via
+///   `call_registry.lookup_with_leaf_match` find a registered entry and
+///   the dual gate no longer Skips with "not registered in
+///   PyreCallRegistry" for these paths.
 ///
 /// `specs` is typically the output of
 /// `front::mir::collect_unsafe_fn_stubs_from_llbc` (the Charon/LLBC-
@@ -3751,6 +3795,10 @@ fn run_phase_b_rtype_isolated(
 /// forces the `>X` result argcode, `assembler.rs:2226`) and panic in
 /// `lookup_coloring`.  A twin the rtyper *positively* typed `Signed` /
 /// `Float` is left untouched — that is a real kind conflict → Skip.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTyped) {
     use crate::translator::rtyper::lltypesystem::lltype::GCREF;
     for block in &legacy.blocks {

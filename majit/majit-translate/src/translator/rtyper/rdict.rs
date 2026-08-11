@@ -51,6 +51,10 @@ impl std::fmt::Debug for AbstractDictRepr {
 impl AbstractDictRepr {
     /// RPython `AbstractDictRepr.pickrepr` / `pickkeyrepr`
     /// (`rdict.py:37-44`).
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub fn pickrepr(
         rtyper: &Rc<RPythonTyper>,
         item_repr: Arc<dyn Repr>,
@@ -153,6 +157,10 @@ impl Repr for AbstractDictIteratorRepr {
 /// SomeOrderedDict`, so the `SomeOrderedDict.get_dict_repr` override
 /// (`rdict.py:32-34`) wins and the concrete repr is
 /// `lltypesystem.rordereddict.OrderedDictRepr`.
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+)]
 pub(crate) fn somedict_rtyper_makerepr(
     s_dict: &SomeDict,
     rtyper: &RPythonTyper,

@@ -105,8 +105,8 @@ pub struct RPythonAnnotator {
     ///   * `self.annotated[block] == False`: inputs bound, awaiting
     ///     `flowin()`.
     ///   * `self.annotated[block] == graph`: done.
-    /// Rust port models the two non-absent states as
-    /// `Option<GraphRef>`: `None = False`, `Some = graph`.
+    ///     Rust port models the two non-absent states as
+    ///     `Option<GraphRef>`: `None = False`, `Some = graph`.
     pub annotated: RefCell<IndexMap<BlockKey, Option<GraphRef>>>,
     /// Rust-side identity→BlockRef index. Upstream's `self.annotated`
     /// dict keys ARE the Python `Block` objects, so iterating the dict
@@ -146,6 +146,10 @@ pub struct RPythonAnnotator {
     /// RPython `self.blocked_blocks = {}` (annrpython.py:42).
     /// `{blocked_block: (graph, opindex)}`. `opindex == None` upstream
     /// → `None` here (block is blocked at entry, not mid-flow).
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub blocked_blocks: RefCell<IndexMap<BlockKey, (BlockRef, GraphRef, Option<usize>)>>,
     /// RPython `self.blocked_graphs = {}` (annrpython.py:44). Records
     /// graphs that have at least one blocked block; the `bool` value
@@ -1252,6 +1256,10 @@ impl RPythonAnnotator {
     /// (possibly empty) list of new variables — the annotation is
     /// either rebuilt against the renamed variables or stripped if
     /// no renaming entry exists.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn apply_renaming(
         &self,
         s_out: SomeValue,
@@ -1884,6 +1892,10 @@ impl RPythonAnnotator {
     /// they are *known* to carry when the link is taken — the caller
     /// extracts this from the source block's `exitswitch.annotation`
     /// `knowntypedata`.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn follow_link(
         &self,
         graph: &GraphRef,
@@ -1998,11 +2010,19 @@ impl RPythonAnnotator {
     ///     self.links_followed[link] = True
     ///     self.addpendingblock(graph, link.target, inputs_s)
     /// ```
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn follow_raise_link(&self, graph: &GraphRef, link: &LinkRef, s_last_exc_value: SomeValue) {
         use super::model::r#typeof;
 
         // Phase 1: mutate link's extravars in place (setbinding). We
         // need &mut access to the Variable slots inside the Link.
+        #[expect(
+            clippy::type_complexity,
+            reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+        )]
         let (target_rc, args_clone, v_last_exc_value_opt, v_last_exc_type_opt): (
             BlockRef,
             Vec<Option<Hlvalue>>,
@@ -2748,6 +2768,10 @@ impl RPythonAnnotator {
     ///    - Otherwise → knowntypedata-driven `follow_link` per exit.
     /// 3. Notify reflow (annrpython.py:574-576): any position subscribed
     ///    to this block's updates is re-queued.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     fn flowin(&self, graph: &GraphRef, block: &BlockRef) -> Result<(), FlowinError> {
         use super::super::flowspace::model::LinkRef;
         use super::model::{

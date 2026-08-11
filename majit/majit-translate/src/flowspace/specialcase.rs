@@ -81,6 +81,10 @@ fn builtin(name: &str) -> HostObject {
 
 /// RPython `rpython/flowspace/specialcase.py:4` — `SPECIAL_CASES = {}`
 /// populated by `register_flow_sc` / `redirect_function`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub(crate) static SPECIAL_CASES: LazyLock<HashMap<HostObject, SpecialCaseDispatch>> =
     LazyLock::new(|| {
         let mut cases: HashMap<HostObject, SpecialCaseDispatch> = HashMap::new();

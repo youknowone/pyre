@@ -1178,16 +1178,16 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
 ///    index (`d` argcode) without an explicit virtualizable-pointer
 ///    register — the canonical `setfield_vable_*` shape (`r` vable-ptr
 ///    + `d` FieldDescr) does not apply because the entire machine IS
-///    the vable, accessed via the implicit `self` of the proc-macro-
-///    generated handler functions.  Migration to canonical `*_vable_*`
-///    is feasible (see `epic_e_task94b_prereq_audit_2026_05_04.md`) but
-///    requires materializing `state` as a vable-ptr register +
-///    synthesizing FieldDescr/ArrayDescr/LenDescr objects for every
-///    state slot — a 4-6 session proc-macro refactor with non-obvious
-///    failure modes. Per CLAUDE.md, the proc-macro bridge is itself
-///    a permitted Rust adaptation, so quarantining the 6 keys is the
-///    orthodox shape: keep `wellknown_bh_insns()` strictly canonical,
-///    keep the proc-macro state addressing here.
+///      the vable, accessed via the implicit `self` of the proc-macro-
+///      generated handler functions.  Migration to canonical `*_vable_*`
+///      is feasible (see `epic_e_task94b_prereq_audit_2026_05_04.md`) but
+///      requires materializing `state` as a vable-ptr register +
+///      synthesizing FieldDescr/ArrayDescr/LenDescr objects for every
+///      state slot — a 4-6 session proc-macro refactor with non-obvious
+///      failure modes. Per CLAUDE.md, the proc-macro bridge is itself
+///      a permitted Rust adaptation, so quarantining the 6 keys is the
+///      orthodox shape: keep `wellknown_bh_insns()` strictly canonical,
+///      keep the proc-macro state addressing here.
 ///
 /// All extension keys retain their fixed `BC_*` byte values in the same
 /// number-space as the canonical opcodes; only the catalogue is split

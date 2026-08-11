@@ -239,6 +239,9 @@ impl SharedConstPool {
     // through a shared reference; `mut_from_ref` is the signature that escape
     // hatch has to have, and the contract above is what makes it sound.
     #[allow(clippy::mut_from_ref)]
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn as_mut_vec_for_gc(&self) -> &mut Vec<Const> {
         unsafe { &mut *self.values.get() }
     }
@@ -1308,7 +1311,7 @@ mod tests {
     #[test]
     fn test_value_types() {
         assert_eq!(Value::Int(42).get_type(), Type::Int);
-        assert_eq!(Value::Float(3.14).get_type(), Type::Float);
+        assert_eq!(Value::Float(std::f64::consts::PI).get_type(), Type::Float);
         assert_eq!(Value::Ref(GcRef::NULL).get_type(), Type::Ref);
         assert_eq!(Value::Void.get_type(), Type::Void);
     }
@@ -1425,8 +1428,8 @@ mod tests {
         assert_eq!(7u32.__green_repr(), (7i64, GreenType::Int));
         assert_eq!(true.__green_repr(), (1i64, GreenType::Int));
 
-        let (fv, ft) = 3.14f64.__green_repr();
-        assert_eq!(fv, 3.14f64.to_bits() as i64);
+        let (fv, ft) = std::f64::consts::PI.__green_repr();
+        assert_eq!(fv, std::f64::consts::PI.to_bits() as i64);
         assert_eq!(ft, GreenType::Float);
 
         let s: &'static str = "abc";

@@ -235,6 +235,10 @@ pub struct JitCodeBuilder {
     /// The macro-generated dispatch JitCode and embedded sub-JitCodes use
     /// this deferred path, then finalize against the driver-shared
     /// `Assembler` during install/prebuild.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pending_live_triples: Vec<(usize, Vec<u8>, Vec<u8>, Vec<u8>)>,
     /// Positions of leading-dummy `BC_LIVE` slots
     /// (`live_placeholder` without an explicit triple) whose 2-byte offset
@@ -2698,6 +2702,10 @@ impl JitCodeBuilder {
     /// helper does not assume that: a future jitdriver with float
     /// greens or red ints flows through the same code path with
     /// non-empty lists.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn jit_merge_point(
         &mut self,
         jdindex: i64,
@@ -3182,6 +3190,10 @@ impl JitCodeBuilder {
         self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, args_f, None, None, None);
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn inline_call_grouped(
         &mut self,
         sub_jitcode_idx: u16,
@@ -3390,8 +3402,8 @@ impl JitCodeBuilder {
     ///   - any float arg → `opcode_irf_v` (`iIRFd`)
     ///   - else any int arg → `opcode_ir_v` (`iIRd`)
     ///   - else → `opcode_r_v` (`iRd`)
-    /// (R variant cannot hold int / float bytes — the handler reads only
-    /// the funcptr_reg byte + the R list + the descr.)
+    ///     (R variant cannot hold int / float bytes — the handler reads only
+    ///     the funcptr_reg byte + the R list + the descr.)
     fn emit_canonical_call_void(
         &mut self,
         opcodes: (u8, u8, u8),
@@ -3591,7 +3603,7 @@ impl JitCodeBuilder {
         helper_name: &'static str,
     ) {
         let target = match self.descrs.get(fn_ptr_idx as usize) {
-            Some(RuntimeBhDescr::Call(target)) => *target,
+            Some(RuntimeBhDescr::Call(target)) => *target.as_ref(),
             other => panic!(
                 "{helper_name}: descrs[{fn_ptr_idx}] expected \
                  RuntimeBhDescr::Call, got {other:?}"
@@ -3670,6 +3682,10 @@ impl JitCodeBuilder {
     /// and records the pyre trace/concrete pointer bridge against the
     /// emitted `d` operand.
     #[allow(dead_code)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn emit_canonical_call_typed_via_target(
         &mut self,
         opcodes: (u8, u8, u8),
@@ -3682,7 +3698,7 @@ impl JitCodeBuilder {
         helper_name: &'static str,
     ) {
         let target = match self.descrs.get(fn_ptr_idx as usize) {
-            Some(RuntimeBhDescr::Call(target)) => *target,
+            Some(RuntimeBhDescr::Call(target)) => *target.as_ref(),
             other => panic!(
                 "{helper_name}: descrs[{fn_ptr_idx}] expected \
                  RuntimeBhDescr::Call, got {other:?}"
@@ -3899,7 +3915,7 @@ impl JitCodeBuilder {
         effect_info: majit_ir::descr::EffectInfo,
     ) {
         let target = match self.descrs.get(fn_ptr_idx as usize) {
-            Some(RuntimeBhDescr::Call(target)) => *target,
+            Some(RuntimeBhDescr::Call(target)) => *target.as_ref(),
             other => panic!(
                 "residual_call_float_canonical_via_target: descrs[{fn_ptr_idx}] \
                  expected RuntimeBhDescr::Call, got {other:?}"
@@ -4953,12 +4969,12 @@ impl JitCodeBuilder {
         let target = JitCallTarget::with_save_err(trace_ptr, concrete_ptr, slot, save_err);
         for (idx, entry) in self.descrs.iter().enumerate() {
             if let RuntimeBhDescr::Call(existing) = entry
-                && *existing == target
+                && existing.as_ref() == &target
             {
                 return idx as u16;
             }
         }
-        self.push_descr_entry(RuntimeBhDescr::Call(target))
+        self.push_descr_entry(RuntimeBhDescr::Call(Box::new(target)))
     }
 
     pub fn add_call_assembler_target_number(
@@ -5075,17 +5091,17 @@ impl JitCodeBuilder {
                 return idx as u16;
             }
         }
-        self.push_descr_entry(RuntimeBhDescr::Descr(descr))
+        self.push_descr_entry(RuntimeBhDescr::Descr(Box::new(descr)))
     }
 
     fn add_switch_descr(&mut self, mut const_keys_in_order: Vec<i64>) -> u16 {
         const_keys_in_order.sort();
         // RPython creates one SwitchDictDescr object per switch site
         // (`flatten.py:282-285`), so do not deduplicate.
-        self.push_descr_entry(RuntimeBhDescr::Descr(CanonicalBhDescr::Switch {
+        self.push_descr_entry(RuntimeBhDescr::Descr(Box::new(CanonicalBhDescr::Switch {
             dict: std::collections::HashMap::new(),
             const_keys_in_order,
-        }))
+        })))
     }
 
     pub fn try_finish(mut self) -> Option<JitCode> {
@@ -5655,7 +5671,10 @@ impl JitCodeBuilder {
                 })
                 .collect();
             match self.descrs.get_mut(descr_idx as usize) {
-                Some(RuntimeBhDescr::Descr(CanonicalBhDescr::Switch { dict: slot, .. })) => {
+                Some(RuntimeBhDescr::Descr(descr)) => {
+                    let CanonicalBhDescr::Switch { dict: slot, .. } = descr.as_mut() else {
+                        panic!("pending switch descr {descr_idx} is not Switch: {descr:?}");
+                    };
                     *slot = dict;
                 }
                 other => panic!("pending switch descr {descr_idx} is not Switch: {other:?}"),
@@ -5713,13 +5732,16 @@ impl JitCodeBuilder {
     /// `heaptracker.py:68-69` mints no descr for at all.
     fn patch_field_descr_parents(&mut self) {
         for entry in &mut self.descrs {
-            let RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+            let RuntimeBhDescr::Descr(descr) = entry else {
+                continue;
+            };
+            let CanonicalBhDescr::Field {
                 offset,
                 index_in_parent,
                 parent,
                 name,
                 ..
-            }) = entry
+            } = descr.as_mut()
             else {
                 continue;
             };
@@ -5777,13 +5799,16 @@ impl JitCodeBuilder {
     /// [`patch_field_descr_parents`]: Self::patch_field_descr_parents
     fn field_descr_position_disagreement(&self) -> Option<String> {
         for entry in &self.descrs {
-            let RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+            let RuntimeBhDescr::Descr(descr) = entry else {
+                continue;
+            };
+            let CanonicalBhDescr::Field {
                 offset,
                 index_in_parent,
                 parent: Some(p),
                 name,
                 ..
-            }) = entry
+            } = descr.as_ref()
             else {
                 continue;
             };
@@ -6020,6 +6045,10 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
 /// fills indices 0..=255 and is legal).  RPython jitcode register indices
 /// are `chr(...)`-encoded `u8`s (`assembler.py:241`, `liveness.py:148-159`);
 /// a 257th slot would overflow that encoding.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 pub fn live_slots_for_state_field_jit(
     num_scalars: usize,
     array_lens: &[usize],
@@ -6143,8 +6172,8 @@ mod tests {
             .exec
             .descrs
             .iter()
-            .filter_map(|entry| match entry {
-                RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+            .filter_map(|entry| match entry.as_bh_descr() {
+                Some(CanonicalBhDescr::Field {
                     offset,
                     index_in_parent,
                     parent,
@@ -6217,8 +6246,8 @@ mod tests {
                 .exec
                 .descrs
                 .iter()
-                .find_map(|entry| match entry {
-                    RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+                .find_map(|entry| match entry.as_bh_descr() {
+                    Some(CanonicalBhDescr::Field {
                         index_in_parent,
                         parent,
                         name,
@@ -6305,8 +6334,8 @@ mod tests {
         let opcode = jitcode::insn_byte("getfield_vable_r/rd>r");
         assert_eq!(jitcode.code, vec![opcode, 1, 0, 0, 2]);
         assert!(matches!(
-            &jitcode.exec.descrs[0],
-            RuntimeBhDescr::Descr(CanonicalBhDescr::VableField { index: 3 })
+            jitcode.exec.descrs[0].as_bh_descr(),
+            Some(CanonicalBhDescr::VableField { index: 3 })
         ));
         assert_eq!(
             jitcode
@@ -6327,8 +6356,8 @@ mod tests {
         // [opcode, descr_idx_lo, descr_idx_hi, dest]
         assert_eq!(jitcode.code, vec![opcode, 0, 0, 2]);
         assert!(matches!(
-            &jitcode.exec.descrs[0],
-            RuntimeBhDescr::Descr(CanonicalBhDescr::Size {
+            jitcode.exec.descrs[0].as_bh_descr(),
+            Some(CanonicalBhDescr::Size {
                 size: 16,
                 type_id: 0xAB,
                 vtable: 0x1234,
@@ -6353,8 +6382,8 @@ mod tests {
         let opcode = jitcode::insn_byte("new/d>r");
         assert_eq!(jitcode.code, vec![opcode, 0, 0, 3]);
         assert!(matches!(
-            &jitcode.exec.descrs[0],
-            RuntimeBhDescr::Descr(CanonicalBhDescr::Size {
+            jitcode.exec.descrs[0].as_bh_descr(),
+            Some(CanonicalBhDescr::Size {
                 size: 16,
                 type_id: 0xCD,
                 vtable: 0,
@@ -6420,12 +6449,12 @@ mod tests {
         let opcode = jitcode::insn_byte("getarrayitem_vable_r/ridd>r");
         assert_eq!(jitcode.code, vec![opcode, 1, 2, 0, 0, 1, 0, 4]);
         assert!(matches!(
-            &jitcode.exec.descrs[0],
-            RuntimeBhDescr::Descr(CanonicalBhDescr::VableArray { index: 7 })
+            jitcode.exec.descrs[0].as_bh_descr(),
+            Some(CanonicalBhDescr::VableArray { index: 7 })
         ));
         assert!(matches!(
-            &jitcode.exec.descrs[1],
-            RuntimeBhDescr::Descr(CanonicalBhDescr::Array {
+            jitcode.exec.descrs[1].as_bh_descr(),
+            Some(CanonicalBhDescr::Array {
                 item_type: majit_ir::value::Type::Ref,
                 ..
             })
@@ -7082,10 +7111,10 @@ mod tests {
     fn fill_descr_pool(entries: usize) -> JitCodeBuilder {
         let mut builder = JitCodeBuilder::new();
         for _ in 0..entries {
-            builder.push_descr_entry(RuntimeBhDescr::Call(JitCallTarget::new(
+            builder.push_descr_entry(RuntimeBhDescr::Call(Box::new(JitCallTarget::new(
                 std::ptr::null(),
                 std::ptr::null(),
-            )));
+            ))));
         }
         builder
     }

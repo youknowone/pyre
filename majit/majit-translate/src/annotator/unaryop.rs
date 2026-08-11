@@ -331,11 +331,10 @@ fn known_type_issubclass(cls1: KnownType, cls2: KnownType) -> bool {
     if cls1 == cls2 {
         return true;
     }
-    match (cls1, cls2) {
-        (KnownType::Bool, KnownType::Int) => true,
-        (_, KnownType::Object) => true,
-        _ => false,
-    }
+    matches!(
+        (cls1, cls2),
+        (KnownType::Bool, KnownType::Int) | (_, KnownType::Object)
+    )
 }
 
 fn host_issubclass(
@@ -391,10 +390,9 @@ pub fn s_isinstance(
             if !s_obj.can_be_none() {
                 r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
             }
-        } else if !host_issubclass(bk, typ, &obj_type) {
-            r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
-        } else if s_obj.knowntype() == KnownType::Int
-            && known_type_host(KnownType::Bool).as_ref() == Some(typ)
+        } else if !host_issubclass(bk, typ, &obj_type)
+            || (s_obj.knowntype() == KnownType::Int
+                && known_type_host(KnownType::Bool).as_ref() == Some(typ))
         {
             r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
         }
@@ -1191,8 +1189,10 @@ fn init_somebool_overrides(
     );
     // unaryop.py:320-330 — abs / abs_ovf / pos / int: SomeInteger(nonneg=True).
     let nonneg_int = |_ann: &RPythonAnnotator, _hl: &HLOperation| -> SomeValue {
-        let mut i = SomeInteger::default();
-        i.nonneg = true;
+        let i = SomeInteger {
+            nonneg: true,
+            ..SomeInteger::default()
+        };
         SomeValue::Integer(i)
     };
     register(
@@ -4419,9 +4419,7 @@ pub fn transform_varargs(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec
     let data_v: Vec<Hlvalue> = args[2..].to_vec();
     let callspec = CallSpec::fromshape(&shape, data_v);
     // upstream: `v_vararg = callspec.w_stararg; if callspec.w_stararg: ...`.
-    let Some(v_vararg) = callspec.w_stararg.clone() else {
-        return None;
-    };
+    let v_vararg = callspec.w_stararg.clone()?;
     // upstream: `s_vararg = annotator.annotation(v_vararg)`.
     let s_vararg = ann.annotation(&v_vararg)?;
     // upstream: `if not isinstance(s_vararg, SomeTuple): raise AnnotatorError`.
@@ -4519,9 +4517,7 @@ pub(crate) fn decode_call_shape(
     let shape_keys: Vec<String> = match &items[1] {
         ConstValue::Tuple(keys) => keys
             .iter()
-            .map(|k| match k {
-                value => value.as_text().map(str::to_owned),
-            })
+            .map(|value| value.as_text().map(str::to_owned))
             .collect::<Option<Vec<_>>>()?,
         _ => return None,
     };
@@ -4760,7 +4756,6 @@ fn init_instance_single_transform(
 /// "mixed property/non-property" case falls through with no rewrite).
 /// `setattr` is the setter analogue — three-arg `simple_call(setter,
 /// v_value)` instead.
-
 #[allow(non_snake_case)]
 pub fn getattr_SomeInstance(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     let v_obj = args[0].clone();

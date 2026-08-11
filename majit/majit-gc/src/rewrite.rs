@@ -2061,6 +2061,10 @@ impl GcRewriterImpl {
     /// When `None`, the lowered op is emitted directly — used for
     /// internal stores synthesised by the rewriter that do not replace an
     /// input op (e.g. tid initialisation for fresh allocations).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameters mirror rewrite.py's GC store descriptor, address calculation, value, and replacement channels; grouping them would obscure opcode parity"
+    )]
     fn emit_gc_store_or_indexed(
         &self,
         original: Option<&Op>,
@@ -2202,6 +2206,10 @@ impl GcRewriterImpl {
     /// `sign` is encoded into the emitted `itemsize` arg by negating it
     /// (rewrite.py:192-194) — the backend decodes the sign back out of
     /// the sign bit on the nsize operand.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameters mirror rewrite.py's GC load descriptor, address calculation, sign, and replacement channels; grouping them would obscure opcode parity"
+    )]
     fn emit_gc_load_or_indexed(
         &self,
         original: &Op,

@@ -51,6 +51,10 @@ pub struct Loop {
 /// (an inner loop sits inside loops with fewer constants), breaking ties
 /// toward fewer blocks; the head is the first `Bool`-switching two-exit
 /// block closest to the start block.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn find_inner_loops(
     graph: &FunctionGraph,
     check_exitswitch_type: Option<&ConcretetypePlaceholder>,
@@ -103,8 +107,8 @@ pub fn find_inner_loops(
     for cycle in &cycles {
         // find the headblock (`:65-78`).
         let mut candidates: Vec<(usize, usize)> = Vec::new();
-        for i in 0..cycle.len() {
-            let block = &cycle[i].source.0;
+        for (i, vertex) in cycle.iter().enumerate() {
+            let block = &vertex.source.0;
             let b = block.borrow();
             // `if isinstance(v, Variable) and len(block.exits) == 2:`
             if let Some(Hlvalue::Variable(v)) = &b.exitswitch {

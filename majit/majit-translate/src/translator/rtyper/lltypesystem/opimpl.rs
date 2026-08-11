@@ -2052,10 +2052,22 @@ mod tests {
     #[test]
     fn wide_int_casts_are_bit_pattern_identity_on_64bit_carrier() {
         let v = i(0x1234_5678);
-        assert_eq!(op_cast_int_to_uint(&[v.clone()]), Some(v.clone()));
-        assert_eq!(op_cast_uint_to_int(&[v.clone()]), Some(v.clone()));
-        assert_eq!(op_cast_int_to_longlong(&[v.clone()]), Some(v.clone()));
-        assert_eq!(op_truncate_longlong_to_int(&[v.clone()]), Some(v.clone()));
+        assert_eq!(
+            op_cast_int_to_uint(std::slice::from_ref(&v)),
+            Some(v.clone())
+        );
+        assert_eq!(
+            op_cast_uint_to_int(std::slice::from_ref(&v)),
+            Some(v.clone())
+        );
+        assert_eq!(
+            op_cast_int_to_longlong(std::slice::from_ref(&v)),
+            Some(v.clone())
+        );
+        assert_eq!(
+            op_truncate_longlong_to_int(std::slice::from_ref(&v)),
+            Some(v.clone())
+        );
         assert_eq!(op_cast_bool_to_uint(&[b(true)]), Some(i(1)));
     }
 

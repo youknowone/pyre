@@ -3051,6 +3051,10 @@ impl Variable {
     /// Upstream mapping values are polymorphic (Variable or Constant);
     /// the Rust port routes through `Hlvalue` so Variable → Constant
     /// substitutions work too.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> Hlvalue {
         mapping
             .get(self)
@@ -3158,6 +3162,10 @@ impl Constant {
     }
 
     /// RPython `Constant.replace(mapping)` — Constants never rename.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn replace(&self, _mapping: &HashMap<Variable, Hlvalue>) -> Hlvalue {
         Hlvalue::Constant(self.clone())
     }
@@ -3601,6 +3609,10 @@ impl Hlvalue {
     /// RPython `.replace(mapping)` dispatch — matches whichever
     /// subclass `Variable.replace` / `Constant.replace` method the
     /// cell carries.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> Hlvalue {
         match self {
             Hlvalue::Variable(v) => v.replace(mapping),
@@ -3679,6 +3691,10 @@ impl SpaceOperation {
     ///
     /// Returns a fresh SpaceOperation with the same opname/offset and
     /// every arg/result remapped through `mapping`.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> SpaceOperation {
         let newargs: Vec<Hlvalue> = self.args.iter().map(|a| a.replace(mapping)).collect();
         let newresult = self.result.replace(mapping);
@@ -3902,6 +3918,10 @@ impl Link {
     }
 
     /// RPython `Link.replace(mapping)`.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> Link {
         self.copy(|v| v.replace(mapping))
     }
@@ -4087,6 +4107,10 @@ impl Block {
     }
 
     /// RPython `Block.renamevariables(mapping)`.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn renamevariables(&mut self, mapping: &HashMap<Variable, Hlvalue>) {
         self.inputargs = self.inputargs.iter().map(|a| a.replace(mapping)).collect();
         self.operations = self
@@ -4169,6 +4193,10 @@ impl BlockRefExt for BlockRef {
 /// `Debug`. Equality/identity of `GraphFunc` is `id`-based and ignores
 /// this field.
 #[derive(Clone)]
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub struct HostCall(pub Arc<dyn Fn(&[ConstValue]) -> Result<ConstValue, String> + Send + Sync>);
 
 impl std::fmt::Debug for HostCall {
@@ -4809,6 +4837,10 @@ impl std::hash::Hash for LinkKey {
 /// by a fresh Variable (new identity) unless `shallowvars` is true,
 /// in which case the original Variable is reused. When `shallow` is
 /// true, operation lists are also kept as-is.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn copygraph(
     graph: &FunctionGraph,
     shallow: bool,
@@ -5021,6 +5053,10 @@ fn is_valid_switch_exitcase(exitcase: &Hlvalue) -> bool {
 ///
 /// Sanity-check a flow graph. Panics with an assertion failure on any
 /// violation, matching upstream semantics (RPython: `AssertionError`).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn checkgraph(graph: &FunctionGraph) {
     for (block, nbargs) in [(&graph.returnblock, 1usize), (&graph.exceptblock, 2usize)] {
         let b = block.borrow();

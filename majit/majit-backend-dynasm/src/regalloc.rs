@@ -37,7 +37,7 @@ const DEFAULT_IMM_SIZE: i64 = 4096;
 
 /// aarch64/regalloc.py:161 check_imm_arg
 fn check_imm_arg(arg: i64) -> bool {
-    arg >= 0 && arg < DEFAULT_IMM_SIZE
+    (0..DEFAULT_IMM_SIZE).contains(&arg)
 }
 
 // Large-immediate scratch register:
@@ -143,13 +143,12 @@ impl Lifetime {
     pub fn fixed_register(&mut self, position: i32, reg: RegLoc) -> i32 {
         debug_assert!(self.definition_pos <= position && position <= self.last_usage);
         let res;
-        if self.fixed_positions.is_none() {
-            self.fixed_positions = Some(Vec::new());
-            res = self.definition_pos_shared();
-        } else {
-            let positions = self.fixed_positions.as_ref().unwrap();
+        if let Some(positions) = self.fixed_positions.as_ref() {
             debug_assert!(position > positions.last().unwrap().0);
             res = positions.last().unwrap().0;
+        } else {
+            self.fixed_positions = Some(Vec::new());
+            res = self.definition_pos_shared();
         }
         self.fixed_positions.as_mut().unwrap().push((position, reg));
         res
@@ -164,10 +163,10 @@ impl Lifetime {
                 }
             }
         }
-        if let Some(share_opref) = self.share_with {
-            if let Some(share_lt) = longevity.get(share_opref) {
-                return share_lt.find_fixed_register(opindex, longevity);
-            }
+        if let Some(share_opref) = self.share_with
+            && let Some(share_lt) = longevity.get(share_opref)
+        {
+            return share_lt.find_fixed_register(opindex, longevity);
         }
         None
     }
@@ -265,6 +264,12 @@ pub struct LifetimeManager {
     lifetimes: indexmap::IndexMap<OpRef, Lifetime, FxBuildHasher>,
     /// regalloc.py:1064 maps register → FixedRegisterPositions
     pub fixed_register_use: IndexMap<RegLoc, FixedRegisterPositions>,
+}
+
+impl Default for LifetimeManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LifetimeManager {
@@ -394,10 +399,10 @@ impl LifetimeManager {
         let longevity_var = &self.lifetimes[&v];
         // check whether there is a fixed register and whether it's free
         let fixed_reg = longevity_var.find_fixed_register(position, self);
-        if let Some(reg) = fixed_reg {
-            if free_regs.contains(&reg) {
-                return Some(reg);
-            }
+        if let Some(reg) = fixed_reg
+            && free_regs.contains(&reg)
+        {
+            return Some(reg);
         }
         // try to find a register that's free for the whole lifetime of v
         let loc = self.free_reg_whole_lifetime(position, v, free_regs);
@@ -454,17 +459,17 @@ pub fn compute_vars_longevity(inputargs: &[InputArg], operations: &[Op]) -> Life
         }
 
         // regalloc.py:1202-1208 guard failargs
-        if opnum.is_guard() {
-            if let Some(fail_args) = op.getfailargs() {
-                for arg in fail_args.iter() {
-                    if arg.is_none() {
-                        continue; // hole
-                    }
-                    debug_assert!(!arg.is_constant());
-                    let arg = arg.to_opref();
-                    if !longevity.contains(arg) {
-                        longevity.set(arg, Lifetime::new(UNDEF_POS, i));
-                    }
+        if opnum.is_guard()
+            && let Some(fail_args) = op.getfailargs()
+        {
+            for arg in fail_args.iter() {
+                if arg.is_none() {
+                    continue; // hole
+                }
+                debug_assert!(!arg.is_constant());
+                let arg = arg.to_opref();
+                if !longevity.contains(arg) {
+                    longevity.set(arg, Lifetime::new(UNDEF_POS, i));
                 }
             }
         }
@@ -910,12 +915,11 @@ impl RegisterManager {
             self.reg_bindings_list[old_index as usize] = None;
         }
         // Clear new slot's old occupant's register index.
-        if let Some(old_v) = self.reg_bindings_list[new_index] {
-            if old_v != v {
-                if let Some(lt) = longevity.get_mut(old_v) {
-                    lt.current_register_index = -1;
-                }
-            }
+        if let Some(old_v) = self.reg_bindings_list[new_index]
+            && old_v != v
+            && let Some(lt) = longevity.get_mut(old_v)
+        {
+            lt.current_register_index = -1;
         }
         // regalloc.py:287-288: set new binding.
         let lifetime = longevity
@@ -1082,10 +1086,10 @@ impl RegisterManager {
         if need_lower_byte {
             // regalloc.py:487-501
             let loc = self.reg_bindings_get(v, longevity);
-            if let Some(reg) = loc {
-                if !self.no_lower_byte_regs.contains(&reg) {
-                    return Some(reg);
-                }
+            if let Some(reg) = loc
+                && !self.no_lower_byte_regs.contains(&reg)
+            {
+                return Some(reg);
             }
             let free_regs: Vec<RegLoc> = self
                 .free_regs
@@ -1094,9 +1098,7 @@ impl RegisterManager {
                 .copied()
                 .collect();
             let newloc = longevity.try_pick_free_reg(self.position, v, &free_regs);
-            if newloc.is_none() {
-                return None;
-            }
+            newloc?;
             let newloc = newloc.unwrap();
             self.free_regs.retain(|r| *r != newloc);
             if let Some(old) = loc {
@@ -1606,10 +1608,11 @@ impl RegisterManager {
         // directly. `rgc.can_move` parity via `majit_gc::can_move`; the
         // `we_are_translated()` clause is subsumed because `can_move` is
         // false when no moving GC is active.
-        if let Some(g) = v.as_const_ptr() {
-            if !g.is_null() && majit_gc::can_move(g) {
-                panic!("convert_to_imm: ConstPtr needs special care");
-            }
+        if let Some(g) = v.as_const_ptr()
+            && !g.is_null()
+            && majit_gc::can_move(g)
+        {
+            panic!("convert_to_imm: ConstPtr needs special care");
         }
         // history.py:227/268/314 — inline-Const variants carry the value
         // directly; legacy pool-indexed Const variants look up the i64
@@ -1917,10 +1920,10 @@ impl<'a> RegAlloc<'a> {
         // x86/regalloc.py:1274 descr._ll_loop_code != 0:
         //   target LABEL already compiled (bridge/external jump) → apply
         //   hints now. else: same-loop, wait for consider_label.
-        if let Some(target) = descr.as_loop_target_descr() {
-            if target.ll_loop_code() != 0 {
-                self._compute_hint_locations_from_descr(&*target);
-            }
+        if let Some(target) = descr.as_loop_target_descr()
+            && target.ll_loop_code() != 0
+        {
+            self._compute_hint_locations_from_descr(target);
         }
     }
 
@@ -2555,10 +2558,12 @@ impl<'a> RegAlloc<'a> {
                 self.possibly_free_var(arg, tp);
             }
         }
-        if let Some(dst) = def {
-            if !dst.is_none() && !dst.is_constant() && def_tp != Type::Void {
-                self.possibly_free_var(dst, def_tp);
-            }
+        if let Some(dst) = def
+            && !dst.is_none()
+            && !dst.is_constant()
+            && def_tp != Type::Void
+        {
+            self.possibly_free_var(dst, def_tp);
         }
     }
 
@@ -3551,7 +3556,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_int_lshift(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         #[cfg(target_arch = "aarch64")]
         {
-            return self.consider_binop(op, i, output);
+            self.consider_binop(op, i, output)
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -3597,7 +3602,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_uint_mul_high(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         #[cfg(target_arch = "aarch64")]
         {
-            return self.consider_binop_symm(op, i, output);
+            self.consider_binop_symm(op, i, output)
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -3687,10 +3692,10 @@ impl<'a> RegAlloc<'a> {
         {
             return false;
         }
-        if let Some(lt) = self.longevity.get(result) {
-            if lt.last_usage > (i as i32) + 1 {
-                return false;
-            }
+        if let Some(lt) = self.longevity.get(result)
+            && lt.last_usage > (i as i32) + 1
+        {
+            return false;
         }
         // history.py:251 `Const.same_constant` — variant-aware equality
         // (`OpRef`'s derived `PartialEq`) handles inline-Const fail args /
@@ -3700,10 +3705,10 @@ impl<'a> RegAlloc<'a> {
         // the correct semantics: a constant fail-arg can never alias a
         // body op result.
         if opnum != OpCode::CondCallN {
-            if let Some(fail_args) = next_op.getfailargs() {
-                if fail_args.iter().any(|a| a.to_opref() == result) {
-                    return false;
-                }
+            if let Some(fail_args) = next_op.getfailargs()
+                && fail_args.iter().any(|a| a.to_opref() == result)
+            {
+                return false;
             }
         } else if next_op
             .getarglist()
@@ -5752,9 +5757,8 @@ impl<'a> RegAlloc<'a> {
             let arg = arg.to_opref();
             let tp = self.tp(arg);
             let loc = self.loc(arg, tp);
-            match loc {
-                Loc::Reg(_) => self.fm.mark_as_free(arg, tp, &mut self.longevity),
-                _ => {}
+            if let Loc::Reg(_) = loc {
+                self.fm.mark_as_free(arg, tp, &mut self.longevity)
             }
             locs.push(loc);
         }
@@ -5777,35 +5781,34 @@ impl<'a> RegAlloc<'a> {
         //     intentionally not emitted on aarch64
         //
         // Mirror the per-arch difference exactly via #[cfg].
-        if let Some(label_id) = op.getdescr().as_ref().map(descr_identity) {
-            if self
+        if let Some(label_id) = op.getdescr().as_ref().map(descr_identity)
+            && self
                 .final_jump_args
                 .as_ref()
                 .is_some_and(|(jump_id, _)| *jump_id == label_id)
-            {
-                let jump_args = self.final_jump_args.as_ref().unwrap().1.clone();
-                #[cfg(target_arch = "x86_64")]
-                let position = self.final_jump_op_position;
-                #[cfg(target_arch = "x86_64")]
-                let mut hinted: Vec<OpRef> = Vec::new();
-                for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
-                    if iarg.is_constant() {
-                        continue;
+        {
+            let jump_args = self.final_jump_args.as_ref().unwrap().1.clone();
+            #[cfg(target_arch = "x86_64")]
+            let position = self.final_jump_op_position;
+            #[cfg(target_arch = "x86_64")]
+            let mut hinted: Vec<OpRef> = Vec::new();
+            for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
+                if iarg.is_constant() {
+                    continue;
+                }
+                match *target_loc {
+                    Loc::Frame(frame_loc) => {
+                        self.fm
+                            .add_frame_pos_hint(*iarg, frame_loc, &mut self.longevity);
                     }
-                    match *target_loc {
-                        Loc::Frame(frame_loc) => {
-                            self.fm
-                                .add_frame_pos_hint(*iarg, frame_loc, &mut self.longevity);
+                    #[cfg(target_arch = "x86_64")]
+                    Loc::Reg(r) => {
+                        if !hinted.contains(iarg) {
+                            hinted.push(*iarg);
+                            self.longevity.fixed_register(position, r, Some(*iarg));
                         }
-                        #[cfg(target_arch = "x86_64")]
-                        Loc::Reg(r) => {
-                            if !hinted.contains(iarg) {
-                                hinted.push(*iarg);
-                                self.longevity.fixed_register(position, r, Some(*iarg));
-                            }
-                        }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
@@ -5835,42 +5838,40 @@ impl<'a> RegAlloc<'a> {
         for &arg in args {
             let tp = self.tp(arg);
             let loc = self.loc(arg, tp);
-            match loc {
-                Loc::Reg(_) => self.fm.mark_as_free(arg, tp, &mut self.longevity),
-                _ => {}
+            if let Loc::Reg(_) = loc {
+                self.fm.mark_as_free(arg, tp, &mut self.longevity)
             }
             locs.push(loc);
         }
 
-        if let Some(label_id) = op.getdescr().as_ref().map(descr_identity) {
-            if self
+        if let Some(label_id) = op.getdescr().as_ref().map(descr_identity)
+            && self
                 .final_jump_args
                 .as_ref()
                 .is_some_and(|(jump_id, _)| *jump_id == label_id)
-            {
-                let jump_args = self.final_jump_args.as_ref().unwrap().1.clone();
-                #[cfg(target_arch = "x86_64")]
-                let position = self.final_jump_op_position;
-                #[cfg(target_arch = "x86_64")]
-                let mut hinted: Vec<OpRef> = Vec::new();
-                for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
-                    if iarg.is_constant() {
-                        continue;
+        {
+            let jump_args = self.final_jump_args.as_ref().unwrap().1.clone();
+            #[cfg(target_arch = "x86_64")]
+            let position = self.final_jump_op_position;
+            #[cfg(target_arch = "x86_64")]
+            let mut hinted: Vec<OpRef> = Vec::new();
+            for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
+                if iarg.is_constant() {
+                    continue;
+                }
+                match *target_loc {
+                    Loc::Frame(frame_loc) => {
+                        self.fm
+                            .add_frame_pos_hint(*iarg, frame_loc, &mut self.longevity);
                     }
-                    match *target_loc {
-                        Loc::Frame(frame_loc) => {
-                            self.fm
-                                .add_frame_pos_hint(*iarg, frame_loc, &mut self.longevity);
+                    #[cfg(target_arch = "x86_64")]
+                    Loc::Reg(r) => {
+                        if !hinted.contains(iarg) {
+                            hinted.push(*iarg);
+                            self.longevity.fixed_register(position, r, Some(*iarg));
                         }
-                        #[cfg(target_arch = "x86_64")]
-                        Loc::Reg(r) => {
-                            if !hinted.contains(iarg) {
-                                hinted.push(*iarg);
-                                self.longevity.fixed_register(position, r, Some(*iarg));
-                            }
-                        }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
@@ -6355,10 +6356,9 @@ mod tests {
             if let RegAllocOp::PerformGuard {
                 op_index, faillocs, ..
             } = ra_op
+                && *op_index == 2
             {
-                if *op_index == 2 {
-                    return Some(faillocs);
-                }
+                return Some(faillocs);
             }
             None
         });
@@ -6449,10 +6449,9 @@ mod tests {
                 result_loc,
                 ..
             } = ra_op
+                && *op_index == 0
             {
-                if *op_index == 0 {
-                    return Some((arglocs, result_loc));
-                }
+                return Some((arglocs, result_loc));
             }
             None
         });

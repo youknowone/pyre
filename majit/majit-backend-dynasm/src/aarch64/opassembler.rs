@@ -217,7 +217,7 @@ impl<'a> AssemblerARM64<'a> {
         match ofs_loc {
             Loc::Immed(i) => {
                 let o = i.value as i32;
-                if o < 0 && o >= -256 {
+                if (-256..0).contains(&o) {
                     self.emit_stur_sized(base, o, val, size);
                 } else if o < 0 {
                     // Negative offset outside stur range: load into scratch x16
@@ -239,7 +239,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// Emit a sized store using STUR (unscaled signed offset, ±256 range).
     fn emit_stur_sized(&mut self, base: &RegLoc, ofs: i32, val: &RegLoc, size: usize) {
-        debug_assert!(ofs >= -256 && ofs < 256);
+        debug_assert!((-256..256).contains(&ofs));
         if val.is_xmm {
             dynasm!(self.mc ; .arch aarch64 ; stur D(val.value), [X(base.value), ofs]);
             return;

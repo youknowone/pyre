@@ -1,11 +1,11 @@
-/// Interpreter for tiny3_hotpath — direct translation of rpython/jit/tl/tiny3_hotpath.py.
-///
-/// A word-based language identical to tiny2 but with IntBox/FloatBox instead of
-/// IntBox/StrBox. Arithmetic on mixed int/float types automatically casts to float.
-///
-///    6 7 ADD              => 13
-///    3.8 1 ADD            => 4.8
-///    3.8                  => 3.8
+//! Interpreter for tiny3_hotpath — direct translation of rpython/jit/tl/tiny3_hotpath.py.
+//!
+//! A word-based language identical to tiny2 but with IntBox/FloatBox instead of
+//! IntBox/StrBox. Arithmetic on mixed int/float types automatically casts to float.
+//!
+//!    6 7 ADD              => 13
+//!    3.8 1 ADD            => 4.8
+//!    3.8                  => 3.8
 
 /// A boxed value — either a known integer or a float.
 #[derive(Clone, Debug)]

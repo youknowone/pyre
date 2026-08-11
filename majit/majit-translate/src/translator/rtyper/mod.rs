@@ -61,6 +61,10 @@ pub mod rptr;
 pub mod rrange;
 pub mod rstr;
 pub mod rtuple;
+#[expect(
+    clippy::module_inception,
+    reason = "module names mirror the corresponding RPython package and file layout for line-by-line parity"
+)]
 pub mod rtyper;
 pub mod rvirtualizable;
 pub mod rweakref;

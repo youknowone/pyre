@@ -2,7 +2,19 @@
 ///
 /// This crate implements the `majit_backend::Backend` trait using Cranelift
 /// to translate majit IR traces into native machine code.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Cranelift lowering helpers explicitly thread builder, frame, GC-root, descriptor, and ABI state in the same phase boundaries as the RPython backend; grouping them would hide ownership and parity relationships"
+)]
+#[expect(
+    clippy::mut_from_ref,
+    reason = "CompiledLoop owns this UnsafeCell-backed recovery table and mutates it only during the single-threaded compilation/attachment phase before executable code is published; shared access afterward is read-only"
+)]
 pub mod compiler;
+#[expect(
+    clippy::mut_from_ref,
+    reason = "BridgeData owns this UnsafeCell-backed recovery table and mutates it only while a bridge is being attached, before the bridge is published; runtime consumers only borrow the immutable view"
+)]
 pub mod guard;
 
 pub use compiler::{

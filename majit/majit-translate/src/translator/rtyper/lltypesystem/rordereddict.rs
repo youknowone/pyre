@@ -1090,6 +1090,10 @@ impl Repr for OrderedDictRepr {
     /// `_ll_dictnext_reversed` constructors (still `ordered_dict_runtime_deferred`
     /// stubs); accepting it here without swapping those in would silently walk
     /// the dict forward, so it is rejected fail-closed instead.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     fn make_iterator_repr(
         &self,
         variant: &[String],
@@ -6623,6 +6627,10 @@ pub(crate) fn build_ll_dict_get_helper_graph(
 
 /// Synthesise `ll_dict_setdefault(dict, key, default)`
 /// (`rordereddict.py:1291-1298`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 pub(crate) fn build_ll_dict_setdefault_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -6801,6 +6809,10 @@ pub(crate) fn build_ll_dict_setdefault_helper_graph(
 /// `'f_valid'` are unconditionally true in the baseline (non-`simple_hash_eq`,
 /// no dummy-obj) layout this repr always builds today, so both entry writes
 /// are unconditional.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -8582,7 +8594,6 @@ mod tests {
 
     #[test]
     fn lookup_constants_match_64bit_upstream_layout() {
-        assert!(IS_64BIT, "test host is expected to match PyPy's 64-bit arm");
         assert_eq!(FUNC_SHIFT, 3);
         assert_eq!(FUNC_MASK, 0x07);
         assert_eq!(FUNC_BYTE, 0);

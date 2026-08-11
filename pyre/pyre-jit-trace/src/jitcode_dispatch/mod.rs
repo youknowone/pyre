@@ -6386,9 +6386,11 @@ fn portal_vable_bookkeeping_anchor(
                 let descr_index = lo as usize | ((hi as usize) << 8);
                 if !matches!(
                     perfn_descrs.get(descr_index),
-                    Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(
-                        majit_translate::jitcode::BhDescr::VableField { .. }
-                    ))
+                    Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr))
+                        if matches!(
+                            descr.as_ref(),
+                            majit_translate::jitcode::BhDescr::VableField { .. }
+                        )
                 ) {
                     return false;
                 }

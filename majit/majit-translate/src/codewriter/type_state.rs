@@ -48,6 +48,10 @@ pub use crate::model::ConcreteType;
 /// processed it yet) leaves its legacy counterpart untouched —
 /// equivalent to RPython's "no `.concretetype` attribute" window before
 /// `setconcretetype` runs.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn apply_from_flowspace_variables(
     value_to_var: &crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
 ) {
@@ -146,6 +150,10 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
 /// Walk the rewritten graph and collect every op-result that carries an
 /// authoritative `ConcreteType` (per-op declaration), keyed on the backing
 /// [`Variable`].  Feeds [`merge_synth_kinds`]'s `post_result` lane.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Variable, ConcreteType> {
     let mut result = HashMap::new();
     for block in &graph.blocks {

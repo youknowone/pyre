@@ -343,6 +343,10 @@ impl Repr for FixedSizeListRepr {
     /// `AbstractBaseListRepr`: the no-variant case mints
     /// `ListIteratorRepr(self)`; the `("reversed",)` variant
     /// (`ReversedListIteratorRepr`) is deferred.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     fn make_iterator_repr(
         &self,
         variant: &[String],
@@ -1513,6 +1517,10 @@ impl Repr for ListRepr {
     /// `ListIteratorRepr(self)`; the `("reversed",)` variant
     /// (`ReversedListIteratorRepr`) is deferred. The resized receiver is
     /// flagged so `ll_listnext` reads `length` via the struct header.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     fn make_iterator_repr(
         &self,
         variant: &[String],
@@ -3192,6 +3200,10 @@ fn build_ll_append_helper_graph(
 /// to a MemoryError raise. `rtype_method_extend` still declares
 /// `exception_cannot_occur` — MemoryError is an implicit (always-possible)
 /// exception, not a Python-level one the caller's flow graph handles.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 fn build_ll_extend_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
@@ -4357,6 +4369,10 @@ fn build_ll_copy_helper_graph(
 /// helper graphs — the only per-kind difference (`ll_listslice_%s`,
 /// rlist.py:883-911) is how `newlength` and `src_start` are computed, which
 /// the caller has already materialised into `block`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 fn emit_listslice_alloc_and_copy(
     block: &BlockRef,
     returnblock: &BlockRef,
@@ -4457,6 +4473,10 @@ fn emit_listslice_alloc_and_copy(
 /// The `ll_assert(0 <= start <= len1)` bounds are debug-only (no production
 /// op). Single-block graph: read len, `int_sub` for newlength, then the
 /// shared alloc-and-copy tail with `src_start = start`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 fn build_ll_listslice_startonly_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
@@ -4531,6 +4551,10 @@ fn build_ll_listslice_startonly_helper_graph(
 ///
 /// `ll_assert(newlength >= 0)` is debug-only. Single-block graph:
 /// `int_sub(len, 1)` then the shared tail with `src_start = 0`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 fn build_ll_listslice_minusone_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
@@ -4604,6 +4628,10 @@ fn build_ll_listslice_minusone_helper_graph(
 /// `ll_assert(0 <= start <= length and stop >= start)` is debug-only. Three
 /// blocks: start (read len, `int_gt`) → clamp (pass `length` as the merged
 /// stop) / merge (`int_sub` newlength, then the shared alloc-and-copy tail).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 fn build_ll_listslice_startstop_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,

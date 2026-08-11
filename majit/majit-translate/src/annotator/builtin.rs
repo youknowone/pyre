@@ -84,17 +84,17 @@ use crate::flowspace::model::ConstValue;
 /// * `kwds_s` — keyword argument annotations, already `s_` prefixed to
 ///   match upstream's `kwds_s['s_'+key] = s_value`. Most analysers do
 ///   not consume keywords.
-/// `unaryop.py:944-946 SomeBuiltin.call`: `args_s, kwds = args.unpack();
+///   `unaryop.py:944-946 SomeBuiltin.call`: `args_s, kwds = args.unpack();
 /// return self.analyser(*args_s, **kwds_s)` — args_s passes through as a
-/// Python list possibly carrying `None` for unbound caller args.  The
-/// analyser body raises AttributeError on the first
-/// `s_arg.knowntype` / `.is_constant()` access if it touches an
-/// unbound slot.  The Rust port mirrors this by taking
-/// `&[Option<SomeValue>]`: each analyser body unwraps via [`arg_at`]
-/// at the touch site, panicking with the analyser name and slot
-/// index — observationally equivalent to upstream's first-attribute-
-/// touch failure, matching `unaryop.py:940 simple_call_SomeBuiltin`'s
-/// bind-then-body sequence.
+///   Python list possibly carrying `None` for unbound caller args.  The
+///   analyser body raises AttributeError on the first
+///   `s_arg.knowntype` / `.is_constant()` access if it touches an
+///   unbound slot.  The Rust port mirrors this by taking
+///   `&[Option<SomeValue>]`: each analyser body unwraps via [`arg_at`]
+///   at the touch site, panicking with the analyser name and slot
+///   index — observationally equivalent to upstream's first-attribute-
+///   touch failure, matching `unaryop.py:940 simple_call_SomeBuiltin`'s
+///   bind-then-body sequence.
 pub type BuiltinAnalyzer = fn(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -899,7 +899,7 @@ pub fn builtin_float(
     let s_obj = arg_at(args_s, 0, "builtin_float");
     constpropagate(
         bk,
-        &[s_obj.clone()],
+        std::slice::from_ref(s_obj),
         SomeValue::Float(SomeFloat::new()),
         |consts| match consts {
             [ConstValue::Int(n)] => Some(ConstValue::float(*n as f64)),
@@ -926,7 +926,7 @@ pub fn builtin_chr(
     let s_int = arg_at(args_s, 0, "builtin_chr");
     constpropagate(
         bk,
-        &[s_int.clone()],
+        std::slice::from_ref(s_int),
         SomeValue::Char(SomeChar::new(false)),
         |consts| match consts {
             [ConstValue::Int(n)] => {

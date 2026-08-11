@@ -19,6 +19,10 @@
 pub(crate) mod annotation_state;
 pub mod assembler;
 pub mod call;
+#[expect(
+    clippy::module_inception,
+    reason = "module names mirror the corresponding RPython package and file layout for line-by-line parity"
+)]
 pub mod codewriter;
 pub use codewriter::{AllJitCodes, CodeWriter};
 pub mod effectinfo;

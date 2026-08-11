@@ -1303,7 +1303,7 @@ pub enum SpecializeResult {
     /// case).
     Graph(Rc<PyGraph>),
     /// An annotation returned directly by the specializer (`memo`).
-    Annotation(SomeValue),
+    Annotation(Box<SomeValue>),
 }
 
 impl SpecializeResult {
@@ -1557,6 +1557,10 @@ impl FunctionDesc {
     ///
     /// The star-args path uses an upstream-style builder closure to
     /// rewrite the fresh graph so it no longer takes a `*arg` tuple.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub(crate) fn flatten_star_args(
         &self,
         args_s: &[Option<SomeValue>],
@@ -2253,7 +2257,7 @@ impl FunctionDesc {
                 }
             }
             // `memo` returns the union-of-results annotation directly.
-            SpecializeResult::Annotation(s) => s,
+            SpecializeResult::Annotation(s) => *s,
         };
         // upstream: `s_result = unionof(s_result, s_previous_result)`.
         super::model::unionof([&s_result, s_previous_result])
@@ -2832,8 +2836,14 @@ impl MethodDesc {
             .values()
             .filter_map(|entry| entry.as_method())
             .collect();
-        let mut groups: HashMap<(DescKey, ClassDefKey, String), Vec<Rc<RefCell<MethodDesc>>>> =
-            HashMap::new();
+        #[expect(
+            clippy::type_complexity,
+            reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+        )]
+        let mut groups: HashMap<
+            (DescKey, ClassDefKey, String),
+            Vec<Rc<RefCell<MethodDesc>>>,
+        > = HashMap::new();
         for desc in &lst {
             let borrowed = desc.borrow();
             if borrowed.selfclassdef.is_none() {
@@ -3580,7 +3590,7 @@ mod tests {
         match result {
             SpecializeResult::Annotation(s) => {
                 // union of constant 10 and constant 20 -> non-constant int.
-                assert!(matches!(s, SomeValue::Integer(_)), "got {s:?}");
+                assert!(matches!(*s, SomeValue::Integer(_)), "got {s:?}");
                 assert!(
                     !s.is_constant(),
                     "two distinct results should not be constant"
@@ -4872,8 +4882,13 @@ mod tests {
             None,
             None,
         );
-        FunctionDesc::consider_call_site(&[fd.clone()], &args, &SomeValue::Impossible, None)
-            .unwrap();
+        FunctionDesc::consider_call_site(
+            std::slice::from_ref(&fd),
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
         bk.enter(Some(PositionKey::new(7, 8, 9)));
 
         let family = fd.borrow().base.getcallfamily().unwrap();

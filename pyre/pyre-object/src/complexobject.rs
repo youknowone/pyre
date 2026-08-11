@@ -102,11 +102,17 @@ pub unsafe fn w_complex_get_imag(obj: PyObjectRef) -> f64 {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_complex_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_ComplexObject)).w_dict }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_complex_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe { (*(obj as *mut W_ComplexObject)).w_dict = w_dict };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
@@ -120,14 +126,23 @@ unsafe fn complex_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
     unsafe { &mut (*(obj as *mut W_ComplexObject)).w_slots }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_complex_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
     unsafe { crate::slots::slot_get(obj, index, complex_slots_field) }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_complex_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
     unsafe { crate::slots::slot_set(obj, index, value, complex_slots_field) }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_complex_slot_del(obj: PyObjectRef, index: usize) -> bool {
     unsafe { crate::slots::slot_del(obj, index, complex_slots_field) }
 }

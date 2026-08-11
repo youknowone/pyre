@@ -147,6 +147,10 @@ pub fn cartesian_product<T: Clone>(lstlst: &[Vec<T>]) -> Vec<Vec<T>> {
 /// machinery. This top-level wrapper preserves the upstream module function
 /// name for call sites that are ported line-by-line.
 #[allow(dead_code)] // RPython module-level port surface; implementation lives on FunctionDesc.
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub fn flatten_star_args<'a>(
     funcdesc: &'a FunctionDesc,
     args_s: &[Option<SomeValue>],
@@ -1016,7 +1020,7 @@ pub fn memo(
     }
     let s =
         unionof(results_s.iter()).map_err(|e| AnnotatorError::new(format!("memo unionof: {e}")))?;
-    Ok(SpecializeResult::Annotation(s))
+    Ok(SpecializeResult::Annotation(Box::new(s)))
 }
 
 #[cfg(test)]

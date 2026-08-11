@@ -66,6 +66,9 @@ pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
     })
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_slice(obj: PyObjectRef) -> bool {
     // A tagged immediate is an `int`, never a slice; short-circuit before
     // the `ob_type` deref. Gated on `CAN_BE_TAGGED` (default false).
@@ -75,14 +78,23 @@ pub unsafe fn is_slice(obj: PyObjectRef) -> bool {
     unsafe { !obj.is_null() && std::ptr::eq((*obj).ob_type, &SLICE_TYPE) }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_slice_get_start(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_SliceObject)).start }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_slice_get_stop(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_SliceObject)).stop }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_slice_get_step(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_SliceObject)).step }
 }

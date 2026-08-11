@@ -848,12 +848,17 @@ pub fn normalize_calltable_row_signature(
 
         let newblock = Block::shared(inlist.clone());
         let mut outlist = inlist[..shape.shape_cnt].to_vec();
-        for j in shape.shape_cnt..inputargs_s.len() {
+        for (j, default) in padded_defaults
+            .iter()
+            .enumerate()
+            .take(inputargs_s.len())
+            .skip(shape.shape_cnt)
+        {
             if let Some(i) = argorder.iter().position(|idx| *idx == j) {
                 outlist.push(inlist[i].clone());
                 continue;
             }
-            let default = padded_defaults[j].clone();
+            let default = default.clone();
             if matches!(default.value, ConstValue::Placeholder) {
                 return Err(AnnotatorError::new(format!(
                     "call pattern has {} positional arguments, but {:?} takes at least {} arguments",

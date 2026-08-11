@@ -1,13 +1,16 @@
-/// Interpreter for tiny2_hotpath — direct translation of rpython/jit/tl/tiny2_hotpath.py.
-///
-/// A word-based language: the program is a list of space-separated words.
-/// Most words push themselves on a stack; some words have special actions.
-///
-///    6 7 ADD              => 13
-///    { #1 #1 1 SUB ->#1 #1 }   => with arg 5: pushes 5 4 3 2 1
-///
-/// Boxed values: IntBox (known integers) and StrBox (symbolic/string values).
-/// In the Rust port we simplify to i64 for the integer path and String for symbolic.
+//! Interpreter for tiny2_hotpath — direct translation of rpython/jit/tl/tiny2_hotpath.py.
+//!
+//! A word-based language: the program is a list of space-separated words.
+//! Most words push themselves on a stack; some words have special actions.
+//!
+//!    6 7 ADD              => 13
+//!    { #1 #1 1 SUB ->#1 #1 }   => with arg 5: pushes 5 4 3 2 1
+//!
+//! Boxed values: IntBox (known integers) and StrBox (symbolic/string values).
+//! In the Rust port we simplify to i64 for the integer path and String for symbolic.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParseBoxIntError;
 
 /// A boxed value — either a known integer or a symbolic string.
 #[derive(Clone, Debug)]
@@ -17,10 +20,10 @@ pub enum Box {
 }
 
 impl Box {
-    pub fn as_int(&self) -> Result<i64, ()> {
+    pub fn as_int(&self) -> Result<i64, ParseBoxIntError> {
         match self {
             Box::Int(v) => Ok(*v),
-            Box::Str(s) => parse_int(s, 0).ok_or(()),
+            Box::Str(s) => parse_int(s, 0).ok_or(ParseBoxIntError),
         }
     }
 

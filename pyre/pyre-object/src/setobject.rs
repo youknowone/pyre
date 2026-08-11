@@ -28,6 +28,10 @@ pub struct W_SetIterObject {
     pub index: usize,
 }
 
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn w_set_iter_new(w_set: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_set);
@@ -44,6 +48,9 @@ pub fn w_set_iter_new(w_set: PyObjectRef) -> PyObjectRef {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_set_iterator(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
@@ -52,32 +59,50 @@ pub unsafe fn is_set_iterator(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_set_iter_get_set(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_SetIterObject)).w_set
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_set_iter_set_set(obj: PyObjectRef, w_set: PyObjectRef) {
     (*(obj as *mut W_SetIterObject)).w_set = w_set;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_set_iter_get_startlen(obj: PyObjectRef) -> usize {
     (*(obj as *const W_SetIterObject)).startlen
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_set_iter_set_startlen(obj: PyObjectRef, startlen: usize) {
     (*(obj as *mut W_SetIterObject)).startlen = startlen;
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_set_iter_get_index(obj: PyObjectRef) -> usize {
     (*(obj as *const W_SetIterObject)).index
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_set_iter_set_index(obj: PyObjectRef, index: usize) {
     (*(obj as *mut W_SetIterObject)).index = index;
 }
@@ -204,16 +229,25 @@ impl crate::lltype::GcType for W_SetObject {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_set(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SET_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_frozenset(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FROZENSET_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_set_or_frozenset(obj: PyObjectRef) -> bool {
     unsafe { is_set(obj) || is_frozenset(obj) }
 }
@@ -790,10 +824,7 @@ pub unsafe fn w_set_update_from_set(
     let dst_items = capture_set_items(dst);
     let src_items = capture_set_items(src);
     let mut i = 0;
-    loop {
-        let Some((&key, _)) = (*src_items).get_index(i) else {
-            break;
-        };
+    while let Some((&key, _)) = (*src_items).get_index(i) {
         w_set_insert_key_into(dst, dst_items, key)?;
         i += 1;
     }
@@ -1028,6 +1059,9 @@ pub unsafe fn w_set_len(obj: PyObjectRef) -> usize {
 
 /// Cached frozenset hash; `-1` is the uncomputed sentinel.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_frozenset_cached_hash(obj: PyObjectRef) -> Option<i64> {
     let _set_guard = w_set_lock(obj);
     let hash = (*(obj as *const W_SetObject)).hash;
@@ -1035,6 +1069,9 @@ pub unsafe fn w_frozenset_cached_hash(obj: PyObjectRef) -> Option<i64> {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_frozenset_set_cached_hash(obj: PyObjectRef, hash: i64) {
     let _set_guard = w_set_lock(obj);
     (*(obj as *mut W_SetObject)).hash = hash;
@@ -1042,6 +1079,9 @@ pub unsafe fn w_frozenset_set_cached_hash(obj: PyObjectRef, hash: i64) {
 
 /// Digests already carried by the r_dict keys. Python 3.14 frozenset hashing
 /// consumes these instead of invoking each element's `__hash__` again.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_set_stored_hashes(obj: PyObjectRef) -> Vec<i64> {
     let _set_guard = w_set_lock(obj);
     let s = &*(obj as *const W_SetObject);

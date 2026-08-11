@@ -256,7 +256,7 @@ impl CodeWriter {
     ///   1. jtransform — `transform_graph()` (codewriter.py:42)
     ///   2. regalloc — `perform_register_allocation()` per kind (codewriter.py:45-47)
     ///   3. flatten — `flatten_graph()` (codewriter.py:53)
-    ///   3b. liveness — `compute_liveness()` (codewriter.py:56, called inside assemble)
+    ///      3b. liveness — `compute_liveness()` (codewriter.py:56, called inside assemble)
     ///   4. assemble — `assembler.assemble()` (codewriter.py:67)
     ///   5. `jitcode.index = index` (codewriter.py:68)
     ///   6. `if self.debug: self.print_ssa_repr(ssarepr, portal_jd, verbose)`
@@ -452,6 +452,14 @@ impl CodeWriter {
         }
     }
 
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     pub fn transform_graph_to_jitcode(
         &mut self,
         graph: &FunctionGraph,
@@ -1078,6 +1086,10 @@ impl Default for CodeWriter {
 /// `CallPath::for_impl_method` and stamps it as `resolved_path`.
 /// call.py:181 `getfunctionptr(graph)` — consumer does
 /// `function_graphs.get(&path)` directly.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn stamp_classdef_hints_on_graph(
     graph: &mut FunctionGraph,
     value_to_var: &crate::translator::rtyper::flowspace_adapter::LegacyToTyped,

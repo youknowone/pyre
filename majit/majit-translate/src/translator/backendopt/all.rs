@@ -477,18 +477,22 @@ fn task_error(error: impl std::fmt::Debug) -> TaskError {
 ///
 /// Upstream resolves an arbitrary dotted name through `__import__`
 /// + `getattr`. Pyre has no Python-style import resolver, so this
-/// helper carries the closed-world equivalent: a registry mapping
-/// the dotted names that upstream config defaults ship into the
-/// already-ported Rust callable. Misses surface as `TaskError`
-/// (the same shape upstream's `Exception("Function %s not found")`
-/// at `:31` produces); future heuristic ports register an entry
-/// alongside their landing commit.
+///   helper carries the closed-world equivalent: a registry mapping
+///   the dotted names that upstream config defaults ship into the
+///   already-ported Rust callable. Misses surface as `TaskError`
+///   (the same shape upstream's `Exception("Function %s not found")`
+///   at `:31` produces); future heuristic ports register an entry
+///   alongside their landing commit.
 ///
 /// The two production callers live at `:83 inline_heuristic` and
 /// `:101 profile_based_inline_heuristic`. Both default to
 /// `"rpython.translator.backendopt.inline.inlining_heuristic"`
 /// (`translationoption.py:216`, `:239`) which maps to
 /// [`inline::inlining_heuristic`].
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 fn get_function(dottedname: &str) -> Result<fn(&GraphRef) -> (f64, bool), TaskError> {
     match dottedname {
         "rpython.translator.backendopt.inline.inlining_heuristic" => {
@@ -615,7 +619,8 @@ mod tests {
         let translator = fixture_translator();
         let config = backendopt_config(ported_only_kwds(), None).expect("config");
 
-        remove_obvious_noops(&config, &translator, &[graph.clone()]).expect("remove_obvious_noops");
+        remove_obvious_noops(&config, &translator, std::slice::from_ref(&graph))
+            .expect("remove_obvious_noops");
 
         let borrowed = graph.borrow();
         assert!(borrowed.startblock.borrow().operations.is_empty());
@@ -630,7 +635,7 @@ mod tests {
         let (_r, graph) = make_int_constfold_graph();
         let config = backendopt_config(ported_only_kwds(), None).expect("config");
 
-        constfold_pass(&config, &[graph.clone()]).expect("constfold_pass");
+        constfold_pass(&config, std::slice::from_ref(&graph)).expect("constfold_pass");
 
         let borrowed = graph.borrow();
         assert!(borrowed.startblock.borrow().operations.is_empty());

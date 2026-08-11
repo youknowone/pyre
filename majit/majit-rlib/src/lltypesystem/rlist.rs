@@ -77,6 +77,9 @@ pub const TYPED_ITEMS_BLOCK_LEN_OFFSET: usize = std::mem::offset_of!(TypedItemsB
 
 /// Items base pointer (`&items[0]`) of a `TypedItemsBlock`. Null-safe.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn typed_items_block_items_base(block: *mut TypedItemsBlock) -> *mut u8 {
     if block.is_null() {
         return std::ptr::null_mut();
@@ -86,6 +89,9 @@ pub unsafe fn typed_items_block_items_base(block: *mut TypedItemsBlock) -> *mut 
 
 /// Allocated capacity (GcArray length header) of a `TypedItemsBlock`. 0 for null.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn typed_items_block_capacity(block: *mut TypedItemsBlock) -> usize {
     if block.is_null() {
         return 0;
@@ -113,6 +119,9 @@ pub fn try_typed_items_block_layout(cap: usize) -> Option<Layout> {
 /// allocation failure must remain a failure: a raw fallback would leave
 /// `RBigInt._digits` pointing outside the managed heap even though its
 /// descriptor traces that field as `GcArray(Signed)`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_typed_items_block_nursery(cap: usize, tid: u32) -> *mut TypedItemsBlock {
     unsafe {
         try_alloc_typed_items_block_nursery(cap, tid)
@@ -211,6 +220,10 @@ impl Digits {
     /// Every item the caller reads must be one it has written. Use
     /// [`Digits::alloc_and_set_zero`] for the `[NULLDIGIT] * n` shape.
     #[inline]
+    #[expect(
+        clippy::new_ret_no_self,
+        reason = "This is the direct ll_newlist allocator port from rlist.py; the translated low-level result is a TypedItemsBlock pointer rather than a Rust Digits namespace value"
+    )]
     pub unsafe fn new(length: usize) -> *mut TypedItemsBlock {
         unsafe { alloc_typed_items_block_nursery(length, GC_INT_ARRAY_GC_TYPE_ID) }
     }
@@ -278,6 +291,9 @@ impl Digits {
 /// `[length][items...]` GcArray shape seen by generated code, while the hybrid
 /// collector deliberately treats the address as non-managed. Upstream's
 /// prebuilt `rbigint` digit lists have the same process lifetime.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_typed_items_block_immortal(cap: usize) -> *mut TypedItemsBlock {
     let cap = cap.max(1);
     let layout = typed_items_block_layout(cap);

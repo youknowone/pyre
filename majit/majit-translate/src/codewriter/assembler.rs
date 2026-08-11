@@ -262,6 +262,10 @@ pub struct Assembler {
     pub all_liveness_length: usize,
     /// RPython: Assembler.all_liveness_positions — dedup cache.
     /// Maps (live_i set, live_r set, live_f set) → offset in all_liveness.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     all_liveness_positions: indexmap::IndexMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), usize>,
     /// RPython: Assembler.num_liveness_ops (assembler.py:32).
     pub num_liveness_ops: usize,
@@ -368,7 +372,7 @@ impl Assembler {
     }
 
     fn emit_ready_descr(&mut self, descr: crate::jitcode::BhDescr) -> usize {
-        self.emit_descr(AssemblerDescr::Ready(descr))
+        self.emit_descr(AssemblerDescr::Ready(Box::new(descr)))
     }
 
     fn emit_pending_jitcode_descr(&mut self, jitcode: crate::jitcode::JitCodeHandle) -> usize {
@@ -533,10 +537,10 @@ impl Assembler {
                     (*key, target)
                 })
                 .collect();
-            *descr = AssemblerDescr::Ready(crate::jitcode::BhDescr::Switch {
+            *descr = AssemblerDescr::Ready(Box::new(crate::jitcode::BhDescr::Switch {
                 dict,
                 const_keys_in_order,
-            });
+            }));
         }
 
         // RPython assembler.py:46 `self.check_result()`, :265-269 —
@@ -2782,8 +2786,14 @@ impl Assembler {
                 OpKind::LoadStatic { .. } => "LoadStatic",
             }
         }
-        let mut sites: std::collections::HashMap<crate::flowspace::model::Variable, ValueSites> =
-            std::collections::HashMap::new();
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded; this exactly models RPython object-identity dictionary keys without a divergent side table"
+        )]
+        let mut sites: std::collections::HashMap<
+            crate::flowspace::model::Variable,
+            ValueSites,
+        > = std::collections::HashMap::new();
 
         for op in &ssarepr.insns {
             match op {
@@ -3393,6 +3403,10 @@ pub(crate) fn inline_substruct_field_offset(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 fn bh_field_spec_from_parts(
     index: u32,
     owner: &str,
@@ -4680,7 +4694,7 @@ impl Assembler {
         self.descrs
             .iter()
             .map(|descr| match descr {
-                AssemblerDescr::Ready(descr) => descr.clone(),
+                AssemblerDescr::Ready(descr) => descr.as_ref().clone(),
                 AssemblerDescr::PendingJitCode { jitcode } => crate::jitcode::BhDescr::JitCode {
                     jitcode_index: jitcode.index(),
                     fnaddr: jitcode.fnaddr,
@@ -5194,7 +5208,7 @@ impl AssemblerDescrKey {
 
 #[derive(Debug, Clone)]
 enum AssemblerDescr {
-    Ready(crate::jitcode::BhDescr),
+    Ready(Box<crate::jitcode::BhDescr>),
     PendingJitCode {
         jitcode: crate::jitcode::JitCodeHandle,
     },
@@ -6908,13 +6922,9 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = flatten_graph(&graph, &mut regallocs);
         assert!(
-            !flat.insns.iter().any(|op| matches!(
-                op,
-                FlatOp::Op(crate::model::SpaceOperation {
-                    kind: OpKind::Input { .. },
-                    ..
-                })
-            )),
+            !flat.insns.iter().any(
+                |op| matches!(op, FlatOp::Op(inner) if matches!(inner.kind, OpKind::Input { .. }))
+            ),
             "flatten unexpectedly left input ops: {:?}",
             flat.insns
         );
@@ -6936,7 +6946,7 @@ mod tests {
         let vid_var = graph.alloc_value_var();
         let mut flat = SSARepr {
             name: "bad_input".into(),
-            insns: vec![FlatOp::Op(crate::model::SpaceOperation {
+            insns: vec![FlatOp::op(crate::model::SpaceOperation {
                 result: Some(vid_var),
                 kind: crate::model::OpKind::Input {
                     name: "x".into(),

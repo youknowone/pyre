@@ -167,6 +167,10 @@ impl crate::lltype::GcType for GcWeakrefBox {
 /// Allocate a `GcWeakrefBox` wrapping a fresh rweakref to `target`.
 /// Returns null when no GC hook is installed (test environments that
 /// did not wire `pyre-jit`) or when `target` itself is null.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn w_gc_weakref_box_new(target: PyObjectRef) -> PyObjectRef {
     if target.is_null() {
         return std::ptr::null_mut();

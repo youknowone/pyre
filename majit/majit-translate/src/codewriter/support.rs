@@ -1432,7 +1432,7 @@ mod tests {
     #[test]
     fn normalize_opargs_emits_const_float_for_float_slot() {
         let argtuple = vec![
-            super::NormalizeSlot::ConstFloat(3.14f64.to_bits()),
+            super::NormalizeSlot::ConstFloat(3.25f64.to_bits()),
             super::NormalizeSlot::Index(0),
         ];
         let v7 = crate::flowspace::model::Variable::new();
@@ -1441,7 +1441,7 @@ mod tests {
         assert_eq!(
             normalized,
             vec![
-                super::NormalizedArg::ConstFloat(3.14f64.to_bits()),
+                super::NormalizedArg::ConstFloat(3.25f64.to_bits()),
                 super::NormalizedArg::Pass(v7),
             ]
         );

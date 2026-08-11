@@ -240,6 +240,10 @@ fn range_iter_origin_matches(
 /// including the renamed loop-iterator phi) and rejects if any op / exitswitch
 /// / exception payload other than the construction writes or the `next` op
 /// reads a closure member.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn range_feeds_only_forloop(
     graph: &FunctionGraph,
     range_result: &Variable,

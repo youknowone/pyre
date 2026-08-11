@@ -109,22 +109,34 @@ pub unsafe fn w_array_dealloc(obj: PyObjectRef) {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Array)).w_dict }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe { (*(obj as *mut W_Array)).w_dict = w_dict };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_getweakref(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Array)).w_weakreflifeline }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
     unsafe { (*(obj as *mut W_Array)).w_weakreflifeline = lifeline };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
@@ -139,16 +151,25 @@ unsafe fn array_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
 }
 
 /// Read one app-level `__slots__` entry from an array subclass.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
     unsafe { crate::slots::slot_get(obj, index, array_slots_field) }
 }
 
 /// Write one app-level `__slots__` entry on an array subclass.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
     unsafe { crate::slots::slot_set(obj, index, value, array_slots_field) }
 }
 
 /// Clear one app-level `__slots__` entry on an array subclass.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_slot_del(obj: PyObjectRef, index: usize) -> bool {
     unsafe { crate::slots::slot_del(obj, index, array_slots_field) }
 }
@@ -214,14 +235,23 @@ pub unsafe fn w_array_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_exports(obj: PyObjectRef) -> i64 {
     unsafe { (*(obj as *const W_Array)).exports }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_exports_incref(obj: PyObjectRef) {
     unsafe { (*(obj as *mut W_Array)).exports += 1 };
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_exports_decref(obj: PyObjectRef) {
     unsafe {
         let array = &mut *(obj as *mut W_Array);

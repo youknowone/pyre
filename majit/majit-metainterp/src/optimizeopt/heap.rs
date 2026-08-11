@@ -20,7 +20,7 @@ fn use_untranslated_heap_ordering() -> bool {
 #[inline]
 fn sort_descr_entries_untranslated<T>(entries: &mut [(u32, DescrRef, T)]) {
     if use_untranslated_heap_ordering() {
-        entries.sort_by(|a, b| b.1.repr().cmp(&a.1.repr()));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.1.repr()));
     }
 }
 
@@ -36,7 +36,7 @@ fn sort_descr_entry_indices_untranslated<T>(entries: &[(u32, DescrRef, T)], orde
 #[inline]
 fn sort_descr_item_refs_untranslated<T>(entries: &mut [(&DescrRef, T)]) {
     if use_untranslated_heap_ordering() {
-        entries.sort_by(|a, b| b.0.repr().cmp(&a.0.repr()));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.0.repr()));
     }
 }
 
@@ -142,7 +142,7 @@ type FieldKey = (OpRef, usize);
 ///   field-cache identity, with a separate `field_idx` / `descr_idx`
 ///   (u32) only where the RPython source indexes `PtrInfo` slots or
 ///   EffectInfo bitsets.
-/// heap.py:168-226 CachedField(AbstractCachedEntry)
+///   heap.py:168-226 CachedField(AbstractCachedEntry)
 struct CachedField {
     /// heap.py:39 cached_structs — struct boxes with a cached value
     /// for this descr. Replaces RPython's parallel `cached_infos`;
@@ -1454,8 +1454,8 @@ impl OptHeap {
     /// - Immutable (green) field caches: values never change.
     /// - Unescaped object caches: calls cannot access objects that haven't
     ///   been passed to a call or stored into the heap.
-    /// heap.py:379-391: invalidate non-pure field/array caches.
-    /// Only `is_always_pure` (immutable) fields survive.
+    ///   heap.py:379-391: invalidate non-pure field/array caches.
+    ///   Only `is_always_pure` (immutable) fields survive.
     ///
     /// heap.py:189-196 `CachedField.invalidate(descr)` clears
     /// `opinfo._fields[idx]` for every cached_info BEFORE clearing the
@@ -1638,10 +1638,7 @@ impl OptHeap {
         // Plain residual calls preserve cache entries for unescaped
         // allocations. Calls with explicit EffectInfo keep the more
         // precise heap.py force_from_effectinfo path.
-        if !op.has_descr() {
-            self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-            self.clean_caches(ctx);
-        } else if Self::call_has_random_effects(op) {
+        if !op.has_descr() || Self::call_has_random_effects(op) {
             self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
             self.clean_caches(ctx);
         } else {

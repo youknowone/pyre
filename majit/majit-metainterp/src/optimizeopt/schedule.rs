@@ -885,7 +885,7 @@ pub fn prepare_fail_arguments(
 pub fn prepare_arguments(
     state: &mut VecScheduleState,
     pack: &Pack,
-    args: &mut Vec<OpRef>,
+    args: &mut [OpRef],
     ops: &[OpRc],
 ) {
     for i in 0..args.len() {
@@ -912,7 +912,7 @@ pub fn prepare_arguments(
 pub fn assemble_scattered_values(
     state: &mut VecScheduleState,
     pack: &Pack,
-    args: &mut Vec<OpRef>,
+    args: &mut [OpRef],
     index: usize,
     ops: &[OpRc],
 ) {
@@ -1044,7 +1044,7 @@ pub fn pack_into_vector(
 pub fn position_values(
     state: &mut VecScheduleState,
     pack: &Pack,
-    args: &mut Vec<OpRef>,
+    args: &mut [OpRef],
     index: usize,
     position: usize,
     ops: &[OpRc],
@@ -1066,7 +1066,7 @@ pub fn position_values(
 pub fn crop_vector(
     state: &mut VecScheduleState,
     pack: &Pack,
-    args: &mut Vec<OpRef>,
+    args: &mut [OpRef],
     index: usize,
     ops: &[OpRc],
 ) {
@@ -1117,7 +1117,7 @@ fn get_op_bytesize_for_ref(state: &mut VecScheduleState, opref: OpRef, ops: &[Op
 pub fn expand(
     state: &mut VecScheduleState,
     pack: &Pack,
-    args: &mut Vec<OpRef>,
+    args: &mut [OpRef],
     arg: OpRef,
     index: usize,
     ops: &[OpRc],

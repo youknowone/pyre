@@ -12,11 +12,11 @@
 //! two residual calls the rtyper census cannot type:
 //!   - `res = from_size_align(size, align)` → `Result<Layout, LayoutError>`,
 //!   - `opt = res.ok()` → `Option<Layout>`.
-//! Both cross a value the census cannot model as a residual return (`Layout` is
-//! a 2-word `{size, align}` aggregate; `Result`/`Option` of it likewise), so
-//! the pair is the standing wall in `rlist::try_typed_items_block_layout`
-//! once `checked_mul`/`checked_add` are natively lowered
-//! ([`crate::front::checked_arith_uint`]).
+//!     Both cross a value the census cannot model as a residual return (`Layout` is
+//!     a 2-word `{size, align}` aggregate; `Result`/`Option` of it likewise), so
+//!     the pair is the standing wall in `rlist::try_typed_items_block_layout`
+//!     once `checked_mul`/`checked_add` are natively lowered
+//!     ([`crate::front::checked_arith_uint`]).
 //!
 //! `from_size_align(size, align)` returns `Ok(Layout { size, align })` iff
 //! `align.is_power_of_two()` and `size <= isize::MAX - (align - 1)`.  An earlier
@@ -38,8 +38,8 @@
 //!   - `layout = <transparent Layout ctor>{ __pos_0 = size, __pos_1 = align }`;
 //!   - `opt = <transparent Option ctor>{ __discriminant = disc, __pos_0(Some) =
 //!     layout }`.
-//! Block Q's `ok` call is deleted and its result aliased to the block-P
-//! `Option` value threaded across the P→Q edge — no diamond, no exit rewiring.
+//!     Block Q's `ok` call is deleted and its result aliased to the block-P
+//!     `Option` value threaded across the P→Q edge — no diamond, no exit rewiring.
 //!
 //! Like [`crate::front::checked_arith_uint`] it is **order-independent** and
 //! **fail-safe**: any structural mismatch returns `Err`, the caller leaves both

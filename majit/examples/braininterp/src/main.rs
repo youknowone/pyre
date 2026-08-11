@@ -36,9 +36,7 @@ const MANDELBROT: &[u8] = b"+++++++++++++[->++>>>+++++>++>+<<<<<<]>>>>>++++++>--
 /// BF: set cell0=N via repeated +, then loop: [-]
 fn countdown_bf(n: usize) -> Vec<u8> {
     let mut prog = Vec::with_capacity(n + 3);
-    for _ in 0..n {
-        prog.push(b'+');
-    }
+    prog.extend(std::iter::repeat_n(b'+', n));
     prog.extend_from_slice(b"[-]");
     prog
 }
@@ -46,14 +44,10 @@ fn countdown_bf(n: usize) -> Vec<u8> {
 /// Multiply: cell1 = a * b via nested loop.
 fn multiply_bf(a: u8, b: u8) -> Vec<u8> {
     let mut prog = Vec::new();
-    for _ in 0..a {
-        prog.push(b'+');
-    }
+    prog.extend(std::iter::repeat_n(b'+', usize::from(a)));
     prog.push(b'[');
     prog.push(b'>');
-    for _ in 0..b {
-        prog.push(b'+');
-    }
+    prog.extend(std::iter::repeat_n(b'+', usize::from(b)));
     prog.extend_from_slice(b"<-]");
     prog
 }

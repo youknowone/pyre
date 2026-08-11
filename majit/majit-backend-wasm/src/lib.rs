@@ -63,12 +63,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// re-bridged after its first bridge was outgrown); a count that tracks
 /// `BRIDGE_OK` says the epilogue dispatch is not taking the cell at all and
 /// every bridge after the first is dead weight.
-pub static BRIDGE_DIAG: [AtomicU64; 30] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-    ]
-};
+pub static BRIDGE_DIAG: [AtomicU64; 30] = [const { AtomicU64::new(0) }; 30];
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
 /// the `pyre_jit_bridge_diag` export in the `pyre-wasm` crate.
@@ -1379,8 +1374,10 @@ impl WasmBackend {
     /// (assembler.py:1971-1974 reads these bounds at codegen time).
     fn collect_guard_gc_type_info(&self, ops: &[Op]) -> codegen::GuardGcTypeInfo {
         with_wasm_active_gc(|gc| {
-            let mut info = codegen::GuardGcTypeInfo::default();
-            info.supports_guard_gc_type = gc.supports_guard_gc_type();
+            let mut info = codegen::GuardGcTypeInfo {
+                supports_guard_gc_type: gc.supports_guard_gc_type(),
+                ..codegen::GuardGcTypeInfo::default()
+            };
             if !info.supports_guard_gc_type {
                 return info;
             }

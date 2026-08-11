@@ -1397,6 +1397,12 @@ pub struct DynasmBackend {
     arch_cpu_ext: ArchCpuExt,
 }
 
+impl Default for DynasmBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DynasmBackend {
     /// Legacy test-only entry point.  Production code routes the typed
     /// pool through `Backend::set_constants_pool`; this raw-`i64`
@@ -1502,10 +1508,10 @@ impl DynasmBackend {
         let blocks_clt = token.compiled_loop_token_expect();
         let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter().rev() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
-                if bridge.source_guard == Some((source_trace_id, source_fail_index)) {
-                    return codebuf::buffer_ptr(&bridge.buffer) as usize;
-                }
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>()
+                && bridge.source_guard == Some((source_trace_id, source_fail_index))
+            {
+                return codebuf::buffer_ptr(&bridge.buffer) as usize;
             }
         }
         0
@@ -1934,10 +1940,10 @@ impl DynasmBackend {
                 let classptr = class_arg
                     .const_int_value()
                     .or_else(|| const_pool.get(&class_arg.raw()).map(|c| c.as_raw_i64()));
-                if let Some(classptr) = classptr {
-                    if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
-                        table.insert(classptr, tid);
-                    }
+                if let Some(classptr) = classptr
+                    && let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize)
+                {
+                    table.insert(classptr, tid);
                 }
             }
         }
@@ -1964,12 +1970,11 @@ impl DynasmBackend {
                 let class_arg = op.arg(1).to_opref();
                 // history.py:227 — inline-Const carries its class pointer directly.
                 let classptr = class_arg.const_int_value();
-                if let Some(classptr) = classptr {
-                    if let Some(range) =
+                if let Some(classptr) = classptr
+                    && let Some(range) =
                         with_dynasm_active_gc(|gc| gc.subclass_range(classptr as usize)).flatten()
-                    {
-                        table.insert(classptr, range);
-                    }
+                {
+                    table.insert(classptr, range);
                 }
             }
         }
@@ -2031,9 +2036,9 @@ impl DynasmBackend {
     ///
     /// `compile.py:618-671` parity: the four `DoneWithThisFrame*`
     /// + `ExitFrameWithExceptionDescrRef` singletons attached to
-    /// `self.cpu` are compared by pointer identity against the raw
-    /// `jf_descr` value — same as RPython
-    /// `llgraph/runner.py:1478-1484` (`faildescr == self.cpu.done_with_this_frame_descr_*`).
+    ///   `self.cpu` are compared by pointer identity against the raw
+    ///   `jf_descr` value — same as RPython
+    ///   `llgraph/runner.py:1478-1484` (`faildescr == self.cpu.done_with_this_frame_descr_*`).
     ///
     /// Panics if not found — RPython uses object identity, so lookup
     /// failure is impossible in well-formed execution.
@@ -2163,14 +2168,13 @@ impl DynasmBackend {
         let blocks_clt = token.compiled_loop_token_expect();
         let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
-                if let Some(found) = bridge
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>()
+                && let Some(found) = bridge
                     .fail_descrs
                     .iter()
                     .find(|d| Arc::as_ptr(d) as *const () as usize == ptr)
-                {
-                    return found.descr.clone();
-                }
+            {
+                return found.descr.clone();
             }
         }
         drop(blocks);
@@ -2255,20 +2259,19 @@ impl DynasmBackend {
         // singleton FINISH descrs share an Arc across emissions and
         // would otherwise answer `fail_index_per_trace()` / `trace_id()`
         // with the trait default `0`.
-        if compiled.trace_id == trace_id {
-            if let Some(found) = compiled.fail_descrs.get(fail_index as usize) {
-                return Some(found.descr.clone());
-            }
+        if compiled.trace_id == trace_id
+            && let Some(found) = compiled.fail_descrs.get(fail_index as usize)
+        {
+            return Some(found.descr.clone());
         }
         let blocks_clt = token.compiled_loop_token_expect();
         let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
-                if bridge.trace_id == trace_id {
-                    if let Some(found) = bridge.fail_descrs.get(fail_index as usize) {
-                        return Some(found.descr.clone());
-                    }
-                }
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>()
+                && bridge.trace_id == trace_id
+                && let Some(found) = bridge.fail_descrs.get(fail_index as usize)
+            {
+                return Some(found.descr.clone());
             }
         }
         None
@@ -3099,7 +3102,7 @@ impl Backend for DynasmBackend {
         // (synthetic descrs without rd_locs) falls back to identity.
         let rd_locs_len = descr_fd.rd_locs().len();
         let mut typed_outputs = Vec::with_capacity(num_fail_args);
-        for i in 0..num_fail_args {
+        for (i, fail_arg_type) in fail_arg_types.iter().enumerate() {
             let raw = if i < rd_locs_len {
                 match crate::guard::decode_rd_loc_slot(descr_fd, i) {
                     Some(slot) => outputs.get(slot).copied().unwrap_or(0),
@@ -3108,7 +3111,7 @@ impl Backend for DynasmBackend {
             } else {
                 outputs.get(i).copied().unwrap_or(0)
             };
-            typed_outputs.push(match fail_arg_types[i] {
+            typed_outputs.push(match fail_arg_type {
                 Type::Ref => Value::Ref(GcRef(raw as usize)),
                 Type::Float => Value::Float(f64::from_bits(raw as u64)),
                 // `Type::Void` is the resume.py:411-417 hole sentinel —
@@ -3339,10 +3342,11 @@ impl Backend for DynasmBackend {
                 // counter yet stamped).  Route the predicate through the
                 // FailDescr trait so the metainterp class hierarchy
                 // (`final_descr=True` on Done*/Exit*/Propagate) answers.
-                if let Some(fd) = descr.as_fail_descr() {
-                    if !fd.is_finish() && fd.get_status() == 0 {
-                        fd.store_hash(hash);
-                    }
+                if let Some(fd) = descr.as_fail_descr()
+                    && !fd.is_finish()
+                    && fd.get_status() == 0
+                {
+                    fd.store_hash(hash);
                 }
             }
         }
@@ -3366,12 +3370,12 @@ impl Backend for DynasmBackend {
                 let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
                 if addr == bridge_addr {
                     for (i, &hash) in hashes.iter().enumerate() {
-                        if let Some(descr) = bridge.fail_descrs.get(i) {
-                            if let Some(fd) = descr.as_fail_descr() {
-                                if !fd.is_finish() && fd.get_status() == 0 {
-                                    fd.store_hash(hash);
-                                }
-                            }
+                        if let Some(descr) = bridge.fail_descrs.get(i)
+                            && let Some(fd) = descr.as_fail_descr()
+                            && !fd.is_finish()
+                            && fd.get_status() == 0
+                        {
+                            fd.store_hash(hash);
                         }
                     }
                     return;
@@ -3391,10 +3395,10 @@ impl Backend for DynasmBackend {
             unsafe {
                 // llmodel.py:780-782: if self.vtable_offset is not None:
                 //   self.write_int_at_mem(res, self.vtable_offset, WORD, sizedescr.get_vtable())
-                if let Some(vt_off) = self.vtable_offset {
-                    if vtable != 0 {
-                        *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
-                    }
+                if let Some(vt_off) = self.vtable_offset
+                    && vtable != 0
+                {
+                    *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
                 }
             }
         }
@@ -3935,23 +3939,23 @@ impl Backend for DynasmBackend {
         let blocks_clt = token.compiled_loop_token_expect();
         let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
-                if bridge.trace_id == trace_id {
-                    return Some(
-                        bridge
-                            .fail_descrs
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, d)| {
-                                crate::guard::layout_for_fail_descr(
-                                    d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
-                                    idx as u32,
-                                    trace_id,
-                                )
-                            })
-                            .collect(),
-                    );
-                }
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>()
+                && bridge.trace_id == trace_id
+            {
+                return Some(
+                    bridge
+                        .fail_descrs
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, d)| {
+                            crate::guard::layout_for_fail_descr(
+                                d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
+                                idx as u32,
+                                trace_id,
+                            )
+                        })
+                        .collect(),
+                );
             }
         }
         None
@@ -4341,8 +4345,8 @@ mod tests {
             OpRef::NONE.raw(),
         )];
 
-        let mut token = JitCellToken::new(1499);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1499);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         assert_eq!(token.inputarg_types().to_vec(), vec![Type::Ref, Type::Int]);
     }
@@ -4361,8 +4365,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(30)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1500);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1500);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(4), Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 9);
@@ -4425,8 +4429,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1500);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1500);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         let obj = backend.get_ref_value(&frame, 0);
@@ -4509,8 +4513,8 @@ mod tests {
             ),
         ];
 
-        let mut token = JitCellToken::new(1501);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1501);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         let obj = backend.get_ref_value(&frame, 0);
@@ -4591,8 +4595,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1502);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1502);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(64)]);
         let obj = backend.get_ref_value(&frame, 0);
@@ -4646,8 +4650,8 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut token = JitCellToken::new(1503);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1503);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(payload)]);
         assert_eq!(backend.get_ref_value(&frame, 0), payload);
@@ -4679,9 +4683,9 @@ mod tests {
             &[OpRef::input_arg_ref(0)],
             OpRef::NONE.raw(),
         )];
-        let mut callee_token = JitCellToken::new(1600);
+        let callee_token = JitCellToken::new(1600);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .unwrap();
         let direct = backend.execute_token(&callee_token, &[Value::Ref(payload)]);
         assert_eq!(backend.get_ref_value(&direct, 0), payload);
@@ -4697,9 +4701,9 @@ mod tests {
             call,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-        let mut caller_token = JitCellToken::new(1601);
+        let caller_token = JitCellToken::new(1601);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
             .unwrap();
 
         let frame = backend.execute_token(&caller_token, &[Value::Ref(payload)]);
@@ -4718,7 +4722,7 @@ mod tests {
         constants.insert(101, 0);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1602);
+        let token = JitCellToken::new(1602);
         // resoperation.py:719 InputArgInt — slot 0 is `InputArg::new_int(0)`,
         // referenced via `OpRef::input_arg_int(0)`. Variant-aware Eq/Hash
         // treats `IntOp(0)` and `InputArgInt(0)` as disjoint Box classes.
@@ -4749,7 +4753,7 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
             mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
@@ -4808,7 +4812,7 @@ mod tests {
         constants.insert(101, 0);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1603);
+        let token = JitCellToken::new(1603);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(vec![rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_ref(1))].into());
         let ops = vec![
@@ -4843,7 +4847,7 @@ mod tests {
             },
             mk_op(OpCode::Finish, &[OpRef::ref_op(4)], OpRef::NONE.raw()),
         ];
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(0), Value::Ref(payload)]);
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
@@ -4943,7 +4947,7 @@ mod tests {
             },
             mk_op(OpCode::Finish, &[OpRef::ref_op(4)], OpRef::NONE.raw()),
         ];
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(0)]);
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
@@ -5043,7 +5047,7 @@ mod tests {
             },
             mk_op(OpCode::Finish, &[OpRef::ref_op(4)], OpRef::NONE.raw()),
         ];
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(0)]);
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
@@ -5165,7 +5169,7 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef::int_op(6), OpRef::int_op(7)], 8),
             mk_op(OpCode::Finish, &[OpRef::int_op(8)], OpRef::NONE.raw()),
         ];
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(1)]);
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
@@ -5225,7 +5229,7 @@ mod tests {
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1604);
+        let token = JitCellToken::new(1604);
         let guard = mk_op(
             OpCode::GuardClass,
             &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
@@ -5241,7 +5245,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Ref(payload)]);
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
@@ -5315,7 +5319,7 @@ mod tests {
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1618);
+        let token = JitCellToken::new(1618);
         let guard = mk_op(
             OpCode::GuardClass,
             &[OpRef::input_arg_ref(1), OpRef::int_op(100)],
@@ -5335,7 +5339,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(
             &token,
@@ -5407,7 +5411,7 @@ mod tests {
         constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
 
-        let mut token = JitCellToken::new(1605);
+        let token = JitCellToken::new(1605);
         let passthrough = mk_op(
             OpCode::CondCallValueR,
             &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
@@ -5419,7 +5423,7 @@ mod tests {
             passthrough,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(payload)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
@@ -5454,9 +5458,9 @@ mod tests {
             &[OpRef::input_arg_ref(0)],
             OpRef::NONE.raw(),
         )];
-        let mut callee_token = JitCellToken::new(1604);
+        let callee_token = JitCellToken::new(1604);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .unwrap();
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -5481,9 +5485,9 @@ mod tests {
             call_asm,
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-        let mut caller_token = JitCellToken::new(1605);
+        let caller_token = JitCellToken::new(1605);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
             .unwrap();
 
         let frame = backend.execute_token(&caller_token, &[Value::Ref(payload)]);
@@ -5520,9 +5524,9 @@ mod tests {
             &[OpRef::input_arg_ref(0)],
             OpRef::NONE.raw(),
         )];
-        let mut callee_token = JitCellToken::new(1606);
+        let callee_token = JitCellToken::new(1606);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .unwrap();
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -5551,9 +5555,9 @@ mod tests {
             call_asm,
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
-        let mut caller_token = JitCellToken::new(1607);
+        let caller_token = JitCellToken::new(1607);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
             .unwrap();
 
         let frame = backend.execute_token(&caller_token, &[Value::Ref(payload), Value::Ref(ec)]);
@@ -5600,9 +5604,9 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut callee_token = JitCellToken::new(1610);
+        let callee_token = JitCellToken::new(1610);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .unwrap();
 
         let plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(203)], 1);
@@ -5629,9 +5633,9 @@ mod tests {
             alloc_marked_ref_collecting as *const () as usize as i64,
         );
         backend.set_constants(caller_consts);
-        let mut caller_token = JitCellToken::new(1611);
+        let caller_token = JitCellToken::new(1611);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
             .unwrap();
 
         let frame = backend.execute_token(&caller_token, &[Value::Ref(ec)]);
@@ -5682,9 +5686,9 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut callee_token = JitCellToken::new(1612);
+        let callee_token = JitCellToken::new(1612);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .unwrap();
 
         let call_asm = mk_op(
@@ -5702,9 +5706,9 @@ mod tests {
             call_asm,
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-        let mut caller_token = JitCellToken::new(1613);
+        let caller_token = JitCellToken::new(1613);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
             .unwrap();
 
         let frame = backend.execute_token(&caller_token, &[Value::Ref(payload), Value::Ref(ec)]);
@@ -5749,9 +5753,9 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut callee_token = JitCellToken::new(1608);
+        let callee_token = JitCellToken::new(1608);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .unwrap();
         let direct = backend.execute_token(&callee_token, &[Value::Ref(payload)]);
         assert!(backend.get_latest_descr(&direct).is_finish());
@@ -5768,9 +5772,9 @@ mod tests {
             call,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-        let mut caller_token = JitCellToken::new(1609);
+        let caller_token = JitCellToken::new(1609);
         backend
-            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
             .unwrap();
 
         let frame = backend.execute_token(&caller_token, &[Value::Ref(payload)]);
@@ -5808,9 +5812,9 @@ mod tests {
             &[OpRef::input_arg_ref(0)],
             OpRef::NONE.raw(),
         )];
-        let mut callee_token = JitCellToken::new(1610);
+        let callee_token = JitCellToken::new(1610);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .unwrap();
 
         let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -5830,9 +5834,9 @@ mod tests {
             call,
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-        let mut caller_token = JitCellToken::new(1611);
+        let caller_token = JitCellToken::new(1611);
         backend
-            .compile_loop(&[], &caller_ops, &mut caller_token)
+            .compile_loop(&[], &caller_ops, &caller_token)
             .unwrap();
 
         let frame = backend.execute_token(&caller_token, &[]);
@@ -5873,8 +5877,8 @@ mod tests {
             plain_call,
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
-        let mut token = JitCellToken::new(1612);
-        backend.compile_loop(&[], &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1612);
+        backend.compile_loop(&[], &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         assert!(backend.get_latest_descr(&frame).is_finish());
@@ -5917,8 +5921,8 @@ mod tests {
             plain_call,
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
-        let mut token = JitCellToken::new(1613);
-        backend.compile_loop(&[], &ops, &mut token).unwrap();
+        let token = JitCellToken::new(1613);
+        backend.compile_loop(&[], &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
         assert!(backend.get_latest_descr(&frame).is_finish());

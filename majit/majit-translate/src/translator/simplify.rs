@@ -41,6 +41,10 @@ use crate::translator::translator::TranslationContext;
 /// The Rust port mirrors upstream's single-threaded mutation pattern:
 /// walk each snapshot link, collapse chains of empty successor
 /// blocks, and rewrite the link's `args` / `target` in place.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn eliminate_empty_blocks(graph: &FunctionGraph) {
     // upstream: `for link in list(graph.iterlinks()):`
     for link_ref in graph.iterlinks() {
@@ -139,6 +143,10 @@ pub fn eliminate_empty_blocks(graph: &FunctionGraph) {
 /// Thin wrapper around `Hlvalue::replace` kept for back-compat with
 /// this file's internal call shape — `Hlvalue::replace` is now
 /// polymorphic (`HashMap<Variable, Hlvalue>`) in line with upstream.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn rename_hl(v: &Hlvalue, mapping: &HashMap<Variable, Hlvalue>) -> Hlvalue {
     match v {
         Hlvalue::Variable(var) => mapping
@@ -149,6 +157,10 @@ fn rename_hl(v: &Hlvalue, mapping: &HashMap<Variable, Hlvalue>) -> Hlvalue {
     }
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn rename_op(op: &SpaceOperation, mapping: &HashMap<Variable, Hlvalue>) -> SpaceOperation {
     // upstream: `op = op.replace(renaming)`.
     let mut new_op = SpaceOperation {
@@ -171,6 +183,10 @@ fn rename_op(op: &SpaceOperation, mapping: &HashMap<Variable, Hlvalue>) -> Space
     new_op
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn rename_link_args(link: &LinkRef, mapping: &HashMap<Variable, Hlvalue>) -> LinkRef {
     // upstream's `link.replace(mapping)` path — rebuild a fresh Link
     // with renamed args / last_exception / last_exc_value.
@@ -390,9 +406,7 @@ pub fn get_graph(arg: &Hlvalue, translator: &TranslationContext) -> Option<Graph
         Err(lltype::DelayedPointer) => return None,
     };
     // upstream: `try: return funcobj.graph except AttributeError: return None`.
-    let Some(graph_key) = funcobj.graph else {
-        return None;
-    };
+    let graph_key = funcobj.graph?;
     translator
         .graphs
         .borrow()
@@ -496,12 +510,9 @@ fn resolve_graph_family(
     let graphs = translator.graphs.borrow();
     let mut resolved: Vec<GraphRef> = Vec::with_capacity(graph_keys.len());
     for graph_key in graph_keys {
-        let Some(graph) = graphs
+        let graph = graphs
             .iter()
-            .find(|graph| GraphKey::of(graph).as_usize() == *graph_key)
-        else {
-            return None;
-        };
+            .find(|graph| GraphKey::of(graph).as_usize() == *graph_key)?;
         resolved.push(graph.clone());
     }
     Some(resolved)
@@ -624,6 +635,10 @@ pub fn transform_dead_op_vars(graph: &FunctionGraph, translator: Option<&Transla
 /// single-graph start block instead of a heterogeneous Python list:
 /// upstream only branches on `len(graphs) == 1`, and the multi-graph
 /// arm recovers start blocks through `translator.annotator`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn transform_dead_op_vars_in_blocks(
     blocks: &[BlockRef],
     graphs_len: usize,
@@ -924,6 +939,10 @@ pub fn isspecialvar(v: &Hlvalue) -> bool {
 /// requires. `Block::renamevariables` matches RPython's canonical shape
 /// (args / operations / exitswitch / link.args) but stops short of the
 /// exception-extras Links carry; this helper closes that gap.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn renamevariables_hl(block: &BlockRef, mapping: &HashMap<Variable, Hlvalue>) {
     if mapping.is_empty() {
         return;
@@ -968,6 +987,10 @@ fn renamevariables_hl(block: &BlockRef, mapping: &HashMap<Variable, Hlvalue>) {
 /// instead of `DataFlowFamilyBuilder`, inlining the phi-node collapse
 /// loop over block inputs with linked `link.args[i]` as phi sources.
 #[allow(non_snake_case)]
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn remove_identical_vars_SSA(graph: &FunctionGraph) {
     use crate::tool::algo::unionfind::UnionFind;
 
@@ -985,6 +1008,10 @@ pub fn remove_identical_vars_SSA(graph: &FunctionGraph) {
     // for link in links]))`. Rust: Vec<(Variable, Vec<Hlvalue>)> per
     // block. We key by BlockKey and carry a BlockRef alongside for
     // later iteration.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     let mut inputs: HashMap<BlockKey, (BlockRef, Vec<(Variable, Vec<Hlvalue>)>)> = HashMap::new();
     for (bkey, links) in entrymap.iter() {
         let block = links
@@ -1075,6 +1102,10 @@ pub fn remove_identical_vars_SSA(graph: &FunctionGraph) {
 
 /// Inner of `remove_identical_vars_SSA`'s `simplify_phis(block)` closure
 /// (simplify.py:555-573).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn simplify_phis_inner(
     uf: &mut crate::tool::algo::unionfind::UnionFind<Hlvalue, Representative>,
     slot: &mut (BlockRef, Vec<(Variable, Vec<Hlvalue>)>),
@@ -1148,6 +1179,10 @@ fn simplify_phis_inner(
 ///                 for link in links:
 ///                     del link.args[i]
 /// ```
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn remove_identical_vars(graph: &FunctionGraph) {
     let mut builder = DataFlowFamilyBuilder::new(graph);
     // upstream: `builder.get_variable_families()` triggers initial
@@ -1268,6 +1303,10 @@ pub fn remove_identical_vars(graph: &FunctionGraph) {
 ///             exits.append(link)
 ///         block.recloseblock(*(preserve + exits))
 /// ```
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn simplify_exceptions(graph: &FunctionGraph) {
     let exception_class = HOST_ENV
         .lookup_builtin("Exception")
@@ -1450,6 +1489,10 @@ pub fn simplify_exceptions(graph: &FunctionGraph) {
 /// Upstream walks candidate bool-ended blocks, rewrites each
 /// `bool`-exitcase-keyed exit to point at `block2`'s outgoing arm, and
 /// repeats until a fixed point.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn coalesce_bool(graph: &FunctionGraph) {
     // upstream: list of (block, [(case, target_block)]) candidate tuples.
     let mut candidates: Vec<(BlockRef, Vec<(bool, BlockRef)>)> = Vec::new();
@@ -1882,6 +1925,10 @@ pub fn remove_assertion_errors(graph: &FunctionGraph) {
 /// the start of its block, upstream collapses the predecessor link
 /// first via `join_blocks` and re-enters; the Rust port mirrors that
 /// fixpoint loop.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn transform_ovfcheck(graph: &FunctionGraph) {
     // upstream `covf = Constant(rarithmetic.ovfcheck)`. The sentinel
     // lives on the `rpython.rlib.rarithmetic` module; looking it up
@@ -2193,6 +2240,10 @@ impl<'a> ListComprehensionDetector<'a> {
         result
     }
 
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     fn run(&mut self, vlist: Hlvalue, vmeth: Hlvalue, appendblock: BlockRef) -> Result<(), ()> {
         let append_ops = appendblock.borrow().operations.clone();
         for hlop in &append_ops {
@@ -2413,6 +2464,10 @@ impl<'a> ListComprehensionDetector<'a> {
 }
 
 /// RPython `detect_list_comprehension(graph)` (simplify.py:703-780).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn detect_list_comprehension(graph: &FunctionGraph) {
     let mut variable_families = DataFlowFamilyBuilder::new(graph).into_variable_families();
     let c_append = Constant::new(ConstValue::byte_str("append"));
@@ -2804,6 +2859,10 @@ pub fn remove_trivial_links(graph: &FunctionGraph) {
 ///                 stack.extend(link.target.exits)
 ///                 seen[link.target] = True
 /// ```
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn join_blocks(graph: &FunctionGraph) {
     let entrymap = mkentrymap(graph);
     let mut seen: HashSet<BlockKey> = HashSet::new();

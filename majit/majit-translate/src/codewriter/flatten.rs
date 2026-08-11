@@ -127,7 +127,7 @@ pub enum FlatOp {
     /// Label definition (target for jumps).
     Label(Label),
     /// Semantic op (from the graph).
-    Op(SpaceOperation),
+    Op(Box<SpaceOperation>),
     /// Unconditional jump to label.
     /// RPython: `('goto', TLabel(target))`.
     Jump(Label),
@@ -263,6 +263,12 @@ pub enum FlatOp {
     /// `AssertionError`. Distinct from [`FlatOp::EndOfBlock`] which
     /// is a placement separator and emits no bytecode.
     Unreachable,
+}
+
+impl FlatOp {
+    pub fn op(operation: SpaceOperation) -> Self {
+        Self::Op(Box::new(operation))
+    }
 }
 
 /// `flatten.py:30` `Register.kind` — `'int' | 'ref' | 'float'`.
@@ -732,7 +738,7 @@ impl<'a> GraphFlattener<'a> {
                 });
             }
             _ => {
-                self.emitline(FlatOp::Op(op.clone()));
+                self.emitline(FlatOp::op(op.clone()));
             }
         }
     }
@@ -1582,7 +1588,7 @@ where
 mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, Constant};
-    use crate::model::{ExitCase, FunctionGraph, OpKind, SpaceOperation, exception_exitcase};
+    use crate::model::{ExitCase, FunctionGraph, OpKind, exception_exitcase};
 
     /// Test helper — build an Int-kind `regallocs` map that assigns
     /// each Variable the graph references
@@ -1739,10 +1745,10 @@ mod tests {
         let true_first = flat.insns[goto_idx + 1..]
             .iter()
             .find_map(|op| match op {
-                FlatOp::Op(SpaceOperation {
-                    kind: OpKind::ConstInt(value),
-                    ..
-                }) => Some(*value),
+                FlatOp::Op(inner) => match &inner.kind {
+                    OpKind::ConstInt(value) => Some(*value),
+                    _ => None,
+                },
                 _ => None,
             })
             .expect("expected at least one ConstInt body marker after GotoIfNot");
@@ -2069,13 +2075,9 @@ mod tests {
         let mut regallocs = identity_regallocs(&graph, 8);
         let flat = flatten_graph(&graph, &mut regallocs);
         assert!(
-            !flat.insns.iter().any(|op| matches!(
-                op,
-                FlatOp::Op(SpaceOperation {
-                    kind: OpKind::Input { .. },
-                    ..
-                })
-            )),
+            !flat.insns.iter().any(
+                |op| matches!(op, FlatOp::Op(inner) if matches!(inner.kind, OpKind::Input { .. }))
+            ),
             "flatten must not serialize input ops: {:?}",
             flat.insns
         );

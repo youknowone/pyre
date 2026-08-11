@@ -268,7 +268,7 @@ mod tests {
         let i0 = b.input(Type::Int, 0);
         let i1 = b.input(Type::Int, 1);
         b.op(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
-        b.op(OpCode::CallPureI, &[i0.clone()]);
+        b.op(OpCode::CallPureI, std::slice::from_ref(&i0));
         b.op(OpCode::RecordExactClass, &[i0.clone(), i1.clone()]);
         b.op(OpCode::IntSub, &[i0, i1]);
         let result = run_trace(b);

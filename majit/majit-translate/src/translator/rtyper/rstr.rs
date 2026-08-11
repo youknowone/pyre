@@ -2348,6 +2348,10 @@ enum StringIsxxxPredicate {
     OrConditions(&'static [CharCondition]),
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 fn rtype_abstract_string_method_isxxx(
     self_repr: &dyn Repr,
     hop: &HighLevelOp,

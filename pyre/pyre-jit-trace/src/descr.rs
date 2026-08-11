@@ -2137,7 +2137,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         ],
         "PyFrame",
         "pyframe::PyFrame",
-        &[PYFRAME_VABLE_TOKEN_FIELD_DESCR.clone()],
+        std::slice::from_ref(&PYFRAME_VABLE_TOKEN_FIELD_DESCR),
         &[],
     )
 });
@@ -3201,6 +3201,9 @@ pub fn object_storage_descr() -> DescrRef {
 
 /// Map field for a receiver already proven to carry a translated mapdict
 /// layout.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
     if unsafe { pyre_object::is_int(obj) } {
         field_descr_from_group(&W_INT_USER_DESCR_GROUP, 0)
@@ -3217,6 +3220,9 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
 }
 
 /// Storage-field sibling of [`mapdict_map_descr`].
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
     if unsafe { pyre_object::is_int(obj) } {
         field_descr_from_group(&W_INT_USER_DESCR_GROUP, 1)

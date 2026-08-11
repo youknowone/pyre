@@ -7742,17 +7742,15 @@ pub(crate) fn pyre_portal_runner(
     use majit_metainterp::blackhole::BhReturnType;
     use majit_metainterp::jitexc::JitException;
 
-    let JitException::ContinueRunningNormally {
-        green_int,
-        green_ref,
-        green_float,
-        red_int,
-        red_ref,
-        red_float,
-    } = exc
-    else {
+    let JitException::ContinueRunningNormally(args) = exc else {
         return Ok((BhReturnType::Void, 0));
     };
+    let green_int = &args.green_int;
+    let green_ref = &args.green_ref;
+    let green_float = &args.green_float;
+    let red_int = &args.red_int;
+    let red_ref = &args.red_ref;
+    let red_float = &args.red_float;
 
     // warmspot.py:972-975: portalfunc_ARGS extraction.
     // Build merged arg lists like blackhole.py:1113-1116.

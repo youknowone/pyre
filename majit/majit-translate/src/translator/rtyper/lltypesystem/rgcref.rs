@@ -65,6 +65,10 @@ impl GCRefRepr {
     /// `hasattr` guard is vacuously false — there is nothing to wrap. The
     /// wrapper ports once a `Repr::ll_str` surface and `gen_str_function`
     /// land.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     pub fn make(
         r_base: Arc<dyn Repr>,
         cache: &RefCell<HashMap<usize, Arc<GCRefRepr>>>,

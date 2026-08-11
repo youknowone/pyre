@@ -807,7 +807,7 @@ impl DependencyGraph {
 
     /// Helper: add a dependency edge between two nodes (dependency.py:170-195 Node.edge_to).
     fn add_edge(
-        nodes: &mut Vec<Node>,
+        nodes: &mut [Node],
         from_idx: usize,
         to_idx: usize,
         arg: Option<OpRef>,
@@ -867,12 +867,7 @@ impl DependencyGraph {
     }
 
     /// Helper: depends_on_arg using DefTracker (works with &mut nodes borrow).
-    fn depends_on_arg_static(
-        tracker: &DefTracker,
-        arg: OpRef,
-        to_idx: usize,
-        nodes: &mut Vec<Node>,
-    ) {
+    fn depends_on_arg_static(tracker: &DefTracker, arg: OpRef, to_idx: usize, nodes: &mut [Node]) {
         if let Some(at_idx) = tracker.definition(arg)
             && at_idx != to_idx
         {
@@ -1526,7 +1521,7 @@ impl DefTracker {
     }
 
     /// dependency.py:525-534: depends_on_arg — add edge from definition to `to_idx`.
-    pub fn depends_on_arg(&self, arg: OpRef, to_idx: usize, graph: &mut Vec<Vec<usize>>) {
+    pub fn depends_on_arg(&self, arg: OpRef, to_idx: usize, graph: &mut [Vec<usize>]) {
         if let Some(at_idx) = self.definition(arg)
             && at_idx != to_idx
             && !graph[at_idx].contains(&to_idx)

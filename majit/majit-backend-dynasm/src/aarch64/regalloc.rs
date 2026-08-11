@@ -26,7 +26,7 @@ const DEFAULT_IMM_SIZE: i64 = 4096;
 /// on the OpRef itself (`arg.getint()` never fails).
 fn check_imm_box(arg: OpRef) -> bool {
     match arg {
-        OpRef::ConstInt(v) => v >= 0 && v < DEFAULT_IMM_SIZE,
+        OpRef::ConstInt(v) => (0..DEFAULT_IMM_SIZE).contains(&v),
         _ => false,
     }
 }

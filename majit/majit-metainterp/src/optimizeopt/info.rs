@@ -504,7 +504,7 @@ impl PtrInfoExt for PtrInfo {
             // info.py:83-84: PtrInfo base — no-op
             PtrInfo::NonNull { .. } => {
                 // info.py:120-122: NonNullPtrInfo.make_guards
-                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
             }
             PtrInfo::Instance(info) => {
                 // info.py:336-353 InstancePtrInfo.make_guards line-by-line.
@@ -544,8 +544,8 @@ impl PtrInfoExt for PtrInfo {
                     // `cls_of_box()`.
                     let class_ref = alloc_const(ctx, Value::Int(cls));
                     if !ctx.remove_gctypeptr {
-                        short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
-                        short.push(Op::new(OpCode::GuardIsObject, &[op_b.clone()]));
+                        short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
+                        short.push(Op::new(OpCode::GuardIsObject, std::slice::from_ref(&op_b)));
                         short.push(Op::new(
                             OpCode::GuardClass,
                             &[op_b.clone(), class_ref.clone()],
@@ -577,9 +577,9 @@ impl PtrInfoExt for PtrInfo {
                         )
                         .vtable() as i64;
                     let vtable_const = alloc_const(ctx, Value::Int(vtable));
-                    short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                    short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
                     if !ctx.remove_gctypeptr {
-                        short.push(Op::new(OpCode::GuardIsObject, &[op_b.clone()]));
+                        short.push(Op::new(OpCode::GuardIsObject, std::slice::from_ref(&op_b)));
                     }
                     short.push(Op::new(
                         OpCode::GuardSubclass,
@@ -588,7 +588,7 @@ impl PtrInfoExt for PtrInfo {
                 } else {
                     // info.py:353 fall-through with neither class nor
                     // descr — base NonNullPtrInfo.make_guards.
-                    short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                    short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
                 }
             }
             PtrInfo::Struct(info) => {
@@ -597,7 +597,7 @@ impl PtrInfoExt for PtrInfo {
                 //       c_typeid = ConstInt(self.descr.get_type_id())
                 //       short.extend([GUARD_NONNULL[op],
                 //                     GUARD_GC_TYPE[op, c_typeid]])
-                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
                 // `StructPtrInfo.descr` is a plain `DescrRef`
                 // (ptr_info.rs:232-239), so info.py:361 `if self.descr is not
                 // None` is unconditionally true here and the `SizeDescr`
@@ -645,7 +645,7 @@ impl PtrInfoExt for PtrInfo {
                 //       lenop = ARRAYLEN_GC[op] (descr=self.descr)
                 //       short.append(lenop)
                 //       self.lenbound.make_guards(lenop, short, optimizer)
-                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
                 // `ArrayPtrInfo.descr` is a plain `DescrRef`
                 // (ptr_info.rs:245-255) and info.py:634 reads
                 // `self.descr.get_type_id()` unconditionally.  Every producer
@@ -678,8 +678,11 @@ impl PtrInfoExt for PtrInfo {
                 // `Option`, so the parity check is on `is_unbounded()`
                 // rather than `is None`.
                 if !info.lenbound.is_unbounded() {
-                    let mut lenop =
-                        Op::with_descr(OpCode::ArraylenGc, &[op_b.clone()], info.descr.clone());
+                    let mut lenop = Op::with_descr(
+                        OpCode::ArraylenGc,
+                        std::slice::from_ref(&op_b),
+                        info.descr.clone(),
+                    );
                     // info.py:637 `lenop = ResOperation(ARRAYLEN_GC, [op])`
                     // followed by `lenbound.make_guards(lenop, ...)` — the
                     // `lenop` object is the consumer's box arg via Python
@@ -726,7 +729,7 @@ impl PtrInfoExt for PtrInfo {
             }
             PtrInfo::Str(sinfo) => {
                 // vstring.py:116-126: StrPtrInfo.make_guards
-                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
                 if let Some(ref bound) = sinfo.lenbound
                     && bound.lower >= 1
                 {
@@ -735,7 +738,7 @@ impl PtrInfoExt for PtrInfo {
                     } else {
                         OpCode::Unicodelen
                     };
-                    let mut lenop = Op::new(lenop_code, &[op_b.clone()]);
+                    let mut lenop = Op::new(lenop_code, std::slice::from_ref(&op_b));
                     // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
                     // is consumed by `bound.make_guards(lenop, ...)`.
                     // Materialize the producer result before the chain.
@@ -1239,7 +1242,7 @@ fn force_box_impl(
                 OpCode::NewArray
             };
             let arg_len = ctx.materialize_operand_at(len_ref);
-            let mut alloc_op = Op::new(alloc_opcode, &[arg_len.clone()]);
+            let mut alloc_op = Op::new(alloc_opcode, std::slice::from_ref(&arg_len));
             alloc_op.pos.set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
@@ -1301,7 +1304,7 @@ fn force_box_impl(
 
             let len_ref = ctx.emit_constant_int(num_elements as i64);
             let arg_len = ctx.materialize_operand_at(len_ref);
-            let mut alloc_op = Op::new(OpCode::NewArrayClear, &[arg_len.clone()]);
+            let mut alloc_op = Op::new(OpCode::NewArrayClear, std::slice::from_ref(&arg_len));
             alloc_op.pos.set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
@@ -1394,7 +1397,7 @@ fn force_box_impl(
 
             // info.py:425: CHECK_MEMORY_ERROR
             let arg_alloc = ctx.materialize_operand_at(alloc_ref);
-            let check_op = Op::new(OpCode::CheckMemoryError, &[arg_alloc.clone()]);
+            let check_op = Op::new(OpCode::CheckMemoryError, std::slice::from_ref(&arg_alloc));
             emit_op(ctx, check_op);
 
             // info.py:429-436: emit RAW_STORE for each buffered write.
@@ -1525,7 +1528,7 @@ fn force_box_impl(
                 OpCode::Newstr
             };
             let arg_length = ctx.materialize_operand_at(lengthbox);
-            let mut newstr_op = Op::new(new_opcode, &[arg_length.clone()]);
+            let mut newstr_op = Op::new(new_opcode, std::slice::from_ref(&arg_length));
             newstr_op.pos.set(opref);
             let newop = emit_op(ctx, newstr_op);
 
@@ -2233,8 +2236,8 @@ mod tests {
 
     #[test]
     fn test_opinfo_float_const() {
-        let info = OpInfo::FloatConstInfo(FloatConstInfo::new(3.14));
+        let info = OpInfo::FloatConstInfo(FloatConstInfo::new(3.25));
         assert!(info.is_constant());
-        assert_eq!(info.get_constant_float(), Some(3.14));
+        assert_eq!(info.get_constant_float(), Some(3.25));
     }
 }

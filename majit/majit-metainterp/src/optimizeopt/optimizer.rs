@@ -1102,7 +1102,7 @@ impl Optimizer {
                 .expect("imported virtual leaf missing box.type");
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let arg0 = ctx.materialize_operand_at(*label_arg);
-            let mut op = majit_ir::Op::new(same_as_op, &[arg0.clone()]);
+            let mut op = majit_ir::Op::new(same_as_op, std::slice::from_ref(&arg0));
             op.pos.set(ctx.reserve_pos_typed(tp));
             let fresh = op.pos.get();
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
@@ -1716,9 +1716,9 @@ impl Optimizer {
         }
     }
 
-    /// Pre-tag Phase 1 JUMP arg OpRefs as generation 0.
+    // Pre-tag Phase 1 JUMP arg OpRefs as generation 0.
 
-    /// Lock JUMP arg OpRefs so make_equal_to won't forward them.
+    // Lock JUMP arg OpRefs so make_equal_to won't forward them.
 
     /// optimizer.py:557 parity:
     ///
@@ -3142,7 +3142,7 @@ impl Optimizer {
                         let same_as = OpCode::same_as_for_type(arg_type);
                         let fresh = ctx.alloc_op_position_typed(arg_type);
                         let arg0 = ctx.materialize_operand_at(orig);
-                        let mut op = Op::new(same_as, &[arg0.clone()]);
+                        let mut op = Op::new(same_as, std::slice::from_ref(&arg0));
                         op.pos.set(fresh);
                         // unroll.py:146 + compile.py:327 parity: accumulate the
                         // alias op in `extra_same_as` and splice it between the
@@ -3256,7 +3256,7 @@ impl Optimizer {
                     .make_inputargs_and_virtuals(vs_args, self, &mut ctx, false)
                 {
                     Ok(pair) => pair,
-                    Err(()) => {
+                    Err(_) => {
                         // unroll.py:193,207-210: on the BRIDGE path the
                         // short-preamble/export preview does not exist — VS
                         // matching is deferred to `jump_to_existing_trace`,
@@ -3719,7 +3719,6 @@ impl Optimizer {
             for op in ctx.resop_refs.values() {
                 consider_const(op);
             }
-            drop(consider_const);
             // Align each const-folded producer's canonical `Op.pos` to its
             // post-compact slot. The `new_operations` loop above already
             // remapped emitted live ops; removed constant-folded ops (their
@@ -3976,12 +3975,16 @@ impl Optimizer {
     /// Returns `(optimized_ops, retrace_requested)`. When retrace_requested
     /// is true, the caller should increment retraced_count and may use the
     /// optimizer's exported_loop_state for the new target token.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub(crate) fn optimize_bridge(
         &mut self,
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
-        front_target_tokens: &mut Vec<crate::history::TargetToken>,
+        front_target_tokens: &mut [crate::history::TargetToken],
         runtime_boxes: &[OpRef],
         inline_short_preamble: bool,
         retraced_count: u32,
@@ -4256,7 +4259,7 @@ impl Optimizer {
             Ok(vs) => vs,
             // unroll.py:209-210: except InvalidLoop → jump_to_preamble
             // RPython: self.jump_to_preamble → send_extra_operation
-            Err(()) => {
+            Err(_) => {
                 if !front_target_tokens.is_empty() {
                     // unroll.py:196,238-242 jump_to_preamble parity: the jump-to
                     // jitcell is `jump_op.getdescr()` = terminal_jump's own
@@ -4322,7 +4325,7 @@ impl Optimizer {
             // unroll.py:224-225: except InvalidLoop: pass
             // vs (from first attempt) is still not None → falls through
             // to jump_to_preamble below.
-            Err(()) => vs,
+            Err(_) => vs,
         };
 
         // unroll.py:226-227: vs is None → matched with forced boxes
@@ -4360,12 +4363,16 @@ impl Optimizer {
     }
 
     /// Wrapper: call jump_to_existing_trace, catch only InvalidLoop panics.
-    /// Returns Ok(vs) on normal return, Err(()) on InvalidLoop.
+    /// Returns Ok(vs) on normal return, Err(_) on InvalidLoop.
     /// Non-InvalidLoop panics are re-raised.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn try_jump_to_existing_trace(
         opt_unroll: &crate::optimizeopt::unroll::OptUnroll,
         jump_args: &[OpRef],
-        front_target_tokens: &mut Vec<crate::history::TargetToken>,
+        front_target_tokens: &mut [crate::history::TargetToken],
         optimizer: &mut Self,
         ctx: &mut OptContext,
         force_boxes: bool,
@@ -6504,7 +6511,7 @@ mod tests {
         let y = b.input(Type::Int, 1);
         b.op_with_descr(
             OpCode::GuardTrue,
-            &[x.clone()],
+            std::slice::from_ref(&x),
             crate::compile::make_resume_guard_descr_typed(Vec::new()),
         );
         b.op(OpCode::IntAdd, &[x.clone(), y]);
@@ -7249,7 +7256,7 @@ mod tests {
         let x_ref = x.to_opref();
         let y_ref = y.to_opref();
         b.op(OpCode::IntAdd, &[x.clone(), y.clone()]);
-        b.op(OpCode::GuardTrue, &[x.clone()]);
+        b.op(OpCode::GuardTrue, std::slice::from_ref(&x));
         b.op(OpCode::Finish, &[]);
         let (ops, inputs) = b.build();
         // The GuardTrue (ops[1]) keeps both header inputs as fail args; bind

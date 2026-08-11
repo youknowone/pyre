@@ -1,7 +1,7 @@
-/// Interpreter for Brainfuck — direct translation of rpython/jit/tl/braininterp.py.
-///
-/// Tape-based interpreter with 30000 cells, byte-sized values.
-/// Operations: > < + - . , [ ]
+//! Interpreter for Brainfuck — direct translation of rpython/jit/tl/braininterp.py.
+//!
+//! Tape-based interpreter with 30000 cells, byte-sized values.
+//! Operations: > < + - . , [ ]
 
 const TAPE_SIZE: usize = 30000;
 

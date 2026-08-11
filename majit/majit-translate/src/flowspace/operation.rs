@@ -975,6 +975,10 @@ impl HLOperation {
     /// is typed `Variable` in upstream too, and RPython's pre-rtyper
     /// stages never rename a Variable into a Constant — the Rust port
     /// keeps the field concrete and asserts that shape.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> HLOperation {
         let newargs: Vec<Hlvalue> = self.args.iter().map(|a| a.replace(mapping)).collect();
         let newresult = match self.result.replace(mapping) {
@@ -2085,6 +2089,10 @@ use crate::tool::pairtype::DoubleDispatchRegistry;
 pub(crate) struct Specialization {
     /// The actual annotation handler — `spec(annotator, *self.args)`
     /// upstream (operation.py:104).
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub apply: Box<
         dyn Fn(
             &crate::annotator::annrpython::RPythonAnnotator,
@@ -2143,6 +2151,10 @@ pub(crate) fn apply_specialization(
 /// whose upstream methods `return None`) and explicit-block handlers
 /// register a plain `Box::new` closure that returns `None` or
 /// `Some(s_ImpossibleValue)` directly instead of going through `pure`.
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub(crate) fn pure(
     f: impl Fn(
         &crate::annotator::annrpython::RPythonAnnotator,
@@ -2174,6 +2186,10 @@ pub enum CanOnlyThrow {
     /// `return can_only_throw(*args)` branch. Returns `None` to mirror
     /// `_dict_can_only_throw_*` helpers (binaryop.py:527-535) that
     /// defer to `op.canraise` for r_dict's unrestricted throw set.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     Callable(Box<dyn Fn(&[crate::annotator::model::SomeValue]) -> Option<Vec<BuiltinException>>>),
 }
 

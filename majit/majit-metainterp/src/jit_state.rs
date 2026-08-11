@@ -1053,6 +1053,10 @@ pub trait JitState: Sized {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn restore_guard_failure_with_resume_layout(
         &mut self,
         meta: &Self::Meta,
@@ -1159,6 +1163,10 @@ pub trait JitState: Sized {
     /// When `session_cache` is provided, materialized virtuals are stored in
     /// it and reused across subsequent deopts within the same session (e.g.,
     /// when GUARD_NOT_FORCED triggers resumption after CALL_MAY_FORCE).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn restore_guard_failure_with_session_cache(
         &mut self,
         meta: &Self::Meta,

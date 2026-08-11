@@ -1,16 +1,16 @@
-/// JIT-enabled tiny3 interpreter via `#[jit_interp]` proc macro with `state_fields`.
-///
-/// TODO: `rpython/jit/tl/tiny3_hotpath.py:96` models the
-/// operand stack as a linked-list `Stack(value, next)`, identical shape to
-/// tiny2_hotpath.py. pyre's `state_fields = { stackpos, stack: [int; virt] }`
-/// does not express linked-list stacks — see the same adaptation note on
-/// `majit/examples/tiny2/src/jit_interp.rs`.
-///
-/// Greens: [pc]
-/// Reds:   [stackpos, stack]  (args at bottom, computation stack on top)
-///
-/// The JIT traces the integer-only path. Float arithmetic falls back to the
-/// plain interpreter. This matches RPython's promote(y.__class__) strategy.
+//! JIT-enabled tiny3 interpreter via `#[jit_interp]` proc macro with `state_fields`.
+//!
+//! TODO: `rpython/jit/tl/tiny3_hotpath.py:96` models the
+//! operand stack as a linked-list `Stack(value, next)`, identical shape to
+//! tiny2_hotpath.py. pyre's `state_fields = { stackpos, stack: [int; virt] }`
+//! does not express linked-list stacks — see the same adaptation note on
+//! `majit/examples/tiny2/src/jit_interp.rs`.
+//!
+//! Greens: [pc]
+//! Reds:   [stackpos, stack]  (args at bottom, computation stack on top)
+//!
+//! The JIT traces the integer-only path. Float arithmetic falls back to the
+//! plain interpreter. This matches RPython's promote(y.__class__) strategy.
 
 // ── Bytecode opcodes ──
 
@@ -246,7 +246,7 @@ impl JitTiny3Interp {
     }
 
     /// Run a word-based program with integer args.
-    pub fn run(&mut self, bytecode: &[&str], args: &mut Vec<i64>) -> i64 {
+    pub fn run(&mut self, bytecode: &[&str], args: &mut [i64]) -> i64 {
         let code = compile(bytecode);
         let num_args = args.len();
         let has_result_on_stack = program_has_result(bytecode, num_args);
@@ -297,7 +297,7 @@ impl JitTiny3Interp {
     pub fn run_typed(
         &mut self,
         bytecode: &[&str],
-        args: &mut Vec<crate::interp::Box>,
+        args: &mut [crate::interp::Box],
     ) -> crate::interp::Box {
         // For typed runs, use the plain interpreter.
         // The JIT only traces the integer-only path.
@@ -321,12 +321,8 @@ fn program_has_result(words: &[&str], num_args: usize) -> bool {
             loop_depth -= 1;
             depth -= 1;
         } else if loop_depth == 0 {
-            if *w == "ADD" || *w == "SUB" || *w == "MUL" {
+            if matches!(*w, "ADD" | "SUB" | "MUL") || w.starts_with("->#") {
                 depth -= 1;
-            } else if w.starts_with("->#") {
-                depth -= 1;
-            } else if w.starts_with('#') {
-                depth += 1;
             } else {
                 depth += 1;
             }

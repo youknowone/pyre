@@ -297,6 +297,9 @@ impl JitFrame {
     }
 
     /// Get an immutable slice of the jf_frame items.
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn frame_slots(ptr: *const JitFrame, len: usize) -> &'static [isize] {
         unsafe {
             let base = (ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const isize;
@@ -305,6 +308,9 @@ impl JitFrame {
     }
 
     /// Read the jf_frame array length.
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn frame_length(ptr: *const JitFrame) -> isize {
         unsafe {
             let len_ptr = (ptr as *const u8).add(JF_FRAME_OFS + LENGTHOFS) as *const isize;
@@ -313,6 +319,9 @@ impl JitFrame {
     }
 
     /// jitframe.py:54-57 — jitframe_resolve.
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn resolve(mut frame: *mut JitFrame) -> *mut JitFrame {
         unsafe {
             while !(*frame).jf_forward.is_null() {
@@ -332,6 +341,9 @@ impl JitFrame {
     }
 
     /// Const variant of `slot_ptr`.
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn slot_ptr_const(ptr: *const JitFrame, index: usize) -> *const isize {
         unsafe { (ptr as *const u8).add(FIRST_ITEM_OFFSET + index * SIZEOFSIGNED) as *const isize }
     }
@@ -346,6 +358,9 @@ impl JitFrame {
 ///
 /// `trace_callback` is called for each GCREF slot address that the
 /// GC needs to visit (read and potentially update).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl FnMut(*mut usize)) {
     unsafe {
         // jitframe.py:105-109 — trace fixed GCREF header fields
@@ -406,6 +421,9 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
 /// `CustomTraceFn(usize, &mut dyn FnMut(*mut GcRef))` interface.
 ///
 /// jitframe.py:49 — `rgc.register_custom_trace_hook(JITFRAME, lambda_jitframe_trace)`
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe {
         jitframe_trace(obj_addr as *mut JitFrame, |slot_ptr| {

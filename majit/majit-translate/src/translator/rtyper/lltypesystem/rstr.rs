@@ -11252,8 +11252,8 @@ mod tests {
     /// `_ll_strhash` synthesised against `Ptr(STR)` produces a
     /// 2-block-plus-returnblock CFG: start (getsubstruct + direct_call
     /// + int_eq) branches on `is_zero`; both branches converge on
-    /// `block_set_hash` (setfield). The True branch carries the
-    /// zero-fixup constant 29872897.
+    ///   `block_set_hash` (setfield). The True branch carries the
+    ///   zero-fixup constant 29872897.
     #[test]
     fn build_ll_strhash_internal_emits_zero_fixup_then_setfield_for_str() {
         use crate::annotator::annrpython::RPythonAnnotator;

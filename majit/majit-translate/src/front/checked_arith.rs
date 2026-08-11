@@ -476,7 +476,7 @@ mod tests {
             .with_prevblock(c),
         ];
 
-        let rewritten = rewire_checked_arith_call_sites(&mut g, &[opt.clone()]);
+        let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt));
         assert_eq!(rewritten, 1, "the checked_add site must be rewritten");
 
         // Block A's last op is now `add_ovf(va, vb)`, reusing `opt`.
@@ -595,7 +595,7 @@ mod tests {
             .with_prevblock(c),
         ];
 
-        let rewritten = rewire_checked_arith_call_sites(&mut g, &[opt.clone()]);
+        let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt));
         assert_eq!(rewritten, 0, "a None arm that reads opt must decline");
         // The residual call survives untouched.
         let last = g.blocks[a.0].operations.last().unwrap();

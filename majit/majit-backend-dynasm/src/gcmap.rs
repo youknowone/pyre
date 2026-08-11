@@ -11,6 +11,10 @@ pub fn allocate_gcmap(frame_depth: usize, fixed_size: usize) -> *mut usize {
     Box::into_raw(gcmap) as *mut usize
 }
 
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "this mirrors RPython's GC-map primitive: callers receive the pointer only from allocate_gcmap, and the null check is intentionally part of the total safe helper contract"
+)]
 pub fn gcmap_set_bit(gcmap: *mut usize, index: usize) {
     if gcmap.is_null() {
         return;

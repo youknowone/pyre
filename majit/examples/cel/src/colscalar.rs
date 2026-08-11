@@ -4,9 +4,9 @@
 //!
 //! The `column` probe proved base-in-REGISTER compiles (13-16x). This isolates the
 //! VirtualStatesCantMatch root cause: base-in-SCALAR-FIELD. Two programs,
-//! identical except one re-writes the scalar field each iteration:
-//!   * RDONLY  — `state.col_base` set once at init, only READ in the loop.
-//!   * WRITTEN — `state.col_base` re-assigned from a register every iteration.
+//! identical except one re-writes the scalar field each iteration.
+//! RDONLY keeps `state.col_base` read-only after initialization; WRITTEN
+//! reassigns it from a register every iteration.
 //! Prints compiles/aborts for each. RELEASE ONLY.
 
 use crate::common::*;

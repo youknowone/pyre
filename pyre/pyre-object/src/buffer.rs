@@ -69,6 +69,9 @@ unsafe fn external_release(w_obj: PyObjectRef) {
 impl Buffer {
     /// Release the single exporter lock owned by a root memoryview.
     /// Derived/sub views do not call this; their root view owns the count.
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn release_export(&self) {
         unsafe {
             match self {

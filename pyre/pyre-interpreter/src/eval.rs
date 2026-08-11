@@ -280,6 +280,9 @@ unsafe fn walk_raw_function_roots(
 /// mapdict-method entries. This is both the managed wrapper's custom trace and
 /// the explicit walk for bootstrap wrappers outside the collector. No-op for
 /// non-code values.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn walk_raw_code_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -362,6 +365,9 @@ pub unsafe fn walk_raw_code_roots(
 /// `W_BASE_EXCEPTION_GC_PTR_OFFSETS` slot in place, the same shape
 /// `walk_raw_function_roots` / `walk_raw_getset_roots` use for Box/`malloc_typed`
 /// -held children. No-op for non-exception values.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn walk_raw_exception_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -3022,7 +3028,7 @@ impl ControlFlowOpcodeHandler for PyFrame {
                 };
                 let arg0_intval = {
                     let lw = locals_w!(self);
-                    if lw.len() > 0 {
+                    if !lw.is_empty() {
                         let v = lw[0];
                         if !v.is_null() && pyre_object::pyobject::is_int(v) {
                             Some(pyre_object::intobject::w_int_get_value(v))
@@ -5345,10 +5351,10 @@ r = acc",
 
     #[test]
     fn test_float_negation() {
-        let result = run_eval("-3.14").unwrap();
+        let result = run_eval("-3.25").unwrap();
         unsafe {
             assert!(is_float(result));
-            assert_eq!(w_float_get_value(result), -3.14);
+            assert_eq!(w_float_get_value(result), -3.25);
         }
     }
 

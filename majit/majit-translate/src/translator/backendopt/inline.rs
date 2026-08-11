@@ -1042,6 +1042,10 @@ impl<'t> BaseInliner<'t> {
     /// `inline_guarded_calls_no_matter_what=False`,
     /// `raise_analyzer=None` (asserted non-None at `:158`),
     /// `call_count_pred=None`, `cleanup=True`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     pub fn new(
         translator: &'t TranslationContext,
         graph: GraphRef,
@@ -1457,15 +1461,11 @@ impl<'t> BaseInliner<'t> {
         let mut non_recursive: std::collections::HashMap<usize, ()> =
             std::collections::HashMap::new();
         // Upstream `:167 while self.block_to_index:`.
-        loop {
+        while let Some(block_key) = self.block_to_index.keys().next().cloned() {
             // Upstream `:168 block, d = self.block_to_index.popitem()`.
             // Pyre's HashMap iteration order is unspecified; pop any
             // entry — order does not affect correctness because each
             // call site is processed exactly once.
-            let block_key = match self.block_to_index.keys().next().cloned() {
-                Some(k) => k,
-                None => break,
-            };
             let (block, mut d) = self
                 .block_to_index
                 .remove(&block_key)
@@ -2040,6 +2040,10 @@ impl<'t> BaseInliner<'t> {
     /// `inline_all` would call `contains_call(None, None)` on those
     /// and AttributeError out, so the dropped behaviour matches
     /// upstream's reachable contract.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     pub fn new_inliner(
         translator: &'t TranslationContext,
         graph: GraphRef,
@@ -2487,7 +2491,11 @@ pub fn auto_inlining(
                 // Upstream `:636 weight, fixed = heuristic(graph)`.
                 let (w, f) = heuristic(&top.graph);
                 // Upstream `:644-645 if not (weight < 1e9): weight = 1e9`.
-                let w = if !(w < 1e9) { 1e9 } else { w };
+                let w = if w.partial_cmp(&1e9) != Some(std::cmp::Ordering::Less) {
+                    1e9
+                } else {
+                    w
+                };
                 (w, f)
             };
             // Upstream `:647 heapreplace(heap, ...)`. Rust BinaryHeap
@@ -3098,7 +3106,7 @@ mod tests {
     fn inlinable_static_callers_no_calls_returns_empty() {
         let translator = fixture_translator();
         let g = int_add_graph("f");
-        let result = inlinable_static_callers(&[g.clone()], false, None, &translator);
+        let result = inlinable_static_callers(std::slice::from_ref(&g), false, None, &translator);
         assert_eq!(result.len(), 0);
         let result_with_ops = inlinable_static_callers(&[g], true, None, &translator);
         assert_eq!(result_with_ops.len(), 0);
@@ -3660,7 +3668,7 @@ mod tests {
         let f = int_add_graph("f");
         translator.graphs.borrow_mut().push(f.clone());
         let (host, host_start) = host_calling(&f, "f", None);
-        let n = instrument_inline_candidates(&[host.clone()], 100.0, &translator);
+        let n = instrument_inline_candidates(std::slice::from_ref(&host), 100.0, &translator);
         assert_eq!(n, 1);
         // The startblock should now hold [instrument_count, direct_call].
         let ops = host_start.borrow().operations.clone();
@@ -3926,7 +3934,7 @@ mod tests {
 
         let _ = auto_inline_graphs(
             &translator,
-            &[g.clone()],
+            std::slice::from_ref(&g),
             100.0,
             always_low_weight_heuristic,
             None,

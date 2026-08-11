@@ -747,15 +747,13 @@ impl OptPure {
         if op1_args.len() - start_index1 != op2_args.len() - start_index2 {
             return false;
         }
-        let mut j = start_index2;
-        for i in start_index1..op1_args.len() {
+        for (j, i) in (start_index2..).zip(start_index1..op1_args.len()) {
             // pure.py:240-247 — same_box(op1_args[i], op2_args[j])
             // applies `get_box_replacement` to both sides, then dispatches
             // identity vs Const value equality (`history.py:204-205`).
             if !ctx.same_box(op1_args[i], op2_args[j]) {
                 return false;
             }
-            j += 1;
         }
         true
     }
@@ -839,12 +837,9 @@ impl OptPure {
         let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
         for i in start_index..op.num_args() {
             let forced = self.force_box(&op.arg(i), ctx);
-            let Some(const_value) = ctx
+            let const_value = ctx
                 .get_box_replacement_operand_opt(forced)
-                .and_then(|b| ctx.get_constant_box(&b))
-            else {
-                return None;
-            };
+                .and_then(|b| ctx.get_constant_box(&b))?;
             arg_consts.push(const_value);
         }
         self.call_pure_results
@@ -1397,7 +1392,7 @@ mod tests {
                 .and_then(|b| b.produced_short_op(&source_box.clone()))
                 .map(|p| p.preamble_op)
                 .unwrap_or_else(|| {
-                    let mut same_as = Op::new(OpCode::SameAsI, &[source_box.clone()]);
+                    let mut same_as = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_box));
                     same_as.pos.set(source);
                     std::rc::Rc::new(same_as)
                 });
@@ -2000,7 +1995,7 @@ mod tests {
         // `Some(Type::Void)`.
         let mut b = crate::history::test_support::TraceBuilder::new();
         let f0 = b.input(Type::Float, 0);
-        b.op(OpCode::CallPureF, &[f0.clone()]);
+        b.op(OpCode::CallPureF, std::slice::from_ref(&f0));
         b.op(OpCode::CallPureN, &[f0]);
         let (ops, inputs) = b.build();
 
@@ -2288,7 +2283,7 @@ mod tests {
         let descr = group.field_descrs[0].clone() as majit_ir::DescrRef;
         let base = crate::history::test_support::rooted_inputarg_operand(Type::Ref, 100);
         let mut ops = vec![
-            Op::with_descr(opcode, &[base.clone()], descr.clone()),
+            Op::with_descr(opcode, std::slice::from_ref(&base), descr.clone()),
             Op::with_descr(opcode, &[base], descr),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -2338,7 +2333,7 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let arg_box = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.make_constant_box(&arg_box, Value::Int(2));
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[arg_box.clone()], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, std::slice::from_ref(&arg_box), descr);
         op.pos.set(OpRef::int_op(0));
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op

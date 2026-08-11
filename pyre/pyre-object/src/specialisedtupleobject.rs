@@ -239,21 +239,33 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_specialised_tuple_ii(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SPECIALISED_TUPLE_II_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_specialised_tuple_ff(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SPECIALISED_TUPLE_FF_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_specialised_tuple_oo(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SPECIALISED_TUPLE_OO_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_specialised_tuple(obj: PyObjectRef) -> bool {
     unsafe {
         is_specialised_tuple_ii(obj) || is_specialised_tuple_ff(obj) || is_specialised_tuple_oo(obj)

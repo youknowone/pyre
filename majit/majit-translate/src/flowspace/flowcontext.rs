@@ -626,7 +626,8 @@ impl BlockRecorder {
                 self.entry_state.clone(),
                 false,
             );
-            ctx.pendingblocks.push_back(PendingBlock::Egg(egg.clone()));
+            ctx.pendingblocks
+                .push_back(PendingBlock::Egg(Box::new(egg.clone())));
             links.push(
                 Link::new(
                     Vec::new(),
@@ -674,7 +675,8 @@ impl BlockRecorder {
                 false,
             );
             egg.extravars(last_exception.clone());
-            ctx.pendingblocks.push_back(PendingBlock::Egg(egg.clone()));
+            ctx.pendingblocks
+                .push_back(PendingBlock::Egg(Box::new(egg.clone())));
             let mut link = Link::new(vars, Some(egg.block.clone()), case.clone());
             if let Some(last_exc) = last_exception {
                 link.extravars(
@@ -762,7 +764,7 @@ impl Replayer {
                 .clone()
                 .unwrap_or_else(|| self.inputargs[self.inputargs.len() - 2].clone());
             let w_exc_value = self.inputargs[self.inputargs.len() - 1].clone();
-            return Err(FlowContextError::Signal(FlowSignal::RaiseImplicit {
+            return Err(FlowContextError::from_signal(FlowSignal::RaiseImplicit {
                 w_exc: FSException::new(w_exc_cls, w_exc_value),
             }));
         }
@@ -801,11 +803,15 @@ impl Recorder {
 
 #[derive(Clone, Debug)]
 pub enum PendingBlock {
-    Spam(SpamBlock),
-    Egg(EggBlock),
+    Spam(Box<SpamBlock>),
+    Egg(Box<EggBlock>),
 }
 
 impl PendingBlock {
+    fn spam(block: SpamBlock) -> Self {
+        Self::Spam(Box::new(block))
+    }
+
     pub fn block(&self) -> BlockRef {
         match self {
             PendingBlock::Spam(block) => block.block.clone(),
@@ -840,7 +846,13 @@ pub enum FlowContextError {
     StopFlowing,
     BytecodeCorruption(BytecodeCorruption),
     Flowing(FlowingError),
-    Signal(FlowSignal),
+    Signal(Box<FlowSignal>),
+}
+
+impl FlowContextError {
+    fn from_signal(signal: FlowSignal) -> Self {
+        Self::Signal(Box::new(signal))
+    }
 }
 
 impl From<BytecodeCorruption> for FlowContextError {
@@ -1107,7 +1119,9 @@ impl FlowContext {
                         Some(format!("No module named '{name}'")),
                     ),
                 );
-                Err(FlowContextError::Signal(FlowSignal::Raise { w_exc: exc }))
+                Err(FlowContextError::from_signal(FlowSignal::Raise {
+                    w_exc: exc,
+                }))
             }
         }
     }
@@ -1175,7 +1189,9 @@ impl FlowContext {
                         Some(format!("cannot import name '{name}'")),
                     ),
                 );
-                Err(FlowContextError::Signal(FlowSignal::Raise { w_exc: exc }))
+                Err(FlowContextError::from_signal(FlowSignal::Raise {
+                    w_exc: exc,
+                }))
             }
         }
     }
@@ -1333,7 +1349,7 @@ impl FlowContext {
                 self.guessbool(w_is)?
             };
             if !arg2_is_none {
-                return Err(FlowContextError::Signal(FlowSignal::Raise {
+                return Err(FlowContextError::from_signal(FlowSignal::Raise {
                     w_exc: FSException::new(
                         exception_class_value("TypeError"),
                         exception_instance_value(
@@ -1466,7 +1482,7 @@ impl FlowContext {
             && let Some(items) = value.sequence_items()
         {
             if items.len() != expected_length {
-                return Err(FlowContextError::Signal(FlowSignal::Raise {
+                return Err(FlowContextError::from_signal(FlowSignal::Raise {
                     w_exc: FSException::new(
                         exception_class_value("ValueError"),
                         exception_instance_value("ValueError", None),
@@ -1493,7 +1509,7 @@ impl FlowContext {
         )?;
         let w_correct_bool = self.bool_operand(w_correct)?;
         if !self.guessbool(w_correct_bool)? {
-            return Err(FlowContextError::Signal(FlowSignal::Raise {
+            return Err(FlowContextError::from_signal(FlowSignal::Raise {
                 w_exc: FSException::new(
                     exception_class_value("ValueError"),
                     exception_instance_value("ValueError", None),
@@ -1603,7 +1619,7 @@ impl FlowContext {
     fn pop_hlvalue(&mut self) -> Result<Hlvalue, FlowContextError> {
         match self.popvalue() {
             StackElem::Value(value) => Ok(value),
-            StackElem::Signal(signal) => Err(FlowContextError::Signal(signal)),
+            StackElem::Signal(signal) => Err(FlowContextError::from_signal(signal)),
         }
     }
 
@@ -1612,7 +1628,7 @@ impl FlowContext {
             .into_iter()
             .map(|item| match item {
                 StackElem::Value(value) => Ok(value),
-                StackElem::Signal(signal) => Err(FlowContextError::Signal(signal)),
+                StackElem::Signal(signal) => Err(FlowContextError::from_signal(signal)),
             })
             .collect()
     }
@@ -2002,7 +2018,7 @@ impl FlowContext {
                         .into_ref(),
                 ]);
                 self.pendingblocks
-                    .push_back(PendingBlock::Spam(replacement.clone()));
+                    .push_back(PendingBlock::spam(replacement.clone()));
                 self.joinpoints.get_mut(&next_offset).unwrap()[idx] = replacement;
                 return;
             }
@@ -2022,7 +2038,7 @@ impl FlowContext {
             Link::new_mergeable(outputargs, Some(newblock.block.clone()), None).into_ref(),
         ]);
         self.pendingblocks
-            .push_back(PendingBlock::Spam(newblock.clone()));
+            .push_back(PendingBlock::spam(newblock.clone()));
         newblock
     }
 
@@ -2036,7 +2052,7 @@ impl FlowContext {
         {
             locals[index] = Some(arg);
         }
-        PendingBlock::Spam(SpamBlock::from_block(
+        PendingBlock::spam(SpamBlock::from_block(
             self.graph.startblock.clone(),
             FrameState::new(locals, Vec::new(), None, Vec::new(), 0),
         ))
@@ -2830,7 +2846,9 @@ impl FlowContext {
                     let w_name = self.getname_w(oparg as usize)?;
                     let w_module = match self.peekvalue() {
                         StackElem::Value(value) => value,
-                        StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
+                        StackElem::Signal(signal) => {
+                            return Err(FlowContextError::from_signal(signal));
+                        }
                     };
                     let w_value = self.import_from(w_module, w_name)?;
                     self.pushvalue(StackElem::Value(w_value));
@@ -2931,7 +2949,7 @@ impl FlowContext {
                             )?
                         }
                     };
-                    Err(FlowContextError::Signal(FlowSignal::Raise { w_exc }))
+                    Err(FlowContextError::from_signal(FlowSignal::Raise { w_exc }))
                 }
                 Instruction::CheckExcMatch => {
                     let w_check_class = self.pop_hlvalue()?;
@@ -2989,7 +3007,9 @@ impl FlowContext {
                     let w_value = self.pop_hlvalue()?;
                     let w_list = match self.peekvalue_at((oparg as usize).saturating_sub(1)) {
                         StackElem::Value(value) => value,
-                        StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
+                        StackElem::Signal(signal) => {
+                            return Err(FlowContextError::from_signal(signal));
+                        }
                     };
                     self.record_side_effect_op(
                         "list_append",
@@ -3002,7 +3022,9 @@ impl FlowContext {
                     let w_iterable = self.pop_hlvalue()?;
                     let w_list = match self.peekvalue_at((oparg as usize).saturating_sub(1)) {
                         StackElem::Value(value) => value,
-                        StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
+                        StackElem::Signal(signal) => {
+                            return Err(FlowContextError::from_signal(signal));
+                        }
                     };
                     self.record_side_effect_op(
                         "list_extend",
@@ -3015,7 +3037,9 @@ impl FlowContext {
                     let w_value = self.pop_hlvalue()?;
                     let w_set = match self.peekvalue_at((oparg as usize).saturating_sub(1)) {
                         StackElem::Value(value) => value,
-                        StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
+                        StackElem::Signal(signal) => {
+                            return Err(FlowContextError::from_signal(signal));
+                        }
                     };
                     self.record_side_effect_op(
                         "set_add",
@@ -3028,7 +3052,9 @@ impl FlowContext {
                     let w_other = self.pop_hlvalue()?;
                     let w_set = match self.peekvalue_at((oparg as usize).saturating_sub(1)) {
                         StackElem::Value(value) => value,
-                        StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
+                        StackElem::Signal(signal) => {
+                            return Err(FlowContextError::from_signal(signal));
+                        }
                     };
                     self.record_side_effect_op(
                         "set_update",
@@ -3042,7 +3068,9 @@ impl FlowContext {
                     let w_key = self.pop_hlvalue()?;
                     let w_dict = match self.peekvalue_at((oparg as usize).saturating_sub(1)) {
                         StackElem::Value(value) => value,
-                        StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
+                        StackElem::Signal(signal) => {
+                            return Err(FlowContextError::from_signal(signal));
+                        }
                     };
                     self.record_side_effect_op(
                         "map_add",
@@ -3055,7 +3083,9 @@ impl FlowContext {
                     let w_other = self.pop_hlvalue()?;
                     let w_dict = match self.peekvalue_at((oparg as usize).saturating_sub(1)) {
                         StackElem::Value(value) => value,
-                        StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
+                        StackElem::Signal(signal) => {
+                            return Err(FlowContextError::from_signal(signal));
+                        }
                     };
                     let opname = if matches!(instruction, Instruction::DictMerge { .. }) {
                         "dict_merge"
@@ -3114,7 +3144,7 @@ impl FlowContext {
                                 "RERAISE without an active exception",
                             ))
                         })?;
-                    Err(FlowContextError::Signal(FlowSignal::Raise { w_exc }))
+                    Err(FlowContextError::from_signal(FlowSignal::Raise { w_exc }))
                 }
                 Instruction::WithExceptStart => {
                     if self.stack.len() < 5 {
@@ -3127,11 +3157,15 @@ impl FlowContext {
                     // function sits at peekvalue_at(4) and self at (3).
                     let w_exitfunc = match self.peekvalue_at(4) {
                         StackElem::Value(value) => value,
-                        StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
+                        StackElem::Signal(signal) => {
+                            return Err(FlowContextError::from_signal(signal));
+                        }
                     };
                     let w_self_or_null = match self.peekvalue_at(3) {
                         StackElem::Value(value) => value,
-                        StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
+                        StackElem::Signal(signal) => {
+                            return Err(FlowContextError::from_signal(signal));
+                        }
                     };
                     let w_exc_value = self
                         .last_exception
@@ -3265,7 +3299,7 @@ impl FlowContext {
                 }
                 Instruction::ReturnValue => {
                     let value = self.pop_hlvalue()?;
-                    Err(FlowContextError::Signal(FlowSignal::Return {
+                    Err(FlowContextError::from_signal(FlowSignal::Return {
                         w_value: value,
                     }))
                 }
@@ -3441,7 +3475,7 @@ impl FlowContext {
         match step {
             Ok(Some(offset)) => Ok(offset),
             Ok(None) => Ok(decoded_next_offset as i64),
-            Err(FlowContextError::Signal(signal)) => self.unroll(signal),
+            Err(FlowContextError::Signal(signal)) => self.unroll(*signal),
             Err(err) => Err(err),
         }
     }
@@ -3811,9 +3845,12 @@ mod test {
             )
             .unwrap_err();
         match err {
-            FlowContextError::Signal(FlowSignal::Raise { w_exc }) => {
-                assert_eq!(w_exc.w_type, exception_class_value("ValueError"));
-            }
+            FlowContextError::Signal(signal) => match *signal {
+                FlowSignal::Raise { w_exc } => {
+                    assert_eq!(w_exc.w_type, exception_class_value("ValueError"));
+                }
+                other => panic!("expected Raise(ValueError), got {other:?}"),
+            },
             other => panic!("expected Raise(ValueError), got {other:?}"),
         }
     }
@@ -4153,12 +4190,15 @@ mod test {
         let w_value = Hlvalue::Constant(Constant::new(ConstValue::byte_str("junk")));
         let err = ctx.exc_from_raise(w_non_type, w_value).unwrap_err();
         match err {
-            FlowContextError::Signal(FlowSignal::Raise { w_exc }) => match &w_exc.w_type {
-                Hlvalue::Constant(Constant {
-                    value: ConstValue::HostObject(obj),
-                    ..
-                }) if obj.is_class() => assert_eq!(obj.qualname(), "TypeError"),
-                other => panic!("expected TypeError class constant, got {other:?}"),
+            FlowContextError::Signal(signal) => match *signal {
+                FlowSignal::Raise { w_exc } => match &w_exc.w_type {
+                    Hlvalue::Constant(Constant {
+                        value: ConstValue::HostObject(obj),
+                        ..
+                    }) if obj.is_class() => assert_eq!(obj.qualname(), "TypeError"),
+                    other => panic!("expected TypeError class constant, got {other:?}"),
+                },
+                other => panic!("expected Raise(TypeError), got {other:?}"),
             },
             other => panic!("expected Raise(TypeError), got {other:?}"),
         }
@@ -4301,7 +4341,7 @@ mod test {
 
     #[test]
     fn const_value_float_round_trips_and_folds() {
-        let original = 3.14_f64;
+        let original = 3.25_f64;
         let cv = ConstValue::float(original);
         assert_eq!(cv.as_float(), Some(original));
         let c = Constant::new(cv);
@@ -4310,7 +4350,7 @@ mod test {
         assert!(c.foldable());
         // Python `bool(3.14) == True`.
         assert_eq!(
-            Constant::new(ConstValue::float(3.14)).value.truthy(),
+            Constant::new(ConstValue::float(3.25)).value.truthy(),
             Some(true)
         );
         assert_eq!(

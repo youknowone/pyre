@@ -461,16 +461,25 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
 ///
 /// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
 /// storage list by `Member.index`.  `PY_NULL` is the unbound-slot sentinel.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_str_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
     unsafe { crate::slots::slot_get(obj, index, str_slots_field) }
 }
 
 /// Write one app-level `__slots__` entry on a `str` subclass.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_str_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
     unsafe { crate::slots::slot_set(obj, index, value, str_slots_field) }
 }
 
 /// Clear one app-level `__slots__` entry on a `str` subclass.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_str_slot_del(obj: PyObjectRef, index: usize) -> bool {
     unsafe { crate::slots::slot_del(obj, index, str_slots_field) }
 }

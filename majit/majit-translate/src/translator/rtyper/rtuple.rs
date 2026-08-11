@@ -2226,6 +2226,10 @@ impl Repr for TupleRepr {
     /// RPython `TupleRepr.make_iterator_repr(self, variant=None)`
     /// (rtuple.py:214-222).  A tuple is immutable, so the list foldable
     /// flag is irrelevant here.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     fn make_iterator_repr(
         &self,
         variant: &[String],

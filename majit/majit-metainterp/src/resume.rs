@@ -644,6 +644,10 @@ impl ResumeStorage {
     /// Internal accessor for the GC root walker. SAFETY: caller must
     /// ensure exclusive access — only the minor-collection walker in
     /// `MetaInterp::walk_rd_consts_refs` uses this.
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "The stop-the-world GC root walker is the sole writer and ResumeDataStorage owns an UnsafeCell-backed root vector; this unsafe accessor makes that externally enforced exclusivity explicit"
+    )]
     pub(crate) unsafe fn rd_consts_mut_for_gc(&self) -> &mut Vec<Const> {
         unsafe { self.rd_consts.as_mut_vec_for_gc() }
     }
@@ -3823,7 +3827,7 @@ impl ResumeDataLoopMemo {
     /// - `get_type(opref)` → box.type ('i', 'r', 'f') (resume.py:211,214)
     /// - `is_virtual_ref(opref)` → getptrinfo(box).is_virtual() (resume.py:212-213)
     /// - `is_virtual_raw(opref)` → getrawptrinfo(box).is_virtual() (resume.py:215-216)
-    /// resume.py:192-226 `_number_boxes` — tag each box in a snapshot section.
+    ///   resume.py:192-226 `_number_boxes` — tag each box in a snapshot section.
     pub fn _number_boxes(
         &mut self,
         boxes: &[SnapshotBox],
@@ -4028,6 +4032,10 @@ impl ResumeDataLoopMemo {
     /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)`.
     /// `livebox_types` maps typed OpRef → Type, captured at numbering time
     /// (RPython Box.type parity).
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub fn finish(
         &mut self,
         mut numb_state: NumberingState,
@@ -6940,8 +6948,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             "force_all_virtuals: virtuals_ptr_cache is not a registered resume root"
         );
         if let Some(rd_virtuals) = self.rd_virtuals {
-            for i in 0..rd_virtuals.len() {
-                let rd_virtual = &rd_virtuals[i];
+            for (i, rd_virtual) in rd_virtuals.iter().enumerate() {
                 // resume.py:973 `if rd_virtual is not None`: skip empty
                 // slots (Pyre carries them as the `Empty`-derived
                 // placeholder shape).
@@ -7802,6 +7809,10 @@ fn prepare_resume_heap_with_roots<'a>(
 /// `blackhole_from_resumedata`: it sizes `rd_virtuals`, roots the virtual cache,
 /// materializes virtual pending-field targets/values on demand, and applies
 /// `rd_pendingfields`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 pub fn prepare_resume_heap<'a>(
     rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
@@ -7831,6 +7842,10 @@ pub fn prepare_resume_heap<'a>(
         prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, Some(guard_pf));
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
     resolve_jitcode: &dyn Fn(i32, i32) -> Option<ResolvedJitCode>,
@@ -7966,6 +7981,10 @@ pub fn blackhole_from_resumedata<'a>(
 /// parity — plus the virtualizable the vable section named, which the caller
 /// needs as the cache key (see `MetaInterp::save_forced_virtuals`).
 #[allow(clippy::needless_lifetimes)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 pub fn force_from_resumedata<'a>(
     profiler: &crate::jitprof::JitProfiler,
     rd_numb: &'a [u8],

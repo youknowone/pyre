@@ -2611,7 +2611,7 @@ fn try_adopt_single_frame_blackhole(
         eprintln!(
             "[s1-drive-outcome] {}",
             match terminal.outcome {
-                majit_metainterp::jitexc::JitException::ContinueRunningNormally { .. } =>
+                majit_metainterp::jitexc::JitException::ContinueRunningNormally(_) =>
                     "ContinueRunningNormally",
                 majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid =>
                     "DoneWithThisFrameVoid",
@@ -2627,14 +2627,12 @@ fn try_adopt_single_frame_blackhole(
         );
     }
     match terminal.outcome {
-        majit_metainterp::jitexc::JitException::ContinueRunningNormally {
-            ref green_int, ..
-        } => {
+        majit_metainterp::jitexc::JitException::ContinueRunningNormally(ref args) => {
             // The portal's `jit_merge_point` carries `py_pc` as its first int
             // green. Upstream indexes that green unconditionally
             // (`warmspot.py:973-976`); a missing one is a codewriter invariant
             // failure, never a licence to replay an already-driven region.
-            let &resume_py_pc = green_int.first().expect(
+            let &resume_py_pc = args.green_int.first().expect(
                 "post-blackhole ContinueRunningNormally has no resume pc; \
                  replay is forbidden after blackhole effects",
             );
@@ -3103,10 +3101,8 @@ fn try_adopt_multi_frame_blackhole(
         }
     }
     match outcome {
-        majit_metainterp::jitexc::JitException::ContinueRunningNormally {
-            ref green_int, ..
-        } => {
-            let &resume_py_pc = green_int.first().expect(
+        majit_metainterp::jitexc::JitException::ContinueRunningNormally(ref args) => {
+            let &resume_py_pc = args.green_int.first().expect(
                 "post-blackhole ContinueRunningNormally has no resume pc; \
                  replay is forbidden after blackhole effects",
             );

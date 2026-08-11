@@ -110,6 +110,10 @@ fn is_falsy(value: &ConstValue) -> bool {
 /// * `varmap` — substitution from "any-block-in-chain Variable" to
 ///   "first-block Variable" so the merged block's link args route
 ///   correctly.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn merge_chain(
     chain: &[(BlockRef, Hlvalue)],
     checkvar: &Hlvalue,
@@ -200,6 +204,10 @@ fn merge_chain(
 /// RPython `merge_if_blocks_once(graph)` (`merge_if_blocks.py:63-122`).
 ///
 /// Returns `true` when a chain was merged (caller should retry).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn merge_if_blocks_once(graph: &FunctionGraph) -> bool {
     let mut candidates: Vec<BlockRef> = Vec::new();
     for block in graph.iterblocks() {
@@ -400,6 +408,10 @@ fn merge_if_blocks_once(graph: &FunctionGraph) -> bool {
 /// `HashMap<Variable, Hlvalue>` and silently dropped the None case;
 /// `varmap` now carries `LinkArg` so `varmap[newvar] = var` is
 /// always representable.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn add_to_varmap(varmap: &mut HashMap<Variable, LinkArg>, var: &LinkArg, newvar: Variable) {
     let value: LinkArg = match var {
         Some(Hlvalue::Variable(v)) => varmap

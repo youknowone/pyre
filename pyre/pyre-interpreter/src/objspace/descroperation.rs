@@ -4805,10 +4805,10 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             && !is_instance(b)
             && let (Some(a_type), Some(b_type)) =
                 (crate::typedef::r#type(a), crate::typedef::r#type(b))
+            && a_type != b_type
+            && issubtype_cached(b_type.as_ptr(), a_type.as_ptr())
         {
-            if a_type != b_type && issubtype_cached(b_type.as_ptr(), a_type.as_ptr()) {
-                return compare_slot(b, a, reverse_compare_op(op));
-            }
+            return compare_slot(b, a, reverse_compare_op(op));
         }
     }
     compare_slot(a, b, op)

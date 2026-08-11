@@ -68,6 +68,10 @@ pub const W_OBJECT_OBJECT_GC_TYPE_ID: u32 = 53;
 /// Allocate a new instance of a user-defined class.
 ///
 /// PyPy equivalent: object.__new__(space, w_type) → allocate_instance
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`) for
     // the allocation below. `w_type` is a `W_TypeObject`
@@ -167,12 +171,18 @@ fn alloc_instance_object(value: W_ObjectObject) -> PyObjectRef {
 }
 
 /// Get the class (W_TypeObject) of an instance.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_instance_get_type(obj: PyObjectRef) -> PyObjectRef {
     (*obj).w_class
 }
 
 /// Check if an object is an instance of a user-defined class.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_instance(obj: PyObjectRef) -> bool {
     py_type_check(obj, &INSTANCE_TYPE)
 }

@@ -701,6 +701,10 @@ pub const RANGE_LENGTH_OFFSET: usize = std::mem::offset_of!(W_Range, length);
 /// already be non-zero (the caller raises `ValueError` for a zero step
 /// before reaching here).  The element count is computed once here and
 /// stored, mirroring `descr_new`'s `compute_range_length`.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn w_range_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(start);

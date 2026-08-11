@@ -145,6 +145,10 @@ pub fn w_module_new_managed(name: &str) -> PyObjectRef {
 /// tracing the allocation. The `-> PyObjectRef` result is a plain GCREF with no
 /// discriminant to erase.
 #[majit_macros::dont_look_inside]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn w_module_new_aliasing_dict(name: &str, w_dict_object: PyObjectRef) -> PyObjectRef {
     let value = module_aliasing_dict_value(name, w_dict_object);
     crate::lltype::malloc_typed(value) as PyObjectRef

@@ -492,6 +492,10 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
 /// getfield — pointer identity, which `compute_bitstrings` keys on.  Must run
 /// before `finish_setup_descrs` (jitcode assembly does), matching the
 /// non-trivial-raw-set construction-timing `call_descr` asserts.
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub fn struct_fields_write_effect_info(
     layouts: &[(usize, u64, bool, &[(usize, bool, &str, usize, bool)])],
     can_raise: bool,
@@ -2598,10 +2602,14 @@ where
     ///    so nothing is recorded, and `opimpl_goto_if_not` then sees a `Const`
     ///    condbox so `generate_guard` records no guard either (pyjitpl.py:523,
     ///    2583).
-    /// Only a non-constant, non-same-box operand pair materialises the compare
+    ///    Only a non-constant, non-same-box operand pair materialises the compare
     /// + guard. The branch is followed identically in all cases (`taken`
-    /// already reflects the concrete condition): `taken` = condition true =
-    /// fall through; `!taken` jumps to `target`.
+    ///   already reflects the concrete condition): `taken` = condition true =
+    ///   fall through; `!taken` jumps to `target`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn record_or_fold_fused_guard(
         &mut self,
         ctx: &mut TraceCtx,
@@ -2639,7 +2647,7 @@ where
                 | OpCode::FloatGe
         );
         let same_box = !is_float && lhs.same_box(rhs);
-        if !same_box && !(lhs.is_constant() && rhs.is_constant()) {
+        if !(same_box || lhs.is_constant() && rhs.is_constant()) {
             let cond = ctx.record_op(opcode, &[lhs, rhs]);
             ctx.set_opref_concrete(cond, majit_ir::Value::Int(taken as i64));
             let guard = if taken {
@@ -5240,9 +5248,8 @@ where
                 // native state — completing the transfer that storage-only
                 // `recover` cannot (loop-carried reds never written to the heap).
                 let mut walk_reds: Vec<Value> = Vec::new();
-                for slot in 0..6 {
+                for (slot, &max) in max_regs.iter().enumerate().take(6) {
                     let count = frame.next_u8() as usize;
-                    let max = max_regs[slot];
                     let is_green_slot = slot < 3;
                     for _ in 0..count {
                         let reg = frame.next_reg();
@@ -8597,6 +8604,10 @@ where
         }
     }
 
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     fn read_canonical_call_args(
         &mut self,
         arg_classes: &str,
@@ -9412,6 +9423,10 @@ fn build_concrete_values(
     values
 }
 
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
+)]
 pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
     // Where a backend cannot build a `call_indirect` whose type matches the
     // callee's real signature (wasm32), route through the host trampoline,
@@ -9757,6 +9772,10 @@ pub fn call_ref_function(func_ptr: *const (), args: &[i64]) -> i64 {
     call_int_function(func_ptr, args)
 }
 
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
+)]
 pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
     // See `call_int_function`: the host trampoline reflects the callee's real
     // signature, so a void-typed residual whose target actually returns `i64`

@@ -892,9 +892,7 @@ impl TreeLoop {
                 if !seen.insert(r) {
                     continue;
                 }
-                let Some(op) = self.ops.get((r.raw() - num_original_inputargs) as usize) else {
-                    return None;
-                };
+                let op = self.ops.get((r.raw() - num_original_inputargs) as usize)?;
                 if !op.opcode.is_always_pure() {
                     if !is_root || !op.opcode.is_malloc() {
                         return None;
@@ -1087,12 +1085,10 @@ impl TreeLoop {
         // Phase 5: Re-emit escaped ops as prefix, assigning fresh OpRefs.
         // Result type comes from the original op's opcode so the new OpRef
         // variant matches RPython's IntOp/FloatOp/RefOp dispatch.
-        let mut next_ref = new_inputargs_count;
-        for &r in &op_escaped {
+        for (next_ref, &r) in (new_inputargs_count..).zip(op_escaped.iter()) {
             let op_idx = (r.raw() - num_original_inputargs) as usize;
             let result_tp = self.ops[op_idx].opcode.result_type();
             remap.insert(r, OpRef::op_typed(next_ref, result_tp));
-            next_ref += 1;
         }
 
         // Also assign fresh refs for post-cut ops (shifted by prefix count).
@@ -2966,14 +2962,14 @@ impl TraceCtx {
     /// (`resoperation.py`).  Production guard recording goes through
     /// the snapshot path (`record_guard_typed` + `capture_resumedata`
     /// + `set_last_guard_resume_position`); the optimizer's
-    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:3200`) then
-    /// derives `op.fail_args` from the snapshot via
-    /// `op.store_final_boxes(liveboxes)` (`mod.rs:3392`).  This setter
-    /// is for tests and other callers that construct synthetic guard
-    /// shapes outside the standard `capture_resumedata` flow —
-    /// matching how RPython's `test_resume.py` /
-    /// `test_optimizeopt.py` build `ResOperation`s with `setfailargs`
-    /// directly rather than through `history.record_default_val`.
+    ///   `store_final_boxes_in_guard` (`optimizeopt/mod.rs:3200`) then
+    ///   derives `op.fail_args` from the snapshot via
+    ///   `op.store_final_boxes(liveboxes)` (`mod.rs:3392`).  This setter
+    ///   is for tests and other callers that construct synthetic guard
+    ///   shapes outside the standard `capture_resumedata` flow —
+    ///   matching how RPython's `test_resume.py` /
+    ///   `test_optimizeopt.py` build `ResOperation`s with `setfailargs`
+    ///   directly rather than through `history.record_default_val`.
     pub fn set_fail_args(&mut self, opref: OpRef, fail_args: &[OpRef]) {
         self.recorder.set_op_fail_args(opref, fail_args);
     }
@@ -3313,7 +3309,6 @@ impl TraceCtx {
     ///
     /// Mirrors RPython's `current_merge_points[0]`: this stays anchored to the
     /// original loop/portal merge point even if `green_key` is later retargeted
-
     /// Record a promote: emit GuardValue to specialize on a runtime value.
     ///
     /// In RPython this is `jit.promote(x)` — it records a `GUARD_VALUE`
@@ -3696,6 +3691,10 @@ impl TraceCtx {
     /// helper does NOT emit `GuardNoException`.  For elidable-can-raise
     /// callees the caller must thread the call through the
     /// (yet-unwritten) variant that handles `handle_possible_exception`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn call_typed_with_effect_pure(
         &mut self,
         opcode: OpCode,
@@ -3735,6 +3734,10 @@ impl TraceCtx {
     /// `returned.inline_const_to_value().is_none()`. Used for the long division
     /// payload helpers (`rbigint.divmod`, `@jit.elidable`, raises
     /// ZeroDivisionError) — `longobject.py:409/426`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn call_typed_with_effect_pure_can_raise(
         &mut self,
         opcode: OpCode,
@@ -3833,6 +3836,10 @@ impl TraceCtx {
     /// `concrete_arg_values` contains the execution-time values for ALL
     /// args (pyjitpl.py:3572 `[executor.constant_from_op(a) for a in
     /// normargboxes]`). Used as the full cache key.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn record_result_of_call_pure(
         &mut self,
         op: OpRef,

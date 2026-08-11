@@ -882,13 +882,15 @@ mod set_effect_bitstrings_tests {
         use majit_ir::descr::SimpleFieldDescr;
         let f3: DescrRef = Arc::new(SimpleFieldDescr::new(3, 0, 8, Type::Int, false));
         let f7: DescrRef = Arc::new(SimpleFieldDescr::new(7, 0, 8, Type::Int, false));
-        let mut ei = EffectInfo::default();
-        ei._readonly_descrs_fields = Some(vec![f3, f7]);
-        ei._write_descrs_fields = Some(vec![]);
-        ei._readonly_descrs_arrays = Some(vec![]);
-        ei._write_descrs_arrays = Some(vec![]);
-        ei._readonly_descrs_interiorfields = Some(vec![]);
-        ei._write_descrs_interiorfields = Some(vec![]);
+        let ei = EffectInfo {
+            _readonly_descrs_fields: Some(vec![f3, f7]),
+            _write_descrs_fields: Some(vec![]),
+            _readonly_descrs_arrays: Some(vec![]),
+            _write_descrs_arrays: Some(vec![]),
+            _readonly_descrs_interiorfields: Some(vec![]),
+            _write_descrs_interiorfields: Some(vec![]),
+            ..EffectInfo::default()
+        };
         let descr = make_call_descr_with_effect(&[Type::Int], Type::Int, ei);
         let cd = descr.as_call_descr().unwrap();
         // Pre-set: bitstring_readonly_descrs_fields was seeded at
@@ -949,21 +951,25 @@ mod set_effect_bitstrings_tests {
         let f2: DescrRef = Arc::new(SimpleFieldDescr::new(91_000_002, 0, 8, Type::Int, false));
 
         // Two EIs that BOTH read `f1` (Arc identity).
-        let mut ei_a = EffectInfo::default();
-        ei_a._readonly_descrs_fields = Some(vec![f1.clone()]);
-        ei_a._write_descrs_fields = Some(vec![]);
-        ei_a._readonly_descrs_arrays = Some(vec![]);
-        ei_a._write_descrs_arrays = Some(vec![]);
-        ei_a._readonly_descrs_interiorfields = Some(vec![]);
-        ei_a._write_descrs_interiorfields = Some(vec![]);
+        let ei_a = EffectInfo {
+            _readonly_descrs_fields: Some(vec![f1.clone()]),
+            _write_descrs_fields: Some(vec![]),
+            _readonly_descrs_arrays: Some(vec![]),
+            _write_descrs_arrays: Some(vec![]),
+            _readonly_descrs_interiorfields: Some(vec![]),
+            _write_descrs_interiorfields: Some(vec![]),
+            ..EffectInfo::default()
+        };
 
-        let mut ei_b = EffectInfo::default();
-        ei_b._readonly_descrs_fields = Some(vec![f1.clone()]);
-        ei_b._write_descrs_fields = Some(vec![]);
-        ei_b._readonly_descrs_arrays = Some(vec![]);
-        ei_b._write_descrs_arrays = Some(vec![]);
-        ei_b._readonly_descrs_interiorfields = Some(vec![]);
-        ei_b._write_descrs_interiorfields = Some(vec![]);
+        let ei_b = EffectInfo {
+            _readonly_descrs_fields: Some(vec![f1.clone()]),
+            _write_descrs_fields: Some(vec![]),
+            _readonly_descrs_arrays: Some(vec![]),
+            _write_descrs_arrays: Some(vec![]),
+            _readonly_descrs_interiorfields: Some(vec![]),
+            _write_descrs_interiorfields: Some(vec![]),
+            ..EffectInfo::default()
+        };
 
         let cd_a = make_call_descr_with_effect(&[Type::Int], Type::Int, ei_a.clone());
         let cd_b = make_call_descr_with_effect(&[Type::Float], Type::Float, ei_b.clone());
@@ -1025,13 +1031,15 @@ mod set_effect_bitstrings_tests {
     fn gc_cache_call_snapshot_returns_recent_entries() {
         use majit_ir::descr::SimpleFieldDescr;
         let f1: DescrRef = Arc::new(SimpleFieldDescr::new(1, 0, 8, Type::Int, false));
-        let mut ei = EffectInfo::default();
-        ei._readonly_descrs_fields = Some(vec![f1]);
-        ei._write_descrs_fields = Some(vec![]);
-        ei._readonly_descrs_arrays = Some(vec![]);
-        ei._write_descrs_arrays = Some(vec![]);
-        ei._readonly_descrs_interiorfields = Some(vec![]);
-        ei._write_descrs_interiorfields = Some(vec![]);
+        let ei = EffectInfo {
+            _readonly_descrs_fields: Some(vec![f1]),
+            _write_descrs_fields: Some(vec![]),
+            _readonly_descrs_arrays: Some(vec![]),
+            _write_descrs_arrays: Some(vec![]),
+            _readonly_descrs_interiorfields: Some(vec![]),
+            _write_descrs_interiorfields: Some(vec![]),
+            ..EffectInfo::default()
+        };
         let descr = make_call_descr_with_effect(&[Type::Int, Type::Ref], Type::Float, ei);
 
         let cached = majit_ir::descr::gc_cache().lock().unwrap().snapshot_calls();

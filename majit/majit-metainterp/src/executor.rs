@@ -527,18 +527,18 @@ pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64
 /// for the opnum. RPython's `optimizer.py:810 constant_fold` does not catch
 /// that exception; it propagates to the caller. Pyre encodes the same
 /// dispatch distinction at the type level:
-///   * `Err(())` — no helper claimed the opnum (terminal
+///   * `Err(NoConstExecutor)` — no helper claimed the opnum (terminal
 ///     fall-through below), mirroring the upstream raise.
 ///   * `Ok(None)` — a helper claimed the opnum but declined to fold
 ///     (null gcref, unsupported field size, etc.); pyre keeps these
 ///     as `Ok(None)` so the caller can still see "helper ran, fold
 ///     skipped" distinctly from "no helper".
 ///   * `Ok(Some(value))` — successful fold.
-
-/// executor.py:555 `execute_nonspec_const` free function — the
-/// generic opnum dispatch invoked by `optimizer.py:810 constant_fold`
-/// once every arg has been resolved to a `Const*` via
-/// `get_constant_box`. Mirrors the RPython structure:
+///
+///     executor.py:555 `execute_nonspec_const` free function — the
+///     generic opnum dispatch invoked by `optimizer.py:810 constant_fold`
+///     once every arg has been resolved to a `Const*` via
+///     `get_constant_box`. Mirrors the RPython structure:
 ///
 /// ```python
 /// def execute_nonspec_const(cpu, metainterp, opnum, argboxes,
@@ -553,7 +553,7 @@ pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64
 /// `_execute_arglist` (executor.py:563-610) selects
 /// `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` and raises
 /// `NotImplementedError` (`:610`) only when no function is registered
-/// for the opnum. Pyre returns `Err(())` for that case and `Ok(None)`
+/// for the opnum. Pyre returns `Err(NoConstExecutor)` for that case and `Ok(None)`
 /// for helper-internal "decline to fold" outcomes (e.g. null gcref,
 /// unsupported field size).
 ///
@@ -561,13 +561,16 @@ pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64
 /// parameter; it is not consulted because the Value variant in
 /// `argboxes` already determines the result type via the helper that
 /// fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoConstExecutor;
+
 pub fn execute_nonspec_const(
     cpu: &dyn crate::cpu::Cpu,
     opnum: OpCode,
     argboxes: &[majit_ir::Value],
     descr: Option<&majit_ir::descr::DescrRef>,
     _type: majit_ir::Type,
-) -> Result<Option<majit_ir::Value>, ()> {
+) -> Result<Option<majit_ir::Value>, NoConstExecutor> {
     use majit_ir::Value;
     let arity = argboxes.len();
 
@@ -621,7 +624,7 @@ pub fn execute_nonspec_const(
                 },
                 OpCode::GetfieldGcR => Value::Ref(cpu.bh_getfield_gc_r(struct_ref.0, fd)),
                 OpCode::GetfieldGcF => Value::Float(cpu.bh_getfield_gc_f(struct_ref.0, fd)),
-                _ => return Err(()),
+                _ => return Err(NoConstExecutor),
             }));
         }
         // ARRAYLEN_GC — withdescr arity-1.
@@ -707,7 +710,7 @@ pub fn execute_nonspec_const(
                 OpCode::GetarrayitemGcPureF => {
                     Value::Float(cpu.bh_getarrayitem_gc_f(array, index, ad))
                 }
-                _ => return Err(()),
+                _ => return Err(NoConstExecutor),
             }));
         }
         // STRGETITEM / UNICODEGETITEM — protect_speculative_string /
@@ -747,8 +750,8 @@ pub fn execute_nonspec_const(
     // `executor.py:610 _execute_arglist` raises `NotImplementedError`
     // when `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` is None.
     // RPython's `optimizer.py:810 constant_fold` lets that propagate; Pyre
-    // encodes the same missing-helper signal as `Err(())`.
-    Err(())
+    // encodes the same missing-helper signal as `Err(NoConstExecutor)`.
+    Err(NoConstExecutor)
 }
 
 /// executor.py cross-type cast fold:
@@ -962,9 +965,11 @@ mod execute_residual_call_tests {
     }
 
     fn make_may_force_descr(arg_types: Vec<Type>, result_type: Type) -> SimpleCallDescr {
-        let mut effect = EffectInfo::default();
-        // EF_CAN_RAISE / forces — the non-pure classification.
-        effect.extraeffect = ExtraEffect::CanRaise;
+        let effect = EffectInfo {
+            // EF_CAN_RAISE / forces — the non-pure classification.
+            extraeffect: ExtraEffect::CanRaise,
+            ..EffectInfo::default()
+        };
         SimpleCallDescr::new(0, arg_types, result_type, false, 8, effect)
     }
 
@@ -1063,8 +1068,10 @@ mod execute_pure_call_tests {
     }
 
     fn make_descr(arg_types: Vec<Type>, result_type: Type) -> SimpleCallDescr {
-        let mut effect = EffectInfo::default();
-        effect.extraeffect = ExtraEffect::ElidableCannotRaise;
+        let effect = EffectInfo {
+            extraeffect: ExtraEffect::ElidableCannotRaise,
+            ..EffectInfo::default()
+        };
         SimpleCallDescr::new(0, arg_types, result_type, false, 8, effect)
     }
 
@@ -1160,8 +1167,10 @@ mod execute_pure_call_tests {
     #[test]
     #[should_panic(expected = "execute_pure_call requires EF_ELIDABLE_CANNOT_RAISE EI")]
     fn non_elidable_ei_panics_debug_assertion() {
-        let mut effect = EffectInfo::default();
-        effect.extraeffect = ExtraEffect::CannotRaise;
+        let effect = EffectInfo {
+            extraeffect: ExtraEffect::CannotRaise,
+            ..EffectInfo::default()
+        };
         let descr = SimpleCallDescr::new(0, vec![Type::Int], Type::Int, false, 8, effect);
         let _ = execute_pure_call(&descr, double_i64 as *const () as i64, &[1]);
     }
@@ -1170,8 +1179,10 @@ mod execute_pure_call_tests {
     #[test]
     #[should_panic(expected = "execute_pure_call requires EF_ELIDABLE_CANNOT_RAISE EI")]
     fn elidable_can_raise_panics_debug_assertion() {
-        let mut effect = EffectInfo::default();
-        effect.extraeffect = ExtraEffect::ElidableCanRaise;
+        let effect = EffectInfo {
+            extraeffect: ExtraEffect::ElidableCanRaise,
+            ..EffectInfo::default()
+        };
         let descr = SimpleCallDescr::new(0, vec![Type::Int], Type::Int, false, 8, effect);
         let _ = execute_pure_call(&descr, double_i64 as *const () as i64, &[1]);
     }

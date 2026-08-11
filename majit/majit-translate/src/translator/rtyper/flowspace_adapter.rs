@@ -405,6 +405,10 @@ fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
 /// `"undefined operand"` is preserved verbatim so the dual
 /// gate's `is_known_unported` predicate (`cutover.rs:441`) keeps
 /// matching this category.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn lookup_operand(
     value_map: &HashMap<Variable, Hlvalue>,
     operand: &Variable,
@@ -430,6 +434,10 @@ fn lookup_operand(
 /// RPython convention (every `SpaceOperation.result` slot is non-None
 /// upstream — model.py:432-438; void-result ops use a throwaway
 /// `Variable()`).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn resolve_result_hlvalue(
     op: &SpaceOperation,
     value_map: &HashMap<Variable, Hlvalue>,
@@ -1025,6 +1033,10 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
     }
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<Variable, Hlvalue>,
@@ -3132,6 +3144,10 @@ fn legacy_const_define_hlvalue(
 /// arg role).  The required substring `"undefined operand"`
 /// is preserved verbatim for `is_known_unported`
 /// (`cutover.rs:441`).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn link_arg_to_hlvalue(
     arg: &LinkArg,
     value_map: &HashMap<Variable, Hlvalue>,
@@ -3164,6 +3180,10 @@ fn link_arg_to_hlvalue(
 /// Pyre's legacy graph represents them as fresh slots whose only
 /// definition site is the link, so the adapter must materialise them in
 /// a per-link map instead of requiring a block-local definition.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn link_extravar_to_hlvalue(
     arg: &LinkArg,
     value_map: &mut HashMap<Variable, Hlvalue>,
@@ -3217,6 +3237,10 @@ fn link_extravar_to_hlvalue(
 ///   `ValueType` (only `ValueType::Unknown`) — the inputarg's type
 ///   is an annotation gap; the helper surfaces it the same way
 ///   `seed_variable` does (`flowspace_adapter.rs:99-115`).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub(crate) fn derive_subject_inputcells(
     legacy: &FunctionGraph,
     // Used to seed a `Ref` receiver with its cached, identity-stable
@@ -3498,6 +3522,10 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
 /// `legacy.variable(vid).annotation` directly via
 /// `legacy_annotator::setbinding(&var, ValueType::…)` before calling
 /// this function so `seed_variable` reads the right shell.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn function_graph_to_flowspace(
     legacy: &FunctionGraph,
     // Call resolution plumbing — see [`translate_op`].

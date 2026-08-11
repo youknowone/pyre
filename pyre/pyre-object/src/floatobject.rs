@@ -125,11 +125,17 @@ pub unsafe fn w_float_get_value(obj: PyObjectRef) -> f64 {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_float_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_FloatObject)).w_dict }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_float_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe { (*(obj as *mut W_FloatObject)).w_dict = w_dict };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
@@ -143,14 +149,23 @@ unsafe fn float_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
     unsafe { &mut (*(obj as *mut W_FloatObject)).w_slots }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_float_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
     unsafe { crate::slots::slot_get(obj, index, float_slots_field) }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_float_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
     unsafe { crate::slots::slot_set(obj, index, value, float_slots_field) }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_float_slot_del(obj: PyObjectRef, index: usize) -> bool {
     unsafe { crate::slots::slot_del(obj, index, float_slots_field) }
 }
@@ -171,11 +186,11 @@ mod tests {
 
     #[test]
     fn test_float_create_and_read() {
-        let obj = w_float_new(3.14);
+        let obj = w_float_new(3.25);
         unsafe {
             assert!(is_float(obj));
             assert!(!is_int(obj));
-            assert_eq!(w_float_get_value(obj), 3.14);
+            assert_eq!(w_float_get_value(obj), 3.25);
         }
     }
 

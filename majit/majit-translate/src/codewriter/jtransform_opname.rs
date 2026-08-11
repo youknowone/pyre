@@ -104,6 +104,10 @@ impl StrFamily {
 /// operands and block inputargs — they are the same
 /// `crate::flowspace::model::Variable` type and carry their `concretetype`
 /// cell through unchanged, so no value-bridge round-trip is needed.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
     let mut out = crate::model::FunctionGraph::new(graph.name.clone());
     let family = detect_family(graph);
@@ -207,6 +211,10 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
 /// `block`, materialising any constant operands as `ConstInt`/`ConstBool`
 /// ops and fusing `getsubstruct`-derived array accesses into the string
 /// blackhole opcodes.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn transduce_op(
     out: &mut crate::model::FunctionGraph,
     block: BlockId,
@@ -328,6 +336,10 @@ fn transduce_op(
 /// block-local `getsubstruct` alias map.  Fail-loud if the array was not
 /// produced by a same-block `getsubstruct` (e.g. threaded across a Phi —
 /// out of scope for this slice).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn resolve_string(chars_alias: &HashMap<FVar, FVar>, arr: &Hlvalue) -> FVar {
     let arr_var = expect_var(arr);
     chars_alias

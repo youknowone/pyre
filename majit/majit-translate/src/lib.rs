@@ -13,17 +13,61 @@
 //! (flowspace/operation.py ↔ annotator, annotator/annrpython.py ↔
 //! rtyper/normalizecalls.py) that Cargo's DAG crate boundary cannot model.
 
+#[cfg_attr(
+    test,
+    expect(
+        clippy::mutable_key_type,
+        clippy::type_complexity,
+        reason = "translator tests intentionally exercise RPython identity-keyed Variable maps and literal annotation signatures; Variable hashes only its immutable ID, and wrapping the upstream shapes would hide parity"
+    )
+)]
 pub mod annotator;
+#[cfg_attr(
+    test,
+    expect(
+        clippy::mutable_key_type,
+        clippy::arc_with_non_send_sync,
+        reason = "codewriter tests preserve RPython object identity: Variables hash only immutable IDs and JitCode Arc values are shared identity handles confined to the single-threaded translation run"
+    )
+)]
 pub mod codewriter;
 pub mod config;
+#[cfg_attr(
+    test,
+    expect(
+        clippy::mutable_key_type,
+        reason = "flowspace Variable keys compare and hash exclusively by immutable identity ID; interior annotation state is deliberately excluded, matching RPython's object-identity dictionaries"
+    )
+)]
 pub mod flowspace;
+#[cfg_attr(
+    test,
+    expect(
+        clippy::mutable_key_type,
+        reason = "these tests use Variable as RPython identity-dictionary keys; equality and hashing depend only on the immutable Variable ID"
+    )
+)]
 pub mod tool;
 pub use codewriter::{
     assembler, call, flatten, format, insns, jitcode, jtransform, liveness, policy, support,
 };
 pub use tool::algo::regalloc;
 
+#[cfg_attr(
+    test,
+    expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc is the established shared identity handle for generated JitCode; code generation is single-thread confined and never transfers its non-Send construction payload across threads"
+    )
+)]
 mod codegen;
+#[cfg_attr(
+    test,
+    expect(
+        clippy::type_complexity,
+        reason = "the graph-body census retains Charon's literal nested block/body map shape so extraction and source-translation parity remain directly auditable"
+    )
+)]
 pub mod front;
 // TODO(pyre): pyre-interpreter handler JitCode registry
 // (Rust source → FunctionGraph bridge with no RPython counterpart;
@@ -34,9 +78,23 @@ pub mod hints;
 pub mod inline;
 pub mod layout;
 mod local_crates;
+#[cfg_attr(
+    test,
+    expect(
+        clippy::type_complexity,
+        reason = "the model test spells the exact nested RPython graph shape under test; a one-use alias would conceal rather than simplify that contract"
+    )
+)]
 pub mod model;
 pub mod model_ssa;
 mod parse;
+#[cfg_attr(
+    test,
+    expect(
+        clippy::arc_with_non_send_sync,
+        reason = "the pipeline returns Arc<JitCode> as a stable shared identity handle across generated artifacts; all mutation and use remain within the single-threaded translator"
+    )
+)]
 pub mod pipeline;
 #[cfg(test)]
 mod test_support;
@@ -46,6 +104,15 @@ mod test_support;
 // port, alongside the transitional `legacy_{annotator,resolve,pipeline}.rs`
 // adapters that the cutover (`translator/rtyper/cutover.rs`) consumes
 // until the real-rtyper path types every production graph end-to-end.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::mutable_key_type,
+        clippy::arc_with_non_send_sync,
+        clippy::type_complexity,
+        reason = "rtyper parity tests intentionally retain RPython identity dictionaries, shared identity nodes, and literal nested signatures; keys hash immutable IDs and the translator is single-thread confined"
+    )
+)]
 pub mod translator;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
@@ -794,6 +861,14 @@ fn expand_immutable_fields_to_all_spellings(
     out
 }
 
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
 fn analyze_pipeline_from_module_paths(
     module_paths: &[&str],
     explicit_llbc_paths: Option<&[&str]>,
@@ -2021,6 +2096,10 @@ fn register_configured_jitdrivers(
 ///     self.assembler.finished(self.callcontrol.callinfocollection)
 ///     return all_jitcodes
 /// ```
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 fn make_jitcodes(
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
@@ -2256,7 +2335,6 @@ pub fn recognition_report(result: &pipeline::ProgramPipelineResult) -> codegen::
 pub use codegen::{JitCodeRecognition, RecognitionReport};
 
 /// Generate code from graph pipeline results.
-
 /// `rlib` — Rust port of `rpython/rlib/` helpers pulled in on demand.
 /// Currently only the pieces required by the annotator port are
 /// present (rarithmetic subset for `compute_restype`).
@@ -2391,10 +2469,10 @@ mod portal_driver_tests {
             .insns
             .iter()
             .find_map(|flat_op| match flat_op {
-                FlatOp::Op(SpaceOperation {
-                    kind: OpKind::JitMergePoint { reds_r, .. },
-                    ..
-                }) => Some(reds_r),
+                FlatOp::Op(inner) => match &inner.kind {
+                    OpKind::JitMergePoint { reds_r, .. } => Some(reds_r),
+                    _ => None,
+                },
                 _ => None,
             })
             .expect("portal emits a jit_merge_point");

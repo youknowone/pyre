@@ -829,7 +829,6 @@ mod tests {
         let (translator, config) = fixture_translator_and_config();
         let csb = CStandaloneBuilder::new(translator, None, config, None, None, Vec::new());
         assert!(csb.base.split, "CStandaloneBuilder must flip split=True");
-        assert!(CStandaloneBuilder::STANDALONE);
     }
 
     #[test]

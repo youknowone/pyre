@@ -556,6 +556,9 @@ fn fixed_array_layout(len: usize) -> std::alloc::Layout {
 /// The returned pointer points at the length prefix; items follow
 /// immediately in memory at `FIXED_ARRAY_ITEMS_OFFSET` — matching
 /// RPython `Ptr(GcArray(PyObjectRef))`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_fixed_array_with_header(
     len: usize,
     fill: pyre_object::PyObjectRef,
@@ -618,6 +621,9 @@ pub fn remember_frame_locals_array(array: *mut FixedObjectArray) {
 
 /// Deallocate a `FixedObjectArray` allocated with
 /// [`alloc_fixed_array_with_header`].
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn dealloc_array_with_gc_header(ptr: *mut FixedObjectArray) {
     if ptr.is_null() {
         return;
@@ -1369,6 +1375,9 @@ impl PyFrame {
 /// the concrete result back into the Ref bank.
 #[majit_macros::elidable_cannot_raise]
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
     unsafe { crate::w_code_get_ptr(frame.pycode as pyre_object::PyObjectRef) as *const CodeObject }
 }

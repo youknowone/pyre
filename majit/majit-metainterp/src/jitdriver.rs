@@ -138,6 +138,10 @@ fn seed_deopt_vinfo_ptr(
 /// at the call site below.  `copy_data_from_miframe` deliberately copies only
 /// the typed register values and pc, so all interpreter-global / frame-global
 /// state is supplied explicitly here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 pub fn drive_single_frame_blackhole(
     miframe: &mut crate::pyjitpl::MIFrame,
     state_field_layout: crate::blackhole::StateFieldLayout,
@@ -290,6 +294,10 @@ pub struct PendingAbortBlackhole {
 /// Run a tracing MIFrame chain through the structured multi-frame blackhole
 /// conversion.  Every frame shares the portal-level virtualizable layout, but
 /// retains its own jitcode, register banks, and blackhole interpreter.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 pub fn drive_multi_frame_blackhole(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
     framestack: &mut crate::pyjitpl::MIFrameStack,
@@ -1283,6 +1291,10 @@ pub struct JitDriver<S: JitState> {
     /// Called when ContinueRunningNormally is raised at a recursive portal
     /// level during blackhole execution. Re-enters the portal function
     /// with green/red args and returns the result.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     portal_runner: Option<
         Box<
             dyn Fn(
@@ -1410,6 +1422,10 @@ impl<S: JitState> JitDriver<S> {
             portal_runner: None,
             portal_jd_index: None,
             state_field_fvc: None,
+            #[expect(
+                clippy::arc_with_non_send_sync,
+                reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
+            )]
             shared_asm: std::sync::Arc::new(std::sync::Mutex::new(
                 majit_translate::codewriter::assembler::Assembler::new(),
             )),
@@ -1918,7 +1934,7 @@ impl<S: JitState> JitDriver<S> {
     /// the very double-application this conversion exists to prevent. Every
     /// post-chain path therefore returns `Some`, using the `single_pass_finish`
     /// + `usize::MAX` "no forward pc" outcome when it has no merge point to
-    /// resume at. Upstream has no such split: `blackhole.py:1799
+    ///   resume at. Upstream has no such split: `blackhole.py:1799
     /// convert_and_run_from_pyjitpl` never returns to its caller at all.
     ///
     /// **Seeding.** The walk keeps state fields on the sym; the blackhole reads
@@ -1971,9 +1987,7 @@ impl<S: JitState> JitDriver<S> {
         // (`token_offset > 0`, e.g. PyFrame) keeps the null-vinfo resume
         // contract and reaches the chain with `virtualizable_info` unset.
         let vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
-        let Some(root) = framestack.frames.first_mut() else {
-            return None;
-        };
+        let root = framestack.frames.first_mut()?;
         if let Some(slot) = layout.vable_identity_slot()
             && slot < root.int_values.len()
         {
@@ -2060,7 +2074,8 @@ impl<S: JitState> JitDriver<S> {
             // The bottommost frame reached its `jit_merge_point`
             // (`blackhole.py:1068-1069`): resume the interpreter at the green
             // pc it reported.  Every `greens` declaration puts `pc` first.
-            crate::jitexc::JitException::ContinueRunningNormally { ref green_int, .. } => {
+            crate::jitexc::JitException::ContinueRunningNormally(ref args) => {
+                let green_int = &args.green_int;
                 let Some(&resume_pc) = green_int.first() else {
                     // Unreachable for any declared jitdriver — every `greens`
                     // declaration puts `pc` first.  Do NOT return `None`: that
@@ -2295,9 +2310,7 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         green_key: u64,
     ) -> Option<u32> {
-        let Some(pending_key) = self.meta.single_pass_label_entry_key.take() else {
-            return None;
-        };
+        let pending_key = self.meta.single_pass_label_entry_key.take()?;
         if pending_key != green_key {
             if portal_rca_enabled() {
                 eprintln!(
@@ -4249,7 +4262,11 @@ impl<S: JitState> JitDriver<S> {
     /// Returns `Some(pc)` when compiled code ran:
     /// - FINISH → `Some(target_pc)` (loop completed, re-enter at header)
     /// - Guard failure → `Some(resume_pc)` (resume from failure point)
-    /// Returns `None` when no compiled code exists or tracing started.
+    ///   Returns `None` when no compiled code exists or tracing started.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn back_edge_internal(
         &mut self,
         green_key: u64,
@@ -4330,16 +4347,14 @@ impl<S: JitState> JitDriver<S> {
                 ) {
                     return None;
                 }
-                let Some(live_values) = self.extend_compiled_live_values(
+
+                self.extend_compiled_live_values(
                     green_key,
                     state,
                     &compiled_meta,
                     descriptor.as_deref(),
                     live_values,
-                ) else {
-                    return None;
-                };
-                live_values
+                )?
             };
             if dispatch_key.is_some() && !values_are_label_ordered {
                 let full_len = live_values.len();
@@ -4372,9 +4387,7 @@ impl<S: JitState> JitDriver<S> {
                 // The compact values are LABEL-ordered by construction, but the
                 // same unchecked Ref dereference is downstream of them, so the
                 // types are confirmed here as well.
-                let Some(types) = self.meta.front_target_inputarg_types(green_key) else {
-                    return None;
-                };
+                let types = self.meta.front_target_inputarg_types(green_key)?;
                 if types.len() != live_values.len()
                     || types
                         .iter()
@@ -4445,9 +4458,7 @@ impl<S: JitState> JitDriver<S> {
                 self.meta
                     .run_compiled_detailed_with_values(green_key, &live_values)
             };
-            let Some(result) = result else {
-                return None;
-            };
+            let result = result?;
             if portal_rca_enabled() {
                 eprintln!(
                     "[portal-rca][compiled-exit] green_key={green_key} \
@@ -4784,10 +4795,8 @@ impl<S: JitState> JitDriver<S> {
                         // Next merge point reached (loop back-edge): flush the
                         // register file into the live state and resume the
                         // interpreter at the merge point's green pc.
-                        crate::jitexc::JitException::ContinueRunningNormally {
-                            ref green_int,
-                            ..
-                        } => {
+                        crate::jitexc::JitException::ContinueRunningNormally(ref args) => {
+                            let green_int = &args.green_int;
                             // PyPy re-enters the portal with the CRN greens
                             // (warmspot.py:970-983), so the interpreter
                             // resumes at the pc the re-executed
@@ -5931,7 +5940,7 @@ impl<S: JitState> JitDriver<S> {
             should_bridge,
             owning_key,
             raw_values,
-            exit_layout,
+            exit_layout: Box::new(exit_layout),
             guard_exc,
         }
     }
@@ -6350,6 +6359,10 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn opimpl_setarrayitem_vable_int(
         &mut self,
         pc: usize,
@@ -6373,6 +6386,10 @@ impl<S: JitState> JitDriver<S> {
         );
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn opimpl_setarrayitem_vable_ref(
         &mut self,
         pc: usize,
@@ -6396,6 +6413,10 @@ impl<S: JitState> JitDriver<S> {
         );
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn opimpl_setarrayitem_vable_float(
         &mut self,
         pc: usize,
@@ -6926,6 +6947,10 @@ impl<S: JitState> JitDriver<S> {
     /// `on_guard_failure` receives (state, meta, raw_values, exit_layout) where
     /// exit_layout contains recovery_layout with rd_virtuals equivalent for
     /// materializing virtual objects after guard failure.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn run_back_edge_generic(
         &mut self,
         green_values: &[i64],

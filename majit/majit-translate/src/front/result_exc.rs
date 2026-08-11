@@ -855,6 +855,10 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
 /// distinct `(block, inputarg)` pairs, so it always terminates.  A value
 /// occupying several `mergeable` slots reaches a block under more than one
 /// alias; each is a distinct state and is followed independently.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn verify_forwards_to_returnblock_general(
     graph: &FunctionGraph,
     from_block: usize,
@@ -949,6 +953,10 @@ fn verify_forwards_to_returnblock_general(
 /// the caller can tell a genuine (but un-lowerable) return shell apart from
 /// a consumed intermediate that never returns.  Follows the same
 /// link-arg-position → target-inputarg aliasing as the verifier.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn shell_reaches_returnblock(graph: &FunctionGraph, from_block: usize, var: &Variable) -> bool {
     let mut seen: std::collections::HashSet<(usize, Variable)> = std::collections::HashSet::new();
     let mut work: Vec<(usize, Variable)> = vec![(from_block, var.clone())];

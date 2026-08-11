@@ -355,6 +355,10 @@ fn can_thread_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable) ->
 /// folded `contains`) reads a Variable in that closure.  An iteration-form
 /// range's `into_iter`/`next` reads the range as an op operand, so it is
 /// caught even after a rename; a dead forward is not.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn range_value_single_op_consumer(
     graph: &FunctionGraph,
     new_result: &Variable,

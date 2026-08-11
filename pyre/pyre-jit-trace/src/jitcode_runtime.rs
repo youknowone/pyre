@@ -1217,10 +1217,10 @@ pub fn install_global_build_descr_pool() {
                         Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
                             majit_metainterp::JitCode::from_canonical((*canonical).clone()),
                         )),
-                        None => RuntimeBhDescr::Descr(bh.clone()),
+                        None => RuntimeBhDescr::Descr(Box::new(bh.clone())),
                     }
                 }
-                other => RuntimeBhDescr::Descr(other.clone()),
+                other => RuntimeBhDescr::Descr(Box::new(other.clone())),
             })
             .collect()
     });

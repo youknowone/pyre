@@ -1744,8 +1744,8 @@ mod tests {
         let a = IntBound::from_constant(i64::MIN);
         let b = IntBound::from_constant(1);
         let result = a.sub_bound(&b);
-        // Should handle overflow gracefully
-        assert!(result.lower <= i64::MAX);
+        // RPython's test_sub_bound_bug checks the machine-integer wraparound.
+        assert!(result.contains(i64::MAX));
     }
 
     #[test]

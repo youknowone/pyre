@@ -413,6 +413,10 @@ fn test_renamevariables() {
     // v = Variable()
     let v = Variable::new();
     // block.renamevariables({pieces.sum2: v})
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Variable hashes by immutable graph identity; mutable annotations are excluded, matching RPython identity-keyed rename maps"
+    )]
     let mut mapping: std::collections::HashMap<Variable, Hlvalue> =
         std::collections::HashMap::new();
     mapping.insert(sum2.clone(), Hlvalue::Variable(v.clone()));
@@ -430,6 +434,10 @@ fn test_renamevariables() {
     );
 
     // block.renamevariables({v: pieces.sum2})
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Variable hashes by immutable graph identity; mutable annotations are excluded, matching RPython identity-keyed rename maps"
+    )]
     let mut mapping2: std::collections::HashMap<Variable, Hlvalue> =
         std::collections::HashMap::new();
     mapping2.insert(v, Hlvalue::Variable(sum2.clone()));

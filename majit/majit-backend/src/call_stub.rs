@@ -1089,6 +1089,9 @@ macro_rules! dispatch_classes_body {
 /// `extern "C" fn(...) -> i64` whose parameter list is the same ordered
 /// Int/Float sequence and whose float slots are carried in `args` as
 /// `f64::to_bits`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
     unsafe { dispatch_classes_body!(func, classes, args, i64) }
 }
@@ -1100,6 +1103,9 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
 /// `RESULT == lltype.Void`; calling such a function through an `i64`-returning
 /// transmute reads garbage from rax/x0, so the canonical
 /// `BC_RESIDUAL_CALL_*_V` blackhole/trace path must use this dispatcher.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bh_call_v_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) {
     unsafe { dispatch_classes_body!(func, classes, args, ()) }
 }
@@ -1111,6 +1117,9 @@ pub unsafe fn bh_call_v_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
 /// `RESULT == lltype.Float`; the C ABI returns f64 in xmm0 / d0 rather than
 /// rax / x0, so an `i64`-typed transmute would read uninitialized integer-bank
 /// state.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bh_call_f_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> f64 {
     unsafe { dispatch_classes_body!(func, classes, args, f64) }
 }

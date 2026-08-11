@@ -1988,6 +1988,9 @@ fn sre_scanner_step(
 ///
 /// PyPy's `W_SRE_Scanner._finalize_` and normal-exhaustion path share this
 /// idempotent ownership-bit check.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn sre_scanner_release_export(obj: PyObjectRef) {
     let sc = obj as *mut W_SRE_Scanner;
     unsafe {

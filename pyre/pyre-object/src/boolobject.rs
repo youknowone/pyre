@@ -104,18 +104,27 @@ pub fn w_bool_from(value: bool) -> PyObjectRef {
 
 /// boolobject.py:74 descr_and — both operands W_BoolObject.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bool_descr_and(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     unsafe { w_bool_from(w_bool_get_value(a) & w_bool_get_value(b)) }
 }
 
 /// boolobject.py:75 descr_or — both operands W_BoolObject.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bool_descr_or(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     unsafe { w_bool_from(w_bool_get_value(a) | w_bool_get_value(b)) }
 }
 
 /// boolobject.py:76 descr_xor — both operands W_BoolObject.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bool_descr_xor(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     unsafe { w_bool_from(w_bool_get_value(a) ^ w_bool_get_value(b)) }
 }

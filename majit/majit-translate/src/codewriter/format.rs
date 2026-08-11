@@ -946,7 +946,7 @@ mod tests {
         let result_var = Variable::new();
         let result_id = result_var.id();
         let mut ssa = empty_ssa();
-        ssa.insns.push(FlatOp::Op(SpaceOperation {
+        ssa.insns.push(FlatOp::op(SpaceOperation {
             kind: OpKind::ConstInt(42),
             result: Some(result_var),
         }));
@@ -976,7 +976,7 @@ mod tests {
         let mut ssa = empty_ssa();
         let funcptr = CallTarget::function_path(["foo"]);
         let descriptor = CallDescriptor::known(EffectInfo::default());
-        ssa.insns.push(FlatOp::Op(SpaceOperation {
+        ssa.insns.push(FlatOp::op(SpaceOperation {
             kind: OpKind::CallResidual {
                 funcptr: CallFuncPtr::Target(funcptr),
                 descriptor,
@@ -1027,7 +1027,7 @@ mod tests {
         callee.set_index(7);
         let red = Variable::new();
         let red_id = red.id();
-        ssa.insns.push(FlatOp::Op(SpaceOperation {
+        ssa.insns.push(FlatOp::op(SpaceOperation {
             kind: OpKind::InlineCall {
                 jitcode: crate::jitcode::JitCodeHandle::new(callee),
                 args_i: vec![],
@@ -1058,7 +1058,7 @@ mod tests {
         use crate::flowspace::model::Variable;
         use crate::model::{OpKind, SpaceOperation};
         let mut ssa = empty_ssa();
-        ssa.insns.push(FlatOp::Op(SpaceOperation {
+        ssa.insns.push(FlatOp::op(SpaceOperation {
             kind: OpKind::RecursiveCall {
                 jd_index: 0,
                 greens_i: vec![Variable::new()],

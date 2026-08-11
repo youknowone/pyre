@@ -284,16 +284,21 @@ impl ArgumentsForRtype {
         let mut missing = 0usize;
         if input_argcount < co_argcount {
             let def_first = co_argcount - defaults_w.map_or(0, |d| d.len());
-            for i in input_argcount..co_argcount {
+            for (i, slot) in scope_w
+                .iter_mut()
+                .enumerate()
+                .take(co_argcount)
+                .skip(input_argcount)
+            {
                 let name = &signature.argnames[i];
                 if let Some(v) = self.keywords.get(name) {
-                    scope_w[i] = Some(v.clone());
+                    *slot = Some(v.clone());
                     continue;
                 }
                 let defnum = i as isize - def_first as isize;
                 if defnum >= 0 {
                     if let Some(defaults) = defaults_w {
-                        scope_w[i] = Some(defaults[defnum as usize].clone());
+                        *slot = Some(defaults[defnum as usize].clone());
                     } else {
                         missing += 1;
                     }
@@ -362,7 +367,7 @@ pub enum Holder {
         num: usize,
         /// RPython `VarHolder.s_obj` — annotation copy from
         /// `hop.args_s[num]`.
-        s_obj: SomeValue,
+        s_obj: Box<SomeValue>,
         cache: RefCell<HashMap<usize, Hlvalue>>,
     },
     /// RPython `class ConstHolder(Holder)` (callparse.py:112-124).
@@ -394,7 +399,7 @@ impl Holder {
     pub fn var(num: usize, s_obj: SomeValue) -> Self {
         Holder::Var {
             num,
-            s_obj,
+            s_obj: Box::new(s_obj),
             cache: RefCell::new(HashMap::new()),
         }
     }
@@ -469,7 +474,7 @@ impl Holder {
             Holder::Var { s_obj, .. } => {
                 // upstream callparse.py:100-103 — `n = len(self.s_obj.items)`,
                 // `return tuple([ItemHolder(self, i) for i in range(n)])`.
-                let n = match s_obj {
+                let n = match s_obj.as_ref() {
                     SomeValue::Tuple(st) => st.items.len(),
                     other => panic!("Holder::Var::items called on non-tuple s_obj: {other:?}"),
                 };
@@ -665,6 +670,10 @@ pub fn getrresult(rtyper: &RPythonTyper, graph: &Rc<PyGraph>) -> Result<RResult,
 /// return (graph.signature, graph.defaults,
 ///         getrinputs(rtyper, graph), getrresult(rtyper, graph))
 /// ```
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub fn getsig(
     rtyper: &RPythonTyper,
     graph: &Rc<PyGraph>,
@@ -735,16 +744,16 @@ pub fn callparse(
     r_self: Option<Arc<dyn Repr>>,
 ) -> Result<Vec<Hlvalue>, TyperError> {
     let mut rinputs = getrinputs(rtyper, graph)?;
-    let start = if r_self.is_none() {
-        1usize
-    } else {
+    let start = if let Some(r_self) = r_self {
         if rinputs.is_empty() {
             return Err(TyperError::message(
                 "callparse: r_self provided but graph has 0 inputargs",
             ));
         }
-        rinputs[0] = r_self.expect("just-checked Some");
+        rinputs[0] = r_self;
         0usize
+    } else {
+        1usize
     };
     let opname = hop.spaceop.opname.as_str();
     let arguments = match opname {

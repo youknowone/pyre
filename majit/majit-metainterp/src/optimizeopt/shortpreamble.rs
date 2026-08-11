@@ -755,7 +755,10 @@ impl ShortBoxes {
         // (registered on first materialization), so every later
         // `materialize_operand_at(arg)` lookup returns the same key (ptr_eq).
         let arg_res = ctx.materialize_operand_at(arg);
-        let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg_res.clone()]);
+        let mut same_as = Op::new(
+            OpCode::same_as_for_type(arg_type),
+            std::slice::from_ref(&arg_res),
+        );
         // `ProducedShortOp` stores an OpRc, so the fresh renamed InputArg
         // that shortpreamble.py:257 carries as `preamble_op` is stood in for
         // by this non-emitted SAME_AS. The stand-in stays at the ORIGINAL
@@ -1417,6 +1420,10 @@ impl ProducedShortOp {
     /// - args cannot be fully classified, mirroring legacy
     ///   `collect_exported_short_ops` skip;
     /// - the kind is non-emit (Heap with non-getfield/getarrayitem opcode).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn produce_op(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
@@ -1633,6 +1640,10 @@ impl ProducedShortOp {
     }
 
     /// shortpreamble.py:62-79 HeapOp.produce_op (getfield case)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn produce_heap_field(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
@@ -1770,6 +1781,10 @@ impl ProducedShortOp {
     }
 
     /// shortpreamble.py:80-85 HeapOp.produce_op (getarrayitem case)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn produce_heap_array_item(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
@@ -2041,7 +2056,7 @@ impl AbstractShortPreambleBuilderState {
             let source = same_as_source.unwrap_or_else(|| op.clone());
             let mut same_as = Op::new(
                 OpCode::same_as_for_type(replay_op.result_type()),
-                &[source.clone()],
+                std::slice::from_ref(&source),
             );
             same_as.pos.set(op.to_opref());
             self.extra_same_as.push(same_as);
@@ -2083,7 +2098,7 @@ impl AbstractShortPreambleBuilderState {
     /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
     /// Non-recursive: iterates preamble_op's args (adding non-input deps
     /// + guards to short), then appends preamble_op + result guards.
-    /// Called by force_op_from_preamble (unroll.py:32).
+    ///   Called by force_op_from_preamble (unroll.py:32).
     ///
     /// Dependency args carry the dep's replay op object (produce_arg
     /// object-carry); a non-input, non-const arg whose bound op still
@@ -3057,7 +3072,7 @@ impl ExtendedShortPreambleBuilder {
                 .unwrap_or_else(|| result.clone());
             let mut op = Op::new(
                 OpCode::same_as_for_type(produced.preamble_op.result_type()),
-                &[source.clone()],
+                std::slice::from_ref(&source),
             );
             op.pos.set(current_result);
             self.extra_same_as.push(op);

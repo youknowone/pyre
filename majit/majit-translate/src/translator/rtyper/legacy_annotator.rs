@@ -8,12 +8,12 @@
 //! This file remains because the cutover transitional path
 //! ([`crate::translator::rtyper::cutover::dual_gate_check_with_registry`]
 //! + [`crate::translator::rtyper::cutover::lift_callee_to_pygraph`]) and
-//! the Skip-fallback in
-//! [`crate::codewriter::codewriter::transform_graph_to_jitcode`]
-//! still drive this `annotate()` for its side-effect: populating each
-//! `Variable.annotation` cell via [`setbinding`].  A
-//! follow-up retirement slice drops both consumers and this file
-//! together once the dual-gate Skip categories close.
+//!   the Skip-fallback in
+//!   [`crate::codewriter::codewriter::transform_graph_to_jitcode`]
+//!   still drive this `annotate()` for its side-effect: populating each
+//!   `Variable.annotation` cell via [`setbinding`].  A
+//!   follow-up retirement slice drops both consumers and this file
+//!   together once the dual-gate Skip categories close.
 //!
 //! Propagates ValueType annotations through the graph by analyzing
 //! each op's inputs and computing the output type. Iterates to

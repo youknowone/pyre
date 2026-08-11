@@ -18,8 +18,8 @@ use majit_ir::{DescrRef, OpRef};
 /// Both RPython subclasses return values:
 /// - `ResumeDataVirtualAdder` (resume.py:320-357) returns `VirtualInfo` subclasses
 /// - `VirtualStateConstructor` (virtualstate.py:743-760) returns `VirtualStateInfo` subclasses
-/// RPython relies on dynamic dispatch; Rust models this with an associated
-/// type on the trait (the single minimal adaptation due to static typing).
+///   RPython relies on dynamic dispatch; Rust models this with an associated
+///   type on the trait (the single minimal adaptation due to static typing).
 pub trait VirtualVisitor {
     /// Return type of visit_* dispatch (see trait doc).
     type VInfo;

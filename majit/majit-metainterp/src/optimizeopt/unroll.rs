@@ -2203,6 +2203,10 @@ enum ExportedGcRefField {
 
 impl ExportedState {
     /// unroll.py: ExportedState.__init__
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn new(
         end_args: Vec<OpRef>,
         label_source_positions: Vec<usize>,
@@ -3246,6 +3250,10 @@ impl OptUnroll {
     /// GUARD_VALUE when the runtime value matches a known constant. Always a
     /// position-aligned list — both the loop (`state.runtime_boxes`) and the
     /// bridge (`optimize_bridge`'s `runtime_boxes`) paths supply it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn jump_to_existing_trace(
         &self,
         jump_args: &[OpRef],
@@ -3271,6 +3279,10 @@ impl OptUnroll {
     /// Like jump_to_existing_trace, but with an optional pre-computed
     /// virtual_state. Used by optimize_bridge where force_at_the_end_of_preamble
     /// may change forwarding chains after the virtual state was exported.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn jump_to_existing_trace_with_vs(
         &self,
         jump_args: &[OpRef],
@@ -3303,6 +3315,10 @@ impl OptUnroll {
         result
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn jump_to_existing_trace_impl(
         &self,
         jump_args: &[OpRef],
@@ -3351,7 +3367,7 @@ impl OptUnroll {
                 force_boxes,
             ) {
                 Ok(guards) => guards,
-                Err(()) => {
+                Err(_) => {
                     if crate::log_jtet_enabled() {
                         eprintln!(
                             "[jit][jte] target_token #{tt_idx} generate_guards failed (force_boxes={force_boxes})",
@@ -3448,7 +3464,7 @@ impl OptUnroll {
                 force_boxes,
             ) {
                 Ok(result) => result,
-                Err(()) => {
+                Err(_) => {
                     if crate::log_jtet_enabled() {
                         eprintln!(
                             "[jit][jte] target_token #{tt_idx} make_inputargs failed (force_boxes={force_boxes})",
@@ -4129,7 +4145,7 @@ impl OptUnroll {
             // unroll.py:483 `raise InvalidLoop`: the imported virtual state is
             // incompatible. Recorded as a deferred signal (checked by the
             // caller) so the loop is abandoned without unwinding.
-            Err(()) => {
+            Err(_) => {
                 ctx.signal_invalid_loop("Cannot import state, virtual states don't match");
                 return Vec::new();
             }
@@ -4527,13 +4543,9 @@ pub(crate) fn import_state_full(
     label_args
 }
 
-/// unroll.py: pick_virtual_state(my_vs, label_vs, target_tokens)
-///
-/// Given the current virtual state and available target tokens,
-/// find a compatible target to jump to. Returns the target index
-/// or None if no match.
-/// RPython unroll.py: import_state + _generate_virtual.
-///
+// unroll.py: pick_virtual_state(my_vs, label_vs, target_tokens)
+// Given the current virtual state and available target tokens, find a
+// compatible target to jump to. RPython: import_state + _generate_virtual.
 // ── RPython-parity helper functions for 2-phase preamble peeling ──
 
 /// Derive ImportedVirtual entries from ExportedState's VirtualState.
@@ -4605,6 +4617,10 @@ fn build_imported_virtuals_from_state(
 
 /// compile.py:310-338: [preamble_no_jump] + Label(label_args) + [body_with_jump]
 #[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "this parity-test helper exposes every segment and mapping of RPython's peeled-trace assembly independently so failures identify the exact upstream phase input"
+)]
 fn assemble_peeled_trace(
     p1_ops: &[Op],
     p2_ops: &[Op],
@@ -4671,12 +4687,19 @@ fn emit_alias_same_as_for_imports(
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
 ) {
     for alias in imported_short_aliases {
-        let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source.clone()]);
+        let mut op = Op::new(
+            alias.same_as_opcode,
+            std::slice::from_ref(&alias.same_as_source),
+        );
         op.pos.set(alias.result);
         result.push(std::rc::Rc::new(op));
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 fn assemble_peeled_trace_with_jump_args(
     p1_ops: &[majit_ir::OpRc],
     p2_ops: &[majit_ir::OpRc],
@@ -6980,8 +7003,11 @@ mod tests {
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op =
-                        Op::with_descr(OpCode::GetfieldGcI, &[si0.clone()], field_descr.clone());
+                    let mut op = Op::with_descr(
+                        OpCode::GetfieldGcI,
+                        std::slice::from_ref(&si0),
+                        field_descr.clone(),
+                    );
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },

@@ -11829,7 +11829,9 @@ fn portal_vable_bookkeeping_anchor_accepts_only_same_pc_same_frame_vable_writes(
     let int_copy = *insns_opname_to_byte()
         .get("int_copy/c>i")
         .expect("int_copy/c>i must exist");
-    let descrs = [RuntimeBhDescr::Descr(BhDescr::VableField { index: 0 })];
+    let descrs = [RuntimeBhDescr::Descr(Box::new(BhDescr::VableField {
+        index: 0,
+    }))];
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.metadata.py_floor_by_jit_pc = vec![(0, 29)];
     let portal_gap = [setfield, 1, 7, 0, 0, abort];
@@ -11903,7 +11905,9 @@ fn portal_vable_bookkeeping_anchor_admits_this_frames_spills_and_reloads_only() 
         .get("abort_permanent/")
         .expect("abort_permanent must exist");
     // `valuestackdepth` is static field index 2, not 0.
-    let descrs = [RuntimeBhDescr::Descr(BhDescr::VableField { index: 2 })];
+    let descrs = [RuntimeBhDescr::Descr(Box::new(BhDescr::VableField {
+        index: 2,
+    }))];
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.metadata.py_floor_by_jit_pc = vec![(0, 29)];
 

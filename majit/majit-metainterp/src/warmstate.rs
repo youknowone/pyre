@@ -271,14 +271,10 @@ pub enum CellJitState {
 
 pub use crate::memmgr::MemoryManager;
 
-/// Warm state manager — the orchestrator of the JIT lifecycle.
-///
-/// Keeps track of per-greenkey cells and the global hot counter.
-/// The interpreter calls `maybe_compile()` at loop headers;
-/// WarmEnterState decides whether to start tracing, continue interpreting,
-/// or dispatch to compiled code.
-/// rlib/jit.py:588-605 PARAMETERS defaults.
-/// DEFAULT_ constants must match RPython exactly.
+// Warm state manager — the orchestrator of the JIT lifecycle. It keeps track
+// of per-greenkey cells and the global hot counter.
+// rlib/jit.py:588-605 PARAMETERS defaults.
+// DEFAULT_ constants must match RPython exactly.
 
 /// rlib/jit.py:588 threshold = 1039 (just above 1024, prime)
 const DEFAULT_THRESHOLD: u32 = 1039;
@@ -808,10 +804,10 @@ impl WarmEnterState {
         if let Some(cell) = self.lookup_chain_with_key_mut(key) {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
-            if disable_noninlinable_function || (cell.flags & jc_flags::DONT_TRACE_HERE != 0) {
-                cell.flags |= jc_flags::DONT_TRACE_HERE;
-                cell.state = BaseJitCellState::DontTraceHere;
-            } else if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+            if disable_noninlinable_function
+                || (cell.flags & jc_flags::DONT_TRACE_HERE != 0)
+                || cell.abort_count >= MAX_TRACE_ABORT_COUNT
+            {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
                 cell.state = BaseJitCellState::DontTraceHere;
             } else {
@@ -1883,10 +1879,10 @@ impl WarmEnterState {
     ///   - "trace_eagerness": guard fail count before bridge compilation
     ///   - "function_threshold": calls before inlining
     ///   - "max_inline_depth": maximum inlining depth
-    /// warmstate.py: set_param() — set a JIT parameter by name.
-    /// Negative values for thresholds mean "disabled/off" (rpython/rlib/jit.py:843).
-    /// counter.py:124 — compute_threshold(threshold<=0) returns 0.0 (JIT off).
-    /// Parameter names match RPython exactly: vec, vec_all, vec_cost.
+    ///     warmstate.py: set_param() — set a JIT parameter by name.
+    ///     Negative values for thresholds mean "disabled/off" (rpython/rlib/jit.py:843).
+    ///     counter.py:124 — compute_threshold(threshold<=0) returns 0.0 (JIT off).
+    ///     Parameter names match RPython exactly: vec, vec_all, vec_cost.
     pub fn set_param(&mut self, name: &str, value: i64) {
         // counter.py:124 — threshold <= 0 → compute_threshold returns 0.0
         // (JIT off). Negative i64 must clamp to 0, not wrap to u32::MAX.

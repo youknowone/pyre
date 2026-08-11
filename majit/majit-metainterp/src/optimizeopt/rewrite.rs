@@ -663,9 +663,9 @@ impl OptRewrite {
     ///
     /// rewrite.py:163-184 `optimize_guard` proper (the contradiction check
     /// + emit) is the call-time half. The `make_constant(box, CONST_1)` half
-    /// of the upstream `optimize_guard` is split into
-    /// `propagate_postprocess` (rewrite.py:352-371) per RPython's
-    /// `have_postprocess` model — see the bottom of this file.
+    ///   of the upstream `optimize_guard` is split into
+    ///   `propagate_postprocess` (rewrite.py:352-371) per RPython's
+    ///   `have_postprocess` model — see the bottom of this file.
     fn optimize_guard_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
@@ -1257,6 +1257,10 @@ impl OptRewrite {
     ///
     /// Element-by-element unrolling for small constant-length array
     /// copy/move operations. Handles both virtual and non-virtual arrays.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn optimize_call_arrayop(
         &mut self,
         op: &Op,
@@ -1305,7 +1309,7 @@ impl OptRewrite {
         };
 
         // rewrite.py:613-617: both start constant, at least one virtual or length <= 8
-        if !((dest_is_virtual || length_int <= 8) && (source_is_virtual || length_int <= 8)) {
+        if (!source_is_virtual || !dest_is_virtual) && length_int > 8 {
             return false;
         }
 
@@ -1627,7 +1631,7 @@ impl OptRewrite {
                     return OptimizationResult::Remove;
                 }
                 if v == -1.0 {
-                    let mut neg = Op::new(OpCode::FloatNeg, &[rhs.clone()]);
+                    let mut neg = Op::new(OpCode::FloatNeg, std::slice::from_ref(rhs));
                     neg.pos.set(op.pos.get());
                     return OptimizationResult::Replace(neg);
                 }
@@ -2144,7 +2148,7 @@ impl Optimization for OptRewrite {
                         // dual-slot rule (mod.rs:1817 replay_pos).
                         let replay_pos = ctx.get_replacement_opref(source);
                         let source_op = ctx.materialize_operand_at(source);
-                        let mut replay = Op::new(OpCode::SameAsI, &[source_op.clone()]);
+                        let mut replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
                         replay.pos.set(replay_pos);
                         self.loop_invariant_results.insert(
                             func_val,
@@ -2381,9 +2385,9 @@ impl Optimization for OptRewrite {
     fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
         self.loop_invariant_results
             .iter()
-            .filter_map(|(func_ptr, entry)| match entry {
-                LoopInvariantEntry::Direct(r) => Some((*func_ptr, *r)),
-                LoopInvariantEntry::Preamble(pop) => Some((*func_ptr, pop.op.to_opref())),
+            .map(|(func_ptr, entry)| match entry {
+                LoopInvariantEntry::Direct(r) => (*func_ptr, *r),
+                LoopInvariantEntry::Preamble(pop) => (*func_ptr, pop.op.to_opref()),
             })
             .collect()
     }

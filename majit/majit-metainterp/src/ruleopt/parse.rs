@@ -75,6 +75,10 @@ impl fmt::Display for Rule {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "PatternVar/PatternConst/PatternOp are the canonical ruleopt parser node names from RPython; dropping the prefix would obscure generated-rule and proof-code parity"
+)]
 pub enum Pattern {
     PatternVar(PatternVar),
     PatternConst(PatternConst),
@@ -910,36 +914,35 @@ fn is_signed_number(chars: &[char], i: usize, prev: Option<&Token>) -> bool {
     if chars.get(i + 1).is_none_or(|next| !next.is_ascii_digit()) {
         return false;
     }
-    match prev.map(|t| &t.kind) {
-        None => true,
-        Some(
+    matches!(
+        prev.map(|t| &t.kind),
+        None | Some(
             TokenKind::LParen
-            | TokenKind::Comma
-            | TokenKind::Equal
-            | TokenKind::Colon
-            | TokenKind::Arrow
-            | TokenKind::Plus
-            | TokenKind::Minus
-            | TokenKind::Mul
-            | TokenKind::Div
-            | TokenKind::LShift
-            | TokenKind::URShift
-            | TokenKind::ARShift
-            | TokenKind::And
-            | TokenKind::Or
-            | TokenKind::OpAnd
-            | TokenKind::OpOr
-            | TokenKind::OpXor
-            | TokenKind::EqualEqual
-            | TokenKind::Ne
-            | TokenKind::Ge
-            | TokenKind::Gt
-            | TokenKind::Le
-            | TokenKind::Lt
-            | TokenKind::Invert,
-        ) => true,
-        _ => false,
-    }
+                | TokenKind::Comma
+                | TokenKind::Equal
+                | TokenKind::Colon
+                | TokenKind::Arrow
+                | TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Mul
+                | TokenKind::Div
+                | TokenKind::LShift
+                | TokenKind::URShift
+                | TokenKind::ARShift
+                | TokenKind::And
+                | TokenKind::Or
+                | TokenKind::OpAnd
+                | TokenKind::OpOr
+                | TokenKind::OpXor
+                | TokenKind::EqualEqual
+                | TokenKind::Ne
+                | TokenKind::Ge
+                | TokenKind::Gt
+                | TokenKind::Le
+                | TokenKind::Lt
+                | TokenKind::Invert,
+        )
+    )
 }
 
 struct PatternParser {

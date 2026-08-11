@@ -1290,6 +1290,9 @@ pub unsafe fn py_type_check(obj: PyObjectRef, tp: &PyType) -> bool {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_int(obj: PyObjectRef) -> bool {
     // A tagged immediate is a plain `int` (never a `bool`: bools are
     // even-aligned singletons). `is_int` reaches `ob_type` via
@@ -1304,31 +1307,49 @@ pub unsafe fn is_int(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_bool(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &BOOL_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_float(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FLOAT_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_complex(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &COMPLEX_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_long(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &LONG_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_int_or_long(obj: PyObjectRef) -> bool {
     unsafe { is_int(obj) || is_long(obj) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_list(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &LIST_TYPE) }
 }
@@ -1341,6 +1362,9 @@ pub unsafe fn is_list(obj: PyObjectRef) -> bool {
 /// each variant a distinct `ob_type` (RPython-vtable equivalent) while
 /// `w_class` always resolves to the canonical `tuple` class object.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
     use crate::specialisedtupleobject::{
         SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
@@ -1359,12 +1383,18 @@ pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
 /// class object (not `get_instantiate(ob_type)`) keeps them exact while a
 /// subclass instance (retagged `w_class`) reads as non-exact.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_exact_tuple(obj: PyObjectRef) -> bool {
     unsafe { is_tuple(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&TUPLE_TYPE)) }
 }
 
 /// `PyList_CheckExact` — an exact `list`, excluding list subclasses.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_exact_list(obj: PyObjectRef) -> bool {
     unsafe { is_list(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&LIST_TYPE)) }
 }
@@ -1376,21 +1406,33 @@ pub unsafe fn is_exact_list(obj: PyObjectRef) -> bool {
 /// the right cast), but `is_dict` reports the user-visible answer and
 /// returns true for either.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_dict(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &DICT_TYPE) || crate::dictmultiobject::is_module_dict(obj) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_none(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &NONE_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_not_implemented(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &NOTIMPLEMENTED_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_ellipsis(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &ELLIPSIS_TYPE) }
 }

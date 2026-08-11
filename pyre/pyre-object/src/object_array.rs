@@ -133,6 +133,9 @@ pub const ITEMS_BLOCK_TOKEN: ArrayToken = ArrayToken {
 /// block itself is null, so callers can treat a null items pointer as
 /// an empty list without branching through `Option`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef {
     if block.is_null() {
         return std::ptr::null_mut();
@@ -144,6 +147,9 @@ pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef
 /// Returns 0 for a null pointer so "empty list" is represented by
 /// a null `items` field.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn items_block_capacity(block: *mut ItemsBlock) -> usize {
     if block.is_null() {
         return 0;
@@ -162,6 +168,9 @@ pub unsafe fn items_block_capacity(block: *mut ItemsBlock) -> usize {
 /// (rlist.py:251 `_ll_list_resize_*` always keeps at least one slot
 /// for in-place growth). Tuples must NOT use this allocator — see
 /// [`alloc_tuple_items_block`] for the exact-size variant.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_list_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock {
     let len = values.len();
     let cap = len.max(1);
@@ -189,6 +198,9 @@ pub unsafe fn alloc_list_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock 
 /// or [`items_block_capacity`] on the host side. No companion length
 /// cache lives on `W_TupleObject` (`_immutable_fields_ =
 /// ['wrappeditems[*]']` per upstream tupleobject.py:381).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_tuple_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock {
     let cap = values.len();
     unsafe {
@@ -206,6 +218,9 @@ pub unsafe fn alloc_tuple_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock
 /// block. The caller swaps the owner field and then deallocates `old`, keeping
 /// the SETFIELD_GC barrier adjacent to the publication. `old` may be null
 /// (fresh allocation). rlist.py:262-267 parity.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn grow_list_items_block(
     old: *mut ItemsBlock,
     new_cap: usize,
@@ -216,6 +231,9 @@ pub unsafe fn grow_list_items_block(
 
 /// Deallocate an `ItemsBlock` previously allocated via
 /// `alloc_list_items_block` / `grow_list_items_block`. No-op on null.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
 }
@@ -244,6 +262,9 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 /// written, so the block is safe to expose to the collector immediately. Falls
 /// back to the `std::alloc` [`alloc_items_block`] when no GC hook is installed
 /// (pure interpreter / early startup). `cap` 0 yields a header-only block.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef], cap: usize) -> *mut ItemsBlock {
     debug_assert!(cap >= values.len());
     let _roots = crate::gc_roots::push_roots();
@@ -270,6 +291,9 @@ pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef], cap: usize) -> 
 /// deallocates `old`; dropping it here would introduce a GC operation while the
 /// fresh block is not yet reachable from its owner. `old` may be null.
 /// mapdict.py:942-959 `_add_attr` grow-by-one.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn grow_instance_items_block(
     old: *mut ItemsBlock,
     new_cap: usize,
@@ -292,6 +316,9 @@ pub unsafe fn grow_instance_items_block(
 /// Deallocate an instance storage block. A GC-managed (stable) block is
 /// reclaimed by the collector and must never be freed here; the `std::alloc`
 /// fallback block is freed. No-op on null. `try_gc_owns_object` discriminates.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn dealloc_instance_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
 }
@@ -341,6 +368,9 @@ unsafe fn alloc_items_block_gc(cap: usize) -> *mut ItemsBlock {
 /// holds pre-collection addresses. Capacity is `len.max(1)`
 /// (overallocation policy); spare slots are NULL. Degrades to the
 /// `std::alloc` [`alloc_list_items_block`] when the gate is off.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlock {
     if !itemsblock_gc_enabled() {
         return unsafe { alloc_list_items_block(values) };
@@ -404,6 +434,9 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
 /// queries — each a TLS lookup, a `RefCell` borrow, an arena range test and a
 /// rawmalloced-set probe — so the 1% of appends that resize dominated the
 /// profile of every Object-strategy list build.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn grow_list_items_block_gc(
     old: *mut ItemsBlock,
     new_cap: usize,
@@ -452,6 +485,9 @@ pub unsafe fn grow_list_items_block_gc(
 /// allocation and fills from the relocated shadow-stack slots, mirroring
 /// `w_tuple_new_array_backed`'s read-back. Degrades to the `std::alloc`
 /// [`alloc_tuple_items_block`] when the gate is off.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlock {
     if !itemsblock_gc_enabled() {
         return unsafe { alloc_tuple_items_block(values) };
@@ -495,6 +531,9 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
 /// `setarrayitem_ref` + a block write barrier. No `std::alloc` fallback here
 /// (unlike [`alloc_items_block_gc`]): the materialization requires a GC-traced
 /// block whose escaping young element refs are forwarded by a collection.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_cleared_ref_items_block_gc(cap: usize) -> Option<*mut ItemsBlock> {
     if !itemsblock_gc_enabled() {
         return None;
@@ -656,6 +695,9 @@ const _: () = assert!(
 /// old-gen buys immobility, not survival: a block born before this cycle
 /// finished scanning carries no `GCFLAG_VISITED`, so between this call and the
 /// owner store the caller must root it (`IntArray::pin_block`).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBlock {
     unsafe {
         try_alloc_typed_items_block(cap, tid)
@@ -668,6 +710,9 @@ pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBl
 /// ordinary translated allocation path above remains infallible at the Rust
 /// type level, matching RPython's implicit exception edge; this entry point
 /// makes that edge explicit for Rust methods that already return `Result`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut TypedItemsBlock> {
     let cap = cap.max(1);
     let layout = try_typed_items_block_layout(cap)?;
@@ -705,6 +750,9 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
 /// `fresh` and the live words are copied directly; it also stays reachable
 /// through its owner's `block` field for that whole span, since the caller only
 /// overwrites that field with the returned value.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn grow_typed_items_block(
     old: *mut TypedItemsBlock,
     new_cap: usize,
@@ -740,6 +788,9 @@ pub unsafe fn grow_typed_items_block(
 /// by the collector and must never be freed here — its allocation is prefixed by
 /// a `GcHeader` the `std::alloc` layout knows nothing about. `try_gc_owns_object`
 /// gates the `std::alloc` free to the gate-off / no-hook fallback blocks.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn dealloc_typed_items_block(block: *mut TypedItemsBlock) {
     if block.is_null() {
         return;
@@ -822,6 +873,11 @@ impl FixedObjectArray {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
     pub fn items_ptr(&self) -> *const PyObjectRef {
         unsafe {
             (self as *const Self as *const u8).add(FIXED_ARRAY_ITEMS_OFFSET) as *const PyObjectRef
@@ -849,6 +905,10 @@ impl FixedObjectArray {
     /// local is not part of that generated root map, so publish it explicitly
     /// and reload it after the barrier's safepoint before writing the slot.
     #[inline]
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+    )]
     pub fn set_ref(&mut self, index: usize, value: PyObjectRef) {
         assert!(index < self.len);
         // Clearing a slot cannot create an old-to-young edge.  PyPy's
@@ -932,6 +992,9 @@ impl IndexMut<usize> for FixedObjectArray {
 /// GC hook is installed (bootstrap / pure interpreter). A young MRO element
 /// (a metaclass `mro()` returning fresh types) is registered on the
 /// remembered set via the old→young write barrier.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArray {
     let len = values.len();
     let payload = FIXED_ARRAY_ITEMS_OFFSET + std::mem::size_of_val(values);
@@ -1076,6 +1139,9 @@ fn gc_typed_array_layout(length: usize, item_size: usize) -> Layout {
 
 /// Return the items base pointer of a `GcTypedArray`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn gc_typed_array_items_base(array: *mut GcTypedArray) -> *mut u8 {
     if array.is_null() {
         return std::ptr::null_mut();
@@ -1103,6 +1169,10 @@ unsafe fn gc_typed_array_item_ptr(
 }
 
 /// llmodel.py:607-609 bh_setarrayitem_gc_r parity.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn setarrayitem_ref(array: *mut GcTypedArray, index: usize, value: PyObjectRef) {
     unsafe {
         let ptr = gc_typed_array_item_ptr(array, index, std::mem::size_of::<PyObjectRef>());
@@ -1125,6 +1195,10 @@ pub fn getarrayitem_ref(array: *const GcTypedArray, index: usize) -> PyObjectRef
 
 /// llmodel.py:613-615 bh_setarrayitem_gc_i parity.
 /// Write a raw i64 to an int array slot.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn setarrayitem_int(array: *mut GcTypedArray, index: usize, value: i64) {
     unsafe {
         let ptr = gc_typed_array_item_ptr(array, index, std::mem::size_of::<i64>());
@@ -1134,6 +1208,10 @@ pub fn setarrayitem_int(array: *mut GcTypedArray, index: usize, value: i64) {
 
 /// llmodel.py:618-619 bh_setarrayitem_gc_f parity.
 /// Write a raw f64 to a float array slot.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
     unsafe {
         let ptr = gc_typed_array_item_ptr(array, index, std::mem::size_of::<f64>());
@@ -1145,6 +1223,10 @@ pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
 /// resume.py:1520-1529 ResumeDataDirectReader: dispatch on descr type.
 /// llmodel.py:648-665: byte offset = elem_idx * item_size + field_offset.
 ///
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn setinteriorfield(
     array: *mut GcTypedArray,
     elem_idx: usize,
@@ -1199,6 +1281,10 @@ pub fn setinteriorfield(
 }
 
 /// Resume parity: get the length of a GcTypedArray.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn gcarray_len(array: *const GcTypedArray) -> usize {
     if array.is_null() {
         return 0;

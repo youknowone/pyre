@@ -235,7 +235,7 @@ pub enum RuntimeBhDescr {
     /// `ArrayDescr`, virtualizable descriptors, ...).  RPython keeps all
     /// of these in `BlackholeInterpBuilder.descrs`; pyre's runtime
     /// `JitCodeBuilder` uses the per-JitCode pool described below.
-    Descr(CanonicalBhDescr),
+    Descr(Box<CanonicalBhDescr>),
     /// Target JitCode for a `j` argcode (`BC_INLINE_CALL`).  RPython:
     /// `blackhole.py:150-157` — `argtype == 'j' → descrs[idx]` asserted
     /// `isinstance(value, JitCode)`.
@@ -248,7 +248,7 @@ pub enum RuntimeBhDescr {
     /// and blackhole-side function pointers in a single indirection
     /// slot.  Once pyre emits the function address via an int register
     /// this variant can split into the RPython-shaped pair.
-    Call(JitCallTarget),
+    Call(Box<JitCallTarget>),
     /// Compiled-assembler target for `BC_CALL_ASSEMBLER_*`.  The
     /// `token_number` identifies a `CompiledLoopToken` (RPython
     /// `compile.py CompiledLoopToken.number`) that the tracer hands
@@ -261,7 +261,7 @@ impl RuntimeBhDescr {
     /// Extract an ordinary blackhole descriptor for `d` argcodes.
     pub fn as_bh_descr(&self) -> Option<&CanonicalBhDescr> {
         match self {
-            Self::Descr(descr) => Some(descr),
+            Self::Descr(descr) => Some(descr.as_ref()),
             _ => None,
         }
     }

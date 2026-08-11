@@ -1339,6 +1339,10 @@ fn record_struct_id(
         .or_insert(Some(id));
 }
 
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 fn derive_program_metadata(
     llbc: &Llbc,
 ) -> (
@@ -2969,15 +2973,22 @@ impl<'a> Lowering<'a> {
         // reaches the real-rtyper dual-gate.
         let mut startblock_args: Vec<Variable> = Vec::with_capacity(arg_count);
         let mut input_ops: Vec<SpaceOperation> = Vec::with_capacity(arg_count);
-        for i in 1..=arg_count {
-            let local = &body.locals.locals[i];
+        for (i, (local, slot)) in body
+            .locals
+            .locals
+            .iter()
+            .zip(local_var.iter_mut())
+            .enumerate()
+            .take(arg_count + 1)
+            .skip(1)
+        {
             let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             // Register a stable name so canonical comparison can spot
             // arg-renames.  Names live on the value via `name_value_var`
             // (mirrors the `parse.rs` arg-binding path).
             graph.name_value_var(&var, name.clone());
-            local_var[i] = Some(var.clone());
+            *slot = Some(var.clone());
             let ty = tyref_to_value_type(&local.ty, llbc);
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
@@ -3219,8 +3230,8 @@ impl<'a> Lowering<'a> {
         // Blocks unreachable from bb0 are still lowered (kept complete),
         // last and in MIR order — after every reachable def is seeded, so
         // they can only see *more* bindings than linear order did.
-        for bb in 0..n {
-            if state[bb] != 2 {
+        for (bb, mark) in state.iter().enumerate().take(n) {
+            if *mark != 2 {
                 order.push(bb);
             }
         }
@@ -3678,8 +3689,8 @@ impl<'a> Lowering<'a> {
         // caught in Pass 1 by the empty-entry stub above.)  Mark them
         // `dead` so the graph stays closed for the legacy fallback path,
         // which consumes this same `FunctionGraph`.
-        for bb in 0..n {
-            if reachable[bb] {
+        for (bb, is_reachable) in reachable.iter().enumerate().take(n) {
+            if *is_reachable {
                 continue;
             }
             self.stub_dead_block(self.block_id[bb]);
@@ -6471,13 +6482,13 @@ impl<'a> Lowering<'a> {
     ///   * a second `_0`-defining call, or a `_0`-defining call to any
     ///     function other than `size_of`/`align_of`;
     ///   * a body with no `Return`.
-    /// Linear `Goto`s and panic-cleanup terminators (`Abort`,
-    /// `UnwindResume`, `Drop`, `Assert`), plus calls and assignments that
-    /// do *not* write `_0`, are permitted: none of them define the const
-    /// value, so with no `Switch` the single `size_of` call is its
-    /// unconditional sole definer.  Also `None` for a non-ADT type argument
-    /// (primitive / pointer / tuple, which has no `TypeDecl` layout to
-    /// read) or a layout Charon left unresolved.
+    ///     Linear `Goto`s and panic-cleanup terminators (`Abort`,
+    ///     `UnwindResume`, `Drop`, `Assert`), plus calls and assignments that
+    ///     do *not* write `_0`, are permitted: none of them define the const
+    ///     value, so with no `Switch` the single `size_of` call is its
+    ///     unconditional sole definer.  Also `None` for a non-ADT type argument
+    ///     (primitive / pointer / tuple, which has no `TypeDecl` layout to
+    ///     read) or a layout Charon left unresolved.
     fn fold_size_const_global(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
         if gd
@@ -9337,6 +9348,10 @@ impl<'a> Lowering<'a> {
     /// untouched for the std special-case matchers (`checked_neg` /
     /// `try_from` / `into` / `expect`) that key on the
     /// `[.., "<Impl>", leaf]` shape.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     fn call_target_segments(
         &self,
         mir_bb: usize,
@@ -10833,9 +10848,9 @@ impl<'a> Lowering<'a> {
     ///     `from_u32` constructor (`newtype_oparg!`), and
     ///   * the `From` conversions (`u32::from(oparg)` for a newtype, the
     ///     `__discriminant` read for a fieldless enum).
-    /// Gated on the defining impl living in `bytecode::oparg` so the
-    /// generic `from` / `as_u32` / `as_usize` names cannot match
-    /// unrelated types.
+    ///     Gated on the defining impl living in `bytecode::oparg` so the
+    ///     generic `from` / `as_u32` / `as_usize` names cannot match
+    ///     unrelated types.
     fn oparg_value_alias(&self, segments: &[String], args: &[Variable]) -> Option<Variable> {
         let [arg] = args else {
             return None;
@@ -12026,6 +12041,10 @@ impl<'a> Lowering<'a> {
     /// Returns `Ok(false)` when the call is not `checked_neg` (or the
     /// destination's `Option` decl cannot be resolved) so the generic
     /// `Call` lowering proceeds.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn try_lower_checked_neg(
         &mut self,
         mir_bb: usize,
@@ -12160,6 +12179,10 @@ impl<'a> Lowering<'a> {
     ///
     /// `Ok=0`/`Err=1`: `disc = (fits == 0)` is 0 when it fits (`Ok` tag)
     /// and 1 otherwise (`Err` tag).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn try_lower_bigint_i64_try_from(
         &mut self,
         mir_bb: usize,
@@ -12228,6 +12251,10 @@ impl<'a> Lowering<'a> {
     /// have no enum class to narrow. Preserve the source control flow by
     /// materializing the runtime Result tag and payload, using the shared
     /// non-trapping payload rule below.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn try_lower_rbigint_toint(
         &mut self,
         mir_bb: usize,
@@ -12384,6 +12411,10 @@ impl<'a> Lowering<'a> {
     /// inputs — the genuinely fallible directions of the same impl
     /// group — keep the `Call` form, so this filter must not be
     /// widened to `U64` on the strength of the host being 64-bit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn try_lower_usize_try_from(
         &mut self,
         mir_bb: usize,
@@ -12494,6 +12525,10 @@ impl<'a> Lowering<'a> {
     /// ([`Lowering::try_lower_usize_try_from`]).  `pyopcode.rs`
     /// `u32_as_i64` is `i64::from(x: u32)`.  Word-or-wider sources keep
     /// the `Call` form (no smaller-than-word identity to fold).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn try_lower_num_from(
         &mut self,
         mir_bb: usize,
@@ -13006,6 +13041,10 @@ impl<'a> Lowering<'a> {
     /// `Result::Ok`) — so its runtime offset matches the
     /// `resolve_adt_field` read, which is variant-qualified
     /// (`{enum_leaf}::{variant}`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn emit_tagged_pair_aggregate(
         &mut self,
         mir_bb: usize,

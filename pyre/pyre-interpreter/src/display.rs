@@ -252,6 +252,9 @@ pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
 /// and the native `py_repr` fast path use the same recursion guard and item
 /// walk. Calling the base descriptor on a subclass must not redispatch its
 /// overriding `__repr__`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn list_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     let Some(_guard) = ReprGuard::enter(obj) else {
         return Ok(Wtf8Buf::from_string("[...]".to_string()));
@@ -279,6 +282,9 @@ pub unsafe fn list_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
 /// `tupleobject.py W_AbstractTupleObject.descr_repr`. This is the base slot
 /// body, so it formats tuple storage directly even when invoked through
 /// `super().__repr__()` on a subtype.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn tuple_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     let Some(_guard) = ReprGuard::enter(obj) else {
         return Ok(Wtf8Buf::from_string("(...)".to_string()));
@@ -570,6 +576,9 @@ unsafe fn module_user_dunder_obj(
 /// so a lone surrogate an item wrote survives being nested. A `Wtf8Buf` is the
 /// buffer that can hold the same thing here; a Rust `String` cannot, so every
 /// caller reads the WTF-8 rather than a `String` round trip of it.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // A tagged immediate must be formatted before `ob_type` touches it as a
     // pointer; `repr` of a plain `int` is its
@@ -1066,6 +1075,9 @@ macro_rules! wtf8_format {
 pub(crate) use wtf8_format;
 
 /// Format for str() — tries __str__ first, then __repr__.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         // `str` of a tagged `int` immediate is its decimal value; format

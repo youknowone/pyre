@@ -162,31 +162,49 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BytearrayObject)).w_dict }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe { (*(obj as *mut W_BytearrayObject)).w_dict = w_dict };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_getweakref(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BytearrayObject)).w_weakreflifeline }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
     unsafe { (*(obj as *mut W_BytearrayObject)).w_weakreflifeline = lifeline };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_bytearray(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &BYTEARRAY_TYPE) }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_len(obj: PyObjectRef) -> usize {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
@@ -195,11 +213,17 @@ pub unsafe fn w_bytearray_len(obj: PyObjectRef) -> usize {
 }
 
 /// CPython 3.14 `PyByteArrayObject.ob_alloc`, including the trailing NUL.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_capacity(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_BytearrayObject)).alloc }
 }
 
 /// Port of CPython 3.14 `bytearray_resize_lock_held`'s allocation policy.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
@@ -225,10 +249,16 @@ pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
 
 /// CPython `bytearray_setslice_linear`: a shrinking prefix slice advances
 /// `ob_start` before entering the resize policy.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_advance_logical_start(obj: PyObjectRef, amount: usize) {
     unsafe { (*(obj as *mut W_BytearrayObject)).logical_offset += amount }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_getitem(obj: PyObjectRef, index: usize) -> u8 {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
@@ -236,6 +266,9 @@ pub unsafe fn w_bytearray_getitem(obj: PyObjectRef, index: usize) -> u8 {
     }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_setitem(obj: PyObjectRef, index: usize, value: u8) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
@@ -244,12 +277,15 @@ pub unsafe fn w_bytearray_setitem(obj: PyObjectRef, index: usize, value: u8) {
 }
 
 /// bytearray.find(sub, start) — find first occurrence of byte value.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_find(obj: PyObjectRef, value: u8, start: usize) -> i64 {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
         let data = &*ba.data;
-        for i in start..data.len() {
-            if data[i] == value {
+        for (i, item) in data.iter().enumerate().skip(start) {
+            if *item == value {
                 return i as i64;
             }
         }
@@ -258,6 +294,9 @@ pub unsafe fn w_bytearray_find(obj: PyObjectRef, value: u8, start: usize) -> i64
 }
 
 /// Concatenate bytearray + bytes (b'\0' * N pattern).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_extend(obj: PyObjectRef, other: &[u8]) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
@@ -268,6 +307,9 @@ pub unsafe fn w_bytearray_extend(obj: PyObjectRef, other: &[u8]) {
 }
 
 /// Get a reference to the internal data.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_data(obj: PyObjectRef) -> &'static [u8] {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
@@ -277,6 +319,9 @@ pub unsafe fn w_bytearray_data(obj: PyObjectRef) -> &'static [u8] {
 
 /// Get a mutable reference to the internal data. Caller must ensure
 /// the bytearray is not aliased while the returned slice is live.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
@@ -288,6 +333,9 @@ pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
 /// mutators (append / insert / remove / pop / clear).  Caller must
 /// ensure the bytearray is not aliased while the reference is live and call
 /// [`w_bytearray_sync_alloc`] after every actual length change.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
@@ -296,11 +344,17 @@ pub unsafe fn w_bytearray_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
 }
 
 /// `_exports` — number of live buffer exports over this bytearray.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_exports(obj: PyObjectRef) -> i64 {
     unsafe { (*(obj as *const W_BytearrayObject)).exports }
 }
 
 /// `buffer_w` — record a new live buffer export.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_exports_incref(obj: PyObjectRef) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
@@ -311,6 +365,9 @@ pub unsafe fn w_bytearray_exports_incref(obj: PyObjectRef) {
 /// `bf_releasebuffer` — a consumer released its buffer export.  A release
 /// without a matching acquisition is a fatal accounting bug
 /// (`_exports_underflow`).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_exports_decref(obj: PyObjectRef) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);

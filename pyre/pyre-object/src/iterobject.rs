@@ -152,6 +152,9 @@ pub fn w_tuple_iter_new(seq: PyObjectRef) -> PyObjectRef {
     })
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
     // A tagged immediate is an `int`, never a seq-iter; short-circuit before
     // the `ob_type` deref so the GC value-stack walker (`walk_raw_immortal_roots`)
@@ -178,6 +181,9 @@ pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
 /// that exposes no pickle protocol (`__length_hint__` / `__setstate__` absent,
 /// `__reduce__` inherited from `object`, which refuses).
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_memory_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
@@ -191,6 +197,9 @@ pub unsafe fn is_memory_iter(obj: PyObjectRef) -> bool {
 /// later `__setstate__` revives it.  Its immutable siblings (`str`, `bytes`)
 /// and `arrayiterator` clamp a negative state to zero.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_bytearray_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
@@ -201,6 +210,9 @@ pub unsafe fn is_bytearray_iter(obj: PyObjectRef) -> bool {
 /// `array.arrayiterator` — carries `__reduce__` / `__setstate__` but, unlike
 /// the str and bytes flavours, no `__length_hint__`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_array_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
@@ -209,6 +221,9 @@ pub unsafe fn is_array_iter(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_list_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
@@ -217,6 +232,9 @@ pub unsafe fn is_list_iter(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_list_reverse_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
@@ -225,6 +243,9 @@ pub unsafe fn is_list_reverse_iter(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_tuple_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
@@ -233,64 +254,100 @@ pub unsafe fn is_tuple_iter(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_iter_seq(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_ListIterObject)).seq
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_iter_index(obj: PyObjectRef) -> i64 {
     (*(obj as *const W_ListIterObject)).index
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
     (*(obj as *mut W_ListIterObject)).seq = seq;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_iter_set_index(obj: PyObjectRef, index: i64) {
     (*(obj as *mut W_ListIterObject)).index = index;
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_reverse_iter_seq(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_ListReverseIterObject)).seq
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_reverse_iter_index(obj: PyObjectRef) -> i64 {
     (*(obj as *const W_ListReverseIterObject)).index
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_reverse_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
     (*(obj as *mut W_ListReverseIterObject)).seq = seq;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_reverse_iter_set_index(obj: PyObjectRef, index: i64) {
     (*(obj as *mut W_ListReverseIterObject)).index = index;
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_tuple_iter_seq(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_TupleIterObject)).seq
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_tuple_iter_index(obj: PyObjectRef) -> i64 {
     (*(obj as *const W_TupleIterObject)).index
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_tuple_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
     (*(obj as *mut W_TupleIterObject)).seq = seq;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_tuple_iter_set_index(obj: PyObjectRef, index: i64) {
     (*(obj as *mut W_TupleIterObject)).index = index;
 }
@@ -324,6 +381,9 @@ pub unsafe fn w_seq_iter_length(obj: PyObjectRef) -> i64 {
 
 /// Empty producer shape used by Python 3.14's exhausted reduce form.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_seq_iter_empty_kind(obj: PyObjectRef) -> u8 {
     unsafe { (*(obj as *const W_SeqIterObject)).empty_kind }
 }

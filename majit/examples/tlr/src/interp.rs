@@ -1,6 +1,6 @@
-/// Interpreter for TLR — direct translation of rpython/jit/tl/tlr.py:interpret().
-///
-/// Bytecode format is identical: &[u8] with single-byte opcodes and args.
+//! Interpreter for TLR — direct translation of rpython/jit/tl/tlr.py:interpret().
+//!
+//! Bytecode format is identical: &[u8] with single-byte opcodes and args.
 
 const MOV_A_R: u8 = 1;
 const MOV_R_A: u8 = 2;

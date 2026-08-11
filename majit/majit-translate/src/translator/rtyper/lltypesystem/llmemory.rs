@@ -384,12 +384,20 @@ impl AddressOffset {
 
     /// llmemory.py:28 `def __add__(self, other): return
     /// CompositeOffset(self, other)`.
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "This method is the direct llmemory.py __add__ operation used by the translator; AddressOffset's heterogeneous and fallible operations do not share Rust Add's output contract"
+    )]
     pub fn add(self, other: AddressOffset) -> AddressOffset {
         AddressOffset::composite(vec![self, other])
     }
 
     /// llmemory.py:67-72 `ItemOffset.__mul__` (`__rmul__ = __mul__`).
     /// Non-`ItemOffset` returns `NotImplemented` upstream → `None` here.
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "This preserves llmemory.py __mul__ returning NotImplemented for unsupported offset kinds, which cannot be represented by the standard Mul trait contract"
+    )]
     pub fn mul(self, other: i64) -> Option<AddressOffset> {
         match self {
             AddressOffset::ItemOffset(offset) => Some(AddressOffset::ItemOffset(ItemOffset {
@@ -403,6 +411,10 @@ impl AddressOffset {
     /// llmemory.py:74-75 `ItemOffset.__neg__`; :250-253 `CompositeOffset
     /// .__neg__`. Only those two define `__neg__` upstream; for the other
     /// variants `-offset` raises `TypeError` (no `__neg__`), so `None`.
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "This preserves llmemory.py's partial __neg__ operation and its NotImplemented cases; std::ops::Neg requires an unconditional output"
+    )]
     pub fn neg(self) -> Option<AddressOffset> {
         match self {
             AddressOffset::ItemOffset(offset) => Some(AddressOffset::ItemOffset(ItemOffset {

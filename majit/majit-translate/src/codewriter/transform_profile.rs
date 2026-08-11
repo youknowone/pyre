@@ -49,7 +49,7 @@ pub fn dump_transform_phase_totals() {
             grand.as_secs_f64(),
         );
         let mut rows: Vec<_> = t.iter().cloned().collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows.sort_by_key(|b| std::cmp::Reverse(b.1));
         for (name, dur, n) in rows {
             eprintln!(
                 "[PYRE_PROFILE_DRAIN]   {:>8.3}s  {:>5} calls  {}",

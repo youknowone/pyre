@@ -88,6 +88,10 @@ use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, R
 // RPython defines `externalvsinternal` in rmodel.py and lazily imports rclass.
 // The implementation lives beside InstanceRepr in rclass.rs; keep the upstream
 // module surface here while the Rust implementation stays crate-local.
+#[expect(
+    clippy::type_complexity,
+    reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+)]
 pub fn externalvsinternal(
     rtyper: &std::rc::Rc<RPythonTyper>,
     item_repr: Arc<dyn Repr>,
@@ -239,6 +243,10 @@ pub(crate) fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
 /// the `cflags` argument shape used by `malloc` / `malloc_varsize`
 /// SpaceOperations. Mirrors upstream `inputconst(Void, {'flavor':
 /// 'gc'})` (rmodel.py:216, rstr.py:1130).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub(crate) fn gc_flavor_const() -> Result<Hlvalue, TyperError> {
     let flags = HashMap::from([(ConstValue::byte_str("flavor"), ConstValue::byte_str("gc"))]);
     HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags)).map(Hlvalue::Constant)
@@ -365,7 +373,6 @@ impl Default for ReprState {
 /// .convert_from_to` reads both sides' `methodname` + `self_repr`).
 /// All concrete `Repr` impls are `'static` today so the bound is
 /// satisfied implicitly.
-
 /// `not r_list.listitem.mutated` for the foldable iterator-next selection
 /// (`lltypesystem/rlist.py:462-466`): an unmutated list reads each element
 /// through the PURE `getarrayitem_pure` (`ll_getitem_foldable_nonneg`). Any
@@ -3046,6 +3053,10 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
 /// centralises into this match; as each concrete Repr lands in its
 /// r*.rs file the arm flips from `MissingRTypeOperation` to the real
 /// constructor.
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+)]
 pub fn rtyper_makerepr(
     s_obj: &crate::annotator::model::SomeValue,
     rtyper: &crate::translator::rtyper::rtyper::RPythonTyper,

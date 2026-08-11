@@ -54,6 +54,9 @@ pub(crate) struct JitCode {
 impl JitCode {
     /// Extract raw CodeObject from this JitCode's payload.
     #[inline]
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn raw_code(&self) -> *const CodeObject {
         self.payload.code_ptr
     }
@@ -11889,7 +11892,7 @@ mod tests {
         pyre_interpreter::typedef::init_typeobjects();
         let int_obj = pyre_object::w_int_new(11);
         let true_obj = pyre_object::w_bool_from(true);
-        let float_obj = pyre_object::w_float_new(3.14);
+        let float_obj = pyre_object::w_float_new(3.25);
 
         assert_eq!(ConcreteValue::from_pyobj(int_obj), ConcreteValue::Int(11));
         assert_eq!(
@@ -11898,7 +11901,7 @@ mod tests {
         );
         assert_eq!(
             ConcreteValue::from_pyobj(float_obj),
-            ConcreteValue::Float(3.14)
+            ConcreteValue::Float(3.25)
         );
     }
 
@@ -13440,7 +13443,7 @@ mod tests {
         runtime_jc.body_mut().c_num_regs_f = 2;
         runtime_jc.body_mut().constants_i = vec![100, 200];
         runtime_jc.body_mut().constants_r = vec![0xAABB_CCDD_u64 as i64];
-        runtime_jc.body_mut().constants_f = vec![3.14_f64.to_bits() as i64];
+        runtime_jc.body_mut().constants_f = vec![3.25_f64.to_bits() as i64];
 
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);
@@ -14576,6 +14579,9 @@ pub fn execute_inline_residual_call(
 /// at this site was a deviation that mishandled int subclasses
 /// because pyre stores them with `ob_type == &INT_TYPE` and only
 /// distinguishes them via `w_class` (`typedef.rs:686 w_int_new_unique`).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn int_strategy_preserves_identity(value: pyre_object::PyObjectRef) -> bool {
     unsafe { pyre_object::is_plain_int1(value) }
 }

@@ -21,8 +21,8 @@ pub const FALSEBV: &str = "BitVecVal(0, LONG_BIT)";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProofProblem {
-    CouldNotProve(CouldNotProve),
-    RuleCannotApply(RuleCannotApply),
+    CouldNotProve(Box<CouldNotProve>),
+    RuleCannotApply(Box<RuleCannotApply>),
     SolverUnavailable { rule: String },
 }
 
@@ -285,7 +285,7 @@ impl Prover {
 
 pub fn prove_source(source: &str, _force: bool) -> Result<File, ProofProblem> {
     let ast = parse::parse(source).map_err(|err| {
-        ProofProblem::CouldNotProve(CouldNotProve {
+        ProofProblem::CouldNotProve(Box::new(CouldNotProve {
             rule: Rule {
                 name: "<parse>".to_string(),
                 pattern: Pattern::PatternConst(parse::PatternConst {
@@ -307,7 +307,7 @@ pub fn prove_source(source: &str, _force: bool) -> Result<File, ProofProblem> {
             model: None,
             lhs: "parse".to_string(),
             rhs: "parse".to_string(),
-        })
+        }))
     })?;
     for rule in &ast.rules {
         let mut prover = Prover::new();

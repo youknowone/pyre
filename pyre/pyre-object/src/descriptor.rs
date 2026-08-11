@@ -76,24 +76,36 @@ pub fn w_super_new(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_super(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SUPER_TYPE) }
 }
 
 /// Get the super_type (cls) from a super proxy.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_super_get_type(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Super)).super_type }
 }
 
 /// Get the type selected by `_super_check`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_super_get_obj_type(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Super)).obj_type }
 }
 
 /// Get the bound object (self) from a super proxy.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_super_get_obj(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Super)).obj }
 }
@@ -219,14 +231,23 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
     })
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_get_fget(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_Property)).fget
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_get_fset(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_Property)).fset
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_get_fdel(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_Property)).fdel
 }
@@ -238,6 +259,9 @@ pub unsafe fn w_property_get_fdel(obj: PyObjectRef) -> PyObjectRef {
 /// getter.  CPython 3.14 additionally clears `prop_name` on every init.  Keep
 /// those object-resident fields together here instead of maintaining an
 /// interpreter-side shadow table.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_reinit(
     obj: PyObjectRef,
     fget: PyObjectRef,
@@ -256,6 +280,9 @@ pub unsafe fn w_property_reinit(
 
 /// `descriptor.py:249-250 W_Property.get_doc` — returns the raw slot
 /// (NULL plays None; the caller wraps).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_get_doc(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_Property)).w_doc
 }
@@ -265,6 +292,9 @@ pub unsafe fn w_property_get_doc(obj: PyObjectRef) -> PyObjectRef {
 /// does not change whether the constructor originally copied it from the
 /// getter.  `_copy` still needs that provenance so a later `.getter()` can
 /// derive the new getter's docstring.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_set_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let prop = obj as *mut W_Property;
     (*prop).w_doc = w_doc;
@@ -275,6 +305,9 @@ pub unsafe fn w_property_set_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
 
 /// `descriptor.py:199-204` — stamp a doc inherited from `fget.__doc__`
 /// at construction time, marking `getter_doc`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_set_getter_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let prop = obj as *mut W_Property;
     (*prop).w_doc = w_doc;
@@ -286,17 +319,26 @@ pub unsafe fn w_property_set_getter_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
 /// getter.  CPython 3.14 stores that visible value in the subclass instance
 /// dict (because the subclass class dict shadows property's member), while
 /// `_copy` still consults the flag on the native property payload.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_mark_getter_doc(obj: PyObjectRef) {
     (*(obj as *mut W_Property)).getter_doc = true;
 }
 
 /// `self.w_name` — NULL plays unset.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_get_name(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_Property)).w_name
 }
 
 /// `descriptor.py:274-276 W_Property.set_name` — record the name the
 /// property was assigned under.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_property_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     let prop = obj as *mut W_Property;
     (*prop).w_name = w_name;
@@ -304,6 +346,9 @@ pub unsafe fn w_property_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_property(obj: PyObjectRef) -> bool {
     py_type_check(obj, &PROPERTY_TYPE)
 }

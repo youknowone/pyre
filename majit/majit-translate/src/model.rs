@@ -2356,6 +2356,10 @@ fn exc_args(
 /// load-bearing once Z4's flowcontext-walker rewrite materialises
 /// intermediate `SpamBlock`s per fold step (the upstream
 /// `flowcontext.py:443-463 mergeblock` chain pattern).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
     use std::collections::HashMap;
     // upstream: `for link in list(graph.iterlinks()):` — walk every
@@ -2570,9 +2574,7 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
             // `v` is not defined by an op here; if it is an inputarg and the
             // block has exactly one predecessor, hop to the link arg feeding
             // that inputarg slot.
-            let Some(slot) = b.inputargs.iter().position(|a| a == &v) else {
-                return None;
-            };
+            let slot = b.inputargs.iter().position(|a| a == &v)?;
             if !seen.insert(block) {
                 return None;
             }
@@ -2733,6 +2735,10 @@ pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
 /// `Link.arg`, a terminal-block inputarg — pins the result and the
 /// chain is kept.  Runs to a fixpoint so a store of one dead aggregate
 /// into another exposes the inner one once the outer store is gone.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
     use crate::flowspace::model::Variable;
 
@@ -3264,6 +3270,10 @@ pub fn fuse_boxing_alloc(
 /// A rename map is the direct equivalent of RPython's per-clone variable
 /// mapping: it preserves the nested header/outer-object shape without a
 /// side-table that survives this local graph rewrite.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn sink_fused_boxing_aggregates_at_raw_writes(
     graph: &mut FunctionGraph,
     aggregates: &[crate::flowspace::model::Variable],
@@ -3539,6 +3549,10 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
 /// cluster at once; the inputargs / link args the removed producers leave
 /// dangling (and the now-dead address constants) are reclaimed by the
 /// [`prune_dead_phis`] pass the lowering runs next.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
     use crate::flowspace::model::Variable;
     use std::collections::HashMap;
@@ -3805,11 +3819,11 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///          for non-`canremove` ops).  Raising-op operands therefore
 ///          stay live unconditionally — the raise side-effect is
 ///          observable.
-///      The `exitswitch` (if a Variable) joins `read_vars`.  For
-///      each block with no exits (`returnblock` / `exceptblock` /
-///      otherwise terminal), the inputargs are also added — return
-///      and except blocks implicitly use their inputs
-///      (`simplify.py:459-462`).
+///          The `exitswitch` (if a Variable) joins `read_vars`.  For
+///          each block with no exits (`returnblock` / `exceptblock` /
+///          otherwise terminal), the inputargs are also added — return
+///          and except blocks implicitly use their inputs
+///          (`simplify.py:459-462`).
 ///   2. For every Link, record `dependencies[targetarg].add(linkarg)`
 ///      mapping (`simplify.py:457-458`).  This is the key
 ///      difference from a naïve forward pass — link args are NOT
@@ -3861,9 +3875,9 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///          `translator=None`, so the arm is unreachable.  The
 ///          `op is not block.raising_op` clause is moot for the
 ///          same reason.
-///      Convergence path: surface a translator-equivalent (callee
-///      effect classifier) and route `OpKind::Call`-with-elidable-EI
-///      through this Step's drop path.
+///          Convergence path: surface a translator-equivalent (callee
+///          effect classifier) and route `OpKind::Call`-with-elidable-EI
+///          through this Step's drop path.
 ///   6. For each reachable block, walk its exits and drop
 ///      `Link.args[i]` for every `i` where `target.inputargs[i]`
 ///      is not in `read_vars` — inputarg-side trim happens in a
@@ -3874,6 +3888,10 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///      `block.inputargs[i]` (and its matching `OpKind::Input` op
 ///      if still present in `block.operations`) for every dead
 ///      Variable (`simplify.py:520-524`).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     use crate::inline::is_pure_op;
     use std::collections::HashMap;
@@ -4282,6 +4300,10 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         inputs.insert(block_id, phis);
     }
 
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     fn simplify_phis(
         uf: &mut UnionFind<LinkArg, Representative>,
         phis: &mut Vec<(crate::flowspace::model::Variable, Vec<LinkArg>)>,
@@ -4343,6 +4365,10 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
     }
 
     let keys: Vec<LinkArg> = uf.keys().cloned().collect();
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded; this exactly models RPython object-identity dictionary keys without a divergent side table"
+    )]
     let mut renaming: HashMap<
         crate::flowspace::model::Variable,
         crate::flowspace::model::Variable,
@@ -4368,8 +4394,13 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
             // `OpKind::Input` op per slot, so remove the Input ops whose result
             // is a dropped slot — otherwise the later rename leaves a spurious
             // in-block definition for a value no predecessor supplies.
-            let surviving_set: std::collections::HashSet<&crate::flowspace::model::Variable> =
-                surviving.iter().collect();
+            #[expect(
+                clippy::mutable_key_type,
+                reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded; this exactly models RPython object-identity dictionary keys without a divergent side table"
+            )]
+            let surviving_set: std::collections::HashSet<
+                &crate::flowspace::model::Variable,
+            > = surviving.iter().collect();
             let block = graph.block_mut(block_id);
             let dropped: Vec<crate::flowspace::model::Variable> = block
                 .inputargs
@@ -4430,6 +4461,10 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         if block_id == start || block_id == return_block || block_id == except_block {
             continue;
         }
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded; this exactly models RPython object-identity dictionary keys without a divergent side table"
+        )]
         let mut first_seen: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
         let mut duplicate_slots: Vec<(usize, usize)> = Vec::new();
         for (i, inputarg) in graph.blocks[block_idx].inputargs.iter().enumerate() {
@@ -5207,6 +5242,10 @@ impl FunctionGraph {
     /// minted but never referenced are naturally absent — every
     /// consumer filters such values out anyway (`getcolor` returns
     /// `None`, `annotation` is empty).
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     pub fn iter_variables(&self) -> Vec<crate::flowspace::model::Variable> {
         use crate::flowspace::model::Variable;
         let mut seen: std::collections::HashSet<Variable> = std::collections::HashSet::new();

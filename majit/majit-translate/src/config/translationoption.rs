@@ -764,19 +764,18 @@ pub fn get_combined_translation_config(
     };
 
     // Upstream `:299-303`.
-    if existing_config.is_none() {
-        children.push(opt(translating_opt));
-        children.push(desc(translation_optiondescription()));
-    } else {
+    if let Some(existing) = existing_config {
         // Upstream copies the children of `existing_config._cfgimpl_descr`
         // excluding the one that collides with `other_optdescr._name`.
-        let existing = existing_config.unwrap();
         for child in existing._cfgimpl_descr._children.iter() {
             if child.name() == newname {
                 continue;
             }
             children.push(child.clone());
         }
+    } else {
+        children.push(opt(translating_opt));
+        children.push(desc(translation_optiondescription()));
     }
 
     let descr = Rc::new(OptionDescription::new("pypy", "all options", children));

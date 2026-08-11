@@ -1,17 +1,17 @@
-/// JIT-enabled tiny2 interpreter via `#[jit_interp]` proc macro with `state_fields`.
-///
-/// TODO: `rpython/jit/tl/tiny2_hotpath.py:90` models the
-/// operand stack as a linked-list `Stack(value, next)`; each push allocates
-/// one cons cell that RPython's JIT peels as a chain of virtuals. pyre's
-/// `state_fields = { stackpos, stack: [int; virt] }` does not express
-/// linked-list stacks — it requires a contiguous virtualizable array. The
-/// array backing is a source-shape deviation; post-optimization the trace
-/// shape is equivalent to RPython's peeled virtuals for the shallow,
-/// constant-height stacks the tinybench exercises. Porting a linked-list
-/// state kind to #[jit_interp] is a separate, larger port.
-///
-/// Greens: [bytecode (env), pc]
-/// Reds:   [stackpos, stack]  (tracked via state_fields)
+//! JIT-enabled tiny2 interpreter via `#[jit_interp]` proc macro with `state_fields`.
+//!
+//! TODO: `rpython/jit/tl/tiny2_hotpath.py:90` models the
+//! operand stack as a linked-list `Stack(value, next)`; each push allocates
+//! one cons cell that RPython's JIT peels as a chain of virtuals. pyre's
+//! `state_fields = { stackpos, stack: [int; virt] }` does not express
+//! linked-list stacks — it requires a contiguous virtualizable array. The
+//! array backing is a source-shape deviation; post-optimization the trace
+//! shape is equivalent to RPython's peeled virtuals for the shallow,
+//! constant-height stacks the tinybench exercises. Porting a linked-list
+//! state kind to #[jit_interp] is a separate, larger port.
+//!
+//! Greens: [bytecode (env), pc]
+//! Reds:   [stackpos, stack]  (tracked via state_fields)
 
 // ── Bytecode opcodes ──
 

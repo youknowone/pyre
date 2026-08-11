@@ -22,14 +22,17 @@ pub enum JitException {
     /// jitexc.py:45 ExitFrameWithExceptionRef
     ExitFrameWithExceptionRef(GcRef),
     /// jitexc.py:53 ContinueRunningNormally
-    ContinueRunningNormally {
-        green_int: Vec<i64>,
-        green_ref: Vec<i64>,
-        green_float: Vec<i64>,
-        red_int: Vec<i64>,
-        red_ref: Vec<i64>,
-        red_float: Vec<i64>,
-    },
+    ContinueRunningNormally(Box<ContinueRunningNormallyArgs>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContinueRunningNormallyArgs {
+    pub green_int: Vec<i64>,
+    pub green_ref: Vec<i64>,
+    pub green_float: Vec<i64>,
+    pub red_int: Vec<i64>,
+    pub red_ref: Vec<i64>,
+    pub red_float: Vec<i64>,
 }
 
 /// Result of a completed trace execution.

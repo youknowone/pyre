@@ -514,6 +514,9 @@ pub fn clear_gc_root_hooks() {
 // atomic fn-pointer cell) stays opaque to the JIT — the `try_gc_write_barrier`
 // twin; calls residualize via the registered fnaddr (`rlib/jit.py:139`).
 #[majit_macros::dont_look_inside]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn try_gc_add_root(slot: *mut *mut u8) -> bool {
     match GC_ADD_ROOT_HOOK.get() {
         Some(f) => {

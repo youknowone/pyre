@@ -402,6 +402,9 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
 /// Canonical `BaseException` comes from the EXC_CLASS_REGISTRY populated at
 /// `make_exc_type` time — not from the mutable builtins dict — so a user
 /// rebinding `builtins.BaseException` cannot redirect the gate.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
     if !is_type_like_w(w_obj) {
         return false;
@@ -420,6 +423,9 @@ pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
 /// Like `exception_is_valid_obj_as_class_w` but skips the
 /// `isinstance_w(w_cls, w_type)` precheck — the caller already knows
 /// `w_cls` is a class object.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn exception_is_valid_class_w(w_cls: PyObjectRef) -> bool {
     let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
         return false;
@@ -480,6 +486,9 @@ pub(crate) fn syntax_error_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
 ///
 ///   def exception_issubclass_w(self, w_cls1, w_cls2):
 ///       return self.issubtype_w(w_cls1, w_cls2)
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn exception_issubclass_w(w_cls1: PyObjectRef, w_cls2: PyObjectRef) -> bool {
     unsafe { issubtype_w(w_cls1, w_cls2) }
 }
@@ -587,6 +596,9 @@ unsafe fn is_type_like_w(obj: PyObjectRef) -> bool {
 /// equality.  pyre's `pyre_object::is_str` only matches the exact
 /// `STR_TYPE` tag and so rejects `class MyStr(str): pass` instances
 /// — this helper fills in the MRO walk.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn isinstance_str_w(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
@@ -604,6 +616,9 @@ pub unsafe fn isinstance_str_w(obj: PyObjectRef) -> bool {
 /// `space.int_w` callers that should accept `int` and any `int`
 /// subclass (e.g. `bool` and user-defined `class MyInt(int): pass`).
 /// pyre's `pyre_object::is_int` matches `int` + `bool` only.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn isinstance_int_w(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
@@ -619,6 +634,9 @@ pub unsafe fn isinstance_int_w(obj: PyObjectRef) -> bool {
 
 /// `space.isinstance_w(w_obj, space.w_bytes)` — accepts `bytes` and
 /// any `bytes` subclass.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn isinstance_bytes_w(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
@@ -637,6 +655,9 @@ pub unsafe fn isinstance_bytes_w(obj: PyObjectRef) -> bool {
 /// uses it for `w_object` and then coerces to `bytes`.  In pyre the
 /// concrete buffer producers are `bytes` and `bytearray` (incl.
 /// subclasses); this helper accepts either.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn isinstance_bytes_like_w(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
@@ -658,6 +679,9 @@ pub unsafe fn isinstance_bytes_like_w(obj: PyObjectRef) -> bool {
 /// `space.isinstance_w(w_obj, space.w_list)` — accepts `list` and any
 /// `list` subclass.  pyre's `pyre_object::is_list` matches the exact
 /// `LIST_TYPE` tag only.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn isinstance_list_w(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
@@ -8722,6 +8746,9 @@ fn buffer_bytes(
 /// Look up a descriptor on an object's type.
 ///
 /// PyPy equivalent: `space.lookup(w_obj, name)`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn lookup(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     let w_type = crate::typedef::r#type(obj)?;
     lookup_in_type(w_type.as_ptr(), name)
@@ -8734,6 +8761,9 @@ pub unsafe fn lookup(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
 /// Returns `Ok(None)` when the type MRO does not define `name`, `Ok(Some(m))`
 /// with the bound method otherwise, and propagates a descriptor `__get__`
 /// error (e.g. a `__get__` that raises `ValueError`).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn lookup_special(
     obj: PyObjectRef,
     name: &str,
@@ -8753,6 +8783,9 @@ pub unsafe fn lookup_special(
 /// Look up a name on a type by walking the C3 MRO.
 ///
 /// PyPy equivalent: `space.lookup_in_type(w_type, name)`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn lookup_in_type(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     lookup_in_type_where(w_type, name)
 }
@@ -8761,6 +8794,9 @@ pub unsafe fn lookup_in_type(w_type: PyObjectRef, name: &str) -> Option<PyObject
 /// getattr consults a data descriptor before the object's own dict, so a
 /// same-named dict entry is shadowed; a JIT fold that reads the dict directly
 /// must decline for such a name.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn type_lookup_is_data_descr(w_type: PyObjectRef, name: &str) -> bool {
     match lookup_in_type(w_type, name) {
         Some(descr) => is_data_descr(descr),
@@ -9131,6 +9167,9 @@ fn method_hash(version_tag: u64, name: &Wtf8) -> usize {
 /// `version_tag`-keyed lookup to a constant.
 #[majit_macros::elidable_promote]
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _pure_version_tag(w_type: PyObjectRef) -> u64 {
     unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) }
 }
@@ -9176,6 +9215,9 @@ pub(crate) unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
 /// the front door, so this is only ever entered with a valid promoted
 /// `version_tag`.
 #[majit_macros::elidable]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _pure_lookup_where_with_method_cache(
     w_type: PyObjectRef,
     w_name: PyObjectRef,
@@ -9206,6 +9248,9 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
 /// `w_name` ABI and the null-as-`None` convention (a negative result has a
 /// null `w_class`).
 #[majit_macros::elidable]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _pure_lookup_class_with_method_cache(
     w_type: PyObjectRef,
     w_name: PyObjectRef,
@@ -10041,6 +10086,9 @@ pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<P
 ///   - PY_NULL       if it is a staticmethod (no binding)
 ///   - the class obj if it is a classmethod  (bind class)
 ///   - `self_obj`    otherwise                (bind instance)
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn super_lookup_binding(
     super_type: PyObjectRef,
     self_obj: PyObjectRef,
@@ -10093,6 +10141,9 @@ pub unsafe fn super_lookup_binding(
 /// algorithm (Python 2.3+). Handles diamond inheritance correctly.
 ///
 /// Public wrapper for use by isinstance and other external callers.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn compute_default_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
     compute_mro(w_type)
 }
@@ -10245,6 +10296,9 @@ unsafe fn abstract_mro(w_klass: PyObjectRef) -> Result<Vec<usize>, crate::PyErro
 /// `check_and_find_best_base` (typeobject.py:1519), so a bad type base is still
 /// reported before any classic base's `__bases__` executes.  The early
 /// pre-flight passes `false` and stays a pure C3 check.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn validate_c3_mro(
     bases: PyObjectRef,
     walk_classic_bases: bool,
@@ -10482,6 +10536,9 @@ pub(crate) unsafe fn compute_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
 /// for these names.
 /// baseobjspace.py isinstance_w: check if w_obj is instance of w_cls
 /// by walking the MRO of type(w_obj) and comparing with w_cls.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
     let w_obj_type = if is_instance(w_obj) {
         w_instance_get_type(w_obj)
@@ -11793,6 +11850,9 @@ fn is_exception_typedef_member(descr: PyObjectRef, slot: ExceptionAttrSlot) -> b
 /// fallback.  `args` returns the raw `args_w` storage as an ingredient only;
 /// the walker must preserve `fixedview` on stores and allocate the public
 /// tuple view on loads, so it declines shapes it cannot decompose safely.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn exception_attr_slot_fold(
     obj: PyObjectRef,
     name: &str,

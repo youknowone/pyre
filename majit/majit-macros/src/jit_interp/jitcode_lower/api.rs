@@ -386,6 +386,10 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+)]
 pub(crate) fn generate_inline_helper_jitcode_with_calls(
     func: &ItemFn,
     calls: &[crate::jit_interp::CallEntry],

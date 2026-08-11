@@ -42,6 +42,10 @@ impl DictKey {
     /// RPython `DictKey.__init__(bookkeeper, s_value, is_r_dict=False)`
     /// (dictdef.py:11-13). Returns the underlying `ListItem` wrapped in
     /// a shared cell, ready for storage in `DictDef.dictkey`.
+    #[expect(
+        clippy::new_ret_no_self,
+        reason = "This is the direct DictKey.__init__ namespace port from rpython/annotator/dictdef.py; Rust represents the inherited ListItem instance as Rc<RefCell<ListItem>>"
+    )]
     pub fn new(
         bookkeeper: Option<Rc<Bookkeeper>>,
         s_value: SomeValue,
@@ -72,8 +76,8 @@ impl DictKey {
             );
             if self_ceh != other_ceh {
                 return Err(UnionError {
-                    lhs: self_li.borrow().s_value.clone(),
-                    rhs: other_li.borrow().s_value.clone(),
+                    lhs: Box::new(self_li.borrow().s_value.clone()),
+                    rhs: Box::new(other_li.borrow().s_value.clone()),
                     msg: "mixing plain dictionaries with r_dict()".into(),
                 });
             }
@@ -157,8 +161,8 @@ impl DictKey {
             let b = self_li.borrow();
             (
                 b.bookkeeper.clone().ok_or_else(|| UnionError {
-                    lhs: b.s_value.clone(),
-                    rhs: b.s_value.clone(),
+                    lhs: Box::new(b.s_value.clone()),
+                    rhs: Box::new(b.s_value.clone()),
                     msg: "r_dict key has no bookkeeper".into(),
                 })?,
                 b.s_value.clone(),
@@ -179,14 +183,14 @@ impl DictKey {
                 None,
             )
             .map_err(|e| UnionError {
-                lhs: s_eqfn.clone(),
-                rhs: s_key.clone(),
+                lhs: Box::new(s_eqfn.clone()),
+                rhs: Box::new(s_key.clone()),
                 msg: e.msg.unwrap_or_else(|| "emulate_pbc_call failed".into()),
             })?;
         if !SomeValue::Bool(SomeBool::new()).contains(&s_eq) {
             return Err(UnionError {
-                lhs: s_eq,
-                rhs: s_key.clone(),
+                lhs: Box::new(s_eq),
+                rhs: Box::new(s_key.clone()),
                 msg: "the custom eq function of an r_dict must return a boolean".into(),
             });
         }
@@ -198,19 +202,19 @@ impl DictKey {
                     role: "hash",
                 },
                 &s_hashfn,
-                &[s_key.clone()],
+                std::slice::from_ref(&s_key),
                 &[],
                 None,
             )
             .map_err(|e| UnionError {
-                lhs: s_hashfn.clone(),
-                rhs: s_key.clone(),
+                lhs: Box::new(s_hashfn.clone()),
+                rhs: Box::new(s_key.clone()),
                 msg: e.msg.unwrap_or_else(|| "emulate_pbc_call failed".into()),
             })?;
         if !SomeValue::Integer(SomeInteger::default()).contains(&s_hash) {
             return Err(UnionError {
-                lhs: s_hash,
-                rhs: s_key,
+                lhs: Box::new(s_hash),
+                rhs: Box::new(s_key),
                 msg: "the custom hash function of an r_dict must return an integer".into(),
             });
         }
@@ -229,6 +233,10 @@ impl DictValue {
     /// [`ListItem::__init__`] verbatim (dictdef.py:69). Keep the
     /// factory on the subclass namespace so `DictDef::new` mirrors the
     /// upstream `DictValue(bookkeeper, s_value)` call shape.
+    #[expect(
+        clippy::new_ret_no_self,
+        reason = "This preserves the inherited DictValue/ListItem constructor call shape from rpython/annotator/dictdef.py while Rust stores the concrete ListItem cell"
+    )]
     pub fn new(bookkeeper: Option<Rc<Bookkeeper>>, s_value: SomeValue) -> Rc<RefCell<ListItem>> {
         Rc::new(RefCell::new(ListItem::new(bookkeeper, s_value)))
     }

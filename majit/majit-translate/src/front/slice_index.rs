@@ -388,6 +388,10 @@ fn reachable_from_start(graph: &FunctionGraph) -> std::collections::HashSet<crat
 /// an ordinary MIR copy. Multiple incoming values must converge to one
 /// identity; disagreement is deliberately not guessed through.
 fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     fn visit(
         graph: &FunctionGraph,
         var: &Variable,
@@ -711,9 +715,11 @@ fn array_len_base_is_stable(
         let Some(block) = graph.blocks.iter().find(|block| block.id == *block_id) else {
             return true;
         };
-        let start = (block.id == earlier.0 && !later_is_in_cycle)
-            .then_some(earlier.1 + 1)
-            .unwrap_or(0);
+        let start = if block.id == earlier.0 && !later_is_in_cycle {
+            earlier.1 + 1
+        } else {
+            0
+        };
         let end = if block.id == later.0 && !later_is_in_cycle {
             later.1
         } else {
@@ -944,6 +950,10 @@ fn slice_index_segments_match(segments: &[String]) -> bool {
 /// if any op / exitswitch / exception payload other than the construction
 /// writes or the index op reads a closure member. Mirrors
 /// `range_iter::range_feeds_only_forloop`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn range_feeds_only_index(
     graph: &FunctionGraph,
     range_result: &Variable,

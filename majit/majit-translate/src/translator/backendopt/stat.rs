@@ -135,14 +135,14 @@ pub fn get_statistics(
 ///
 /// pyre walks `GraphFunc.code: Option<HostCode>`:
 ///   * `None`        → `md5(b"None")` (upstream's AttributeError
-///                     branch).
+///     branch).
 ///   * `Some(host)`  → `md5(co_code_bytes(&host))`. The byte
-///                     representation packs each `CodeUnit` as
-///                     `(op, arg)` two-byte pairs, which matches
-///                     CPython 3.14's `co_code` layout. The digest
-///                     is therefore not byte-identical to a
-///                     CPython-2.7 upstream run, but the
-///                     stat.py-shaped branching is preserved.
+///     representation packs each `CodeUnit` as
+///     `(op, arg)` two-byte pairs, which matches
+///     CPython 3.14's `co_code` layout. The digest
+///     is therefore not byte-identical to a
+///     CPython-2.7 upstream run, but the
+///     stat.py-shaped branching is preserved.
 fn graph_co_code_hash(graph: &GraphRef) -> String {
     let g = graph.borrow();
     match g.func.as_ref().and_then(|f| f.code.as_deref()) {

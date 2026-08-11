@@ -2450,12 +2450,9 @@ impl ClassDef {
         start: &Rc<RefCell<ClassDef>>,
         attrname: &str,
     ) -> Option<Rc<RefCell<ClassDef>>> {
-        for cd in Self::getmro(start) {
-            if cd.borrow().attrs.contains_key(attrname) {
-                return Some(cd);
-            }
-        }
-        None
+        Self::getmro(start)
+            .into_iter()
+            .find(|cd| cd.borrow().attrs.contains_key(attrname))
     }
 
     /// RPython `ClassDef.about_attribute(self, name)` (classdesc.py:324-334).
@@ -3025,7 +3022,7 @@ impl ClassDef {
     /// position previously recorded in `read_locations_of__class__`.
     /// Called from `ClassDef::__init__` after a fresh subclass attaches
     /// itself via `basedef.subdefs.append(self)`.
-    fn see_new_subclass_recursive(base: &Rc<RefCell<ClassDef>>, child: &Rc<RefCell<ClassDef>>) {
+    fn see_new_subclass_recursive(base: &Rc<RefCell<ClassDef>>, _child: &Rc<RefCell<ClassDef>>) {
         // upstream: for position in self.read_locations_of__class__:
         //     self.bookkeeper.annotator.reflowfromposition(position)
         let (positions, bk_opt) = {
@@ -3045,7 +3042,7 @@ impl ClassDef {
         }
         let parent = base.borrow().basedef.clone();
         if let Some(parent_rc) = parent {
-            Self::see_new_subclass_recursive(&parent_rc, child);
+            Self::see_new_subclass_recursive(&parent_rc, _child);
         }
     }
 }

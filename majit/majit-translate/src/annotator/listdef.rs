@@ -292,8 +292,8 @@ impl ListItem {
         if updated {
             if self.dont_change_any_more {
                 return Err(UnionError {
-                    lhs: self.s_value.clone(),
-                    rhs: s_other_value.clone(),
+                    lhs: Box::new(self.s_value.clone()),
+                    rhs: Box::new(s_other_value.clone()),
                     msg: "TooLateForChange on generalize()".into(),
                 });
             }
@@ -364,8 +364,8 @@ impl ListItem {
             let a = self_li.borrow();
             let b = other_li.borrow();
             return Err(UnionError {
-                lhs: a.s_value.clone(),
-                rhs: b.s_value.clone(),
+                lhs: Box::new(a.s_value.clone()),
+                rhs: Box::new(b.s_value.clone()),
                 msg: "ListItem.merge during side-effect-free union".into(),
             });
         }
@@ -379,8 +379,8 @@ impl ListItem {
             if other_b.dont_change_any_more {
                 if self_b.dont_change_any_more {
                     return Err(UnionError {
-                        lhs: self_b.s_value.clone(),
-                        rhs: other_b.s_value.clone(),
+                        lhs: Box::new(self_b.s_value.clone()),
+                        rhs: Box::new(other_b.s_value.clone()),
                         msg: "TooLateForChange".into(),
                     });
                 }
@@ -416,8 +416,8 @@ impl ListItem {
             if folded_flags.3 {
                 if driver_mut.resized {
                     return Err(UnionError {
-                        lhs: driver_mut.s_value.clone(),
-                        rhs: folded_s_value.clone(),
+                        lhs: Box::new(driver_mut.s_value.clone()),
+                        rhs: Box::new(folded_s_value.clone()),
                         msg: "ListChangeUnallowed: list merge with a resized".into(),
                     });
                 }
@@ -427,8 +427,8 @@ impl ListItem {
         if folded_flags.0 {
             // upstream: `self.mutate()` — propagates TooLateForChange.
             driver_li.borrow_mut().mutate().map_err(|_| UnionError {
-                lhs: driver_li.borrow().s_value.clone(),
-                rhs: folded_s_value.clone(),
+                lhs: Box::new(driver_li.borrow().s_value.clone()),
+                rhs: Box::new(folded_s_value.clone()),
                 msg: "TooLateForChange on mutate() during merge".into(),
             })?;
         }
@@ -436,8 +436,8 @@ impl ListItem {
             // upstream: `self.resize()` — propagates TooLateForChange /
             // ListChangeUnallowed.
             driver_li.borrow_mut().resize().map_err(|e| UnionError {
-                lhs: driver_li.borrow().s_value.clone(),
-                rhs: folded_s_value.clone(),
+                lhs: Box::new(driver_li.borrow().s_value.clone()),
+                rhs: Box::new(folded_s_value.clone()),
                 msg: e.msg.unwrap_or_else(|| "resize() failed".into()),
             })?;
         }
@@ -449,8 +449,8 @@ impl ListItem {
                 .borrow_mut()
                 .setrangestep(new_step)
                 .map_err(|_| UnionError {
-                    lhs: driver_li.borrow().s_value.clone(),
-                    rhs: folded_s_value.clone(),
+                    lhs: Box::new(driver_li.borrow().s_value.clone()),
+                    rhs: Box::new(folded_s_value.clone()),
                     msg: "TooLateForChange on setrangestep() during merge".into(),
                 })?;
         }
@@ -468,8 +468,8 @@ impl ListItem {
         let widens_folded = new_s_value != folded_s_value;
         if widens_driver && driver_li.borrow().dont_change_any_more {
             return Err(UnionError {
-                lhs: driver_s_value_pre,
-                rhs: folded_s_value,
+                lhs: Box::new(driver_s_value_pre),
+                rhs: Box::new(folded_s_value),
                 msg: "TooLateForChange on dont_change_any_more ListItem".into(),
             });
         }

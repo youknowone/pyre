@@ -696,6 +696,10 @@ mod jitcode_handle_serde {
     }
 
     impl<'de> Deserialize<'de> for JitCodeHandle {
+        #[expect(
+            clippy::arc_with_non_send_sync,
+            reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+        )]
         fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
             let jc = JitCode::deserialize(de)?;
             Ok(JitCodeHandle(Arc::new(jc)))

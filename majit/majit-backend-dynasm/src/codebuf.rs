@@ -1,8 +1,8 @@
-/// codebuf.py: Code buffer management.
-///
-/// In RPython, MachineCodeBlockWrapper wraps rx86 code builders with
-/// block management. In the dynasm backend, dynasmrt::Assembler
-/// handles this natively — this module provides any extra utilities.
+//! codebuf.py: Code buffer management.
+//!
+//! In RPython, MachineCodeBlockWrapper wraps rx86 code builders with
+//! block management. In the dynasm backend, dynasmrt::Assembler
+//! handles this natively — this module provides any extra utilities.
 
 /// codebuf.py:34 MachineCodeBlockWrapper
 /// dynasm-rs handles code buffer management internally.

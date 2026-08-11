@@ -101,9 +101,9 @@ pub(super) fn prebuilt_payload_pointer(value: &RBigInt) -> Option<*mut RBigInt> 
         return None;
     }
     let digits = value._digits as usize;
-    for index in 0..PREBUILT_DIGITS.len() {
+    for (index, slot) in PREBUILT_DIGITS.iter().enumerate() {
         // An unpublished slot reads 0, which no live digit array can equal.
-        if PREBUILT_DIGITS[index].load(std::sync::atomic::Ordering::Relaxed) != digits {
+        if slot.load(std::sync::atomic::Ordering::Relaxed) != digits {
             continue;
         }
         let Some(&raw) = prebuilt_slots()[index].get() else {

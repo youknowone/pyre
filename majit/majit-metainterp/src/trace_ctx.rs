@@ -80,8 +80,8 @@ fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
 /// `bh_getarrayitem_gc_*` consumes the descr through
 /// `unpack_arraydescr_size` (`base_size`, `itemsize`, `is_item_signed`)
 /// + the `array_base_size()` accessor for Ref/Float reads; the
-/// remaining `BhDescr::Array` fields are placeholder defaults the load
-/// path never reads.  Returns `None` for non-array descrs.
+///   remaining `BhDescr::Array` fields are placeholder defaults the load
+///   path never reads.  Returns `None` for non-array descrs.
 fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_translate::jitcode::BhDescr> {
     let a = descr.as_array_descr()?;
     Some(majit_translate::jitcode::BhDescr::Array {
@@ -357,6 +357,10 @@ pub struct TraceCtx {
     /// point's key. `green_key_from_code_ptr(green_key_raw.0, pc)` is not it —
     /// `JitState::code_ptr()` defaults to 0, and the driver's key is
     /// `GreenKey::hash_u64` over the declared green tuple.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub compiled_key_for_greens_fn:
         Option<Box<dyn Fn(&(Vec<i64>, Vec<i64>, Vec<i64>)) -> Option<u64>>>,
     /// Explicit "this trace started from a guard failure" flag. RPython
@@ -2504,10 +2508,16 @@ impl TraceCtx {
         // short/misaligned shadow (only the identity slot present, or fewer
         // data slots than expected) can never overwrite the identity.
         let shadow_data_len = values.len().saturating_sub(1);
-        for i in 0..static_count.min(shadow_data_len) {
-            let ty = info.static_fields[i].field_type;
+        for (i, (field, slot)) in info
+            .static_fields
+            .iter()
+            .zip(values.iter_mut())
+            .take(static_count.min(shadow_data_len))
+            .enumerate()
+        {
+            let ty = field.field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
-            values[i] = crate::pyjitpl::heap_value_for_pub(ty, bits);
+            *slot = crate::pyjitpl::heap_value_for_pub(ty, bits);
         }
         let mut cursor = static_count;
         for (a_idx, &length) in array_lengths.iter().enumerate() {
@@ -2645,15 +2655,21 @@ impl TraceCtx {
         if shadow_data_len < static_count {
             return;
         }
-        for i in 0..static_count {
-            let ty = info.static_fields[i].field_type;
+        for (i, (field, value)) in info
+            .static_fields
+            .iter()
+            .zip(values.iter())
+            .take(static_count)
+            .enumerate()
+        {
+            let ty = field.field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
             let heap = crate::pyjitpl::heap_value_for_pub(ty, bits);
             debug_assert_eq!(
-                values[i], heap,
+                *value, heap,
                 "virtualizable static field {} ({:?}) diverged from the shadow: \
                  a vable write did not update virtualizable_boxes",
-                i, info.static_fields[i].name,
+                i, field.name,
             );
         }
         let mut cursor = static_count;
@@ -3059,16 +3075,16 @@ impl TraceCtx {
     ///      `None` as "never matches a real heap pointer", so PTR_EQ
     ///      comparisons with the standard vable resolve to "different" at
     ///      trace time.
-    /// Reconstruct a ref value whose recorder box carries no stamped concrete,
-    /// by re-executing its recorded producer against now-resolvable operands.
-    /// history.py:948 `resbox = execute_with_descr(...)` deferred to
-    /// resume-image build time: an inlined sub-walk that reads a loop-invariant
-    /// OUTER input arg records a `getfield_gc_r` while the obj is still symbolic
-    /// (its concrete lives only in the outer frame's register shadow), so
-    /// `concrete_of_opref` stays `None` until the seeded input arg lets the load
-    /// re-run here.  Follows a chain of `getfield_gc_r` ops down to a resolvable
-    /// root; `depth` bounds the walk.  Returns `None` when the chain roots at an
-    /// op that is neither stamped nor a ref getfield, or the obj is null.
+    ///      Reconstruct a ref value whose recorder box carries no stamped concrete,
+    ///      by re-executing its recorded producer against now-resolvable operands.
+    ///      history.py:948 `resbox = execute_with_descr(...)` deferred to
+    ///      resume-image build time: an inlined sub-walk that reads a loop-invariant
+    ///      OUTER input arg records a `getfield_gc_r` while the obj is still symbolic
+    ///      (its concrete lives only in the outer frame's register shadow), so
+    ///      `concrete_of_opref` stays `None` until the seeded input arg lets the load
+    ///      re-run here.  Follows a chain of `getfield_gc_r` ops down to a resolvable
+    ///      root; `depth` bounds the walk.  Returns `None` when the chain roots at an
+    ///      op that is neither stamped nor a ref getfield, or the obj is null.
     pub fn recover_ref_value(&self, opref: OpRef, depth: u32) -> Option<Value> {
         if let Some(v) = self.concrete_of_opref(opref) {
             return Some(v);
@@ -3202,6 +3218,10 @@ impl TraceCtx {
     /// upstream caller of this reload — the escape path of
     /// `vable_after_residual_call` (pyjitpl.py:3377) — is reached from the
     /// state-field dispatcher, which holds no `MetaInterp` reference.
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
+    )]
     pub fn load_fields_from_virtualizable(
         &mut self,
         info: &VirtualizableInfo,
@@ -3456,10 +3476,10 @@ impl TraceCtx {
     ///
     /// Emits `GETFIELD_GC` for every static field and `GETFIELD_GC_R`
     /// + `GETARRAYITEM_GC` for every array item of the virtualizable
-    /// referenced by `vable`. Returns the freshly recorded OpRefs in
-    /// `[scalar_0, ..., scalar_{N-1}, array_0_item_0, ...,
+    ///   referenced by `vable`. Returns the freshly recorded OpRefs in
+    ///   `[scalar_0, ..., scalar_{N-1}, array_0_item_0, ...,
     /// array_K_item_M]` order — the callee inputarg order minus the
-    /// leading frame reference.
+    ///   leading frame reference.
     ///
     /// `array_lengths[i]` is the live element count of the i-th array
     /// field, mirroring `vinfo.get_array_length(vable, arrayindex)`
@@ -4812,6 +4832,10 @@ impl TraceCtx {
     /// the virtualizable array, making `OutOfVable` an invariant violation on
     /// that path. Graceful handling belongs to dispatcher/walker callers that
     /// have a trace to abort.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn vable_setarrayitem_indexed(
         &mut self,
         pc: usize,
@@ -5243,11 +5267,11 @@ mod tests {
     #[test]
     fn test_opref_to_box_constant_float_m1() {
         let mut ctx = TraceCtx::for_test(0);
-        let c = ctx.const_float((3.14_f64).to_bits() as i64);
+        let c = ctx.const_float((3.25_f64).to_bits() as i64);
         assert!(c.is_constant());
         match ctx.opref_to_box(c) {
             OcBox::ConstFloat(bits) => {
-                assert_eq!(f64::from_bits(bits), 3.14);
+                assert_eq!(f64::from_bits(bits), 3.25);
             }
             other => panic!("expected ConstFloat, got {:?}", other),
         }
@@ -5426,7 +5450,7 @@ mod tests {
         let cpu = SanityTestCpu {
             int_value: 0,
             ref_value: majit_ir::GcRef(0xAAAA_BBBB),
-            float_value: 3.14,
+            float_value: 3.25,
         };
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
@@ -5442,7 +5466,7 @@ mod tests {
         ctx.heapcache_getfield_now_known(vable, field_index_r, cached_r);
 
         let fd_f = majit_ir::make_field_descr_full(2, 8, 8, Type::Float, false);
-        let cached_f = ctx.const_float((3.14_f64).to_bits() as i64);
+        let cached_f = ctx.const_float((3.25_f64).to_bits() as i64);
         let field_index_f = fd_f.index();
         ctx.heapcache_getfield_now_known(vable, field_index_f, cached_f);
 

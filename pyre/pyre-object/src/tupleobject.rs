@@ -481,6 +481,10 @@ pub unsafe fn w_tuple_set_cached_hash(obj: PyObjectRef, hash: i64) {
 /// Predicates: `listobject.py:2390 is_plain_int1` accepts exact
 /// `W_IntObject` (not bool, not int subclass) AND fits-int
 /// `W_LongObject`; `type(w) is W_FloatObject` is strict identity.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub fn makespecialisedtuple2(w_arg1: PyObjectRef, w_arg2: PyObjectRef) -> PyObjectRef {
     unsafe {
         if is_plain_int1(w_arg1) && is_plain_int1(w_arg2) {
@@ -501,6 +505,9 @@ pub fn makespecialisedtuple2(w_arg1: PyObjectRef, w_arg2: PyObjectRef) -> PyObje
 /// directly with no fits-* extension (no `is_plain_float1` helper
 /// upstream).
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_plain_float_strict(obj: PyObjectRef) -> bool {
     if !py_type_check(obj, &FLOAT_TYPE) {
         return false;

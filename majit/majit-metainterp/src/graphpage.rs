@@ -131,6 +131,10 @@ pub fn getdescr(op: &Op) -> Option<DescrRef> {
 #[derive(Default)]
 pub struct ResOpGraphPage {
     pub source: String,
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub links: Vec<(String, (String, (u8, u8, u8)))>,
 }
 
@@ -375,6 +379,10 @@ impl<'a> ResOpGen<'a> {
         format!("{op}")
     }
 
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     fn getlinks(&mut self) -> Vec<(String, (String, (u8, u8, u8)))> {
         let mut links = Vec::new();
         for graphindex in 0..self.graphs.len() {
@@ -391,6 +399,10 @@ impl<'a> ResOpGen<'a> {
         links
     }
 
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     fn add_link_for_box(&mut self, links: &mut Vec<(String, (String, (u8, u8, u8)))>, box_: OpRef) {
         let short = self.repr_short(box_);
         if short.len() > 1

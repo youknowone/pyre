@@ -637,6 +637,10 @@ impl VirtualizableInfo {
     /// (e.g. Rust Vec-like containers). The `ptr_offset` is relative
     /// to `field_offset` and locates the data pointer within the
     /// container.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     pub fn add_embedded_array_field(
         &mut self,
         name: impl Into<String>,
@@ -1073,9 +1077,7 @@ impl VirtualizableInfo {
         array_lengths: &[usize],
     ) -> usize {
         let mut idx = self.num_static_extra_boxes;
-        for i in 0..array_index {
-            idx += array_lengths[i];
-        }
+        idx += array_lengths.iter().take(array_index).sum::<usize>();
         idx + item_index
     }
 

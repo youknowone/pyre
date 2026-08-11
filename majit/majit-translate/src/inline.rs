@@ -99,6 +99,10 @@ fn find_inline_sites(graph: &FunctionGraph, call_control: &CallControl) -> Vec<I
 /// 3. Connect: before → callee entry (passing call args)
 /// 4. Connect: callee Return → merge block (passing return value)
 /// 5. Merge block continues with the "after" ops
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     let InlineSite {
         block_id,
@@ -315,6 +319,10 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
 /// Variable referenced inside the callee.  Returns the callee-Variable
 /// → caller-Variable rename map consumed by [`remap_op`] and the
 /// cross-graph remap closures in [`inline_call_site`].
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn remap_callee_values(
     graph: &mut FunctionGraph,
     callee: &FunctionGraph,
@@ -392,6 +400,10 @@ fn remap_callee_blocks(
 /// every operand Variable is looked up directly (falling back to
 /// the source Variable if it is not in the map — e.g. a Constant
 /// or an external-graph reference).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn remap_op(
     op: &SpaceOperation,
     value_map: &HashMap<crate::flowspace::model::Variable, crate::flowspace::model::Variable>,
@@ -1301,7 +1313,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
 /// upstream — direct port of the unary entries in
 /// `simplify.CanRemove` (`rpython/translator/simplify.py:405-417`)
 /// + `enum_ops_without_sideeffects()`
-/// (`rpython/rtyper/lltypesystem/lloperation.py:128-134`).
+///   (`rpython/rtyper/lltypesystem/lloperation.py:128-134`).
 ///
 /// Any opname not in this list is treated as side-effecting so the
 /// dead-op DCE pass does not silently remove it.  Notably absent:

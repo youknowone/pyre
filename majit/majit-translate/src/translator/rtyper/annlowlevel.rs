@@ -103,7 +103,7 @@ use super::rtyper::{GenopResult, HighLevelOp, RPythonTyper};
 use crate::tool::sourcetools::valid_identifier;
 
 fn already_annotation_sigarg(s_value: SomeValue) -> SigArgType {
-    SigArgType::Spec(AnnotationSpec::Already(s_value))
+    SigArgType::Spec(AnnotationSpec::Already(Box::new(s_value)))
 }
 
 fn signature_error(msg: impl Into<String>) -> SignatureError {
@@ -746,7 +746,7 @@ impl MixLevelAnnotatorPolicy {
     pub fn specialize_genconst(
         &self,
         funcdesc: &FunctionDesc,
-        args_s: &mut Vec<Option<SomeValue>>,
+        args_s: &mut [Option<SomeValue>],
         i: usize,
     ) -> Result<Rc<PyGraph>, TyperError> {
         let s = args_s[i].as_ref().ok_or_else(|| {
@@ -2099,8 +2099,10 @@ mod tests {
     }
 
     fn lowlevel_type_const_annotation(t: LowLevelType) -> SomeValue {
-        let mut s = SomeObject::default();
-        s.const_box = Some(Constant::new(ConstValue::LowLevelType(Box::new(t))));
+        let s = SomeObject {
+            const_box: Some(Constant::new(ConstValue::LowLevelType(Box::new(t)))),
+            ..SomeObject::default()
+        };
         SomeValue::Object(s)
     }
 
@@ -2126,7 +2128,7 @@ mod tests {
         let SigArgType::Spec(AnnotationSpec::Already(s_value)) = sigarg else {
             panic!("expected AnnotationSpec::Already");
         };
-        s_value
+        *s_value
     }
 
     #[test]
@@ -2290,7 +2292,8 @@ mod tests {
         };
         let s_self = SomeValue::Ptr(SomePtr::new(ptr.clone()));
 
-        let expanded_item = already_annotation(call_dynamic_sigarg(&item, &[s_self.clone()]));
+        let expanded_item =
+            already_annotation(call_dynamic_sigarg(&item, std::slice::from_ref(&s_self)));
         assert!(matches!(expanded_item, SomeValue::Integer(_)));
         let expanded_self = already_annotation(call_dynamic_sigarg(&self_arg, &[s_self]));
         let SomeValue::Ptr(expanded_self) = expanded_self else {
@@ -2307,7 +2310,7 @@ mod tests {
 
         let expanded_self = already_annotation(call_dynamic_sigarg(
             &typemeth_placeholder_sigarg("self").expect("self typemeth placeholder"),
-            &[s_type.clone()],
+            std::slice::from_ref(&s_type),
         ));
         let SomeValue::Ptr(s_ptr) = expanded_self else {
             panic!("typemeth self should return Ptr(TYPE)");
@@ -2321,7 +2324,7 @@ mod tests {
 
         let expanded_self_type = already_annotation(call_dynamic_sigarg(
             &typemeth_placeholder_sigarg("SELF").expect("SELF typemeth placeholder"),
-            &[s_type.clone()],
+            std::slice::from_ref(&s_type),
         ));
         assert_eq!(expanded_self_type, s_type);
 

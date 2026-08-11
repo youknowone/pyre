@@ -2619,9 +2619,11 @@ mod tests {
         assert_eq!(jitcode.constants_r, vec![0]);
         assert!(matches!(
             &jitcode.exec.descrs[0],
-            majit_metainterp::jitcode::RuntimeBhDescr::Descr(
-                majit_metainterp::blackhole::BhDescr::VableField { index: 3 }
-            )
+            majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr)
+                if matches!(
+                    descr.as_ref(),
+                    majit_metainterp::blackhole::BhDescr::VableField { index: 3 }
+                )
         ));
     }
 

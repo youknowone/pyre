@@ -105,6 +105,10 @@ impl RegAllocatorState {
     }
 
     /// Process one block: compute die_at, build interference edges.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
     fn process_block(
         &mut self,
         block: &Block,
@@ -181,13 +185,13 @@ impl RegAllocatorState {
             .collect();
         for (i, v) in livevars.iter().enumerate() {
             self.depgraph.add_node(v.clone());
-            for j in 0..i {
+            for prior in livevars.iter().take(i) {
                 // Pyre can carry duplicate block input Variables after
                 // parity-preserving flow rewrites.  RPython's shared
                 // DependencyGraph asserts against self-edges, so skip them
                 // locally instead of weakening the color.py port.
-                if livevars[j] != *v {
-                    self.depgraph.add_edge(livevars[j].clone(), v.clone());
+                if *prior != *v {
+                    self.depgraph.add_edge(prior.clone(), v.clone());
                 }
             }
         }
@@ -385,15 +389,15 @@ impl RegAllocator {
 /// concretetypes `Ptr(OBJECT_VTABLE)` / `Ptr(OBJECT)` so
 /// `flatten.py:143 raise %r`, `flatten.py:220-231 last_exception/>i`
 /// + `goto_if_exception_mismatch/i` see canonical kinds.  Pyre's
-/// codewriter creates the canonical exceptblock eagerly in
-/// `FunctionGraph::new` with `Unknown` placeholders; this helper
-/// stamps the canonical Signed / GcRef kinds whenever the rtyper
-/// hand-off (`apply_to_graph` / `apply_from_flowspace_variables`)
-/// did not — equivalent to the previous `augment_value_kinds_*`
-/// helper but written directly through to each backing
-/// `Variable.concretetype` cell via
-/// `FunctionGraph::set_concretetype_of_inline` instead of returning
-/// a transitional HashMap.
+///   codewriter creates the canonical exceptblock eagerly in
+///   `FunctionGraph::new` with `Unknown` placeholders; this helper
+///   stamps the canonical Signed / GcRef kinds whenever the rtyper
+///   hand-off (`apply_to_graph` / `apply_from_flowspace_variables`)
+///   did not — equivalent to the previous `augment_value_kinds_*`
+///   helper but written directly through to each backing
+///   `Variable.concretetype` cell via
+///   `FunctionGraph::set_concretetype_of_inline` instead of returning
+///   a transitional HashMap.
 pub(crate) fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
     let except_args = &graph.block(graph.exceptblock).inputargs;
     if except_args.len() == 2 {
@@ -457,6 +461,10 @@ pub(crate) fn perform_all_register_allocations(
 /// port.  Runs on FunctionGraph (Block structure), BEFORE flatten.
 /// Reads kind from `FunctionGraph::concretetype_of(&v)` exactly like
 /// upstream reads `getkind(v.concretetype)`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegAllocator {
     let consider =
         |var: &crate::flowspace::model::Variable| -> bool { variable_regkind(var) == Some(kind) };

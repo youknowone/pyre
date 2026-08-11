@@ -303,8 +303,9 @@ impl DoneWithThisFrameDescrMulti {
 /// (`AGENTS.md` forbids HashMap/BTreeMap).  Linear scan is fine here —
 /// the cache size is bounded by the number of distinct FINISH result
 /// type lists in the program (typically a small handful).
-static DONE_MULTI_CACHE: OnceLock<Mutex<Vec<(Vec<Type>, Arc<DoneWithThisFrameDescrMulti>)>>> =
-    OnceLock::new();
+type DoneMultiCache = Vec<(Vec<Type>, Arc<DoneWithThisFrameDescrMulti>)>;
+
+static DONE_MULTI_CACHE: OnceLock<Mutex<DoneMultiCache>> = OnceLock::new();
 
 fn done_multi_cache() -> &'static Mutex<Vec<(Vec<Type>, Arc<DoneWithThisFrameDescrMulti>)>> {
     DONE_MULTI_CACHE.get_or_init(|| Mutex::new(Vec::new()))

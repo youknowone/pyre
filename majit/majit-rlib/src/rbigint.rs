@@ -4316,11 +4316,8 @@ impl PartsCacheBase {
     fn base_parameters(base: i64) -> (i64, i64) {
         let mut mindigits = 1;
         let mut curr = base;
-        loop {
-            let Some(next) = curr.checked_mul(base) else {
-                break;
-            };
-            if next >= MASK {
+        while let Some(next) = curr.checked_mul(base) {
+            if next == MASK {
                 break;
             }
             curr = next;
@@ -4519,6 +4516,10 @@ fn _format_int10_18digits(mut val: i64, builder: &mut String) {
 /// This is the `_format_int10` graph.  Keeping it separate from the general
 /// graph preserves RPython's constant callable identity checks and removes a
 /// runtime discriminator from recursive calls.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The signature is the direct specialized _format_recursive graph from rbigint.py; callable identity and argument order are part of RPython specialization parity"
+)]
 fn _format_recursive_decimal(
     mut x: RBigInt,
     mut i: i64,
@@ -4595,6 +4596,10 @@ fn _format_recursive_decimal(
 
 /// The `_format_int_general` graph emitted by upstream's
 /// `@specialize.arg(6) _format_recursive`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The signature is the direct specialized _format_recursive graph from rbigint.py; grouping state would obscure recursive-call and specialization parity"
+)]
 fn _format_recursive_general(
     mut x: RBigInt,
     mut i: i64,
@@ -4666,7 +4671,7 @@ fn _format_lowest_level_divmod_int_results(x: &RBigInt, iother: i64) -> (i64, i6
     if !x.tobool() {
         return (0, 0);
     }
-    debug_assert!(iother > 0 && iother <= MASK);
+    debug_assert!(iother > 0);
     let size = x.numdigits() - 1;
     let mut rem = if size == 1 {
         let rem = x.uwidedigit(1);

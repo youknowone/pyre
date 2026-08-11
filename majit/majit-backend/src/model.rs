@@ -14,6 +14,9 @@ use std::sync::Arc;
 use majit_ir::operand::Operand;
 use majit_ir::{ArrayDescr, FieldDescr, GcRef, Value};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpeculativeError;
+
 /// `model.py:39 AbstractCPU` (subset) — services hosted on
 /// `optimizer.cpu` and reached from any `Optimization` sub-class.
 pub trait Cpu: Send + Sync {
@@ -154,16 +157,16 @@ pub trait Cpu: Send + Sync {
         &self,
         gcptr: GcRef,
         arraydescr: &dyn ArrayDescr,
-    ) -> Result<(), ()> {
+    ) -> Result<(), SpeculativeError> {
         if gcptr.is_null() {
-            return Err(());
+            return Err(SpeculativeError);
         }
         if !majit_gc::supports_guard_gc_type() {
             return Ok(());
         }
-        let actual_tid = majit_gc::get_actual_typeid(gcptr).ok_or(())?;
+        let actual_tid = majit_gc::get_actual_typeid(gcptr).ok_or(SpeculativeError)?;
         if actual_tid != arraydescr.type_id() {
-            return Err(());
+            return Err(SpeculativeError);
         }
         Ok(())
     }
@@ -185,32 +188,32 @@ pub trait Cpu: Send + Sync {
     /// string/unicode branch when `supports_guard_gc_type == false`
     /// (`mod.rs:5430` "we don't unroll in that case" port), so only
     /// the null check is reachable in that mode.
-    fn protect_speculative_string(&self, gcptr: GcRef) -> Result<(), ()> {
+    fn protect_speculative_string(&self, gcptr: GcRef) -> Result<(), SpeculativeError> {
         if gcptr.is_null() {
-            return Err(());
+            return Err(SpeculativeError);
         }
         if !majit_gc::supports_guard_gc_type() {
             return Ok(());
         }
         match self.str_descr() {
             Some(d) => self.protect_speculative_array(gcptr, d),
-            None => Err(()),
+            None => Err(SpeculativeError),
         }
     }
 
     /// `llmodel.py:580-581 protect_speculative_unicode`.  Mirror of
     /// `protect_speculative_string` for unicode storage; routes
     /// through `unicode_descr()` when registered.
-    fn protect_speculative_unicode(&self, gcptr: GcRef) -> Result<(), ()> {
+    fn protect_speculative_unicode(&self, gcptr: GcRef) -> Result<(), SpeculativeError> {
         if gcptr.is_null() {
-            return Err(());
+            return Err(SpeculativeError);
         }
         if !majit_gc::supports_guard_gc_type() {
             return Ok(());
         }
         match self.unicode_descr() {
             Some(d) => self.protect_speculative_array(gcptr, d),
-            None => Err(()),
+            None => Err(SpeculativeError),
         }
     }
 

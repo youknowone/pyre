@@ -1,12 +1,12 @@
-/// Reference interpreter for a two-tape Brainfuck-like language.
-///
-/// Two independent tapes `a` and `b`, each with its own pointer:
-///   `>` `<` `+` `-`   move/mutate tape `a`
-///   `}` `{` `*` `/`   move/mutate tape `b`
-///   `[` `]`           loop on tape `a`'s current cell
-///
-/// `interpret` returns the sum of every cell across both tapes so the JIT
-/// result can be compared against this oracle with a single integer.
+//! Reference interpreter for a two-tape Brainfuck-like language.
+//!
+//! Two independent tapes `a` and `b`, each with its own pointer:
+//!   `>` `<` `+` `-`   move/mutate tape `a`
+//!   `}` `{` `*` `/`   move/mutate tape `b`
+//!   `[` `]`           loop on tape `a`'s current cell
+//!
+//! `interpret` returns the sum of every cell across both tapes so the JIT
+//! result can be compared against this oracle with a single integer.
 
 pub const TAPE_SIZE: usize = 8;
 

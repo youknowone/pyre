@@ -1,7 +1,7 @@
-/// Interpreter for TLA — direct translation of rpython/jit/tl/tla/tla.py.
-///
-/// Object-oriented stack machine with wrapped values (W_IntObject, W_StringObject).
-/// The frame is virtualizable in RPython: `_virtualizable_ = ['stackpos', 'stack[*]']`.
+//! Interpreter for TLA — direct translation of rpython/jit/tl/tla/tla.py.
+//!
+//! Object-oriented stack machine with wrapped values (W_IntObject, W_StringObject).
+//! The frame is virtualizable in RPython: `_virtualizable_ = ['stackpos', 'stack[*]']`.
 
 const CONST_INT: u8 = 0;
 const POP: u8 = 1;

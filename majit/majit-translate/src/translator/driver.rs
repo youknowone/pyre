@@ -52,10 +52,10 @@
 //!    method binding; the port keeps `self.exposed: Vec<String>`
 //!    (line 101) verbatim and provides [`TranslationDriver::exposed_method`]
 //!    + [`TranslationDriver::proceed`] to dispatch by name. The
-//!    `proceed`-bound `backend_goal` is captured in a side-table
-//!    [`TranslationDriver::exposed_backend_goal`] so `proceed("compile")`
-//!    routes to the platform-specific `compile_c` task exactly as
-//!    upstream's bound `proc()` closure would.
+//!      `proceed`-bound `backend_goal` is captured in a side-table
+//!      [`TranslationDriver::exposed_backend_goal`] so `proceed("compile")`
+//!      routes to the platform-specific `compile_c` task exactly as
+//!      upstream's bound `proc()` closure would.
 //! 2. **`@taskdef` decorator** at `:22-32` — upstream attaches
 //!    `task_deps` / `task_title` / `task_idempotent` / `task_earlycheck`
 //!    attributes to each `task_*` function. The Rust port calls
@@ -327,6 +327,10 @@ struct TaskDef {
     idempotent: bool,
     /// Upstream `task.task_earlycheck`. Optional callback that
     /// `_event("planned", goal)` invokes at upstream `:611-612`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     earlycheck: Option<Rc<dyn Fn(&TranslationDriver) -> Result<(), TaskError>>>,
 }
 
@@ -514,6 +518,10 @@ pub struct TranslationDriver {
     // idempotency flag; the earlycheck function rides here so
     // `_event("planned", goal)` can invoke it.
     // -----------------------------------------------------------------
+    #[expect(
+        clippy::type_complexity,
+        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+    )]
     pub task_earlycheck:
         RefCell<HashMap<String, Rc<dyn Fn(&TranslationDriver) -> Result<(), TaskError>>>>,
 }
@@ -614,7 +622,7 @@ impl TranslationDriver {
         // including the silent `None`-on-skip downgrade.
         if let Some(default_goal) = default_goal {
             let resolved = driver
-                .backend_select_goals(&[default_goal.clone()])?
+                .backend_select_goals(std::slice::from_ref(&default_goal))?
                 .into_iter()
                 .next()
                 .ok_or_else(|| {
@@ -1045,9 +1053,9 @@ impl TranslationDriver {
             // a `SomeList`; wrap it in `AnnotationSpec::Already` so
             // the build_types pipeline at `annrpython.rs:534`
             // (`typeannotation` short-circuit) accepts it.
-            vec![AnnotationSpec::Already(SomeValue::List(
+            vec![AnnotationSpec::Already(Box::new(SomeValue::List(
                 crate::annotator::listdef::s_list_of_strings(),
-            ))]
+            )))]
         });
         *self.inputtypes.borrow_mut() = Some(resolved_inputtypes);
 
@@ -1920,7 +1928,6 @@ impl TranslationDriver {
             .cloned()
             .map(|_| ())
             .unwrap_or(());
-        ();
         let v = interp.eval_graph(placeholder_graph, Vec::new(), false)?;
         // Upstream `:555`: `log.llinterpret("result -> %s" % v)`.
         self.info(&format!("llinterpret result -> {:?}", v.type_id()));
@@ -2073,7 +2080,7 @@ impl TranslationDriver {
             if let Some(fb) = fork_before {
                 // Upstream `:616`: `fork_before, = self.backend_select_goals([fork_before])`.
                 let resolved = self
-                    .backend_select_goals(&[fb.clone()])
+                    .backend_select_goals(std::slice::from_ref(&fb))
                     .map_err(|e| TaskError {
                         message: format!("fork_before backend_select_goals({fb:?}): {e}"),
                     })?;

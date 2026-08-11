@@ -212,21 +212,33 @@ pub fn w_coroutine_wrapper_new(coroutine: PyObjectRef) -> PyObjectRef {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_generator(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &GENERATOR_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_coroutine(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &COROUTINE_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_async_generator(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &ASYNC_GENERATOR_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_generator_or_coroutine(obj: PyObjectRef) -> bool {
     unsafe { is_generator(obj) || is_coroutine(obj) || is_async_generator(obj) }
 }
@@ -292,25 +304,40 @@ pub fn w_async_gen_athrow_new(
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_coroutine_wrapper(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &COROUTINE_WRAPPER_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_coroutine_wrapper_get_coroutine(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const CoroutineWrapper)).coroutine }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_get_frame(obj: PyObjectRef) -> *mut u8 {
     unsafe { (*(obj as *const GeneratorIterator)).frame_ptr }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_get_pycode(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GeneratorIterator)).pycode }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_frame(obj: PyObjectRef, frame_ptr: *mut u8) {
     unsafe { (*(obj as *mut GeneratorIterator)).frame_ptr = frame_ptr };
     if !frame_ptr.is_null() {
@@ -318,20 +345,32 @@ pub unsafe fn w_generator_set_frame(obj: PyObjectRef, frame_ptr: *mut u8) {
     }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_is_exhausted(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const GeneratorIterator)).exhausted }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_exhausted(obj: PyObjectRef) {
     unsafe {
         (*(obj as *mut GeneratorIterator)).exhausted = true;
     }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_is_started(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const GeneratorIterator)).started }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_started(obj: PyObjectRef) {
     unsafe {
         (*(obj as *mut GeneratorIterator)).started = true;
@@ -339,21 +378,33 @@ pub unsafe fn w_generator_set_started(obj: PyObjectRef) {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_coroutine_warned_unawaited(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const GeneratorIterator)).warned_unawaited }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_coroutine_set_warned_unawaited(obj: PyObjectRef) {
     unsafe {
         (*(obj as *mut GeneratorIterator)).warned_unawaited = true;
     }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_is_running(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const GeneratorIterator)).running }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_running(obj: PyObjectRef, val: bool) {
     unsafe {
         (*(obj as *mut GeneratorIterator)).running = val;
@@ -361,86 +412,134 @@ pub unsafe fn w_generator_set_running(obj: PyObjectRef, val: bool) {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_get_saved_exc_value(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GeneratorIterator)).saved_exc_value }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_saved_exc_value(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).saved_exc_value = value };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_get_previous(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GeneratorIterator)).previous_gen_or_coroutine }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_previous(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).previous_gen_or_coroutine = value };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_get_name(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GeneratorIterator)).name }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_name(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).name = value };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_get_qualname(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GeneratorIterator)).qualname }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).qualname = value };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_coroutine_get_origin(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GeneratorIterator)).cr_origin }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_coroutine_set_origin(obj: PyObjectRef, origin: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).cr_origin = origin };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_async_generator_hooks_inited(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const GeneratorIterator)).hooks_inited }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_async_generator_set_hooks_inited(obj: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).hooks_inited = true };
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_async_generator_is_running(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const GeneratorIterator)).ag_running }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_async_generator_set_running(obj: PyObjectRef, value: bool) {
     unsafe { (*(obj as *mut GeneratorIterator)).ag_running = value };
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_async_generator_get_finalizer(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GeneratorIterator)).w_finalizer }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_async_generator_set_finalizer(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).w_finalizer = value };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);

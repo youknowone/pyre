@@ -6704,7 +6704,7 @@ mod tests {
                 map: term,
                 storage: vec![],
             };
-            let v = -3.141_592_653_589_793_f64;
+            let v = -3.25_f64;
             let m = obj._get_mapdict_map();
             node_write(m, &mut obj, wn("f"), DICT, pyre_object::w_float_new(v));
             let m = obj._get_mapdict_map();

@@ -156,6 +156,11 @@ impl FloatArray {
         self.len
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn to_vec(&self) -> Vec<f64> {
         self.as_slice().to_vec()
     }

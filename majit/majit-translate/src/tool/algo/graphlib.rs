@@ -713,6 +713,10 @@ where
             }
             // depth of a cycle = how far it reaches from any root
             // (`:368-371`).
+            #[expect(
+                clippy::type_complexity,
+                reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
+            )]
             let mut allcycles: Vec<(usize, Vec<Rc<Edge<V, P>>>)> = Vec::new();
             for cycle in cycles {
                 let cycledepth = cycle

@@ -20,9 +20,9 @@
 //!   - `transform_extend_with_char_count` (transform.py:84-106)
 //!   - `transform_list_contains` (transform.py:115-134)
 //!   - `transform_dead_op_vars` (transform.py:137-143) — forwards to
-//!      [`crate::translator::simplify::transform_dead_op_vars_in_blocks`].
+//!     [`crate::translator::simplify::transform_dead_op_vars_in_blocks`].
 //!   - `transform_dead_code` + `cutoff_alwaysraising_block`
-//!      (transform.py:145-198).
+//!     (transform.py:145-198).
 //!   - `default_extra_passes` + `transform_graph` (transform.py:246-272).
 //!
 //! `insert_ll_stackcheck` (transform.py:200-243) is rtyper-phase and
@@ -488,7 +488,7 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
         (t, v)
     };
     // upstream: `s_type = annmodel.SomeTypeOf([evalue])`.
-    let s_type = r#typeof(&[evalue_rc.clone()]);
+    let s_type = r#typeof(std::slice::from_ref(&evalue_rc));
     // upstream: `s_value = annmodel.SomeInstance(
     //     self.bookkeeper.getuniqueclassdef(Exception))`.
     let exc_class = HOST_ENV
@@ -577,6 +577,10 @@ pub fn transform_dead_op_vars(ann: &RPythonAnnotator, block_subset: &[BlockRef])
 ///                                         op.result)
 ///                 block.operations[i] = new_op
 /// ```
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn transform_allocate(_ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
     for block in block_subset {
         // upstream: maps `c` (newlist result) → `a` (newlist's only arg).
@@ -641,6 +645,10 @@ pub fn transform_allocate(_ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
 /// `is list` check goes through `SomeValue::List(_)` since the Rust
 /// port's [`KnownType`] enum collapses SomeList to [`KnownType::Other`]
 /// (list variant pending).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn transform_extend_with_str_slice(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
     for block in block_subset {
         // upstream: maps `b` (getslice result Variable) → [string, x, y].
@@ -725,6 +733,10 @@ pub fn transform_extend_with_char_count(ann: &RPythonAnnotator, block_subset: &[
 
     for block in block_subset {
         // upstream: maps `b` (mul result Variable) → (char, count).
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded; this exactly models RPython object-identity dictionary keys without a divergent side table"
+        )]
         let mut mul_sources: HashMap<Variable, (Hlvalue, Hlvalue)> = HashMap::new();
         let ops_len = block.borrow().operations.len();
         for i in 0..ops_len {
@@ -790,6 +802,10 @@ pub fn transform_extend_with_char_count(ann: &RPythonAnnotator, block_subset: &[
 ///                     s_dict.dictdef.generalize_key(self.binding(op.args[1]))
 /// ```
 ///
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
     for block in block_subset {
         let mut newlist_sources: HashMap<Variable, Vec<Hlvalue>> = HashMap::new();
@@ -1105,7 +1121,7 @@ mod tests {
                 .insert(LinkKey::of(link), link.clone());
         }
 
-        transform_graph(&ann, None, Some(&[start.clone()]));
+        transform_graph(&ann, None, Some(std::slice::from_ref(&start)));
     }
 
     #[test]
@@ -1154,7 +1170,7 @@ mod tests {
                 .insert(LinkKey::of(link), link.clone());
         }
 
-        transform_graph(&ann, None, Some(&[start.clone()]));
+        transform_graph(&ann, None, Some(std::slice::from_ref(&start)));
 
         let ops = &start.borrow().operations;
         assert_eq!(ops.len(), 1);
@@ -1219,7 +1235,7 @@ mod tests {
         .into_ref();
         body.closeblock(vec![body_end]);
 
-        transform_dead_code(&ann, &[start.clone()]);
+        transform_dead_code(&ann, std::slice::from_ref(&start));
 
         let s = start.borrow();
         assert_eq!(s.exits.len(), 1);
@@ -1267,7 +1283,7 @@ mod tests {
             Hlvalue::Variable(Variable::new()),
         ));
 
-        transform_allocate(&ann, &[block.clone()]);
+        transform_allocate(&ann, std::slice::from_ref(&block));
 
         let ops = &block.borrow().operations;
         assert_eq!(ops[0].opname, "newlist");
@@ -1331,7 +1347,7 @@ mod tests {
             Hlvalue::Variable(result.clone()),
         ));
 
-        transform_extend_with_str_slice(&ann, &[block.clone()]);
+        transform_extend_with_str_slice(&ann, std::slice::from_ref(&block));
 
         let ops = &block.borrow().operations;
         assert_eq!(ops[0].opname, "getslice");
@@ -1401,7 +1417,7 @@ mod tests {
             Hlvalue::Variable(result.clone()),
         ));
 
-        transform_extend_with_char_count(&ann, &[block.clone()]);
+        transform_extend_with_char_count(&ann, std::slice::from_ref(&block));
 
         let ops = &block.borrow().operations;
         assert_eq!(ops[0].opname, "mul");
@@ -1454,7 +1470,7 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        transform_list_contains(&ann, &[block.clone()]);
+        transform_list_contains(&ann, std::slice::from_ref(&block));
 
         let ops = &block.borrow().operations;
         let Hlvalue::Constant(dict_c) = &ops[1].args[0] else {
@@ -1505,7 +1521,7 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        transform_list_contains(&ann, &[block.clone()]);
+        transform_list_contains(&ann, std::slice::from_ref(&block));
 
         let ops = &block.borrow().operations;
         assert!(matches!(ops[1].args[0], Hlvalue::Variable(_)));
@@ -1557,7 +1573,7 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        transform_list_contains(&ann, &[block.clone()]);
+        transform_list_contains(&ann, std::slice::from_ref(&block));
 
         let ops = &block.borrow().operations;
         assert!(
@@ -1602,7 +1618,7 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        transform_list_contains(&ann, &[block.clone()]);
+        transform_list_contains(&ann, std::slice::from_ref(&block));
 
         let ops = &block.borrow().operations;
         assert!(
@@ -1649,7 +1665,7 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        transform_list_contains(&ann, &[block.clone()]);
+        transform_list_contains(&ann, std::slice::from_ref(&block));
     }
 
     #[test]
@@ -1689,7 +1705,7 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        transform_list_contains(&ann, &[block.clone()]);
+        transform_list_contains(&ann, std::slice::from_ref(&block));
 
         assert!(
             matches!(
@@ -1738,7 +1754,7 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        transform_list_contains(&ann, &[block.clone()]);
+        transform_list_contains(&ann, std::slice::from_ref(&block));
     }
 
     #[test]
@@ -1781,7 +1797,7 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        transform_list_contains(&ann, &[block.clone()]);
+        transform_list_contains(&ann, std::slice::from_ref(&block));
 
         assert!(
             matches!(
@@ -1861,7 +1877,7 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        transform_list_contains(&ann, &[block.clone()]);
+        transform_list_contains(&ann, std::slice::from_ref(&block));
 
         let ops = &block.borrow().operations;
         let Hlvalue::Constant(dict_c) = &ops[1].args[0] else {

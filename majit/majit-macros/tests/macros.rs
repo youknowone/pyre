@@ -671,9 +671,9 @@ mod jit_module {
         // variants normalise to the same upstream attribute name (the
         // `_cannot_raise` / `_or_memerror` distinctions are codewriter-
         // derived `EffectInfo` classes per `call.py:292-299`).
-        assert!(_elidable_function_pure_plain);
-        assert!(_elidable_function_pure_cannot_raise);
-        assert!(_elidable_function_pure_or_memerror);
+        assert!(std::hint::black_box(_elidable_function_pure_plain));
+        assert!(std::hint::black_box(_elidable_function_pure_cannot_raise));
+        assert!(std::hint::black_box(_elidable_function_pure_or_memerror));
         // Methods (`self`-receiver) skip module-level const emission —
         // `rpython_attribute_const_for`'s receiver guard avoids
         // trait-impl associated-item conflicts.  RPython's
@@ -682,17 +682,17 @@ mod jit_module {
 
         // `rlib/jit.py:139 _jit_look_inside_ = False` — both opaque
         // variants share the upstream attribute.
-        assert!(!_jit_look_inside_opaque_plain);
-        assert!(!_jit_look_inside_opaque_cannot_raise);
+        assert!(!std::hint::black_box(_jit_look_inside_opaque_plain));
+        assert!(!std::hint::black_box(_jit_look_inside_opaque_cannot_raise));
 
         // `rlib/jit.py:169 _jit_loop_invariant_ = True` — both
         // `loop_invariant` and `jit_loop_invariant` (the latter is a pyre
         // alias for the unprefixed name) share the upstream attribute.
-        assert!(_jit_loop_invariant_invariant_jit);
-        assert!(_jit_loop_invariant_invariant_plain);
+        assert!(std::hint::black_box(_jit_loop_invariant_invariant_jit));
+        assert!(std::hint::black_box(_jit_loop_invariant_invariant_plain));
 
         // `rlib/jit.py:159 _jit_unroll_safe_ = True`.
-        assert!(_jit_unroll_safe_unrolled_helper);
+        assert!(std::hint::black_box(_jit_unroll_safe_unrolled_helper));
     }
 
     mod look_inside_alias_module {
@@ -733,18 +733,20 @@ mod jit_module {
         use look_inside_alias_module::*;
 
         // `@look_inside` sets `_jit_look_inside_ = True`.
-        assert!(_jit_look_inside_force_traced);
+        assert!(std::hint::black_box(_jit_look_inside_force_traced));
 
         // `@purefunction` is the `@elidable` alias — emits
         // `_elidable_function_<NAME>` exactly like canonical `@elidable`.
-        assert!(_elidable_function_purefunction_helper);
+        assert!(std::hint::black_box(_elidable_function_purefunction_helper));
 
         // `@purefunction_promote` (`jit.py:203`) is the `@elidable_promote`
         // alias.  `jit.py:185 elidable(func)` puts `_elidable_function_ =
         // True` on the ORIGINAL `func` — which pyre stores as the hidden
         // `_orig_<NAME>_unlikely_name` — and NOT on the wrapper `result`
         // returned at `jit.py:201`.
-        assert!(_elidable_function__orig_purefunction_promote_helper_unlikely_name);
+        assert!(std::hint::black_box(
+            _elidable_function__orig_purefunction_promote_helper_unlikely_name
+        ));
     }
 
     mod oopspec_attribute_module {

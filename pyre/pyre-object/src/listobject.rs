@@ -466,6 +466,9 @@ pub unsafe fn w_list_grow_items_block(obj: PyObjectRef, value: PyObjectRef) -> P
 /// `IntegerListStrategy.is_correct_type` strategy gate
 /// (`listobject.py:1957-1958`).
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     if item.is_null() {
         return false;
@@ -686,6 +689,9 @@ fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
 /// whole cold transition via the registered fnaddr so the hot append/setitem
 /// paths that call it stay traceable.
 #[majit_macros::dont_look_inside]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
     if list.strategy == ListStrategy::Object {
         return;
@@ -1029,6 +1035,9 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
 ///
 /// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
 /// storage list by `Member.index`. `PY_NULL` is the unbound-slot sentinel.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
     let slots = unsafe { (*(obj as *const W_ListObject)).w_slots };
     if slots.is_null() {
@@ -1038,6 +1047,9 @@ pub unsafe fn w_list_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObject
 }
 
 /// Write one app-level `__slots__` entry on a `list` subclass.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(obj);
@@ -1068,6 +1080,9 @@ pub unsafe fn w_list_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef
 }
 
 /// Clear one app-level `__slots__` entry on a `list` subclass.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_slot_del(obj: PyObjectRef, index: usize) -> bool {
     let slots = unsafe { (*(obj as *const W_ListObject)).w_slots };
     if slots.is_null()
@@ -1390,6 +1405,9 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
 /// CPython `list_extend_iter_lock_held`'s direct-store append while its
 /// length-hint reservation still has a free logical slot. The physical
 /// strategy append is identical; only `list_resize` is skipped.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_append_preallocated(obj: PyObjectRef, value: PyObjectRef) {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
@@ -1560,12 +1578,18 @@ pub unsafe fn w_list_int_set_len(obj: PyObjectRef, n: usize) {
 /// JIT rollback leaves for IntOrFloatListStrategy's signed-longlong storage.
 /// These mirror the Integer leaves but encode the restored boxed value using
 /// listobject.py:2193 `IntOrFloatListStrategy.unwrap`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_int_or_float_set_len(obj: PyObjectRef, n: usize) {
     let list = &mut *(obj as *mut W_ListObject);
     debug_assert_eq!(list.strategy, ListStrategy::IntOrFloat);
     list.int_items.set_len(n);
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_int_or_float_setitem(
     obj: PyObjectRef,
     index: usize,
@@ -1603,6 +1627,9 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
 }
 
 /// CPython-visible `PyListObject.allocated` under the list's mutation lock.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_allocated(obj: PyObjectRef) -> isize {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
@@ -1614,6 +1641,9 @@ pub unsafe fn w_list_allocated(obj: PyObjectRef) -> isize {
 }
 
 /// Reserve CPython's logical slots before `list.extend` consumes its source.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_reserve_for_extend(obj: PyObjectRef, extra: usize) {
     if extra == 0 {
         return;
@@ -1631,6 +1661,9 @@ pub unsafe fn w_list_reserve_for_extend(obj: PyObjectRef, extra: usize) {
 /// `list_extend_set` / `list_extend_dict` use ordinary `list_resize` even
 /// when the destination has no backing array; unlike sequence-fast extension
 /// they do not call `list_preallocate_exact`.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_resize_for_extend(obj: PyObjectRef, extra: usize) {
     if extra == 0 {
         return;
@@ -1645,6 +1678,9 @@ pub unsafe fn w_list_resize_for_extend(obj: PyObjectRef, extra: usize) {
 
 /// `list_extend_iter_lock_held` trims an overestimated length hint after the
 /// iterator ends, using ordinary `list_resize` shrink rules.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_finish_extend(obj: PyObjectRef) {
     let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
@@ -1656,6 +1692,9 @@ pub unsafe fn w_list_finish_extend(obj: PyObjectRef) {
 
 /// Recompute one CPython `list_resize` after a pyre implementation performed
 /// a batch mutation as several primitive removals.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_finish_batch_resize(obj: PyObjectRef, old_size: usize, old_allocated: isize) {
     let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
@@ -1665,6 +1704,9 @@ pub unsafe fn w_list_finish_batch_resize(obj: PyObjectRef, old_size: usize, old_
 
 /// Set CPython's raw `PyListObject.allocated` field. `list.sort` uses `-1`
 /// while the saved item array is detached, then restores the previous value.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_set_allocated(obj: PyObjectRef, allocated: isize) {
     let _list_guard = w_list_lock(obj);
     (*(obj as *mut W_ListObject)).allocated = allocated;
@@ -1714,26 +1756,41 @@ pub unsafe fn w_list_is_inline_storage(obj: PyObjectRef) -> bool {
     }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_uses_object_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     list.strategy == ListStrategy::Object
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_uses_int_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     list.strategy == ListStrategy::Integer
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_uses_float_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     list.strategy == ListStrategy::Float
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_uses_int_or_float_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     list.strategy == ListStrategy::IntOrFloat
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_uses_empty_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     list.strategy == ListStrategy::Empty
@@ -1846,6 +1903,9 @@ fn normalize_insert_index(index: i64, len: usize) -> usize {
 /// listobject.py:1712-1720 IntegerListStrategy.insert
 /// Strategy-preserving: inserts on typed storage when type matches,
 /// switches to Object only when incompatible.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     let old_size = list.live_len();
@@ -1909,6 +1969,9 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
 
 /// listobject.py:1850-1862 IntegerListStrategy.pop
 /// Strategy-preserving: pops from typed storage, wraps result.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
@@ -2090,6 +2153,9 @@ pub unsafe fn w_list_float_items_raw(obj: PyObjectRef) -> Option<(*mut f64, usiz
 /// accessors above, the encoded `i64` values must be ordered after decoding.
 /// Reverse follows PyPy's reverse/stable-sort/reverse sequence so equal
 /// int/float values retain reverse-sort stability.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_sort_int_or_float(obj: PyObjectRef, reverse: bool) -> bool {
     let list = &mut *(obj as *mut W_ListObject);
     if list.strategy != ListStrategy::IntOrFloat {
@@ -2188,6 +2254,9 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
 /// Drops any typed storage and resets the list to the EmptyListStrategy
 /// state, exactly like PyPy. The next append will pick a fresh typed
 /// strategy via switch_to_correct_strategy.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_clear(obj: PyObjectRef) {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
@@ -2226,6 +2295,9 @@ pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef
 
 /// listobject.py:1873-1874 IntegerListStrategy.reverse
 /// Strategy-preserving: reverses typed storage in place.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_reverse(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
@@ -2241,6 +2313,9 @@ pub unsafe fn w_list_reverse(obj: PyObjectRef) {
 
 /// listobject.py:1814-1844 deleteslice (step=1 simple case)
 /// Strategy-preserving: drains from typed storage.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     let list = &mut *(obj as *mut W_ListObject);
     let old_size = list.live_len();
@@ -2336,6 +2411,9 @@ pub enum ListFindFast {
 /// `FloatListStrategy.find_or_count` (listobject.py:1928) fast paths
 /// only. Callers must handle `NeedsGeneric` via the interpreter-level
 /// `ListStrategy.find_or_count` which runs the `space.eq_w` loop.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_find_or_count_fast(
     obj: PyObjectRef,
     w_item: PyObjectRef,
@@ -2454,6 +2532,9 @@ pub unsafe fn w_list_find_or_count_fast(
 /// When replacement is a list with the same strategy, operates on typed
 /// storage directly. Otherwise falls back to Object strategy.
 /// `start` and `end` are already normalized (non-negative, clamped).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_setslice(
     obj: PyObjectRef,
     start: usize,

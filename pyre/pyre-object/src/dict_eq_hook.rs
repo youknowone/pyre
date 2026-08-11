@@ -230,6 +230,10 @@ pub extern "C" fn has_eq_w_hook() -> bool {
 /// plain fnaddr); `a` / `b` must nonetheless be valid PyObjectRefs (null
 /// tolerated as per PyPy's `is_w` shortcut at `baseobjspace.py:818-822`).
 #[majit_macros::dont_look_inside]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub extern "C" fn eq_w_hooked(a: PyObjectRef, b: PyObjectRef) -> bool {
     EQ_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(a, b) }).unwrap_or(false))
 }
@@ -287,6 +291,10 @@ pub extern "C" fn has_hash_w_hook() -> bool {
 /// calls dispatch through a plain fnaddr); `obj` must nonetheless be
 /// a valid PyObjectRef (null tolerated).
 #[majit_macros::dont_look_inside]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub extern "C" fn hash_w_hooked(obj: PyObjectRef) -> i64 {
     HASH_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(obj) }).unwrap_or(0))
 }
@@ -318,6 +326,10 @@ pub extern "C" fn has_hash_str_hook() -> bool {
 /// `ptr`/`len` must describe a valid WTF-8 byte range (a zero-length range
 /// with a dangling-but-aligned `ptr` is fine).
 #[majit_macros::dont_look_inside]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub extern "C" fn hash_str_hooked(ptr: *const u8, len: usize) -> i64 {
     HASH_STR_HOOK.with(|cell| cell.get().map(|f| unsafe { f(ptr, len) }).unwrap_or(0))
 }
@@ -409,6 +421,10 @@ pub extern "C" fn has_compares_by_identity_hook() -> bool {
 /// [`try_compares_by_identity`] wrapper does).  `w_type` must be a
 /// valid PyObjectRef pointing at a `W_TypeObject` (null tolerated).
 #[majit_macros::dont_look_inside]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
+)]
 pub extern "C" fn compares_by_identity_hooked(w_type: PyObjectRef) -> bool {
     COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.get().map(|f| unsafe { f(w_type) }).unwrap_or(false))
 }

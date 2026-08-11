@@ -1547,7 +1547,13 @@ pub struct AllocHelpers {
     pub new_array_oldgen_fn_ptr: i64,
 }
 
+type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize, u32, Option<Box<[u32]>>);
+
 /// Build a wasm module from majit IR.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "this is the single code-generation phase boundary and keeps each RPython backend input—IR, descriptors, GC state, frame geometry, and chaining state—explicit and independently auditable"
+)]
 pub fn build_wasm_module(
     inputargs: &[InputArg],
     ops: &[Op],
@@ -1587,7 +1593,7 @@ pub fn build_wasm_module(
     // Self-recursive CALL_ASSEMBLER arm parameters (`PYRE_WASM_CA`); `emit_ca`
     // off keeps the module byte-identical.
     ca: CaParams,
-) -> Result<(Vec<u8>, Vec<GuardExit>, usize, u32, Option<Box<[u32]>>), BackendError> {
+) -> Result<BuildWasmModuleOutput, BackendError> {
     let (mut guards, num_vars) = collect_guards_and_vars(inputargs, ops);
 
     // Every trace's guard/finish exits draw their indices from ONE global
@@ -4326,11 +4332,10 @@ fn build_function(
                         if threshold < GcHeader::MIN_NURSERY_OBJ_SIZE || base_total > threshold {
                             return None;
                         }
-                        let max_len = if item_size_usize == 0 {
-                            u32::MAX as usize
-                        } else {
-                            ((threshold - base_total) / item_size_usize).min(u32::MAX as usize)
-                        };
+                        let max_len = (threshold - base_total)
+                            .checked_div(item_size_usize)
+                            .unwrap_or(u32::MAX as usize)
+                            .min(u32::MAX as usize);
                         let max_len = i64::try_from(max_len).ok()?;
                         Some((max_len, base_total as i64, item_size_usize as i64, na))
                     })()

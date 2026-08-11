@@ -1626,6 +1626,9 @@ impl FsEncodedPath {
         pyre_object::gc_roots::shadow_stack_get(self.w_path_slot)
     }
 
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+    /// invariant required by the object and pointer arguments for the entire call.
     pub unsafe fn is_bytes(&self) -> bool {
         unsafe { pyre_object::bytesobject::is_bytes(self.w_path()) }
     }

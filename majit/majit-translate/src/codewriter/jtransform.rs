@@ -550,6 +550,10 @@ fn is_source_constant_variable(
 /// RPython: `support.autodetect_jit_markers_redvars` (support.py:64-102).
 /// Compute the Variables live across the portal's `jit_merge_point`, remove
 /// its greens, filter Constants/Void, and return INT/REF/FLOAT order.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn autodetect_jit_markers_redvars(
     graph: &FunctionGraph,
     greens: &[crate::flowspace::model::Variable],
@@ -2259,24 +2263,28 @@ impl<'a> Transformer<'a> {
                     op.result.clone(),
                     crate::codewriter::type_state::ConcreteType::Float,
                 );
-                let mut ops = Vec::with_capacity(2);
-                ops.push(funcptr_op);
-                ops.push(SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::CallResidual {
-                        funcptr: CallFuncPtr::Value(funcptr),
-                        descriptor: CallDescriptor::from_signature(
-                            &[majit_ir::value::Type::Int],
-                            majit_ir::value::Type::Float,
-                            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
-                        ),
-                        args_i: vec![operand.clone()],
-                        args_r: vec![],
-                        args_f: vec![],
-                        result_kind: 'f',
-                        indirect_targets: None,
+                let ops = vec![
+                    funcptr_op,
+                    SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::CallResidual {
+                            funcptr: CallFuncPtr::Value(funcptr),
+                            descriptor: CallDescriptor::from_signature(
+                                &[majit_ir::value::Type::Int],
+                                majit_ir::value::Type::Float,
+                                EffectInfo::new(
+                                    ExtraEffect::ElidableCannotRaise,
+                                    OopSpecIndex::None,
+                                ),
+                            ),
+                            args_i: vec![operand.clone()],
+                            args_r: vec![],
+                            args_f: vec![],
+                            result_kind: 'f',
+                            indirect_targets: None,
+                        },
                     },
-                });
+                ];
                 RewriteResult::Replace(ops)
             }
             OpKind::UnaryOp {
@@ -2297,24 +2305,28 @@ impl<'a> Transformer<'a> {
                     op.result.clone(),
                     crate::codewriter::type_state::ConcreteType::Signed,
                 );
-                let mut ops = Vec::with_capacity(2);
-                ops.push(funcptr_op);
-                ops.push(SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::CallResidual {
-                        funcptr: CallFuncPtr::Value(funcptr),
-                        descriptor: CallDescriptor::from_signature(
-                            &[majit_ir::value::Type::Float],
-                            majit_ir::value::Type::Int,
-                            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
-                        ),
-                        args_i: vec![],
-                        args_r: vec![],
-                        args_f: vec![operand.clone()],
-                        result_kind: 'i',
-                        indirect_targets: None,
+                let ops = vec![
+                    funcptr_op,
+                    SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::CallResidual {
+                            funcptr: CallFuncPtr::Value(funcptr),
+                            descriptor: CallDescriptor::from_signature(
+                                &[majit_ir::value::Type::Float],
+                                majit_ir::value::Type::Int,
+                                EffectInfo::new(
+                                    ExtraEffect::ElidableCannotRaise,
+                                    OopSpecIndex::None,
+                                ),
+                            ),
+                            args_i: vec![],
+                            args_r: vec![],
+                            args_f: vec![operand.clone()],
+                            result_kind: 'i',
+                            indirect_targets: None,
+                        },
                     },
-                });
+                ];
                 RewriteResult::Replace(ops)
             }
             // RPython `jtransform.py:1606` rename pass:
@@ -2544,24 +2556,25 @@ impl<'a> Transformer<'a> {
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
         let lhs_var = lhs.clone();
         let rhs_var = rhs.clone();
-        let mut ops = Vec::with_capacity(2);
-        ops.push(funcptr_op);
-        ops.push(SpaceOperation {
-            result,
-            kind: OpKind::CallResidual {
-                funcptr: CallFuncPtr::Value(funcptr),
-                descriptor: CallDescriptor::from_signature(
-                    &[majit_ir::value::Type::Int, majit_ir::value::Type::Int],
-                    majit_ir::value::Type::Int,
-                    EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),
-                ),
-                args_i: vec![lhs_var, rhs_var],
-                args_r: vec![],
-                args_f: vec![],
-                result_kind: 'i',
-                indirect_targets: None,
+        let ops = vec![
+            funcptr_op,
+            SpaceOperation {
+                result,
+                kind: OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor: CallDescriptor::from_signature(
+                        &[majit_ir::value::Type::Int, majit_ir::value::Type::Int],
+                        majit_ir::value::Type::Int,
+                        EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),
+                    ),
+                    args_i: vec![lhs_var, rhs_var],
+                    args_r: vec![],
+                    args_f: vec![],
+                    result_kind: 'i',
+                    indirect_targets: None,
+                },
             },
-        });
+        ];
         ops
     }
 
@@ -3985,6 +3998,10 @@ impl<'a> Transformer<'a> {
     ///   `_register_extra_helper`, which pyre has not ported; that spelling
     ///   returns `None` and falls through to the residual-call path until the
     ///   helper-registration machinery lands.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn _handle_stroruni_call(
         &mut self,
         oopspec_name: &str,
@@ -4109,6 +4126,10 @@ impl<'a> Transformer<'a> {
     /// which keeps rgc oopspecs pyre has not lowered yet (e.g.
     /// `rgc.ll_arraycopy`) as ordinary residual calls rather than aborting
     /// codewriting.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn _handle_rgc_call(
         &mut self,
         oopspec_name: &str,
@@ -4669,6 +4690,10 @@ impl<'a> Transformer<'a> {
     /// the callee JitCode at runtime.
     ///
     /// RPython jtransform.py:473-482.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
     fn handle_regular_call(
         &mut self,
         op: &SpaceOperation,
@@ -4838,6 +4863,10 @@ impl<'a> Transformer<'a> {
 
     /// RPython: `Transformer.__handle_jit_call(op, oopspec_name, args)` (jtransform.py:1730-1757).
     /// Dispatches jit.* oopspec calls to dedicated opcodes or __handle_oopspec_call.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn _handle_jit_call(
         &mut self,
         oopspec_name: &str,
@@ -4971,6 +5000,10 @@ impl<'a> Transformer<'a> {
     /// (jtransform.py:1988-2008).
     /// Produces a residual_call with the given oopspecindex embedded in the calldescr,
     /// and registers the function in the callinfocollection.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn _handle_oopspec_call(
         &mut self,
         graph: &mut FunctionGraph,
@@ -5043,6 +5076,10 @@ impl<'a> Transformer<'a> {
     /// `lower_conditional_call_elidable` instead. This body is kept as
     /// structural documentation so the two code paths stay aligned.
     #[allow(dead_code)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn _rewrite_op_cond_call(
         &mut self,
         graph: &mut FunctionGraph,
@@ -5491,6 +5528,10 @@ impl<'a> Transformer<'a> {
     /// Args are split by kind via `rewrite_call()` → `make_three_lists()`.
     /// `target` is the funcptr identity (mirrors `op.args[0]` upstream),
     /// kept separate from `descriptor` per jtransform.py:457.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn handle_residual_call(
         &mut self,
         graph: &mut FunctionGraph,
@@ -5512,6 +5553,10 @@ impl<'a> Transformer<'a> {
     /// `indirect_targets` parameter so `handle_regular_indirect_call`
     /// can attach the candidate jitcode list without having to build the
     /// `OpKind::CallResidual` twice.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn handle_residual_call_with_targets(
         &mut self,
         graph: &mut FunctionGraph,
@@ -5594,6 +5639,10 @@ impl<'a> Transformer<'a> {
     ///
     /// `lst` is built from `candidates` via `cc.get_jitcode(p)` which
     /// returns the `Arc<JitCode>` shell from `CallControl::jitcodes`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn lower_indirect_call_op(
         &mut self,
         op: &SpaceOperation,
@@ -5732,6 +5781,10 @@ impl<'a> Transformer<'a> {
     ///
     /// `target` is the funcptr identity per jtransform.py:457.
     #[allow(dead_code)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn handle_elidable_call(
         &mut self,
         graph: &mut FunctionGraph,
@@ -5772,6 +5825,10 @@ impl<'a> Transformer<'a> {
     ///
     /// `target` is the funcptr identity per jtransform.py:457.
     #[allow(dead_code)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn handle_may_force_call(
         &mut self,
         graph: &mut FunctionGraph,
@@ -6323,6 +6380,10 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
 /// alias chain to the canonical Variable.  Variable-keyed: RPython
 /// `self._renamings` is a `{Variable: Variable}` dict
 /// (`jtransform.py:71`).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn resolve_alias(
     value: &crate::flowspace::model::Variable,
     aliases: &std::collections::HashMap<
@@ -6340,6 +6401,10 @@ fn resolve_alias(
     cur
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn remap_value(
     value: &crate::flowspace::model::Variable,
     aliases: &std::collections::HashMap<
@@ -6350,6 +6415,10 @@ fn remap_value(
     resolve_alias(value, aliases)
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn remap_call_funcptr(
     funcptr: &CallFuncPtr,
     aliases: &std::collections::HashMap<
@@ -6363,6 +6432,10 @@ fn remap_call_funcptr(
     }
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn remap_op(
     op: &SpaceOperation,
     aliases: &std::collections::HashMap<
@@ -10482,7 +10555,7 @@ mod tests {
         let rewritten = transformer.rewrite_op_direct_call(
             &op,
             &target,
-            &[arg.clone()],
+            std::slice::from_ref(&arg),
             &result_ty,
             "cast_ptr_marker",
             &mut graph,
@@ -10953,7 +11026,7 @@ mod tests {
             assert!(
                 transformer.is_synthetic_result_option_ctor(
                     &target,
-                    &[arg.clone()],
+                    std::slice::from_ref(&arg),
                     &ValueType::Ref(None),
                 ),
                 "{owner:?}::{name} must elide identically to the bare form",
@@ -10995,17 +11068,17 @@ mod tests {
         let transformer = Transformer::new(&config);
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::function_path(["Result", "Ok"]),
-            &[arg.clone()],
+            std::slice::from_ref(&arg),
             &ValueType::Ref(None),
         ));
         assert!(!transformer.is_synthetic_result_option_ctor(
             &CallTarget::synthetic_transparent_ctor("Foo"),
-            &[arg.clone()],
+            std::slice::from_ref(&arg),
             &ValueType::Ref(None),
         ));
         assert!(transformer.is_synthetic_result_option_ctor(
             &CallTarget::synthetic_transparent_ctor("Err"),
-            &[arg.clone()],
+            std::slice::from_ref(&arg),
             &ValueType::Ref(None),
         ));
         assert!(transformer.is_synthetic_result_option_ctor(
@@ -12267,7 +12340,7 @@ mod tests {
             ._handle_list_call(
                 "list.int_len",
                 &op,
-                &[l.clone()],
+                std::slice::from_ref(&l),
                 &mut graph,
                 "list_int_len",
             )
@@ -12321,7 +12394,7 @@ mod tests {
             ._handle_list_call(
                 "newlist_clear",
                 &op,
-                &[count.clone()],
+                std::slice::from_ref(&count),
                 &mut graph,
                 "newlist_clear",
             )
@@ -12387,7 +12460,7 @@ mod tests {
             ._handle_list_call(
                 "newlist_clear",
                 &op,
-                &[count.clone()],
+                std::slice::from_ref(&count),
                 &mut graph,
                 "newlist_clear_resized",
             )
@@ -12444,7 +12517,7 @@ mod tests {
             ._handle_list_call(
                 "newlist_clear",
                 &op,
-                &[count.clone()],
+                std::slice::from_ref(&count),
                 &mut graph,
                 "newlist_clear_fixed",
             )
@@ -12855,7 +12928,7 @@ mod tests {
             ._handle_list_call(
                 "list.int_capacity",
                 &op,
-                &[l.clone()],
+                std::slice::from_ref(&l),
                 &mut graph,
                 "list_int_capacity",
             )
@@ -12949,7 +13022,7 @@ mod tests {
             ._handle_list_call(
                 "list.float_len",
                 &op,
-                &[l.clone()],
+                std::slice::from_ref(&l),
                 &mut graph,
                 "list_float_len",
             )
@@ -13047,7 +13120,7 @@ mod tests {
             ._handle_list_call(
                 "list.float_capacity",
                 &op,
-                &[l.clone()],
+                std::slice::from_ref(&l),
                 &mut graph,
                 "list_float_capacity",
             )

@@ -152,22 +152,34 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BytesObject)).w_dict }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe { (*(obj as *mut W_BytesObject)).w_dict = w_dict };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_getweakref(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_BytesObject)).w_weakreflifeline }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
     unsafe { (*(obj as *mut W_BytesObject)).w_weakreflifeline = lifeline };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
@@ -179,35 +191,56 @@ pub fn w_bytes_empty() -> PyObjectRef {
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_bytes(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &BYTES_TYPE) }
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_len(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_BytesObject)).len }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_ctypes_keepalive_refs(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_BytesObject)).ctypes_keepalive_refs }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_inc_ctypes_keepalive_refs(obj: PyObjectRef) {
     let bytes = unsafe { &mut *(obj as *mut W_BytesObject) };
     bytes.ctypes_keepalive_refs = bytes.ctypes_keepalive_refs.saturating_add(1);
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_dec_ctypes_keepalive_refs(obj: PyObjectRef) {
     let bytes = unsafe { &mut *(obj as *mut W_BytesObject) };
     bytes.ctypes_keepalive_refs = bytes.ctypes_keepalive_refs.saturating_sub(1);
 }
 
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_getitem(obj: PyObjectRef, index: usize) -> u8 {
     unsafe { w_bytes_data(obj)[index] }
 }
 
 /// Get a reference to the internal data.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_data(obj: PyObjectRef) -> &'static [u8] {
     unsafe {
         let b = obj as *const W_BytesObject;
@@ -217,11 +250,14 @@ pub unsafe fn w_bytes_data(obj: PyObjectRef) -> &'static [u8] {
 }
 
 /// bytes.find(sub, start) — find first occurrence of byte value.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_find(obj: PyObjectRef, value: u8, start: usize) -> i64 {
     unsafe {
         let data = w_bytes_data(obj);
-        for i in start..data.len() {
-            if data[i] == value {
+        for (i, item) in data.iter().enumerate().skip(start) {
+            if *item == value {
                 return i as i64;
             }
         }
@@ -236,12 +272,18 @@ pub unsafe fn w_bytes_find(obj: PyObjectRef, value: u8, start: usize) -> i64 {
 
 /// Check if obj is bytes or bytearray (bytes-like object).
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_bytes_like(obj: PyObjectRef) -> bool {
     unsafe { is_bytes(obj) || crate::bytearrayobject::is_bytearray(obj) }
 }
 
 /// Get length of a bytes-like object.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bytes_like_len(obj: PyObjectRef) -> usize {
     unsafe {
         if is_bytes(obj) {
@@ -254,6 +296,9 @@ pub unsafe fn bytes_like_len(obj: PyObjectRef) -> usize {
 
 /// Get byte at index from a bytes-like object.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bytes_like_getitem(obj: PyObjectRef, index: usize) -> u8 {
     unsafe {
         if is_bytes(obj) {
@@ -266,6 +311,9 @@ pub unsafe fn bytes_like_getitem(obj: PyObjectRef, index: usize) -> u8 {
 
 /// Get data slice from a bytes-like object.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bytes_like_data(obj: PyObjectRef) -> &'static [u8] {
     unsafe {
         if is_bytes(obj) {

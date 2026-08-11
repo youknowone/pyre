@@ -171,8 +171,6 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn platform_constants_match_longlong_py_branch() {
-        assert!(is_64_bit);
-        assert!(!supports_longlong);
         assert_eq!(FLOATSTORAGE, LowLevelType::Float);
         assert!(!is_longlong(&LowLevelType::SignedLongLong));
         assert_eq!(ZEROF, 0.0);

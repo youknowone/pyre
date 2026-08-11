@@ -26,6 +26,9 @@ pub struct GenericAlias {
 
 /// Check if an object is a GenericAlias.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_generic_alias(obj: PyObjectRef) -> bool {
     py_type_check(obj, &GENERIC_ALIAS_TYPE)
 }
@@ -177,6 +180,9 @@ pub struct UnionType {
 
 /// Check if an object is a UnionType.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_union(obj: PyObjectRef) -> bool {
     py_type_check(obj, &UNION_TYPE)
 }
@@ -230,6 +236,9 @@ pub unsafe fn w_union_get_parameters(obj: PyObjectRef) -> PyObjectRef {
 /// Check if `instance` is an instance of any type in the union.
 ///
 /// PyPy equivalent: UnionType.__instancecheck__
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_union_instancecheck(union: PyObjectRef, instance: PyObjectRef) -> bool {
     let args = w_union_get_args(union);
     let n = crate::w_tuple_len(args);

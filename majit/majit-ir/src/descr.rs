@@ -1726,6 +1726,10 @@ impl GcCache {
     /// Callers that know the owning struct's source name pass the full
     /// `Owner.field` spelling; `None` falls back to the `T<type_id>.` stand-in
     /// for the mint sites that only carry the numeric struct identity.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+    )]
     pub fn get_field_descr(
         &mut self,
         struct_key: LLType,
@@ -1946,6 +1950,10 @@ impl GcCache {
     /// `length_offset`: offset of the length field (only used when !nolength).
     /// `is_pure`: descr.py:364 bool(ARRAY_INSIDE._immutable_field(None)).
     /// `concrete_type`: descr.py:366-370 '\x00' or 'f' for Float/SingleFloat.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+    )]
     pub fn get_array_descr(
         &mut self,
         key: LLType,
@@ -4850,6 +4858,10 @@ impl SimpleFieldDescr {
     ///
     /// `index` is deliberately excluded — it is the per-trace codewriter slot
     /// id, which the analyzer legitimately restamps onto a shared `Arc`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+    )]
     pub fn describes_same_field(
         &self,
         offset: usize,
@@ -4901,6 +4913,10 @@ impl SimpleFieldDescr {
     /// RPython: FieldDescr(name, offset, size, flag, index_in_parent, is_pure).
     /// `name` format: `"STRUCT.fieldname"` (descr.py:227).
     /// `flag`: descr.py:226 get_type_flag(FIELDTYPE).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+    )]
     pub fn new_with_name(
         index: u32,
         offset: usize,
@@ -5380,6 +5396,10 @@ pub fn make_simple_descr_group_keyed(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+)]
 pub fn make_simple_descr_group_keyed_with_headerless(
     index: u32,
     size: usize,
@@ -5460,6 +5480,10 @@ pub fn make_simple_descr_group_keyed_with_headerless(
 /// cache key) and [`make_simple_descr_group_keyed`] (registers into
 /// the keyed cache map after construction).  `cache_key == 0` is the
 /// no-identity sentinel for the non-keyed path.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+)]
 fn make_simple_descr_group_inner(
     index: u32,
     size: usize,
@@ -7509,6 +7533,10 @@ pub fn make_array_descr_full(
 ///   `Ptr(rstr.UNICODE)` and any `lltype.Array(... hints={'immutable':
 ///   True})`.  Drives the optimizer's pure-array fold.
 ///
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+)]
 pub fn make_array_descr_from_lltype_shape(
     type_id: u32,
     base_size: usize,

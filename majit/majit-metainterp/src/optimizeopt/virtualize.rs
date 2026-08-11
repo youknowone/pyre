@@ -1867,8 +1867,8 @@ impl OptVirtualize {
     /// Two tracked fields:
     /// - virtual_token: set to a ForceToken op
     /// - forced: set to CONST_NULL
-    /// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE when
-    /// the vref is forced — not stored as a tracked virtual field.
+    ///   The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE when
+    ///   the vref is forced — not stored as a tracked virtual field.
     fn optimize_virtual_ref(
         &mut self,
         op: &Op,

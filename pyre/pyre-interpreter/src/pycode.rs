@@ -883,6 +883,9 @@ fn legacy_lnotab(code: &crate::CodeObject, firstlineno: i64) -> Vec<u8> {
 /// `PyCode.typedef` field getters. Each type-dict descriptor delegates here so
 /// the object carries one authoritative compiler `CodeObject`, matching
 /// `pycode.py`'s direct `co_*` attributes rather than a parallel side table.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, name)? };
     Ok(match name {
@@ -927,6 +930,9 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
 /// CPython 3.14 `code.__new__` positional-only constructor, with the PyPy
 /// `descr_code__new__` validations and field order adjusted to 3.14 (the
 /// exception table precedes freevars/cellvars).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !(17..=19).contains(&args.len()) {
         return Err(crate::PyError::type_error(format!(
@@ -1094,6 +1100,9 @@ fn constant_strong_equal(
     }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_eq(
     this: PyObjectRef,
     other: PyObjectRef,
@@ -1111,6 +1120,9 @@ pub unsafe fn code_eq(
     Ok(w_bool_from(code_data_equal(a, b)))
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_ne(
     this: PyObjectRef,
     other: PyObjectRef,
@@ -1123,6 +1135,9 @@ pub unsafe fn code_ne(
     }
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     let code = unsafe { require_code(obj, "__hash__")? };
     #[inline]
@@ -1176,6 +1191,9 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     Ok(if result == -1 { -2 } else { result })
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "__repr__")? };
     // pycode.py:570-572 represents the internal zero sentinel as line -1.
@@ -1192,6 +1210,9 @@ pub unsafe fn code_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
     Ok(pyre_object::w_str_from_wtf8_managed(repr))
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_varname_from_oparg(
     obj: PyObjectRef,
     index: PyObjectRef,
@@ -1226,6 +1247,9 @@ pub unsafe fn code_varname_from_oparg(
     ))
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "co_positions")? };
     let rows = code
@@ -1244,6 +1268,9 @@ pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyE
     Ok(w_seq_iter_new(w_list_new(rows), n))
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_lines(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "co_lines")? };
     let mut rows = Vec::new();
@@ -1265,6 +1292,9 @@ pub unsafe fn code_lines(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError
     Ok(w_seq_iter_new(w_list_new(rows), n))
 }
 
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_branches(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "co_branches")? };
     let mut rows = Vec::new();
@@ -1956,6 +1986,9 @@ pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
 /// codewriter/bridge read this to fold globals lookups without an off-GC
 /// proxy.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
         return pyre_object::PY_NULL;
@@ -1965,6 +1998,9 @@ pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> PyObjectRef {
 
 /// PyPy: `PyCode.w_globals = w_globals`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     if obj.is_null() {
         return;
@@ -1984,6 +2020,9 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
 #[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;

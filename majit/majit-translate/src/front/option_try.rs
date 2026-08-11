@@ -443,6 +443,10 @@ fn verify_break_arm_is_return_none(
     verify_forwards_to_returnblock(graph, e_block, &none_return_var, name)
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn verify_forwards_to_returnblock(
     graph: &FunctionGraph,
     from_block: usize,

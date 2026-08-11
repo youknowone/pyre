@@ -38,6 +38,10 @@ type SplitBlocks = HashMap<BlockKey, (BlockRef, Vec<LinkSplit>)>;
 
 /// RPython `fold_op_list(block, constants, exit_early=False,
 /// exc_catch=False)` at `constfold.py:10-100`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn fold_op_list(
     block: &BlockRef,
     constants: &mut HashMap<Variable, Constant>,
@@ -240,6 +244,10 @@ enum FoldOpListResult {
 /// rtyped switches carry the low-level integer in `llexitcase` while
 /// `exitcase` retains the flow-level value, so a flow-keyed match
 /// would pick the wrong exit on rtyped switches.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn constant_fold_block(block: &BlockRef) {
     let mut constants = HashMap::new();
     let FoldOpListResult::Ops(newops) = fold_op_list(block, &mut constants, false) else {
@@ -385,6 +393,10 @@ fn linkarg_is(a: &LinkArg, b: &LinkArg) -> bool {
 /// match by Python identity (upstream's `assert constants[v2] is v1`).
 /// The Rust port mirrors that with [`linkarg_is`] — Variable identity
 /// via `Variable.id()`, Constant identity via `Constant.id`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub(crate) fn complete_constants(link: &LinkRef, constants: &mut LinkConstants) {
     let l = link.borrow();
     let target = l
@@ -426,6 +438,10 @@ pub(crate) fn complete_constants(link: &LinkRef, constants: &mut LinkConstants) 
 /// `llexitvalue`, falling back to the trailing `'default'` exit if
 /// present. If neither matches, upstream returns silently and so does
 /// the local port.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub(crate) fn rewire_link_for_known_exitswitch(link1: &LinkRef, llexitvalue: &ConstValue) {
     let block = link1
         .borrow()
@@ -514,6 +530,10 @@ pub(crate) fn rewire_link_for_known_exitswitch(link1: &LinkRef, llexitvalue: &Co
 /// with the target's inputargs). `fold_op_list` may add more Constant
 /// entries; the indirect-call rewrite below adds the fresh Variable
 /// produced for the rebound `direct_call` result.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn prepare_constant_fold_link(
     link: &LinkRef,
     constants: &mut LinkConstants,
@@ -676,7 +696,7 @@ fn rewire_links(splitblocks: SplitBlocks) {
     for (_key, (block, mut splits)) in splitblocks {
         // Upstream `splits.sort(); splits.reverse()` — descending
         // folded_count.
-        splits.sort_by(|a, b| b.folded_count.cmp(&a.folded_count));
+        splits.sort_by_key(|b| std::cmp::Reverse(b.folded_count));
         for LinkSplit {
             folded_count: position,
             link,
@@ -896,6 +916,10 @@ fn constant_diffuse(graph: &FunctionGraph) -> usize {
 ///   single-`_ovf`-op block special case directly here, routing the
 ///   link to either the OverflowError exit or the normal exit
 ///   depending on whether the fold raised.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn constant_fold_graph(graph: &FunctionGraph) {
     for block in graph.iterblocks() {
         if !block.borrow().operations.is_empty() {

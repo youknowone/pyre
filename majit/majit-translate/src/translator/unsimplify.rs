@@ -19,6 +19,10 @@ pub fn varoftype(concretetype: LowLevelType, name: Option<&str>) -> Variable {
 
 /// RPython `unsimplify.insert_empty_block(link, newops=[])`
 /// (unsimplify.py:10-31).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn insert_empty_block(link: &LinkRef, newops: Vec<SpaceOperation>) -> BlockRef {
     let link_args = link.borrow().args.clone();
     let target = link
@@ -226,6 +230,10 @@ pub fn call_final_function(translator: &TranslationContext, c_final_func: Consta
 /// in the new block (a fresh `Variable::copy()`), and is passed through
 /// the synthetic link's args.
 ///
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 pub fn split_block(block: &BlockRef, index: usize, _forcelink: Option<&[Hlvalue]>) -> LinkRef {
     {
         let b = block.borrow();
@@ -458,6 +466,10 @@ pub fn split_block(block: &BlockRef, index: usize, _forcelink: Option<&[Hlvalue]
 /// Helper for `split_block`. Adds `v` to `varmap` (with a fresh
 /// `Variable::copy()`) unless it's already present or has been marked
 /// as produced inside the moved suffix.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn intern_var(
     v: &Variable,
     varmap_order: &mut Vec<Variable>,
@@ -485,6 +497,10 @@ fn copy_hlvalue(value: &Hlvalue) -> Hlvalue {
 /// Constants pass through unchanged; Variables get their varmap copy,
 /// creating one on demand for explicit `_forcelink` values that were not
 /// otherwise needed by the moved suffix.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn get_new_name_for_split_input(
     arg: &Hlvalue,
     varmap: &mut HashMap<Variable, Variable>,

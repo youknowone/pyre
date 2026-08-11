@@ -63,7 +63,7 @@ mod tests {
     fn args_eq_uses_same_box_const_value_semantics() {
         let a = Some(Operand::const_(Const::Int(5)));
         let b = Some(Operand::const_(Const::Int(5)));
-        assert!(args_eq(&[a.clone()], &[b.clone()]));
+        assert!(args_eq(std::slice::from_ref(&a), std::slice::from_ref(&b)));
         assert_eq!(args_hash(&[a]), args_hash(&[b]));
     }
 
