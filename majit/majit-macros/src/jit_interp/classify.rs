@@ -92,8 +92,7 @@ fn classify_arm_body(body: &Expr) -> ArmPattern {
     ArmPattern::Lowerable
 }
 
-// ── Pattern detection helpers ────────────────────────────────────────
-
+// Pattern detection helpers
 fn is_break_expr(expr: &Expr) -> bool {
     matches!(expr, Expr::Break(_))
 }
@@ -303,8 +302,10 @@ fn check_expr_unsupported(expr: &Expr) -> Option<String> {
                     return Some(reason);
                 }
             }
-            if let Some((_, else_expr)) = &if_expr.else_branch {
-                check_expr_unsupported(else_expr)?;
+            if let Some((_, else_expr)) = &if_expr.else_branch
+                && let Some(reason) = check_expr_unsupported(else_expr)
+            {
+                return Some(reason);
             }
             None
         }
@@ -419,5 +420,40 @@ mod tests {
         let arm = parse_arm("0 => { io.read_utf8(); },");
         let result = classify_arm_body(&arm.body);
         assert!(matches!(result, ArmPattern::AbortPermanent));
+    }
+
+    /// NOT behavioural coverage of `detect_unsupported_pattern` — read the
+    /// assertion as what it says.
+    ///
+    /// `check_stmt_unsupported` and `check_expr_unsupported` are mutually
+    /// recursive and **neither constructs a `String`**: every `Some(..)` in the
+    /// cycle forwards the other's return. So the cycle answers `None` for every
+    /// input, `ArmPattern::Unsupported` (built only at the `detect_unsupported_pattern`
+    /// call above) is never constructed, and no behavioural test of this cycle can
+    /// fail. This one pins that dormancy instead, over an arm exercising every
+    /// construct `check_expr_unsupported` matches.
+    ///
+    /// ⇒ When it goes red, someone has added a leaf that mints a reason — which
+    /// is exactly the moment the recursion arms start carrying information, and
+    /// the moment each needs a real test. The `Expr::If` else branch is the one
+    /// to write first: it is the arm whose finding used to be discarded.
+    ///
+    /// It is a LOWER BOUND, measured rather than assumed: a leaf added as a new
+    /// `Expr` arm for a construct this sample does not contain stays invisible to
+    /// it. A temporary `Expr::Await(_) => Some(..)` leaf left this green while the
+    /// else-branch recursion was demonstrably broken. The exact question is
+    /// whether any `Some(..)` in `check_stmt_unsupported`/`check_expr_unsupported`
+    /// mints a `String` rather than forwarding one; this test samples that, it
+    /// does not decide it.
+    #[test]
+    fn unsupported_cycle_still_mints_no_reason() {
+        let arm = parse_arm(
+            "0 => {
+                let v = if a { b(); } else { match c { 1 => { loop { break; } }, _ => d() } };
+                while e { for i in 0..2 { { f(); } } }
+            },",
+        );
+        let stmts = extract_stmts(&arm.body);
+        assert_eq!(detect_unsupported_pattern(&stmts), None);
     }
 }

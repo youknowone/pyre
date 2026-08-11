@@ -1131,9 +1131,7 @@ impl<'a> Assembler386<'a> {
             .propagate_exception_descr as i64
     }
 
-    // ----------------------------------------------------------------
     // Helper methods
-    // ----------------------------------------------------------------
 
     /// Frame-pointer-relative byte offset for a given slot index.
     /// Slots are absolute jf_frame indices, including the fixed
@@ -1645,9 +1643,7 @@ impl<'a> Assembler386<'a> {
         );
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:543 _call_header — function prologue
-    // ----------------------------------------------------------------
 
     fn setup_input_state(&mut self, inputargs: &[InputArg]) {
         // opref_to_slot stores ABSOLUTE jitframe slot indices so that
@@ -2141,9 +2137,7 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_call_reg_with_extra_pushes(reg, 0);
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:2153 _call_footer — function epilogue
-    // ----------------------------------------------------------------
 
     /// Emit the function epilogue: return jf_ptr in RAX/X0.
     /// Thin wrapper around the free-fn `emit_call_footer_raw` so the
@@ -2562,9 +2556,7 @@ impl<'a> Assembler386<'a> {
         )))
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:501 assemble_loop
-    // ----------------------------------------------------------------
 
     /// assembler.py:501 assemble_loop: compile a loop trace.
     ///
@@ -5452,9 +5444,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:652 write_pending_failure_recoveries
-    // ----------------------------------------------------------------
 
     /// assembler.py:982 generate_quick_failure.
     ///
@@ -5605,9 +5595,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    // ----------------------------------------------------------------
     // assembler.py:965-987 patch_jump_for_descr
-    // ----------------------------------------------------------------
 
     /// assembler.py:965 patch_jump_for_descr: redirect a guard to a
     /// bridge by overwriting the recovery stub with a JMP to bridge.
@@ -5678,9 +5666,7 @@ impl<'a> Assembler386<'a> {
         });
     }
 
-    // ----------------------------------------------------------------
     // genop_* — integer arithmetic
-    // ----------------------------------------------------------------
 
     /// INT_ADD: result = arg0 + arg1
     fn genop_int_add(&mut self, op: &Op) {
@@ -5801,9 +5787,7 @@ impl<'a> Assembler386<'a> {
         self.store_rax_to_result(op.pos.get());
     }
 
-    // ----------------------------------------------------------------
     // genop_* — overflow arithmetic (assembler.py:1413-1425)
-    // ----------------------------------------------------------------
 
     /// assembler.py:1856 genop_int_add_ovf — delegates to genop_int_add,
     /// then sets guard_success_cc = 'NO'. On x86, ADD always sets OF.
@@ -5824,9 +5808,7 @@ impl<'a> Assembler386<'a> {
         self.guard_success_cc = Some(CC_NO);
     }
 
-    // ----------------------------------------------------------------
     // genop_* — comparisons
-    // ----------------------------------------------------------------
 
     /// INT_LT/LE/GT/GE/EQ/NE/UINT_*: CMP arg0, arg1 then store CC.
     /// If the next op is a guard, guard_success_cc is set and consumed.
@@ -5902,9 +5884,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    // ----------------------------------------------------------------
     // genop_* — guards
-    // ----------------------------------------------------------------
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
@@ -5973,9 +5953,11 @@ impl<'a> Assembler386<'a> {
         }
         let descr_arc = op.getdescr();
         if let Some(fd) = descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
-            // Step A (43c64ee0bb) installs op.descr = ResumeGuardDescr
-            // with post-numbering fail_arg_types via
+            // Step A installs op.descr = ResumeGuardDescr with
+            // post-numbering fail_arg_types via
             // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404).
+            // The hash once cited for Step A resolves nowhere in this
+            // repository, so that symbol is the reference.
             // Prefer the descr for guards too; fall through to
             // op.fail_arg_types only for sharing-path guards
             // (optimizeopt/mod.rs:3068-3088) where op.descr=None.
@@ -6167,9 +6149,7 @@ impl<'a> Assembler386<'a> {
         );
     }
 
-    // ----------------------------------------------------------------
     // genop_* — control flow
-    // ----------------------------------------------------------------
 
     /// LABEL: define the back-edge target for JUMP.
     ///
@@ -6464,9 +6444,7 @@ impl<'a> Assembler386<'a> {
             .push(majit_ir::FailDescrCell::wrap(descr.clone()));
     }
 
-    // ----------------------------------------------------------------
     // genop_* — type conversions
-    // ----------------------------------------------------------------
 
     /// SAME_AS: result = arg0 (copy value)
     /// SAME_AS: result = arg0 (identity).
@@ -6481,9 +6459,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    // ----------------------------------------------------------------
     // Float helpers
-    // ----------------------------------------------------------------
 
     /// Load a float value from `opref` into XMM0 (x64) / D0 (aarch64).
     /// Float values are stored as bit-cast i64 in frame slots.
@@ -6535,11 +6511,9 @@ impl<'a> Assembler386<'a> {
         );
     }
 
-    // ----------------------------------------------------------------
     // genop_* — float arithmetic
     // x86/assembler.py:1648 genop_float_add etc.
     // aarch64/assembler.py float equivalents
-    // ----------------------------------------------------------------
 
     /// FLOAT_ADD: result = arg0 + arg1
     fn genop_float_add(&mut self, op: &Op) {
@@ -6625,10 +6599,8 @@ impl<'a> Assembler386<'a> {
         self.store_rax_to_result(op.pos.get());
     }
 
-    // ----------------------------------------------------------------
     // genop_* — memory operations
     // x86/assembler.py:1747 genop_getfield_gc etc.
-    // ----------------------------------------------------------------
 
     /// Extract the byte offset from an op's FieldDescr.
     /// Returns 0 if no field descriptor is present.
@@ -7119,10 +7091,8 @@ impl<'a> Assembler386<'a> {
         self.store_rax_to_result(op.pos.get());
     }
 
-    // ----------------------------------------------------------------
     // genop_* — calls
     // x86/assembler.py:2230 _genop_call
-    // ----------------------------------------------------------------
 
     fn argloc_imm(arglocs: &[Loc], index: usize) -> i64 {
         match arglocs.get(index) {
@@ -7614,11 +7584,9 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    // ----------------------------------------------------------------
     // genop_* — allocation
     // x86/assembler.py:2338 genop_new etc.
     // These require GC runtime support. Emit trap for now.
-    // ----------------------------------------------------------------
 
     /// rewrite.py:936-942 `handle_write_barrier_setarrayitem` value gate.
     ///
@@ -8188,9 +8156,7 @@ impl<'a> Assembler386<'a> {
         self.genop_alloc_varsize(op, base_size, item_size);
     }
 
-    // ----------------------------------------------------------------
     // genop_* — misc
-    // ----------------------------------------------------------------
 
     /// FORCE_TOKEN: return the jitframe pointer itself.
     /// x86/assembler.py genop_force_token: mov resloc, ebp
@@ -8271,9 +8237,7 @@ impl<'a> Assembler386<'a> {
         self.store_rax_to_result(op.pos.get());
     }
 
-    // ================================================================
     // assembler.py:1817 genop_save_exc_class / genop_save_exception
-    // ================================================================
 
     /// assembler.py:1817-1818 genop_save_exc_class:
     /// `MOV resloc, [pos_exception]`.  The regalloc always assigns the
@@ -8337,9 +8301,7 @@ impl<'a> Assembler386<'a> {
         store_loc_to(self, crate::jit_exc_type_addr() as i64, &arglocs[0]);
     }
 
-    // ================================================================
     // genop_* — extended integer arithmetic
-    // ================================================================
 
     /// INT_FLOORDIV: result = arg0 / arg1 (signed)
     fn genop_int_floordiv(&mut self, op: &Op) {
@@ -8393,9 +8355,7 @@ impl<'a> Assembler386<'a> {
         self.store_rax_to_result(op.pos.get());
     }
 
-    // ================================================================
     // genop_* — extended float operations
-    // ================================================================
 
     /// FLOAT_ABS: result = |arg0|
     fn genop_float_abs(&mut self, op: &Op) {
@@ -8470,9 +8430,7 @@ impl<'a> Assembler386<'a> {
         self.store_d0_to_result(op.pos.get());
     }
 
-    // ================================================================
     // genop_* — GC memory operations
-    // ================================================================
 
     /// Emit a sized load from [rax]/[x0]. Positive size = zero-extend,
     /// negative = sign-extend.
@@ -8616,9 +8574,7 @@ impl<'a> Assembler386<'a> {
         self.emit_store_to_rax_sized(size);
     }
 
-    // ================================================================
     // genop_* — interior field operations
-    // ================================================================
 
     /// GETINTERIORFIELD_GC_I/R/F: load field from array-of-structs element.
     fn genop_getinteriorfield(&mut self, op: &Op) {
@@ -8690,9 +8646,7 @@ impl<'a> Assembler386<'a> {
         self.emit_store_to_rax_sized(field_size);
     }
 
-    // ================================================================
     // genop_* — call variants
-    // ================================================================
 
     /// COND_CALL_N: if arg(0) != 0, call function at arg(1).
     ///
@@ -8749,9 +8703,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    // ================================================================
     // genop_* — string/array operations
-    // ================================================================
 
     /// STRSETITEM / UNICODESETITEM: string[index] = value.
     /// Address = base + (basesize - extra_null) + index * itemsize, per
@@ -9021,9 +8973,7 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_call_rax();
     }
 
-    // ================================================================
     // genop_* — address computation
-    // ================================================================
 
     /// LOAD_EFFECTIVE_ADDRESS: result = base + (index << shift) + baseofs.
     /// resoperation.py:1052-1054 — `[v_gcptr, v_index, c_baseofs, c_shift]`.

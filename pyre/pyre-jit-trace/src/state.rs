@@ -1096,14 +1096,102 @@ pub unsafe fn walk_jitcode_constants_refs_area(
     walk_jitcode_constants_refs_in(sd, visitor);
 }
 
+/// Relocation probe for the non-moving invariant stated on
+/// [`walk_jitcode_constants_refs`] above.  `drag_out_root` relocates a root
+/// only when it is a nursery object start, so a slot whose value the visitor
+/// CHANGES is proof that a movable object entered the pool and that marking
+/// in place without forwarding leaves a stale address behind.
+///
+/// `WALKS`/`SLOTS` are the arming witnesses: `RELOCATED == 0` means nothing
+/// moved only when `SLOTS > 0`.  With `SLOTS == 0` the walker observed
+/// nothing and the run says nothing either way.
+///
+/// Gated on `PYRE_PROBE14=1`; reports on stderr as it happens because the
+/// fault this chases is a non-unwinding abort that never reaches shutdown.
+pub static PROBE14_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static PROBE14_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static PROBE14_RELOCATED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn probe14_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PYRE_PROBE14").as_deref() == Ok("1"))
+}
+
 fn walk_jitcode_constants_refs_in(
     sd: &MetaInterpStaticData,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    for jc in sd.jitcodes.iter() {
-        for &slot in jc.payload.jitcode.constants_r.iter() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let probe = probe14_enabled();
+    if probe {
+        PROBE14_WALKS.fetch_add(1, Relaxed);
+    }
+    for (jitcode_index, jc) in sd.jitcodes.iter().enumerate() {
+        let pool_len = jc.payload.jitcode.constants_r.len();
+        for (pool_slot, &slot) in jc.payload.jitcode.constants_r.iter().enumerate() {
             let mut gcref = majit_ir::GcRef(slot as usize);
+            let before = gcref.0;
             visitor(&mut gcref);
+            if probe {
+                PROBE14_SLOTS.fetch_add(1, Relaxed);
+                if gcref.0 != before {
+                    let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
+                    if n <= 20 {
+                        // `jitcode` is the position in the walked `sd.jitcodes`
+                        // and `pool_slot` the position inside that jitcode's own
+                        // `constants_r`, so each report names the pool it came
+                        // from.  `cum_slot` is the running slot-visit ordinal
+                        // across every walk and every jitcode -- it is NOT a
+                        // within-pool index, and earlier runs are keyed on it.
+                        //
+                        // This locates the pool.  It does NOT name the WRITER:
+                        // nothing here distinguishes a pool built by
+                        // `add_const_r` from one built by `emit_const_r_bits`.
+                        eprintln!(
+                            "[probe14] RELOCATION DISCARDED #{n}: constants_r slot \
+                             0x{before:x} -> 0x{:x} (walk {}, cum_slot {}, \
+                             jitcode {}/{}, pool_slot {}/{})",
+                            gcref.0,
+                            PROBE14_WALKS.load(Relaxed),
+                            PROBE14_SLOTS.load(Relaxed),
+                            jitcode_index,
+                            sd.jitcodes.len(),
+                            pool_slot,
+                            pool_len,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // ARMING WITNESS.  The relocation report above prints only when a slot
+    // MOVES, so on a run with no relocations it emits nothing at all — and
+    // "nothing" is indistinguishable from "this walker never ran" or "the pool
+    // was empty".  Those are the REFUTES and NOT-EXERCISED branches of this
+    // probe's pre-registration, and they must not share a rendering.  Emit the
+    // observed population unconditionally so a silent run is always readable as
+    // one or the other.  Printed as it happens, not at shutdown: the fault this
+    // chases is a non-unwinding abort that never reaches shutdown.
+    if probe {
+        let walks = PROBE14_WALKS.load(Relaxed);
+        // Window widened after the first run: `walks <= 3 || walks % 200 == 0`
+        // sampled ONLY the walks before any jitcode was installed (jitcodes=0,
+        // slots=0) and then nothing until walk 200, but the abort lands around
+        // walk 5.  The arming witness therefore reported slots=0 -- "NOT
+        // EXERCISED" -- for runs whose own relocation reports proved the
+        // opposite.  An arming witness whose sampling window misses the armed
+        // regime is worse than none: it manufactures the null it exists to rule
+        // out.  Cover every early walk, then thin out.
+        if walks <= 50 || walks % 50 == 0 {
+            eprintln!(
+                "[probe14] ARMED walk={} slots_cumulative={} relocated_cumulative={} \
+                 jitcodes={}",
+                walks,
+                PROBE14_SLOTS.load(Relaxed),
+                PROBE14_RELOCATED.load(Relaxed),
+                sd.jitcodes.len(),
+            );
         }
     }
 }
@@ -1655,9 +1743,8 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
 ///
 /// `pyjitpl.py:218-225 get_list_of_active_boxes` reads each live register
 /// directly from its kind-specific bank (`registers_i[reg]` /
-/// `registers_r[reg]` / `registers_f[reg]`); commit
-/// `3fdb617f5d1` removed pyre's prior `registers_r_semantic` fallback to
-/// match that contract. Production tracers fill the kind banks via
+/// `registers_r[reg]` / `registers_f[reg]`). There is deliberately no
+/// `registers_r_semantic` fallback. Production tracers fill the kind banks via
 /// `bcd_op` dispatch as the trace is recorded, but unit-test fixtures
 /// build a `PyreSym` directly through `from_test_state` and never run the
 /// dispatch loop — without seeding, `current_fail_args` returns a vector
@@ -5509,7 +5596,7 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
 /// during the publish can collect, so the copy has to be registered as resume
 /// roots (`push_resume_ref_roots`) for the duration.
 ///
-/// ⚠️Restoring the FRAME is not the same as undoing the drive.  This and
+/// Restoring the FRAME is not the same as undoing the drive.  This and
 /// [`capture_frame_scalars`] together cover the whole mutable virtualizable
 /// surface — the only vable fields with a production emit site are `last_instr`
 /// (index 0) and `valuestackdepth` (2), plus this array; `setfield_vable_r`/`_f`
@@ -8613,7 +8700,8 @@ fn bh_field_descr_from_info(fd: &majit_ir::FieldDescrInfo) -> majit_translate::j
         is_field_signed: matches!(fd.field_type, Type::Int),
         is_immutable: false,
         is_quasi_immutable: false,
-        index_in_parent: fd.index as usize,
+        // A live `FieldDescrInfo` carries a resolved index.
+        index_in_parent: Some(fd.index as usize),
         parent: None,
         name: String::new(),
         owner: String::new(),

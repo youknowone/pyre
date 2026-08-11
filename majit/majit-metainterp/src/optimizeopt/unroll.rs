@@ -488,7 +488,7 @@ impl UnrollOptimizer {
     /// unroll.py:238-242: jump_to_preamble(cell_token, jump_op).
     ///
     /// Redirect the closing JUMP to the preamble entry token
-    /// (target_tokens[0], virtual_state=None). Only changes the
+    /// (`target_tokens[0]`, `virtual_state=None`). Only changes the
     /// descriptor, keeping arglist intact — RPython parity.
     pub fn jump_to_preamble(
         body_ops: &[majit_ir::OpRc],
@@ -5391,14 +5391,14 @@ fn assemble_peeled_trace_with_jump_args(
         }
         // RPython parity: each guard in the assembled trace owns a
         // distinct ResumeGuardDescr with a globally unique fail_index.
-        // optimizeopt::store_final_boxes_in_guard (mod.rs:3392-3404,
-        // commit 43c64ee0bb) installs a fresh ResumeGuardDescr on every
-        // optimizer-routed guard, and Optimizer::_copy_resume_data_from /
-        // OptContext::emit_guard_operation share-branch (commit
-        // 329297b38a) call Descr::clone_descr to allocate a fresh
-        // fail_index for the sharing-path guard. Both phases of the
-        // unroll optimizer therefore emit body guards with unique
-        // descrs already; no post-process re-stamping is needed.
+        // optimizeopt::store_final_boxes_in_guard (mod.rs:3392-3404)
+        // installs a fresh ResumeGuardDescr on every optimizer-routed
+        // guard, and Optimizer::_copy_resume_data_from /
+        // OptContext::emit_guard_operation share-branch call
+        // Descr::clone_descr to allocate a fresh fail_index for the
+        // sharing-path guard. Both phases of the unroll optimizer
+        // therefore emit body guards with unique descrs already; no
+        // post-process re-stamping is needed.
         let new_rc = std::rc::Rc::new(new_op);
         if new_rc.result_type() != Type::Void && !new_rc.pos.get().is_none() {
             emitted_at.insert(new_rc.pos.get(), new_rc.clone());
@@ -5838,8 +5838,6 @@ mod tests {
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024)
     }
 
-    // ── Basic peeling ─────────────────────────────────────────────────
-
     #[test]
     fn test_no_jump_no_unroll() {
         // Without a Jump back-edge, the pass just buffers and nothing is emitted.
@@ -6206,8 +6204,6 @@ mod tests {
         }
     }
 
-    // ── OpRef remapping ───────────────────────────────────────────────
-
     #[test]
     fn test_internal_refs_remapped_in_peeled_copy() {
         // op0: v0 = IntAdd(v100, v101)  -- uses input args
@@ -6290,8 +6286,6 @@ mod tests {
         assert_eq!(result[2].arg(1).to_opref(), OpRef::int_op(101));
     }
 
-    // ── Guard preservation ────────────────────────────────────────────
-
     #[test]
     fn test_guards_duplicated_in_peel() {
         // Guards in the preamble serve as type checks.
@@ -6366,8 +6360,6 @@ mod tests {
         );
     }
 
-    // ── Jump args remapping ───────────────────────────────────────────
-
     #[test]
     fn test_jump_args_remapped_to_body() {
         // Jump args should reference the body's ops, not the original positions.
@@ -6435,8 +6427,6 @@ mod tests {
         );
     }
 
-    // ── Multiple ops in loop body ─────────────────────────────────────
-
     #[test]
     fn test_multi_op_loop() {
         let mut ops = vec![
@@ -6484,8 +6474,6 @@ mod tests {
         assert_eq!(result[9].opcode, OpCode::Jump);
     }
 
-    // ── Setup resets state ────────────────────────────────────────────
-
     #[test]
     fn test_setup_resets_state() {
         let mut pass = OptUnroll::new();
@@ -6502,8 +6490,6 @@ mod tests {
         assert!(pass.buffer.is_empty());
         assert!(!pass.seen_jump);
     }
-
-    // ── Integration with optimizer ────────────────────────────────────
 
     #[test]
     fn test_unroll_standalone_optimizer() {
@@ -6586,8 +6572,6 @@ mod tests {
         assert!(!guards[0].getdescr().unwrap().is_resume_at_position());
         assert!(!guards[1].getdescr().unwrap().is_resume_at_position());
     }
-
-    // ── Chain of references ───────────────────────────────────────────
 
     #[test]
     fn test_chain_of_refs_correctly_remapped() {

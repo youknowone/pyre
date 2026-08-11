@@ -317,7 +317,7 @@ impl Guard {
     /// subtype tag).  Mirrors RPython's:
     ///   descr = myop.getdescr()
     ///   descr.copy_all_attributes_from(other.op.getdescr())
-    ///   myop.setfailargs(otherop.getfailargs()[:])
+    ///   `myop.setfailargs(otherop.getfailargs()[:])`
     /// where `descr` is the strengthened guard's *own* ResumeGuardDescr.
     pub fn inhert_attributes(&mut self, other: &Guard) {
         // guard.py:118

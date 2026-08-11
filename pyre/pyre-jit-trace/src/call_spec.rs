@@ -10,6 +10,89 @@ pub const PYFRAME_CALL_OWNER_ROOT: &str = "PyFrame";
 pub enum CallEffectKind {
     Elidable,
     Residual,
+    /// A callee whose effects are stated here rather than derived from a
+    /// graph (callee census).
+    ///
+    /// `Elidable` and `Residual` are shorthands for two whole rows; this arm
+    /// carries the row itself, which is what a callee with **no graph** needs.
+    /// It is upstream's `analyze_external_call` answer — the middle arm of
+    /// `graphanalyze.py:93-130` — reached through the only channel this side
+    /// has for it: a spelling-keyed table, not a source attribute.
+    ///
+    /// `#[allow(dead_code)]` because **no row uses this arm yet.** The rows
+    /// are blocked on callee census item 6: a census re-run on a fresh LLBC set names
+    /// the callees and, decisively, their SEGMENTATION — and a
+    /// `FunctionPath` override matches on the split, so a row written from a
+    /// `::`-joined listing is a guess that fails silently. Delete the
+    /// attribute along with the first row.
+    #[allow(dead_code)]
+    Declared(DeclaredEffects),
+}
+
+/// `effectinfo.py:17-24` `EF_*`, minus `EF_RANDOM_EFFECTS`.
+///
+/// A table entry states what a callee **does**. `EF_RANDOM_EFFECTS` is the
+/// answer for a callee nobody can describe — it is the absence of a
+/// declaration, so it has no member here.
+///
+/// Omitting it is load-bearing, not tidiness: it is what makes upstream's
+///
+/// ```text
+/// assert not (elidable_function and random_effects_on_gcobjs)
+/// ```
+///
+/// (`rpython/rtyper/lltypesystem/rffi.py:160`, inside `llexternal`) hold **by
+/// construction** — the illegal pairing cannot be written. Upstream enforces
+/// it at the declaration site for externals, which is exactly what this table
+/// is, so the constraint belongs here and not downstream in an analyzer.
+///
+/// The converse must stay writable. `elidable` **plus a concrete benign
+/// row** is legal upstream and is the whole point: `random_effects_on_gcobjs`
+/// derives from `invoke_around_handlers or has_callback` (`rffi.py:130-175`),
+/// i.e. "can release the GIL or can run a callback". A primitive like
+/// `core::ptr::null` does neither. A type that forbade elidable-with-a-row
+/// would delete the population this arm exists to serve, at compile time,
+/// while looking like a hardening.
+///
+/// `#[allow(dead_code)]` for the same reason as `CallEffectKind::Declared`:
+/// every member is *matched* by the translators, none is *constructed*, and
+/// none will be until the first row lands. Delete it with that row.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeclaredExtraEffect {
+    /// `EF_ELIDABLE_CANNOT_RAISE` — the row a pure primitive wants.
+    ElidableCannotRaise,
+    /// `EF_LOOPINVARIANT`
+    LoopInvariant,
+    /// `EF_CANNOT_RAISE`
+    CannotRaise,
+    /// `EF_ELIDABLE_OR_MEMORYERROR`
+    ElidableOrMemoryError,
+    /// `EF_ELIDABLE_CAN_RAISE`
+    ElidableCanRaise,
+    /// `EF_CAN_RAISE`
+    CanRaise,
+    /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
+    ForcesVirtualOrVirtualizable,
+}
+
+/// One declared effects row.
+///
+/// The six read/write descr sets are **not** expressible here and are left
+/// at `EffectInfo`'s default (empty, i.e. "touches no field or array"). A
+/// `const` table has no way to name a descr — the descr universe does not
+/// exist until the codewriter has run. Empty is the correct row for the
+/// primitives this arm targets (`core::ptr::null` reads and writes nothing),
+/// and it is **wrong** for anything that touches memory, so an entry for such
+/// a callee must not be written until that channel exists.
+#[derive(Clone, Copy)]
+pub struct DeclaredEffects {
+    pub extra: DeclaredExtraEffect,
+    /// `effectinfo.py:125 can_collect` — upstream defaults it to `True`.
+    /// `false` states the callee cannot trigger a collection.
+    pub can_collect: bool,
+    /// Whether the callee can invalidate a quasi-immutable.
+    pub can_invalidate: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +110,19 @@ pub struct CallEffectSpec {
     pub effect: CallEffectKind,
 }
 
+/// Every row below is currently **inert** — the per-entry match counter reads
+/// 0 for all 88. The `FunctionPath` rows carry a bare leaf name while the call
+/// sites resolve to the module-qualified path (`["opcode_binary_op"]` vs
+/// `["pyre_interpreter", "pyopcode", "opcode_binary_op"]`), and non-`Method`
+/// patterns are compared by full structural equality.
+///
+/// Do **not** repair that by relaxing the comparison to the leaf name. An
+/// unmatched row is inert and safe; a wrongly-matched row installs another
+/// function's declared effects on the call, and matching on the leaf alone
+/// would make an `RBigInt::sub` row also capture `time::Instant::sub` and
+/// `core::ops::arith::<Impl>::sub`. Fix the spelling in the row, not the
+/// predicate — see `CallEffectOverride::target` for how to read the spelling a
+/// call site actually carries, and verify against the census match counter.
 pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     CallEffectSpec {
         target: CallTargetSpec::Method {

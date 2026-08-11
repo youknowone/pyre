@@ -15,6 +15,10 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", fn_name);
     let dispatch_jitcode_fn_name = format_ident!("__dispatch_jitcode_{}", fn_name);
     let declare_schema_fn_name = format_ident!("__declare_jit_schema_{}", fn_name);
+    // Must match `codegen_state.rs`'s spelling: the symbolic-state struct is one
+    // module-level item shared by both emitters, suffixed so two machines can
+    // live in one module.
+    let sym_ty = format_ident!("__JitSym_{}", fn_name);
 
     let match_expr = find_dispatch_match(&func.block);
     let Some(match_expr) = match_expr else {
@@ -131,7 +135,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         #[allow(non_snake_case, unused_variables, unused_mut)]
         fn #trace_fn_name<__R: majit_metainterp::JitCodeRuntime>(
             __ctx: &mut majit_metainterp::TraceCtx,
-            __sym: &mut __JitSym,
+            __sym: &mut #sym_ty,
             program: &#env_type,
             pc: usize,
             // Slice X-D production wire-up: caller passes a
@@ -253,7 +257,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         /// triples into the driver-shared `Assembler`, mirroring RPython
         /// `pyjitpl.py:2255 finish_setup`'s "all `-live-` entries land
         /// in `asm.all_liveness` before the snapshot" invariant.
-        /// Invoked from `__JitMeta::install_canonical_liveness` exactly
+        /// Invoked from `__JitMeta_<fn>::install_canonical_liveness` exactly
         /// once at install time, before
         /// `JitDriver::install_canonical_liveness` snapshots
         /// `metainterp_sd.liveness_info`.

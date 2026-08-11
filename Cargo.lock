@@ -1599,7 +1599,6 @@ dependencies = [
  "majit-backend",
  "majit-gc",
  "majit-ir",
- "majit-metainterp",
  "majit-translate",
  "smallvec",
  "target-lexicon",

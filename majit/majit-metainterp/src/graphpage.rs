@@ -638,8 +638,17 @@ mod tests {
 
         page.compute(&[(&procedure as &dyn ResOpProcedure, 0)], None);
 
-        assert!(page.links.iter().any(|(name, _)| name == "i0"));
-        assert!(page.links.iter().any(|(name, _)| name == "i1"));
+        // Both links, with the colour each carries. The two membership checks
+        // this replaces named only the keys: nothing pinned the count, and
+        // nothing looked at the value side at all, so the colour the page
+        // assigns was free to change silently.
+        assert_eq!(
+            page.links
+                .iter()
+                .map(|(key, (name, colour))| (key.as_str(), name.as_str(), *colour))
+                .collect::<Vec<_>>(),
+            [("i0", "i0", (128, 0, 96)), ("i1", "i1", (128, 0, 96))]
+        );
     }
 
     #[test]

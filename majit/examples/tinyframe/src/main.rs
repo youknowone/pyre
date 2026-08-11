@@ -7,6 +7,31 @@ pub mod jit_interp;
 
 use std::time::Instant;
 
+/// Absolute trip-count gate on the JIT path.
+///
+/// `count_to` adds 1 to `r1` once per pass and stops when `r1` reaches `r0`,
+/// so the returned value names the number of passes exactly: `n` passes answer
+/// `n`, and one extra pass answers `n+1`. Agreement with `interp::Frame` alone
+/// would not settle this — both run the same program, and a duplicated
+/// iteration of the *compiled* loop is invisible to any check that does not
+/// assert an absolute count.
+///
+/// Two lengths of different parity, because a peeled first iteration plus an
+/// even/odd body count is exactly the shape an off-by-one hides in.
+fn trip_count_gate(code: &interp::Code) {
+    for n in [1001i64, 1002] {
+        let mut jit = jit_interp::JitTinyFrameInterp::new();
+        let got = jit.run(code, &[(0, n)]);
+        assert_eq!(
+            got, n,
+            "count_to({n}) = {got}, so the loop ran {got} passes rather than {n} \
+             — an off-by-one trip count is the signature of a terminal arm whose \
+             exit the trace dropped"
+        );
+        println!("[trip-count] count_to({n}) = {got} — exactly {n} passes");
+    }
+}
+
 fn main() {
     let n: i64 = std::env::args()
         .nth(1)
@@ -25,6 +50,8 @@ fn main() {
     RETURN r1
     ",
     );
+
+    trip_count_gate(&code);
 
     // Correctness check
     {

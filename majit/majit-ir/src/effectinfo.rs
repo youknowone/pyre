@@ -35,6 +35,10 @@ impl std::error::Error for UnsupportedFieldExc {}
 /// these tuples.  The key alone identifies the slot; what it does *not* carry
 /// is the layout needed to create the descr when the slot is empty, which is
 /// what [`DescrMintSpec`] adds.
+/// `Ord` is derived so build-time consumers can order a raw set by its
+/// *members* rather than by `Arc::as_ptr`.  A heap address orders a set
+/// reproducibly within one process and arbitrarily across two, which makes
+/// any artifact carrying that order a non-function of its inputs.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DescrSetMember {
     /// `descr.py:218-239 get_field_descr(gccache, STRUCT, fieldname)` —
@@ -1215,9 +1219,7 @@ impl EffectInfo {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // effectinfo.py:422-461: CallInfoCollection
-// ════════════════════════════════════════════════════════════════════════
 
 /// effectinfo.py:422: `class CallInfoCollection(object)`.
 ///
@@ -1278,7 +1280,6 @@ impl CallInfoCollection {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // effectinfo.py:465-547 `compute_bitstrings(all_descrs)`.
 /// `effectinfo.py:182-184` "no new EffectInfo after compute_bitstrings"
 /// invariant — flipped to `true` on the first
@@ -1632,8 +1633,15 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
         // ptr-id is exact.
         let mut all_sets: Vec<(usize, DescrRef, Vec<usize>, Vec<usize>)> =
             Vec::with_capacity(category_descrs.len());
-        // Fix iteration order — sort by ptr-id so the popularity-sort
-        // tie-break below is deterministic across runs.
+        // Fix the iteration order so the popularity-sort tie-break below
+        // does not inherit `category_descrs`' arbitrary one.
+        //
+        // A ptr-id is a heap address: it orders the walk reproducibly
+        // within one process and arbitrarily across two. That is the whole
+        // requirement here — `compute_bitstrings` runs at runtime, and no
+        // output of it crosses a process boundary. Anything moved from here
+        // to build time loses the property, because the two sides are two
+        // processes.
         let mut sorted_descrs: Vec<(usize, DescrRef)> = category_descrs.into_iter().collect();
         sorted_descrs.sort_by_key(|(pid, _)| *pid);
         for (pid, descr) in sorted_descrs {
@@ -1665,7 +1673,9 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
         // `effectinfo.py:519-521`: heuristic — sort by len(eisetr) +
         // len(eisetw) descending so the most popular descrs claim the
         // low ei_index slots, reducing total bitstring length. Tie-
-        // break on ptr-id ascending for determinism.
+        // break on ptr-id ascending, which fixes the order within this
+        // process (see the sort above for what a ptr-id does and does not
+        // promise).
         all_sets.sort_by(|a, b| {
             (b.2.len() + b.3.len())
                 .cmp(&(a.2.len() + a.3.len()))

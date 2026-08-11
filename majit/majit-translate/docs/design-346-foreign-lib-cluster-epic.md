@@ -29,9 +29,16 @@ three readings of one unchanged input set:
   rg --no-config 'PREPASS phaseA fail' "$stderr" | rg --no-config 'try_from' | sort -u | wc -l
   ```
 
-- **276 total post-Slice-A phaseA failures:** commit
-  `bb6ee8d179c70f170ee4e3a3cb9b4dce99d96d9b`, release profile, default
-  features, and `PYRE_RTYPER_VERBOSE=1`. Slice A changed `pyre-object`, so this
+- **276 total post-Slice-A phaseA failures** (the *post-Slice-A baseline
+  commit*, named that way everywhere below): release profile, default
+  features, and `PYRE_RTYPER_VERBOSE=1`.
+
+  That commit existed only on a feature branch and was later replaced by the
+  squash merge in PR #606 (`7944966b4dd`, "jit: retire foreign-lib cluster
+  walls (gh#346 Slice A + B1a + B2 + B3a)"). The squash tree contains the
+  whole PR, not the exact tree measured here, so the 276 reading cannot be
+  reproduced from that merge. Re-run the command below at a named commit
+  before comparing a new result to 276. Slice A changed `pyre-object`, so this
   run first re-extracted the default LLBC set with the repository's pinned
   Charon, then rebuilt and counted:
 
@@ -43,7 +50,8 @@ three readings of one unchanged input set:
   rg --no-config 'PREPASS phaseA fail' "$stderr" | sort -u | wc -l
   ```
 
-The 276 run is **not** a direct 268→276 Slice-A delta: `bb6ee8d179c` descends
+The 276 run is **not** a direct 268→276 Slice-A delta: the post-Slice-A
+baseline commit descends
 from `eca75827fe4` through intervening changes and uses re-extracted LLBC, while
 268 used the older frozen snapshot. The 268 figure is therefore the historical
 pre-Slice-A planning baseline only; the separately configured 276 run is the
@@ -165,7 +173,7 @@ Err arm — MUST still raise IndexError/ValueError, not panic).
 ### Slice B — String / Wtf8 / IndexMap / slice / iter-adapter residuals (task #22, after A)
 
 Scoped 7/17 on the separate post-Slice-A census run
-(`bb6ee8d179c70f170ee4e3a3cb9b4dce99d96d9b`, 276 total phaseA; exact
+(the post-Slice-A baseline commit, 276 total phaseA; exact
 configuration and command above): **46 distinct unregistered
 residual paths**, saved to `/tmp/sliceB_residual_ranking.txt` (de-escape `\"`→`"` before counting).
 The three walls that gate the hot dispatcher heads (innermost per record):
@@ -221,7 +229,7 @@ co-land):**
 
 ### Slice C — vec!/NewList recognizer + repr-generic rtype_newlist (task #20, LAST, capstone)
 
-- **Ca** Re-add the front/mir recognizer (verbatim from reverted `f41cb0496dc`): match
+- **Ca** Re-add the front/mir recognizer (verbatim from the reverted work in PR #310): match
   `box_assume_init_into_vec_unsafe(box [e0..eN])` → `OpKind::NewList{args}`. Helpers
   `read_array_literal_elements` (mir.rs:13581) + `fmt_path_ends_with` (mir.rs:13673) still in tree.
 - **Cb** `remove_dead_aggregates` (model.rs:2469) already sweeps the dead `Box::new_uninit`. No work.
@@ -248,8 +256,8 @@ The metric is the distinct `[PREPASS phaseA fail]` count produced by the exact
 commands and configurations recorded above. Use set-diff only between runs made
 from the same source commit ancestry and the same extracted LLBC snapshot. In
 particular, 268 at `eca75827fe4` is the historical pre-Slice-A planning baseline,
-16 at `ccdc1a52be2` is only the filtered `try_from` subset, and 276 at
-`bb6ee8d179c` is a separately configured post-Slice-A baseline; do not treat
+16 at `ccdc1a52be2` is only the filtered `try_from` subset, and 276 at the
+post-Slice-A baseline commit is separately configured; do not treat
 268→276 as a Slice-A regression. GOTCHA: the census **stderr** logs only phaseA
 *reasons* — the emitted `newlist/r>r`
 opname lives in `insns.bin` (build OUT_DIR `target/debug/build/pyre-jit-trace-<hash>/out/insns.bin`;

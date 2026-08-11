@@ -75,7 +75,7 @@ struct KnownResultEntry {
 ///
 /// RPython uses a flat array of Op references, scanned linearly on lookup.
 /// At limit=16 (pureop_historylength), linear scan beats HashMap because:
-/// - No hashing overhead or Vec<OpRef> allocation per lookup
+/// - No hashing overhead or `Vec<OpRef>` allocation per lookup
 /// - Cache-friendly sequential memory access
 /// - Typical hit is within first few entries
 pub struct RecentPureOps {
@@ -1747,7 +1747,7 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
     }
 
-    /// #171/#11 Approach C: two `getarrayitem_gc_pure_r(arr, const_i, descr)`
+    /// Two `getarrayitem_gc_pure_r(arr, const_i, descr)` operations
     /// against the SAME (immutable) array, index, and descr are CSE'd by
     /// OptPure — the second is folded to the first (`make_equal_to`).  This
     /// is the producer-side invariant the canonical-tuple `t[i]` arm relies
@@ -2653,7 +2653,7 @@ mod tests {
             Some(1),
         );
         // Production threads the builder's replay Rc into the pop
-        // (produce_pure); mirror it so use_box sees one object. #146/S8: the
+        // (produce_pure); mirror it so use_box sees one object. unsupported-green-type/S8: the
         // builder keys by the entry res box (`materialize_operand_at(pos)`); the
         // memoized box for the same position hits.
         let src1 = ctx.materialize_operand_at(OpRef::int_op(1));
@@ -2999,7 +2999,7 @@ mod tests {
         // `from_bound_op` reference (Prod(0)), so the fold is observed where it
         // matters in production: the folded Ref reaches its consumer as an
         // inline `ConstPtr` operand (later rewritten to `LoadFromGcTable` by the
-        // GC rewrite). #108: a Ref constant is NEVER exported as a raw `GcRef`
+        // GC rewrite). compilation-panic: a Ref constant is NEVER exported as a raw `GcRef`
         // into the backend constant pool — that pool has no GC root walker, so
         // refs live only in the GC-traced gc_table. (The Int analog DOES export
         // to the pool; ints carry no GC concern.)
@@ -3067,7 +3067,7 @@ mod tests {
             !matches!(consumer.arg(1).to_opref(), OpRef::ConstInt(_)),
             "folded CallPureR constant aliased to ConstInt — ConstPtr/ConstInt distinction lost"
         );
-        // #108: no raw GcRef is exported into the backend constant pool.
+        // compilation-panic: no raw GcRef is exported into the backend constant pool.
         assert!(
             constants.values().all(|v| !matches!(v, Value::Ref(_))),
             "backend constant pool must not retain a raw GcRef (use the gc_table); got {constants:?}"

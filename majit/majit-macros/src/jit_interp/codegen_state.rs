@@ -23,6 +23,21 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", func.sig.ident);
     let dispatch_jitcode_fn_name = format_ident!("__dispatch_jitcode_{}", func.sig.ident);
     let declare_schema_fn_name = format_ident!("__declare_jit_schema_{}", func.sig.ident);
+    // Every module-level item this macro emits is suffixed with the annotated
+    // function's name, because the expansion lands in the CALLER's module and two
+    // machines in one module would otherwise collide (E0428).  These five were
+    // fixed names while the three above were already suffixed; the split was not
+    // deliberate.  Note the ceiling: unique names let two machines share a module
+    // only when their `state` types DIFFER -- two machines over the same state
+    // type still conflict on `impl JitState for #state_type` (E0119), which no
+    // naming scheme can fix.
+    let meta_ty = format_ident!("__JitMeta_{}", func.sig.ident);
+    let sym_ty = format_ident!("__JitSym_{}", func.sig.ident);
+    // `_name` because `loop_carried_boxes_fn` is already taken further down by the
+    // TokenStream holding the whole function definition; this is only its ident.
+    let loop_carried_boxes_fn_name = format_ident!("__jit_loop_carried_boxes_{}", func.sig.ident);
+    let fresh_alloc_fn = format_ident!("__majit_recursive_fresh_alloc_{}", func.sig.ident);
+    let fresh_free_fn = format_ident!("__majit_recursive_fresh_free_{}", func.sig.ident);
     let sf = config.state_fields.as_ref().unwrap();
 
     let unsupported_fields: Vec<String> = sf
@@ -180,7 +195,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {}
     };
 
-    // ── __JitMeta fields: one `{name}_len: usize` per flattened array ──
+    // `__JitMeta_<fn>` fields: one `{name}_len: usize` per flattened array
     // Virt arrays do NOT store length in meta: `virtualizable.py:150-153` reads
     // each one off the live object, so it is neither a meta field nor a box.
     let meta_fields: Vec<TokenStream> = arrays
@@ -191,10 +206,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
 
-    // ── __JitSym fields ──
+    // `__JitSym_<fn>` fields
     // scalar → OpRef
     // flattened array → Vec<OpRef>
-    // virt array → (OpRef, OpRef) for (data_ptr, len)
+    // virt array → an `i64` length mirror, and nothing else (see
+    //   `sym_virt_array_fields` below). This line used to read
+    //   `(OpRef, OpRef) for (data_ptr, len)`; no such pair is built here or
+    //   anywhere else. A virt array's base address is NEVER materialised as an
+    //   SSA value: the vable-relative `getarrayitem_vable_*` /
+    //   `setarrayitem_vable_*` ops carry `(fdescr, adescr)` and resolve the base
+    //   inside the op, off the live virtualizable. The only OpRef a
+    //   virtualizable gets is the single `__vable_identity` below.
+    //   Worth stating rather than deleting: read as a promise that the base is
+    //   already available, the old wording collapses the design of anything that
+    //   needs one.
     let sym_scalar_fields: Vec<TokenStream> = scalars
         .iter()
         .map(|(_, f)| {
@@ -364,7 +389,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // Matches `live_slots_for_state_field_jit` slot order so a
     // `MIFrame::get_list_of_active_boxes` walk against the canonical
     // liveness entry decodes back the same OpRefs / values that
-    // `__JitSym` and the macro-emitted `live/<offset>` placeholder
+    // `__JitSym_<fn>` and the macro-emitted `live/<offset>` placeholder
     // refer to.  Virt-array populate is deferred — see
     // the trait-method docstring.
     let populate_scalar_parts: Vec<TokenStream> = scalars
@@ -582,7 +607,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // is permanently live, so the canonical entry is just
     // `[0..total_slots]` of int slots.  The `array_lens` slice fed to
     // `live_slots_for_state_field_jit` enumerates the runtime lengths
-    // captured in `__JitMeta::<arr>_len` (one per flattened array).
+    // captured in `__JitMeta_<fn>::<arr>_len` (one per flattened array).
     let canonical_liveness_array_len_refs: Vec<TokenStream> = arrays
         .iter()
         .map(|(_, f)| {
@@ -722,7 +747,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
 
-    // ── #184 recursive CALL_ASSEMBLER portal entry (JitCodeSym side) ──
+    // Recursive CALL_ASSEMBLER portal entry on the JitCodeSym side
     // A recursive callee runs as its own compiled loop with a fresh frame.
     // `recursive_fresh_entry_reds` allocates a fresh `#state_type` (scalars
     // zeroed = empty frame; arrays re-allocated at the caller's live
@@ -821,7 +846,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! {}
         };
 
-    // ── #184 recursive CALL_ASSEMBLER portal entry (host alloc/free) ──
+    // Recursive CALL_ASSEMBLER portal entry for host allocation and release
     // The compiled caller loop cannot `New` a host `#state_type` through the
     // IR, so the recursive dispatcher records a residual call to these host
     // helpers: `alloc` returns a fresh `Box::into_raw`-ed `#state_type`
@@ -851,7 +876,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {
             #[doc(hidden)]
             #[allow(non_snake_case)]
-            extern "C" fn __majit_recursive_fresh_alloc(__cap: i64) -> i64 {
+            extern "C" fn #fresh_alloc_fn(__cap: i64) -> i64 {
                 let __fresh: ::std::boxed::Box<#state_type> = ::std::boxed::Box::new(#state_type {
                     #(#fresh_entry_scalar_inits)*
                     #virt_name: ::std::vec![#virt_zero; __cap as usize],
@@ -860,7 +885,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
             #[doc(hidden)]
             #[allow(non_snake_case)]
-            extern "C" fn __majit_recursive_fresh_free(__ptr: i64) {
+            extern "C" fn #fresh_free_fn(__ptr: i64) {
                 if __ptr != 0 {
                     unsafe {
                         ::core::mem::drop(::std::boxed::Box::from_raw(__ptr as *mut #state_type));
@@ -875,8 +900,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {
             fn recursive_fresh_alloc_free_targets(&self) -> Option<(*const (), *const ())> {
                 Some((
-                    __majit_recursive_fresh_alloc as usize as *const (),
-                    __majit_recursive_fresh_free as usize as *const (),
+                    #fresh_alloc_fn as usize as *const (),
+                    #fresh_free_fn as usize as *const (),
                 ))
             }
         }
@@ -1274,7 +1299,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // builds it: `live_arg_boxes = greenboxes + redboxes` and then
     // `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
     // (pyjitpl.py:2981-2989) — `+=` appends, so no element can precede a red.
-    // ⚠️Splicing the elements before the ref/float scalars (as this did until
+    // Splicing the elements before the ref/float scalars (as this did until
     // the order was unified) leaves the JUMP and the Label at the SAME arity
     // with different slot meanings, so `jump.numargs() == label.numargs()`
     // (compile.py:334) still passes and nothing downstream catches it.
@@ -1341,8 +1366,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         /// pyjitpl.py:2981-2989 `live_arg_boxes`, typed. See the emit-site
         /// comment in `majit-macros/src/jit_interp/codegen_state.rs`.
         #[allow(unused_variables)]
-        fn __jit_loop_carried_boxes(
-            sym: &__JitSym,
+        fn #loop_carried_boxes_fn_name(
+            sym: &#sym_ty,
             __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
         ) -> Vec<(majit_ir::OpRef, majit_ir::Type)> {
             let mut args: Vec<(majit_ir::OpRef, majit_ir::Type)> = Vec::new();
@@ -1364,10 +1389,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let collect_jump_args_with_boxes_method: TokenStream = if num_virt_arrays >= 1 {
         quote! {
             fn collect_jump_args_with_boxes(
-                sym: &__JitSym,
+                sym: &#sym_ty,
                 __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
             ) -> Vec<majit_ir::OpRef> {
-                __jit_loop_carried_boxes(sym, __boxes)
+                #loop_carried_boxes_fn_name(sym, __boxes)
                     .into_iter()
                     .map(|(__opref, _)| __opref)
                     .collect()
@@ -1459,6 +1484,63 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let create_sym_float_scalar_value_names: Vec<syn::Ident> = float_scalars
         .iter()
         .map(|(_, f)| quote::format_ident!("{}_value", f.name))
+        .collect();
+    // `clear_sym_inputarg_bindings`: drop every `OpRef` that `create_sym`
+    // minted off `__offset`, and only those — the `_value` / `_len_value`
+    // mirrors are concrete runtime data seeded by `initialize_sym`, not
+    // positions, so they stay.  One statement per field the `#sym_ty`
+    // constructor above lists as `OpRef` / `Vec<OpRef>`; virt arrays carry
+    // only an `i64` length mirror and so contribute nothing here.
+    // Counterpart of `clear_sym_binding_parts`, over the identical five
+    // sources so the two cannot drift: if a kind is added to the clearing and
+    // not to the count, the assertion at the call site stops covering it.
+    let count_bound_sym_parts: Vec<TokenStream> = create_sym_scalar_names
+        .iter()
+        .map(|fname| quote! { if !sym.#fname.is_none() { __bound += 1; } })
+        .chain(create_sym_array_names.iter().map(|fname| {
+            quote! {
+                for __cell in sym.#fname.iter() {
+                    if !__cell.is_none() { __bound += 1; }
+                }
+            }
+        }))
+        .chain(has_vable_identity.then(|| {
+            quote! { if !sym.__vable_identity.is_none() { __bound += 1; } }
+        }))
+        .chain(
+            create_sym_ref_scalar_names
+                .iter()
+                .map(|fname| quote! { if !sym.#fname.is_none() { __bound += 1; } }),
+        )
+        .chain(
+            create_sym_float_scalar_names
+                .iter()
+                .map(|fname| quote! { if !sym.#fname.is_none() { __bound += 1; } }),
+        )
+        .collect();
+    let clear_sym_binding_parts: Vec<TokenStream> = create_sym_scalar_names
+        .iter()
+        .map(|fname| quote! { sym.#fname = majit_ir::OpRef::NONE; })
+        .chain(create_sym_array_names.iter().map(|fname| {
+            quote! {
+                for __cell in sym.#fname.iter_mut() {
+                    *__cell = majit_ir::OpRef::NONE;
+                }
+            }
+        }))
+        .chain(has_vable_identity.then(|| {
+            quote! { sym.__vable_identity = majit_ir::OpRef::NONE; }
+        }))
+        .chain(
+            create_sym_ref_scalar_names
+                .iter()
+                .map(|fname| quote! { sym.#fname = majit_ir::OpRef::NONE; }),
+        )
+        .chain(
+            create_sym_float_scalar_names
+                .iter()
+                .map(|fname| quote! { sym.#fname = majit_ir::OpRef::NONE; }),
+        )
         .collect();
     let extract_float_scalar_parts: Vec<TokenStream> = float_scalars
         .iter()
@@ -1640,7 +1722,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // and that lint is deny-by-default in every consumer of this
                 // macro, so a state of arrays only would not compile there.
                 #[allow(clippy::reversed_empty_ranges)]
-                fn live_value_types(&self, _meta: &__JitMeta) -> Vec<majit_ir::Type> {
+                fn live_value_types(&self, _meta: &#meta_ty) -> Vec<majit_ir::Type> {
                     // Value-routing types in `extract_live` order: int scalars,
                     // int array elements, then the ONE virtualizable identity
                     // (Ref), then appended ref scalars (Ref), then appended float
@@ -1671,7 +1753,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {
             fn restore_banked3(
                 &mut self,
-                meta: &__JitMeta,
+                meta: &#meta_ty,
                 int_values: &[i64],
                 ref_values: &[i64],
                 float_values: &[i64],
@@ -1802,6 +1884,40 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // statement (`standard_virtualizable_jitcode_argbox` has nothing to
     // resolve), so a state with `[.. ; virt]` arrays never forms a bridge at
     // all — every guard exit deopts through the blackhole instead.
+    // Rebind the vable identity the bridge actually entered with.
+    //
+    // `clear_sym_inputarg_bindings` retires this field along with the other
+    // `create_sym` mints, and the frame-register seeding below has no arm for
+    // it: `reg_indices` addresses the int/ref/float scalar banks and this
+    // field is in none of them. Left retired it travels straight into the
+    // jump args as `OpRef::NONE` (`collect_jump_args` and
+    // `collect_jump_args_with_boxes` both push it), where the optimizer has
+    // neither an operand nor a type for it and `not_virtual` faults.
+    //
+    // `standard_virtualizable_jitcode_argbox` is the right source rather than
+    // a constant built from the mirror: it prefers the exact trace-entry red
+    // inputarg named by `index_of_virtualizable`, falling back to
+    // `virtualizable_boxes[-1]`, which `#seed_bridge_vable` has just
+    // populated. Note that seeding does not do this itself —
+    // `seed_bridge_virtualizable_boxes` takes no `Sym` and writes only the
+    // ctx-side boxes.
+    let rebind_bridge_vable_identity: TokenStream = if has_vable_identity {
+        quote! {
+            if let Some((_, __vable_op, __vable_val)) =
+                ctx.standard_virtualizable_jitcode_argbox()
+            {
+                sym.__vable_identity = __vable_op;
+                sym.__vable_identity_value = __vable_val;
+                if std::env::var("MAJIT_BRIDGE_DEBUG").is_ok() {
+                    eprintln!("  vable identity REBOUND to {:?}", __vable_op);
+                }
+            } else if std::env::var("MAJIT_BRIDGE_DEBUG").is_ok() {
+                eprintln!("  vable identity NOT REBOUND — no standard argbox");
+            }
+        }
+    } else {
+        quote! {}
+    };
     let seed_bridge_vable: TokenStream = if num_virt_arrays > 0 {
         quote! {
             if let Some(__vinfo) = Self::__build_virtualizable_info() {
@@ -1911,10 +2027,28 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         // constant — `num_scalars` — so the identity can be DECLARED the way
         // `warmspot.py:529-538` declares `index_of_virtualizable`, and
         // `initialize_virtualizable` can look it up instead of searching the
-        // reds for a matching pointer. A fixed `[int]` array alongside a
-        // `[int; virt]` one would make the position depend on that array's
-        // runtime length; no front-end declares both, and the lookup falls
-        // back to the pointer match when it happens.
+        // reds for a matching pointer.
+        //
+        // A fixed `[int]` array alongside a `[int; virt]` one — which
+        // `majit-metainterp/tests/jit_interp_float_state_field.rs`
+        // `virt_array_with_float_scalar` declares — makes the position
+        // `num_scalars + sum(array lengths)`, and those lengths are the runtime
+        // `Vec` lengths this expansion reads back through `meta.<arr>_len`
+        // (`create_sym_array_inits`), so no constant can be emitted here — the
+        // vinfo itself is built once per driver by the `&self`-less
+        // `__build_virtualizable_info`, before any state instance exists.
+        // Emitting nothing is therefore correct, but it is NOT harmless on its
+        // own: it leaves the identity's position unstated, and both consumers
+        // must resolve it instead of assuming one.
+        // `MetaInterp::identity_live_position` does resolve it for the runtime
+        // path — it pointer-matches `vable_ptr` against the reds, so a wrong or
+        // absent declaration is survivable there. The optimizer has no pointer
+        // to match against, so with nothing declared it DECLINES to track the
+        // virtualizable (`VirtualizableConfig::identity_input_index` is `None`)
+        // rather than probing flat slot 0 — an int scalar on this layout, which
+        // made every trace abort with VirtualStatesCantMatch. Declining was
+        // measured to cost nothing here; see
+        // `tests/jit_interp_fixed_array_identity_slot.rs`.
         let identity_live_index_stmt: TokenStream = if arrays.is_empty() {
             quote! { __info.identity_live_index = Some(#num_scalars); }
         } else {
@@ -2005,11 +2139,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         /// Compiled loop metadata for state_fields mode: flattened array lengths at trace start.
         #[derive(Clone)]
         #[allow(non_camel_case_types)]
-        struct __JitMeta {
+        struct #meta_ty {
             #(#meta_fields)*
         }
 
-        impl __JitMeta {
+        impl #meta_ty {
             /// RPython `assembler.py:218-231 get_liveness_info(insn, kind)`
             /// adapted for flat-state JIT: every state_field slot is
             /// permanently live, so the canonical `(live_i, live_r,
@@ -2235,7 +2369,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
         /// Symbolic state during tracing: per-field OpRefs.
         #[allow(non_camel_case_types)]
-        struct __JitSym {
+        struct #sym_ty {
             #(#sym_scalar_fields)*
             #(#sym_scalar_value_fields)*
             #(#sym_array_fields)*
@@ -2252,7 +2386,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
         #loop_carried_boxes_fn
 
-        impl majit_metainterp::JitCodeSym for __JitSym {
+        impl majit_metainterp::JitCodeSym for #sym_ty {
             fn total_slots(&self) -> usize {
                 #num_scalars #(#total_slots_array_parts)* + #num_vable_identity_slots
             }
@@ -2261,7 +2395,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 &self,
                 __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
             ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
-                Some(__jit_loop_carried_boxes(self, __boxes))
+                Some(#loop_carried_boxes_fn_name(self, __boxes))
             }
 
             fn int_identity_slots_end(&self) -> usize {
@@ -2270,6 +2404,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
             fn int_identity_slots_base(&self) -> usize {
                 #int_identity_base
+            }
+
+            // Mirrors `split_identity_reg_ends`' int end in
+            // `jitcode_lower/mod.rs` exactly: the working-register floor stops
+            // after the scalars plus the single vable-identity slot, because a
+            // virt array's element count is only known from the live object.
+            fn int_identity_reserved_end(&self) -> usize {
+                #int_identity_base + #num_scalars + #num_vable_identity_slots
             }
 
             fn loop_header_pc(&self) -> usize {
@@ -2407,21 +2549,21 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         }
 
         impl majit_metainterp::JitState for #state_type {
-            type Meta = __JitMeta;
-            type Sym = __JitSym;
+            type Meta = #meta_ty;
+            type Sym = #sym_ty;
             type Env = #env_type;
 
             fn can_trace(&self) -> bool {
                 true
             }
 
-            fn build_meta(&self, _header_pc: usize, _program: &#env_type) -> __JitMeta {
-                __JitMeta {
+            fn build_meta(&self, _header_pc: usize, _program: &#env_type) -> #meta_ty {
+                #meta_ty {
                     #(#build_meta_fields)*
                 }
             }
 
-            fn extract_live(&self, _meta: &__JitMeta) -> Vec<i64> {
+            fn extract_live(&self, _meta: &#meta_ty) -> Vec<i64> {
                 let mut values = Vec::new();
                 #(#extract_scalar_parts)*
                 #(#extract_array_parts)*
@@ -2433,7 +2575,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
             #live_value_types_override
 
-            fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
+            fn create_sym(meta: &#meta_ty, header_pc: usize) -> #sym_ty {
                 let mut __offset: usize = 0;
                 #(#create_sym_scalar_inits)*
                 #(#create_sym_array_inits)*
@@ -2441,7 +2583,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #create_sym_vable_identity_init
                 #(#create_sym_ref_scalar_inits)*
                 #(#create_sym_float_scalar_inits)*
-                __JitSym {
+                #sym_ty {
                     #(#create_sym_scalar_names,)*
                     #(#create_sym_scalar_value_names,)*
                     #(#create_sym_array_names,)*
@@ -2457,13 +2599,29 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             }
 
-            fn initialize_sym(&self, sym: &mut __JitSym, _meta: &__JitMeta) {
+            fn initialize_sym(&self, sym: &mut #sym_ty, _meta: &#meta_ty) {
                 #(#initialize_sym_scalar_parts)*
                 #(#initialize_sym_array_parts)*
                 #(#initialize_sym_virt_array_parts)*
                 #initialize_sym_vable_identity_part
                 #(#initialize_sym_ref_scalar_parts)*
                 #(#initialize_sym_float_scalar_parts)*
+            }
+
+            // Retires `create_sym`'s `__offset` numbering for callers whose
+            // trace does not number its inputargs the same way — see the trait
+            // declaration for why a bridge is such a caller and why a stale
+            // mint resolves instead of missing.  Mirrors the `#sym_ty`
+            // constructor field-for-field: every `OpRef` it fills from
+            // `__offset` is cleared here, and nothing else is touched.
+            fn count_bound_sym_inputargs(sym: &#sym_ty) -> Option<usize> {
+                let mut __bound = 0usize;
+                #(#count_bound_sym_parts)*
+                Some(__bound)
+            }
+
+            fn clear_sym_inputarg_bindings(sym: &mut #sym_ty) {
+                #(#clear_sym_binding_parts)*
             }
 
             // ── Part A (bridge resume-decode). ──
@@ -2483,7 +2641,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // a stack-mutating residual) — not a missing or unseeded bridge.
             // See `aheui-logo-spin-observer-replay-rootcause.md`.
             fn rebuild_from_resumedata(
-                _meta: &mut __JitMeta,
+                _meta: &mut #meta_ty,
                 fail_arg_types: &[majit_ir::Type],
                 storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
             ) -> Option<majit_metainterp::ResumeDataResult> {
@@ -2588,7 +2746,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // Const → a folded pool constant.  MAJIT_BRIDGE_DEBUG dumps it.
             #[allow(clippy::reversed_empty_ranges)]
             fn setup_bridge_sym(
-                sym: &mut __JitSym,
+                sym: &mut #sym_ty,
                 ctx: &mut majit_metainterp::TraceCtx,
                 resume_data: &majit_metainterp::ResumeDataResult,
                 rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
@@ -2623,6 +2781,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     &mut __bridge_cache,
                 );
                 #seed_bridge_vable
+                #rebind_bridge_vable_identity
                 let frame = match resume_data.frames.first() {
                     Some(f) => f,
                     None => return,
@@ -2669,8 +2828,44 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     let __pos = match __pos {
                         Some(p) => p,
                         None => {
+                            // The guard's resume frame does not carry this
+                            // field's identity register, so there is no red to
+                            // decode — measured on dualtape, where the frame's
+                            // live int set is `[0]` while the two int scalars
+                            // sit at identity registers 1 and 2.
+                            //
+                            // Its concrete value is still known: `initialize_sym`
+                            // read it off the live state at bridge entry and
+                            // `clear_sym_inputarg_bindings` preserves the value
+                            // mirrors. Bind it as a constant, which is exactly
+                            // what the `RebuiltValue::Const` arm below does for a
+                            // field the frame carries already folded — the two
+                            // cases differ in who folded it, not in what the
+                            // bridge should observe.
+                            //
+                            // Leaving it unbound instead hands the optimizer an
+                            // `OpRef::NONE`, which has no operand and no type;
+                            // `materialize_operand_at` and `not_virtual` both
+                            // reject it.
+                            //
+                            // The `.expect` is load-bearing and it has been
+                            // exercised: on `examples/dualtape` this arm is
+                            // reached 24 times in a passing run (counted off
+                            // the `MAJIT_BRIDGE_DEBUG` line below) and fires 0
+                            // times. So the mirror is populated at every reach
+                            // — the value is recovered from the state, never
+                            // fabricated, and `const_int` never mints a
+                            // stand-in zero. That separation is measured here
+                            // and nowhere else: the dualtape fixture greens on
+                            // no-panic plus correct output, so a fabricated
+                            // value would pass it. Same for the ref and float
+                            // arms below, which share this shape.
+                            let __bits = sym.state_field_value(__k).expect("state field concrete value not initialized");
+                            let __op = ctx.const_int(__bits);
+                            sym.set_state_field_ref(__k, __op);
+                            sym.set_state_field_value(__k, __bits);
                             if __dbg {
-                                eprintln!("  int scalar {} <- reg {} UNSEEDED (color not in reg_indices.int)", __k, __target);
+                                eprintln!("  int scalar {} <- reg {} ABSENT from frame, bound Const {}", __k, __target, __bits);
                             }
                             continue;
                         }
@@ -2722,8 +2917,17 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     let __pos = match __pos {
                         Some(p) => p,
                         None => {
+                            // Ref twin of the int arm above — same reason, same
+                            // remedy, `const_ref` instead of `const_int`. Kept
+                            // symmetric deliberately: a bank left on the bare
+                            // `continue` reintroduces the unbound-field hazard
+                            // for any state that declares one.
+                            let __bits = sym.state_ref_field_value(__j).expect("ref state field concrete value not initialized");
+                            let __op = ctx.const_ref(__bits);
+                            sym.set_state_ref_field_ref(__j, __op);
+                            sym.set_state_ref_field_value(__j, __bits);
                             if __dbg {
-                                eprintln!("  ref scalar {} <- reg {} UNSEEDED (color not in reg_indices.ref)", __j, __target);
+                                eprintln!("  ref scalar {} <- reg {} ABSENT from frame, bound Const {:#x}", __j, __target, __bits);
                             }
                             continue;
                         }
@@ -2772,7 +2976,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     let __pos = reg_indices.float.iter().position(|&r| r as usize == __target);
                     let __pos = match __pos {
                         Some(p) => p,
-                        None => continue,
+                        None => {
+                            // Float twin of the int/ref arms above. The mirror
+                            // stores the float's raw bits, so the constant is
+                            // minted from the bit pattern, matching how
+                            // `initialize_sym` and `restore_banked3` carry it.
+                            let __bits = sym.state_float_field_value(__k).expect("float state field concrete value not initialized");
+                            let __op = ctx.const_float(__bits);
+                            sym.set_state_float_field_ref(__k, __op);
+                            sym.set_state_float_field_value(__k, __bits);
+                            if __dbg {
+                                eprintln!("  float scalar {} <- reg {} ABSENT from frame, bound Const {}", __k, __target, f64::from_bits(__bits as u64));
+                            }
+                            continue;
+                        }
                     };
                     match &frame.values[__float_off + __pos] {
                         RebuiltValue::Box(n, kind) if matches!(kind, majit_ir::Type::Float) => {
@@ -2799,11 +3016,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             }
 
-            fn is_compatible(&self, meta: &__JitMeta) -> bool {
+            fn is_compatible(&self, meta: &#meta_ty) -> bool {
                 true #(#compat_checks)*
             }
 
-            fn restore(&mut self, _meta: &__JitMeta, values: &[i64]) {
+            fn restore(&mut self, _meta: &#meta_ty, values: &[i64]) {
                 let mut __offset: usize = 0;
                 #(#restore_scalar_parts)*
                 #(#restore_array_parts)*
@@ -2816,7 +3033,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #recover_body
             }
 
-            fn debug_state_fields(&self, _meta: &__JitMeta) -> Option<::std::string::String> {
+            fn debug_state_fields(&self, _meta: &#meta_ty) -> Option<::std::string::String> {
                 let mut out = ::std::string::String::new();
                 #(#debug_scalar_state_parts)*
                 #(#debug_array_state_parts)*
@@ -2826,7 +3043,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 Some(out)
             }
 
-            fn debug_state_live_labels(&self, _meta: &__JitMeta) -> Option<::std::vec::Vec<::std::string::String>> {
+            fn debug_state_live_labels(&self, _meta: &#meta_ty) -> Option<::std::vec::Vec<::std::string::String>> {
                 let mut labels: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
                 #(#debug_scalar_label_parts)*
                 #(#debug_array_label_parts)*
@@ -2887,7 +3104,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #state_field_layout_ctor
             }
 
-            fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
+            fn collect_jump_args(sym: &#sym_ty) -> Vec<majit_ir::OpRef> {
                 let mut args = Vec::new();
                 #(#collect_scalar_parts)*
                 #(#collect_array_parts)*
@@ -2899,7 +3116,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
             #collect_jump_args_with_boxes_method
 
-            fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
+            fn validate_close(sym: &#sym_ty, meta: &#meta_ty) -> bool {
                 true #(#validate_array_checks)*
             }
 
@@ -2910,10 +3127,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // as the dispatch-level `record_state_guard`
             // (`pyjitpl/dispatch.rs:284`).  Calls the macro-emitted
             // `JitCodeSym::populate_frame_int_regs` to bridge
-            // `__JitSym` slots onto `MIFrame.int_regs`, then builds a
+            // `__JitSym_<fn>` slots onto `MIFrame.int_regs`, then builds a
             // single-frame snapshot via the canonical helper.
             fn populate_frame_for_guard(
-                sym: &__JitSym,
+                sym: &#sym_ty,
                 frames: &mut majit_metainterp::MIFrameStack,
                 __op_live: u8,
                 __all_liveness: &[u8],
@@ -2961,7 +3178,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     false,
                     __virtualizable_boxes,
                     __virtualref_boxes,
-                    Some((sym.int_identity_slots_base(), sym.int_identity_slots_end())),
+                    Some((sym.int_identity_slots_base(), sym.int_identity_reserved_end())),
                 );
                 let __root = &mut frames.frames[0];
                 __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);

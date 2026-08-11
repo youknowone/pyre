@@ -1,6 +1,22 @@
 use super::lower_value::struct_type_id_tokens;
 use super::*;
 
+/// Joins the refusals accumulated into one `DegradedDispatchArm::reason`.
+///
+/// Cross-crate contract. `majit_metainterp::REFUSAL_SEPARATOR` must hold the
+/// same bytes — a proc-macro crate cannot export a value to its runtime, so the
+/// two literals are mirrored rather than shared.
+///
+/// The drift detector is `both_blockers_are_reported` in
+/// `majit-metainterp/tests/jit_interp_degraded_arm_accumulates_refusals.rs`. It
+/// takes a two-blocker arm's reason from the registry — minted with THIS
+/// literal — and splits it with the runtime's, so a change to either side reads
+/// one member where it expects two. It has to be that fixture and not the
+/// literal corpus in `degraded_arm_refusal_kind.rs`: a recorded string frozen
+/// into a `const` was minted by whatever this literal said on the day it was
+/// copied, so it goes stale silently when this side changes.
+pub(super) const REFUSAL_SEPARATOR: &str = " || ";
+
 impl<'c> Lowerer<'c> {
     /// If `func` is a registered `residual_writes` mutator, return the
     /// `struct_field_write_effect_info(...)` expression naming the written
@@ -87,6 +103,27 @@ impl<'c> Lowerer<'c> {
     }
 
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) -> Option<()> {
+        // A statement that lowers contributes no blockers. An inner attempt can
+        // refuse and stash its reason before an outer strategy succeeds on the
+        // same statement — `lower_local` failing into `lower_stmt_fallback`'s
+        // inert arm is the shape — and reporting that stash would name a
+        // statement that played no part in the refusal. Drop back to the depth
+        // this call started at, so only genuinely unlowered statements carry
+        // reasons upward.
+        let carried_on_entry = self.nested_failure_reasons.len();
+        let lowered = self.lower_stmt_dispatch(stmt);
+        if lowered.is_some() {
+            self.nested_failure_reasons.truncate(carried_on_entry);
+        }
+        lowered
+    }
+
+    fn lower_stmt_dispatch(&mut self, stmt: &Stmt) -> Option<()> {
+        // Consume the one-shot tail marker (see `Lowerer::inline_arm_tail_stmt`).
+        // Taking it here rather than reading it is what confines the in-arm
+        // `return` lowering to statement-tail position: every nested
+        // `lower_stmt` — an `if` body, a loop body — observes `false`.
+        let is_arm_tail = std::mem::take(&mut self.inline_arm_tail_stmt);
         match stmt {
             Stmt::Local(local) => {
                 if let Some(()) = self.lower_local(local) {
@@ -95,6 +132,9 @@ impl<'c> Lowerer<'c> {
                 self.lower_stmt_fallback(stmt, "local")
             }
             Stmt::Expr(expr, _) => {
+                if let Expr::Return(ret) = expr {
+                    return self.lower_return_stmt(ret, is_arm_tail);
+                }
                 if matches!(expr, Expr::Continue(_)) {
                     if let Some(label) = self.dispatch_loop_label.clone() {
                         self.emit_jump(&label);
@@ -163,6 +203,54 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    /// Lower a `return` statement to its typed return terminator —
+    /// `int_return` / `ref_return` / `float_return` by operand kind, or
+    /// `void_return` for a bare `return;`.
+    ///
+    /// **Language-gap adaptation, not a parity fix.**  `interp_jit.py:95-100`
+    /// is upstream's single return point: the portal funnels every exit from
+    /// the bytecode loop through that one `return`, because its opcode
+    /// implementations raise `Return` rather than returning in place.  That
+    /// shape never produces a `return` inside a dispatch arm, so there is no
+    /// upstream construct to mirror here.  A Rust interpreter instead
+    /// idiomatically returns straight out of a `match` arm, and the terminator
+    /// emitted here is what that spelling corresponds to — the same single
+    /// return point upstream arrives at by unwinding.
+    ///
+    /// Accepted **only** in statement-tail position of an inline dispatch arm
+    /// body (`is_arm_tail`, from `Lowerer::inline_arm_tail_stmt`).  A `return`
+    /// anywhere else is rejected with `None`, which rolls the arm back to the
+    /// sub-JitCode / abort path.  Rejecting is mandatory rather than tidy: this
+    /// site exists because lowering a `return`'s operand while dropping its
+    /// control transfer let the arm fall through to the dispatch back-edge and
+    /// re-enter the loop at the terminal pc, so a walk could only ever end by
+    /// closing a loop.  Reproducing that one level down — for a `return` nested
+    /// in an `if` — would reintroduce exactly the defect.
+    fn lower_return_stmt(&mut self, ret: &syn::ExprReturn, is_arm_tail: bool) -> Option<()> {
+        if !is_arm_tail {
+            if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+                eprintln!(
+                    "[majit-macro] lower_stmt rejected `return`: only an inline dispatch \
+                     arm body's tail statement can carry a return terminator, so this \
+                     one's control transfer cannot be lowered here: {}",
+                    quote!(#ret)
+                );
+            }
+            return None;
+        }
+        // A bare `return;` has no operand and lowers to `void_return`.  An
+        // operand that fails to lower must NOT fall back to `void_return` — it
+        // would return the wrong value — so `?` rejects and the caller rolls
+        // back whatever ops the partial operand lowering emitted.
+        let binding = match ret.expr.as_deref() {
+            Some(expr) => Some(self.lower_value_expr(expr)?),
+            None => None,
+        };
+        let (reads, emitter) = super::dispatch::typed_return_terminator(binding);
+        self.emit_op(OpMeta::terminal(reads), emitter);
+        Some(())
+    }
+
     /// Last resort for a statement no lowering arm accepted, in the
     /// state-field dispatch body (`config` present).
     ///
@@ -183,6 +271,135 @@ impl<'c> Lowerer<'c> {
     /// aborts mid-record.
     fn lower_stmt_fallback(&mut self, stmt: &Stmt, what: &str) -> Option<()> {
         self.config?;
+        // A statement containing a `return` is never inert, however little jit
+        // state it touches.  `if flag { return 0; }` writes no state, reads no
+        // storage and calls nothing, so the purity test below would classify it
+        // inert and drop it — silently deleting the control transfer and
+        // letting the arm fall through to the dispatch back-edge.  That is the
+        // exact defect `lower_return_stmt` exists to fix, so it is refused here
+        // rather than reproduced one level down.  Only a `return` in arm-body
+        // tail position lowers; it never reaches this fallback.
+        if stmt_contains_return(stmt) {
+            if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+                eprintln!(
+                    "[majit-macro] lower_stmt rejected ({what}): statement encloses a \
+                     `return` that cannot be lowered in place: {}",
+                    quote!(#stmt)
+                );
+            }
+            self.record_body_failure("encloses a `return` that cannot be lowered in place", stmt);
+            return None;
+        }
+        // `break` and `continue` are control transfers for exactly the same
+        // reason `return` is, and the purity test below cannot see either:
+        // `expr_modifies_jit_state` reports `false` for both, so a statement
+        // whose only effect is `if cond { continue; }` writes no state, touches
+        // no storage and calls nothing — it is scored inert, dropped, and the
+        // arm falls through to the dispatch back-edge with the transfer gone.
+        //
+        // The observable symptom is one extra loop iteration.  A terminal arm
+        // spelled `{ store; break }` is an `Expr::Block`, so
+        // `classify_arm_body` does not reach `ArmPattern::Halt` —
+        // `is_break_expr` requires the body to be exactly `break` — and the arm
+        // is lowered, putting its tail `break` on this path.  That is the
+        // defect, not a hypothetical.
+        //
+        // Measured coverage, `MAJIT_MACRO_DEBUG` over all 13 examples: this
+        // guard fires exactly four times — tiny2, tiny3, braininterp and
+        // dualtape, once each — and zero times in `examples/cel` or
+        // `examples/tl`. Those two crates do not witness this guard.
+        // Rebuilding with the guard disabled (confirmed by zero firings)
+        // leaves every example's output unchanged, because at each of the four
+        // sites the same arm body also yields `unsupported` — `if target <= pc`
+        // in tiny2/tiny3, `find_matching_open` in braininterp/dualtape — which
+        // refuses the arm on its own.  The guard is therefore defensive: it
+        // covers a body reaching this path with no co-occurring refusal, a
+        // shape the current corpus does not contain.
+        if stmt_contains_loop_control(stmt) {
+            if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+                eprintln!(
+                    "[majit-macro] lower_stmt rejected ({what}): statement encloses a \
+                     `break`/`continue` that cannot be lowered in place: {}",
+                    quote!(#stmt)
+                );
+            }
+            self.record_body_failure(
+                "encloses a `break`/`continue` that cannot be lowered in place",
+                stmt,
+            );
+            return None;
+        }
+        // A write to a green is the third member of the family above, and the
+        // purity test is blind to it for the same reason it is blind to
+        // `break`: `stmt_modifies_jit_state` scores writes to `state.*`, and a
+        // green is a caller local, not state.  So `pc += 1` writes no state,
+        // references no storage and calls nothing — scored inert, dropped, and
+        // the advance is gone from the arm's jitcode.
+        //
+        // Its symptom is worse than the other two.  `break`/`continue` cost one
+        // extra loop iteration; a dropped green-pc advance costs nothing
+        // visible at all until the walk resumes: the arm emits no
+        // `BC_INT_ADD`, the green pc advances only by the dispatch prologue's
+        // read of the opcode byte, and a multi-byte instruction therefore
+        // resumes on its own operand — which the interpreter decodes as the
+        // next opcode.  The trace is well-formed, records, compiles, and
+        // computes a wrong answer.
+        //
+        // The sub-JitCode arm path is where this lands, because a green write
+        // has exactly one channel out of a sub-JitCode: the `BC_INT_RETURN`
+        // that `try_generate_jitcode_pc_return_body_with_caller_bindings`
+        // emits for an arm whose advance is its *final* statement.  An arm
+        // that spells the advance mid-body (`let r = program[pc]; pc += 1;
+        // residual(r);`) fails `arm_is_pure_pc_advance`, gets the void
+        // `inline_call` instead, and has no channel at all.
+        //
+        // Measured coverage, `MAJIT_MACRO_DEBUG` per crate over all 13
+        // examples (160 dispatch arms): three firings — `tl::ROLL`,
+        // `tlc::ROLL` and `tlr::ALLOCATE`, one each, and none anywhere else.
+        // All three are inert today, because each arm ALSO yields
+        // `unsupported` for a co-occurring statement —
+        // `storage_roll(state.stack.as_mut_ptr() as usize, ...)`,
+        // `tlc_roll(...)` and `state.regs = vec![0; n]` — so each degrades to
+        // an abort stub on its own and its dropped advance never runs.
+        // Confirmed at runtime, not inferred from the census: `MAJIT_LOG=1
+        // cargo test -p tl|tlc|tlr` records exactly `TlState::ROLL`,
+        // `TlcState::ROLL` and `TlrState::ALLOCATE` as degraded.
+        //
+        // So this guard is defensive, like the `break` one above — but it
+        // brakes a change already in flight rather than a hypothesis.  The two
+        // `ROLL` arms are inert only because the residual's
+        // `state.stack.as_mut_ptr()` argument has no lowering; give it one and
+        // both become real sub-JitCodes whose advance is dropped, which is a
+        // trace that records, compiles, and returns a wrong answer.
+        if let Some(green) = self
+            .config
+            .map(|config| green_idents(config))
+            .and_then(|greens| stmt_writes_green(stmt, &greens))
+        {
+            if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+                eprintln!(
+                    "[majit-macro] lower_stmt rejected ({what}): statement writes the green \
+                     `{green}`, which this path cannot carry back to the caller: {}",
+                    quote!(#stmt)
+                );
+            }
+            // The reason says its own scope out loud.  Lowering genuinely stops
+            // at this statement, and a green advance is typically statement 2 of
+            // 3, so this refusal is the arm's OUTERMOST blocker rather than its
+            // only one.  `record_body_failure` accumulates and the caller keeps
+            // walking the remaining statements for their reasons, so the ones
+            // behind the stop (`storage_roll(…)`, `tlc_roll(…)`,
+            // `state.regs = vec![0; n]`) are reported after it instead of being
+            // displaced by it — a reader watching `MAJIT_LOG` for their own
+            // blocker to disappear would otherwise read this refusal alone as
+            // progress.
+            self.record_body_failure(
+                "writes a green this lowering path cannot carry back to the caller \
+                 (lowering stopped at this statement; any further blockers follow)",
+                stmt,
+            );
+            return None;
+        }
         // Drop only genuinely inert statements: no jit-state write, no
         // storage/user-local reference, AND no call.  A residual call
         // (e.g. `record_event();` or an unrolled `for _ in 0..4 {
@@ -209,11 +426,98 @@ impl<'c> Lowerer<'c> {
                 quote!(#stmt)
             );
         }
+        self.record_body_failure("has a statement the lowerer cannot express", stmt);
         None
     }
 
+    /// Record why this body's lowering refused; the first writer keeps the head.
+    ///
+    /// The first entry wins because the failure that matters most is the one
+    /// that stopped lowering. It is no longer true that later statements go
+    /// unreached: the caller deliberately keeps walking them for their reasons,
+    /// discarding whatever they lower, so the rest of the string enumerates the
+    /// blockers behind the stop.
+    ///
+    /// Reasons do NOT cross a nested lowerer. `lower_control` and
+    /// `lower_value` build a child `Lowerer` with its own
+    /// `body_failure_reason: None` and merge back `next_reg`, `next_label`,
+    /// `statements` and `op_metadata` — never this field. A blocker found
+    /// inside a nested block is therefore recorded here and then dropped with
+    /// the child, which is why an arm whose inner statement is the interesting
+    /// one (braininterp's and dualtape's `b']'`, whose real blocker is
+    /// `find_matching_open(program, pc)`) reports only its outer refusal.
+    /// Measured from the built artifacts, not inferred:
+    /// `strings target/debug/deps/<crate>-<hash> | rg 'arm body '` shows those
+    /// two crates with a single-member reason. That filter is only trustworthy
+    /// while the spelling below stays newline-free: `strings(1)` ends a run at a
+    /// newline, so a reason carrying one is read back as two literals, and the
+    /// second — having lost the `arm body ` prefix — is invisible to the census
+    /// this comment cites.
+    ///
+    /// The statement spelling is carried because the classification alone does
+    /// not say which lowering rule is missing — "cannot express" reads the same
+    /// for `find_matching_open(program, pc)` (needs a slice argument) and for
+    /// `state.stack[n] = v` (needs a computed-index store), and those are
+    /// different pieces of work. Whitespace runs are collapsed to single spaces
+    /// BEFORE the truncation, so a whole `if` block cannot bake a multi-line
+    /// literal into the binary and the length bound counts the characters that
+    /// actually reach it.
+    ///
+    /// The truncation marker is ASCII `...` on purpose: a `…` splits the
+    /// literal in `strings(1)` output, which is how these reasons get read out
+    /// of a built artifact.
+    /// Refusals accumulate; the FIRST one stays the head of the string.
+    ///
+    /// The head is byte-identical to what this produced before accumulation
+    /// existed, which is what lets every example crate's `.contains()` snippet
+    /// assertion and every landed `RefusalKind` pin keep matching untouched.
+    ///
+    /// The separator is ASCII and spaced for the same reason the truncation
+    /// marker is ASCII `...`: these strings are read out of a built artifact
+    /// with `strings(1)`, and a multi-byte separator splits the literal there.
+    pub(super) fn record_body_failure(&mut self, what: &str, stmt: &Stmt) {
+        const MAX_SPELLING: usize = 80;
+        // A braced group stringifies across several lines, and `strings(1)`
+        // ends a run at a newline: an un-normalised spelling reaches the
+        // artifact as two independent literals whose second half has lost the
+        // `arm body ` prefix every reader of these reasons matches on. Collapse
+        // before truncating, so the bound counts the characters that survive
+        // into the binary rather than characters the reader will never see.
+        let mut spelling = quote!(#stmt)
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if spelling.chars().count() > MAX_SPELLING {
+            spelling = spelling.chars().take(MAX_SPELLING).collect::<String>() + "...";
+        }
+        let entry = format!("arm body {what}: {spelling}");
+        match &mut self.body_failure_reason {
+            // Deduplicated, and not cosmetically: the nested lowerers re-visit
+            // statements, so without this one blocker can be recorded twice and
+            // a count-based reader would take the repeat for a second
+            // mechanism.
+            Some(existing) => {
+                if !existing.split(REFUSAL_SEPARATOR).any(|seen| seen == entry) {
+                    existing.push_str(REFUSAL_SEPARATOR);
+                    existing.push_str(&entry);
+                }
+            }
+            None => self.body_failure_reason = Some(entry),
+        }
+    }
+
     pub(super) fn lower_local(&mut self, local: &Local) -> Option<()> {
-        let Pat::Ident(pat_ident) = &local.pat else {
+        // `let x: i32 = 1;` parses as a `Pat::Type` wrapping the very
+        // `Pat::Ident` that `let x = 1;` produces. The annotation carries no
+        // lowering information — the binding kind comes from the initialiser
+        // via `lower_value_expr` either way — so unwrap it and lower the
+        // annotated spelling exactly like the bare one.
+        let mut pat = &local.pat;
+        while let Pat::Type(pat_type) = pat {
+            pat = &*pat_type.pat;
+        }
+        let Pat::Ident(pat_ident) = pat else {
             return None;
         };
         let init = local.init.as_ref()?;
@@ -1031,8 +1335,6 @@ impl<'c> Lowerer<'c> {
 
         None
     }
-
-    // ── Config-aware lowering methods ────────────────────────────────
 
     pub(super) fn lower_config_call_stmt(&mut self, expr: &Expr) -> Option<()> {
         let Expr::Call(call) = expr else {
@@ -1896,4 +2198,159 @@ impl<'c> Lowerer<'c> {
 
         None
     }
+}
+
+/// Idents naming this machine's greens.
+///
+/// `LowererConfig::greens` holds the merge point's green *expressions*.  Only a
+/// plain-ident green names a caller local that a statement can assign to, so a
+/// field or index spelling is skipped rather than flattened to a bare name that
+/// would collide with an unrelated local of that name.
+fn green_idents(config: &LowererConfig) -> Vec<String> {
+    config
+        .greens
+        .iter()
+        .filter_map(|green| match green {
+            Expr::Path(p) if p.qself.is_none() => p.path.get_ident().map(|id| id.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Name of the green `stmt` assigns to, if it assigns to one.
+///
+/// Covers both spellings the dispatch loops use: the compound
+/// `pc += N` (syn 2 parses it as `Expr::Binary` with an assigning `BinOp`) and
+/// the plain `pc = <expr>`.  Only the assignment *target* counts — a green read
+/// on the right-hand side is what every arm does and is not a write.
+///
+/// Closure bodies and nested items are skipped for the reason
+/// [`stmt_contains_return`] skips them: a name bound there is a different
+/// binding that merely shares a spelling.
+fn stmt_writes_green(stmt: &Stmt, greens: &[String]) -> Option<String> {
+    use syn::visit::Visit;
+    struct Probe<'g> {
+        greens: &'g [String],
+        hit: Option<String>,
+    }
+    impl Probe<'_> {
+        fn record(&mut self, target: &Expr) {
+            if self.hit.is_some() {
+                return;
+            }
+            let Expr::Path(p) = target else { return };
+            if p.qself.is_some() {
+                return;
+            }
+            let Some(id) = p.path.get_ident() else { return };
+            let name = id.to_string();
+            if self.greens.iter().any(|green| *green == name) {
+                self.hit = Some(name);
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Probe<'_> {
+        fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+            self.record(&node.left);
+            syn::visit::visit_expr_assign(self, node);
+        }
+        fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+            if opcode_for_assign_binop(&node.op).is_some() {
+                self.record(&node.left);
+            }
+            syn::visit::visit_expr_binary(self, node);
+        }
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_item(&mut self, _: &'ast syn::Item) {}
+    }
+    let mut probe = Probe { greens, hit: None };
+    probe.visit_stmt(stmt);
+    probe.hit
+}
+
+/// `true` if `stmt` encloses a `return` belonging to the interpreter function
+/// being lowered.
+///
+/// Closure bodies and nested items are deliberately NOT descended into: a
+/// `return` inside `|| { return 1; }` or an inner `fn` exits *that* body, not
+/// the dispatch arm, so it is neither lowerable here nor a reason to refuse the
+/// enclosing statement.
+fn stmt_contains_return(stmt: &Stmt) -> bool {
+    use syn::visit::Visit;
+    struct Probe {
+        hit: bool,
+    }
+    impl<'ast> Visit<'ast> for Probe {
+        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+            self.hit = true;
+        }
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_item(&mut self, _: &'ast syn::Item) {}
+    }
+    let mut probe = Probe { hit: false };
+    probe.visit_stmt(stmt);
+    probe.hit
+}
+
+/// Whether `stmt` encloses a `break` or `continue` that targets the dispatch
+/// loop being lowered — the loop-control twin of `stmt_contains_return`.
+///
+/// `break`/`continue` bind to the *innermost* enclosing loop, so an unlabelled
+/// one inside a nested `loop`/`while`/`for` written in the arm body exits that
+/// inner loop and never reaches the dispatch back-edge.  Descending into those
+/// bodies would refuse statements that are perfectly safe to drop, so the probe
+/// tracks loop depth and only fires at depth 0 — the same scoping rule
+/// `expr_has_loop_control` documents.  A *labelled* `break 'l` / `continue 'l`
+/// can cross a nested loop, so it counts at any depth.
+///
+/// `expr_has_loop_control` is not reused here because it only inspects
+/// `Stmt::Expr`: a control transfer in an initializer (`let x = if c { break }
+/// else { 1 };`) is invisible to it, and this guard has to see it.  Closures and
+/// nested items are skipped for the same reason `stmt_contains_return` skips
+/// them — a `break` inside them belongs to a different body.
+fn stmt_contains_loop_control(stmt: &Stmt) -> bool {
+    use syn::visit::Visit;
+    struct Probe {
+        hit: bool,
+        loop_depth: u32,
+    }
+    impl Probe {
+        fn record(&mut self, labelled: bool) {
+            if labelled || self.loop_depth == 0 {
+                self.hit = true;
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Probe {
+        fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
+            self.record(node.label.is_some());
+            syn::visit::visit_expr_break(self, node);
+        }
+        fn visit_expr_continue(&mut self, node: &'ast syn::ExprContinue) {
+            self.record(node.label.is_some());
+        }
+        fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+            self.loop_depth += 1;
+            syn::visit::visit_expr_loop(self, node);
+            self.loop_depth -= 1;
+        }
+        fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+            self.loop_depth += 1;
+            syn::visit::visit_expr_while(self, node);
+            self.loop_depth -= 1;
+        }
+        fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+            self.loop_depth += 1;
+            syn::visit::visit_expr_for_loop(self, node);
+            self.loop_depth -= 1;
+        }
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_item(&mut self, _: &'ast syn::Item) {}
+    }
+    let mut probe = Probe {
+        hit: false,
+        loop_depth: 0,
+    };
+    probe.visit_stmt(stmt);
+    probe.hit
 }

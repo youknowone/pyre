@@ -2816,17 +2816,37 @@ fn export_single_value_inner(
     // is picked by `box.type` which is ALWAYS set on RPython Boxes.
     // pyre's OptContext::opref_type reconstructs it from value_types
     // (seeded from trace_inputargs) / producing-op result_type.
-    // Verified: 0 hits across all 10 benchmarks. Production panics;
-    // test builds keep a fallback because some unit tests construct
-    // minimal OptContext without seeding value_types for every OpRef
-    // that reaches export_state (pre-existing test limitation, not a
-    // production code path).
+    // The "0 hits" measured here covered the benchmark population; the
+    // example crates' test binaries are a population it did not enumerate,
+    // and one of them hits. `cel tests::policy_gates` reaches this line
+    // under a plain `cargo test --release -p cel` and panics, running
+    // `policy::run_gates` — the full pipeline, not the hand-built minimal
+    // OptContext the fallback below was written for.
+    //
+    // `cfg!(test)` is evaluated in majit-metainterp, so that fallback covers
+    // this crate's own unit tests and nothing else: downstream majit-metainterp
+    // is a plain dependency, `cfg!(test)` is false inside a downstream test
+    // binary too, and the panic is armed there. The firing is the proof — had
+    // the flag been true in cel's build, `Type::Int` would have been returned
+    // instead. So the fallback disarms the check exactly where this crate can
+    // exercise it, and leaves it live where a failure is hardest to attribute.
     let tp = ctx.opref_type(opref).unwrap_or_else(|| {
         if !cfg!(test) {
+            // Two different failures reach this line, and the message used to
+            // spell both of them `None`: `OpRef::None` is the absent-operand
+            // sentinel arriving as the argument, while a named ref means
+            // value_types holds no entry for a ref that does exist. Which one
+            // was seen is the difference between "an unbound operand was
+            // exported" and "a seeding gap", so name it rather than printing
+            // a line that reads as a tautology.
+            let seen = if opref.is_none() {
+                "the absent-operand sentinel reached export_state"
+            } else {
+                "no type recorded for a ref that does exist"
+            };
             panic!(
-                "not_virtual: opref_type({:?}) returned None — \
+                "not_virtual: opref_type({opref:?}) found no type — {seen}; \
                  RPython box.type is always set (virtualstate.py:360)",
-                opref,
             );
         }
         Type::Int

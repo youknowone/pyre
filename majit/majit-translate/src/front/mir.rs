@@ -63,8 +63,9 @@
 //!   - `Switch { discr, targets }` — `ExitSwitch::Value` + per-arm
 //!     `Link` with `ExitCase::Bool` / `ExitCase::Const`.
 //!   - `Call` — Direct / Trait → `Call(FunctionPath)`; Dynamic vtable calls
-//!     use the trait-family indirect pipeline, plain function pointers become
-//!     `IndirectCall`, and the remaining closure shims use synthetic
+//!     use the trait-family indirect pipeline, plain safe function pointers
+//!     become `IndirectCall`, and the residue — `unsafe fn` pointers and
+//!     `dyn` receivers the vtable arm could not resolve — uses synthetic
 //!     `Call(__dyn_call)`.
 //!   - `Drop` — pass-through `Goto` (JIT does not model destructor
 //!     semantics).
@@ -2413,7 +2414,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
         simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
-        // `format!`-chain expansion (#131): rewrite the recognized
+        // `format!`-chain expansion (descriptor census): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
         // fmt externs stop blocking the rtyper.  All emitted ops are ones
@@ -5114,7 +5115,7 @@ impl<'a> Lowering<'a> {
     ///   annotation a pointee-less raw pointer already carries here, so
     ///   the erased callers and the callers that pass an untyped `*mut u8`
     ///   straight through agree on one annotation.
-    /// * **narrow** — `obj as *const RegisteredStruct` (#298); see
+    /// * **narrow** — `obj as *const RegisteredStruct`; see
     ///   `__pyre_cast_instance` below.
     ///
     /// Both are pointer-to-pointer only: a `Ref` source is required, since
@@ -5629,16 +5630,40 @@ impl<'a> Lowering<'a> {
                     return Ok(res);
                 }
                 let segments = self.global_segments(mir_bb, id)?;
-                // A `PyType` singleton static (`&SLICE_TYPE`): narrow the
-                // raw address through `__pyre_cast_instance["PyType"]` so
-                // the read types `SomeInstance("PyType")`, matching the
-                // `(*obj).ob_type` field-read.  The bare `ConstInt` address
-                // would pair `IntegerRepr` against that field's
-                // `InstanceRepr` and block `rtype_is_` on the
-                // `ob_type == &TYPE` pointer-identity chain — the same
-                // narrow `obj as *const RegisteredStruct` already uses
-                // (#298).
-                if let Some(addr) = self.pytype_static_addr(&segments) {
+                // A class-singleton static (`&SLICE_TYPE`, `&CEL_INT_CLASS`):
+                // narrow the raw address through
+                // `__pyre_cast_instance[<root>]` so the read types
+                // `SomeInstance(<root>)`, matching the `(*obj).ob_type`
+                // field-read.  The bare `ConstInt` address would pair
+                // `IntegerRepr` against that field's `InstanceRepr` and
+                // block `rtype_is_` on the `ob_type == &TYPE`
+                // pointer-identity chain — the same narrow
+                // `obj as *const RegisteredStruct` already uses.
+                //
+                // The root is the static's own declared type, read off the
+                // `Global` place, not a fixed name: a prebuilt instance is
+                // annotated with the class of the object itself
+                // (`rpython/annotator/bookkeeper.py:339-345`
+                // `SomeInstance(self.getuniqueclassdef(x.__class__))`).
+                // pyre's whole `pytypes` bucket is declared `PyType`
+                // (`pyre-object/src/pyobject.rs:42`, and the
+                // `#[pyre_class]`-minted statics at
+                // `pyre-macros/src/lib.rs:1330`), so it derives `"PyType"`
+                // exactly as the fixed name did; a host crate with its own
+                // class root (`charon-corpus` `CelClass`) derives that root
+                // instead of being stamped with pyre's.
+                //
+                // A `pytypes` row whose static is not a named ADT has no
+                // class root to narrow to and is not a class singleton at
+                // all — a mis-bucketed key.  Declining here drops it to the
+                // ordinary global handling below (`refs` / `int_values` /
+                // initialiser fold / residual call), which is what any other
+                // static of that shape gets.  Measured empty for pyre: all
+                // 7362 `pyre-object` local functions lower with an identical
+                // `__pyre_cast_instance` root histogram either way.
+                if let Some(addr) = self.pytype_static_addr(&segments)
+                    && let Some(root) = tyref_class_root(&place_ty, self.llbc)
+                {
                     let bb_id = self.block_id[mir_bb];
                     let raw = self
                         .graph
@@ -5654,13 +5679,10 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    "__pyre_cast_instance".to_string(),
-                                    "PyType".to_string(),
-                                ],
+                                segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
                             },
                             args: vec![raw],
-                            result_ty: ValueType::Ref(Some("PyType".to_string())),
+                            result_ty: ValueType::Ref(Some(root)),
                         },
                     });
                     return Ok(res);
@@ -6360,17 +6382,21 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// Address of a `pytypes`-bucket host static — a `PyType` singleton
+    /// Address of a `pytypes`-bucket host static — a class singleton
     /// (`&SLICE_TYPE`, `&INT_TYPE`, …).  The `Global` reader lowers these
-    /// to a `__pyre_cast_instance["PyType"]` narrow of the raw address
+    /// to a `__pyre_cast_instance[<root>]` narrow of the raw address
     /// (a typed instance pointer) rather than the bare `ConstInt` the
-    /// `refs` siblings avoid: a `PyType` static is the same kind of value
+    /// `refs` siblings avoid: a class static is the same kind of value
     /// as the `(*obj).ob_type` field-read it is compared against, so it
-    /// must type `SomeInstance("PyType")` for `rtype_is_` (pointer
+    /// must type `SomeInstance(<root>)` for `rtype_is_` (pointer
     /// identity) to lower the `ob_type == &TYPE` chain
-    /// (`is_slice` / `is_cell` / `is_range`).  `jit_static_pytype_addrs`
-    /// puts only `PyType` statics in this bucket, so the root is always
-    /// `"PyType"`.
+    /// (`is_slice` / `is_cell` / `is_range`).
+    ///
+    /// The bucket carries only the address; the root comes from the
+    /// static's own declared type at the read site ([`tyref_class_root`]),
+    /// so a host crate whose class root is not pyre's `PyType` — the
+    /// `charon-corpus` `CelClass` — narrows to its own root rather than
+    /// being stamped with pyre's.
     fn pytype_static_addr(&self, segments: &[String]) -> Option<i64> {
         let full = segments.join("::");
         let stripped = strip_crate_prefix(&full);
@@ -7788,10 +7814,9 @@ impl<'a> Lowering<'a> {
                 // `newlist/r>r` — an opname with no blackhole handler —
                 // breaking `default_bh_builder_unwired_set_matches_task_85_snapshot`.
                 //
-                // Measured (base 4d3d6e290f6, assembler
-                // `[ASM newlist DIAG]`): EXACTLY TWO graphs carry a vec! and
-                // still drop to the legacy walker, each behind an INDEPENDENT
-                // non-vec! wall the recognizer does not touch —
+                // Two graphs carry a vec! and still drop to the legacy walker,
+                // each behind an independent non-vec! wall the recognizer does
+                // not touch:
                 //   • `_pypy_generic_alias::make_generic_alias`: `collect_parameters`
                 //     → `push_unique` → `slice::iter::Iter::next` (unregistered),
                 //     plus a `collect_parameters` `UnionError: r_uint ∪ int`.
@@ -8182,12 +8207,18 @@ impl<'a> Lowering<'a> {
                 // receiver slot `IndirectCall` expects, so the arg list
                 // passes through unchanged.
                 //
-                // Any other operand shape — the one-hop `Option<fn-ptr>`
-                // deref and `call_once` closure shims — is a stored
-                // fn-ptr / `FnOnce`, not a vtable slot; it keeps the
-                // synthetic `__dyn_call` path (the fat-pointer receiver
-                // threaded into `args[0]`).
-                let is_fn_ptr = operand_is_fn_ptr(&dyn_operand, self.llbc);
+                // A stored fn-ptr — the one-hop `Option<fn-ptr>` deref, a
+                // host-registered callback table, a settable hook — is not a
+                // vtable slot, so `dyn_indirect_target` does not name it.  It
+                // is still a PBC: RPython's rtyped call through a
+                // `Ptr(FuncType)` value is `indirect_call(funcptr, *args,
+                // c_graphs)`, not a synthetic opaque helper, and the family
+                // it carries decides whether the codewriter looks inside the
+                // callees or emits a residual call. Only a genuinely
+                // non-pointer operand, such as a `dyn` fat pointer the vtable
+                // arm could not resolve, keeps the synthetic `__dyn_call`
+                // path with the receiver threaded into `args[0]`.
+                let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
                 let indirect = self.dyn_indirect_target(&dyn_operand);
                 if let Some((trait_root, method_name)) = indirect {
                     OpKind::Call {
@@ -8195,20 +8226,16 @@ impl<'a> Lowering<'a> {
                         args,
                         result_ty,
                     }
-                } else if is_fn_ptr {
-                    // RPython `BuiltinCode.func` (and any other plain ll
-                    // function-pointer field) is a PBC.  Its rtyped call is
-                    // `indirect_call(funcptr, *args, c_graphs)`, not a
-                    // synthetic opaque helper.  `Some([])` is the
-                    // pre-CallControl marker for the generated builtin
-                    // wrapper family; `rpbc::lower_indirect_calls` fills the
-                    // candidate list once all registered graphs/fnaddrs are
-                    // available.
+                } else if let Some(family) = fn_ptr_family {
                     let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    let graphs = match family {
+                        FnPtrFamily::BuiltinWrapper => Some(Vec::new()),
+                        FnPtrFamily::Unknown => None,
+                    };
                     OpKind::IndirectCall {
                         funcptr,
                         args,
-                        graphs: Some(Vec::new()),
+                        graphs,
                         result_ty,
                     }
                 } else {
@@ -13297,31 +13324,89 @@ impl<'a> Lowering<'a> {
     }
 }
 
-fn operand_is_fn_ptr(operand: &Operand, llbc: &Llbc) -> bool {
+/// Which PBC family an `OpKind::IndirectCall` through a bare function
+/// pointer carries — the `c_graphs` argument `FunctionReprBase.call`
+/// appends at `rpbc.py:216`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FnPtrFamily {
+    /// The generated builtin-wrapper family.  `Some([])` is the
+    /// pre-CallControl marker `rpbc::lower_indirect_calls` fills once the
+    /// registered graphs and the linker-resolved wrapper addresses are
+    /// available.
+    BuiltinWrapper,
+    /// The candidate set is not recoverable from the LLBC: the pointer is
+    /// installed at runtime (a host-registered callback, a settable hook),
+    /// so the addresses that reach the site are not a closed set a static
+    /// walk of the artifact can enumerate.  Carries `None` —
+    /// `graphs_from` then answers `None` (`call.py:105`) and
+    /// `guess_call_kind` answers `residual` (`call.py:137-138`), so
+    /// `rewrite_op_indirect_call` emits `handle_residual_call`
+    /// (`jtransform.py:410-412`).  `None` is also what keeps the family
+    /// analyzers conservative: `Some([])` reads as "empty family" and
+    /// collapses canraise / can_invalidate / forces_virtualizable to their
+    /// bottom result, which is unsound for a callee this side cannot see.
+    Unknown,
+}
+
+/// Classify a `CallFunc::Dynamic` operand that resolves to a bare
+/// function pointer.  `None` means the operand is not a plain fn pointer
+/// (a `dyn` fat pointer), or is one this side declines to name a family
+/// for, and leaves the caller on its `__dyn_call` fallback.
+fn operand_fn_ptr_family(operand: &Operand, llbc: &Llbc) -> Option<FnPtrFamily> {
     let ty = match operand {
         Operand::Copy(place) | Operand::Move(place) => &place.ty,
-        Operand::Const(_) => return false,
+        Operand::Const(_) => return None,
     };
-    let Some(fnptr) = tyref_node(ty, llbc)
+    let signature = tyref_node(ty, llbc)
         .and_then(|node| strip_ty_wrappers(node, llbc))
-        .and_then(|node| node.get("FnPtr"))
-        .and_then(serde_json::Value::as_object)
-    else {
-        return false;
-    };
-    let Some(signature) = fnptr
+        .and_then(|node| node.get("FnPtr"))?
         .get("skip_binder")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return false;
-    };
-    if signature
+        .and_then(serde_json::Value::as_object)?;
+    // A missing or non-boolean `is_unsafe` reads as unsafe.
+    let is_safe = signature
         .get("is_unsafe")
         .and_then(serde_json::Value::as_bool)
-        != Some(false)
-    {
-        return false;
+        == Some(false);
+    fn_ptr_family_for(
+        is_safe,
+        fn_ptr_signature_is_builtin_code_fn(signature, llbc),
+        fnptr_indirect_enabled(),
+    )
+}
+
+/// The family decision itself, separated from the LLBC digging above so it
+/// can be exercised without an extracted artefact — the fixture corpus
+/// declares exactly one fn-pointer alias and it is safe, so a corpus-driven
+/// test cannot reach the `unsafe` rows at all.
+///
+/// `is_builtin_shape` is [`fn_ptr_signature_is_builtin_code_fn`], which
+/// matches on signature SHAPE. An `unsafe fn` of that shape would otherwise
+/// be handed the `__pyre_wrap_*` family: a positive claim about a callee set
+/// it is not a member of. Only a safe pointer may name that family.
+///
+/// An `unsafe fn` pointer is otherwise the same value with the same ABI as a
+/// safe one, so it still carries the unknown family — `None` graphs is an
+/// honest residual, not a claim about the callee.
+fn fn_ptr_family_for(
+    is_safe: bool,
+    is_builtin_shape: bool,
+    fnptr_indirect: bool,
+) -> Option<FnPtrFamily> {
+    if is_builtin_shape {
+        return is_safe.then_some(FnPtrFamily::BuiltinWrapper);
     }
+    fnptr_indirect.then_some(FnPtrFamily::Unknown)
+}
+
+/// Whether an fn-pointer signature is the exact source signature of
+/// `gateway::BuiltinCodeFn`: `fn(&[PyObjectRef]) -> Result<PyObjectRef,
+/// PyError>`.  That family's members are the `__pyre_wrap_*` graphs
+/// `CallControl::builtin_wrapper_indirect_graphs` enumerates, so a call
+/// through it carries the deferred-family marker instead of `None`.
+fn fn_ptr_signature_is_builtin_code_fn(
+    signature: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> bool {
     let Some(inputs) = signature
         .get("inputs")
         .and_then(serde_json::Value::as_array)
@@ -13334,9 +13419,6 @@ fn operand_is_fn_ptr(operand: &Operand, llbc: &Llbc) -> bool {
         .get("output")
         .map(|value| charon_type_value_to_ast_string(value, llbc, 0))
         .unwrap_or_default();
-    // Exact source signature of `gateway::BuiltinCodeFn`:
-    // `fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>`.  Keep other
-    // one-argument callbacks in their existing residual `__dyn_call` family.
     input.starts_with('[')
         && input.contains("PyObject")
         && output.starts_with("Result<")
@@ -15168,6 +15250,19 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if tyref_is_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
+    // "At every site" above includes a BORROW of such an enum: `Rvalue::Ref`
+    // is the identity on a value that is already its own tag, so `&E` carries
+    // no representation of its own and a `fn f(&self)` method on `E` receives
+    // the int.  Without this arm the enum is `Int` by value and `Ref(None)`
+    // through a borrow, and the `Rvalue::Discriminant` fold above — which
+    // tests the place TYPE (the pointee, a fieldless enum) and then aliases
+    // the place VALUE (which `resolve_place` collapses a `Deref` out of) —
+    // hands a ref-kinded operand to a `SwitchInt`, which
+    // `codewriter/flatten.rs` rejects outright (`switch exitswitch must be
+    // int`).  `match self { .. }` on a C-like enum is the shape that hits it.
+    if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+        return ValueType::Int;
+    }
     // A `str`/`String`/`Wtf8`/`Wtf8Buf` value is the single immutable
     // rpy_string in the value model (`tyref_is_string_value`), matching
     // upstream's one string type (`rstr.py`).  A bare string-family value
@@ -15203,6 +15298,65 @@ fn tyref_deref_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 /// every variant carrying zero payload fields.
 fn tyref_is_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_fieldless_enum_def(ty, llbc).is_some()
+}
+
+/// `ty` is a **borrow** of a fieldless (C-like) enum — `&E` / `&mut E` for an
+/// `E` that [`tyref_is_fieldless_enum_free`] accepts.
+///
+/// A fieldless enum is modelled by-value as its discriminant integer, and
+/// `Rvalue::Ref` is the identity on it, so the borrow carries no
+/// representation of its own (the same statement
+/// [`Lowerer::tyref_is_borrowed_fieldless_enum`] documents).  A `&self`
+/// method on such an enum therefore receives the tag, not a pointer to it.
+///
+/// Peels `Ref` ONLY, deliberately — unlike
+/// [`Lowerer::tyref_ref_adt_def_id`], which also peels `RawPtr`.  A
+/// `*const E` / `*mut E` is a genuine pointer value that some other code is
+/// free to compare, offset or null-check; folding it to the tag would be a
+/// wrong answer rather than a missed optimization.  A borrow is not.
+fn tyref_is_borrowed_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
+    let mut v: &serde_json::Value = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    let mut peeled_a_ref = false;
+    loop {
+        let Some(obj) = v.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            match llbc.dedup_body(id) {
+                Some(next) => v = next,
+                None => return false,
+            }
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            v = &arr[1];
+            continue;
+        }
+        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+            let Some(next) = arr.get(1) else {
+                return false;
+            };
+            v = next;
+            peeled_a_ref = true;
+            continue;
+        }
+        // Reached a non-indirection node. Only a genuine borrow qualifies;
+        // the by-value shape is the caller's other arm.
+        return peeled_a_ref
+            && inline_adt_def_id(v)
+                .and_then(|def_id| llbc.type_by_id(def_id))
+                .is_some_and(type_decl_is_fieldless_enum);
+    }
 }
 
 /// The `TypeDecl` behind `ty` when it resolves to a fieldless (C-like)
@@ -16785,6 +16939,72 @@ fn render_adt_type_args(
 /// | off | 243 | `__dyn_call` 48 |
 /// | on  | **224** | `Wtf8::as_str` 37 |
 ///
+/// Lower a call through a plain function pointer whose PBC family is not
+/// recoverable from the LLBC — a host-registered callback table, a settable
+/// hook — as `OpKind::IndirectCall` with `graphs: None` instead of the
+/// synthetic `__dyn_call` residual.
+///
+/// `graphs is None` is upstream's own spelling for "cannot follow the
+/// indirect call": `call.py:105` skips the candidate filter, `call.py:137`
+/// answers `residual`, and `jtransform.py:410-412` emits
+/// `handle_residual_call`.  `__dyn_call` has no such continuation — it is an
+/// unregistered synthetic path that stops the graph reaching it. Before this
+/// arm existed only the
+/// `BuiltinCodeFn` signature reached `IndirectCall`, so every other
+/// fn-pointer call site was a wall; census at the flip point, both states,
+/// same artifacts:
+///
+/// | artifact | `__dyn_call` off→on | `IndirectCall(graphs=None)` off→on |
+/// |---|---:|---:|
+/// | `cel.ullbc` | 6 → **0** | 0 → 6 |
+/// | `pyre-object.ullbc` | 33 → 17 | 0 → 16 |
+/// | `pyre-jit.ullbc` | 1 → **0** | 0 → 1 |
+/// | `pyre-interpreter.ullbc` | 38 → 12 | 0 → 26 |
+///
+/// The residue there was exactly the `unsafe fn` pointers (pyre's GC and
+/// slot hooks), which the classifier declined outright when that census was
+/// taken.  [`operand_fn_ptr_family`] now admits them as
+/// `FnPtrFamily::Unknown` — an `unsafe fn` pointer is the same value with
+/// the same ABI as a safe one, so `graphs: None` is an honest residual for
+/// it; only `BuiltinWrapper` stays closed to it, because that family is
+/// matched on signature *shape* and an `unsafe fn` of that shape is not one
+/// of its members.  **The `on` column has not been re-measured since**; the
+/// `off` column is unaffected by construction, since this arm emits nothing
+/// with the switch off.  Nothing else moved in the original census: the
+/// vtable-slot calls already on `CallTarget::Indirect` held at 47 / 24, and
+/// `pyre-interpreter`'s 203 `BuiltinCodeFn` sites kept the `Some([])`
+/// marker in both states.
+///
+/// OFF by default, and the reason is a pyre-side consequence of being
+/// right rather than a defect in the lowering.  `__dyn_call` is an
+/// unregistered path, so every effect analyzer classified it as an
+/// *external* call and took its bottom result; a `graphs: None`
+/// `IndirectCall` is the top result instead
+/// (`analyze_random_effects` → `BoolGraphAnalyzer.top_result()`,
+/// `graphanalyze.py:117`).  Turning the arm on therefore propagates
+/// `EF_RANDOM_EFFECTS` up through every caller that transitively reaches
+/// one of pyre's hook pointers, and `getcalldescr`'s elidable
+/// post-condition (`call.py:326-332`) then rejects the first
+/// `#[elidable_cannot_raise]` helper that does:
+///
+/// ```text
+/// getcalldescr: pyre_object::longobject::jit_bigint_is_zero is marked
+/// elidable but got extraeffect=RandomEffects
+/// ```
+///
+/// `cargo build -p pyre-jit-trace --no-default-features --features
+/// cranelift` reproduces it with the switch on and is green with it off.
+/// Clearing that needs pyre's elidable helpers to stop reaching an
+/// unanalyzable callee — or those hooks to carry a real family — which is
+/// its own change; until then this stays opt-in with
+/// `PYRE_FNPTR_INDIRECT=1`.  The `BuiltinCodeFn` family is unaffected by
+/// the switch: it reached `IndirectCall` before this arm and still does.
+pub(crate) fn fnptr_indirect_enabled() -> bool {
+    matches!(
+        std::env::var("PYRE_FNPTR_INDIRECT").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
 /// Narrow a `dont_look_inside` residual call whose destination is
 /// `Option<*mut PyObject>` from the classdef-less `ref` GCREF token to the
 /// per-instantiation `Option` enum root, so the caller's `if let Some(x) =
@@ -20197,9 +20417,9 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
 mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
-        DecodedConst, cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_const_generic_to_string,
-        charon_type_value_to_ast_string, decode_literal, simplify_lowered_graph,
-        tyref_is_raw_byte_ptr,
+        DecodedConst, FnPtrFamily, cast_kind_is_raw_ptr, cast_pointer_marker_op,
+        charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
+        fn_ptr_family_for, simplify_lowered_graph, tyref_is_raw_byte_ptr,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -20283,6 +20503,40 @@ mod tests {
             "the orphaned block must be cleared, not left naming the array: {:?}",
             graph.block(forwarding).inputargs
         );
+    }
+
+    /// Every row of the fn-pointer family decision, including the two the
+    /// fixture corpus structurally cannot reach: it declares one fn-pointer
+    /// alias (`HostCallback`) and that alias is safe, so no corpus-driven
+    /// test distinguishes `is_safe` either way.
+    ///
+    /// The load-bearing row is `(unsafe, builtin shape) -> None`. Its
+    /// positive control is the row above it: drop the safety gate and
+    /// `(safe, builtin shape)` still passes while that row flips to
+    /// `Some(BuiltinWrapper)`, so the pair fails in exactly one direction.
+    #[test]
+    fn fn_ptr_family_names_the_wrapper_set_only_for_a_safe_pointer() {
+        // (is_safe, is_builtin_shape, fnptr_indirect) -> family
+        let rows = [
+            (true, true, false, Some(FnPtrFamily::BuiltinWrapper)),
+            (true, true, true, Some(FnPtrFamily::BuiltinWrapper)),
+            (false, true, false, None),
+            (false, true, true, None),
+            (true, false, true, Some(FnPtrFamily::Unknown)),
+            // An `unsafe fn` outside the wrapper shape keeps the unknown
+            // family: `None` graphs claims nothing about the callee.
+            (false, false, true, Some(FnPtrFamily::Unknown)),
+            (true, false, false, None),
+            (false, false, false, None),
+        ];
+        for (is_safe, is_builtin_shape, fnptr_indirect, expected) in rows {
+            assert_eq!(
+                fn_ptr_family_for(is_safe, is_builtin_shape, fnptr_indirect),
+                expected,
+                "is_safe={is_safe} is_builtin_shape={is_builtin_shape} \
+                 fnptr_indirect={fnptr_indirect}"
+            );
+        }
     }
 
     #[test]
@@ -22129,6 +22383,18 @@ mod tests {
     /// interpreter LLBC.  `constant_at` must project the wrapper's sole field
     /// and index that list; `code_getdocstring` must project the same field
     /// for its slice view.  Neither accessor may survive as a residual call.
+    ///
+    /// `#[ignore]` is deliberate and has a precondition, not a verdict: this
+    /// loads a 667 MB artefact that only exists after `extract-llbc.py` has run,
+    /// and takes ~11 s.  Run it explicitly after a fresh extraction:
+    ///
+    /// ```text
+    /// cargo test -p majit-translate --lib \
+    ///     constants_wrapper_access_matches_real_interpreter_llbc -- --ignored
+    /// ```
+    ///
+    /// An ignored test states a belief until someone runs it, so this must be
+    /// exercised explicitly whenever the extracted interpreter LLBC changes.
     #[test]
     #[ignore]
     fn constants_wrapper_access_matches_real_interpreter_llbc() {
@@ -22177,8 +22443,14 @@ mod tests {
                 ("im".to_string(), "f64".to_string()),
             ])
         );
+        // `attrs` is keyed by the crate-stripped path, and `strip_crate_prefix`
+        // splits on the FIRST `::` — so `num_complex::Complex` strips to the bare
+        // leaf `Complex` while `compiler_core::bytecode::Constants` above keeps its
+        // module qualifier as `bytecode::Constants`. The two assertions read as a
+        // symmetric pair and are not: path depth decides whether the key retains a
+        // qualifier.
         assert_eq!(
-            attrs.get("num_complex::Complex"),
+            attrs.get("Complex"),
             Some(&vec![
                 ("re".to_string(), ValueType::Float),
                 ("im".to_string(), ValueType::Float),
@@ -22192,30 +22464,49 @@ mod tests {
             .iter()
             .flat_map(|block| block.operations.iter())
             .collect();
-        assert!(
-            constant_ops.iter().any(|op| {
-                matches!(
-                    op.kind,
-                    OpKind::Input {
-                        ty: ValueType::Int,
-                        ..
-                    }
-                )
-            }),
-            "ConstIdx input must use RPython's integer oparg representation"
-        );
-        assert!(constant_ops.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldRead { field, .. }
-                    if field.name == "__pos_0"
-                        && field.owner_root.as_deref() == Some("Constants")
-            )
-        }));
-        assert!(
+        // `ConstIdx` is a `#[repr(transparent)] u32` oparg wrapper, so the
+        // front-end types it `Unsigned` — whose register class *is* `'int'`
+        // (`getkind(Unsigned) == 'int'`, `model.rs:16-30`), signedness being an
+        // rtyper-level distinction only. `Int | Unsigned` is the pairing every
+        // bank-blind consumer already uses; naming the input as well keeps this
+        // from being satisfied by some unrelated integer argument.
+        assert_eq!(
             constant_ops
                 .iter()
-                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Input {
+                            name,
+                            ty: ValueType::Int | ValueType::Unsigned,
+                            ..
+                        } if name == "index"
+                    )
+                })
+                .count(),
+            1,
+            "ConstIdx input must use RPython's integer oparg representation"
+        );
+        assert_eq!(
+            constant_ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if field.name == "__pos_0"
+                                && field.owner_root.as_deref() == Some("Constants")
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            constant_ops
+                .iter()
+                .filter(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+                .count(),
+            1
         );
         assert!(!constant_ops.iter().any(|op| {
             matches!(
@@ -22234,14 +22525,20 @@ mod tests {
             .iter()
             .flat_map(|block| block.operations.iter())
             .collect();
-        assert!(doc_ops.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldRead { field, .. }
-                    if field.name == "__pos_0"
-                        && field.owner_root.as_deref() == Some("Constants")
-            )
-        }));
+        assert_eq!(
+            doc_ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if field.name == "__pos_0"
+                                && field.owner_root.as_deref() == Some("Constants")
+                    )
+                })
+                .count(),
+            1
+        );
         assert!(!doc_ops.iter().any(|op| {
             matches!(
                 &op.kind,
@@ -22259,16 +22556,22 @@ mod tests {
             .iter()
             .flat_map(|block| block.operations.iter())
             .collect();
-        assert!(load_ops.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Input {
-                    name,
-                    class_root: Some(root),
-                    ..
-                } if name == "constant" && root == "ConstantData"
-            )
-        }));
+        assert_eq!(
+            load_ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Input {
+                            name,
+                            class_root: Some(root),
+                            ..
+                        } if name == "constant" && root == "ConstantData"
+                    )
+                })
+                .count(),
+            1
+        );
 
         // `PyFrame::bigint_constant(&RBigInt)` is the LOAD_CONST consumer
         // that boxes the already-translated payload. Anchor its ABI rewrite
@@ -22310,14 +22613,23 @@ mod tests {
                 }));
             }
         }
-        assert!(
-            boxed_handlers >= 1,
+        // The loop above filters to bodies (`unstructured().is_some()`), which
+        // drops the trait declaration and leaves the single impl. `== 1` reds if
+        // a second body-carrying impl appears: the inner ABI check runs only
+        // inside the `w_long_from_raw` arm, so a duplicate that reverted to the
+        // by-value ABI would fall out of that arm and go ungraded.
+        assert_eq!(
+            boxed_handlers, 1,
             "real LOAD_CONST bigint handler must use the RBigInt pointer boxing ABI"
         );
-        assert!(
+        // Pins the whole ArrayRead population of `load_const_value`, not just
+        // its presence — so an added or removed indexed read reds here.
+        assert_eq!(
             load_ops
                 .iter()
-                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+                .filter(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+                .count(),
+            3
         );
         assert!(!load_ops.iter().any(|op| {
             matches!(
@@ -22342,24 +22654,37 @@ mod tests {
             )
         }));
         for residual in ["jit_bigint_to_i64_value_or_zero", "jit_bigint_to_i64_fits"] {
-            assert!(load_ops.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        ..
-                    } if segments.last().map(String::as_str) == Some(residual)
-                )
-            }));
+            assert_eq!(
+                load_ops
+                    .iter()
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments.last().map(String::as_str) == Some(residual)
+                        )
+                    })
+                    .count(),
+                1,
+                "{residual} is called exactly once"
+            );
         }
-        assert!(load_ops.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldWrite { field, .. }
-                    if field.name == "__discriminant"
-                        && field.owner_root.as_deref().is_some_and(|root| root.contains("Result<i64,RBigIntError>"))
-            )
-        }));
+        assert_eq!(
+            load_ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. }
+                            if field.name == "__discriminant"
+                                && field.owner_root.as_deref().is_some_and(|root| root.contains("Result<i64,RBigIntError>"))
+                    )
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]

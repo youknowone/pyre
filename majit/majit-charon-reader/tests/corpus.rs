@@ -25,7 +25,11 @@ fn loads_fixture_corpus() {
     // closure body and its transparent `<Impl>::call_once` inherent method)
     // + `option_source` and `option_question_mark` (the Option `?` fixture)
     // + `bool_then_some` (the eager `then_some` sibling, no closure).
-    assert_eq!(local_count, 12, "12 local fns expected");
+    //
+    // + 2 for the host-registered callback table: `host_registry_dispatch`
+    // and `host_registry_dispatch_optional`. `HostCallback` is a type alias,
+    // not an item, so it contributes no body.
+    assert_eq!(local_count, 14, "14 local fns expected");
 }
 
 #[test]

@@ -32,6 +32,7 @@ mod scalar {
         state = FloatScalarState,
         env = Bytecode,
         state_fields = { a: int, f: float },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn float_scalar_minimal(program: &Bytecode, threshold: u32) -> i64 {
@@ -97,8 +98,9 @@ mod scalar {
 // `lower_dispatch_body`'s `stmt_modifies_jit_state` skip gate. Until float
 // scalars were added to `expr_is_jit_state_place`, that predicate returned
 // false for `state.f`, so the write was silently dropped from the dispatch
-// JitCode and compiled execution left the field stale. Its own module
-// because `#[jit_interp]` emits per-module `__JitSym` / `__JitMeta` types.
+// JitCode and compiled execution left the field stale. The module groups the
+// fixture; it is no longer forced, because `__JitSym_<fn>` / `__JitMeta_<fn>`
+// now carry the annotated function's name.
 mod scalar_toplevel {
     use super::{Bytecode, all_jitcode_bodies};
     use majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD_FLOAT;
@@ -115,6 +117,7 @@ mod scalar_toplevel {
         state = FloatToplevelState,
         env = Bytecode,
         state_fields = { a: int, f: float },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn float_scalar_toplevel_write(program: &Bytecode, threshold: u32) -> i64 {
@@ -176,6 +179,7 @@ mod virt_array {
         state = FloatArrayState,
         env = Bytecode,
         state_fields = { regs: [float; virt] },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn float_array_minimal(program: &Bytecode, threshold: u32) -> i64 {
@@ -249,6 +253,7 @@ mod scalar_f32 {
         state = F32State,
         env = Bytecode,
         state_fields = { a: int, f: float(f32) },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn f32_scalar_minimal(program: &Bytecode, threshold: u32) -> i64 {
@@ -313,6 +318,7 @@ mod scalar_float_slot_reserve {
         state = TwoFloatState,
         env = Bytecode,
         state_fields = { a: float, b: float },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn two_float_minimal(program: &Bytecode, threshold: u32) -> i64 {
@@ -412,6 +418,7 @@ mod virt_array_with_float_scalar {
         // by the recursive-portal fresh-allocation gate, so the ordering bug
         // could only be hit alongside a fixed array or a ref scalar.
         state_fields = { sp: int, cells: [int], acc: float, stack: [int; virt] },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn mixed_virt_and_float(program: &Bytecode, threshold: u32) -> i64 {
@@ -521,5 +528,46 @@ mod virt_array_with_float_scalar {
             "no `stack` element belongs in the red block",
         );
         assert_eq!(state.extract_live(&meta).len(), 5);
+    }
+
+    #[test]
+    fn clearing_the_sym_bindings_drops_positions_and_keeps_values() {
+        let state = MixedState {
+            sp: 7,
+            cells: vec![11, 13],
+            acc: 1.5,
+            stack: vec![0; 2],
+        };
+        let program: &Bytecode = &[OP_NOP, OP_STEP];
+        let meta = state.build_meta(0, program);
+        let mut sym = <MixedState as JitState>::create_sym(&meta, 0);
+        state.initialize_sym(&mut sym, &meta);
+
+        // The mints, in the flat order `live_value_types` above declares.
+        // Spelled out rather than asserted `is_some` so the test also states
+        // WHICH position each field claims.
+        assert_eq!(sym.sp, majit_ir::OpRef::input_arg_int(0));
+        assert_eq!(sym.cells[0], majit_ir::OpRef::input_arg_int(1));
+        assert_eq!(sym.cells[1], majit_ir::OpRef::input_arg_int(2));
+        assert_eq!(sym.__vable_identity, majit_ir::OpRef::input_arg_ref(3));
+        assert_eq!(sym.acc, majit_ir::OpRef::input_arg_float(4));
+
+        <MixedState as JitState>::clear_sym_inputarg_bindings(&mut sym);
+
+        assert!(sym.sp.is_none(), "int scalar kept its position");
+        assert!(sym.cells[0].is_none(), "array cell 0 kept its position");
+        assert!(sym.cells[1].is_none(), "array cell 1 kept its position");
+        assert!(
+            sym.__vable_identity.is_none(),
+            "the virtualizable identity kept its position"
+        );
+        assert!(sym.acc.is_none(), "float scalar kept its position");
+
+        // The concrete mirrors are runtime data, not positions: clearing must
+        // not touch them, or the bridge loses the values `initialize_sym` read
+        // off the live state.
+        assert_eq!(sym.sp_value, 7);
+        assert_eq!(sym.cells_values, vec![11, 13]);
+        assert_eq!(sym.acc_value, 1.5f64.to_bits() as i64);
     }
 }

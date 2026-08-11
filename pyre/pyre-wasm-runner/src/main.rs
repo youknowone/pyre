@@ -790,6 +790,21 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "retrace_arity_giveup",
                 "ptp_push",
                 "ptp_pop",
+                "forced_never_compiled",
+                "mst_entered",
+                "mst_sync_before_false",
+                "mst_live_values_mismatch",
+                "stfe_declined_compiled",
+                "stfe_declined_tracing",
+                "stfe_declined_tracing_stale",
+                "bridge_unattempted_close",
+                "xloop_close_decision_reached",
+                "xloop_close_target_compiled",
+                "xloop_close_published",
+                "abrt_unclassified_default",
+                "unroll_cancelled_invalid_loop",
+                "unroll_free_retry_rescued",
+                "unroll_free_retry_failed",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

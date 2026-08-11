@@ -36,6 +36,7 @@ impl BytecodeExt for [u8] {
     state = DispatchTestState,
     env = Bytecode,
     state_fields = { a: int },
+    greens = [],
 )]
 #[allow(unused_assignments, unused_variables)]
 fn dispatch_minimal(program: &Bytecode, threshold: u32) -> i64 {
@@ -153,6 +154,7 @@ mod literal_for_unroll {
         state = LiteralForState,
         env = Bytecode,
         state_fields = { acc: int },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn dispatch_literal_for_unroll(program: &Bytecode, threshold: u32) -> i64 {
@@ -235,6 +237,7 @@ mod float_state_field_shape {
         state = FloatDispatchState,
         env = Bytecode,
         state_fields = { f: float },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn dispatch_float_field(program: &Bytecode, threshold: u32) -> i64 {
@@ -299,6 +302,7 @@ mod or_pattern {
         state = OrDispatchState,
         env = Bytecode,
         state_fields = { a: int },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn dispatch_or_pattern(program: &Bytecode, threshold: u32) -> i64 {
@@ -370,6 +374,7 @@ mod switch_dispatch {
         env = Bytecode,
         state_fields = { a: int },
         switch_dispatch = true,
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn dispatch_switch_pattern(program: &Bytecode, threshold: u32) -> i64 {
@@ -534,6 +539,7 @@ mod pre_promote {
         state = PromoteState,
         env = Bytecode,
         state_fields = { stackpos: int },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn dispatch_with_pre_promote(program: &Bytecode, threshold: u32) -> i64 {
@@ -2589,6 +2595,7 @@ mod residual_call_not_dropped {
         state = CallState,
         env = Bytecode,
         state_fields = { acc: int },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn dispatch_residual_call(program: &Bytecode, threshold: u32) -> i64 {
@@ -2650,9 +2657,8 @@ mod residual_call_not_dropped {
     }
 }
 
-/// A float comparison lowers in value form (materialized to an int) but a
-/// float comparison feeding a conditional guard must abort lowering — the
-/// guard bridge hangs the compiled trace (a4e191f71b5).
+/// A float comparison can lower as an integer value, but using it directly as
+/// a conditional guard must degrade until guard-bridge lowering is supported.
 mod float_compare_branch_gate {
     use super::Bytecode;
     use majit_metainterp::jitcode::insns::BC_FLOAT_GE;
@@ -2671,6 +2677,7 @@ mod float_compare_branch_gate {
         state = FloatCmpState,
         env = Bytecode,
         state_fields = { fa: float, fb: float, acc: int },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn dispatch_float_cmp(program: &Bytecode, threshold: u32) -> i64 {
@@ -2752,6 +2759,7 @@ mod huge_range_for_loop_falls_back {
         state = HugeState,
         env = Bytecode,
         state_fields = { acc: int },
+        greens = [],
     )]
     #[allow(unused_assignments, unused_variables)]
     fn dispatch_huge_range(program: &Bytecode, threshold: u32) -> i64 {
@@ -2806,6 +2814,213 @@ mod huge_range_for_loop_falls_back {
         assert_eq!(
             store_count, 1,
             "oversized-range arm must bail; stores={store_count}"
+        );
+    }
+}
+
+/// Pairs one genuinely unlowerable float-remainder assignment with healthy
+/// controls, ensuring installation reports the degraded arm without producing
+/// false positives for arms the macro can lower.
+mod degraded_arm_is_named_at_install {
+    use super::Bytecode;
+    use majit_metainterp::jitcode::insns::{
+        BC_ABORT, BC_CONVERT_FLOAT_BYTES_TO_LONGLONG, BC_CONVERT_LONGLONG_BYTES_TO_FLOAT,
+    };
+    use majit_metainterp::{Assembler, JitCode, JitDriver};
+
+    const OP_ADD: u8 = 1;
+    const OP_RETURN: u8 = 2;
+    const OP_RETURN_F: u8 = 3;
+    const OP_BUMP: u8 = 4;
+    const OP_LOAD_CONST_F: u8 = 5;
+    const OP_FBUMP: u8 = 6;
+    const OP_FREM_ASSIGN: u8 = 7;
+
+    struct DegradedArmState {
+        regs: Vec<i64>,
+        fregs: Vec<f64>,
+    }
+
+    #[majit_macros::jit_interp(
+        state = DegradedArmState,
+        env = Bytecode,
+        greens = [pc, program],
+        state_fields = {
+            regs: [int; virt],
+            fregs: [float; virt],
+        },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn dispatch_degraded_arm(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<DegradedArmState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = DegradedArmState {
+            regs: vec![0i64; 4],
+            fregs: vec![0.0f64; 4],
+        };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        loop {
+            jit_merge_point!();
+            let opcode = program[pc];
+            match opcode {
+                OP_ADD => {
+                    let a = program[pc + 1] as usize;
+                    let b = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = state.regs[a] + state.regs[b];
+                    pc += 4;
+                }
+                OP_RETURN => {
+                    return state.regs[program[pc + 1] as usize];
+                }
+                OP_RETURN_F => {
+                    return state.fregs[program[pc + 1] as usize].to_bits() as i64;
+                }
+                OP_BUMP => {
+                    state.regs[program[pc + 1] as usize] += 1;
+                    pc += 2;
+                }
+                OP_FBUMP => {
+                    state.fregs[program[pc + 1] as usize] += 1.0;
+                    pc += 2;
+                }
+                OP_FREM_ASSIGN => {
+                    state.fregs[program[pc + 1] as usize] %= 1.0;
+                    pc += 2;
+                }
+                OP_LOAD_CONST_F => {
+                    state.fregs[program[pc + 2] as usize] = f64::from_bits(program[pc + 1] as u64);
+                    pc += 3;
+                }
+                _ => break,
+            }
+        }
+        0
+    }
+
+    /// Build the dispatch JitCode so the install-time recorder runs.
+    fn install() -> JitCode {
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![0], vec![], vec![0]);
+        __prebuild_jitcode_liveness_dispatch_degraded_arm(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        __dispatch_jitcode_dispatch_degraded_arm(&mut asm, 0i64)
+            .expect("dispatch lower must succeed for fixture")
+    }
+
+    /// Entries this fixture contributed, isolated from every other `#[jit_interp]`
+    /// machine in the binary by the `state = T` name.
+    fn recorded_arms() -> Vec<String> {
+        majit_metainterp::degraded_dispatch_arms()
+            .into_iter()
+            .filter(|entry| entry.interp == "DegradedArmState")
+            .map(|entry| entry.arm.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn degraded_arm_is_named_and_healthy_arms_are_not() {
+        let _ = install();
+        let arms = recorded_arms();
+
+        // Positive: the arm that actually degrades is named.
+        assert!(
+            arms.iter().any(|arm| arm == "OP_FREM_ASSIGN"),
+            "the unsupported float remainder-assign arm must be recorded as degraded; recorded={arms:?}"
+        );
+
+        // Negative controls.  `OP_ADD` is `OP_BUMP` written out and lowers;
+        // `OP_RETURN_F` reads a float register through `f64::to_bits`, which
+        // the macro recognizes, and `OP_RETURN` is its int twin; `_ => break`
+        // is a DECLARED halt rather than a degradation.  A channel that named
+        // any of these would not be telling anyone which arm to fix.
+        for silent in [
+            "OP_ADD",
+            "OP_RETURN",
+            "OP_RETURN_F",
+            "OP_LOAD_CONST_F",
+            "OP_BUMP",
+            "OP_FBUMP",
+            "_",
+        ] {
+            assert!(
+                !arms.iter().any(|arm| arm == silent),
+                "`{silent}` lowers (or is declared) and must not be recorded; recorded={arms:?}"
+            );
+        }
+    }
+
+    /// The inherent float bitcast spellings must reach the bitcast resops, not
+    /// merely avoid the abort stub: `<f64>.to_bits()` is
+    /// `convert_float_bytes_to_longlong` and `f64::from_bits(..)` is its
+    /// inverse, the same two ops the free `majit_f64_to_bits` /
+    /// `majit_bits_to_f64` intrinsics emit.
+    #[test]
+    fn inherent_float_bitcast_spellings_lower_to_the_convert_ops() {
+        let dispatch_jc = install();
+        let count = |op: u8| -> usize {
+            let in_dispatch = dispatch_jc.code.iter().filter(|&&b| b == op).count();
+            let in_subs: usize = dispatch_jc
+                .exec
+                .descrs
+                .iter()
+                .filter_map(|descr| descr.as_jitcode())
+                .map(|sub| sub.code.iter().filter(|&&b| b == op).count())
+                .sum();
+            in_dispatch + in_subs
+        };
+        let to_bits = count(BC_CONVERT_FLOAT_BYTES_TO_LONGLONG);
+        let from_bits = count(BC_CONVERT_LONGLONG_BYTES_TO_FLOAT);
+        assert_eq!(
+            (to_bits, from_bits),
+            (1, 1),
+            "`.to_bits()` and `f64::from_bits(..)` must each lower to one bitcast op"
+        );
+    }
+
+    /// The registry must agree with the artifact it describes; checking it
+    /// against itself would prove nothing.  Every arm the macro named is one
+    /// abort stub in the built dispatch JitCode, and there are no others.
+    #[test]
+    fn the_named_arms_are_exactly_the_abort_stubs_in_the_ir() {
+        let dispatch_jc = install();
+        let abort_stubs = dispatch_jc
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode())
+            .filter(|sub| sub.code.iter().any(|&b| b == BC_ABORT))
+            .count();
+        let arms = recorded_arms();
+        assert_eq!(
+            abort_stubs,
+            arms.len(),
+            "abort stubs in the dispatch JitCode must match the named arms; recorded={arms:?}"
+        );
+        assert_eq!(abort_stubs, 1, "fixture must degrade exactly one arm");
+    }
+
+    #[test]
+    fn install_time_record_carries_a_reason_and_dedups() {
+        let _ = install();
+        let _ = install();
+        let entries: Vec<_> = majit_metainterp::degraded_dispatch_arms()
+            .into_iter()
+            .filter(|entry| entry.interp == "DegradedArmState" && entry.arm == "OP_FREM_ASSIGN")
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a second dispatch build must not duplicate the entry; entries={entries:?}"
+        );
+        assert!(
+            !entries[0].reason.is_empty(),
+            "the recorded arm must carry a staged reason, not an empty bucket"
         );
     }
 }

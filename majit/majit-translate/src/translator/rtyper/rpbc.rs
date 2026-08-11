@@ -332,13 +332,19 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
     let builtin_wrappers = call_control.builtin_wrapper_indirect_graphs();
     for block in &mut graph.blocks {
         for op in &mut block.operations {
-            if let OpKind::IndirectCall {
-                graphs: Some(graphs),
-                ..
-            } = &mut op.kind
-                && graphs.is_empty()
+            if let OpKind::IndirectCall { graphs, .. } = &mut op.kind
+                && graphs.as_deref().is_some_and(<[_]>::is_empty)
             {
-                *graphs = builtin_wrappers.to_vec();
+                // Filling the marker with an empty wrapper set would leave
+                // `Some([])`, which every family analyzer reads as "the
+                // family is known and has no members" and folds to its
+                // bottom result — silently asserting that a callee this
+                // side never enumerated has no effects.  Nothing here can
+                // tell "no wrappers registered" from "wrappers exist but
+                // were not registered", so an unfilled marker is an unknown
+                // family: `None`, the same fold this function makes for an
+                // empty `(trait, method)` family below.
+                *graphs = (!builtin_wrappers.is_empty()).then(|| builtin_wrappers.to_vec());
             }
         }
     }
@@ -937,9 +943,107 @@ pub(crate) mod tests {
             "inherent call must not produce IndirectCall"
         );
     }
+
+    /// Build a graph holding one deferred builtin-wrapper marker —
+    /// `IndirectCall { graphs: Some([]) }`, the shape `front/mir.rs`
+    /// emits for a gateway-wrapper call it cannot resolve yet.
+    fn graph_with_deferred_wrapper_marker() -> JitFunctionGraph {
+        let mut graph = JitFunctionGraph::new("outer");
+        let funcptr_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "fp".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::IndirectCall {
+                funcptr: funcptr_var,
+                args: vec![],
+                graphs: Some(Vec::new()),
+                result_ty: ValueType::Void,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+        graph
+    }
+
+    fn sole_indirect_call_family(graph: &JitFunctionGraph) -> Option<Vec<crate::parse::CallPath>> {
+        let mut found = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::IndirectCall { graphs, .. } => Some(graphs.clone()),
+                _ => None,
+            });
+        let family = found.next().expect("marker op must survive lowering");
+        assert!(found.next().is_none(), "expected exactly one IndirectCall");
+        family
+    }
+
+    /// The deferred builtin-wrapper marker is a request to enumerate a
+    /// family, not a claim that the family is empty.  When `CallControl`
+    /// has no wrappers to fill it with, the request went unanswered, and
+    /// the op must say so — `graphs: None`, the same "unknown family"
+    /// spelling `lower_indirect_calls` gives an unregistered
+    /// `(trait, method)` pair.  Leaving `Some([])` would instead assert a
+    /// closed, empty family, which every downstream analyzer folds to its
+    /// bottom result (`graphanalyze.py:117-121` takes `None` to top).
+    ///
+    /// The registered-wrapper case is the non-vacuity control: it shows
+    /// the fill still runs and still reaches the marker, so the `None`
+    /// above is this rule and not a skipped pass.
+    #[test]
+    fn unfillable_wrapper_marker_lowers_to_unknown_family() {
+        use crate::call::CallControl;
+        use crate::parse::CallPath;
+
+        // Control — the fill is engaged and rewrites the marker.
+        let wrapper = CallPath::from_segments(["helpers", "__pyre_wrap_add"]);
+        let mut with_wrappers = CallControl::new();
+        with_wrappers
+            .register_function_graph(wrapper.clone(), JitFunctionGraph::new("__pyre_wrap_add"));
+        with_wrappers.register_function_fnaddr(wrapper.clone(), 0x1234);
+        assert_eq!(
+            with_wrappers.builtin_wrapper_indirect_graphs().to_vec(),
+            vec![wrapper.clone()],
+            "control needs exactly one registered wrapper"
+        );
+
+        let mut filled = graph_with_deferred_wrapper_marker();
+        lower_indirect_calls(&mut filled, &with_wrappers);
+        assert_eq!(
+            sole_indirect_call_family(&filled),
+            Some(vec![wrapper]),
+            "a fillable marker must be filled with the wrapper family"
+        );
+
+        // Invariant — with nothing to enumerate, the family is unknown.
+        let without_wrappers = CallControl::new();
+        assert!(
+            without_wrappers
+                .builtin_wrapper_indirect_graphs()
+                .is_empty(),
+            "the invariant below needs an empty wrapper registry"
+        );
+
+        let mut unfilled = graph_with_deferred_wrapper_marker();
+        lower_indirect_calls(&mut unfilled, &without_wrappers);
+        assert_eq!(
+            sole_indirect_call_family(&unfilled),
+            None,
+            "an unfillable marker is an unknown family, not an empty one"
+        );
+    }
 }
 
-// =====================================================================
 // rpbc.py:177-994 — full PBC Repr hierarchy
 //
 // Concrete classes ported below mirror upstream's hierarchy:
@@ -959,7 +1063,6 @@ pub(crate) mod tests {
 // field and overrides the lowleveltype + dispatch body.  Pair-type arms
 // (rpbc.py:373-633 `__extend__(pairtype(...))`) live alongside their
 // owning concrete reprs below.
-// =====================================================================
 
 use crate::flowspace::model::{ConstValue, Constant, GraphKey, Hlvalue};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;

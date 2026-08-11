@@ -9,8 +9,7 @@
 
 pub type PyResult<T> = Result<T, &'static str>;
 
-// --- 1. Straight-line ---------------------------------------------------
-
+// 1. Straight-line
 #[inline(never)]
 pub fn straight_line_add(a: i64, b: i64, c: i64) -> i64 {
     let s = a + b;
@@ -18,8 +17,7 @@ pub fn straight_line_add(a: i64, b: i64, c: i64) -> i64 {
     t + c
 }
 
-// --- 2. Branch + loop ---------------------------------------------------
-
+// 2. Branch and loop
 #[inline(never)]
 pub fn branch_loop_sum(slice: &[i64], threshold: i64) -> i64 {
     let mut acc: i64 = 0;
@@ -33,8 +31,7 @@ pub fn branch_loop_sum(slice: &[i64], threshold: i64) -> i64 {
     acc
 }
 
-// --- 3. Strategy dispatch (dict-strategy stand-in) ----------------------
-
+// 3. Strategy dispatch (dict-strategy stand-in)
 pub enum Strategy {
     Empty,
     IntKeyed { len: usize },
@@ -50,8 +47,7 @@ pub fn strategy_len(s: &Strategy) -> usize {
     }
 }
 
-// --- 4. Desugar mix: ?, match, iterator --------------------------------
-
+// 4. Desugaring mix: `?`, `match`, and iteration
 pub enum Token {
     Add(i64),
     Sub(i64),
@@ -81,7 +77,7 @@ pub fn desugar_mix(input: &[i64]) -> PyResult<i64> {
     Ok(acc)
 }
 
-// --- 5. Tuple round-trip: construct a tuple, read .0/.1 in same fn ------
+// 5. Tuple round-trip: construct a tuple and read both fields
 //
 // Exercises `Rvalue::Aggregate` for a *non-Adt* (tuple) value paired
 // with `Field` projection reads of that same local. The lowering must
@@ -94,8 +90,7 @@ pub fn tuple_roundtrip(a: i64, b: i64) -> i64 {
     pair.0 * pair.1
 }
 
-// --- 6. Closures --------------------------------------------------------
-//
+// 6. Closures
 // `bool_then_closure` is the exact `core::bool::<Impl>::then` census shape:
 // an opaque combinator taking a `FnOnce` closure that captures a value from
 // the enclosing scope. Charon extracts the closure's `call_once` body as a
@@ -114,8 +109,7 @@ pub fn bool_then_some(c: bool, x: i64) -> Option<i64> {
     c.then_some(x + 1)
 }
 
-// --- 7. Option question mark -------------------------------------------
-//
+// 7. Option question mark
 // Exercises `Try::branch` on `Option`: `Some(v)` continues with `v`, while
 // `None` returns `None` normally from the enclosing Option-returning function.
 
@@ -128,4 +122,36 @@ fn option_source(keep: bool, value: i64) -> Option<i64> {
 pub fn option_question_mark(keep: bool, value: i64, addend: i64) -> Option<i64> {
     let v = option_source(keep, value)?;
     Some(v + addend)
+}
+
+// A host-registered callback table.
+
+/// The callback a host installs at run time. A bare `fn` pointer, so the set
+/// of addresses that can reach a call through it is not recoverable from this
+/// artifact — the shape used by host-settable callback hooks.
+pub type HostCallback = fn(i64) -> i64;
+
+pub struct HostRegistry {
+    pub slot: HostCallback,
+    pub maybe_slot: Option<HostCallback>,
+}
+
+/// Call through the registered callback. `front::mir` lowers this to
+/// `OpKind::IndirectCall { graphs: None }` — `indirect_call` with an
+/// unknown PBC family, which `guess_call_kind` answers `residual` for
+/// (`call.py:105`/`137`, `jtransform.py:410-412`). The `__dyn_call`
+/// placeholder it used to reach is an unregistered synthetic path with no
+/// continuation.
+#[inline(never)]
+pub fn host_registry_dispatch(reg: &HostRegistry, x: i64) -> i64 {
+    (reg.slot)(x)
+}
+
+/// The one-hop `Option<fn-ptr>` spelling of the same shape.
+#[inline(never)]
+pub fn host_registry_dispatch_optional(reg: &HostRegistry, x: i64) -> i64 {
+    match reg.maybe_slot {
+        Some(f) => f(x),
+        None => 0,
+    }
 }

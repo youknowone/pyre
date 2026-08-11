@@ -54,7 +54,7 @@ pub struct Pack {
 }
 
 /// vector.py: Accumulation pack — tracks reduction operations
-/// (e.g., sum += array[i]) that can be vectorized with horizontal
+/// (e.g., `sum += array[i]`) that can be vectorized with horizontal
 /// reduction instructions.
 #[derive(Clone, Debug)]
 /// schedule.py:980-1003: AccumPack — accumulation (reduction) pack.
@@ -74,7 +74,7 @@ pub struct AccumPack {
 }
 
 /// Accumulation info stored in the accumulation map.
-/// schedule.py:649: state.accumulation[arg] = pack
+/// schedule.py:649: `state.accumulation[arg] = pack`
 ///
 /// schedule.py keys `accumulation` by the failarg box and `getleftmostseed`
 /// returns a box object; pyre shapes `seed` as a flat `OpRef` and keys
@@ -143,8 +143,6 @@ impl GuardAnalysis {
         }
     }
 }
-
-// ── schedule.py:584-779: VecScheduleState ─────────────────────
 
 /// schedule.py:584-779: State for vector-aware instruction scheduling.
 /// Tracks which scalar ops have been mapped to vector ops, handles
@@ -772,8 +770,6 @@ impl VecScheduleState {
     }
 }
 
-// ── schedule.py:317-400: turn_into_vector and helpers ─────────────────────
-
 /// Combined failure mode for `optimize_vector` / `run_optimization`,
 /// mirroring vector.py:154-166's two `except` arms. Callers convert this
 /// back to a "no-vectorize-this-time" decision and replay the original
@@ -1003,8 +999,8 @@ fn get_vec_info(state: &mut VecScheduleState, opref: OpRef, ops: &[OpRc]) -> (ch
 /// schedule.py:488-502: pack_into_vector — insert `src` at position `tidx`
 /// in `tgt`, producing a wider vector.
 ///
-/// tgt = [1,2,3,4,_,_,_,_], src = [5,6,_,_]
-/// result = [1,2,3,4,5,6,_,_] (tidx=4, scount=2)
+/// `tgt = [1,2,3,4,_,_,_,_]`, `src = [5,6,_,_]`
+/// `result = [1,2,3,4,5,6,_,_]` (tidx=4, scount=2)
 pub fn pack_into_vector(
     state: &mut VecScheduleState,
     tgt: OpRef,

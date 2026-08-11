@@ -690,6 +690,108 @@ static FIELD_INDEX_REDERIVED: std::sync::atomic::AtomicUsize =
 static FIELD_INDEX_UNRESOLVED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// One `FIELD_INDEX_UNRESOLVED` event, named, keyed so identical mints fold
+/// into one row with a count.
+///
+/// `BTreeMap`, not `HashMap`: the whole point of the table is to be printed,
+/// and a hash-ordered print makes two runs of the same program produce
+/// different bytes for the same finding.
+static FIELD_UNRESOLVED_NAMES: std::sync::Mutex<
+    std::collections::BTreeMap<UnresolvedFieldMint, usize>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether to build [`FIELD_UNRESOLVED_NAMES`] at all, read once.
+///
+/// The COUNT (`field_pos_unresolved`) is ungated and always accurate; only the
+/// names cost anything, so they sit behind a knob like
+/// `PYRE_SIZE_SHELL_OWNERS`. Read through this one function so the variable has
+/// exactly one spelling in-tree — the collector lives here and the printer
+/// lives in `pyre-jit-trace`, and two independently-checked names would let the
+/// printer report "nothing unresolved" from a run that never recorded.
+///
+/// Unreachable on wasm32 for the ordinary reason: a
+/// `wasm32-unknown-unknown` guest's `std::env` is permanently empty, so the
+/// knob cannot be set there and this returns false however the host is
+/// configured.
+///
+/// The names are out of reach there, but the COUNT is not. The guest's export
+/// list (`pyre-wasm/src/lib.rs`) carries all eight `pyre_jit_field_pos_*`
+/// counters, `field_pos_unresolved` among them, and `pyre-wasm-runner` asks for
+/// all eight — so on wasm this hazard is measurable as a number, and only the
+/// per-mint naming is unavailable. Read the count; do not infer it from the
+/// names being absent.
+///
+/// Do not read a missing counter as a zero, and do not assume the runner
+/// would object to one: it refuses a counter it ASKS for and cannot resolve,
+/// which structurally cannot catch a counter nobody added to its list. A guard
+/// against wrong entries is not a guard against missing ones — which is why the
+/// four census dispositions had to be exported deliberately rather than waited
+/// for.
+pub fn field_position_unresolved_naming_enabled() -> bool {
+    field_position_unresolved_limit().is_some()
+}
+
+/// How many rows the knob asks for: `MAJIT_FIELD_POS_UNRESOLVED=<n>`, or the
+/// whole table for `1` / any non-numeric value. `None` when unset.
+///
+/// A cap is a parameter, not a constant. `size_shell_owner_sample`'s sibling
+/// diagnostic hardcodes 24 and prints it against a count of 155 — so the rows
+/// it shows are the alphabetically-first sixth of a `BTreeSet`, which is the
+/// one thing a reader must not compute a proportion from. Whoever asks a census
+/// for names is asking a question about the whole population; let them say how
+/// much of it they want.
+fn field_position_unresolved_limit() -> Option<usize> {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let raw = std::env::var("MAJIT_FIELD_POS_UNRESOLVED").ok()?;
+        Some(match raw.trim().parse::<usize>() {
+            Ok(0) | Ok(1) | Err(_) => usize::MAX,
+            Ok(n) => n,
+        })
+    })
+}
+
+/// A field mint whose name the parent's positional list does not contain.
+///
+/// Everything needed to decide WHERE the fix belongs is in the key, because
+/// the layer is not derivable from the count:
+/// * `label` — the descr's display name, `Owner.field` or the `T<type_id>.`
+///   stand-in. Says which producer minted it.
+/// * `lookup_key` — the string actually searched for (`field_key`), which is
+///   not always the tail of `label`; a producer that spells the key one way
+///   and the display name another is a different defect from one that ranks
+///   the field wrongly.
+/// * `caller_index` / `parent_len` — the un-arbitrated `index_in_parent` the
+///   caller supplied, against the length of the list it would index. The pair
+///   says whether the number is merely wrong or out of range. `None` is a
+///   producer that never claimed a slot at all, which is a different finding
+///   from one that claimed slot 0 — and while this field was a plain `usize`
+///   the two were the same row, so the table could be read but not split.
+/// * `parent_keys` — what the parent DOES list. This is the discriminator
+///   between "the field is missing from its own parent" and "the parent is a
+///   different struct that shares an identity key", and neither the count nor
+///   the label can distinguish them.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct UnresolvedFieldMint {
+    label: String,
+    lookup_key: String,
+    caller_index: Option<usize>,
+    parent_len: usize,
+    parent_keys: String,
+}
+
+/// `FIELD_INDEX_UNRESOLVED` split by whether the producer had claimed a slot.
+///
+/// Ungated, unlike the row table above: the rows are only recorded when
+/// `MAJIT_FIELD_POS_UNRESOLVED` was set before the first mint, so a late-armed
+/// gate yields a short table, and a split derived from a short table is a split
+/// of the wrong denominator. These two are bumped on every unresolved mint and
+/// sum to `FIELD_INDEX_UNRESOLVED` exactly.
+static FIELD_INDEX_UNRESOLVED_CLAIMED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_INDEX_UNRESOLVED_PLACEHOLDER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Counters behind [`GcCache::spec_position_census`] — the same question the
 /// four above ask, put to the producer instead of to the reader.
 static FIELD_SPEC_CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -701,6 +803,56 @@ static FIELD_ATTACHED_CHECKED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static FIELD_ATTACHED_MISPLACED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Counters behind [`GcCache::mint_index_census`].
+static FIELD_MINT_INDEX_CLAIMED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_MINT_INDEX_PLACEHOLDER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a field mint's `index_in_parent` was WRITTEN by a lookup arm or is
+/// still the initialiser the mint opened with.
+///
+/// No other counter in this module records where that value came from. The ones
+/// that look at it at all compare its VALUE — `census_attached_index` against
+/// the attached parent's slot, `census_spec_positions` against the submitted
+/// list's own order, `derive_index_in_parent` against a name lookup — and the
+/// rest report a disposition reached before any comparison happens. An
+/// unwritten initialiser is the literal `0`, so a mint that never claimed a slot
+/// and a mint that claims slot 0 are the same bytes in the same table to every
+/// one of them, and no reader can separate them at any level of care.
+///
+/// This is the missing bit, taken at the only place that still holds it.
+///
+/// UNGUARDED BY DESIGN, and that is the point. The censuses that ask about a
+/// mint's `index_in_parent` are conditional on a usable parent —
+/// `census_attached_index`'s caller needs `Some(parent_spec)` and a resolvable
+/// slot, and `derive_index_in_parent` diverts to `FIELD_PARENT_ABSENT` /
+/// `FIELD_PARENT_EMPTY` before it reaches the comparison. In exactly the case
+/// where the placeholder survives unrepaired FOR WANT OF A PARENT, both of them
+/// are silent. Counting here, before any parent is consulted, is what reaches
+/// that hole. Do not move this call inside a parent check.
+///
+/// What does NOT bump it, so the number is read against the right
+/// population: only `codewriter::assembler::fielddescrof` calls this, so
+/// `claimed + placeholder` is the count of `fielddescrof` mints and NOT of
+/// field descrs in the program.
+///
+/// The vable-field and vable-array synthesizers in `blackhole.rs` also emit
+/// `index_in_parent: 0` — but as a literal, beside `parent: None`, with no
+/// lookup in front of it that could have written something else. There is no
+/// provenance question to ask of a constant: those mints never had a parent
+/// list to claim a slot in, so counting them would add rows to `placeholder`
+/// that are not the hazard this pair exists to size.
+pub fn census_mint_index_provenance(claimed: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let counter = if claimed {
+        &FIELD_MINT_INDEX_CLAIMED
+    } else {
+        &FIELD_MINT_INDEX_PLACEHOLDER
+    };
+    counter.fetch_add(1, Relaxed);
+}
 
 /// One field descr's two halves, compared against each other.
 ///
@@ -714,10 +866,19 @@ static FIELD_ATTACHED_MISPLACED: std::sync::atomic::AtomicUsize =
 /// Caller supplies `expected`, because only it holds the parent the producer
 /// actually attached. Once the descr reaches `get_field_descr` the parent is
 /// whatever `_cache_size` holds for the key, which is a different question.
-pub fn census_attached_index(expected: usize, actual: usize) {
+///
+/// `actual` is an `Option` because the producer's slot claim now carries its own
+/// provenance, but this pair deliberately folds `None` to `0` before comparing:
+/// `0` is the exact value the descr used to carry in that state, so folding
+/// keeps `[checked, misplaced]` numerically identical to every reading taken
+/// before the widening. The provenance split belongs to the counters that were
+/// added to answer it — [`census_mint_index_provenance`] on the mint side and
+/// `FIELD_INDEX_UNRESOLVED_{CLAIMED,PLACEHOLDER}` on the resolve side — not
+/// here, where redefining `misplaced` would silently move a published number.
+pub fn census_attached_index(expected: usize, actual: Option<usize>) {
     use std::sync::atomic::Ordering::Relaxed;
     FIELD_ATTACHED_CHECKED.fetch_add(1, Relaxed);
-    if expected != actual {
+    if expected != actual.unwrap_or(0) {
         FIELD_ATTACHED_MISPLACED.fetch_add(1, Relaxed);
     }
 }
@@ -831,6 +992,23 @@ impl GcCache {
             // DUMMY member at index 0.
             next_type_id: 1,
         }
+    }
+
+    /// descriptor cardinality — the cardinality [`Self::setup_descrs`] would produce, **without
+    /// its `set_descr_index` side effect**.
+    ///
+    /// The selection-vs-pool fork needs `all_descrs` and the assembler's
+    /// `opcode_descrs` measured in the same generation: `all_descrs` stable
+    /// while the pool moves is a *selection* defect; both moving is a *pool*
+    /// defect. `setup_descrs` cannot serve — it stamps `descr_index` on every
+    /// entry, so calling it merely to count would perturb the thing measured.
+    pub fn all_descrs_len(&self) -> usize {
+        self._cache_size_order.len()
+            + self._cache_field_order.len()
+            + self._cache_array_order.len()
+            + self._cache_arraylen_order.len()
+            + self._cache_call_order.len()
+            + self._cache_interiorfield_order.len()
     }
 
     /// descr.py:25-47 setup_descrs().
@@ -1023,6 +1201,128 @@ impl GcCache {
         ]
     }
 
+    /// The `unresolved` population, named — one line per distinct mint, most
+    /// frequent first.
+    ///
+    /// `field_position_census`'s fourth number says how many field mints named
+    /// a field their parent's positional list does not contain. It cannot say
+    /// WHERE the fix belongs, and that is the whole decision: a population
+    /// concentrated in one producer is fixed at that producer, one spread
+    /// across every owner is fixed at the resolution layer. Counting cannot
+    /// distinguish those two and no amount of re-running changes that, so the
+    /// records have to be printed.
+    ///
+    /// Deliberately NOT reconstructed from the final cache the way
+    /// [`size_shell_owner_sample`]'s `orphan_fields` section is. That one
+    /// re-asks the question at exit, against parents that have grown since, and
+    /// it dedupes into a set — so it answers a neighbouring question and its
+    /// total does not match this counter's. These rows are the mint events
+    /// themselves, which is the population the counter counts.
+    ///
+    /// The first line is a header carrying the ungated counter next to the
+    /// number of records actually collected. They agree only if the knob was
+    /// set before the first mint; printing both makes a late-armed gate read as
+    /// a short table rather than as a small finding. `all_descrs` is the
+    /// caller's, for the same reason `descr_set_resolved` rides its own line —
+    /// a run where the descr pool never loaded reports zero here, and without a
+    /// denominator that zero is indistinguishable from a clean tree.
+    ///
+    /// `shown`, `distinct` and `limit` are all printed, and the knob's own value
+    /// sets the cap. `limit` is not redundant with `shown`: they coincide only
+    /// while the table is truncated, so without it a complete table cannot be
+    /// told from one that happens to fit. `order` is printed for the same
+    /// reason — rows are ranked by FREQUENCY, so a prefix is the most frequent
+    /// rows and never a sample, and a reader who takes a proportion from
+    /// `shown < distinct` is reading a ranking's head.
+    ///
+    /// [`size_shell_owner_sample`]: Self::size_shell_owner_sample
+    pub fn field_position_unresolved_sample(all_descrs: usize) -> Vec<String> {
+        let limit = field_position_unresolved_limit().unwrap_or(0);
+        let [parent_absent, parent_empty, rederived, unresolved] = Self::field_position_census();
+        let table = FIELD_UNRESOLVED_NAMES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let recorded: usize = table.values().sum();
+        // Frequency first, then the key's own order, so the ranking is total
+        // and two runs of one program print the same bytes.
+        let mut rows: Vec<(&UnresolvedFieldMint, usize)> =
+            table.iter().map(|(k, v)| (k, *v)).collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        // `shown` equals `limit` exactly when the table is truncated, so the cap
+        // is recoverable from a SHORT table but not from a complete one. Print it
+        // either way: a reader who sees `distinct=158 shown=158` still has to know
+        // whether they asked for 158 or for everything, because only the second
+        // says no further rows exist.
+        let limit_shown = if limit == usize::MAX {
+            "all".to_string()
+        } else {
+            limit.to_string()
+        };
+        // `claimed + placeholder == unresolved` by construction — both are bumped
+        // on the same arm, outside the naming gate — so the pair splits the
+        // COUNT and not the (possibly short) table. Printing it beside
+        // `recorded` is what lets a reader tell a producer that ranked the field
+        // wrongly from one that never ranked it at all; while `caller_index` was
+        // a plain `usize` those were the same rows.
+        let [unresolved_claimed, unresolved_placeholder] = Self::unresolved_index_provenance();
+        let mut lines = vec![format!(
+            "field_pos_unresolved_names unresolved={unresolved} \
+             unresolved_claimed={unresolved_claimed} \
+             unresolved_placeholder={unresolved_placeholder} recorded={recorded} \
+             distinct={} shown={} limit={limit_shown} order=count-desc,key-asc \
+             mints={} all_descrs={all_descrs} names_scope=native-only",
+            table.len(),
+            rows.len().min(limit),
+            parent_absent + parent_empty + rederived + unresolved,
+        )];
+        // The ordering is a total one and it is NOT the population's shape: rows
+        // are ranked by frequency, so a prefix is the most frequent rows, not a
+        // sample. Named in the output rather than only in this doc comment,
+        // because the reader taking a proportion has the line and not the source.
+        // Two clauses with two different subjects, and only one of them ever went
+        // stale: the COUNT's export exists now, the LISTING's absence is still
+        // real. Do not delete this line as stale — it is the only warning a wasm
+        // reader gets that the rows below are missing rather than empty.
+        lines.push(
+            "field_pos_unresolved_note names-listing only: the COUNT reaches wasm as \
+             pyre_jit_field_pos_unresolved, but the guest has no stderr, so these per-mint \
+             rows never appear there. Read the count; do not read their absence as a zero"
+                .to_string(),
+        );
+        lines.extend(rows.iter().take(limit).map(|(mint, count)| {
+            // `none` rather than a number: the whole reason this field is an
+            // `Option` is that a producer which resolved nothing must not print
+            // the same token as one that resolved slot 0.
+            let caller_index = match mint.caller_index {
+                Some(i) => i.to_string(),
+                None => "none".to_string(),
+            };
+            format!(
+                "field_pos_unresolved {count}x {} key={} caller_index={caller_index} \
+                 parent_fields={} parent=[{}]",
+                mint.label, mint.lookup_key, mint.parent_len, mint.parent_keys,
+            )
+        }));
+        lines
+    }
+
+    /// `[claimed, placeholder]` over the mints `derive_index_in_parent` could not
+    /// resolve — the split of `field_pos_unresolved` by whether the producer had
+    /// written an `index_in_parent` at all.
+    ///
+    /// Sums to `field_position_census()[3]` exactly. This is the resolve-side
+    /// half of the question [`census_mint_index_provenance`] asks on the mint
+    /// side, and the two run in DIFFERENT PROCESSES — pyre mints in
+    /// `pyre-jit-trace/build.rs` and resolves in the program — so neither pair
+    /// can be read off the other's numbers.
+    pub fn unresolved_index_provenance() -> [usize; 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            FIELD_INDEX_UNRESOLVED_CLAIMED.load(Relaxed),
+            FIELD_INDEX_UNRESOLVED_PLACEHOLDER.load(Relaxed),
+        ]
+    }
+
     /// `[checked, misplaced]` over field descrs compared against the parent
     /// their own producer attached — see [`census_attached_index`].
     ///
@@ -1041,6 +1341,25 @@ impl GcCache {
         [
             FIELD_ATTACHED_CHECKED.load(Relaxed),
             FIELD_ATTACHED_MISPLACED.load(Relaxed),
+        ]
+    }
+
+    /// `[claimed, placeholder]` over every `fielddescrof` mint — see
+    /// [`census_mint_index_provenance`] for what each arm means and for why the
+    /// call site is deliberately outside every parent check.
+    ///
+    /// Read it as the denominator the other two censuses cannot supply. A
+    /// `placeholder` of 0 settles the question outright: no mint carried an
+    /// unwritten index, so no row anywhere downstream can be a placeholder, and
+    /// every `index_in_parent == 0` in the program is a real slot claim. A
+    /// nonzero bounds the population instead of splitting it — it says how many
+    /// unwritten indices were minted, not how many of them reached any
+    /// particular table.
+    pub fn mint_index_census() -> [usize; 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            FIELD_MINT_INDEX_CLAIMED.load(Relaxed),
+            FIELD_MINT_INDEX_PLACEHOLDER.load(Relaxed),
         ]
     }
 
@@ -1320,10 +1639,22 @@ impl GcCache {
         fields.iter().position(|f| f.field_key() == field_name)
     }
 
+    /// `label` is the descr's display name, used only to name the mint in the
+    /// `unresolved` table. It is not consulted for the lookup — `field_name` is
+    /// the key the parent's list is searched by, and the two disagreeing is one
+    /// of the states the table exists to report.
+    ///
+    /// `caller_index` is `None` when the producer never resolved a slot. The
+    /// existing counters compare against `caller_index.unwrap_or(0)`, which is
+    /// the literal the descr used to carry in that state, so their published
+    /// values are unchanged by the widening; the new information is taken by the
+    /// `UNRESOLVED_{CLAIMED,PLACEHOLDER}` pair and by the table row, which keep
+    /// the `Option` intact.
     fn derive_index_in_parent(
         parent: Option<&DescrRef>,
         field_name: &str,
-        caller_index: usize,
+        caller_index: Option<usize>,
+        label: &str,
     ) -> Option<usize> {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(size_descr) = parent.and_then(|p| p.as_size_descr()) else {
@@ -1336,13 +1667,40 @@ impl GcCache {
         }
         match Self::find_index_in_parent(parent, field_name) {
             Some(i) => {
-                if i != caller_index {
+                if i != caller_index.unwrap_or(0) {
                     FIELD_INDEX_REDERIVED.fetch_add(1, Relaxed);
                 }
                 Some(i)
             }
             None => {
                 FIELD_INDEX_UNRESOLVED.fetch_add(1, Relaxed);
+                // Outside the naming gate, so the split is taken over the whole
+                // unresolved population and not over the rows a late-armed knob
+                // happened to catch.
+                if caller_index.is_some() {
+                    FIELD_INDEX_UNRESOLVED_CLAIMED.fetch_add(1, Relaxed);
+                } else {
+                    FIELD_INDEX_UNRESOLVED_PLACEHOLDER.fetch_add(1, Relaxed);
+                }
+                if field_position_unresolved_naming_enabled() {
+                    let listed = size_descr.all_fielddescrs();
+                    let mint = UnresolvedFieldMint {
+                        label: label.to_string(),
+                        lookup_key: field_name.to_string(),
+                        caller_index,
+                        parent_len: listed.len(),
+                        parent_keys: listed
+                            .iter()
+                            .map(|f| f.field_key())
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    };
+                    *FIELD_UNRESOLVED_NAMES
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entry(mint)
+                        .or_insert(0) += 1;
+                }
                 None
             }
         }
@@ -1354,7 +1712,10 @@ impl GcCache {
     /// `index_in_parent`: descr.py:228 heaptracker.get_fielddescr_index_in(STRUCT, fieldname).
     ///   The structural slot number within the parent struct's field list.
     ///   Caller must provide it: `heaptracker::get_fielddescr_index_in` runs
-    ///   in `majit-translate`, one crate above this one.
+    ///   in `majit-translate`, one crate above this one. `None` is a caller that
+    ///   never resolved one — the state a deserialized `BhDescr::Field` can be
+    ///   in, and the only state a plain `usize` could not express, since an
+    ///   unwritten claim and a real slot-0 claim are the same integer.
     /// `flag`: descr.py:226 get_type_flag(FIELDTYPE).
     ///
     /// descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable).
@@ -1378,7 +1739,7 @@ impl GcCache {
         flag: ArrayFlag,
         index: u32,
         virtualizable: bool,
-        index_in_parent: usize,
+        index_in_parent: Option<usize>,
     ) -> Arc<SimpleFieldDescr> {
         // descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
@@ -1389,6 +1750,24 @@ impl GcCache {
             .and_then(|inner| inner.get(field_name))
             .cloned();
         if let Some(descr) = cached {
+            // field-cache identity: does this slot answer for the field the caller asked
+            // about?  Passing the *cached* values for the three components
+            // whose expected value is derived differently per build profile
+            // (immutability pair below, `index_in_parent` further down) leaves
+            // offset / size / type / virtualizable as the discriminator — the
+            // physical payload, compared identically in every profile.
+            FIELD_DESCR_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !descr.describes_same_field(
+                offset,
+                field_size,
+                field_type,
+                descr.is_immutable,
+                descr.is_quasi_immutable(),
+                virtualizable,
+                descr.index_in_parent,
+            ) {
+                FIELD_DESCR_CACHE_COLLISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // `front/mir.rs` leaves `SemanticProgram::immutable_fields`
             // empty for the whole LLBC pipeline — Charon serializes doc
             // comments but not the `#[jit_immutable_fields]` hint — so
@@ -1444,7 +1823,7 @@ impl GcCache {
                      size {field_size}, type {field_type:?}, immutable \
                      {expected_immutable}, quasi {expected_quasi_immutable}, \
                      vable {virtualizable}, index_in_parent \
-                     {expected_index_in_parent} [caller said {index_in_parent}])",
+                     {expected_index_in_parent} [caller said {index_in_parent:?}])",
                 descr.name,
                 descr.offset,
                 descr.field_size,
@@ -1497,9 +1876,17 @@ impl GcCache {
         //
         // So take the index from the parent that will actually be indexed,
         // rather than from whoever happened to call.
+        //
+        // The two fallbacks are not the same question. The parent's answer wins
+        // when it has one; failing that the caller's claim stands; failing THAT
+        // there is no claim at all, and `0` is what the descr has always carried
+        // in that state — written here as an explicit floor rather than as an
+        // initialiser, so the next reader sees that it is a fallback and not a
+        // position anyone computed.
         fd.index_in_parent =
-            Self::derive_index_in_parent(parent.as_ref(), field_name, index_in_parent)
-                .unwrap_or(index_in_parent);
+            Self::derive_index_in_parent(parent.as_ref(), field_name, index_in_parent, &fd.name)
+                .or(index_in_parent)
+                .unwrap_or(0);
         // descr.py:229 `is_quasi_immutable = '%s?' in STRUCT._hints.get(
         // '_immutable_fields_', ())` parity.  The analyzer side reads
         // `#[jit_immutable_fields(..., "field?", ...)]` via
@@ -1718,7 +2105,6 @@ impl GcCache {
         descr
     }
 
-    // ── External registration (cache-bypass mint sites) ─────────────
     //
     // PyPy `gc_cache._cache_*` is populated *exclusively* via the
     // cache-or-mint `get_*_descr` API.  Pyre's lift currently has many
@@ -1976,7 +2362,6 @@ impl GcCache {
         descr
     }
 
-    // ── Per-category snapshot accessors ─────────────────────────────
     //
     // `setup_descrs()` returns the full enumeration in PyPy group order;
     // these accessors expose individual groups for callers that need to
@@ -2096,6 +2481,36 @@ static GC_CACHE: OnceLock<Mutex<GcCache>> = OnceLock::new();
 /// descrs flows through this single instance.
 pub fn gc_cache() -> &'static Mutex<GcCache> {
     GC_CACHE.get_or_init(|| Mutex::new(GcCache::new()))
+}
+
+/// field-cache identity — `get_field_descr` cache hits, and the subset whose cached payload
+/// **disagrees** with what the caller asked for.
+///
+/// A disagreeing hit means one `(LLType, fieldname)` slot is answering for two
+/// different logical fields: the key is not injective over the field universe.
+/// That is what can change the number of distinct `Arc`s the descr pool sees —
+/// and it is invisible to any artefact diff, which can only show that the bytes
+/// moved, never whether the pool over-split or the mint minted twice.
+///
+/// **Why this and not "distinct `Arc`s per `(LLType, fieldname)`".** That
+/// quantity is identically 1: `_cache_field` *is* keyed by that pair, so the
+/// map holds one `Arc` per key by construction and a counter reading it back
+/// would report `max = 1` on every possible input. Counting the collisions is
+/// the same question asked where it can still be answered.
+///
+/// Deliberately **not** `cfg!(debug_assertions)`-gated. The `debug_assert!`
+/// in `get_field_descr` already computes a disagreement and discards it in
+/// release; a counter that compiled out would read zero and look clean.
+static FIELD_DESCR_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FIELD_DESCR_CACHE_COLLISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(hits, collisions)` for the `get_field_descr` cache since process start.
+pub fn field_descr_cache_collisions() -> (u64, u64) {
+    (
+        FIELD_DESCR_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        FIELD_DESCR_CACHE_COLLISIONS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// The mint arguments behind every `GcCache` slot an `EffectInfo` raw set
@@ -2731,7 +3146,6 @@ pub trait FailDescr: Descr {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────
     // compile.py:855 ResumeGuardDescr._attrs_ = ('rd_numb', 'rd_consts',
     //   'rd_virtuals', 'rd_pendingfields', 'status')
     //
@@ -2748,7 +3162,6 @@ pub trait FailDescr: Descr {
     // `ExitFrameWithExceptionDescrRef`) — these never carry resume
     // data, matching RPython where the `_attrs_` only live on
     // `AbstractResumeGuardDescr` subclasses.
-    // ──────────────────────────────────────────────────────────────────
 
     /// resume.py:450 — compact resume numbering bytes.
     fn rd_numb(&self) -> Option<&[u8]> {
@@ -5000,7 +5413,15 @@ pub fn make_simple_descr_group_keyed_with_headerless(
                 spec.flag,
                 spec.index,
                 spec.virtualizable,
-                spec.index_in_parent,
+                // `Some` because `SimpleFieldDescrSpec.index_in_parent` is a
+                // plain `usize` and CANNOT express the absence, not because
+                // every spec resolved a slot: the spec factories in
+                // `pyre-jit-trace/src/descr.rs` write literal `index_in_parent:
+                // 0` at a dozen sites. So on this path `unresolved_claimed` is
+                // an upper bound and `unresolved_placeholder` a lower one. The
+                // bound is exact only for callers that hand the `Option` in
+                // themselves — the deserialized-`BhDescr::Field` path.
+                Some(spec.index_in_parent),
             )
         })
         .collect();
@@ -6320,7 +6741,7 @@ mod register_keyed_size_authority_tests {
                 0,
                 false,
                 // A header-counting producer's number, two slots high.
-                3,
+                Some(3),
             )
         };
         let first = lookup(&mut gc);
@@ -6356,7 +6777,7 @@ mod register_keyed_size_authority_tests {
             ArrayFlag::Float,
             0,
             false,
-            0,
+            Some(0),
         );
         assert_eq!(first.index_in_parent, 0);
         // Second lookup: a header-counting producer hands index 2. No parent
@@ -6374,7 +6795,7 @@ mod register_keyed_size_authority_tests {
             ArrayFlag::Float,
             0,
             false,
-            2,
+            Some(2),
         );
         assert_eq!(second.index_in_parent, 0, "the cached descr wins");
     }

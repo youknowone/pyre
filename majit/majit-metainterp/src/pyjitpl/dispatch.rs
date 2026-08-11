@@ -248,7 +248,11 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                     is_quasi_immutable: *is_quasi_immutable,
                                     flag: *field_flag,
                                     virtualizable: false,
-                                    index_in_parent: *index_in_parent,
+                                    // `SimpleFieldDescrSpec` carries a plain
+                                    // `usize`, so the absence cannot ride any
+                                    // further: `0` is the value this field has
+                                    // always had here, spelled as a fallback.
+                                    index_in_parent: index_in_parent.unwrap_or(0),
                                 });
                                 specs.len() - 1
                             });
@@ -321,7 +325,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             *is_immutable,
                             *is_quasi_immutable,
                             *field_flag,
-                            *index_in_parent as u32,
+                            index_in_parent.unwrap_or(0) as u32,
                             false,
                             *index_in_parent,
                         );
@@ -376,7 +380,9 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             is_quasi_immutable: *is_quasi_immutable,
                             flag: *field_flag,
                             virtualizable: false,
-                            index_in_parent: *index_in_parent,
+                            // Same floor as the sibling arm above: the spec type
+                            // has no way to say "no slot was claimed".
+                            index_in_parent: index_in_parent.unwrap_or(0),
                         };
                         let group = majit_ir::descr::make_simple_descr_group_with_flags(
                             u32::MAX,
@@ -414,7 +420,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         *is_immutable,
                         *is_quasi_immutable,
                         *field_flag,
-                        *index_in_parent as u32,
+                        index_in_parent.unwrap_or(0) as u32,
                         false,
                         *index_in_parent,
                     );
@@ -467,7 +473,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
     }
 }
 
-/// Build a `CanRaise` [`EffectInfo`] whose field write-set names `write_field`
+/// Build a `CanRaise` [`majit_ir::effectinfo::EffectInfo`] whose field write-set names `write_field`
 /// of struct `type_id`, sharing the exact keyed `Arc<SimpleFieldDescr>` that a
 /// `getfield_gc_i` on the same `(type_id, write_field)` resolves to.  A
 /// residual helper that mutates a struct field through opaque host code — e.g.
@@ -651,7 +657,6 @@ pub trait JitCodeSym {
     /// Update an array state field element's concrete value.
     fn set_state_array_value(&mut self, _array_idx: usize, _elem_idx: usize, _value: i64) {}
 
-    // -- Ref-typed scalar state field support -------------
     //
     // A ref state field (`selected: ref(Stack)`) is tracked in the ref
     // register bank so its OpRef carries `Type::Ref`; this gives
@@ -674,7 +679,6 @@ pub trait JitCodeSym {
     /// Update a ref-typed scalar state field's concrete value.
     fn set_state_ref_field_value(&mut self, _field_idx: usize, _value: i64) {}
 
-    // -- Float-typed scalar state field support -------------
     //
     // Float state fields live in the float register bank and carry raw f64
     // bits in their concrete shadows.
@@ -726,6 +730,24 @@ pub trait JitCodeSym {
         self.total_slots()
     }
 
+    /// One past the last int-bank register the *register allocator*
+    /// reserves for identity slots, i.e. `int_identity_base +
+    /// num_scalars + num_vable_identity_slots`.
+    ///
+    /// This is deliberately NOT `int_identity_slots_end()`. That one is
+    /// `base + total_slots()`, and `total_slots()` adds every virt array's
+    /// **live `Vec::len()`** — a runtime quantity the jitcode lowerer cannot
+    /// see, so the lowering floor (`split_identity_reg_ends`) stops after the
+    /// scalars plus the single vable-identity slot. Registers between the two
+    /// ends are ordinary working registers; only `[base, reserved_end)` is
+    /// guaranteed to hold nothing but identity.
+    ///
+    /// The inline-frame snapshot trim must use THIS end: it blanks the range
+    /// unconditionally, and blanking a working register would drop live data.
+    fn int_identity_reserved_end(&self) -> usize {
+        self.int_identity_slots_end()
+    }
+
     /// First int-bank register used as a canonical identity slot
     /// (`int_scalar_base`). Identity slots occupy `[base, end)`; the base
     /// keeps the dispatch JitCode's int argument registers (`pc` at i0)
@@ -735,7 +757,7 @@ pub trait JitCodeSym {
         0
     }
 
-    /// Bridge state-field JIT's `__JitSym` storage onto
+    /// Bridge state-field JIT's `__JitSym_<fn>` storage onto
     /// `MIFrame.int_regs` / `int_values` ahead of guard capture.
     ///
     /// TODO (state-field JIT divergence):
@@ -743,13 +765,13 @@ pub trait JitCodeSym {
     /// directly via `setfield_*` opimpls during dispatch
     /// (`pyjitpl.py:74-95 MIFrame.setup` + per-opcode register
     /// assignments).  pyre's state-field JIT instead stores OpRefs +
-    /// concrete values in `__JitSym.<field>` / `<field>_value` etc.
+    /// concrete values in `__JitSym_<fn>.<field>` / `<field>_value` etc.
     /// because the macro emits per-opcode jitcodes that read state
     /// directly from the symbolic side-channel.  At guard-capture
     /// time `MIFrame::get_list_of_active_boxes`
     /// (`pyjitpl/frame.rs:430-440`) still expects live state in
     /// `int_regs` / `int_values`, so this hook copies the
-    /// `__JitSym` slots into the frame's banks at the canonical
+    /// `__JitSym_<fn>` slots into the frame's banks at the canonical
     /// liveness indices defined by `live_slots_for_state_field_jit`
     /// (orth-6): scalars at `0..num_scalars`, then
     /// flattened arrays, then virt-array (ptr, len) pairs.  Virt-
@@ -757,15 +779,17 @@ pub trait JitCodeSym {
     /// time from the user state's `<varr>.as_ptr() as i64` /
     /// `<varr>.len() as i64` (framestack-lift 1)
     /// — accurate iff the Vec does not reallocate during tracing
-    /// (true for the 6 macro examples that use fixed-capacity
-    /// `vec![0i64; program.len()]`).
+    /// (the examples allocate backing storage once at a fixed capacity
+    /// before tracing and never grow it). An example that pushes onto
+    /// that storage, or sizes it from something that changes during the
+    /// trace, breaks the mirror.
     ///
     /// Convergence path: when the macro switches to RPython
     /// MIFrame-regs storage, this
     /// method's default no-op impl matches RPython's "regs already
     /// populated by dispatch" semantics and the macro override drops
     /// out.  Until then, callers with a state-field JIT pass
-    /// `&__JitSym` here right before invoking
+    /// `&__JitSym_<fn>` here right before invoking
     /// `TraceRecordBuffer::capture_resumedata` so the framestack-walk
     /// snapshot has matching slot data.
     ///
@@ -778,19 +802,19 @@ pub trait JitCodeSym {
     /// calls `capture_resumedata`, every register bank is already
     /// up-to-date and `MIFrame::get_list_of_active_boxes` reads them
     /// without any side-channel sync.  pyre's macro instead routes
-    /// the same data through `__JitSym.<field>` for ergonomic reasons
+    /// the same data through `__JitSym_<fn>.<field>` for ergonomic reasons
     /// (the proc-macro can derive symbolic state-field accesses
     /// statically), and this trait method is the back-door that
     /// re-establishes the RPython invariant just before the snapshot
     /// is captured.  Convergence path: (codegen.rs / macro
-    /// → register-machine jitcode) eliminates `__JitSym` as a
+    /// → register-machine jitcode) eliminates `__JitSym_<fn>` as a
     /// distinct storage; macro-emitted opimpls then write directly to
-    /// `MIFrame.regs`, and this method (along with its `__JitSym`
+    /// `MIFrame.regs`, and this method (along with its `__JitSym_<fn>`
     /// value-mirror seeding from `JitState::initialize_sym`) is
     /// removed.
     fn populate_frame_int_regs(&self, _frame: &mut MIFrame) {}
 
-    /// [FR] Seed an INLINE recursive-portal callee frame's int register bank
+    /// \[FR\] Seed an INLINE recursive-portal callee frame's int register bank
     /// with its FRESH state as compile-time CONSTANTS (scalars zeroed, virt
     /// arrays sized at the caller's captured capacity).  The state-field
     /// dispatch keeps each scalar (e.g. `stackpos`) in a working int register
@@ -804,7 +828,7 @@ pub trait JitCodeSym {
     /// never reach the inline path.
     fn seed_recursive_fresh_frame(&self, _frame: &mut MIFrame) {}
 
-    /// [FR] Snapshot the sym's WORKING scalar (and fixed-array) state before an
+    /// \[FR\] Snapshot the sym's WORKING scalar (and fixed-array) state before an
     /// inline recursive-portal callee overwrites it.  `BC_LOAD/STORE_STATE_FIELD`
     /// read/write the single shared sym (dispatch.rs:2831), not a per-frame
     /// register, so an inline callee mutates the caller's live scalar state in
@@ -817,17 +841,17 @@ pub trait JitCodeSym {
         None
     }
 
-    /// [FR] Reset the sym's working scalar/fixed-array state to FRESH (zeroed),
+    /// \[FR\] Reset the sym's working scalar/fixed-array state to FRESH (zeroed),
     /// so the inline callee starts from a clean state rather than inheriting the
     /// caller's.  Paired with [`Self::snapshot_inline_scalar_state`].
     fn reset_inline_scalar_state_fresh(&mut self) {}
 
-    /// [FR] Restore the sym's working scalar/fixed-array state from a snapshot
+    /// \[FR\] Restore the sym's working scalar/fixed-array state from a snapshot
     /// when the inline callee returns.  Paired with
     /// [`Self::snapshot_inline_scalar_state`].
     fn restore_inline_scalar_state(&mut self, _snapshot: Vec<(majit_ir::OpRef, i64)>) {}
 
-    /// #184 recursive CALL_ASSEMBLER portal entry: build the fresh-frame
+    /// recursive-call recursive CALL_ASSEMBLER portal entry: build the fresh-frame
     /// reds for a recursive callee run.
     ///
     /// Returns the typed `Value` reds in `extract_live` order for a freshly
@@ -847,7 +871,7 @@ pub trait JitCodeSym {
         None
     }
 
-    /// #184 recursive CALL_ASSEMBLER portal entry: the host-Rust allocator and
+    /// recursive-call recursive CALL_ASSEMBLER portal entry: the host-Rust allocator and
     /// deallocator for a fresh callee state.
     ///
     /// Returns `(alloc, free)` raw function addresses where
@@ -1041,7 +1065,7 @@ where
 }
 
 /// Slice X-D-aware `JitCodeRuntime` carrying the `label_at` /
-/// `jitcell_token_arc_for_number` closures plus the #184 recursive-call
+/// `jitcell_token_arc_for_number` closures plus the recursive-call recursive-call
 /// seams (inline decision, green-key target resolver, concrete loop
 /// executor).  Used by `MetaInterp::trace_jitcode_with_framestack` so the
 /// dispatcher resolves CALL_ASSEMBLER targets to their production Arcs via
@@ -1382,7 +1406,7 @@ where
 
     /// Record a state-field-JIT guard.  Records the guard with no
     /// inline `op.fail_args` and attaches a snapshot built from the
-    /// current `MIFrame`'s `int_regs` (populated from `__JitSym` via
+    /// current `MIFrame`'s `int_regs` (populated from `__JitSym_<fn>` via
     /// `JitCodeSym::populate_frame_int_regs`).  The optimizer's
     /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:3200`) then
     /// derives `op.fail_args` from the snapshot via `_number_boxes`,
@@ -1597,7 +1621,7 @@ where
         // RPython only swaps the top frame pc before
         // `capture_resumedata`; it never writes portal state into an
         // inline callee frame.  State-field JIT still needs to
-        // materialize `__JitSym` scalars into an MIFrame register bank,
+        // materialize `__JitSym_<fn>` scalars into an MIFrame register bank,
         // but the only orthodox destination is the root/portal frame.
         if crate::bh_debug_enabled() {
             eprintln!(
@@ -1682,7 +1706,10 @@ where
             after_residual_call,
             &virtualizable_snapshot,
             &virtualref_snapshot,
-            Some((sym.int_identity_slots_base(), sym.int_identity_slots_end())),
+            Some((
+                sym.int_identity_slots_base(),
+                sym.int_identity_reserved_end(),
+            )),
         );
         for idx in 0..n {
             // RPython pyjitpl.py:180-193 leaves the parent frame's
@@ -1708,6 +1735,65 @@ where
                 ctx.set_guard_op_resume_position_from_end(from_end, snapshot_id)
             }
         }
+    }
+
+    /// pyjitpl.py:1916-1927 `MIFrame.implement_guard_value` — promote a box
+    /// to a `Const`, guarding that the runtime value still matches.
+    ///
+    /// ```python
+    /// def implement_guard_value(self, box, orgpc):
+    ///     if isinstance(box, Const):
+    ///         return box     # no promotion needed, already a Const
+    ///     else:
+    ///         promoted_box = executor.constant_from_op(box)
+    ///         self.metainterp.generate_guard(rop.GUARD_VALUE, box, promoted_box,
+    ///                                        resumepc=orgpc)
+    ///         self.metainterp.replace_box(box, promoted_box)
+    ///         return promoted_box
+    /// ```
+    ///
+    /// `generate_guard` is reached here through [`Self::record_state_guard`],
+    /// which walks the live framestack and the per-trace virtualizable /
+    /// virtualref boxes (`pyjitpl.py:2591-2625 capture_resumedata`). That is
+    /// the whole point of promoting at this layer: `TraceCtx::promote_int`
+    /// (`history.rs`) holds no `MIFrameStack`, so the snapshot it attaches
+    /// carries empty `boxes` AND an empty `vable_boxes`, and a guard that
+    /// survives optimization then deopts into a frame with no live registers
+    /// and a zero-length vable section.
+    ///
+    /// `replace_box` has no whole-metainterp equivalent here; writing the
+    /// promoted constant back into the source register is the same stand-in
+    /// `BC_SWITCH` already uses for it (`dispatch.rs:4585`), and it is what
+    /// keeps a second read of the same register from emitting a redundant
+    /// `GUARD_VALUE`.
+    fn implement_guard_value(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        reg: usize,
+        box_: OpRef,
+        runtime_value: i64,
+        resume_pc: usize,
+    ) -> OpRef {
+        // pyjitpl.py:1920-1921
+        if box_.is_constant() {
+            return box_;
+        }
+        // pyjitpl.py:1923 `executor.constant_from_op(box)`.
+        let promoted_box = ctx.const_int(runtime_value);
+        // pyjitpl.py:1924-1925
+        self.record_state_guard(
+            ctx,
+            sym,
+            OpCode::GuardValue,
+            &[box_, promoted_box],
+            resume_pc,
+            false,
+        );
+        // pyjitpl.py:1926 `replace_box`.
+        self.set_int_reg(reg, Some(promoted_box), Some(runtime_value));
+        // pyjitpl.py:1927
+        promoted_box
     }
 
     /// pyjitpl.py:1622 `MIFrame._create_segmented_trace_and_blackhole`,
@@ -2234,11 +2320,6 @@ where
             if frame.portal_entered {
                 let jd_box = ctx.const_int(frame.portal_jd as i64);
                 ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
-            }
-            // [FR] A recursive-portal INLINE frame installed its callee's
-            // fresh standard vable on push; restore the caller's on return.
-            if frame.portal_vable_saved {
-                ctx.restore_saved_virtualizable();
             }
             frame.portal_scalar_state
         } else {
@@ -3170,6 +3251,48 @@ where
         self.finish_call_assembler_exception_path(ctx, sym)
     }
 
+    /// Report where a bytecode-level abort was DECIDED, which the merge point
+    /// structurally cannot.
+    ///
+    /// `[jit] trace action at pc=N -> Abort` is emitted by the generated merge
+    /// point (`majit-macros/src/jit_interp/codegen_trace.rs`), so `N` is the
+    /// **portal pc** — where the walk started, not where it stopped. Read
+    /// literally it names the wrong dispatch arm: braininterp's abort reports
+    /// `pc=7` (`[`) and fires at `pc=14` (`]`). tla's and tinyframe's headers
+    /// already warned that this pc is the trace START, and the warning did not
+    /// prevent the misreading — a message that must be read against a comment
+    /// elsewhere will eventually be read on its own.
+    ///
+    /// `depth`/`body` are the other half, and they are the part the opcode
+    /// cannot supply: **`BC_ABORT` has two emitter families** in `majit-macros`
+    /// — the per-arm degraded stubs (`jitcode_lower/dispatch.rs`'s
+    /// `__sub_builder.abort()` sites) and a bounds-check bailout in the
+    /// dispatch body (`__builder.abort()`). Both emit this one opcode, so
+    /// seeing it identifies neither the arm nor the family. They are told apart
+    /// by *where* it ran: a degraded arm aborts inside its own sub-JitCode, an
+    /// inline frame whose whole body is the single abort byte, so
+    /// `depth>1 body=1` is the stub and the dispatch body is neither.
+    ///
+    /// `JitCode.name` would be the direct answer and is NOT usable here:
+    /// `majit_metainterp::JitCodeBuilder::new()` takes no name (unlike
+    /// `majit-translate`'s), so every macro-built JitCode carries `name: ""`.
+    /// Threading one through the macro's emit sites is the real fix; until then
+    /// these three numbers discriminate without it.
+    fn log_bytecode_abort(&mut self, insn: &str) {
+        if !crate::majit_log_enabled() {
+            return;
+        }
+        let depth = self.frames.len();
+        let frame = self.frames.current_mut();
+        eprintln!(
+            "[jit] {insn} decided at pos={} depth={depth} body={} \
+             (depth>1 body=1 = a degraded arm stub; the merge point's \
+             `trace action at pc=` reports the PORTAL pc, not this one)",
+            frame.last_opcode_position,
+            frame.jitcode.code.len(),
+        );
+    }
+
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
         if self.frames.is_empty() {
             return TraceAction::Continue;
@@ -3194,12 +3317,9 @@ where
                 ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
             }
             // [FR] Restore the caller's sym scalar/fixed-array state that this
-            // inline recursive-portal frame overwrote, and its nested vable.
+            // inline recursive-portal frame overwrote.
             if let Some(snapshot) = finished_frame.portal_scalar_state.clone() {
                 sym.restore_inline_scalar_state(snapshot);
-            }
-            if finished_frame.portal_vable_saved {
-                ctx.restore_saved_virtualizable();
             }
             if let Some(parent) = self.frames.frames.last_mut()
                 && let Some((return_kind, callee_src)) =
@@ -3319,16 +3439,66 @@ where
                 let dest = self.frames.current_mut().next_reg() as usize;
                 let (_, index_concrete) = self.read_int_reg(index_reg);
                 let elem_idx = index_concrete as usize;
-                let opref = sym.state_array_ref(array_idx, elem_idx);
-                if let Some(opref) = opref {
-                    let value = sym
-                        .state_array_value(array_idx, elem_idx)
-                        .expect("state array concrete value not initialized");
-                    self.set_int_reg(dest, Some(opref), Some(value));
-                } else {
-                    // Array element beyond initialized range (e.g., push expanded).
-                    // Abort trace -- this path needs dynamic array support.
-                    return TraceAction::Abort;
+                // Three outcomes, not two. `state_array_ref` returns
+                // `Option<OpRef>` and `OpRef` *itself* has a `None` variant, so
+                // "no such cell" and "the cell holds the cleared sentinel" both
+                // arrive as a `Some`-shaped answer unless they are split here.
+                // The generated accessor is `self.#field.get(elem_idx).copied()`
+                // (`codegen_state.rs:329`): an in-range cell always answers
+                // `Some(..)`, carrying `OpRef::NONE` when it was cleared.
+                match sym.state_array_ref(array_idx, elem_idx) {
+                    // The cell was retired by `clear_sym_inputarg_bindings` and
+                    // never re-seeded. Refuse: passing the sentinel on binds a
+                    // trace register to an OpRef with no operand or type, so it
+                    // would travel into jump args as a silently wrong binding.
+                    //
+                    // This opcode is reached at least 16 times by the
+                    // fixed-array fixtures and every one
+                    // of those reads carries a real binding, so the sentinel
+                    // count is 0-out-of-16+, not 0-out-of-0. (Measured by
+                    // inverting this arm's guard to `!opref.is_none()`, which
+                    // makes a real binding take the refusal: 16 panics, RC=101
+                    // in `jit_interp_fixed_array_identity_slot` alone. It is a
+                    // lower bound — that binary aborts the run before the
+                    // second fixture executes.) The surrounding match is live
+                    // code; what has never occurred is the cleared cell.
+                    //
+                    // That zero is structural rather than untested. This opcode addresses
+                    // *fixed* arrays only -- `codegen_state.rs:323` builds its
+                    // arms from `arrays` (`StateFieldKind::Array`), while
+                    // `virt_arrays` is a separate collection reached through
+                    // `BC_GETFIELD_VABLE_*`. A cell can hold the sentinel only
+                    // after a bridge. No example crate declares a fixed array
+                    // (all use `[T; virt]`); the only declarers are two metainterp
+                    // fixtures, and neither bridges -- measured against a
+                    // control that emitted 48 bridge lines on the same run.
+                    //
+                    // So this arm is a brake for the first crate to declare a
+                    // fixed array, NOT evidence that the path is exercised.
+                    // Do not cite a green suite as coverage of it, and do not
+                    // treat it as fixing the accessor: `.copied()` still cannot
+                    // distinguish the two cases at any other call site.
+                    Some(opref) if opref.is_none() => {
+                        panic!(
+                            "state array cell [{array_idx}][{elem_idx}] holds OpRef::NONE: \
+                             it was retired by `clear_sym_inputarg_bindings` and no bridge \
+                             seeding arm rebound it. `setup_bridge_sym` has no arm for state \
+                             arrays, so a crate declaring a fixed `[int]` array reaches this \
+                             opcode on a bridge with every cell cleared. The fix is a seeding \
+                             arm, not a weaker read here."
+                        );
+                    }
+                    Some(opref) => {
+                        let value = sym
+                            .state_array_value(array_idx, elem_idx)
+                            .expect("state array concrete value not initialized");
+                        self.set_int_reg(dest, Some(opref), Some(value));
+                    }
+                    None => {
+                        // Array element beyond initialized range (e.g., push expanded).
+                        // Abort trace -- this path needs dynamic array support.
+                        return TraceAction::Abort;
+                    }
                 }
             }
             jitcode::insns::BC_STORE_STATE_ARRAY => {
@@ -4282,6 +4452,16 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
+                // pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` /
+                // `_opimpl_setarrayitem_vable` reach the index through
+                // `implement_guard_value` on an `MIFrame`, which owns the
+                // framestack the resume snapshot is built from. Promoting here
+                // rather than inside `TraceCtx::get_arrayitem_vable_index`
+                // keeps that ownership: the guard gets a full-framestack,
+                // vable-carrying snapshot instead of the minimal one
+                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
+                let index =
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
                 let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_int_indexed(
                     opcode_pc,
@@ -4307,6 +4487,16 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
+                // pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` /
+                // `_opimpl_setarrayitem_vable` reach the index through
+                // `implement_guard_value` on an `MIFrame`, which owns the
+                // framestack the resume snapshot is built from. Promoting here
+                // rather than inside `TraceCtx::get_arrayitem_vable_index`
+                // keeps that ownership: the guard gets a full-framestack,
+                // vable-carrying snapshot instead of the minimal one
+                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
+                let index =
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
                 let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_ref_indexed(
                     opcode_pc,
@@ -4332,6 +4522,16 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
+                // pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` /
+                // `_opimpl_setarrayitem_vable` reach the index through
+                // `implement_guard_value` on an `MIFrame`, which owns the
+                // framestack the resume snapshot is built from. Promoting here
+                // rather than inside `TraceCtx::get_arrayitem_vable_index`
+                // keeps that ownership: the guard gets a full-framestack,
+                // vable-carrying snapshot instead of the minimal one
+                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
+                let index =
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
                 let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_float_indexed(
                     opcode_pc,
@@ -4357,6 +4557,16 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
+                // pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` /
+                // `_opimpl_setarrayitem_vable` reach the index through
+                // `implement_guard_value` on an `MIFrame`, which owns the
+                // framestack the resume snapshot is built from. Promoting here
+                // rather than inside `TraceCtx::get_arrayitem_vable_index`
+                // keeps that ownership: the guard gets a full-framestack,
+                // vable-carrying snapshot instead of the minimal one
+                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
+                let index =
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
                 let (value, concrete) = self.read_int_reg(src);
                 let guards_before = ctx.num_guards();
                 let write = match ctx.vable_setarrayitem_indexed(
@@ -4391,6 +4601,16 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
+                // pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` /
+                // `_opimpl_setarrayitem_vable` reach the index through
+                // `implement_guard_value` on an `MIFrame`, which owns the
+                // framestack the resume snapshot is built from. Promoting here
+                // rather than inside `TraceCtx::get_arrayitem_vable_index`
+                // keeps that ownership: the guard gets a full-framestack,
+                // vable-carrying snapshot instead of the minimal one
+                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
+                let index =
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
                 let (value, concrete) = self.read_ref_reg(src);
                 let guards_before = ctx.num_guards();
                 let write = match ctx.vable_setarrayitem_indexed(
@@ -4422,6 +4642,16 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
+                // pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` /
+                // `_opimpl_setarrayitem_vable` reach the index through
+                // `implement_guard_value` on an `MIFrame`, which owns the
+                // framestack the resume snapshot is built from. Promoting here
+                // rather than inside `TraceCtx::get_arrayitem_vable_index`
+                // keeps that ownership: the guard gets a full-framestack,
+                // vable-carrying snapshot instead of the minimal one
+                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
+                let index =
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
                 let (value, concrete) = self.read_float_reg(src);
                 let guards_before = ctx.num_guards();
                 let write = match ctx.vable_setarrayitem_indexed(
@@ -5162,6 +5392,21 @@ where
                 // through the `-live-` marker that precedes every
                 // `jit_merge_point` op, which an arbitrary mid-walk position
                 // has no counterpart for.
+                // Record the interpreter pc this merge point names, for the
+                // abort-resume correction in
+                // `trace_jitcode_with_args_and_runtime`.  It is written before
+                // every early return below, because a visit that goes on to
+                // return `Continue` still passed through a real opcode
+                // boundary, and that boundary is what the correction needs.
+                //
+                // Restricted to `inline_depth() == 0`: the position it competes
+                // with is the ROOT frame's i0, so an inlined callee's own pc
+                // would name a position in the wrong code.
+                if ctx.inline_depth() == 0 {
+                    if let Some(u) = mp_green_pc.and_then(|v| usize::try_from(v).ok()) {
+                        ctx.last_mp_green_pc = Some(u);
+                    }
+                }
                 if ctx.force_finish_trace() && ctx.num_ops() > ctx.trace_limit() * 4 / 5 {
                     // The loop-vs-bridge split lives inside
                     // `create_segmented_trace`, where upstream keeps it
@@ -5394,9 +5639,6 @@ where
                         if let Some(snapshot) = popped.portal_scalar_state.clone() {
                             sym.restore_inline_scalar_state(snapshot);
                         }
-                        if popped.portal_vable_saved {
-                            ctx.restore_saved_virtualizable();
-                        }
                         // (3) do_recursive_call(assembler_call=True) on the caller
                         //     (now current): reuse the existing 8-step
                         //     CALL_ASSEMBLER recorder. `set_int_reg(result_dst)`
@@ -5431,6 +5673,30 @@ where
                         //     caller frame in the walker dispatch loop.
                         return TraceAction::Continue;
                     }
+                    // pyjitpl.py:2975 reached_loop_header, its FIRST statement:
+                    //
+                    //     def reached_loop_header(self, greenboxes, redboxes):
+                    //         self.heapcache.reset()
+                    //
+                    // A merge point is where another trace may be cut in
+                    // (compile.py:255-256 `trace.cut_trace_from`) and where a
+                    // compiled loop may be entered from the interpreter.  So
+                    // nothing recorded past this point may depend on a heapcache
+                    // fact established before it: the guard that proved the fact
+                    // can end up on the far side of a cut, or simply never run on
+                    // an entry that starts here.  Resetting forces the tracer to
+                    // re-emit those guards, which is what keeps the ops after the
+                    // merge point self-sufficient.
+                    //
+                    // Placed after the `inline_depth() > 0` recursive-cut branch
+                    // above because that branch is upstream's `else` at
+                    // pyjitpl.py:1579 — it returns instead of calling
+                    // `reached_loop_header`, so the reset must not run on it.
+                    // Upstream reaches the GUARD_FUTURE_CONDITION at :2993 with
+                    // only `remove_consts_and_duplicates` and the virtualizable
+                    // box handling in between, neither of which reads the
+                    // heapcache, so reset-then-guard is the faithful order.
+                    ctx.heap_cache_mut().reset();
                     // pyjitpl.py:2991-2993 reached_loop_header: generate a dummy
                     // GUARD_FUTURE_CONDITION just before the implicit JUMP so
                     // unroll's `jump_to_existing_trace` has a `patchguardop`
@@ -5611,9 +5877,12 @@ where
                     // compile_loop_body) finds it via get_merge_point_at(inner_key,
                     // ctx.header_pc).
                     //
-                    // S0 census (env-gated MAJIT_INNERMP): append-and-observe with
-                    // NO close, to confirm the inner key is stable and detected on
-                    // revisit before enabling the cut close.
+                    // The S0 census that established this — append-and-observe
+                    // with NO close, confirming the inner key is stable and
+                    // detected on revisit before the cut close was enabled — ran
+                    // behind a `MAJIT_INNERMP` gate that no longer exists. Nothing
+                    // reads that name today; re-running the census means adding
+                    // the gate back, not setting a variable.
                     if inner_close && let Some(pc) = mp_green_pc {
                         let header_pc = ctx.header_pc;
                         // pyjitpl.py:3001-3007, which runs BEFORE the
@@ -5651,7 +5920,7 @@ where
                         // under the key it is reached by and the jump lands
                         // in code the interpreter can also enter.
                         //
-                        // ⚠ The earlier measurement against this lever —
+                        // The earlier measurement against this lever —
                         // cel's `nested_list_loop_varying_trip_count` keeping
                         // its results and losing its 4 aborts while `spread
                         // 0..32` deopts went 959 → 1763 over 4000 rows and
@@ -5700,7 +5969,25 @@ where
                             .has_compiled_targets_fn
                             .as_ref()
                             .is_some_and(|f| f(inner_key));
+                        // Producer side of slots 50/67, which count only what
+                        // happens once a close has been published. Counted here,
+                        // before the branch, so a zero downstream separates "the
+                        // walk never reached this decision" from "it reached it
+                        // and the target was not compiled" — the two render
+                        // identically in those two slots. `is_some_and` also
+                        // answers false when the callback is absent, so the
+                        // reached-count is what makes an uninstalled
+                        // `has_compiled_targets_fn` visible rather than
+                        // indistinguishable from a real "no".
+                        //
+                        // The sibling `already_compiled_here` on the
+                        // `is_bridge_trace` path above is a DIFFERENT decision —
+                        // whether to append a first-visit merge point — and never
+                        // publishes `close_jump_into_key`, so it deliberately
+                        // carries no slot.
+                        crate::mc_diag_bump(68); // xloop_close_decision_reached
                         if already_compiled_here {
+                            crate::mc_diag_bump(69); // xloop_close_target_compiled
                             // pyjitpl.py:3004-3007 — the merge point just reached already owns a
                             // procedure token, so upstream JUMPs into it rather than deriving a second
                             // copy of that loop by cutting this trace.  `compile_trace` raises on
@@ -5727,6 +6014,7 @@ where
                                     );
                                 }
                             } else {
+                                crate::mc_diag_bump(70); // xloop_close_published
                                 ctx.close_greens = Some(mp_greens.clone());
                                 ctx.close_green_pc = Some(pc);
                                 ctx.close_jump_into_key = Some(inner_key);
@@ -6071,6 +6359,8 @@ where
                         exit_with_exception: false,
                         exc_value: 0,
                     };
+                } else {
+                    typed_return_without_caller_destination("BC_INT_RETURN", 'i');
                 }
             }
             // `int_return/c` — USE_C_FORM short source (`assembler.py:312`):
@@ -6106,6 +6396,8 @@ where
                         exit_with_exception: false,
                         exc_value: 0,
                     };
+                } else {
+                    typed_return_without_caller_destination("BC_INT_RETURN_C", 'i');
                 }
             }
             jitcode::insns::BC_REF_RETURN => {
@@ -6137,6 +6429,8 @@ where
                         exit_with_exception: false,
                         exc_value: 0,
                     };
+                } else {
+                    typed_return_without_caller_destination("BC_REF_RETURN", 'r');
                 }
             }
             jitcode::insns::BC_FLOAT_RETURN => {
@@ -6168,6 +6462,8 @@ where
                         exit_with_exception: false,
                         exc_value: 0,
                     };
+                } else {
+                    typed_return_without_caller_destination("BC_FLOAT_RETURN", 'f');
                 }
             }
             jitcode::insns::BC_VOID_RETURN => {
@@ -7946,8 +8242,14 @@ where
                 self.pop_exception_frame(ctx);
                 return self.unwind_to_exception_handler(ctx);
             }
-            jitcode::insns::BC_ABORT => return TraceAction::Abort,
-            jitcode::insns::BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,
+            jitcode::insns::BC_ABORT => {
+                self.log_bytecode_abort("BC_ABORT");
+                return TraceAction::Abort;
+            }
+            jitcode::insns::BC_ABORT_PERMANENT => {
+                self.log_bytecode_abort("BC_ABORT_PERMANENT");
+                return TraceAction::AbortPermanent;
+            }
             // No BC_NEW_ARRAY / BC_NEW_ARRAY_CLEAR arm by design: the codewriter
             // never emits these into a dispatched JitCode body (the byte-emit
             // methods in jitcode/assembler.rs have zero callers; jtransform /
@@ -8697,6 +8999,47 @@ where
     }
 }
 
+/// A typed `*_return` reached a caller that declared no destination for it.
+///
+/// `pyjitpl.py:2503-2509 finishframe` writes the result into `framestack[-1]`
+/// whenever the stack is non-empty, and `pyjitpl.py:258-275
+/// make_result_of_lastop` takes the destination from
+/// `ord(self.bytecode[self.pc-1])` — the result operand of the CALLER's
+/// `inline_call_*` instruction.  There is no no-destination case to fall
+/// through, and none can arise: `jtransform.py:414-435 rewrite_call` builds the
+/// name as `'%s_%s_%s' % (namebase, kinds, reskind)` with `reskind =
+/// getkind(op.result.concretetype)[0]`, so the caller's `_i`/`_r`/`_f`/`_v`
+/// suffix and the callee's terminator are ONE decision taken once, from the
+/// callee's own result type.
+///
+/// Pyre encodes the three destinations explicitly (`NO_RETURN_REG` sentinel,
+/// decoded at the `BC_INLINE_CALL`) instead of re-reading the caller's operand
+/// at return time, which is what makes the disagreement representable here.
+/// Reaching this means an encoder minted `inline_call_*_v` for a callee that
+/// ends in a typed return: the value has nowhere to go, and continuing would
+/// drop it in silence and leave the caller reading a stale register — the same
+/// shape as the green write `lower_stmt_fallback` used to discard, one layer
+/// down.
+///
+/// This does NOT abort the process. `run_to_end` wraps every `run_one_step`
+/// in `catch_unwind` (see the `abort_after_panic` site above), so the unwind is
+/// caught and converted to [`TraceAction::Abort`] — the trace is discarded and
+/// the interpreter answers, with the message printed only under `MAJIT_LOG`.
+/// That is the point: it puts this mismatch on the same disposition as the
+/// sibling site in [`MetaInterp::run_one_step`]'s finished-frame branch, which
+/// reaches the same catch through `expect("inline int return missing caller
+/// destination")`. Before this, the two disagreed — that one aborted the trace,
+/// this one let the walk continue against a register the callee never wrote.
+fn typed_return_without_caller_destination(insn: &str, argcode: char) -> ! {
+    panic!(
+        "{insn} returned an `{argcode}` value into a non-empty framestack, but the \
+         caller's BC_INLINE_CALL encoded NO_RETURN_REG for that bank. The \
+         `inline_call_*_{argcode}` form and the callee's terminator are one \
+         decision (jtransform.py:434 `reskind`) and this pair disagrees, so the \
+         returned value has no destination"
+    );
+}
+
 /// Legacy entry point used by tests and integrations that still hold
 /// `JitCode` by reference and do not pass a `MetaInterp` framestack
 /// borrow.  Allocates a [`StandaloneFrameStack`], pushes the root
@@ -8793,6 +9136,41 @@ where
         {
             ctx.walk_final_pc = Some(pc);
         }
+        // An arm that failed to lower is emitted as a degraded stub: a
+        // sub-JitCode whose entire body is the single `abort` byte, pushed by
+        // the arm's `BC_INLINE_CALL` (`jit_interp/jitcode_lower/dispatch.rs`
+        // emits `__sub_builder.abort()` as the whole body).  The arm's own code
+        // never runs, so the opcode applies NOTHING.
+        //
+        // i0 is the wrong resume position for exactly that case, and wrong in
+        // the silent direction: dispatch advances i0 before running the arm, so
+        // i0 names the position AFTER an opcode that did not execute.  Resuming
+        // there drops the opcode.  The offset is the shared prologue advance,
+        // not the instruction width, so a multi-byte opcode resumes inside its
+        // own operands and the interpreter decodes an operand as an opcode.
+        //
+        // The opcode's own boundary is the position the walk last passed
+        // through the merge point, which is where the interpreter is by
+        // construction re-enterable.  Re-running the opcode is sound precisely
+        // because the stub applied nothing.
+        //
+        // `last_mp_green_pc` is `None` for a driver that declares no greens —
+        // its merge point yields no concrete pc at all — so this correction
+        // does not apply there and the i0 position stands, unchanged.
+        let stub_resume_pc = if standalone.frames.frames.len() > 1
+            && standalone
+                .frames
+                .frames
+                .last()
+                .is_some_and(|f| f.jitcode.code.as_slice() == [crate::jitcode::insns::BC_ABORT])
+        {
+            ctx.last_mp_green_pc
+        } else {
+            None
+        };
+        if let Some(pc) = stub_resume_pc {
+            ctx.walk_final_pc = Some(pc);
+        }
         // Every frame below the top already carries its own resume position:
         // `BC_INLINE_CALL` sets `frame.pc = frame.code_cursor` on the caller
         // before pushing the callee.  The top frame's is still the last guard's
@@ -8803,7 +9181,16 @@ where
         // completed step leaves the cursor just past them — where RPython's
         // `self.pc = position` (`pyjitpl.py:3863`, in the `_get_opimpl_method`
         // handler) leaves `MIFrame.pc`.
-        if !std::mem::replace(&mut ctx.abort_after_panic, false) {
+        //
+        // A stub abort corrected above declines the conversion for the same
+        // reason `abort_after_panic` does — the frames name no work the
+        // blackhole should finish.  Publishing them anyway is what makes the
+        // correction inert: `pending_abort_blackhole` is consumed in preference
+        // to `single_pass_outcome`, so the stale position wins with no error.
+        // The flag is taken unconditionally so declining here cannot leave it
+        // set for the next abort.
+        let abort_after_panic = std::mem::replace(&mut ctx.abort_after_panic, false);
+        if !abort_after_panic && stub_resume_pc.is_none() {
             if let Some(top) = standalone.frames.frames.last_mut() {
                 top.pc = top.code_cursor;
             }
@@ -9804,7 +10191,7 @@ mod tests {
             is_field_signed: true,
             is_immutable: false,
             is_quasi_immutable: false,
-            index_in_parent: 0,
+            index_in_parent: Some(0),
             parent: Some(majit_translate::jitcode::BhSizeSpec {
                 size,
                 type_id,
@@ -10011,7 +10398,7 @@ mod tests {
         }
     }
 
-    /// #184 SLICE 0 — a `BC_RECURSIVE_CALL_INT` whose runtime inlines the
+    /// recursive-call SLICE 0 — a `BC_RECURSIVE_CALL_INT` whose runtime inlines the
     /// portal must push the portal frame, trace into it, marshal the
     /// argument into the portal's register, and write the portal's typed
     /// return back into the caller's destination register.  The portal
@@ -10228,7 +10615,7 @@ mod tests {
         }
     }
 
-    /// #184 S3f — a `BC_RECURSIVE_CALL_INT` whose runtime decides
+    /// recursive-call S3f — a `BC_RECURSIVE_CALL_INT` whose runtime decides
     /// `CallAssembler` must run the callee with a FRESH frame: the reds are
     /// the freshly-allocated callee state (`recursive_fresh_entry_reds`), not
     /// the caller's registers.  Each virt-array `&state` red is recorded as a
@@ -12094,6 +12481,77 @@ mod tests {
                 .count(),
             3,
         );
+    }
+
+    /// A callee ending in `int_return` under a caller that emitted the VOID
+    /// `inline_call` form has nowhere to put its result.
+    ///
+    /// `jtransform.py:414-435 rewrite_call` derives the `_i`/`_r`/`_f`/`_v`
+    /// suffix from `getkind(op.result.concretetype)[0]`, so upstream takes the
+    /// caller's suffix and the callee's terminator from one fact and cannot
+    /// mint this pair at all.  Pyre can, because it encodes the three
+    /// destinations explicitly with a `NO_RETURN_REG` sentinel; before this was
+    /// loud, the value was dropped in silence and the caller went on reading a
+    /// stale register.  The negative twin below is the same jitcode pair with
+    /// the destination declared, and it must still return 7.
+    ///
+    /// Asserted as `TraceAction::Abort`, not `#[should_panic]`: `run_to_end`
+    /// wraps `run_one_step` in `catch_unwind`, so the refusal never leaves the
+    /// tracer as a panic. A `#[should_panic]` version of this test FAILS with
+    /// "test did not panic as expected" while the message is printed — which is
+    /// also the answer to "is the sibling `.expect` at the finished-frame site
+    /// really louder than this was?". It is not; it aborts, and now so does this.
+    #[test]
+    fn typed_return_under_a_void_inline_call_is_refused() {
+        let mut callee = JitCodeBuilder::new();
+        callee.load_const_i_value(0, 7);
+        callee.int_return(0);
+        let callee = callee.finish();
+
+        let mut caller = JitCodeBuilder::new();
+        let sub_idx = caller.add_sub_jitcode(callee);
+        caller.inline_call(sub_idx);
+        caller.load_const_i_value(0, 0);
+        caller.int_return(0);
+        let jitcode = caller.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        assert!(
+            matches!(action, TraceAction::Abort),
+            "a typed return with no caller destination must abort the trace, got {action:?}",
+        );
+    }
+
+    /// Positive control for [`typed_return_under_a_void_inline_call_is_refused`]:
+    /// the identical pair with the caller declaring reg 0 as the destination
+    /// writes the callee's 7 through and finishes normally.  Without this the
+    /// `should_panic` above would also pass if the fixture simply failed to
+    /// reach the inline call.
+    #[test]
+    fn typed_return_under_a_matching_inline_call_writes_the_result_through() {
+        let mut callee = JitCodeBuilder::new();
+        callee.load_const_i_value(0, 7);
+        callee.int_return(0);
+        let callee = callee.finish();
+
+        let mut caller = JitCodeBuilder::new();
+        let sub_idx = caller.add_sub_jitcode(callee);
+        caller.inline_call_irf_i(sub_idx, &[], &[], &[], Some(0));
+        caller.int_return(0);
+        let jitcode = caller.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        let finish_args = match action {
+            TraceAction::Finish { finish_args, .. } => finish_args,
+            other => {
+                panic!("expected the caller to finish with the callee's result, got {other:?}")
+            }
+        };
+        assert_eq!(ctx.const_value(finish_args[0]), Some(7));
     }
 
     #[test]

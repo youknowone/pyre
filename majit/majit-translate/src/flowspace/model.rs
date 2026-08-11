@@ -5914,17 +5914,43 @@ mod tests {
         end.borrow_mut().closeblock(vec![link_es.clone()]);
         let g = FunctionGraph::new("f", start.clone());
 
+        // Name the identities so a wrong walk fails as a readable sequence diff
+        // rather than as a bare `false`. Anything the walk yields that is not
+        // one of the three constructed nodes reads as `?` instead of being
+        // silently absorbed.
+        let name = |b: &Rc<RefCell<Block>>| {
+            for (n, r) in [("start", &start), ("mid", &mid), ("end", &end)] {
+                if Rc::ptr_eq(b, r) {
+                    return n;
+                }
+            }
+            "?"
+        };
+        let lname = |l: &Rc<RefCell<Link>>| {
+            for (n, r) in [("sm", &link_sm), ("me", &link_me), ("es", &link_es)] {
+                if Rc::ptr_eq(l, r) {
+                    return n;
+                }
+            }
+            "?"
+        };
+
+        // The graph is the cycle start -> mid -> end -> start. Both helpers
+        // yield each node once, in forward-exit order; `end`'s exit back to
+        // `start` is the revisit the "once" in this test's name is about.
+        // Measured, and pinned as a sequence: membership alone cannot see a
+        // walk that reaches the same three nodes in a different order.
         let blocks = safe_iterblocks(&g);
-        assert_eq!(blocks.len(), 3);
-        assert!(Rc::ptr_eq(&blocks[0], &start));
-        assert!(blocks.iter().any(|block| Rc::ptr_eq(block, &mid)));
-        assert!(blocks.iter().any(|block| Rc::ptr_eq(block, &end)));
+        assert_eq!(
+            blocks.iter().map(name).collect::<Vec<_>>(),
+            ["start", "mid", "end"]
+        );
 
         let links = safe_iterlinks(&g);
-        assert_eq!(links.len(), 3);
-        assert!(links.iter().any(|link| Rc::ptr_eq(link, &link_sm)));
-        assert!(links.iter().any(|link| Rc::ptr_eq(link, &link_me)));
-        assert!(links.iter().any(|link| Rc::ptr_eq(link, &link_es)));
+        assert_eq!(
+            links.iter().map(lname).collect::<Vec<_>>(),
+            ["sm", "me", "es"]
+        );
     }
 
     #[test]

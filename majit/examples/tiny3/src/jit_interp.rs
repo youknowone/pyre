@@ -81,6 +81,9 @@ struct Tiny3State {
 
 pub type Bytecode = [u8];
 
+pub static COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static LAST_OPS_AFTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[expect(
     dead_code,
     reason = "the jit_interp macro resolves bytecode reads through this trait surface"
@@ -100,6 +103,7 @@ impl BytecodeExt for [u8] {
 #[majit_macros::jit_interp(
     state = Tiny3State,
     env = Bytecode,
+    greens = [pc, program],
     state_fields = {
         stackpos: int,
         stack: [int; virt],
@@ -109,6 +113,10 @@ impl BytecodeExt for [u8] {
 fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<Tiny3State> =
         majit_metainterp::JitDriver::new(threshold);
+    driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, _opcodes| {
+        COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LAST_OPS_AFTER.store(ops_after, std::sync::atomic::Ordering::Relaxed);
+    });
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
     let mut state = Tiny3State {
@@ -125,6 +133,10 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
     }
 
     while pc < program.len() {
+        // Still the bare observer/replay form. The single-executor
+        // `jit_merge_point!(driver, program, pc; state)` conversion does not
+        // hold for this interpreter yet, and `trip_count_gate` below is the
+        // permanent assertion that says so — see its second doc paragraph.
         jit_merge_point!();
         let opcode = program[pc];
         pc += 1;
@@ -345,7 +357,129 @@ fn parse_int(s: &str, start: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::interp;
+    use majit_metainterp::{RefusalKind, refusal_kind};
+
+    /// Serializes every JIT entry in this module, so the `COMPILES` window in
+    /// [`jit_tier_is_inert_pending_arm_lowering`] cannot be written by another
+    /// test running concurrently. The counters are process-wide, and libtest
+    /// runs these tests in parallel by default.
+    ///
+    /// Plain mutex: the helpers below and the gate must never call one
+    /// another, or a single thread takes it twice and deadlocks. The gate holds
+    /// the guard itself and calls `mainloop` directly for exactly that reason.
+    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// [`mainloop`] under [`PROBE_LOCK`].
+    fn mainloop_locked(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        mainloop(program, num_args, threshold)
+    }
+
+    /// [`JitTiny3Interp::run`] under [`PROBE_LOCK`].
+    ///
+    /// Not a convenience alias for `jit.run(..)` — the lock is the whole
+    /// point. A test that enters the JIT without it never READS the counters,
+    /// but it does MOVE them, which is what makes it the hazard.
+    fn run_locked(jit: &mut JitTiny3Interp, prog: &[&str], args: &mut Vec<i64>) -> i64 {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        jit.run(prog, args)
+    }
+
+    #[test]
+    fn jit_tier_is_inert_pending_arm_lowering() {
+        use std::sync::atomic::Ordering;
+
+        const N: i64 = 1001;
+        let src = format!("0 {N} {{ #1 1 ADD ->#1 #2 1 SUB ->#2 #2 }} #1");
+        let words: Vec<&str> = src.split_whitespace().collect();
+        // Bare `mainloop`, not `mainloop_locked`: the guard is taken here so the
+        // store/run/load is a single critical section. Going through the helper
+        // would take the plain mutex twice on one thread and deadlock.
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        COMPILES.store(0, Ordering::Relaxed);
+        let got = mainloop(&compile(&words), 0, 3);
+        let compiles = COMPILES.load(Ordering::Relaxed);
+        assert_eq!(got, N, "the interpreter's own trip count moved");
+
+        // Read after the run: nothing installs the dispatch JitCode until the
+        // interpreter is entered, so a list gathered before it is empty for the
+        // wrong reason.
+        let t3_arms: Vec<_> = majit_metainterp::degraded_dispatch_arms()
+            .into_iter()
+            .filter(|a| a.interp == "Tiny3State")
+            .collect();
+        let mut degraded: Vec<&str> = t3_arms.iter().map(|a| a.arm).collect();
+        degraded.sort_unstable();
+
+        // The CAUSE, which the name set cannot see: an arm can keep degrading
+        // for an entirely different reason. See tl's `jit_tier_is_alive` for the
+        // measurement that motivated this — three A/B arms whose name sets and
+        // pass counts were identical while the mechanism changed underneath.
+        let mut causes: Vec<(&str, RefusalKind)> = t3_arms
+            .iter()
+            .map(|a| (a.arm, refusal_kind(a.reason)))
+            .collect();
+        causes.sort_unstable();
+        assert_eq!(
+            causes,
+            [
+                ("OP_PUSH_FLOAT", RefusalKind::UnlowerableStmt),
+                ("OP_PUSH_INT", RefusalKind::UnlowerableStmt),
+            ],
+            "a degraded arm's cause moved while its name did not — a different \
+             mechanism is refusing it now"
+        );
+        // Both arms are refused for the same statement, the widening read of the
+        // operand bytes. Substring, not the whole reason: the macro renders the
+        // snippet with its own token spacing.
+        for a in &t3_arms {
+            assert!(
+                a.reason.contains("from_le_bytes"),
+                "{}'s refusal no longer names the `from_le_bytes` operand read: {}",
+                a.arm,
+                a.reason
+            );
+        }
+
+        assert_eq!(
+            degraded,
+            ["OP_PUSH_FLOAT", "OP_PUSH_INT"],
+            "the degraded-arm set moved. A MISSING name means that arm lowers \
+             again; once the set is EMPTY the loop body holds no stub, the back \
+             edge can close, and this crate should get a real jit_tier_is_alive \
+             gate instead of this test"
+        );
+        assert_eq!(
+            compiles, 0,
+            "count_to({N}) compiled {compiles} loops, but OP_PUSH_INT and \
+             OP_PUSH_FLOAT are abort stubs inside the loop body, so every trace \
+             aborts and nothing closes. A \
+             non-zero count means the tier came alive: replace this test with a \
+             real liveness gate pinning a measured ops_after"
+        );
+        println!(
+            "[tier-inert] count_to({N}) = {got} from the interpreter alone, {compiles} loops compiled, degraded {degraded:?}"
+        );
+    }
+
+    #[test]
+    fn trip_count_gate() {
+        for n in [1001i64, 1002] {
+            let src = format!("0 {n} {{ #1 1 ADD ->#1 #2 1 SUB ->#2 #2 }} #1");
+            let words: Vec<&str> = src.split_whitespace().collect();
+            let got = mainloop_locked(&compile(&words), 0, 3);
+            assert_eq!(
+                got, n,
+                "count_to({n}) = {got}, so the loop ran {got} passes rather than \
+                 {n} — an off-by-one trip count is the signature of a terminal \
+                 arm whose exit the trace dropped, leaving the lowered arm to \
+                 fall through to the dispatch back-edge"
+            );
+            println!("[trip-count] count_to({n}) = {got} — exactly {n} passes");
+        }
+    }
 
     #[test]
     fn jit_fibonacci_single() {
@@ -354,7 +488,7 @@ mod tests {
             .collect();
         let mut jit = JitTiny3Interp::new();
         let mut args = vec![1i64, 1, 11];
-        let result = jit.run(&prog, &mut args);
+        let result = run_locked(&mut jit, &prog, &mut args);
         assert_eq!(result, 89);
     }
 
@@ -374,7 +508,7 @@ mod tests {
 
             let mut jit = JitTiny3Interp::new();
             let mut jit_args = vec![1i64, 1, n];
-            let jit_result = jit.run(&prog, &mut jit_args);
+            let jit_result = run_locked(&mut jit, &prog, &mut jit_args);
 
             assert_eq!(jit_result.to_string(), expected, "fib({n}) mismatch");
         }
@@ -385,7 +519,7 @@ mod tests {
         let prog: Vec<&str> = "{ #1 #1 1 SUB ->#1 #1 }".split_whitespace().collect();
         let mut jit = JitTiny3Interp::new();
         let mut args = vec![5i64];
-        jit.run(&prog, &mut args);
+        run_locked(&mut jit, &prog, &mut args);
         assert_eq!(args[0], 0);
     }
 

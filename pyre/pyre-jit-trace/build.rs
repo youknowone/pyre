@@ -33,6 +33,17 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "static_ref_bindings.bin",
 ];
 
+/// Lowering switches read by `majit-translate` while this build script runs.
+/// They affect generated graphs, so Cargo and the content cache must both see
+/// their values; otherwise an A/B can silently restore the opposite setting.
+const LOWERING_GATE_ENV: [&str; 5] = [
+    "PYRE_DYN_INDIRECT",
+    "PYRE_FNPTR_INDIRECT",
+    "PYRE_MIR_FRAMESTATE",
+    "PYRE_OPTION_RESIDUAL_NARROW",
+    "PYRE_TUPLE_PER_SHAPE_CLASSDEF",
+];
+
 /// Build script for pyre-jit: runs majit-translate on the active pyre
 /// interpreter to auto-generate tracing code. This is the Rust
 /// equivalent of RPython's translation pipeline.
@@ -655,7 +666,10 @@ fn real_main() {
     // `PYRE_RTYPER_VERBOSE=1` workflow. The generated artifacts themselves do
     // not depend on verbosity, so an ordinary build may still reuse the cache.
     let verbose_prepass = std::env::var_os("PYRE_RTYPER_VERBOSE").is_some_and(|value| value == "1");
-    if !verbose_prepass && restore_codegen_cache(&cache_dir, &out_dir) {
+    // The callee census is emitted from the analysis itself. A cache restore
+    // would print no rows, which is indistinguishable from an empty census.
+    let callee_census = std::env::var_os("PYRE_CALLEE_CENSUS").is_some_and(|value| value == "1");
+    if !verbose_prepass && !callee_census && restore_codegen_cache(&cache_dir, &out_dir) {
         eprintln!(
             "[pyre-jit-trace build.rs] restored generated JIT trace artifacts from cache {}",
             cache_key
@@ -864,10 +878,41 @@ fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
             let effect = match spec.effect {
                 call_spec::CallEffectKind::Elidable => majit_translate::CallEffectKind::Elidable,
                 call_spec::CallEffectKind::Residual => majit_translate::CallEffectKind::Residual,
+                call_spec::CallEffectKind::Declared(declared) => {
+                    majit_translate::CallEffectKind::Declared(
+                        majit_translate::DeclaredCallEffects {
+                            extra: declared_extra_effect(declared.extra),
+                            can_collect: declared.can_collect,
+                            can_invalidate: declared.can_invalidate,
+                        },
+                    )
+                }
             };
             majit_translate::CallEffectOverride::new(target, effect)
         })
         .collect()
+}
+
+/// Carry one declared `EF_*` across the crate boundary.
+///
+/// Two enums rather than one shared type because `call_spec.rs` is the
+/// data-only contract pyre owns and `majit-translate` is the consumer; the
+/// arms are enumerated so adding a member on either side is a compile error
+/// here rather than a silent re-mapping.
+fn declared_extra_effect(
+    extra: call_spec::DeclaredExtraEffect,
+) -> majit_translate::DeclaredExtraEffect {
+    use call_spec::DeclaredExtraEffect as Spec;
+    use majit_translate::DeclaredExtraEffect as Translate;
+    match extra {
+        Spec::ElidableCannotRaise => Translate::ElidableCannotRaise,
+        Spec::LoopInvariant => Translate::LoopInvariant,
+        Spec::CannotRaise => Translate::CannotRaise,
+        Spec::ElidableOrMemoryError => Translate::ElidableOrMemoryError,
+        Spec::ElidableCanRaise => Translate::ElidableCanRaise,
+        Spec::CanRaise => Translate::CanRaise,
+        Spec::ForcesVirtualOrVirtualizable => Translate::ForcesVirtualOrVirtualizable,
+    }
 }
 
 fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
@@ -878,6 +923,11 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
     println!("cargo::rerun-if-changed=src/call_spec.rs");
     println!("cargo::rerun-if-env-changed=PYRE_RTYPER_VERBOSE");
+    println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS");
+    println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS_ROWS");
+    for key in LOWERING_GATE_ENV {
+        println!("cargo::rerun-if-env-changed={key}");
+    }
     // The mir-frontend analysis derives `jit_trace_gen.rs` from
     // the workspace LLBC artefacts or the `PYRE_MIR_FRONTEND_LLBC`
     // override. Track both so re-extracting LLBC or repointing the override
@@ -1072,6 +1122,10 @@ fn codegen_cache_key(manifest_dir: &str, repo_root: &str, source_paths: &[String
         h.write_str(&value);
     }
     h.write_os(std::env::var_os("PYRE_MIR_FRONTEND_LLBC"));
+    for key in LOWERING_GATE_ENV {
+        h.write_str(key);
+        h.write_os(std::env::var_os(key));
+    }
 
     // The codegen output also depends on every crate linked into this
     // build-script binary — `majit-translate`'s own dependencies

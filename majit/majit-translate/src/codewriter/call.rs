@@ -6,7 +6,7 @@
 //! which should remain as opaque calls ("residual").  Also handles builtin
 //! (oopspec) and recursive (portal) call classification.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
@@ -40,6 +40,51 @@ pub enum CanRaise {
     MemoryErrorOnly,
     /// Function can raise arbitrary exceptions.
     Yes,
+}
+
+/// Charon spells the receiver type of every closure `closure`, so a
+/// `Method { receiver_root: Some("closure") }` names a *kind*, not a type:
+/// it cannot say which closure is being invoked.  Test against
+/// [`is_closure_receiver`], never against this literal — Charon appends a
+/// `#N` disambiguator to all but one of them.
+const CLOSURE_RECEIVER_ROOT: &str = "closure";
+
+/// Whether `receiver` names the closure *kind* rather than a type.
+///
+/// Charon appends a `#N` disambiguator when one scope defines several
+/// closures, so the production spelling is `closure`, `closure#1`,
+/// `closure#12`, … — the bare form is the exception, not the rule. A
+/// pyre-jit-trace codegen over the three pyre artefacts reaches the
+/// receiver-agnostic fallback with 11 closure receivers, of which exactly
+/// **one** is spelled bare; matching the literal alone therefore let ten of
+/// them through to bind `Fn::call` to whichever graph happens to be the
+/// table's only `call`.
+///
+/// `#` cannot occur in a Rust path segment, so the disambiguator is
+/// unambiguous to strip and this cannot widen onto a real type name.
+fn is_closure_receiver(receiver: &str) -> bool {
+    match receiver.split_once('#') {
+        Some((base, disambiguator)) => {
+            base == CLOSURE_RECEIVER_ROOT
+                && !disambiguator.is_empty()
+                && disambiguator.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => receiver == CLOSURE_RECEIVER_ROOT,
+    }
+}
+
+/// Which analyzer a witness callstack is being recovered for.
+///
+/// RPython gets one `explain_analyze_slowly` per `GraphAnalyzer` subclass
+/// (graphanalyze.py:79-91); `_raise_effect_error` consults exactly two of
+/// them (call.py:191-194), and those two differ only in their leaf
+/// predicates, so the choice is a value here rather than two walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectWitness {
+    /// `RandomEffectsAnalyzer` — effectinfo.py:410-418.
+    RandomEffects,
+    /// `VirtualizableAnalyzer` — effectinfo.py:401-404.
+    ForcesVirtualizable,
 }
 
 /// Operation-level raise classification for `_canraise()`.
@@ -641,7 +686,7 @@ impl GraphStore {
     }
 }
 
-/// Opt-in receiver-driven method-dispatch family (issue #346).  A
+/// Opt-in receiver-driven method-dispatch family (receiver-dispatch configuration).  A
 /// consumer names a `>=2`-impl trait whose `dyn Trait` receivers should
 /// annotate to a base `ClassDef` linking the impl subclasses, so a
 /// method getattr on the receiver resolves the impl `MethodDesc` family
@@ -667,6 +712,369 @@ pub struct TraitFamilyRegistration {
 /// Instead, callee graphs are collected from parsed Rust source files
 /// (free functions via `collect_function_graphs` and trait impl methods
 /// via `extract_trait_impls`).
+
+/// Output of [`CallControl::unknown_callee_census`] (callee census).
+///
+/// Each direct-call bucket maps a callee spelling to the number of static
+/// call sites naming it, so both populations are readable: how many distinct
+/// callees fall in the bucket, and how many references ride on them.
+///
+/// The bucket key is the callee's SEGMENTS (`["core","ptr","null"]`), never
+/// the `::`-joined path. `CallPath` equality keys on the split, and so does
+/// the only consumer this census exists to feed: a `call_spec.rs`
+/// `FunctionPath(&[...])` override matches through
+/// `call_target_matches_loose`'s `_ => pattern == target` arm, which is
+/// exact structural equality with no leaf-suffix tolerance. Two callees that
+/// differ only in where the owner is split — the pair owner-segmentation records —
+/// render to one string and are two different keys to that matcher, so a
+/// joined key both merges their counts and leaves the entry untranscribable.
+/// `segmentations_by_spelling` is the control that says whether the merge is
+/// happening.
+#[derive(Default, Debug)]
+pub struct UnknownCalleeCensus {
+    /// Resolved and registered — the analyzers walk the body. Upstream's
+    /// `funcobj.graph` arm.
+    pub with_graph: HashMap<String, usize>,
+    /// No graph, but named in `external_funcobjs`. Upstream's
+    /// `analyze_external_call` arm (`graphanalyze.py:104-108`), reached for
+    /// upstream's reason — with the caveat that membership here means a
+    /// `mark_*` setter named the path (`func_effects_mut`), which is an
+    /// assertion about the callee rather than upstream's `external`
+    /// annotation on the funcobj. It is the closest declaration this side
+    /// owns, and the only one.
+    pub declared_external: HashMap<String, usize>,
+    /// No graph and no declaration. Upstream's `AttributeError` arm
+    /// (`graphanalyze.py:109-112`) takes `top_result()` here; this side
+    /// answers it as declared-external, which is bottom in five of the six
+    /// analyzers.
+    pub unknown: HashMap<String, usize>,
+    /// `target_to_path` declined, keyed by `CallTarget` variant. Not one
+    /// answer: `analyze_can_raise_impl` takes top, `analyze_random_effects`
+    /// takes bottom.
+    pub unresolvable_by_variant: HashMap<String, usize>,
+    /// `graphs: None` — the faithfully ported indirect arm
+    /// (`graphanalyze.py:117-121`), already top. The control for the rows
+    /// above.
+    pub indirect_unknown_family: usize,
+    /// `graphs: Some([])` — folds to bottom for the opposite reason (empty-graph).
+    pub indirect_empty_family: usize,
+    pub indirect_named_family: usize,
+    /// `external_funcobjs.len()` — the control for a `declared_external` of
+    /// zero, which otherwise cannot distinguish "the declaration channel is
+    /// empty" from "it has members no call site names". Two different
+    /// findings with the same count.
+    pub external_funcobjs_len: usize,
+    /// `function_graphs.len()` — the same control for `with_graph`.
+    pub function_graphs_len: usize,
+    /// Every `external_funcobjs` key, with the marks it carries and the
+    /// registered graphs whose path ends with it.
+    ///
+    /// This is what tells a declaration nothing calls from a declaration
+    /// spelled so that nothing *can* call it. `func_effects_mut` creates the
+    /// entry under whatever path the `mark_*` setter used, and
+    /// `insert_function_graph_indexed` only folds it into the graph when the
+    /// graph registers under that same key — so a mark written against a
+    /// shorter spelling than the one the graph carries stays here forever,
+    /// having annotated nothing.
+    pub declared_external_keys: Vec<DeclaredExternalKey>,
+    /// Every `::`-joined callee spelling seen in a direct-call bucket, mapped
+    /// to the distinct segmentations that rendered to it.
+    ///
+    /// The control for keying the buckets by segments. A spelling with one
+    /// entry is transcribable into a `FunctionPath(&[...])` override without
+    /// a choice; a spelling with two says the older joined keying was summing
+    /// two callees into one row, and that picking either split for an
+    /// override silently declines on the other — with no diagnostic, because
+    /// `call_target_matches_loose` reports a non-match by returning `false`.
+    ///
+    /// `BTreeSet` so two runs of one program print the same bytes.
+    pub segmentations_by_spelling: HashMap<String, BTreeSet<String>>,
+    /// Every `CallTarget::Method` call site, keyed by the three fields
+    /// `call_target_matches_loose`'s `Method`/`Method` arm actually reads:
+    /// `name`, `receiver_root`, and the `impl_type_prefix()` of
+    /// `resolved_path` (the only fallback it consults).
+    ///
+    /// The buckets above cannot answer why a `Method` override is inert,
+    /// because they key on the resolved `CallPath` and so record neither the
+    /// variant nor the receiver. Worse, they cannot see a `Method` site at
+    /// all when `target_to_path` declines — 80,254 of them on this tree — so
+    /// a reader concluding "no such call site exists" from the buckets would
+    /// be reading a population the instrument excludes. This map is therefore
+    /// filled *before* the resolution check, and covers every `Method` site
+    /// whether or not it resolves.
+    pub method_shapes: HashMap<String, usize>,
+}
+
+/// One `external_funcobjs` entry, as read by the callee census census.
+#[derive(Default, Debug)]
+pub struct DeclaredExternalKey {
+    /// `path.segments.join("::")`.
+    pub spelling: String,
+    /// The non-default [`FuncEffects`](crate::model::FuncEffects) fields this
+    /// entry carries. Empty means the entry exists but asserts nothing, so
+    /// nothing is lost by its being unreachable.
+    pub marks: Vec<String>,
+    /// Registered graph paths ending with this key's segments — the same
+    /// function under a longer spelling. Non-empty means the mark was
+    /// orphaned: the graph exists, and this assertion never reached it.
+    pub graph_suffix_matches: Vec<String>,
+    /// Registered graph paths sharing this key's leaf segment, and one
+    /// example. The control for `graph_suffix_matches` being empty, which
+    /// alone cannot separate "no graph anywhere names this function" from
+    /// "a graph names it under a spelling a suffix match cannot reach" — a
+    /// prefix *replacement* (`crate::jit::x` vs `majit_metainterp::jit::x`)
+    /// is not a suffix relation in either direction.
+    pub leaf_candidates: usize,
+    pub leaf_example: Option<String>,
+    /// Marks carried by `leaf_example`'s own graph. This is what separates a
+    /// LOST mark from a harmless duplicate: the same hint is written twice,
+    /// once against the graph's path (`lib.rs:1705`) and once against the
+    /// 2-segment owner spelling (`lib.rs:1743-1748`). If the graph already
+    /// carries the mark, the `external_funcobjs` entry is redundant; if it
+    /// does not, the assertion was lost.
+    pub leaf_example_marks: Vec<String>,
+}
+
+/// The non-default fields of a [`FuncEffects`](crate::model::FuncEffects),
+/// named. An empty result means the record asserts nothing.
+fn func_effects_marks(effects: &crate::model::FuncEffects) -> Vec<String> {
+    let mut marks = Vec::new();
+    if let Some(spec) = &effects.oopspec {
+        marks.push(format!("oopspec={spec}"));
+    }
+    for (flag, name) in [
+        (effects.cannot_collect, "cannot_collect"),
+        (effects.random_effects_on_gcobjs, "random_effects_on_gcobjs"),
+        (effects.cannot_raise_assertion, "cannot_raise_assertion"),
+        (effects.memerror_only_assertion, "memerror_only_assertion"),
+        (effects.elidable, "elidable"),
+        (effects.loop_invariant, "loop_invariant"),
+        (effects.close_stack, "close_stack"),
+    ] {
+        if flag {
+            marks.push(name.to_string());
+        }
+    }
+    marks
+}
+
+impl UnknownCalleeCensus {
+    /// Bucket totals as `(distinct callees, call sites)`.
+    fn totals(bucket: &HashMap<String, usize>) -> (usize, usize) {
+        (bucket.len(), bucket.values().sum())
+    }
+
+    /// The `limit` heaviest entries, most call sites first, ties broken by
+    /// spelling — an order that reproduces across processes, unlike the
+    /// map's own.
+    fn top(bucket: &HashMap<String, usize>, limit: usize) -> Vec<(&str, usize)> {
+        let mut rows: Vec<(&str, usize)> = bucket.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        rows.truncate(limit);
+        rows
+    }
+
+    /// Rows per table, from `PYRE_CALLEE_CENSUS_ROWS` (`all` for no cap).
+    ///
+    /// A knob rather than a constant because the question this census is
+    /// usually asked — *what spelling does a call site actually carry?* —
+    /// cannot be answered from a 25-row prefix of a 14,834-entry population,
+    /// and widening a constant costs a whole analysis pass to rebuild.
+    ///
+    /// An unparseable value is reported beside the table rather than silently
+    /// replaced by the default: a cap that quietly ignored what was asked for
+    /// would make the header's own `limit=` a lie.
+    fn row_limit() -> (usize, Option<String>) {
+        const DEFAULT: usize = 25;
+        match std::env::var("PYRE_CALLEE_CENSUS_ROWS") {
+            Err(_) => (DEFAULT, None),
+            Ok(raw) if raw == "all" => (usize::MAX, None),
+            Ok(raw) => match raw.parse::<usize>() {
+                Ok(n) => (n, None),
+                Err(_) => (DEFAULT, Some(raw)),
+            },
+        }
+    }
+
+    /// One bucket's heaviest rows, with the cap and the denominator on the
+    /// header line.
+    ///
+    /// `distinct` is the population, `shown` is what this table lists and
+    /// `limit` is what was asked for. All three ride on the header because a
+    /// reader holding only the rows cannot tell a complete table from a
+    /// truncated one — and a truncated census does not fail, it reports a
+    /// smaller true number, which is the failure mode that reads as a result.
+    fn write_bucket(
+        f: &mut std::fmt::Formatter<'_>,
+        label: &str,
+        bucket: &HashMap<String, usize>,
+        limit: usize,
+    ) -> std::fmt::Result {
+        let rows = Self::top(bucket, limit);
+        let limit_shown = if limit == usize::MAX {
+            "all".to_string()
+        } else {
+            limit.to_string()
+        };
+        writeln!(
+            f,
+            "[callee census] {label}_rows distinct={} shown={} limit={limit_shown} \
+             order=count-desc,key-asc",
+            bucket.len(),
+            rows.len()
+        )?;
+        for (name, count) in rows {
+            writeln!(f, "[callee census]   {label} {count:>6}  {name}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for UnknownCalleeCensus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (label, bucket) in [
+            ("with_graph", &self.with_graph),
+            ("declared_external", &self.declared_external),
+            ("unknown", &self.unknown),
+            ("unresolvable", &self.unresolvable_by_variant),
+        ] {
+            let (distinct, sites) = Self::totals(bucket);
+            writeln!(
+                f,
+                "[callee census] {label}: {distinct} distinct, {sites} call sites"
+            )?;
+        }
+        writeln!(
+            f,
+            "[callee census] indirect: {} unknown-family (top), {} empty-family (bottom), \
+             {} named-family",
+            self.indirect_unknown_family, self.indirect_empty_family, self.indirect_named_family
+        )?;
+        writeln!(
+            f,
+            "[callee census] registry sizes: function_graphs {}, external_funcobjs {}",
+            self.function_graphs_len, self.external_funcobjs_len
+        )?;
+        // The keying control. Both denominators ride on the line so an empty
+        // list below is distinguishable from a run that recorded nothing:
+        // `joined 0` means the walk found no direct calls at all, `split 0`
+        // out of a non-zero `joined` means the two keyings agree here.
+        let mut split: Vec<(&str, &BTreeSet<String>)> = self
+            .segmentations_by_spelling
+            .iter()
+            .filter(|(_, splits)| splits.len() > 1)
+            .map(|(spelling, splits)| (spelling.as_str(), splits))
+            .collect();
+        split.sort();
+        let segmented_keys: usize = self
+            .segmentations_by_spelling
+            .values()
+            .map(BTreeSet::len)
+            .sum();
+        writeln!(
+            f,
+            "[callee census] segmentation: {} joined spellings carry >1 segmentation \
+             (joined {}, segmented {})",
+            split.len(),
+            self.segmentations_by_spelling.len(),
+            segmented_keys
+        )?;
+        for (spelling, splits) in &split {
+            writeln!(
+                f,
+                "[callee census]   split-spelling {spelling}  -> {}",
+                splits.iter().cloned().collect::<Vec<_>>().join(" | ")
+            )?;
+        }
+        let (limit, rejected) = Self::row_limit();
+        if let Some(raw) = rejected {
+            writeln!(
+                f,
+                "[callee census] row_limit_env_ignored value={raw:?} is neither a number nor \
+                 `all`; the tables below use the default"
+            )?;
+        }
+        // `with_graph` is printed here for the first time. Its callees are the
+        // only place a call site's ACTUAL resolved spelling is readable, and
+        // the census used to publish just its count -- so the one question an
+        // override author must answer (what do I have to match?) could not be
+        // answered from the census at all.
+        Self::write_bucket(f, "with_graph", &self.with_graph, limit)?;
+        // Zero-row on every run so far. Printed anyway: an absent table and a
+        // table that is genuinely empty read identically, and telling those
+        // two apart is the whole open question about this bucket.
+        Self::write_bucket(f, "declared_external", &self.declared_external, limit)?;
+        Self::write_bucket(f, "unknown", &self.unknown, limit)?;
+        Self::write_bucket(f, "unresolvable", &self.unresolvable_by_variant, limit)?;
+        // Keyed by the fields the Method/Method arm reads, not by resolved
+        // path, and populated before the resolution check — so this is the
+        // only table in which a `Method` override's non-match is falsifiable.
+        Self::write_bucket(f, "method_shapes", &self.method_shapes, limit)?;
+        let orphaned = self
+            .declared_external_keys
+            .iter()
+            .filter(|decl| !decl.graph_suffix_matches.is_empty())
+            .count();
+        let carrying = self
+            .declared_external_keys
+            .iter()
+            .filter(|decl| !decl.marks.is_empty())
+            .count();
+        writeln!(
+            f,
+            "[callee census] declarations: {} total, {orphaned} ORPHANED (a registered graph's \
+             path ends with the key, so the mark never reached it), {carrying} carrying marks",
+            self.declared_external_keys.len()
+        )?;
+        for decl in &self.declared_external_keys {
+            let marks = if decl.marks.is_empty() {
+                "(no marks)".to_string()
+            } else {
+                decl.marks.join(",")
+            };
+            write!(f, "[callee census]   decl {}  [{marks}]", decl.spelling)?;
+            match decl.graph_suffix_matches.split_first() {
+                Some((first, rest)) if rest.is_empty() => writeln!(f, "  ORPHANED-> {first}")?,
+                Some((first, rest)) => writeln!(f, "  ORPHANED-> {first} (+{} more)", rest.len())?,
+                // No suffix match. The leaf control says whether that means
+                // no graph names this function at all, or one names it under
+                // a spelling the suffix test cannot reach.
+                None => match &decl.leaf_example {
+                    None => writeln!(
+                        f,
+                        "  no-graph (leaf absent, {} candidates)",
+                        decl.leaf_candidates
+                    )?,
+                    Some(example) => {
+                        let graph_marks = if decl.leaf_example_marks.is_empty() {
+                            "MARK-LOST".to_string()
+                        } else {
+                            format!("graph-has[{}]", decl.leaf_example_marks.join(","))
+                        };
+                        writeln!(
+                            f,
+                            "  NO-SUFFIX-MATCH but leaf has {} graph(s), e.g. {example} {graph_marks}",
+                            decl.leaf_candidates
+                        )?
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `CallTarget`'s variant name, for bucketing a target no `CallPath`
+/// resolution reached.
+fn call_target_variant_name(target: &CallTarget) -> &'static str {
+    match target {
+        CallTarget::Method { .. } => "Method",
+        CallTarget::FunctionPath { .. } => "FunctionPath",
+        CallTarget::SyntheticTransparentCtor { .. } => "SyntheticTransparentCtor",
+        CallTarget::Indirect { .. } => "Indirect",
+        CallTarget::UnsupportedExpr => "UnsupportedExpr",
+    }
+}
 
 pub struct CallControl {
     /// Registered graphs, keyed by call path through a funcobj-identity
@@ -1717,7 +2125,7 @@ impl CallControl {
                 // Same rule as the named-element path (`get_type_flag`) and
                 // the codewriter-less fallback in `assembler.rs`: a pointer
                 // element strides by the TARGET word, an int/float bank by 8.
-                // The list/tuple items-block ops the #171 append fold emits
+                // The list/tuple items-block ops the list-append append fold emits
                 // carry no `array_type_id`, so a flat 8 here would stride a
                 // `GcArray(OBJECTPTR)` at 8 bytes on a 32-bit target while
                 // the runtime block holds 4-byte items.
@@ -1916,27 +2324,19 @@ impl CallControl {
     /// element type come from `get_type_flag(field_type_str)` (same
     /// mechanism `arraydescrof` uses for primitive item sizing).
     ///
-    /// `descr.py:218-239 get_field_descr` cache-or-mint: PyPy
-    /// `cpu.fielddescrof` 는 `(STRUCT, fieldname)` identity 로 cache 하여
-    /// 분석기와 런타임이 동일한 `FieldDescr` Arc 에 도달한다.  Pyre 는
-    /// `path_hash(STRUCT)` 를 surrogate identity 로 쓰는데, 런타임은
-    /// `__majit_type_id` = `path_hash(concat!(module_path!(), "::",
-    /// stringify!(Struct)))` (`jit_struct.rs:92`) 로 def-path 를 해시
-    /// 한다.  분석기 `field.owner_root` 는 `qualify_type_name(type_root,
-    /// ctx.module_prefix)` 로 use-site 모듈 qualifier 를 받으므로
-    /// `canonical_struct_name` (Followup 2, `5fcab5ddc8`,
-    /// `STRUCT_ORIGIN_REGISTRY` 컨설팅) 를 거쳐 정의-모듈 qualifier 로
-    /// 표준화해야 publish 슬롯과 일치한다.  `fielddescrof_concrete` 의
-    /// `path_hash` boundary 에서 canonicalise (이 모듈 fix), 그리고
-    /// `interiorfielddescrof`/`all_interiorfielddescrs` 와 동일 패턴
-    /// (`call.rs:1492` + `:5067`).
+    /// PyPy's `descr.py:218-239 get_field_descr` caches by `(STRUCT,
+    /// fieldname)`, so analyzer and runtime users reach one descriptor. Pyre
+    /// uses `path_hash(STRUCT)` for that identity. Runtime publication hashes
+    /// the definition path through `__majit_type_id` (`jit_struct.rs:92`),
+    /// while analyzer fields can initially carry a use-site-qualified owner.
+    /// `canonical_struct_name` consults `STRUCT_ORIGIN_REGISTRY` to normalize
+    /// that owner to its definition path before hashing. The same rule is used
+    /// by `interiorfielddescrof` and `all_interiorfielddescrs`.
     ///
-    /// `ei_index` consequence (`effectinfo.py:465-538 compute_bitstrings`):
-    /// `EI_INDEX_TABLE` side-table 폐기 (Round 4) 이후
-    /// `descr.get_ei_index()` 만 readback (`heap.rs:866`).  canonicalise
-    /// 가 분석기와 런타임을 같은 `register_keyed_field` Arc 로 모으므로
-    /// `set_ei_index` 가 단일 슬롯에 도달, cross-module 호출 사이트도
-    /// effectinfo bitstring 을 정상 소비한다.
+    /// `effectinfo.py:465-538 compute_bitstrings` stores the effect-info index
+    /// on the descriptor itself. Canonicalization therefore also ensures that
+    /// cross-module callers read the index written by `set_ei_index` from the
+    /// same `register_keyed_field` descriptor.
     ///
     /// `None` when the struct is not registered in `self.struct_fields`
     /// (unanalyzable callee — caller silently skips the raw-set push).
@@ -2055,19 +2455,10 @@ impl CallControl {
                 // `is_quasi_immutable=true` (the `record_quasiimmut_field`
                 // path `jtransform.py:895-903`).  Missing entry retains
                 // the mutable default.
-                // `descr.py:108-118 cache[STRUCT]` 단일 identity 와
-                // 정렬: 분석기측 `owner_root` 가 use-site 모듈 qualifier
-                // (`front::mir` 이 Charon `name_path()` 에서 기록) 인
-                // 동안 런타임 publish 는
-                // `path_hash(strip_crate(module_path!())::Name)` (def-path).
-                // `canonical_struct_name` 가 `STRUCT_ORIGIN_REGISTRY`
-                // (Followup 2, `5fcab5ddc8`) 를 통해 bare-name 입력에
-                // 정의-모듈 qualifier 를 붙여 `path_hash` 가 publish 슬롯
-                // 과 일치하게 한다.  Cross-module use-site 도 같은
-                // `register_keyed_field` Arc 에 도달하므로 `set_ei_index`
-                // 가 런타임 reader 와 단일 슬롯에서 만난다.
-                // `interiorfielddescrof`/`all_interiorfielddescrs` 와 동일
-                // 패턴 (`call.rs:1492` + `:5067`).
+                // Runtime publication hashes a struct's definition path,
+                // whereas analyzer input can carry a use-site-qualified owner.
+                // Normalize through `STRUCT_ORIGIN_REGISTRY` so both paths use
+                // the same keyed descriptor and its attached effect-info index.
                 // Prefer the source-attached identity token (collision-free
                 // even when `owner_root` is a bare leaf two modules share);
                 // fall back to canonicalising the name when the descriptor
@@ -2186,7 +2577,9 @@ impl CallControl {
                     flag,
                     u32::MAX,
                     false,
-                    index_in_parent,
+                    // Always a claim: `field_pos_in` walks the owner's layout and
+                    // panics rather than hand back an unnumbered field.
+                    Some(index_in_parent),
                 );
                 descr.set_index(idx);
                 // Same arguments this `get_field_descr` miss just used, kept so
@@ -2355,7 +2748,9 @@ impl CallControl {
                         flag,
                         u32::MAX,
                         false,
-                        index_in_parent,
+                        // Always a claim: `field_pos_in` walks the owner's layout and
+                        // panics rather than hand back an unnumbered field.
+                        Some(index_in_parent),
                     );
                     found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
                 }
@@ -3497,7 +3892,15 @@ impl CallControl {
 
     /// Size of the post-`find_all_graphs` candidate set — the graphs the
     /// portal closure actually reaches, against which the registered graph
-    /// count is the eagerly-lowered universe.
+    /// count (`function_graphs.len()`) is the eagerly-lowered universe.
+    ///
+    /// `function_graphs.len()` and `SemanticProgram::functions.len()` are
+    /// *different* populations — the registry is roughly 4x the program's
+    /// function list — so a ratio taken against one is not comparable to a
+    /// ratio taken against the other.  Whenever this count is published as a
+    /// proportion, name the denominator alongside it; the pipeline profile
+    /// line (`lib.rs`, `PYRE_PROFILE_PIPELINE`) prints both absolutes rather
+    /// than a quotient for exactly that reason.
     pub fn candidate_graph_count(&self) -> usize {
         self.candidate_graphs.len()
     }
@@ -4503,51 +4906,33 @@ impl CallControl {
             if receiver.contains("::") || canonical != receiver {
                 return None;
             }
+            // A closure receiver names the kind, not a type, so it can
+            // never identify a callee.  Subsumed by the retirement of the
+            // receiver-agnostic fallback below — every receiver now
+            // declines — and kept as an explicit statement of the case,
+            // since resolving these for real needs the closure bodies in
+            // `function_graphs`, which the front end does not lower.
+            if is_closure_receiver(receiver) {
+                return None;
+            }
         }
 
-        // TODO(parity): retire when annotator wiring publishes
-        // classdef hints before BFS runs.
-        // TODO: receiver-agnostic "unique concrete impl" fallback.
-        // Upstream `call.py:175-187
-        // getfunctionptr(graph)` keys on graph identity, never on
-        // method name, so this branch has no RPython counterpart.
-        // Pyre keeps it as a BFS-coverage adaptation: the codewriter
-        // producer (`codewriter.rs::stamp_classdef_hints_on_graph`)
-        // runs per-graph during transform, which is AFTER
-        // `find_all_graphs_bfs` (`call.rs:2398`) has already chosen
-        // candidates.  When BFS walks a Call site whose receiver is a
-        // generic trait variable (`<H: OpcodeStepExecutor>`) with no
-        // annotator-derived classdef hint and no receiver-name match,
-        // collapsing to the unique concrete impl is the only way to
-        // include the impl's body in `candidate_graphs`.  Retired once
-        // the annotator publishes classdef hints
-        // before BFS runs; the
-        // `find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal`
-        // and `all_jitcodes_registry_contains_inherent_impl_methods`
-        // oracles pin the BFS coverage this branch enables.
-        let concrete_impls: Vec<&String> = impls
-            .iter()
-            .copied()
-            .filter(|t| !t.starts_with("<default methods of"))
-            .collect();
-        if concrete_impls.len() == 1 {
-            let impl_type = concrete_impls[0];
-            let path = CallPath::for_impl_method(impl_type, name);
-            return self.function_graphs.get(&path);
-        }
-
-        // Single registered "default methods" shim — uniqueness here
-        // does not depend on the receiver because the trait default
-        // body is the same for every impl that does not override it
-        // (`classdesc.py:749 lookup` MRO walk).  Match only when the
-        // sole registration is a default-method shim AND no
-        // overriding concrete impl exists.
-        if concrete_impls.is_empty() && impls.len() == 1 {
-            let impl_type = impls[0];
-            let path = CallPath::for_impl_method(impl_type, name);
-            return self.function_graphs.get(&path);
-        }
-
+        // No receiver-agnostic fallback: a method NAME is not a callee.
+        // `call.py:175-187 getfunctionptr(graph)` keys on graph identity,
+        // so a site whose receiver names no registered impl has no
+        // resolution and becomes a residual call.
+        //
+        // Pyre carried a "unique concrete impl" collapse here as a
+        // BFS-coverage adaptation for generic trait receivers
+        // (`<H: OpcodeStepExecutor>`) that reach `find_all_graphs_bfs`
+        // before `stamp_classdef_hints_on_graph` has published a classdef
+        // hint.  It is retired because uniqueness could only ever be
+        // checked over the impls this artifact happens to contain: a
+        // second lowered impl turns the bind into a decline, but an impl
+        // in a crate outside the artifact never registers, the count stays
+        // one, and the wrong bind persists with nothing to detect it.
+        // That is a rule over a partial universe, and the direction it
+        // fails in is silent.
         None
     }
 
@@ -4596,28 +4981,14 @@ impl CallControl {
             if majit_ir::descr::canonical_struct_name(receiver) != receiver {
                 return None;
             }
+            // Closure receiver: same decline as [`Self::resolve_method`].
+            if is_closure_receiver(receiver) {
+                return None;
+            }
         }
 
-        // TODO: receiver-agnostic "unique concrete impl" fallback — see
-        // the matching branch in [`Self::resolve_method`] for the
-        // rationale.  Retired
-        // alongside it once the annotator publishes classdef hints
-        // before BFS.
-        let concrete_impls: Vec<&String> = impls
-            .iter()
-            .copied()
-            .filter(|t| !t.starts_with("<default methods of"))
-            .collect();
-        if concrete_impls.len() == 1 {
-            return Some(concrete_impls[0].as_str());
-        }
-
-        // Lone default-method shim — uniqueness here is a property of
-        // the trait, not the receiver (every impl shares the default
-        // body per `classdesc.py:749 lookup` MRO walk).
-        if concrete_impls.is_empty() && impls.len() == 1 {
-            return Some(impls[0].as_str());
-        }
+        // No receiver-agnostic fallback — see [`Self::resolve_method`] for
+        // why the uniqueness it rested on was not checkable.
         None
     }
 
@@ -4773,7 +5144,6 @@ impl CallControl {
         &self.jitdrivers_sd
     }
 
-    // ── Per-graph JIT hint carrier ───────────────────────────────────
     //
     // `graph.hints` is the raw `#[jit_*]` source-attribute token bag
     // (`elidable`, `loopinvariant`, `close_stack`, plus the open policy
@@ -4805,8 +5175,6 @@ impl CallControl {
             g.hints.push(tok.to_string());
         }
     }
-
-    // ── Elidable / loop-invariant registration ──────────────────────
 
     /// RPython: `getattr(func, "_elidable_function_", False)` (call.py:239).
     /// Mark a target as elidable (pure function). Sets the typed
@@ -4972,7 +5340,164 @@ impl CallControl {
             .filter(|names| !names.is_empty())
     }
 
-    // ── Graph-based analyzers (call.py:282-303) ─────────────────────
+    /// Census of how the analyzers' `function_graphs.get(path)` lookup
+    /// classifies every static call site in the registered universe (callee census).
+    ///
+    /// `GraphAnalyzer.analyze` (`graphanalyze.py:93-130`) — the single base
+    /// all six analyzers below share — splits a `direct_call` four ways, and
+    /// two of those arrive here as one. Upstream reads "external" off a
+    /// *declaration* on the funcobj (`:104-108`) and gives a callee whose
+    /// funcobj has no `graph` attribute `top_result()` (`:109-112`). This
+    /// side has only the external arm and reaches it by absence from
+    /// `function_graphs`, so a callee that is merely unknown is answered as
+    /// one that was declared.
+    ///
+    /// The counts say what that costs. Upstream's fourth arm is a residue
+    /// because the rtyper's universe is closed — every callee has a graph or
+    /// a declaration. An LLBC universe is open, so `unknown` is whatever
+    /// Charon did not extract, and its size indicates how much additional
+    /// callee classification is required.
+    ///
+    /// Scope: static call sites reachable by walking every registered
+    /// graph's operations. It is a call-site population, not a trace of what
+    /// the analyzers actually visited — the analyzers recurse and memoize,
+    /// so one unknown leaf can decide many roots, and this counts the leaf
+    /// once and each reference to it once.
+    pub fn unknown_callee_census(&self) -> UnknownCalleeCensus {
+        let mut census = UnknownCalleeCensus {
+            external_funcobjs_len: self.external_funcobjs.len(),
+            function_graphs_len: self.function_graphs.len(),
+            ..Default::default()
+        };
+        for (_, graph) in self.function_graphs.iter() {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    match &op.kind {
+                        OpKind::Call { target, .. } => {
+                            // Before the resolution check: an unresolvable
+                            // `Method` never reaches the buckets, and that is
+                            // exactly where a missing override match could be
+                            // hiding.
+                            if let CallTarget::Method {
+                                name,
+                                receiver_root,
+                                resolved_path,
+                            } = target
+                            {
+                                let prefix =
+                                    resolved_path.as_ref().map(|path| path.impl_type_prefix());
+                                *census
+                                    .method_shapes
+                                    .entry(format!(
+                                        "name={name:?} receiver_root={receiver_root:?} impl_type_prefix={prefix:?}"
+                                    ))
+                                    .or_default() += 1;
+                            }
+                            let Some(path) = self.target_to_path(target) else {
+                                // `target_to_path` declined. The analyzers
+                                // disagree about this one: `can_raise` takes
+                                // top (:5037), `random_effects` takes bottom
+                                // (:5170).
+                                *census
+                                    .unresolvable_by_variant
+                                    .entry(call_target_variant_name(target).to_string())
+                                    .or_default() += 1;
+                                continue;
+                            };
+                            // Key by the SEGMENTS: that is what `CallPath`
+                            // equality compares, and what an override in
+                            // `call_spec.rs` has to reproduce exactly. The
+                            // joined spelling is recorded beside it, as the
+                            // control for whether the two keyings differ at
+                            // all on this tree.
+                            let segmented = format!("{:?}", path.segments);
+                            census
+                                .segmentations_by_spelling
+                                .entry(path.segments.join("::"))
+                                .or_default()
+                                .insert(segmented.clone());
+                            let bucket = if self.function_graphs.contains_key(&path) {
+                                &mut census.with_graph
+                            } else if self.external_funcobjs.contains_key(&path) {
+                                &mut census.declared_external
+                            } else {
+                                &mut census.unknown
+                            };
+                            *bucket.entry(segmented).or_default() += 1;
+                        }
+                        // The indirect arm is ported faithfully
+                        // (`graphanalyze.py:117-121`), so it is the control:
+                        // `None` here already takes top.
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => census.indirect_unknown_family += 1,
+                            Some([]) => census.indirect_empty_family += 1,
+                            Some(_) => census.indirect_named_family += 1,
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Index every registered graph path by its leaf segment once, rather
+        // than rescanning `function_graphs` per declaration.
+        let mut graphs_by_leaf: HashMap<&str, Vec<(&CallPath, &FunctionGraph)>> = HashMap::new();
+        for (path, graph) in self.function_graphs.iter() {
+            if let Some(leaf) = path.segments.last() {
+                graphs_by_leaf
+                    .entry(leaf.as_str())
+                    .or_default()
+                    .push((path, graph));
+            }
+        }
+        let mut declared: Vec<DeclaredExternalKey> = self
+            .external_funcobjs
+            .iter()
+            .map(|(path, effects)| {
+                let leaf = path.segments.last().map(String::as_str).unwrap_or("");
+                let candidates = graphs_by_leaf.get(leaf).map(Vec::as_slice).unwrap_or(&[]);
+                // A graph naming the same function under a longer path: its
+                // segments end with every segment of the declaration.
+                let mut graph_suffix_matches: Vec<String> = candidates
+                    .iter()
+                    .filter(|(candidate, _)| candidate.segments.ends_with(&path.segments))
+                    .map(|(candidate, _)| candidate.segments.join("::"))
+                    .collect();
+                graph_suffix_matches.sort();
+                // Render the candidate's SEGMENTS, not its joined path: when
+                // the two agree on the joined string and disagree on the
+                // split, only the segmentation shows it — and the split is
+                // what `CallPath` equality keys on.
+                let mut leaf_rows: Vec<(String, Vec<String>)> = candidates
+                    .iter()
+                    .map(|(candidate, graph)| {
+                        (
+                            format!("{:?}", candidate.segments),
+                            func_effects_marks(&graph.func),
+                        )
+                    })
+                    .collect();
+                leaf_rows.sort();
+                let (leaf_example, leaf_example_marks) = match leaf_rows.into_iter().next() {
+                    Some((spelling, graph_marks)) => (Some(spelling), graph_marks),
+                    None => (None, Vec::new()),
+                };
+                DeclaredExternalKey {
+                    spelling: format!("{:?}", path.segments),
+                    marks: func_effects_marks(effects),
+                    graph_suffix_matches,
+                    leaf_candidates: candidates.len(),
+                    leaf_example,
+                    leaf_example_marks,
+                }
+            })
+            .collect();
+        // By spelling: the map's own order is a hash order, and this is read
+        // by a human comparing two runs.
+        declared.sort_by(|a, b| a.spelling.cmp(&b.spelling));
+        census.declared_external_keys = declared;
+        census
+    }
+
     //
     // The five `analyze_*` methods below walk
     // `crate::model::FunctionGraph` (the flat codewriter graph), inlining
@@ -5176,6 +5701,126 @@ impl CallControl {
         false
     }
 
+    /// RPython: `GraphAnalyzer.explain_analyze_slowly` (graphanalyze.py:79-91)
+    /// — re-run the analysis with `verbose` set and collect the callstack that
+    /// reached the top result, for `_raise_effect_error` to print
+    /// (call.py:189-208). The fast analyzers memoize a bare bool, so the
+    /// witness has to be recomputed on the failure path rather than recorded
+    /// on the hot one; upstream re-`__init__`s the analyzer for the same
+    /// reason.
+    ///
+    /// Returned outermost-first, matching upstream's `explanation.reverse()`
+    /// (graphanalyze.py:90) so the offending edge sits nearest the error.
+    fn explain_effect_witness(&self, path: &CallPath, witness: EffectWitness) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        self.walk_effect_witness(path, witness, &mut seen, &mut chain);
+        chain.reverse();
+        chain
+    }
+
+    /// One walk for both witnesses: `RandomEffectsAnalyzer` and
+    /// `VirtualizableAnalyzer` differ only in their leaf predicates, so the
+    /// differing value is selected first and the traversal runs once.
+    fn walk_effect_witness(
+        &self,
+        path: &CallPath,
+        witness: EffectWitness,
+        seen: &mut HashSet<CallPath>,
+        chain: &mut Vec<String>,
+    ) -> bool {
+        if !seen.insert(path.clone()) {
+            return false; // cycle → bottom_result
+        }
+        let name = path.segments.join("::");
+        let graph = match self.function_graphs.get(path) {
+            Some(graph) => graph,
+            None => {
+                // Mirrors the leaf arms of `analyze_random_effects` /
+                // `analyze_forces_virtualizable`: only a
+                // `random_effects_on_gcobjs` external is a witness.
+                let reached = witness == EffectWitness::RandomEffects
+                    && self
+                        .external_funcobjs
+                        .get(path)
+                        .is_some_and(|funcobj| funcobj.random_effects_on_gcobjs);
+                if reached {
+                    chain.push(format!("{name} is external with random_effects_on_gcobjs"));
+                }
+                return reached;
+            }
+        };
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let reason = match &op.kind {
+                    OpKind::VableForce { .. } if witness == EffectWitness::ForcesVirtualizable => {
+                        Some("forces a virtualizable".to_string())
+                    }
+                    OpKind::IndirectCall {
+                        graphs: None,
+                        funcptr,
+                        ..
+                    } => Some(format!(
+                        "calls the function pointer {funcptr} indirectly, and its \
+                         family is unknown"
+                    )),
+                    OpKind::Call { target, .. } => self.target_to_path(target).and_then(|callee| {
+                        self.walk_effect_witness(&callee, witness, seen, chain)
+                            .then(|| format!("calls {}", callee.segments.join("::")))
+                    }),
+                    OpKind::IndirectCall {
+                        graphs: Some(graphs),
+                        ..
+                    } => graphs
+                        .iter()
+                        .find(|callee| self.walk_effect_witness(callee, witness, seen, chain))
+                        .map(|callee| format!("indirectly calls {}", callee.segments.join("::"))),
+                    _ => None,
+                };
+                if let Some(reason) = reason {
+                    chain.push(format!("{name} {reason}"));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// RPython: `_raise_effect_error` (call.py:189-208). A failed
+    /// `elidable` / `_jit_loop_invariant_` post-condition prints the
+    /// callstack that produced the contradicting effect before the error
+    /// itself, so the offending edge is named instead of searched for.
+    fn raise_effect_error(
+        &self,
+        target: &CallTarget,
+        extraeffect: ExtraEffect,
+        functype: &str,
+    ) -> ! {
+        // call.py:191-194 — only these two effects have an explainable
+        // witness; anything else falls back to the bare error.
+        let witness = match extraeffect {
+            ExtraEffect::RandomEffects => Some(EffectWitness::RandomEffects),
+            ExtraEffect::ForcesVirtualOrVirtualizable => Some(EffectWitness::ForcesVirtualizable),
+            _ => None,
+        };
+        let explanation = witness
+            .zip(self.target_to_path(target))
+            .map(|(witness, path)| self.explain_effect_witness(&path, witness))
+            .unwrap_or_default();
+        let mut msg = Vec::new();
+        if !explanation.is_empty() {
+            msg.push("_______ ERROR AT BOTTOM ______".to_string());
+            msg.push("callstack leading to problem:".to_string());
+            msg.extend(explanation);
+            msg.push("_______ ERROR: ______".to_string());
+        }
+        msg.push(format!(
+            "getcalldescr: {target} is marked {functype} but got \
+             extraeffect={extraeffect:?}"
+        ));
+        panic!("{}", msg.join("\n"));
+    }
+
     /// RPython: QuasiImmutAnalyzer.analyze() (effectinfo.py).
     ///
     /// analyze_simple_operation: op.opname == 'jit_force_quasi_immutable'.
@@ -5297,8 +5942,6 @@ impl CallControl {
         }
         false
     }
-
-    // ── Cached analyzer wrappers ────────────────────────────────────
 
     /// Cached version of _canraise for a CallTarget.
     ///
@@ -5488,8 +6131,6 @@ impl CallControl {
             .any(|path| self.cached_can_collect_path(path, cache))
     }
 
-    // ── _canraise + getcalldescr (call.py:210-355) ──────────────────
-
     /// RPython: CallControl._canraise(op) (call.py:337-355).
     ///
     /// ```python
@@ -5513,8 +6154,17 @@ impl CallControl {
             method_name,
         } = target
         {
+            // Same fold as `rpbc.rs:404-421` and as `getcalldescr`'s
+            // `CallShape::Indirect` above: `all_impls_for_indirect` returns
+            // an empty vector both when the family is genuinely empty and
+            // when its impls live outside the analyzed sources, and this
+            // side cannot tell those apart.  `Some(&[])` would reach
+            // `cached_can_raise_family`'s `No` initialiser without the loop
+            // body ever running, i.e. "an unregistered family cannot
+            // raise".  `None` is the honest answer and gives `Yes`.
             let graphs = self.all_impls_for_indirect(trait_root, method_name);
-            return self.cached_can_raise_family(Some(&graphs), cache);
+            let graphs = (!graphs.is_empty()).then_some(graphs);
+            return self.cached_can_raise_family(graphs.as_deref(), cache);
         }
         self.cached_can_raise(target, cache)
     }
@@ -5552,7 +6202,28 @@ impl CallControl {
         }
         let shape = match &op.kind {
             OpKind::Call { target, .. } => CallShape::Direct(target),
-            OpKind::IndirectCall { graphs, .. } => CallShape::Indirect(graphs.as_deref()),
+            // An empty family is folded to `None` HERE, once, rather than
+            // left for each analyzer to meet.  `graphs` distinguishes "the
+            // family is unknown" (`None` → top) from "the family is known
+            // and has no members" (`Some([])`), but every family analyzer
+            // below unwraps the `Option` and then iterates, so `Some([])`
+            // reaches each one's bottom result — `CanRaise::No`,
+            // `forces_virtualizable = false`, no random effects — i.e. it
+            // silently asserts that a callee nobody enumerated has no
+            // effects.  Nothing in this pipeline ever proves a family
+            // closed and empty: `Some([])` is only ever the deferred
+            // `BuiltinWrapper` marker (`front/mir.rs:13056-13073`), and it
+            // survives to here exactly when the fill at `rpbc.rs:335-343`
+            // had no registered wrappers to fill it with.  "No members"
+            // therefore means "unknown", which is `None`.
+            //
+            // `rpbc.rs:404-421` already makes this fold at the other site
+            // that answers the same question, with the same reasoning.
+            OpKind::IndirectCall { graphs, .. } => CallShape::Indirect(
+                graphs
+                    .as_deref()
+                    .filter(|candidates| !candidates.is_empty()),
+            ),
             other => panic!("getcalldescr called on non-call op: {other:?}"),
         };
 
@@ -5830,10 +6501,7 @@ impl CallControl {
                 CallShape::Direct(t) => t,
                 _ => unreachable!(),
             };
-            panic!(
-                "getcalldescr: {target} is marked loop-invariant but got \
-                 extraeffect={extraeffect:?}"
-            );
+            self.raise_effect_error(target, extraeffect, "loop-invariant");
         }
         if elidable {
             let target = match shape {
@@ -5846,10 +6514,7 @@ impl CallControl {
                     | ExtraEffect::ElidableOrMemoryError
                     | ExtraEffect::ElidableCanRaise
             ) {
-                panic!(
-                    "getcalldescr: {target} is marked elidable but got \
-                     extraeffect={extraeffect:?}"
-                );
+                self.raise_effect_error(target, extraeffect, "elidable");
             }
             // call.py:315-318: elidable function must have a result
             if result_type == Type::Void {
@@ -6146,8 +6811,19 @@ fn canonicalize_keyed_descrs(
         descrs.push(descr);
         keys.push(key?);
     }
-    // The raw set stays in pointer order for identity dedup and lookup, while
-    // the member order crossing into the artifact is determined by content.
+    // `descrs` keeps the `Arc::as_ptr` order every raw-set consumer expects
+    // (`descr_set_eq`, `descr_set_hash`, `compute_bitstrings`' ptr-id
+    // `binary_search`); it is `#[serde(skip)]` and never leaves this process,
+    // so its address order is harmless.
+    //
+    // `keys` does leave: it is the `descr_set_keys` that lands in `descrs.bin`
+    // and `jit_metadata.json`, and inheriting the address order would make
+    // those artifacts a function of this process's heap layout rather than of
+    // the analyzed source.  Order it by the member instead — structural, and
+    // identical in any process.  The two Vecs are consequently NOT positionally
+    // paired; the only consumer of `keys` (`rehydrate_effect_info`) rebuilds
+    // each member independently and re-canonicalizes, so it never indexes one
+    // by the other's position.
     keys.sort();
     Some((descrs, keys))
 }
@@ -6304,21 +6980,13 @@ pub fn effectinfo_from_writeanalyze(
     // `UnsupportedFieldExc` filters at `effectinfo.py:380-397` +
     // `:316-324`.
     //
-    // Identity convergence (Followup 2 + Reviewer fix-1):
-    // `__majit_type_id` 는 `path_hash(concat!(module_path!(), "::",
-    // stringify!(Struct)))` (`jit_struct.rs:92`) 로 def-path 해시.
-    // 분석기 `field.owner_root` 는 `qualify_type_name(type_root,
-    // ctx.module_prefix)` 로 use-site qualifier 를 받는다.  `canonical_
-    // struct_name` (`STRUCT_ORIGIN_REGISTRY`, `5fcab5ddc8`) 가
-    // bare-name 입력을 정의-모듈 qualifier 로 표준화하므로
-    // `cc.fielddescrof()` / `cc.interiorfielddescrof()` / `all_interior
-    // fielddescrs` 가 `gc_cache.get_field_descr(LLType::Struct(
-    // path_hash(canonical)), field_name, ...)` 로 분기 통합 —
-    // 분석기와 런타임이 같은 `register_keyed_field` Arc 에 도달
-    // (`descr.py:218-239 get_field_descr` per-tuple identity).
-    //
-    // `compute_bitstrings` 도 `descr.get_ei_index()` 단일 Arc 슬롯으로
-    // 수렴하므로 heap-invalidation 이 cross-module 호출 사이트에서도
+    // Runtime `__majit_type_id` values hash the struct's definition path, but
+    // analyzer fields can carry a use-site-qualified owner. Normalize with
+    // `canonical_struct_name` before descriptor lookup so `fielddescrof`,
+    // `interiorfielddescrof`, and `all_interiorfielddescrs` converge on the
+    // same `register_keyed_field` allocation. This also makes
+    // `compute_bitstrings` and cross-module heap invalidation share the
+    // descriptor's single effect-info index.
     // populated bitstring 을 정상 소비한다.
     // PyPy `effectinfo.py:345-360` `readonly` rule:
     //   elif tup[0] == "readstruct":
@@ -7200,7 +7868,9 @@ fn all_interiorfielddescrs(
                         *flag,
                         u32::MAX,
                         false,
-                        index_in_parent,
+                        // Always a claim: the index is this field's position in
+                        // `entries`, straight off `.iter().enumerate()`.
+                        Some(index_in_parent),
                     )
                 }
             };
@@ -7333,7 +8003,9 @@ fn all_interiorfielddescrs(
                     *flag,
                     u32::MAX,
                     false,
-                    index_in_parent,
+                    // Always a claim: the index is this field's position in
+                    // `entries`, straight off `.iter().enumerate()`.
+                    Some(index_in_parent),
                 )
             }
         };
@@ -7566,7 +8238,6 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
     //   (MemoryError,)      -> MemoryErrorOnly
     //   anything else truthy -> Yes
     match op {
-        // ── Known non-raising ops (canraise = ()) ─────────────────
         // RPython LL: getfield_gc, setfield_gc → cannot raise
         OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => RaiseClass::No,
         // `malloc` / `malloc_varsize` can only raise MemoryError; with
@@ -7642,7 +8313,6 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::ConditionalCall { .. }
         | OpKind::ConditionalCallValue { .. } => RaiseClass::No,
 
-        // ── Known raising ops ─────────────────────────────────────
         // RPython LL: jit_force_virtualizable has `canrun=True`, not
         // `canraise`; effect classification handles its special meaning.
         OpKind::VableForce { .. } => RaiseClass::No,
@@ -7655,7 +8325,6 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython LL: int_neg_ovf → canraise = (OverflowError,)
         OpKind::UnaryOp { .. } => RaiseClass::Yes, // ovf (others matched above)
 
-        // ── Calls handled by analyze() dispatch, not here ─────────
         // RPython: Call ops dispatch to analyze_direct_call/analyze_external_call.
         // op_can_raise is only for "simple operations" (non-call).
         // But if we see a Call here (shouldn't happen in normal flow),
@@ -7761,7 +8430,6 @@ fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
     }
 }
 
-// ── Builtin call effect tables ──────────────────────────────────
 //
 // RPython equivalent: effect classification in `call.py::getcalldescr()`
 // combined with the builtin function tables.
@@ -8447,8 +9115,14 @@ mod tests {
         );
     }
 
+    /// A sole registered impl does NOT make its method name resolvable
+    /// from an unrelated receiver.  `call.py:175-187 getfunctionptr(graph)`
+    /// keys on graph identity; the uniqueness this used to lean on could
+    /// only be observed over the impls this artifact contains, so an impl
+    /// living outside it left the count at one and the bind wrong, with
+    /// nothing able to detect it.
     #[test]
-    fn resolve_method_unique_impl() {
+    fn resolve_method_declines_receiver_agnostic_unique_impl() {
         let mut cc = CallControl::new();
         let graph = FunctionGraph::new("PyFrame::load_local_value");
         cc.register_trait_method(
@@ -8458,19 +9132,24 @@ mod tests {
             graph,
         );
 
-        // TODO: receiver-agnostic unique-impl fallback in
-        // `resolve_method` enables BFS to monomorphise
-        // generic-receiver call sites at trait dispatch.  Retired
-        // when the annotator publishes classdef hints before BFS.
+        // Generic-parameter receivers and an absent receiver name no impl.
         assert!(
             cc.resolve_method("load_local_value", Some("handler"), None)
-                .is_some()
+                .is_none()
         );
         assert!(
             cc.resolve_method("load_local_value", Some("H"), None)
-                .is_some()
+                .is_none()
         );
-        assert!(cc.resolve_method("load_local_value", None, None).is_some());
+        assert!(cc.resolve_method("load_local_value", None, None).is_none());
+
+        // Non-vacuity: the receiver that DOES name the impl still resolves,
+        // so this cannot be satisfied by declining everything.
+        let hit = cc.resolve_method("load_local_value", Some("PyFrame"), None);
+        assert_eq!(
+            hit.expect("named receiver resolves").name,
+            "PyFrame::load_local_value"
+        );
     }
 
     #[test]
@@ -8532,8 +9211,13 @@ mod tests {
         assert_eq!(miframe.unwrap().name, "MIFrame::push_value");
     }
 
+    /// A `resolved_path` that names no registered graph declines outright.
+    /// It used to fall through to the receiver-agnostic fallback, which
+    /// answered with whichever impl happened to be the table's only owner
+    /// of the method name — a different graph than the one the call site
+    /// asked for.
     #[test]
-    fn resolve_method_falls_back_when_resolved_path_miss() {
+    fn resolve_method_declines_when_resolved_path_misses() {
         let mut cc = CallControl::new();
         cc.register_trait_method(
             "load_local_value",
@@ -8545,11 +9229,18 @@ mod tests {
         let unknown_path = CallPath::for_impl_method("Unknown", "load_local_value");
         assert!(
             cc.resolve_method("load_local_value", Some("handler"), Some(&unknown_path))
+                .is_none()
+        );
+
+        // Non-vacuity: the `resolved_path` that DOES name a registered
+        // graph still resolves through the same call.
+        let known_path = CallPath::for_impl_method("PyFrame", "load_local_value");
+        assert!(
+            cc.resolve_method("load_local_value", Some("handler"), Some(&known_path))
                 .is_some()
         );
     }
 
-    // ── getcalldescr tests ───────────────────────────���──────────────
     /// Helper: create a FunctionGraph with just a return.
     fn simple_graph(name: &str) -> FunctionGraph {
         let mut g = FunctionGraph::new(name);
@@ -9905,8 +10596,6 @@ mod tests {
         assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, 0);
     }
 
-    // ── RPython indirect_call family tests ──────────────────────────
-
     /// `guess_call_kind` for `OpKind::IndirectCall`:
     ///   ≥1 candidate impl is a regular candidate → `Regular`
     ///   graphs `None` (unknown family)          → `Residual`
@@ -10009,6 +10698,121 @@ mod tests {
             None,
             &mut cache,
             None,
+        );
+    }
+
+    /// `getcalldescr` must answer an indirect call whose family it cannot
+    /// enumerate with the analyzers' TOP result on every counter, matching
+    /// `graphanalyze.py:117-121` (`graphs is None` → `top_result()`).
+    ///
+    /// A family with no members carries no more information than a family
+    /// that was never enumerated — nothing in this pipeline ever proves a
+    /// family closed and empty — so the two must give the same answer.  The
+    /// registered family is the non-vacuity control: it shows the analyzers
+    /// really do run and really can reach their bottom result here, so a
+    /// top answer above is the lattice speaking and not an inert descriptor.
+    #[test]
+    fn unknown_indirect_family_analyzes_to_top() {
+        let mut cc = CallControl::new();
+        cc.register_trait_method("run", Some("Handler"), "A", simple_graph("A::run"));
+        cc.register_trait_method("run", Some("Handler"), "B", simple_graph("B::run"));
+        cc.find_all_graphs_for_tests();
+
+        let family = cc.all_impls_for_indirect("Handler", "run");
+        assert_eq!(
+            family.len(),
+            2,
+            "control needs an enumerable family: {family:?}"
+        );
+
+        let descr_of = |graphs: Option<Vec<CallPath>>| {
+            let mut cache = AnalysisCache::default();
+            cc.getcalldescr(
+                &indirect_call_op(graphs),
+                Vec::new(),
+                Type::Void,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            )
+        };
+
+        // Control — the mechanism is engaged: two enumerable, effect-free
+        // members drive every family analyzer to its bottom result.
+        let known = descr_of(Some(family));
+        assert_eq!(known.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        assert!(!known.extra_info.can_invalidate);
+        assert!(!known.extra_info.can_collect);
+        assert!(
+            known.extra_info._write_descrs_fields.is_some(),
+            "an enumerated family has a concrete write set"
+        );
+
+        // Invariant — an unenumerable family is top on every counter.
+        let unknown = descr_of(None);
+        assert_eq!(unknown.extra_info.extraeffect, ExtraEffect::RandomEffects);
+        assert!(unknown.extra_info.can_invalidate);
+        assert!(unknown.extra_info.can_collect);
+        assert!(
+            unknown.extra_info._write_descrs_fields.is_none(),
+            "an unenumerable family's write set is the wildcard"
+        );
+
+        // Invariant — "no members" carries no information "not enumerated"
+        // does not, so it must reach the same top.
+        let no_members = descr_of(Some(Vec::new()));
+        assert_eq!(
+            no_members.extra_info.extraeffect,
+            unknown.extra_info.extraeffect
+        );
+        assert_eq!(
+            no_members.extra_info.can_invalidate,
+            unknown.extra_info.can_invalidate
+        );
+        assert_eq!(
+            no_members.extra_info.can_collect,
+            unknown.extra_info.can_collect
+        );
+        assert!(no_members.extra_info._write_descrs_fields.is_none());
+    }
+
+    /// `_canraise`'s `CallTarget::Indirect` arm resolves the family itself
+    /// through `all_impls_for_indirect`, so it meets the same question one
+    /// step earlier than `getcalldescr` does — and must answer it the same
+    /// way: a family it cannot enumerate can raise.
+    ///
+    /// The two registered families are the non-vacuity control: they show
+    /// `cached_can_raise_family` reaching both `No` and `Yes` off the
+    /// members it was handed, so the unregistered family's `Yes` is the
+    /// unknown-family rule and not a constant.
+    #[test]
+    fn unenumerable_indirect_family_canraise_is_top() {
+        let mut cc = CallControl::new();
+        cc.register_trait_method("run", Some("Quiet"), "A", simple_graph("A::run"));
+        cc.register_trait_method("run", Some("Loud"), "B", raising_graph("B::run"));
+        cc.find_all_graphs_for_tests();
+
+        let mut cache = AnalysisCache::default();
+        assert_eq!(
+            cc._canraise(&CallTarget::indirect("Quiet", "run"), &mut cache),
+            CanRaise::No,
+            "control: an enumerated non-raising family reaches bottom"
+        );
+        assert_eq!(
+            cc._canraise(&CallTarget::indirect("Loud", "run"), &mut cache),
+            CanRaise::Yes,
+            "control: an enumerated raising member is seen"
+        );
+
+        assert!(
+            cc.all_impls_for_indirect("Unheard", "run").is_empty(),
+            "the invariant below needs a family with no registered impls"
+        );
+        assert_eq!(
+            cc._canraise(&CallTarget::indirect("Unheard", "run"), &mut cache),
+            CanRaise::Yes,
+            "a family with no enumerable members is unknown, not proven empty"
         );
     }
 
@@ -10312,5 +11116,92 @@ mod tests {
         );
         assert_eq!(cc.fnaddr_for_target(&target), 0x1234);
         assert_eq!(cc.target_to_path(&target), None);
+    }
+
+    /// A closure's `Fn::call` must not be resolved by method name.
+    ///
+    /// A closure receiver names the *kind*, so the receiver-agnostic
+    /// "unique impl owning this method name" fallback — a BFS-coverage
+    /// adaptation for generic *trait* receivers with no RPython
+    /// counterpart — would bind every closure invocation to whichever
+    /// unrelated graph happens to be the only registered `call`. Observed
+    /// in pyre: `longobject::jit_bigint_is_zero`'s `($body)(value)` bound
+    /// to `<default methods of OpcodeStepExecutor>::call`, grafting the
+    /// whole opcode dispatcher onto a function that only reads a bigint.
+    ///
+    /// **Every disambiguated spelling has to be a case here.** The
+    /// guard originally compared against the bare literal, and this test
+    /// exercised only that literal, so both were green while a codegen
+    /// over the three pyre artefacts declined **1** receiver and let
+    /// **10** — `closure#1`, `closure#12`, `closure#39`, … — through to
+    /// the bad bind. The disambiguated forms are the production majority;
+    /// the bare one is the exception.
+    #[test]
+    fn closure_receiver_does_not_resolve_by_method_name() {
+        let mut cc = CallControl::new();
+        // The sole registered `call` — exactly the shape that made the
+        // fallback fire, a trait default-method shim with no concrete impl.
+        cc.register_trait_method(
+            "call",
+            Some("OpcodeStepExecutor"),
+            "<default methods of OpcodeStepExecutor>",
+            FunctionGraph::new("opcode_step_executor_call"),
+        );
+
+        // Both spellings Charon produces. `closure#1` / `closure#39` are
+        // verbatim from the measured population, not invented.
+        for receiver in [CLOSURE_RECEIVER_ROOT, "closure#1", "closure#39"] {
+            let closure_call = CallTarget::Method {
+                name: "call".to_string(),
+                receiver_root: Some(receiver.to_string()),
+                resolved_path: None,
+            };
+            assert_eq!(
+                cc.target_to_path(&closure_call),
+                None,
+                "receiver {receiver:?} must not bind to an unrelated same-named graph"
+            );
+        }
+
+        // No receiver-agnostic fallback survives, so every receiver that
+        // does not name the registration declines — the near-miss spellings
+        // the class match must not widen onto, and the generic-parameter
+        // receiver the fallback used to exist for, alike.
+        for receiver in [
+            "closures",
+            "closure_env",
+            "closure#",
+            "closure#a",
+            "handler",
+            "H",
+        ] {
+            let other = CallTarget::Method {
+                name: "call".to_string(),
+                receiver_root: Some(receiver.to_string()),
+                resolved_path: None,
+            };
+            assert_eq!(
+                cc.target_to_path(&other),
+                None,
+                "receiver {receiver:?} names no registered impl and must decline"
+            );
+        }
+
+        // Non-vacuity: the receiver that DOES name the registration still
+        // resolves, so the assertions above cannot be satisfied by a
+        // `target_to_path` that answers `None` for everything.
+        let named_call = CallTarget::Method {
+            name: "call".to_string(),
+            receiver_root: Some("<default methods of OpcodeStepExecutor>".to_string()),
+            resolved_path: None,
+        };
+        assert_eq!(
+            cc.target_to_path(&named_call),
+            Some(CallPath::for_impl_method(
+                "<default methods of OpcodeStepExecutor>",
+                "call"
+            )),
+            "a receiver that names the registration must still resolve"
+        );
     }
 }

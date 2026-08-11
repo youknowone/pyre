@@ -12,12 +12,12 @@ Write a bytecode interpreter. Annotate it with `#[jit_interp]`. majit does the r
 #[jit_interp(state = State, env = Program, ...)]
 fn mainloop(program: &Program, state: &mut State, driver: &mut JitDriver<State>) {
     while pc < program.len() {
-        jit_merge_point!(driver, program, pc);
+        jit_merge_point!(driver, program, pc; state);
         match program[pc] {
             Op::Add => { /* ... */ }
             Op::Jump(target) => {
-                pc = target;
                 can_enter_jit!(driver, target, state, ...);
+                pc = target;
                 continue;
             }
             // ...
@@ -28,6 +28,16 @@ fn mainloop(program: &Program, state: &mut State, driver: &mut JitDriver<State>)
 ```
 
 Hot loops are detected, traced, optimized, and compiled to native code. Guard failures fall back to the interpreter transparently.
+
+The `; state` tail is load-bearing. Without it the macro parses (the tail is
+optional, `jit_interp/mod.rs` `MergePointArgs::parse`) and expands to the
+observer/replay statement instead: the walk's outcome is discarded and the
+native loop re-runs the same work, which duplicates execution between the
+native loop and its interpreter fallback. That two-executor shape has been
+retired. With it, the expansion writes the walk's state back and either takes
+the loop's exit or resumes at the walked pc — so anything after the loop must
+reconstruct its result from `state` alone, since the pc is not advanced on that
+exit path.
 
 ## Similarities with RPython
 
@@ -54,7 +64,7 @@ majit works with **plain Rust**. Type recovery is not needed (the Rust compiler 
 | `@jit.elidable` | `#[elidable]` |
 | `@jit.dont_look_inside` | `#[dont_look_inside]` |
 | `jit.JitDriver(greens=[...], reds=[...])` | `#[jit_driver(greens = [...], reds = [...])]` |
-| `driver.jit_merge_point(...)` | `jit_merge_point!(driver, ...)` |
+| `driver.jit_merge_point(...)` | `jit_merge_point!(driver, env, pc; state)` |
 | `driver.can_enter_jit(...)` | `can_enter_jit!(driver, ...)` |
 
 ### Translation: live image vs extracted artifacts

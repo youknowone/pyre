@@ -177,15 +177,31 @@ struct TimingState {
 /// Order is the contract with that host: append only, never reorder.
 ///
 /// `ABORT_BRIDGE` is labelled for what it actually counts here, not for its
-/// name. [`AbortReason::Generic`] maps to the same integer 13, and that is the
+/// name. `AbortReason::Generic` maps to the same integer 13, and that is the
 /// value `jitdriver`'s reason ladder falls back to whenever a `TraceAction::
 /// Abort` arrives with no `SwitchToBlackhole`, no staged reason and a trace
-/// that is not too long — which is every walker decline except
-/// `ForceQuasiImmutable`. So a nonzero tally here is overwhelmingly
-/// "unclassified", and reading it as "a bridge aborted" sends the next reader
-/// looking for bridge activity that is not there.
+/// that is not too long — which is every walker decline, without exception.
+/// So a nonzero tally here is overwhelmingly "unclassified", and reading it as
+/// "a bridge aborted" sends the next reader looking for bridge activity that is
+/// not there.
 ///
-/// [`AbortReason::Generic`]: crate::pyjitpl::AbortReason::Generic
+/// `ABORT_FORCE_QUASIIMMUT` is the one reason nothing on this side can raise,
+/// because the quasi-immutable *write* path is unimplemented. `hook_setfield`
+/// (`rclass.rs`) genops `jit_force_quasi_immutable`, but no `OpKind` carries it,
+/// `jtransform` has no arm for it, it has no jitcode opcode, and there is
+/// neither a metainterp opimpl nor a `do_force_quasi_immutable` — so unlike
+/// `opimpl_jit_force_quasi_immutable` (`pyjitpl.py:1094-1118`), which raises
+/// `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` once the mutate field is
+/// non-null, no path here reaches a `SwitchToBlackhole`. The *read* half
+/// (`record_quasiimmut_field` → [`majit_ir::OpCode::QuasiimmutField`]) is
+/// complete, so the asymmetry is in the port, not in this table.
+///
+/// That tally is therefore a true zero rather than a dead slot, and it stays
+/// zero for as long as the write path is missing. Nothing currently declares a
+/// `?`-suffixed field, so the gap is unreachable rather than latent — but
+/// `AbortReason` gains no variant for it either, so the first `?` field anyone
+/// declares gets a setfield hook with nothing downstream and no abort. Keep the
+/// slot; do not synthesise a producer for it.
 pub const ABORT_COUNTER_KINDS: &[(i32, &str)] = &[
     (counters::ABORT_TOO_LONG, "too_long"),
     (counters::ABORT_BRIDGE, "bridge_or_generic"),
@@ -557,7 +573,7 @@ impl JitProfiler {
     /// `cpu.tracker.total_freed_loops += 1` parity.  Fired from the
     /// memory manager when an evicted token represents a root loop.
     /// Hits `self.cpu_tracker` so the paired backend (rebound via
-    /// [`set_cpu_tracker`]) and profiler share the same per-CPU
+    /// [`Self::set_cpu_tracker`]) and profiler share the same per-CPU
     /// instance.
     pub fn inc_freed_loop(&self) {
         self.with_cpu_tracker(|t| t.total_freed_loops.fetch_add(1, Ordering::Relaxed));
@@ -692,7 +708,7 @@ impl JitProfiler {
     /// Note that backend nesting is **reversed** relative to tracing:
     /// `profiler.start_backend()` opens the outer scope here, while
     /// `debug_start('jit-tracing')` opens the outer scope in
-    /// [`enter_tracing`].  PyPy uses both orders depending on the
+    /// [`Self::enter_tracing`].  PyPy uses both orders depending on the
     /// callsite — this guard matches each one exactly.
     pub fn enter_backend(&self) -> ProfilerEventGuard<'_> {
         self.start_backend();
@@ -872,7 +888,7 @@ enum GuardNesting {
 /// RAII guard returned by [`JitProfiler::enter_tracing`] /
 /// [`JitProfiler::enter_backend`].  Drops by firing both the
 /// profiler-event close and the `debug_stop` close in the LIFO order
-/// dictated by [`GuardNesting`], so the profiler stack and the debug
+/// dictated by `GuardNesting`, so the profiler stack and the debug
 /// section stay balanced even when the surrounding body panics.
 #[must_use = "drop the guard to fire the paired end_* event"]
 pub struct ProfilerEventGuard<'a> {

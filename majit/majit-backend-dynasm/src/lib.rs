@@ -242,7 +242,7 @@ pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> O
 /// `cpu.get_latest_descr` parity) and derives the bridge source
 /// identity (`jct.green_key` / `descr.trace_id()` /
 /// `descr.fail_index_per_trace()`) from that Arc, mirroring
-/// `pyjitpl.py:2890 handle_guard_failure(self, resumedescr,
+/// `pyjitpl.py:2914 handle_guard_failure(self, resumedescr,
 /// deadframe)`.  No surrogate triple crosses the C-ABI.
 pub type BridgeFn = fn(*const i64, usize, usize) -> bool;
 

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use majit_backend::JitCellToken;
-use majit_ir::{GreenKey, Type};
+use majit_ir::{GreenKey, RetainedGreens, Type};
 use std::sync::Arc;
 
 use crate::counter::{DEFAULT_SIZE, JitCounter};
@@ -124,6 +124,22 @@ pub struct BaseJitCell {
     /// Migration of all callers from hash-only to typed keys is
     /// unfinished.
     pub comparekey: Option<GreenKey>,
+    /// Owns the `Ref`-typed referents named by `comparekey`, for exactly this
+    /// cell's lifetime — the `setattr` half of `JitCell.__init__`
+    /// (warmstate.py:568-573), which pyre stored as a bare `i64` and so never
+    /// owned. Without it a referent can be freed and its address reused by a
+    /// different object, whose green key is then byte-identical to the dead
+    /// one's; `comparekey_matches` returns `true` and the new object silently
+    /// inherits this cell and its compiled loop token.
+    ///
+    /// Scope: this closes the hazard on the **typed** path only. The legacy
+    /// hash-only flow leaves `comparekey` `None`, so it stores no key, owns
+    /// nothing, and has **no comparator at all** — a collision there is
+    /// unresolvable by any mechanism rather than resolvable-but-unsound. That
+    /// is a different and worse hazard, not a smaller one.
+    ///
+    /// Empty unless a frontend registered `majit_ir::set_ref_resolver`.
+    pub retained_greens: RetainedGreens,
 }
 
 impl BaseJitCell {
@@ -138,7 +154,22 @@ impl BaseJitCell {
             abort_count: 0,
             next: None,
             comparekey: None,
+            retained_greens: RetainedGreens::default(),
         }
+    }
+
+    /// Store `key` as this cell's `comparekey` **and** take ownership of the
+    /// `Ref` referents it names, in one statement.
+    ///
+    /// The two must not be set separately: a `comparekey` without its
+    /// `retained_greens` is exactly the defect this pairing exists to close —
+    /// a stored address the cell does not own. `comparekey` stays `pub` for
+    /// the fixtures that construct chains directly, so this is the invariant
+    /// by convention rather than by type; every production writer goes
+    /// through here.
+    pub fn set_comparekey(&mut self, key: &GreenKey) {
+        self.retained_greens = RetainedGreens::retain(key);
+        self.comparekey = Some(key.clone());
     }
 
     /// warmstate.py:575-582 `JitCell.comparekey(*greenargs2)`.
@@ -311,6 +342,32 @@ pub struct JitStats {
     pub num_disable_noninlinable_function: usize,
     /// Total number of BaseJitCells.
     pub num_cells: usize,
+    /// Referents pinned alive by stored typed green keys, summed over every
+    /// cell in every chain.
+    ///
+    /// This is the resource cost of the ownership invariant (`RetainedGreens`)
+    /// against a `cells` map with no size bound: nothing caps how many cells
+    /// accumulate, so the pinned set grows with them. Reported so the growth
+    /// is a number somebody can read rather than latent RSS — the condition
+    /// under which pinning is allowed to ship ahead of a bound.
+    ///
+    /// WHICH WINDOW THIS IS TAKEN IN. The number is a **running total at
+    /// the moment of the call**, not a settled figure, and it is not
+    /// monotonic. Cells *are* dropped in production — `install_new_cell`
+    /// unlinks every chained cell whose `should_remove_jitcell()` holds
+    /// (which is the default for a cold, tokenless cell), and `cleanup_chain`
+    /// drops the whole chain — and each drop releases that cell's retains.
+    /// So a cold tree, a tree mid-warmup and a settled tree give three
+    /// different answers for the same program, and a reading is only
+    /// comparable against another taken at the same point.
+    ///
+    /// Do not quote it as "how many cells pin a referent" without saying
+    /// after how many portal entries it was read. `gc_cells` has no
+    /// production caller, so the one eviction path that would make this fall
+    /// sharply is currently unreachable.
+    ///
+    /// Zero unless a frontend registered `set_ref_resolver`.
+    pub num_pinned_refs: usize,
 }
 
 pub struct WarmEnterState {
@@ -493,9 +550,21 @@ impl WarmEnterState {
         }
     }
 
+    /// `cells.values()` yields chain heads. Every sweep over the whole table
+    /// must walk `next` as well, or it silently skips chained cells. A chain
+    /// needs no hash collision: one green key reached
+    /// through a hash-only writer and then a typed one produces two cells in
+    /// one bucket, because a `comparekey: None` cell can never match a typed
+    /// lookup, so `ensure_cell_for_key` misses and chains past it. Proven by
+    /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`,
+    /// which uses only public entry points on a single key.
     pub fn clear_all_loop_tokens(&mut self) {
-        for cell in self.cells.values_mut() {
-            cell.loop_token = None;
+        for head in self.cells.values_mut() {
+            let mut cur = Some(head);
+            while let Some(cell) = cur {
+                cell.loop_token = None;
+                cur = cell.next.as_deref_mut();
+            }
         }
     }
 
@@ -813,7 +882,7 @@ impl WarmEnterState {
 
     /// Typed-key variant of [`Self::force_start_tracing`]: reads the
     /// matching cell by comparekey and force-starts tracing on it via
-    /// [`Self::start_tracing_cell_for_key`], so a force-started cell
+    /// `Self::start_tracing_cell_for_key`, so a force-started cell
     /// (function-entry / can_enter_jit) carries a `comparekey` like the
     /// [`Self::maybe_compile_with_key`] path.
     pub fn force_start_tracing_for_key(&mut self, key: &GreenKey) -> HotResult {
@@ -895,6 +964,11 @@ impl WarmEnterState {
     /// and the outer (starting) cell's TRACING is cleared separately
     /// by the `clear_tracing_flag` call in the tracing entry point's
     /// finally block (warmstate.py:444 parity).
+    ///
+    /// Installs the cell under the bare hash, so it cannot set `comparekey`
+    /// and the cell it creates is one no chain walk will ever match. Prefer
+    /// [`Self::attach_procedure_to_interp_for_key`] wherever the green key
+    /// itself is in scope.
     pub fn attach_procedure_to_interp(
         &mut self,
         green_key_hash: u64,
@@ -909,10 +983,39 @@ impl WarmEnterState {
         cell.set_procedure_token(token, false)
     }
 
+    /// Typed form of [`Self::attach_procedure_to_interp`].
+    ///
+    /// `JitCell.__init__` (warmstate.py:610-616) always stores the green args
+    /// on the cell, so upstream has no cell that a chain walk can fail to
+    /// match. The hash form creates one: `cells.entry(hash)` leaves
+    /// `comparekey` unset, `comparekey_matches` refuses it unconditionally,
+    /// and `install_new_cell` links later survivors ahead of it — so the same
+    /// green key ends up with a hash-installed cell at the bucket head and a
+    /// typed cell behind it, holding different token and flag state.
+    pub fn attach_procedure_to_interp_for_key(
+        &mut self,
+        key: &GreenKey,
+        token: impl Into<Arc<JitCellToken>>,
+    ) -> Option<Arc<JitCellToken>> {
+        let token = token.into();
+        self.ensure_cell_for_key(key);
+        let cell = self
+            .lookup_chain_with_key_mut(key)
+            .expect("ensure_cell_for_key just installed a cell matching this key");
+        cell.flags &= !jc_flags::TRACING;
+        cell.set_procedure_token(token, false)
+    }
+
     /// warmstate.py:716-723 `cell.set_procedure_token(procedure_token, tmp=True)`.
     ///
     /// Installs a temporary CALL_ASSEMBLER fallback token without
     /// changing the tracing flags or compiled state.
+    ///
+    /// No typed twin: this has no callers anywhere in the workspace, so it
+    /// creates no cells and contributes nothing to the head/tail split that
+    /// [`Self::attach_procedure_to_interp_for_key`] exists to close. Adding
+    /// one would be a second uncalled entry point. Give it a typed form at
+    /// the point a caller appears, not before.
     pub fn attach_tmp_callback_to_interp(
         &mut self,
         green_key_hash: u64,
@@ -939,6 +1042,44 @@ impl WarmEnterState {
         }
     }
 
+    /// Typed-key variant of [`Self::clear_tracing_flag`], and the missing half
+    /// of a live pair.
+    ///
+    /// `JC_TRACING` is *set* through [`Self::mark_as_being_traced_for_key`],
+    /// which installs through [`Self::ensure_cell_for_key`] and therefore
+    /// writes the cell that matches the key. The hash form above clears
+    /// whichever cell happens to *head* the bucket. Once both spellings have
+    /// written one key those are two different cells
+    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`), and
+    /// `install_new_cell` prepends survivors so the typed cell is the one that
+    /// is *not* the head. The set then lands on the tail and the clear on the
+    /// head, the flag is never cleared, and every gate that reads the head —
+    /// `counter_would_fire`, `counter_tick_checked`, `maybe_compile`,
+    /// `force_start_tracing`, `should_trace_function_entry` — refuses that key
+    /// from then on.
+    ///
+    /// Deliberately does NOT route through `ensure_cell_for_key` the way the
+    /// `_for_key` writers do: clearing a flag must not install a cell. A key
+    /// with no cell has no flag to clear, which is the hash form's behaviour
+    /// too.
+    ///
+    /// No caller yet. Unlike [`Self::attach_tmp_callback_to_interp`], which
+    /// got a stated reason instead of a twin because nothing calls it
+    /// anywhere, the hash form here has a live production caller in
+    /// `pyre-jit` (the `finally` clear after tracing ends) that still passes a
+    /// hash. Converting it is caller-side work in another crate and lands
+    /// separately.
+    pub fn clear_tracing_flag_for_key(&mut self, key: &GreenKey) {
+        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
+            cell.flags &= !jc_flags::TRACING;
+        }
+    }
+
+    /// No typed twin: this has no callers anywhere in the workspace — the only
+    /// occurrence in the tree is this definition. A twin here would be a
+    /// second uncalled entry point, so it gets a reason instead, the same call
+    /// [`Self::attach_tmp_callback_to_interp`] got. Give it a typed form at
+    /// the point a caller appears, not before.
     pub fn take_procedure_token(&mut self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {
         self.cells
             .get_mut(&green_key_hash)
@@ -1015,24 +1156,70 @@ impl WarmEnterState {
         self.cells.get(&green_key_hash)
     }
 
+    /// Typed-key variant of [`Self::get_cell`]:
+    /// `warmstate.py:596-604 JitCell.get_jitcell(*greenargs)`.
+    ///
+    /// Walks the chain by `comparekey`, so it selects the cell belonging to
+    /// this key rather than whichever cell happens to head the bucket. That
+    /// distinction is load-bearing today, not once the table is bucketed: a
+    /// hash-only writer installs a cell with `comparekey: None`, which
+    /// `comparekey_matches` refuses unconditionally, so one key can already
+    /// own two cells in one bucket with no hash collision at all
+    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`).
+    /// `install_new_cell` links survivors ahead of the new cell, so the
+    /// hash-installed one is the head and the typed one is *not* — reading
+    /// the head here returned the wrong cell.
+    ///
+    /// The reason to route through the key rather than the hash at all:
+    /// every upstream cell lookup takes greenargs and compares them
+    /// (`get_jitcell` :596, `_ensure_jit_cell_at_key` :631,
+    /// `dont_trace_here` :644, `mark_as_being_traced` :649 — warmstate.py).
+    /// Upstream has exactly one bare-hash entry point,
+    /// `trace_next_iteration_hash` (warmstate.py:622-623), and it touches
+    /// **the counter, not the cell**.
+    /// That is the line: a hash is enough to find a bucket, never enough to
+    /// pick a cell out of one.
+    pub fn get_cell_for_key(&self, key: &GreenKey) -> Option<&BaseJitCell> {
+        self.lookup_chain_with_key(key)
+    }
+
     /// TODO: walk the warmstate cells to find a
     /// `JitCellToken` by number. Used by `MetaInterp::record_loop_or_bridge`
     /// to widen the CALL_ASSEMBLER keepalive search to cover targets
-    /// that live only on a `BaseJitCell.loop_token` (most importantly
-    /// tmp-callback installs at `attach_tmp_callback_to_interp`) and
-    /// are not yet — or never — registered in `MetaInterp::compiled_loops`.
+    /// that live only on a `BaseJitCell.loop_token` and are not yet — or
+    /// never — registered in `MetaInterp::compiled_loops`.
+    ///
+    /// This doc previously named tmp-callback installs at
+    /// `attach_tmp_callback_to_interp` as the most important such target.
+    /// That function has no callers anywhere in the workspace, so it
+    /// installs nothing and cannot be what this helper covers. The
+    /// surviving population is whatever `attach_procedure_to_interp` wrote
+    /// but `record_loop_or_bridge` has not registered; nobody has measured
+    /// it, so treat the need for this fallback as unquantified rather than
+    /// established.
     ///
     /// RPython equivalent does not exist because upstream descrs hold
     /// the `JitCellToken` object directly (`compile.py:187 isinstance(descr,
     /// JitCellToken)`) — no number→token resolution is needed.  This
     /// helper is removed by Slice X-D once `CallAssemblerDescr` /
     /// `LoopTargetDescr` carry the owning `Arc<JitCellToken>`.
+    /// Walks each chain, not just its head — see `clear_all_loop_tokens`.
+    /// A token living on a chained cell was previously unfindable here, and
+    /// this is the fallback `with_trace_ctx_and_token_resolver` reaches when
+    /// no `compiled_loops` entry matches (`pyjitpl.rs:4663`).
     pub fn find_token_by_number(&self, token_number: u64) -> Option<&Arc<JitCellToken>> {
-        self.cells.values().find_map(|cell| {
-            cell.loop_token
-                .as_ref()
-                .filter(|tok| tok.number == token_number)
-        })
+        for head in self.cells.values() {
+            let mut cur = Some(head);
+            while let Some(cell) = cur {
+                if let Some(tok) = cell.loop_token.as_ref() {
+                    if tok.number == token_number {
+                        return Some(tok);
+                    }
+                }
+                cur = cell.next.as_deref();
+            }
+        }
+        None
     }
 
     /// `rpython/jit/metainterp/warmstate.py:714-723` `get_assembler_token`.
@@ -1347,6 +1534,32 @@ impl WarmEnterState {
         }
     }
 
+    /// Typed-key variant of [`Self::mark_as_being_traced`]:
+    /// `warmstate.py:649-651 mark_as_being_traced(*greenargs)`, which reaches
+    /// its cell through `_ensure_jit_cell_at_key(*greenargs)` — i.e. by
+    /// comparekey, never by hash alone.
+    ///
+    /// Installs through [`Self::ensure_cell_for_key`] rather than
+    /// `cells.entry(hash)`, so the cell it marks carries a `comparekey` (and
+    /// the `RetainedGreens` that come with it) instead of being a
+    /// comparator-less cell that no later typed lookup can ever match — the
+    /// same shape [`Self::disable_noninlinable_function_for_key`] uses.
+    ///
+    /// `tracing_generation` is read before the borrow because the cell
+    /// borrows `self.cells` mutably.
+    pub fn mark_as_being_traced_for_key(&mut self, key: &GreenKey) {
+        self.ensure_cell_for_key(key);
+        let tracing_generation = self.tracing_generation;
+        let cell = self
+            .lookup_chain_with_key_mut(key)
+            .expect("ensure_cell_for_key just installed a cell matching this key");
+        cell.flags |= jc_flags::TRACING;
+        if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
+            cell.state = BaseJitCellState::Tracing;
+            cell.tracing_generation = tracing_generation;
+        }
+    }
+
     /// Restore warm-state parameters to rlib/jit.py:588-605 PARAMETERS defaults.
     pub fn set_default_params(&mut self) {
         self.set_threshold(DEFAULT_THRESHOLD); // 1039
@@ -1372,11 +1585,28 @@ impl WarmEnterState {
     ///
     /// The next tracing run for this green key should segment instead of
     /// repeatedly aborting once it approaches the trace limit.
+    ///
+    /// Installs under the bare hash, so the cell it creates carries no
+    /// `comparekey`. Prefer [`Self::mark_force_finish_tracing_for_key`]
+    /// wherever the green key itself is in scope.
     pub fn mark_force_finish_tracing(&mut self, green_key_hash: u64) {
         let cell = self
             .cells
             .entry(green_key_hash)
             .or_insert_with(BaseJitCell::new);
+        cell.flags |= jc_flags::FORCE_FINISH;
+    }
+
+    /// Typed form of [`Self::mark_force_finish_tracing`].
+    ///
+    /// `FORCE_FINISH` is sticky and never cleared explicitly, so setting it
+    /// on the wrong cell of a bucket is permanent: the key that needs
+    /// segmenting keeps aborting while an unrelated key segments forever.
+    pub fn mark_force_finish_tracing_for_key(&mut self, key: &GreenKey) {
+        self.ensure_cell_for_key(key);
+        let cell = self
+            .lookup_chain_with_key_mut(key)
+            .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags |= jc_flags::FORCE_FINISH;
     }
 
@@ -1397,6 +1627,14 @@ impl WarmEnterState {
     /// Mirrors PyPy's `JitCell.trace_next_iteration()` in warmstate.py:
     /// it does not force tracing right now, it only raises the hot counter
     /// to ~threshold so the next hit converges quickly.
+    ///
+    /// Takes the bare hash on purpose, and it is the one shape allowed to:
+    /// `_trace_next_iteration` (warmstate.py:617-619) hashes the greenargs and
+    /// calls `jitcounter.change_current_fraction` — no cell is looked up, so
+    /// the hash is the whole identity the operation needs. Upstream exposes
+    /// exactly this as `trace_next_iteration_hash` (warmstate.py:622-623).
+    /// The moment a cell read is added here, this needs a `&GreenKey` like
+    /// [`Self::get_cell_for_key`]'s cohort.
     pub fn trace_next_iteration(&mut self, green_key_hash: u64) {
         self.counter.change_current_fraction(green_key_hash, 0.98);
     }
@@ -1407,8 +1645,56 @@ impl WarmEnterState {
     pub fn should_trace_function_entry(&mut self, green_key_hash: u64) -> bool {
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cells.get(&green_key_hash) {
-            if cell.is_compiled() || cell.is_tracing() {
+            // Slot 23 is the total; 64/65 are its two terms, evaluated
+            // independently rather than short-circuited so a cell that is both
+            // reaches both tallies. `is_compiled()` fires on every probe of
+            // every compiled key, so 23 alone cannot attribute a decline.
+            let compiled = cell.is_compiled();
+            let tracing = cell.is_tracing();
+            if compiled || tracing {
                 crate::mc_diag_bump(23);
+                if compiled {
+                    crate::mc_diag_bump(64);
+                }
+                if tracing {
+                    crate::mc_diag_bump(65);
+                    // 65 is NOT a "healthy while a trace runs" reading in
+                    // production, and an earlier version of this comment said
+                    // it was. The only production caller
+                    // (`pyre-jit`'s try_function_entry_jit) guards on
+                    // `!driver.is_tracing()`, which is
+                    // `MetaInterp::tracing.is_some()` — one global Option, not
+                    // a per-cell flag. So while the engine traces, the caller
+                    // returns a frame earlier and this gate is never reached.
+                    // Every production bump of 65 is therefore a cell holding
+                    // JC_TRACING while no trace is running, i.e. a leak on its
+                    // own. The function itself can still be called mid-trace
+                    // directly, and the unit tests below do exactly that.
+                    //
+                    // 66 splits those leaks by AGE, not into leak vs healthy:
+                    // a generation older than the warm state's means the
+                    // session that set the flag was superseded by a later
+                    // trace start. 65 > 0 with 66 == 0 is the flag leaking
+                    // from the most recent session, which is if anything the
+                    // more direct miss.
+                    //
+                    // A ZERO HERE NEEDS TWO WITNESSES, NOT ONE. That the
+                    // door ran (23 + 24 + 25 > 0) does not mean any probed
+                    // cell could ever have held the flag: a stale JC_TRACING
+                    // only sits on a cell that once started tracing, and a
+                    // workload that never arms function-entry tracing gives
+                    // 65 == 0 by construction. The arming witness is
+                    // `caro_funcentry` (slot 19), bumped at the top of
+                    // pyre-jit's `compile_and_run_once` above every early
+                    // return — but on the `FunctionEntry` arm ONLY, since the
+                    // slot is selected by `start` (`BackEdge` bumps 18). So a
+                    // back-edge-only workload leaves 19 at 0 while 18 climbs,
+                    // and 18 is NOT a substitute. Without 19 > 0 a 0 here is
+                    // NOT EXERCISED, not clean. See MC_DIAG's legend.
+                    if cell.tracing_generation < self.tracing_generation {
+                        crate::mc_diag_bump(66);
+                    }
+                }
                 return false;
             }
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
@@ -1477,6 +1763,20 @@ impl WarmEnterState {
     /// GUARD_NOT_INVALIDATED to fail on the next execution.
     ///
     /// Returns the number of loops invalidated.
+    ///
+    /// No typed twin, and unlike the other two abstainers this one is not a
+    /// choice. Its green keys arrive as the *values* of `quasiimmut_deps`,
+    /// which stores them as `u64` hashes, so there is no caller that holds a
+    /// `GreenKey` to hand one down: a twin cannot be given a key to take until
+    /// that table is widened. Dead in production today — its only registrar,
+    /// `register_quasiimmut_dependency`, has no production caller either, so
+    /// `quasiimmut_deps` is empty and this returns 0 at the first line.
+    ///
+    /// That is what makes it a trap rather than a bug: [`Self::invalidate_all`]
+    /// below was fixed to walk chains because *"skipping a cell is a WRONG
+    /// ANSWER rather than a leak"*, and this targeted sibling still reads the
+    /// bucket head. Whoever wires the registrar inherits that, and a sweep
+    /// selecting whole-map `.values()` walks will not see it.
     pub fn invalidate_quasiimmut(&mut self, qmut_key: u64) -> usize {
         let deps = match self.quasiimmut_deps.swap_remove(&qmut_key) {
             Some(deps) => deps,
@@ -1500,11 +1800,19 @@ impl WarmEnterState {
     ///
     /// This is a brute-force invalidation used when the specific qmut_key
     /// is not known (e.g., bulk invalidation after a class hierarchy change).
+    /// Walks each chain, not just its head — see `clear_all_loop_tokens`.
+    /// This is the sweep where skipping a cell is a WRONG ANSWER rather than a
+    /// leak: a cell whose token is not invalidated keeps running compiled code
+    /// built under an assumption that has just been retracted.
     pub fn invalidate_all(&mut self) {
-        for cell in self.cells.values_mut() {
-            if let Some(token) = &cell.loop_token {
-                token.invalidate();
-                cell.state = BaseJitCellState::Invalidated;
+        for head in self.cells.values_mut() {
+            let mut cur = Some(head);
+            while let Some(cell) = cur {
+                if let Some(token) = &cell.loop_token {
+                    token.invalidate();
+                    cell.state = BaseJitCellState::Invalidated;
+                }
+                cur = cell.next.as_deref_mut();
             }
         }
         self.quasiimmut_deps.clear();
@@ -1527,6 +1835,11 @@ impl WarmEnterState {
     /// This is the low-level state-machine driver. Most callers should use
     /// the higher-level methods (`maybe_compile`, `finish_tracing`,
     /// `attach_procedure_to_interp`, `abort_tracing`) which call this internally.
+    ///
+    /// No typed twin: every caller is in this file's own test module, so the
+    /// comparator-less cells it installs exist only in fixtures. That also
+    /// makes it a way for a test to build the split-cell state deliberately.
+    /// A twin becomes necessary if production ever calls this.
     pub fn transition_cell(&mut self, green_key_hash: u64, new_state: BaseJitCellState) {
         let cell = self
             .cells
@@ -1755,18 +2068,39 @@ impl WarmEnterState {
     }
 
     /// Get a snapshot of current JIT statistics.
+    ///
+    /// Counts every cell in every chain, not just the bucket heads.
+    ///
+    /// A chain needs no hash collision: a `comparekey: None` cell — what every
+    /// bare-hash writer installs — can never match a typed lookup, so
+    /// `ensure_cell_for_key` misses on a key that already has a cell and
+    /// chains past it. See
+    /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`.
+    ///
+    /// So `num_cells` and `cells.len()` are **already** capable of
+    /// disagreeing, and the difference is the count of keys that reached
+    /// both an untyped and a typed writer. Counting the cells is the
+    /// definition the field documents ("Total number of BaseJitCells");
+    /// counting the map entries counts buckets, which is a different number.
+    ///
+    /// `num_pinned_refs` sums `retained_greens` per cell, and a
+    /// chained cell pins referents just as a head does. So the "adds zero
+    /// today" note above applies to the state counters only.
     pub fn get_stats(&self) -> JitStats {
-        let mut stats = JitStats {
-            num_cells: self.cells.len(),
-            ..Default::default()
-        };
-        for cell in self.cells.values() {
-            match cell.state {
-                BaseJitCellState::Compiled => stats.num_compiled += 1,
-                BaseJitCellState::Tracing => stats.num_tracing += 1,
-                BaseJitCellState::Invalidated => stats.num_invalidated += 1,
-                BaseJitCellState::DontTraceHere => stats.num_disable_noninlinable_function += 1,
-                BaseJitCellState::NotHot => {}
+        let mut stats = JitStats::default();
+        for head in self.cells.values() {
+            let mut cur = Some(head);
+            while let Some(cell) = cur {
+                stats.num_cells += 1;
+                stats.num_pinned_refs += cell.retained_greens.len();
+                match cell.state {
+                    BaseJitCellState::Compiled => stats.num_compiled += 1,
+                    BaseJitCellState::Tracing => stats.num_tracing += 1,
+                    BaseJitCellState::Invalidated => stats.num_invalidated += 1,
+                    BaseJitCellState::DontTraceHere => stats.num_disable_noninlinable_function += 1,
+                    BaseJitCellState::NotHot => {}
+                }
+                cur = cell.next.as_deref();
             }
         }
         stats
@@ -1899,10 +2233,30 @@ impl WarmEnterState {
     /// `(code_a, pc_a)` and `(code_b, pc_b)` with the same `get_uhash`
     /// no longer alias to the same cell.
     ///
-    /// Currently a `&self` view: `WarmEnterState`'s mutable lookup
-    /// helpers (`maybe_compile`, `should_start_dont_trace_here_trace`)
-    /// keep using the legacy hash-only path until a follow-up
-    /// migrates them.
+    /// Collision resolution is not why this walk earns its keep today.
+    /// The common case is a chain built from ONE key: a hash-only creator
+    /// installs a cell that can carry no `comparekey`, the typed path then
+    /// installs its own, and `install_new_cell` links the survivor ahead —
+    /// so the bucket holds two cells for one key with no collision anywhere.
+    /// Reading `cells.get(&hash)` gets whichever happens to head the bucket.
+    /// A full-width hash makes collisions impractical but says nothing about
+    /// multiple cells linked under one hash. See
+    /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`.
+    ///
+    /// The tracing lifecycle is migrated — `start_tracing_cell_for_key`,
+    /// `finish_tracing_for_key`, `abort_tracing_for_key` and their siblings
+    /// walk the chain through `lookup_chain_with_key_mut`. What still reads
+    /// the bucket HEAD is the `u64` API surface kept for callers that hold
+    /// only a hash: `clear_loop_token`, `counter_would_fire`, `counter_tick`,
+    /// `counter_tick_checked`, `maybe_compile`, `force_start_tracing`,
+    /// `finish_tracing`, `abort_tracing`, `clear_tracing_flag`, `get_cell`,
+    /// `should_trace_function_entry`, `invalidate_quasiimmut`. Those cannot
+    /// move until their callers carry a `GreenKey`, which is the same reason
+    /// `MetaInterp`'s `compiled_loops` / `cut_compiled_keys` are `u64`-keyed:
+    /// the hash, not the green tuple, is the identity currency across the
+    /// metainterp. (`loop_header_pcs` was a third such table; it now lives on
+    /// `CompiledEntry::loop_header_pc`, so it is reached through
+    /// `compiled_loops`' `u64` key rather than carrying one of its own.)
     pub fn lookup_chain_with_key(&self, key: &GreenKey) -> Option<&BaseJitCell> {
         let hash = key.get_uhash();
         let mut cell = self.cells.get(&hash);
@@ -1940,15 +2294,17 @@ impl WarmEnterState {
     /// `HashMap<u64, BaseJitCell>` to a chain-aware container.
     ///
     /// On a miss (no chained cell matches the typed key) the helper
-    /// allocates a new cell with `comparekey = Some(key.clone())` and
-    /// installs it at the head of the chain via `install_new_cell`,
-    /// matching upstream's `jitcounter.install_new_cell` semantics.
+    /// allocates a new cell, stores the key through `set_comparekey` —
+    /// which also takes ownership of the key's `Ref` referents, the
+    /// `setattr` half of `JitCell.__init__` — and installs it at the head
+    /// of the chain via `install_new_cell`, matching upstream's
+    /// `jitcounter.install_new_cell` semantics.
     pub fn ensure_cell_for_key(&mut self, key: &GreenKey) {
         if self.lookup_chain_with_key(key).is_some() {
             return;
         }
         let mut newcell = BaseJitCell::new();
-        newcell.comparekey = Some(key.clone());
+        newcell.set_comparekey(key);
         self.install_new_cell(key.get_uhash(), Some(newcell));
     }
 }
@@ -2480,6 +2836,56 @@ mod tests {
         assert_eq!(mgr.alive_count(), 2);
     }
 
+    /// Pins the PRODUCTION default, which is upstream's **test** default.
+    ///
+    /// The tests above prove the memmgr mechanism is a faithful port. What
+    /// nothing watched is which mode a real `WarmEnterState` ships in.
+    /// `WarmEnterState::new` (the only production constructor — `pyjitpl.rs`
+    /// `warm_state: WarmEnterState::new(threshold)`) builds
+    /// `MemoryManager::new(0)`, so `next_check == -1` and
+    /// `_kill_old_loops_now` is unreachable: `alive_loops` never prunes.
+    ///
+    /// Upstream splits these two defaults and pyre collapsed them:
+    ///
+    /// | | `loop_longevity` |
+    /// |---|---|
+    /// | `rlib/jit.py:594` PARAMETERS — **production** | **1000** |
+    /// | `warmspot.py:9` `jittify_and_run` — **test harness** | **0** |
+    /// | pyre, every path unless `PYRE_JIT` overrides | **0** |
+    ///
+    /// So this asserts a **divergence**, not a desired value. It is here so
+    /// the literal is watched: changing `MemoryManager::new(0)` at the
+    /// construction site turns eviction on across the JIT, and that is a
+    /// behavioural change (it starts feeding `try_to_free_some_loops`) which
+    /// must be measured, not slipped in. If you are here because this test
+    /// failed, that is the intended alarm — see default-retirement.
+    ///
+    /// This governs `alive_loops` (loop TOKENS) only. The `cells` map is a
+    /// different population and is NOT bounded by `max_age`; it sheds
+    /// entries only through `install_new_cell`'s `should_remove_jitcell`
+    /// gate (typed-key eviction). Turning `max_age` on does not bound the cell table.
+    ///
+    /// `install_new_cell` runs the gate over the whole existing chain at the
+    /// bucket on *every* typed install, collision or not — so the gate is
+    /// reached routinely, it simply keeps most cells (a token, `TRACING`,
+    /// `DONT_TRACE_HERE` without a dead token, or `FORCE_FINISH` all veto
+    /// removal). The unbounded-growth conclusion survives; the stated reason
+    /// for it does not.
+    #[test]
+    fn production_warmstate_ships_loop_eviction_disabled() {
+        let ws = WarmEnterState::new(3);
+        assert_eq!(
+            ws.memory_manager.next_check, -1,
+            "next_check must be -1 (eviction disabled) — memmgr.py:43-44",
+        );
+        assert_eq!(
+            ws.memory_manager.loop_longevity_param(),
+            0,
+            "production ships loop_longevity=0, upstream's TEST default; \
+             rlib/jit.py:594 gives production 1000",
+        );
+    }
+
     #[test]
     fn test_loop_aging_refresh() {
         // keep_loop_alive resets `looptoken.generation` to
@@ -2961,6 +3367,130 @@ mod tests {
         assert_eq!(cell.tracing_generation, 2);
     }
 
+    /// Slot 66 fires only for a cell whose `JC_TRACING` outlived the session
+    /// that set it; slot 65 also counts a decline taken while a trace is
+    /// running.
+    ///
+    /// This test calls `should_trace_function_entry` DIRECTLY, so it can
+    /// reach the gate mid-trace. Production cannot: the one production caller
+    /// guards on `!driver.is_tracing()`, so there every 65 is already a leak
+    /// and 66 only says how old. Do not read this test as evidence that a
+    /// production 65 is healthy — see the slot legend in `lib.rs`.
+    ///
+    /// Deltas are asserted as lower bounds because `MC_DIAG` is a process-wide
+    /// static — a concurrent test bumping the same slot can only inflate them.
+    #[test]
+    fn stale_tracing_generation_is_counted_apart_from_a_live_trace() {
+        let mut ws = WarmEnterState::new(2);
+
+        // Cell A is marked as being traced under the current generation.
+        ws.mark_as_being_traced(0xA);
+        let cell = ws.get_cell(0xA).expect("mark_as_being_traced installs it");
+        assert!(cell.is_tracing(), "fixture: A carries JC_TRACING");
+        assert_eq!(
+            cell.tracing_generation,
+            ws.tracing_generation(),
+            "fixture: A's generation is the live one, so it is NOT stale yet"
+        );
+
+        // While A's trace is still the live one, the decline is the healthy
+        // case: 65 moves, 66 must not.
+        let live_65 = crate::mc_diag(65);
+        let live_66 = crate::mc_diag(66);
+        assert!(!ws.should_trace_function_entry(0xA));
+        assert!(
+            crate::mc_diag(65) >= live_65 + 1,
+            "a decline on the tracing term bumps 65"
+        );
+        assert_eq!(
+            crate::mc_diag(66),
+            live_66,
+            "a LIVE trace must not read as stale — this is what 65 alone cannot say"
+        );
+
+        // Starting a trace on another key supersedes A's session without
+        // clearing A's flag: only start_tracing_cell increments the generation.
+        assert!(matches!(ws.maybe_compile(0xB), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(0xB), HotResult::StartTracing));
+        let cell = ws.get_cell(0xA).expect("A is still installed");
+        assert!(cell.is_tracing(), "fixture: A's flag was never cleared");
+        assert!(
+            cell.tracing_generation < ws.tracing_generation(),
+            "fixture: A's session has been superseded"
+        );
+
+        let stale_66 = crate::mc_diag(66);
+        assert!(!ws.should_trace_function_entry(0xA));
+        assert!(
+            crate::mc_diag(66) >= stale_66 + 1,
+            "a stale JC_TRACING at this gate is what slot 66 reports"
+        );
+    }
+
+    /// The set/clear pair for `JC_TRACING` has to agree on which cell it is
+    /// talking about. `mark_as_being_traced_for_key` writes the cell matching
+    /// the key; `clear_tracing_flag` clears the bucket head. When a hash-only
+    /// writer got there first those are different cells, and the clear misses.
+    ///
+    /// This demonstrates the mechanism on a constructed fixture. It does NOT
+    /// establish that production reaches this configuration — that is what the
+    /// `stfe_declined_tracing_stale` counter is for.
+    #[test]
+    fn a_typed_clear_reaches_the_cell_a_typed_mark_wrote() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![100, 200]);
+        let hash = key.get_uhash();
+
+        // Fixture: a hash-only writer heads the bucket, so a later typed
+        // install chains behind it rather than finding it.
+        ws.disable_noninlinable_function(hash);
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "fixture: the hash-only cell carries no comparekey, so a typed \
+             probe cannot see it — this is what makes the chain",
+        );
+
+        ws.mark_as_being_traced_for_key(&key);
+        assert_eq!(
+            ws.get_stats().num_cells,
+            2,
+            "fixture: one green key, two cells",
+        );
+        assert!(
+            ws.lookup_chain_with_key(&key)
+                .expect("the typed cell exists")
+                .is_tracing(),
+            "fixture: the typed cell is the one carrying JC_TRACING",
+        );
+        assert!(
+            !ws.get_cell(hash)
+                .expect("the bucket head exists")
+                .is_tracing(),
+            "fixture: the bucket HEAD never got the flag — so a head-only \
+             clear has nothing to do and cannot fix the tail",
+        );
+
+        // The hash form clears the head, which never had the flag.
+        ws.clear_tracing_flag(hash);
+        assert!(
+            ws.lookup_chain_with_key(&key)
+                .expect("the typed cell exists")
+                .is_tracing(),
+            "the hash clear missed the cell the mark wrote: this is the stuck \
+             flag that makes every bare-head gate refuse the key",
+        );
+
+        // The typed form reaches it.
+        ws.clear_tracing_flag_for_key(&key);
+        assert!(
+            !ws.lookup_chain_with_key(&key)
+                .expect("the typed cell exists")
+                .is_tracing(),
+            "the typed clear selects by comparekey, so it reaches the cell the \
+             typed mark wrote",
+        );
+    }
+
     #[test]
     fn test_jitcell_should_remove() {
         // A freshly created cell with no token and no flags should be removable
@@ -3208,6 +3738,93 @@ mod tests {
         );
     }
 
+    // Sentinel-tagged retain/release log for the ownership test below.
+    //
+    // `set_ref_resolver` is a process-global `OnceLock`, so exactly one test in
+    // this binary may register and it cannot be scoped to a single case.
+    // Everything is therefore asserted by SENTINEL VALUE rather than by call
+    // count: any other fixture that installs a Ref green while this resolver is
+    // live would move a count, but cannot forge these addresses.
+    static RETAIN_LOG: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+    static RELEASE_LOG: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+    fn test_retain(value: i64) {
+        RETAIN_LOG.lock().unwrap().push(value);
+    }
+
+    fn test_release(value: i64) {
+        RELEASE_LOG.lock().unwrap().push(value);
+    }
+
+    /// warmstate.py:568-573 — a cell's stored green key OWNS its `Ref`
+    /// referents, so the address it names cannot be freed and recycled by a
+    /// different object while the cell is alive.
+    ///
+    /// Four legs, and the second is the localization control:
+    ///
+    /// 1. the `Ref` slot is retained on install;
+    /// 2. an `Int` slot holding an equally pointer-shaped value is **not**
+    ///    retained — ownership must key off the declared `GreenType`, not off
+    ///    "looks like an address", which is the only way it can be right;
+    /// 3. a null `Ref` is skipped (`hash_whatever` folds null to 0, and there
+    ///    is nothing to own);
+    /// 4. dropping the cell releases exactly what it retained.
+    #[test]
+    fn stored_green_key_owns_its_ref_referents() {
+        majit_ir::set_ref_resolver(test_retain, test_release);
+
+        const REF_GREEN: i64 = 0x5EED_0001;
+        const INT_GREEN: i64 = 0x5EED_0002;
+
+        let key = GreenKey::with_types(
+            vec![7, INT_GREEN, REF_GREEN, 0],
+            vec![Type::Int, Type::Int, Type::Ref, Type::Ref],
+        );
+
+        {
+            let mut ws = WarmEnterState::new(3);
+            ws.ensure_cell_for_key(&key);
+
+            let retained = RETAIN_LOG.lock().unwrap().clone();
+            assert!(
+                retained.contains(&REF_GREEN),
+                "installing a cell must retain its Ref green; log={retained:x?}"
+            );
+            assert!(
+                !retained.contains(&INT_GREEN),
+                "an Int green must NOT be retained even when its value is \
+                 pointer-shaped — ownership keys off GreenType, not off the \
+                 bit pattern; log={retained:x?}"
+            );
+            assert!(
+                !retained.contains(&0),
+                "a null Ref green has no referent to own; log={retained:x?}"
+            );
+
+            assert_eq!(
+                ws.get_stats().num_pinned_refs,
+                1,
+                "the pinned-population counter must see exactly the one Ref \
+                 referent this cell owns"
+            );
+
+            assert!(
+                !RELEASE_LOG.lock().unwrap().contains(&REF_GREEN),
+                "nothing may be released while the cell that owns it is alive"
+            );
+        }
+
+        let released = RELEASE_LOG.lock().unwrap().clone();
+        assert!(
+            released.contains(&REF_GREEN),
+            "dropping the cell must release its Ref green; log={released:x?}"
+        );
+        assert!(
+            !released.contains(&INT_GREEN),
+            "an unretained Int green must never be released; log={released:x?}"
+        );
+    }
+
     /// warmstate.py:626-641 + 596-604 — `ensure_cell_for_key` allocates
     /// a fresh cell on miss and `lookup_chain_with_key` returns it on a
     /// repeat probe with the same typed greens.
@@ -3228,6 +3845,62 @@ mod tests {
             cell.comparekey.as_ref().expect("comparekey populated"),
             &key,
             "stored comparekey must equal the install key"
+        );
+    }
+
+    /// warmstate.py:644-646 `dont_trace_here(*greenargs)` — the typed and
+    /// hash entry points reach the same cell today but do NOT leave it in the
+    /// same state, and this pins the difference.
+    ///
+    /// Both install on a miss, and on an *empty* table — which is what each
+    /// arm below starts from — they land in the same bucket. Do not read
+    /// that as "they reach the same cell": on a table where the other form
+    /// already wrote, they do not, and no hash collision is required for
+    /// that. See
+    /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`.
+    /// What differs is what the installed cell knows about itself: the typed
+    /// form goes through `ensure_cell_for_key`, so the cell stores its
+    /// `comparekey` — and with it the `RetainedGreens` that make the stored
+    /// address own its referent. The hash form cannot, because a hash is not
+    /// invertible.
+    ///
+    /// This is the whole observable delta of routing an `interp_jit.py`
+    /// helper through the typed key, so it is asserted rather than described:
+    /// a cell without a `comparekey` is one that a chain walk can never
+    /// identify, which is exactly what bucketing (typed-key bucketing) would need it to do.
+    #[test]
+    fn dont_trace_here_typed_form_stores_a_comparekey_and_the_hash_form_does_not() {
+        let key = GreenKey::new(vec![7, 11]);
+
+        let mut typed = WarmEnterState::new(100);
+        typed.disable_noninlinable_function_for_key(&key);
+        let typed_cell = typed
+            .get_cell(key.get_uhash())
+            .expect("typed form installs a cell");
+        assert!(
+            typed_cell.flags & jc_flags::DONT_TRACE_HERE != 0,
+            "typed form must set DONT_TRACE_HERE"
+        );
+        assert_eq!(
+            typed_cell.comparekey.as_ref(),
+            Some(&key),
+            "typed form must store the greens it was called with"
+        );
+
+        let mut hashed = WarmEnterState::new(100);
+        hashed.disable_noninlinable_function(key.get_uhash());
+        let hashed_cell = hashed
+            .get_cell(key.get_uhash())
+            .expect("hash form installs a cell");
+        assert!(
+            hashed_cell.flags & jc_flags::DONT_TRACE_HERE != 0,
+            "hash form must set DONT_TRACE_HERE — the flag is not the delta"
+        );
+        assert!(
+            hashed_cell.comparekey.is_none(),
+            "hash form has no greens to store; if this ever becomes Some, the \
+             typed/hash split has been closed somewhere else and this test is \
+             the wrong guard"
         );
     }
 
@@ -3479,6 +4152,95 @@ mod tests {
         assert_eq!(count, 0, "cached lookups must not invoke make_token");
     }
 
+    /// A hash-form write and a typed-form read of the SAME green key land on
+    /// DIFFERENT cells, and the state the hash form wrote is invisible to the
+    /// typed reader.
+    ///
+    /// This is the behavioural consequence of
+    /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`: that
+    /// fixture shows the chain forms, this one shows what the chain costs.
+    ///
+    /// `disable_noninlinable_function` is reached in production from
+    /// `pyre-jit-trace/src/state.rs:3189` and `pyjitpl.rs:5256/5312`;
+    /// `maybe_compile_with_key` is the typed back-edge path (`pyjitpl.rs:4393`).
+    ///
+    /// The state does not merely move — it SPLITS, and the two reader
+    /// families see opposite halves. `DONT_TRACE_HERE` ends up on the head,
+    /// `TRACING` on the chained typed cell. So a bare-head reader
+    /// (`self.cells.get(&hash)`, ~26 of them here) sees the mark but not the
+    /// tracing state, while a typed reader (`lookup_chain_with_key`) sees the
+    /// tracing state but not the mark. Neither sees the whole cell.
+    ///
+    /// SCOPE. What is proven here is the split and the route change. The
+    /// hash-marked key reaches `StartTracing` on the THRESHOLD tick by the
+    /// ordinary counter route, because the typed decision never saw the mark;
+    /// the typed-marked key reaches it on the FIRST tick by
+    /// `should_start_dont_trace_here_trace` (warmstate.py:483-491), which is
+    /// the rule upstream intends to apply. Both trace in the end, so this is
+    /// NOT demonstrated to be a user-visible wrong answer — it is a lost
+    /// decision input. Whether a production key reaches both entry points, and
+    /// in which order, is a runtime question this fixture does not answer.
+    #[test]
+    fn a_hash_write_and_a_typed_read_of_one_key_use_different_cells() {
+        let mut ws = WarmEnterState::new(3);
+        let key = GreenKey::new(vec![7, 9]);
+        ws.disable_noninlinable_function(key.get_uhash());
+
+        // Ticks 1-2 under threshold, tick 3 fires — the ORDINARY counter
+        // route, i.e. the mark above was never consulted.
+        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(
+            matches!(ws.maybe_compile_with_key(&key), HotResult::StartTracing),
+            "the hash-written DONT_TRACE_HERE never reached the typed decision",
+        );
+
+        // One bucket, two cells: the split itself.
+        assert_eq!(ws.cells.len(), 1, "one green key, so one bucket");
+        assert_eq!(ws.get_stats().num_cells, 2, "but two cells");
+
+        // `install_new_cell` folds the SURVIVOR in front of the newcomer
+        // (counter.py:253-254 `cell.next = keep; keep = cell`), so the
+        // HASH-written cell stays the head and the TYPED cell is chained
+        // behind it. This is the direction that matters: every bare-head
+        // reader — `self.cells.get(&hash)`, ~26 of them in this file — reads
+        // the head, which is the cell WITHOUT the comparekey.
+        let head = ws.lookup_chain(key.get_uhash()).expect("head present");
+        assert!(
+            head.comparekey.is_none(),
+            "the head is the hash-written cell — a hash is not invertible, so \
+             it can store no comparekey",
+        );
+        assert_ne!(
+            head.flags & jc_flags::DONT_TRACE_HERE,
+            0,
+            "the head still holds the mark the hash form wrote",
+        );
+        let typed_cell = head.next.as_deref().expect("typed cell chained behind");
+        assert_eq!(
+            typed_cell.comparekey.as_ref(),
+            Some(&key),
+            "the typed install carries the comparekey and is NOT the head",
+        );
+        assert!(
+            typed_cell.is_tracing(),
+            "the typed cell is the one the tracing transition wrote to, so the \
+             two halves of this key's state now live on two different cells",
+        );
+
+        // Control: the typed form of the same mark keeps ONE cell and takes
+        // the dont-trace-here route on the very first tick.
+        let mut typed = WarmEnterState::new(3);
+        let key2 = GreenKey::new(vec![7, 9]);
+        typed.disable_noninlinable_function_for_key(&key2);
+        assert!(
+            matches!(typed.maybe_compile_with_key(&key2), HotResult::StartTracing),
+            "the typed mark IS consulted, so the dont-trace-here rule applies \
+             at once instead of waiting for the counter",
+        );
+        assert_eq!(typed.get_stats().num_cells, 1, "no split on the typed path");
+    }
+
     /// warmstate.py:446-511 — typed variant of `maybe_compile_and_run`.
     /// Upstream installs the JitCell lazily at `bound_reached`
     /// (warmstate.py:425-444): each tick under threshold returns
@@ -3523,6 +4285,90 @@ mod tests {
             "comparekey populated on lazy install (warmstate.py:438-439)",
         );
         assert!(cell.is_tracing(), "JC_TRACING flag set on threshold tick");
+    }
+
+    /// The three whole-table sweeps must walk each chain, not just its head.
+    ///
+    /// `cells.values()` yields chain HEADS, so a sweep that does not follow
+    /// `next` silently skips every chained cell. "majit-metainterp: count
+    /// chained cells in get_stats, not bucket heads" fixed exactly
+    /// this in `get_stats`; the fix was filed at one access path and three
+    /// siblings kept the defect.
+    ///
+    /// `invalidate_all` is the one that costs a wrong answer rather than a
+    /// leak: a chained cell whose token is never invalidated keeps running
+    /// compiled code built under a retracted assumption.
+    ///
+    /// The token lives on the CHAINED cell and the head is left tokenless, so
+    /// a head-only sweep reaches nothing at all — the assertions below fail on
+    /// every one of the three before the fix.
+    #[test]
+    fn whole_table_sweeps_reach_chained_cells_not_only_heads() {
+        let mut ws = WarmEnterState::new(100);
+
+        let key_head = GreenKey::new(vec![100, 200]);
+        let key_tail = GreenKey::new(vec![300, 400]);
+        let bucket = key_tail.get_uhash();
+
+        // TRACING keeps the head non-removable so the second install chains
+        // behind it rather than replacing it (counter.py:246-256).
+        let mut head = BaseJitCell::new();
+        head.flags |= jc_flags::TRACING;
+        head.comparekey = Some(key_head.clone());
+        ws.install_new_cell(bucket, Some(head));
+
+        const CHAINED_TOKEN: u64 = 0x5EED_0003;
+        let mut tail = BaseJitCell::new();
+        tail.flags |= jc_flags::TRACING;
+        tail.comparekey = Some(key_tail.clone());
+        tail.loop_token = Some(make_token(CHAINED_TOKEN));
+        ws.install_new_cell(bucket, Some(tail));
+
+        // The token is on the chained cell, never on the head.
+        let chain_head = ws.lookup_chain(bucket).expect("bucket has a head");
+        assert!(
+            chain_head.loop_token.is_none(),
+            "fixture requires a tokenless head, or a head-only sweep would pass"
+        );
+        assert!(
+            chain_head
+                .next
+                .as_deref()
+                .is_some_and(|c| c.loop_token.is_some()),
+            "fixture requires the token on the CHAINED cell"
+        );
+
+        // 1. find_token_by_number
+        assert!(
+            ws.find_token_by_number(CHAINED_TOKEN).is_some(),
+            "a token on a chained cell must be findable"
+        );
+
+        // 2. invalidate_all — the correctness one.
+        ws.invalidate_all();
+        let chained = ws
+            .lookup_chain(bucket)
+            .and_then(|h| h.next.as_deref())
+            .expect("chain survives invalidate_all");
+        assert!(
+            chained
+                .loop_token
+                .as_ref()
+                .is_some_and(|t| t.is_invalidated()),
+            "invalidate_all must invalidate a CHAINED cell's token — skipping \
+             it leaves compiled code live under a retracted assumption"
+        );
+
+        // 3. clear_all_loop_tokens
+        ws.clear_all_loop_tokens();
+        let chained = ws
+            .lookup_chain(bucket)
+            .and_then(|h| h.next.as_deref())
+            .expect("chain survives clear_all_loop_tokens");
+        assert!(
+            chained.loop_token.is_none(),
+            "clear_all_loop_tokens must clear a CHAINED cell's token"
+        );
     }
 
     /// warmstate.py:455-465 — `JitCell.get_jitcell_for_args(*greenargs)`
@@ -3604,6 +4450,237 @@ mod tests {
         assert!(
             !chained_after.is_tracing(),
             "B must not have inherited A's TRACING flag (counter under threshold)",
+        );
+    }
+
+    /// A chain does NOT need a hash collision. ONE green key reached
+    /// through both a hash-only entry point and a typed one builds a two-cell
+    /// chain in a single bucket.
+    ///
+    /// The mechanism has no probabilistic step in it:
+    /// 1. a hash-only writer installs a cell with `comparekey: None`;
+    /// 2. `DONT_TRACE_HERE` with no token makes `should_remove_jitcell()`
+    ///    false (warmstate.rs:241-257), so the cell survives the next install;
+    /// 3. `lookup_chain_with_key` cannot match a `None` comparekey — that is
+    ///    asserted by `comparekey_matches_only_with_stored_key` — so
+    ///    `ensure_cell_for_key` misses and calls `install_new_cell`;
+    /// 4. `install_new_cell` (counter.py:246-256) links the survivor behind
+    ///    the newcomer.
+    ///
+    /// Every other chain fixture in this module forces its collision by
+    /// installing two comparekeys under one `get_uhash()` by hand, and says
+    /// so. This one uses only public entry points on a single key, which is
+    /// why it is the one that settles whether chains occur in practice.
+    #[test]
+    fn one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![100, 200]);
+
+        // Hash-only writer (what `dont_trace_here` did before it was routed
+        // through the typed form).
+        ws.disable_noninlinable_function(key.get_uhash());
+        assert_eq!(ws.get_stats().num_cells, 1, "one cell after the hash write");
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "the hash-only cell stores no comparekey, so a typed probe for the \
+             SAME key cannot see it — this is the step that makes the chain",
+        );
+
+        // Typed writer, same key.
+        ws.ensure_cell_for_key(&key);
+
+        assert_eq!(ws.cells.len(), 1, "still ONE bucket — no collision here");
+        assert_eq!(
+            ws.get_stats().num_cells,
+            2,
+            "one green key, two cells: the typed install could not find the \
+             hash-only cell and chained past it",
+        );
+    }
+
+    /// The typed `_for_key` forms must select the cell belonging to the key,
+    /// not whichever cell heads the bucket.
+    ///
+    /// Non-vacuity comes from the fixture, not from trust: both tests first
+    /// assert that the bucket head is the *comparator-less* cell, so a
+    /// head-reading implementation is provably looking at the wrong object.
+    /// Against the hash-delegating forms these read `None` and `false`
+    /// respectively.
+    #[test]
+    fn mark_as_being_traced_for_key_marks_the_keys_own_cell_not_the_bucket_head() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![300, 400]);
+
+        // A hash-only writer squats the bucket with a comparator-less cell.
+        ws.disable_noninlinable_function(key.get_uhash());
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "fixture: the hash-only cell stores no comparekey, so the key \
+             owns nothing yet",
+        );
+
+        ws.mark_as_being_traced_for_key(&key);
+
+        // Delegating to the hash form set TRACING on the comparator-less head
+        // and left the key still owning no cell at all.
+        let cell = ws
+            .lookup_chain_with_key(&key)
+            .expect("the key must own a cell reachable by comparekey");
+        assert!(
+            cell.flags & jc_flags::TRACING != 0,
+            "TRACING must land on the key's own cell",
+        );
+        assert_eq!(
+            cell.state,
+            BaseJitCellState::Tracing,
+            "and so must the state transition",
+        );
+    }
+
+    #[test]
+    fn get_cell_for_key_returns_the_keys_cell_not_whichever_heads_the_bucket() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![500, 600]);
+
+        ws.disable_noninlinable_function(key.get_uhash());
+        ws.ensure_cell_for_key(&key);
+        assert_eq!(ws.cells.len(), 1, "one bucket");
+        assert_eq!(ws.get_stats().num_cells, 2, "two cells in it");
+
+        assert!(
+            !ws.get_cell(key.get_uhash())
+                .expect("bucket is occupied")
+                .comparekey_matches(&key),
+            "fixture: `install_new_cell` links the surviving hash-only cell \
+             AHEAD of the new typed one, so the HEAD is the comparator-less \
+             cell and a head-reading lookup returns the wrong cell here",
+        );
+
+        let cell = ws.get_cell_for_key(&key).expect("the key owns a cell");
+        assert!(
+            cell.comparekey_matches(&key),
+            "get_cell_for_key must return the cell that matches the key",
+        );
+    }
+
+    /// The typed creators must write to the key's own cell, not squat a new
+    /// comparator-less one beside it.
+    ///
+    /// Same fixture discipline as the pair above: a hash-only writer takes the
+    /// bucket first and the assertion that it owns nothing typed runs *before*
+    /// the call under test, so a form that delegated to the hash creator would
+    /// be provably writing to the comparator-less head. Against the hash forms
+    /// these read `None` at the `lookup_chain_with_key` line.
+    #[test]
+    fn attach_procedure_to_interp_for_key_installs_on_the_keys_own_cell() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![700, 800]);
+
+        ws.disable_noninlinable_function(key.get_uhash());
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "fixture: the hash-only cell carries no comparekey",
+        );
+
+        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
+
+        let cell = ws
+            .lookup_chain_with_key(&key)
+            .expect("the key must own a cell reachable by comparekey");
+        assert!(
+            cell.get_procedure_token().is_some(),
+            "the procedure token must land on the key's own cell",
+        );
+        assert_eq!(
+            cell.flags & jc_flags::TRACING,
+            0,
+            "and TRACING must be cleared on that same cell",
+        );
+    }
+
+    #[test]
+    fn mark_force_finish_tracing_for_key_sets_the_flag_on_the_keys_own_cell() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![900, 1000]);
+
+        ws.disable_noninlinable_function(key.get_uhash());
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "fixture: the hash-only cell carries no comparekey",
+        );
+
+        ws.mark_force_finish_tracing_for_key(&key);
+
+        let cell = ws
+            .lookup_chain_with_key(&key)
+            .expect("the key must own a cell reachable by comparekey");
+        assert!(
+            cell.flags & jc_flags::FORCE_FINISH != 0,
+            "FORCE_FINISH is sticky and never cleared, so landing it on the \
+             wrong cell of the bucket is permanent",
+        );
+    }
+
+    /// `get_stats` counts every cell in a chain, not just the bucket head.
+    ///
+    /// Non-vacuity: a chain is the *only* shape that separates the two
+    /// implementations, so this fixture hands `install_new_cell` a shared
+    /// bucket directly — as the collision fixture above does, and for the
+    /// same reason (`cells` is keyed by the full `get_uhash()`, so two real
+    /// green keys will not collide). Head and tail are put in *different*
+    /// states so a head-only reader is caught twice: once on the total and
+    /// once on the per-state split.
+    ///
+    /// The parenthetical above says only that a *collision* is
+    /// impractical to reach from two real keys; it is not a claim that
+    /// chains are rare. The fixture directly above shows a chain forming
+    /// from a SINGLE key with no collision at all.
+    ///
+    /// Measured against the previous body (`num_cells: self.cells.len()`
+    /// plus a `cells.values()` loop): fails `num_cells` 1 vs 2. The
+    /// per-state assertions below are not separately observed in that run —
+    /// the first failure ends it — but they cover the same head-only read
+    /// on a second axis, so a future body that fixes the total and keeps a
+    /// head-only state walk still fails here.
+    #[test]
+    fn get_stats_counts_chained_cells_not_just_bucket_heads() {
+        let mut ws = WarmEnterState::new(100);
+        let key_head = GreenKey::new(vec![100, 200]);
+        let key_tail = GreenKey::new(vec![300, 400]);
+        let bucket = key_head.get_uhash();
+
+        // TRACING keeps the tail non-removable so the second install chains
+        // it rather than dropping it (counter.py:246-256 should_remove gate).
+        let mut tail = BaseJitCell::new();
+        tail.state = BaseJitCellState::Tracing;
+        tail.flags |= jc_flags::TRACING;
+        tail.comparekey = Some(key_tail);
+        ws.install_new_cell(bucket, Some(tail));
+
+        let mut head = BaseJitCell::new();
+        head.state = BaseJitCellState::Compiled;
+        head.flags |= jc_flags::TRACING;
+        head.comparekey = Some(key_head);
+        ws.install_new_cell(bucket, Some(head));
+
+        // Precondition: one map entry holding a two-cell chain. Without
+        // this the assertions below would pass for the wrong reason.
+        assert_eq!(ws.cells.len(), 1, "fixture must build ONE bucket");
+        assert!(
+            ws.lookup_chain(bucket)
+                .and_then(|h| h.next.as_deref())
+                .is_some(),
+            "fixture must build a TWO-cell chain, or it cannot tell the \
+             implementations apart",
+        );
+
+        let stats = ws.get_stats();
+        assert_eq!(stats.num_cells, 2, "both chained cells must be counted");
+        assert_eq!(stats.num_compiled, 1, "head is Compiled");
+        assert_eq!(
+            stats.num_tracing, 1,
+            "the chained tail's Tracing state is invisible to a head-only reader",
         );
     }
 

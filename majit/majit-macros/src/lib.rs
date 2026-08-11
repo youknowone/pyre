@@ -375,10 +375,35 @@ fn helper_call_target_fn_name(path: &Path) -> syn::Result<Ident> {
 /// consts: those attributes already emit a `__majit_call_policy_`
 /// associated fn next to the method, so the surrounding `impl` is
 /// necessarily inherent (a trait impl would reject the foreign
-/// associated fn at compile time).  `jit_elidable` (a pure pass-through),
-/// `look_inside`, and `jit_loop_invariant` emit no policy fn and so stay
-/// free-fn-only, to avoid placing a foreign associated const inside a
-/// trait impl.
+/// associated fn at compile time).  `jit_elidable` (a pure pass-through)
+/// and `look_inside` emit no policy fn and so stay free-fn-only, to avoid
+/// placing a foreign associated const inside a trait impl.
+///
+/// `jit_loop_invariant` is also free-fn-only here and NOT for that
+/// reason.  It is expanded by `expand_call_surface_attr`, which calls
+/// `emit_helper_policy_fn` unconditionally and only afterwards consults
+/// this table, so a policy fn *is* emitted beside it — carrying an
+/// `UNSUPPORTED` body when a receiver makes `emit_helper_call_target_fn`
+/// decline.  What justifies its `false` is not recorded; it is at worst
+/// conservative, since the policy fn would already be rejected inside a
+/// trait impl.  Do not read that entry as "emits no policy fn".
+///
+/// Which attributes emit a policy fn is decided by the call sites of
+/// `emit_helper_policy_fn` and by nothing here.  Derive the set from
+/// them: a list restated beside them goes stale the moment an expander
+/// starts or stops calling one, which is what happened to this
+/// paragraph.
+///
+/// Where to start looking, since the previous paragraph is useless
+/// without it: the expanders calling `emit_helper_policy_fn` are
+/// `expand_elidable_attribute`, `expand_dont_look_inside_attribute`,
+/// `expand_call_surface_attr` and `elidable_promote`, and the spellings
+/// each one covers are the `#[proc_macro_attribute]` fns that reach it
+/// — several attributes share an expander, so the spellings outnumber
+/// the expanders and only the wrappers name them all.  That is an entry
+/// point and not the authority: a fifth expander would not appear in
+/// this sentence, so search for the call sites rather than trusting the
+/// four named here.
 fn rpython_attribute_const_for(
     attr_name: &str,
     sig: &syn::Signature,
@@ -815,9 +840,14 @@ fn emit_helper_policy_fn(
 ) -> syn::Result<proc_macro2::TokenStream> {
     let helper_name = helper_policy_fn_name(path)?;
     // `__majit_call_policy_*` visibility follows the user fn so
-    // external integration tests can read the 4-tuple's trace_target /
-    // concrete_target function pointers for PyPy `getfunctionptr`
-    // parity verification.  The trailing `i32` carries the wrapper
+    // external integration tests can read the returned tuple's
+    // trace_target / concrete_target function pointers for PyPy
+    // `getfunctionptr` parity verification.  The arity is deliberately
+    // not restated here: the signature below is the only statement of it
+    // that cannot go stale, and this comment read "4-tuple" while the
+    // signature returned six — an arity read off prose rather than off
+    // the type is how a caller ends up destructuring the wrong shape.
+    // The trailing `i32` carries the wrapper
     // callable's `_call_aroundstate_target_[1]` (`save_err`) per
     // `rffi.py:228`; non-`release_gil` policies emit `0i32`
     // (`RFFI_ERR_NONE`, `rffi.py:80`).
@@ -1078,7 +1108,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// The JIT can eliminate calls to this function when all arguments are constants.
 /// `rlib/jit.py:72 elidable` sets `_elidable_function_ = True` and nothing else;
-/// the flag travels here as the marker const [`rpython_attribute_const_for`]
+/// the flag travels here as the marker const `rpython_attribute_const_for`
 /// emits, which `front/llbc_hints.rs` harvests from the extracted LLBC, and the
 /// constant fold reaches the separate `__majit_call_target_*` trampoline. None
 /// of that is a property of this function's codegen.
@@ -1216,7 +1246,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
 /// The JIT will not trace into this function; it will be called as a black box.
 /// `rlib/jit.py:133-140 @dont_look_inside` — sets `_jit_look_inside_ = False`
 /// (line 139) and nothing else.  This expansion carries that flag as the
-/// `_jit_look_inside_` marker const [`rpython_attribute_const_for`] emits next
+/// `_jit_look_inside_` marker const `rpython_attribute_const_for` emits next
 /// to the function; `front/llbc_hints.rs` harvests it out of the extracted LLBC
 /// and `front/mir.rs` turns it into the residual-call decision.  The policy is
 /// therefore a property of the marker, not of the function's codegen.
@@ -3112,8 +3142,8 @@ pub fn virtualizable(input: TokenStream) -> TokenStream {
 /// - `#[vable(frame)]` — frame pointer OpRef
 /// - `#[vable(field)]` — static virtualizable field OpRef
 /// - `#[vable(array_base)]` — array base index
-/// - `#[vable(locals)]` — symbolic locals Vec<OpRef>
-/// - `#[vable(stack)]` — symbolic stack Vec<OpRef>
+/// - `#[vable(locals)]` — symbolic locals `Vec<OpRef>`
+/// - `#[vable(stack)]` — symbolic stack `Vec<OpRef>`
 /// - `#[vable(local_types)]` / `#[vable(stack_types)]` — type vectors
 /// - `#[vable(nlocals)]` / `#[vable(valuestackdepth)]` — shape fields
 ///

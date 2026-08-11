@@ -4,6 +4,7 @@
 /// executes them as ordinary function pointers.
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::IndexMapExt;
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -90,7 +91,7 @@ fn majit_verify_enabled() -> bool {
 
 use crate::guard::{BridgeData, JitFrameDeadFrame, drop_bridge_payload};
 
-// ── compile.py:665-674 done_with_this_frame singletons ──────────────
+// `compile.py:665-674` `done_with_this_frame` singletons
 //
 // Per-result-type `DoneWithThisFrame*` singletons.
 // These are now `DescrRef`s holding the metainterp's class-distinct
@@ -272,8 +273,7 @@ fn match_metainterp_finish_descr(
     None
 }
 
-// ── JitFrame layout constants (jitframe.py:61-83) ───────────────────
-//
+// JitFrame layout constants (`jitframe.py:61-83`)
 // The canonical layout lives in `majit_backend::jitframe`; re-export the
 // byte offsets here so uses inside this file stay terse.
 use majit_backend::jitframe::{
@@ -321,6 +321,7 @@ fn jitframe_gc_type_id_is_explicit() -> bool {
     JITFRAME_GC_TYPE_ID_IS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire)
 }
 
+// JitFrame layout registration for the GC rewriter
 /// Ensure the JITFRAME GC type is registered, and that
 /// `JITFRAME_GC_TYPE_ID` reflects the id the GC assigned to it.
 ///
@@ -1150,9 +1151,7 @@ const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
 #[cfg(test)]
 const BUILTIN_STRING_CHARS_OFFSET: usize = BUILTIN_STR_TOKEN_BASE_SIZE - 1;
 
-// ---------------------------------------------------------------------------
 // Helpers (free functions to avoid borrow conflicts)
-// ---------------------------------------------------------------------------
 
 thread_local! {
     /// regalloc.py:140-181 RegisterManager.{reg_bindings, longevity} parity:
@@ -2100,7 +2099,7 @@ pub fn register_call_assembler_blackhole(
 /// compile.py:701-717 handle_fail callback for call_assembler guard failures.
 /// (raw_values_ptr, num_values, descr_addr) -> bridge_compiled.
 ///
-/// `pyjitpl.py:2890 handle_guard_failure(self, resumedescr, deadframe)`
+/// `pyjitpl.py:2914 handle_guard_failure(self, resumedescr, deadframe)`
 /// receives the descr directly; the C-ABI delivers the same shape via
 /// `descr_addr` (recovered to `Arc<dyn FailDescr>` by the receiver)
 /// instead of a surrogate `(green_key, trace_id, fail_index)` triple.
@@ -2292,8 +2291,6 @@ thread_local! {
 pub fn take_pending_frame_restore() -> Option<FrameRestore> {
     PENDING_FRAME_RESTORE.with(|c| c.take())
 }
-
-// ── JitFrame layout registration for the GC rewriter ────────────────
 
 /// JitFrame field descriptors supplied by the interpreter crate so the
 /// GC rewriter's `handle_call_assembler` pass (rewrite.py:665-695) can
@@ -3172,7 +3169,8 @@ fn grab_exc_value_from_jf_ptr(jf_ptr: usize) -> i64 {
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
     let mut cur_code_ptr = target.code_ptr;
-    let mut cur_fail_descrs = target.fail_descrs.clone();
+    // Borrowed, not cloned — see `execute_with_inputs_at_dispatch_key`.
+    let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&target.fail_descrs);
     let mut cur_num_ref_roots = target.num_ref_roots;
     let mut cur_max_output_slots = target.max_output_slots;
     let mut current_inputs = inputs.to_vec();
@@ -3254,7 +3252,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                         .map(host_reentry_dispatch_key)
                         .unwrap_or(0);
                     cur_code_ptr = target_entry.code_ptr;
-                    cur_fail_descrs = target_entry.fail_descrs;
+                    cur_fail_descrs = Cow::Owned(target_entry.fail_descrs.into_vec());
                     cur_num_ref_roots = target_entry.num_ref_roots;
                     cur_max_output_slots = target_entry.max_output_slots;
                     continue;
@@ -6974,9 +6972,7 @@ fn emit_guard_exit(
     builder.ins().return_(&[jf_ptr]);
 }
 
-// ---------------------------------------------------------------------------
 // Compiled loop data
-// ---------------------------------------------------------------------------
 
 struct CompiledLoop {
     trace_id: u64,
@@ -8013,9 +8009,7 @@ fn resolve_fail_arg_types(
         .collect())
 }
 
-// ---------------------------------------------------------------------------
 // CraneliftBackend
-// ---------------------------------------------------------------------------
 
 pub struct CraneliftBackend {
     /// `rpython/jit/backend/model.py:28-29 self.tracker =
@@ -8611,7 +8605,13 @@ impl CraneliftBackend {
         slice_x2_probe::arm_reporter();
         // Current trace state (equivalent to LLFrame.lltrace)
         let mut cur_code_ptr = compiled.code_ptr;
-        let mut cur_fail_descrs: Box<[DescrRef]> = compiled.fail_descrs.clone();
+        // Borrowed, not cloned: the dispatch loop only READS this table, and
+        // the one writer is the external-JUMP re-entry below, which brings its
+        // own owned table. Cloning up front allocated once per entry into
+        // compiled code and bumped one `Arc` refcount per descr — measured at
+        // 64 B / 4 descrs (straight-line trace) and 96 B / 6 (loop) on cel's
+        // `price + qty * 2`.
+        let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = inputs.to_vec();
@@ -8691,7 +8691,7 @@ impl CraneliftBackend {
                     .map(host_reentry_dispatch_key)
                     .unwrap_or(0);
                 cur_code_ptr = target_entry.code_ptr;
-                cur_fail_descrs = target_entry.fail_descrs;
+                cur_fail_descrs = Cow::Owned(target_entry.fail_descrs.into_vec());
                 cur_num_ref_roots = target_entry.num_ref_roots;
                 cur_max_output_slots = target_entry.max_output_slots;
                 cur_inputs = outputs;
@@ -15860,9 +15860,7 @@ fn collect_terminal_exit_layouts(
     Ok(layouts)
 }
 
-// ---------------------------------------------------------------------------
 // Backend trait implementation
-// ---------------------------------------------------------------------------
 
 impl majit_backend::Backend for CraneliftBackend {
     fn backend_name(&self) -> &'static str {
@@ -16481,7 +16479,8 @@ impl majit_backend::Backend for CraneliftBackend {
         // mirrors that dispatch loop with one additional raw-output
         // termination per `execute_token_ints_raw`'s contract.
         let mut cur_code_ptr = compiled.code_ptr;
-        let mut cur_fail_descrs: Box<[DescrRef]> = compiled.fail_descrs.clone();
+        // Borrowed, not cloned — see `execute_with_inputs_at_dispatch_key`.
+        let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = args.to_vec();
@@ -16603,7 +16602,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     .map(host_reentry_dispatch_key)
                     .unwrap_or(0);
                 cur_code_ptr = target_entry.code_ptr;
-                cur_fail_descrs = target_entry.fail_descrs;
+                cur_fail_descrs = Cow::Owned(target_entry.fail_descrs.into_vec());
                 cur_num_ref_roots = target_entry.num_ref_roots;
                 cur_max_output_slots = target_entry.max_output_slots;
                 cur_inputs = outputs;
@@ -17551,7 +17550,6 @@ impl majit_backend::Backend for CraneliftBackend {
 // the same dispatch.
 
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -23650,7 +23648,7 @@ mod tests {
     #[test]
     #[ignore = "sets the process-global PYRE_CL_NO_CLOSING_JUMP env var to force the \
         host-loop external-JUMP path (in-code closing_jump disabled); run serially: \
-        `PYRE_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift --features dynasm \
+        `PYRE_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift \
         test_host_loop_external_jump_to_middle_label -- --ignored --test-threads=1`"]
     fn test_host_loop_external_jump_to_middle_label_uses_label_selector() {
         // Same scenario as the in-code variant above, but with closing_jump
@@ -23767,7 +23765,7 @@ mod tests {
     #[test]
     #[ignore = "sets the process-global PYRE_CL_NO_CLOSING_JUMP env var to force the \
         host-loop external-JUMP path (in-code closing_jump disabled); run serially: \
-        `PYRE_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift --features dynasm \
+        `PYRE_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift \
         test_host_loop_external_jump_to_first_label -- --ignored --test-threads=1`"]
     fn test_host_loop_external_jump_to_first_label_uses_label_selector() {
         // The first LABEL (`label_block_id` 0) is not special: `closing_jump`

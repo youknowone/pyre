@@ -116,8 +116,6 @@ fn derive_slot_types(
         .collect()
 }
 
-// ── Compilation result types (compile.py) ───────────────────────────────
-
 /// Static exit metadata for a compiled guard or finish point.
 #[derive(Debug, Clone)]
 pub struct CompiledExitLayout {
@@ -231,8 +229,6 @@ pub struct DeadFrameArtifacts {
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
 }
-
-// ── CompileData input bundles (compile.py:31-139) ───────────────────────
 
 /// `compile.py:31` `class CompileData(object)`.
 ///
@@ -371,8 +367,6 @@ impl<'a> UnrolledLoopData<'a> {
     }
 }
 
-// ── Compilation helper functions ────────────────────────────────────────
-
 /// Build guard metadata for a compiled trace.
 ///
 /// The backend numbers every guard and finish in a single exit table, so this
@@ -460,7 +454,9 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         // the descr's `fail_arg_types()` (post-numbering, post-virtual-
         // materialization) and mirrors it to `op.fail_arg_types` for
         // sharing-path guards (mod.rs:3068-3088). After the codex #3 fix
-        // (tracer-stage descr=None, dbd452a640c), every guard's descr is
+        // (tracer-stage descr=None -- that hash resolves nowhere in
+        // this repository, so the mechanism named here is the
+        // reference), every guard's descr is
         // minted by `store_final_boxes_in_guard` carrying the
         // post-numbering type vector, so descr-first priority no longer
         // exposes stale tracer types. Fall back to `op.fail_arg_types`
@@ -2264,7 +2260,6 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────
 // `rpython/jit/metainterp/compile.py:623-674` — finish/propagate descrs.
 //
 // These are ported as backend-agnostic `FailDescr` impls on the
@@ -2280,7 +2275,6 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
 // (pyjitpl.rs) and `Backend` (majit-backend/lib.rs via the blanket
 // impl below), so `MetaInterp::new` installs a single `Arc` on both
 // halves; `attach_descrs_to_cpu` forwards the clones to the backend.
-// ──────────────────────────────────────────────────────────────────────
 
 // `compile.py:623-672, 1092-1099` `_DoneWithThisFrameDescr` family /
 // `ExitFrameWithExceptionDescrRef` / `PropagateExceptionDescr`: the
@@ -5198,7 +5192,6 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 /// `ResumeGuardDescr` (`compile.py:855`) is the single guard-owned
 /// resume container.
 
-// ── TraceCtx merge-point / inline-tracking methods ──────────────────────
 //
 // These are the **compile role** of `TraceCtx`, mirroring RPython's
 // `pyjitpl.py` merge-point bookkeeping (`current_merge_points`,
@@ -5347,7 +5340,7 @@ impl TraceCtx {
     ///
     /// `header_pc` identifies the header on its own here: a merge point's
     /// `green_key` is derived from `(code, header_pc)`, so the reverse scan's
-    /// first hit is the same entry [`get_merge_point_at`] would return.
+    /// first hit is the same entry [`Self::get_merge_point_at`] would return.
     /// Only entries recorded during the walk (`position > 0`) answer here.
     /// The entry at position 0 is the synthetic trace-start seed, whose boxes
     /// were built from the trace's own `inputarg_types()`; leaving it out lets
@@ -5418,7 +5411,7 @@ impl TraceCtx {
     /// Record the structured greenkey for the root trace. Called once
     /// at trace start to seed `green_key_raw` and `root_green_key_raw`
     /// from the tracer-side `(code_ptr, pc)`. Subsequent back-edge
-    /// retargeting flows through [`set_green_key`].
+    /// retargeting flows through [`Self::set_green_key`].
     pub fn set_root_green_key_raw(&mut self, raw: (usize, usize)) {
         self.green_key_raw = raw;
         self.root_green_key_raw = raw;

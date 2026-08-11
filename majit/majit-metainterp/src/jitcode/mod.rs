@@ -35,7 +35,6 @@ pub use majit_translate::insns::{pyre_extension_insns, wellknown_bh_insns};
 /// definition lives in `majit_translate::jitcode::enumerate_vars`.
 pub use majit_translate::jitcode::enumerate_vars;
 
-// ──────────────────────────────────────────────────────────────────
 // Runtime descr pool types — RPython
 // `BlackholeInterpBuilder.descrs` / `BlackholeInterpreter.descrs`
 // (`blackhole.py:103`, `blackhole.py:288`).
@@ -51,7 +50,6 @@ pub use majit_translate::jitcode::enumerate_vars;
 // These types are runtime-only — they reference raw `*const ()`
 // trampoline addresses and live `Arc<JitCode>` callee handles, neither
 // of which has a representation in the codewriter source layer.
-// ──────────────────────────────────────────────────────────────────
 
 /// Trace-side function target descriptor for `BC_CALL_*` /
 /// `BC_RESIDUAL_CALL_*`.  RPython `blackhole.py:1225-1256` reads the
@@ -68,7 +66,7 @@ pub use majit_translate::jitcode::enumerate_vars;
 /// resolved `JitCallTarget` thread the slot through
 /// `make_call_descr_from_target_slot` so the recorded descr carries
 /// the right `EffectInfo` instead of the `default_effect_info()`
-/// fallback.  The default ([`EffectInfoSlot::CanRaise`]) preserves the
+/// fallback.  The default ([`crate::call_descr::EffectInfoSlot::CanRaise`]) preserves the
 /// pre-G-2 behaviour for every existing construction site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitCallTarget {
@@ -324,7 +322,7 @@ static GLOBAL_BUILD_DESCR_POOL: std::sync::OnceLock<GlobalDescrPool> = std::sync
 
 /// Install the process-global build-time descr pool.  Idempotent: the first
 /// call wins and later calls are ignored (the pool is a frozen build artifact,
-/// identical across callers).  See [`GLOBAL_BUILD_DESCR_POOL`].
+/// identical across callers).  See `GLOBAL_BUILD_DESCR_POOL`.
 ///
 /// `build` runs only on the call that installs the pool.  It takes a closure
 /// rather than a built `Vec` because the callers sit on hot paths — the jd1
@@ -383,7 +381,6 @@ pub struct JitCodeExecState {
     pub jit_merge_point_offset: Option<usize>,
 }
 
-// ──────────────────────────────────────────────────────────────────
 // Wrapper `JitCode` — runtime jitcode = canonical core + descr pool.
 //
 // RPython parity:
@@ -411,7 +408,6 @@ pub struct JitCodeExecState {
 // dispatch) via `JitCode::from_canonical`.  Per-CodeObject runtime
 // jitcodes are produced directly as wrappers by
 // `JitCodeBuilder::finish()`.
-// ──────────────────────────────────────────────────────────────────
 
 /// Runtime JitCode = canonical RPython parity core + descr pool.
 #[derive(Debug)]
@@ -564,7 +560,7 @@ impl JitCode {
     /// Resolve a `d`/`j` argcode descr for this jitcode.  Runtime-emitted
     /// jitcodes answer from their per-jitcode `exec.descrs` pool; build-time
     /// (LLBC-extracted) jitcodes carry an empty pool and fall through to the
-    /// process-global [`GLOBAL_BUILD_DESCR_POOL`] (RPython's single shared
+    /// process-global `GLOBAL_BUILD_DESCR_POOL` (RPython's single shared
     /// `Assembler.descrs`).  A populated per-jitcode slot always wins, so the
     /// runtime path stays byte-identical to a direct `exec.descrs` read.
     pub fn descr_at(&self, index: usize) -> Option<&RuntimeBhDescr> {
@@ -604,9 +600,9 @@ impl JitCodeRuntimeExt for JitCode {
 /// when decoding). The 256-per-kind register limit, the `num_regs < 256`
 /// assemble-time decline, and every register decode site all rest on this
 /// width. Encode register operands with `JitCodeBuilder::push_reg_u8` and
-/// decode them with [`read_reg`] / `next_reg`, so the width lives in one place.
+/// decode them with `read_reg` / `next_reg`, so the width lives in one place.
 ///
-/// ⚠️ This MUST remain `u8`. Do NOT widen it to `u16` (or any wider type):
+/// This MUST remain `u8`. Do NOT widen it to `u16` (or any wider type):
 /// doing so silently desyncs the encoder from the 1-byte register decoders and
 /// reintroduces exactly the register-width divergence this alias exists to
 /// prevent. Non-register operands (descr / field / array indexes) are `u16`

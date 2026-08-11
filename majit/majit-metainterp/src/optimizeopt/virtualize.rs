@@ -62,6 +62,43 @@ pub(crate) struct VirtualizableConfig {
     /// Mirrors `interp_jit.py:67 reds = ['frame', 'ec']` — the non-vable
     /// extra reds occupy `InputArg` slots `1..1+vable_input_offset`.
     pub vable_input_offset: usize,
+    /// Flat input-arg slot holding the virtualizable identity at loop entry.
+    ///
+    /// `Some(0)` is the legacy `[frame, vable_scalars.., array_items..]` layout,
+    /// where the frame leads. The macro state-field JIT mints its inputargs in
+    /// `[int scalars.., fixed-array cells.., identity]` order instead
+    /// (`majit-macros/src/jit_interp/codegen_state.rs` `create_sym`), so the
+    /// identity sits past the scalars and the cells; that position comes from
+    /// `VirtualizableInfo::identity_live_index`, which the macro emits only when
+    /// the state declares no fixed array. With one present the position is
+    /// `num_scalars + sum(fixed array lengths)` — runtime `Vec` lengths, not a
+    /// macro-expansion constant — so nothing is declared and this is `None`.
+    ///
+    /// `None` means no position was declared, and the tracker then
+    /// DECLINES to track this virtualizable. It must not fall back to slot 0,
+    /// because that does not fail loudly on the state-field layout: it finds the
+    /// first int scalar and installs `PtrInfo::Virtualizable` on it, since
+    /// `inputarg_type` keys on the raw index and never on the `InputArg` variant
+    /// tag, so a `Ref`-tagged probe resolves to the `Int` slot's host. The
+    /// preamble then exports that scalar as a `Ref` leaf and the loop-close jump
+    /// hands back the `Int` it really is — the `expected=Ref actual=Int` cross
+    /// rejected at `virtualstate.rs` `enum_forced_boxes_for_entry`, i.e.
+    /// `VirtualStatesCantMatch`, and no trace ever compiles. It only bites when
+    /// that scalar reaches the Jump as its own inputarg; a scalar reassigned
+    /// every iteration passes the recomputed value instead and hides it.
+    /// Declining costs the virtualizable optimization; guessing costs every
+    /// trace. What declining actually costs on this layout was measured on
+    /// `tests/jit_interp_fixed_array_identity_slot.rs` and is nil: resolving the
+    /// slot and declining it give the same compile count and the same trace size
+    /// (6 ops recorded, 5 after optimization), because `is_standard_ref` never
+    /// returns true there and no vable array access is ever resolved for
+    /// mirroring.
+    ///
+    /// The decline is not total. `identity_input_ref` returns
+    /// `Some(input_arg_ref(base))` whenever `ctx.inputarg_base != 0` — a bridge —
+    /// before it consults this field at all, so a tracker is still installed on
+    /// that path with this set to `None`.
+    pub identity_input_index: Option<usize>,
     /// Whether the tracker seeds array-element state from the trace-entry
     /// input args (`init`'s array loop).
     ///
@@ -124,24 +161,46 @@ impl VirtualizableTracker {
         self.needs_setup = true;
     }
 
+    /// The input-arg slot the virtualizable identity occupies, or `None` when
+    /// no sound slot is known and the tracker must decline.
+    ///
+    /// A bridge keeps the identity at its own base: its input args are rebuilt
+    /// from the deadframe frame-first, which is also what `init`'s `base == 0`
+    /// gate and `is_standard_ref` assume, so the resolved offset applies to the
+    /// loop entry only — and so does the decline, since the bridge's base is
+    /// established by the deadframe rather than by the host's layout.
+    fn identity_input_ref(&self, ctx: &OptContext) -> Option<OpRef> {
+        let base = ctx.inputarg_base;
+        if base != 0 {
+            return Some(OpRef::input_arg_ref(base));
+        }
+        Some(OpRef::input_arg_ref(
+            self.config.identity_input_index? as u32,
+        ))
+    }
+
     /// Apply deferred virtualizable setup if needed.
     fn ensure_setup(&mut self, ctx: &mut OptContext) {
         if self.needs_setup {
             self.needs_setup = false;
-            let base = ctx.inputarg_base;
+            // No sound identity slot — decline rather than install
+            // `PtrInfo::Virtualizable` on whatever inputarg 0 happens to be.
+            let Some(identity_ref) = self.identity_input_ref(ctx) else {
+                return;
+            };
             let first_check = ctx
-                .get_box_replacement_operand_opt(OpRef::input_arg_ref(base))
+                .get_box_replacement_operand_opt(identity_ref)
                 .as_ref()
                 .is_some_and(|b| ctx.has_ptr_info(b));
             if !first_check {
                 self.init(ctx);
                 let second_check = ctx
-                    .get_box_replacement_operand_opt(OpRef::input_arg_ref(base))
+                    .get_box_replacement_operand_opt(identity_ref)
                     .as_ref()
                     .is_some_and(|b| ctx.has_ptr_info(b));
                 if !second_check {
                     {
-                        let b = ctx.materialize_operand_at(OpRef::input_arg_ref(base));
+                        let b = ctx.materialize_operand_at(identity_ref);
                         ctx.set_ptr_info(
                             &b,
                             PtrInfo::Virtualizable(VirtualizableFieldState {
@@ -162,6 +221,11 @@ impl VirtualizableTracker {
         if ctx.num_inputs() <= 1 {
             return;
         }
+        // Same decline as `ensure_setup`: without a known identity slot there is
+        // nothing to hang the seeded `VirtualizableFieldState` on.
+        let Some(identity_ref) = self.identity_input_ref(ctx) else {
+            return;
+        };
 
         let mut state = VirtualizableFieldState {
             fields: vec![],
@@ -269,7 +333,7 @@ impl VirtualizableTracker {
             }
         }
 
-        let b = ctx.materialize_operand_at(OpRef::input_arg_ref(base));
+        let b = ctx.materialize_operand_at(identity_ref);
         ctx.set_ptr_info(&b, PtrInfo::Virtualizable(state));
     }
 
@@ -279,8 +343,14 @@ impl VirtualizableTracker {
         // is the trace's first inputarg, at `inputarg_base`: `0` for
         // loops/preambles, `bridge_inputarg_base` for bridges (whose parent
         // loop owns the low OpRef range, so the bridge's own inputargs — frame
-        // first — start at the shifted base).
-        match ctx.get_box_replacement_operand_opt(OpRef::input_arg_ref(ctx.inputarg_base)) {
+        // first — start at the shifted base). A loop whose front end does not
+        // lead with the identity declares where it does sit
+        // (`identity_input_index`), and a loop with no known identity slot
+        // declines: nothing is the standard ref.
+        match self
+            .identity_input_ref(ctx)
+            .and_then(|r| ctx.get_box_replacement_operand_opt(r))
+        {
             Some(std) => b.same_box(&std) && ctx.is_virtualizable(b),
             None => false,
         }
@@ -856,8 +926,8 @@ impl OptVirtualize {
         // keys fields by slot instead of indexing an array, so the read needed
         // nothing to answer and the call was dropped; `vinfo.descr` then stayed
         // at whatever the allocation set. That descr is what
-        // `field_slot_disagreement` below reads, so the upgrade has to happen
-        // for the slot it checks to be the slot upstream would have used.
+        // `field_slot_identifies` below reads, so the upgrade has to happen for
+        // the slot it checks to be the slot upstream would have used.
         //
         // Only for a virtual: `virtualize.py:185-186` reaches `opinfo.getfield`
         // under `opinfo.is_virtual()`, and a non-virtual info's descr is
@@ -975,8 +1045,8 @@ impl OptVirtualize {
             // with GETFIELD_GC_R to decide whether the frame is JIT-owned, and
             // a non-null pointer reads as owned on a frame that has no token.
             //
-            // A field the positional list does not hold cannot have been
-            // stored under its own identity either, so this is exactly
+            // A field the positional list does not hold cannot have been stored
+            // under its own identity either, so this is exactly
             // `virtualize.py:188`'s state: the trace never stored it and the
             // read answers the zeroed allocation.  Skip the slot lookup and
             // take the zero fold below -- which for `vable_token` is the
@@ -2987,6 +3057,118 @@ mod tests {
         }
     }
 
+    /// A field descr that CLAIMS a slot it does not occupy: `index_in_parent`
+    /// answers `claimed_idx` while `offset` answers a genuinely different
+    /// field's address, so the parent's `all_fielddescrs()[claimed_idx]` and
+    /// this descr do not name the same field.
+    ///
+    /// This is descriptor census's "in-range but naming a different slot" mint reduced to
+    /// two descrs. It is deliberately NOT out-of-range: `get_field` searches a
+    /// `Vec<(u32, Operand)>` by key and cannot index past its end, so the
+    /// out-of-range rows reach `force_box_impl`'s `.get(idx).expect(..)`, a
+    /// different consumer with a different (loud) failure.
+    #[derive(Debug)]
+    struct MisindexedFieldDescr {
+        claimed_idx: u32,
+        real_offset: usize,
+    }
+
+    impl Descr for MisindexedFieldDescr {
+        fn index(&self) -> u32 {
+            0xDEAD_0000 | self.claimed_idx
+        }
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for MisindexedFieldDescr {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            Some(test_parent_size_descr(
+                self.claimed_idx,
+                majit_ir::Type::Int,
+            ))
+        }
+        fn index_in_parent(&self) -> usize {
+            self.claimed_idx as usize
+        }
+        fn offset(&self) -> usize {
+            self.real_offset
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> majit_ir::Type {
+            majit_ir::Type::Int
+        }
+    }
+
+    fn misindexed_field_descr(claimed_idx: u32, real_offset: usize) -> DescrRef {
+        Arc::new(MisindexedFieldDescr {
+            claimed_idx,
+            real_offset,
+        })
+    }
+
+    /// A field descr whose parent carries NO layout: `get_parent_descr()`
+    /// answers a descr for which `as_size_descr()` is `None`.
+    ///
+    /// This is the one shape that lets a POPULATED slot coexist with
+    /// `cur_len == 0`, which is what `init_fields`' first arm needs to be
+    /// observable on the read path. Two short-circuits do it, both on the same
+    /// `as_size_descr()`:
+    ///
+    /// - `init_fields` opens with
+    ///   `let Some(size_descr) = descr.as_size_descr() else { return; }`
+    ///   (`ptr_info.rs:1051`), so the setfield's own `init_fields` leaves the
+    ///   virtual's descr exactly as the allocation set it. Any
+    ///   size-descr-parented field descr would instead take the `cur_len == 0`
+    ///   arm right there and close the window before the read is reached.
+    /// - `field_slot_disagreement` opens with `descr.as_size_descr()?`
+    ///   (`:2508`), so the write is not refused and no panic fires.
+    #[derive(Debug)]
+    struct NarrowParentFieldDescr {
+        idx: u32,
+    }
+
+    impl Descr for NarrowParentFieldDescr {
+        fn index(&self) -> u32 {
+            0xBEEF_0000 | self.idx
+        }
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for NarrowParentFieldDescr {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            // Deliberately NOT a SizeDescr: `TestArrayDescr` implements only
+            // `Descr::index`, so `as_size_descr()` falls through to the trait
+            // default and answers `None`. The `0xA000` tag keeps this parent's
+            // descr index clear of the bare `idx` that `size_descr`/
+            // `field_descr` mint, so nothing keyed on index can confuse them.
+            Some(Arc::new(TestArrayDescr {
+                idx: 0xA000 | self.idx,
+            }))
+        }
+        fn index_in_parent(&self) -> usize {
+            self.idx as usize
+        }
+        fn offset(&self) -> usize {
+            self.idx as usize * 8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> majit_ir::Type {
+            majit_ir::Type::Int
+        }
+    }
+
+    fn narrow_parent_field_descr(idx: u32) -> DescrRef {
+        Arc::new(NarrowParentFieldDescr { idx })
+    }
+
     fn test_parent_size_descr(idx: u32, field_type: majit_ir::Type) -> DescrRef {
         let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = (0..=idx)
             .map(|field_idx| {
@@ -3020,6 +3202,13 @@ mod tests {
 
     fn size_descr(idx: u32) -> DescrRef {
         Arc::new(TestSizeDescr { idx })
+    }
+
+    /// An allocation descr that is NOT a `SizeDescr` — `as_size_descr()`
+    /// answers `None`, so a virtual allocated with it starts at `cur_len == 0`
+    /// via `init_fields`' `.map(..).unwrap_or(0)` (`ptr_info.rs:1080-1084`).
+    fn non_size_descr(idx: u32) -> DescrRef {
+        Arc::new(TestArrayDescr { idx })
     }
 
     fn field_descr(idx: u32) -> DescrRef {
@@ -3243,6 +3432,7 @@ mod tests {
                 array_field_descrs: vec![],
                 array_lengths: vec![1],
                 vable_input_offset: 0,
+                identity_input_index: Some(0),
                 track_array_elements: true,
             },
         )));
@@ -3274,6 +3464,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            identity_input_index: Some(0),
             track_array_elements: true,
         });
         pass.setup();
@@ -3374,6 +3565,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![],
             vable_input_offset: 0,
+            identity_input_index: Some(0),
             track_array_elements: true,
         });
         pass.setup();
@@ -3423,6 +3615,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![],
             vable_input_offset: 0,
+            identity_input_index: Some(0),
             track_array_elements: true,
         });
         pass.setup();
@@ -3454,6 +3647,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![],
             vable_input_offset: 0,
+            identity_input_index: Some(0),
             track_array_elements: true,
         });
         pass.setup();
@@ -3532,6 +3726,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            identity_input_index: Some(0),
             track_array_elements: true,
         });
         pass.setup();
@@ -3578,6 +3773,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            identity_input_index: Some(0),
             track_array_elements: true,
         });
         pass.setup();
@@ -3629,6 +3825,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            identity_input_index: Some(0),
             track_array_elements: true,
         });
         pass.setup();
@@ -3737,6 +3934,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            identity_input_index: Some(0),
             track_array_elements: true,
         });
         pass.setup();
@@ -3851,6 +4049,7 @@ mod tests {
             array_field_descrs: vec![],
             array_lengths: vec![1],
             vable_input_offset: 0,
+            identity_input_index: Some(0),
             track_array_elements: true,
         });
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
@@ -3884,6 +4083,18 @@ mod tests {
 
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
+        // The optimizer above is configured WITH a virtualizable, so every
+        // guard snapshot must carry a vable section — `pyjitpl.py:3326-3330`
+        // makes `virtualizable_boxes` non-empty for the whole life of such a
+        // trace, and `resume.py:236-239` (armed via
+        // `minimum_virtualizable_size`) asserts it. Identity first
+        // (`opencoder.py:718-726`), then this config's one static field and
+        // its one array item.
+        opt.snapshot_vable_boxes = vec![Some(vec![
+            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(0, Type::Ref), Type::Ref),
+            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(1, Type::Int), Type::Int),
+            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(2, Type::Int), Type::Int),
+        ])];
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
         let jump = result
             .iter()
@@ -3981,6 +4192,191 @@ mod tests {
             "all ops should be removed; got {} ops: {:?}",
             result.len(),
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    /// ```text
+    /// p0 = new_with_vtable(descr=size1)
+    /// setfield_gc(p0, i100, descr=field10)          # slot 10 <- i100
+    /// i1 = getfield_gc_i(p0, descr=misindexed)      # claims a slot it does not hold
+    /// i2 = int_mul(i1, i200)                        # survives, so i1 is observable
+    /// ```
+    ///
+    /// The setfield fixes the virtual's descr to `field_descr(10)`'s parent
+    /// (`optimize_setfield_gc` -> `init_fields`), whose slot list is `0..=10`
+    /// with `offset == idx * 8`. So `real_offset` is what decides LISTED vs
+    /// UNLISTED, and it is a parameter rather than a constant precisely so a
+    /// reader can check that for themselves: `read_slot * 8` makes the claimed
+    /// slot genuinely hold the field, anything else makes it a false claim.
+    /// Both legs below pass 24 — slot 3's address — so any `read_slot` other
+    /// than 3 is unlisted.
+    ///
+    /// `IntMul` is not in `OptVirtualize`'s dispatch table, so it survives the
+    /// pass with its argument resolved — that argument is the only place the
+    /// read's answer is observable, because the read itself is `Remove`d under
+    /// BOTH behaviours and an op-count assertion cannot tell them apart.
+    fn slot_read_trace(read_slot: u32, real_offset: usize) -> Vec<Op> {
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], size_descr(1)),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 100),
+                ],
+                field_descr(10),
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
+                misindexed_field_descr(read_slot, real_offset),
+            ),
+            Op::new(
+                OpCode::IntMul,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 2),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                ],
+            ),
+        ];
+        assign_positions(&mut ops);
+        ops
+    }
+
+    /// The answer the surviving `IntMul` received for the folded read, or
+    /// `None` when the read forwarded a non-constant operand.
+    fn folded_read_answer(result: &[Op]) -> Option<Value> {
+        assert_eq!(
+            result.len(),
+            1,
+            "expected only the IntMul to survive; got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        assert_eq!(result[0].opcode, OpCode::IntMul);
+        result[0].arg(0).const_value()
+    }
+
+    /// THE POSITIVE LEG. A read whose claimed slot IS populated but does
+    /// NOT hold the field being read must answer the zeroed allocation, not
+    /// the value the other field stored there.
+    ///
+    /// The correct answer is `Value::Int(0)`: `field_slot_identifies` fails,
+    /// `slot_resolvable` is false, `field_val` is `None`, and the read falls
+    /// through to `virtualize.py:188-189`'s zero-fold — the guard's own log
+    /// line says "folding to the zeroed allocation".
+    ///
+    /// Before `field_slot_identifies` there was no read-side slot check, so
+    /// `get_field` found slot 10 populated and forwarded ANOTHER FIELD'S VALUE.
+    /// The fold is not the harm; the unguarded forward was.
+    #[test]
+    fn test_unlisted_slot_read_of_a_populated_slot_answers_the_zeroed_allocation() {
+        let ops = slot_read_trace(10, 24);
+        let result = run_pass_typed(&ops, &[100, 200]);
+        assert_eq!(
+            folded_read_answer(&result),
+            Some(Value::Int(0)),
+            "a read whose slot does not hold it must answer the zeroed \
+             allocation; forwarding the populated slot hands back a different \
+             field's value"
+        );
+    }
+
+    /// THE NEGATIVE CONTROL, and it must pass with or without the read-side
+    /// check. Same trace, same descrs, same populated slot 10 — only the
+    /// claimed slot moves to 5, which nothing ever stored.
+    ///
+    /// Both behaviours reach the zero-fold here: with a slot check because the
+    /// slot does not hold the field, without one because `get_field` finds
+    /// slot 5 empty. A test that exercised only this case would pass on
+    /// both branches and prove nothing about either.
+    #[test]
+    fn test_unlisted_slot_read_of_an_unpopulated_slot_is_branch_invariant() {
+        let ops = slot_read_trace(5, 24);
+        let result = run_pass_typed(&ops, &[100, 200]);
+        assert_eq!(
+            folded_read_answer(&result),
+            Some(Value::Int(0)),
+            "an unwritten slot folds to the zeroed allocation on either side \
+             of the read-side slot check; this leg discriminates nothing and \
+             exists to prove the positive leg is not measuring the fold"
+        );
+    }
+
+    /// THE THIRD LEG — the one that makes the read path's `init_fields`
+    /// (`:867-877`) actually replace the descr, which neither leg above does.
+    ///
+    /// Both legs above allocate with `size_descr(1)` and then `setfield` a
+    /// `field_descr(10)` whose parent IS a `SizeDescr`, so the SETFIELD's own
+    /// `init_fields` takes the `cur_len == 0` arm at `:749` and leaves
+    /// `cur_len == 11`. Every slot they read is below that, so the read-side
+    /// call is a no-op on both — ablating it (`if false &&`) left both green.
+    ///
+    /// This leg keeps `cur_len == 0` alive until the READ by denying the
+    /// setfield a `SizeDescr` parent (`NarrowParentFieldDescr`), which is the
+    /// only shape that lets a POPULATED slot coexist with `cur_len == 0`:
+    ///
+    /// ```text
+    /// p0 = new_with_vtable(descr=non_size)      # as_size_descr() == None  => cur_len 0
+    /// setfield_gc(p0, i100, descr=narrow(3))    # slot 3 <- i100; init_fields returns
+    ///                                           #   early, disagreement short-circuits
+    /// i1 = getfield_gc_i(p0, descr=misindexed(3, 56))   # claims slot 3, holds slot 7
+    /// i2 = int_mul(i1, i200)                    # survives, so i1 is observable
+    /// ```
+    ///
+    /// At the read, `cur_len == 0` fires `init_fields`' first arm and installs
+    /// the field's own 4-slot parent. `field_slot_identifies` can then see that
+    /// slot 3 sits at offset 24 while the descr claims offset 56, refuses the
+    /// resolution, and the read folds to the zeroed allocation.
+    ///
+    /// WITHOUT the read-side `init_fields` the descr stays the non-size one,
+    /// and `field_slot_identifies` FAILS OPEN — its
+    /// `let Some(size_descr) = descr.as_size_descr() else { return true; }`
+    /// returns `true` for a descr with no field list at all. `get_field` then
+    /// finds slot 3 populated and forwards it, so `folded_read_answer` reads
+    /// `None` (a non-constant operand) instead of `Some(Int(0))`. That is the
+    /// two-sided ablation: delete the block at `:867-877` and this assertion
+    /// must go RED, where the two legs above stay green.
+    #[test]
+    fn test_read_path_init_fields_upgrades_a_zero_length_descr_before_the_slot_check() {
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], non_size_descr(0x0D)),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 100),
+                ],
+                narrow_parent_field_descr(3),
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
+                // Claims slot 3 (offset 24) but answers slot 7's address.
+                misindexed_field_descr(3, 56),
+            ),
+            Op::new(
+                OpCode::IntMul,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 2),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                ],
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_pass_typed(&ops, &[100, 200]);
+        assert_eq!(
+            folded_read_answer(&result),
+            Some(Value::Int(0)),
+            "the read-side init_fields must install the field's parent before \
+             field_slot_identifies runs; without it the descr carries no field \
+             list, the slot check fails open, and the populated slot 3 is \
+             forwarded instead of folded"
         );
     }
 

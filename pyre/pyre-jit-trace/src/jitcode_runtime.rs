@@ -310,7 +310,7 @@ pub fn portal_jitcode_for_key(key: &str) -> Option<Arc<JitCode>> {
 // shifts whenever the jitcode set changes, so it must be resolved by
 // name and never hardcoded.
 //
-// This by-name lookup is the foundation #171 P3 needs to descend the FBW
+// This by-name lookup is the foundation list-append P3 needs to descend the FBW
 // walker into the orthodox charon list-append body (issue #62/#23): the
 // dynamic `lst.append` recognition arm resolves the body here, then
 // builds a by-index sub-walk from `get_jitcode_by_index`.
@@ -767,11 +767,18 @@ pub fn descr_set_jit_stats() -> String {
 /// state `descr.py` cannot reach: `get_size_descr` returns on cache hit, so a
 /// shell published first outranks the real layout for the rest of the run.
 pub fn field_position_jit_stats() -> String {
-    let [parent_absent, parent_empty, rederived, unresolved] =
-        majit_ir::descr::GcCache::field_position_census();
-    let [spec_checked, spec_misplaced] = majit_ir::descr::GcCache::spec_position_census();
-    let [attached_checked, attached_misplaced] =
-        majit_ir::descr::GcCache::attached_position_census();
+    // Through `field_position_counts` rather than the censuses directly, so
+    // this line and the wasm exports cannot describe different populations.
+    let FieldPositionCounts {
+        parent_absent,
+        parent_empty,
+        rederived,
+        unresolved,
+        spec_checked,
+        spec_misplaced,
+        attached_checked,
+        attached_misplaced,
+    } = field_position_counts();
     let (
         [published, fieldless, shadowing, aliased, aliased_multi],
         [slots, misplaced],
@@ -833,6 +840,30 @@ pub struct DescrSetCounts {
     pub stale_absent: u64,
 }
 
+/// Name the `field_pos_unresolved` mints, under `MAJIT_FIELD_POS_UNRESOLVED=1`.
+///
+/// Same split as `report_descr_spelling_gate`: the count rides the gated
+/// `[jit-stats]` line and this is the detail behind it. The count says the slot
+/// hazard was reached; only the names say by whom, and that decides whether the
+/// fix belongs at one producer or at the resolution layer.
+///
+/// `all_descrs` is the caller's — `metainterp_sd.all_descrs`, the table
+/// `pyrex` already reads for its own diag line, not this module's
+/// [`all_descrs`] opcode pool. It rides along as the denominator that says the
+/// descr universe was loaded at all: an empty table under a nonzero
+/// `all_descrs` is a clean tree, and an empty table under a zero one is a run
+/// that never got far enough to have an answer.
+///
+/// Empty when the knob is unset — a bare zero is never printed for a census
+/// that did not run. How many rows it prints is the knob's own value
+/// (`MAJIT_FIELD_POS_UNRESOLVED=<n>`, `1` for all of them).
+pub fn field_position_unresolved_report(all_descrs: usize) -> Vec<String> {
+    if !majit_ir::descr::field_position_unresolved_naming_enabled() {
+        return Vec::new();
+    }
+    majit_ir::descr::GcCache::field_position_unresolved_sample(all_descrs)
+}
+
 /// The two producer-side field-position invariants as numbers, for the same
 /// reason [`descr_set_counts`] exists: the wasm guest has no stderr, so it
 /// exports them individually (`pyre_jit_field_pos_*` in `pyre-wasm`) and the
@@ -846,10 +877,16 @@ pub struct DescrSetCounts {
 /// wasm, and without these exports a wasm-only rise reads as absent-and-
 /// therefore-zero, i.e. healthy.
 pub fn field_position_counts() -> FieldPositionCounts {
+    let [parent_absent, parent_empty, rederived, unresolved] =
+        majit_ir::descr::GcCache::field_position_census();
     let [spec_checked, spec_misplaced] = majit_ir::descr::GcCache::spec_position_census();
     let [attached_checked, attached_misplaced] =
         majit_ir::descr::GcCache::attached_position_census();
     FieldPositionCounts {
+        parent_absent: parent_absent as u64,
+        parent_empty: parent_empty as u64,
+        rederived: rederived as u64,
+        unresolved: unresolved as u64,
         spec_checked: spec_checked as u64,
         spec_misplaced: spec_misplaced as u64,
         attached_checked: attached_checked as u64,
@@ -861,7 +898,20 @@ pub fn field_position_counts() -> FieldPositionCounts {
 /// cannot read the same as one that checked everything, but host-dependent and
 /// therefore not in `JITSTATS_SNAPSHOT_FIELDS`. The two `*_misplaced` are
 /// `JITSTATS_BADNESS_FIELDS` members and healthy only at zero.
+///
+/// The four census members are the `derive_index_in_parent` dispositions, and
+/// they are here rather than in a second struct so that the printed line and
+/// the wasm exports cannot describe different populations: `field_position_jit_stats`
+/// now formats THIS value instead of re-reading the censuses itself. Two
+/// independent readers of the same three counters could only ever agree by
+/// convention, and the convention is what rots — the printed line is what a
+/// human reads and the exports are what the gate reads, so a drift between them
+/// is invisible from either side.
 pub struct FieldPositionCounts {
+    pub parent_absent: u64,
+    pub parent_empty: u64,
+    pub rederived: u64,
+    pub unresolved: u64,
     pub spec_checked: u64,
     pub spec_misplaced: u64,
     pub attached_checked: u64,
@@ -1076,7 +1126,7 @@ fn field_descr_identity_census(refs: &[DescrRef]) {
                 .and_then(|p| p.as_size_descr())
                 .map(|sd| sd.all_fielddescrs().len());
             samples.push(format!(
-                "{owner}.{name}[{index_in_parent}] T{:#x} pool={} walker={} \
+                "{owner}.{name}[{index_in_parent:?}] T{:#x} pool={} walker={} \
                  all_fielddescrs={n_all:?} _cache_field keys={:?}",
                 parent.type_id,
                 pool_class.label(),
@@ -1794,7 +1844,7 @@ mod tests {
 
     #[test]
     fn list_append_jitcode_resolves_charon_body() {
-        // #171 P3 foundation (deferred Route C): the orthodox charon
+        // list-append P3 foundation (deferred Route C): the orthodox charon
         // `w_list_append` body is present and reachable by name in the
         // build-time pipeline (the single-source descent the FBW walker would
         // enter once the prologue strategy-helper fnaddrs are registered).

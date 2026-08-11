@@ -29,8 +29,6 @@ pub use crate::optimizeopt::schedule::{
     unpack_from_vector,
 };
 
-// ── vector.py:601-668: Cost models ────────────────────────────────────
-
 /// Cost model for deciding whether vectorization is profitable.
 ///
 /// From rpython/jit/metainterp/optimizeopt/vector.py.
@@ -188,8 +186,6 @@ impl Default for CostModel {
     }
 }
 
-// ── vector.py:670-678: isomorphic ─────────────────────────────────────
-
 /// vector.py:670-678: isomorphic — two ops can be packed if they have the
 /// same opcode AND the same vecinfo bytesize. PyPy reads each side through
 /// `forwarded_vecinfo(op)`, which lives on `op._forwarded`; pyre keeps that
@@ -203,8 +199,6 @@ pub fn isomorphic(state: &mut VecScheduleState, l_op: &Op, r_op: &Op) -> bool {
     let r_vecinfo = state.forwarded_vecinfo(r_op);
     l_vecinfo.bytesize == r_vecinfo.bytesize
 }
-
-// ── vector.py:680-824: PackSet ────────────────────────────────────────
 
 /// vector.py: PackSet — manages packs and supports merging
 /// 2-packs into 4-packs (or larger) when possible.
@@ -652,8 +646,6 @@ impl PackSet {
     }
 }
 
-// ── vector.py:35-40: copy_resop ────────────────────────────────────────
-
 /// vector.py:35-40: copy_resop — clone an op, preserving VectorizationInfo.
 ///
 /// In RPython, `get_forwarded()` returns VectorizationInfo if set on the
@@ -667,8 +659,6 @@ impl PackSet {
 pub fn copy_resop(op: &Op) -> Op {
     op.clone()
 }
-
-// ── vector.py:42-120: VectorLoop ───────────────────────────────────────
 
 /// vector.py:42-120: VectorLoop — wraps a loop body (Label..operations..Jump)
 /// for vectorization analysis and transformation.
@@ -909,8 +899,6 @@ impl VectorLoop {
     }
 }
 
-// ── vector.py:122-173: optimize_vector ─────────────────────────────────
-
 /// vector.py:122-173: optimize_vector — top-level entry point.
 ///
 /// Creates a VectorizingOptimizer, runs vectorization on the loop, and
@@ -968,8 +956,6 @@ pub fn optimize_vector(
 
     result
 }
-
-// ── compile.py:302-308: vectorization post-pass entry ──────────────────
 
 /// compile.py:302-308 — apply the SIMD vectorizer to an optimizer-assembled
 /// loop and return the rewritten op list.
@@ -1053,8 +1039,6 @@ pub(crate) fn apply_loop_vectorization(
     }
 }
 
-// ── vector.py:175-205: user_loop_bail_fast_path ────────────────────────
-
 /// vector.py:175-205: user_loop_bail_fast_path — quick pre-check.
 ///
 /// Returns `true` if the loop should be SKIPPED (bailed on) for
@@ -1103,8 +1087,6 @@ pub fn user_loop_bail_fast_path(loop_: &VectorLoop) -> bool {
     }
     false
 }
-
-// ── vector.py:207-600: VectorizingOptimizer ────────────────────────────
 
 /// vector.py:207-600: VectorizingOptimizer — the vectorization optimizer.
 ///
@@ -1180,8 +1162,6 @@ impl VectorizingOptimizer {
         opt.vec_size = vec_size;
         opt
     }
-
-    // ── vector.py:220-271: run_optimization ────────────────────────────
 
     /// vector.py:220-271: run_optimization — the main vectorization pipeline.
     ///
@@ -1517,8 +1497,6 @@ impl VectorizingOptimizer {
         Ok((ops, gso_consts))
     }
 
-    // ── vector.py:273-344: unroll_loop_iterations ──────────────────────
-
     /// vector.py:359-367: linear_find_smallest_type — scan ops for the
     /// smallest array element byte size to determine SIMD width.
     pub fn linear_find_smallest_type(&mut self, loop_: &VectorLoop) {
@@ -1550,8 +1528,6 @@ impl VectorizingOptimizer {
         count.saturating_sub(1) // already unrolled once
     }
 
-    // ── vector.py:346-357: copy_guard_descr ────────────────────────────
-
     /// vector.py:346-357: copy_guard_descr — clone guard descriptor and
     /// rename fail args during unrolling.
     fn copy_guard_descr(renamer: &Renamer, copied_op: &mut Op) {
@@ -1574,8 +1550,6 @@ impl VectorizingOptimizer {
             copied_op.setfailargs(renamed);
         }
     }
-
-    // ── vector.py:378-402: find_adjacent_memory_refs ───────────────────
 
     /// vector.py:378-402: find_adjacent_memory_refs — seed the packset
     /// with pairs of adjacent memory accesses.
@@ -1738,8 +1712,6 @@ impl VectorizingOptimizer {
         }
     }
 
-    // ── vector.py:460-494: combine_packset ─────────────────────────────
-
     /// vector.py:460-496: combine_packset — merge adjacent 2-packs into
     /// larger packs, then split overloaded packs.
     pub fn combine_packset(&mut self) -> Result<(), NotAVectorizeableLoop> {
@@ -1771,8 +1743,6 @@ impl VectorizingOptimizer {
         Ok(())
     }
 
-    // ── vector.py:515-521: schedule ────────────────────────────────────
-
     /// vector.py:515-521: schedule — run the scheduler on the given state.
     fn schedule_state(_state: &mut VecScheduleState, _graph: &DependencyGraph) {
         // vector.py:516: state.prepare() — handled by caller
@@ -1780,8 +1750,6 @@ impl VectorizingOptimizer {
         //   is done inline in run_optimization via schedule_operations
         // vector.py:520: state.post_schedule() — handled by caller
     }
-
-    // ── vector.py:523-583: analyse_index_calculations ──────────────────
 
     /// vector.py:523-583: analyse_index_calculations — move guarding
     /// instructions (and all the instructions the guard needs) to the loop
@@ -1886,8 +1854,6 @@ impl VectorizingOptimizer {
         if one_valid { Some(graph) } else { None }
     }
 
-    // ── vector.py:585-599: mark_guard ──────────────────────────────────
-
     /// vector.py:585-599: mark_guard — marks a guard as an early exit
     /// by attaching a CompileLoopVersionDescr and setting failargs to
     /// the label's input args.
@@ -1907,8 +1873,6 @@ impl VectorizingOptimizer {
         }
         guard_op.setfailargs(loop_.label.getarglist());
     }
-
-    // ── Optimization trait helper: try_vectorize ───────────────────────
 
     /// Attempt to vectorize the buffered loop body (Optimization trait path).
     ///
@@ -2210,8 +2174,6 @@ impl VectorizingOptimizer {
     }
 }
 
-// ── VectorLoop: unroll_loop_iterations ─────────────────────────────────
-
 impl VectorLoop {
     /// vector.py:273-344: unroll_loop_iterations — unroll the loop body
     /// `count` times with proper renaming.
@@ -2380,7 +2342,6 @@ impl VectorLoop {
     }
 }
 
-// ── schedule.py helpers used by the vectorizer ─────────────────────────
 // These functions are from schedule.py in RPython, not vector.py.
 // They are placed here because they are called from the vectorizer's
 // scheduling logic in try_vectorize / run_optimization.
@@ -2492,7 +2453,6 @@ pub(crate) fn ensure_args_unpacked(
     }
 }
 
-// ── Optimization trait impl (TODO) ──────────────────
 // In RPython, VectorizingOptimizer extends Optimizer and is called via
 // optimize_vector(). In Rust, it participates in the Optimizer pipeline
 // as an Optimization sub-pass. This impl bridges the two worlds.
@@ -2619,8 +2579,6 @@ impl Optimization for VectorizingOptimizer {
         self.opt_vectorized_emitted = 0;
     }
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -3173,25 +3131,55 @@ mod tests {
         // The pre-vectorize loop is the single tracked version (gso precondition).
         assert_eq!(info.versions.len(), 1, "exactly one snapshot version");
 
-        // Real vectorization happened: the two adjacent loads became packed
-        // VEC_LOAD ops and the paired sums a VEC_INT_ADD — which only exists
-        // now that `to_vector()` maps the memory loads (resoperation.py:1746).
-        assert!(
-            ops.iter().any(|op| op.opcode == OpCode::VecLoadI),
-            "adjacent loads must pack into VecLoadI"
+        // The whole post-vectorize sequence. `optimize_vector` is a pure
+        // function of the fixture built above, so this is determined end to end
+        // rather than sampled — measured, not derived.
+        //
+        // The four membership checks this replaces asserted only that VecLoadI,
+        // VecIntAdd, Label and Jump each appear somewhere. They could not see
+        // the ten-op pack/expand preamble at all, and they hid a drift from the
+        // prose beside them: the body emits THREE VecLoadI and TWO VecIntAdd,
+        // not the "two packed loads and a VEC_INT_ADD" the old comment claimed.
+        // VecIntAdd exists at all only because `to_vector()` maps the memory
+        // loads (resoperation.py:1746). Label first and Jump last is the
+        // preserved loop structure.
+        assert_eq!(
+            ops.iter().map(|op| op.opcode).collect::<Vec<_>>(),
+            [
+                OpCode::VecExpandI,
+                OpCode::VecI,
+                OpCode::VecPackI,
+                OpCode::VecPackI,
+                OpCode::VecExpandI,
+                OpCode::VecI,
+                OpCode::VecPackI,
+                OpCode::VecPackI,
+                OpCode::VecPackI,
+                OpCode::VecPackI,
+                OpCode::Label,
+                OpCode::IntAdd,
+                OpCode::VecLoadI,
+                OpCode::VecLoadI,
+                OpCode::IntAdd,
+                OpCode::VecIntAdd,
+                OpCode::VecLoadI,
+                OpCode::VecUnpackI,
+                OpCode::VecIntAdd,
+                OpCode::VecUnpackI,
+                OpCode::VecUnpackI,
+                OpCode::Jump,
+            ]
         );
-        assert!(
-            ops.iter().any(|op| op.opcode == OpCode::VecIntAdd),
-            "paired sums must pack into VecIntAdd"
-        );
-        // Loop structure is preserved end to end.
-        assert!(ops.iter().any(|op| op.opcode == OpCode::Label));
-        assert!(ops.iter().any(|op| op.opcode == OpCode::Jump));
+
         // gso materialized the index-var constant it strength-reduced and the
         // wiring surfaced it for the caller to register in the constant pool.
-        assert!(
-            !gso_consts.is_empty(),
-            "gso must surface its materialized index constants"
+        // `IndexMap` is insertion-ordered, so this is a sequence, not a set.
+        assert_eq!(
+            gso_consts
+                .iter()
+                .map(|(k, v)| (format!("{k:?}"), *v))
+                .collect::<Vec<_>>(),
+            [(String::from("ConstInt(8)"), 8)]
         );
     }
 

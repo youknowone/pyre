@@ -53,8 +53,8 @@ pub use codewriter::type_state::ConcreteType;
 pub use flatten::{FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten_graph};
 pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram};
 pub use jtransform::{
-    CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformResult,
-    VirtualizableFieldDescriptor, transform_graph,
+    CallEffectKind, CallEffectOverride, DeclaredCallEffects, DeclaredExtraEffect,
+    GraphTransformConfig, GraphTransformResult, VirtualizableFieldDescriptor, transform_graph,
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
@@ -65,7 +65,7 @@ pub use pipeline::{
 
 use serde::{Deserialize, Serialize};
 
-// Exists to localise prepass nondeterminism (gh#1139).
+// Enables focused tracing of prepass nondeterminism.
 pub(crate) fn determinism_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1502,7 +1502,7 @@ fn analyze_pipeline_from_module_paths(
             *struct_leaf_counts.entry(leaf).or_default() += 1;
         }
     }
-    // Opt-in receiver-driven dispatch families (issue #346): a consumer
+    // Opt-in receiver-driven dispatch families (receiver-dispatch configuration): a consumer
     // (e.g. the aheui census) names `>=2`-impl trait qualified paths
     // whose `dyn Trait` receivers should annotate to a base ClassDef
     // linking the impl subclasses, so a method getattr on the receiver
@@ -1569,7 +1569,7 @@ fn analyze_pipeline_from_module_paths(
             },
         )
         .collect();
-    // Auto-population (issue #346): register EVERY `>=2`-impl trait so its
+    // Auto-population (receiver-dispatch configuration): register EVERY `>=2`-impl trait so its
     // inline `dyn Trait` receiver (lowered to `CallTarget::Indirect`) narrows
     // to the family base ClassDef.  Union with the config list (dedup by
     // base_root), never replacing it, to stay forward-safe with the aheui
@@ -1865,10 +1865,21 @@ fn analyze_pipeline_from_module_paths(
     call_control.find_all_graphs(&mut policy);
     prof.mark("  find_all_graphs");
     prof.note(|| {
+        // Two different populations are each legitimately "the universe" the
+        // closure could be read against, and they differ by ~4x:
+        // `program.functions` is what was lowered into this program, while
+        // `function_graphs` is the eagerly-lowered registry that
+        // `candidate_graph_count`'s own doc names.  Print both absolutes with
+        // the field each comes from — a bare quotient leaves the reader to
+        // supply the denominator, and picking the other one yields a number
+        // that is arithmetically correct and means something else entirely.
         format!(
-            "  portal closure: {} candidate graphs out of {} lowered functions",
+            "  portal closure: {} candidate graphs; denominators: \
+             {} lowered functions (program.functions), \
+             {} registered graphs (function_graphs)",
             call_control.candidate_graph_count(),
             program.functions.len(),
+            call_control.function_graphs().len(),
         )
     });
 
@@ -1893,6 +1904,23 @@ fn analyze_pipeline_from_module_paths(
     let (jitcodes, indirectcalltarget_indices, insns, descrs, all_liveness) =
         make_jitcodes(&config.pipeline, &mut call_control, &mut prof);
     mark_phase!("make_jitcodes");
+    // callee census: how many callees the six `getcalldescr` analyzers answer as
+    // upstream's declared-external arm without a declaration behind them.
+    // Off by default — it is a whole extra walk of the registered universe,
+    // and it reports a population, not a defect.
+    if std::env::var_os("PYRE_CALLEE_CENSUS").is_some_and(|v| v == "1") {
+        eprint!("{}", call_control.unknown_callee_census());
+        // the unused-override check's falsifier. `call_target_matches_loose` reports a
+        // non-match by returning `false`, so an override entry that names a
+        // spelling no call site carries is silently never consulted. Printed
+        // beside the census because that is where the spellings it must
+        // reproduce are read from.
+        for line in codewriter::jtransform::call_effect_override_census(
+            &config.pipeline.transform.call_effects,
+        ) {
+            eprintln!("[callee census] {line}");
+        }
+    }
     pipeline.jit_drivers = call_control
         .jitdrivers_sd()
         .iter()
@@ -2089,6 +2117,104 @@ fn make_jitcodes(
     // Snapshotted here so the build artifact carries it alongside
     // `insns`, mirroring RPython's single-store model.
     let descrs: Vec<jitcode::BhDescr> = codewriter.assembler.snapshot_descrs();
+
+    if std::env::var_os("PYRE_DESCR_POOL_CENSUS").is_some_and(|v| v == "1") {
+        let dup = codewriter.assembler.descr_pool_duplication();
+        // C1: the mint universe, beside the pool, in the same generation.
+        // `all_descrs` stable while the pool moves is a SELECTION defect;
+        // both moving is a POOL defect.  No artefact diff can tell them apart.
+        let all_descrs = majit_ir::descr::gc_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .all_descrs_len();
+        // C2: one cache slot answering for two different logical fields.
+        let (field_hits, field_collisions) = majit_ir::descr::field_descr_cache_collisions();
+        eprintln!(
+            "[descriptor pool] total {} | all_descrs {} | effect-keyed {} | \
+             concrete {} | wildcard {} | comparable {} | structurally distinct {} | \
+             invariant violations {} | field-descr cache hits {} collisions {}",
+            dup.total,
+            all_descrs,
+            dup.effect_keyed,
+            dup.concrete,
+            dup.wildcard,
+            dup.comparable,
+            dup.structurally_distinct,
+            dup.invariant_violations,
+            field_hits,
+            field_collisions,
+        );
+        // The three counters above all measure the pool POPULATION, and all
+        // three came back stable while `descrs.bin` still changed size.  The
+        // bytes therefore moved inside entries, which no population counter
+        // can see.  This walks exactly the slice that gets serialized and
+        // sums each length-bearing channel separately, so the next A/B names
+        // WHICH channel moved instead of only that the file did.
+        let content = jitcode::descr_pool_content(&descrs);
+        eprintln!(
+            "[descriptor content] entries {} | strings {} ({} bytes) | \
+             vec members {} | descr-set members {} | wildcard effects {} | \
+             type_ids {} (sum {:#018x}) | kinds {:?}",
+            content.entries,
+            content.string_count,
+            content.string_bytes,
+            content.vec_members,
+            content.descr_set_members,
+            content.wildcard_effects,
+            content.type_id_count,
+            content.type_id_sum,
+            content.kind_counts,
+        );
+        // The pool key carries every component of `BhDescr::Field`, so it is
+        // injective and two entries for one logical field must differ
+        // somewhere.  Printing the differing spellings turns the run-to-run
+        // count difference into a single-run observation naming the component
+        // that varied — the count is intermittent, so a cross-run diff can
+        // easily sample two runs that agree and show nothing.
+        // M1. Printed on the same line as the split totals because it is a
+        // SUBSET of them and reading it alone invites the wrong denominator.
+        // Zero says the `Option<usize>` key added no pool entry, so nothing
+        // downstream that counts pool entries moved — the claim the widening
+        // has to make good on, taken here rather than argued from the key's
+        // shape. It must be READ OUT, not merely computed: a number nobody
+        // prints is the same instrument as no number at all, which is the
+        // defect this whole change exists to repair.
+        eprintln!(
+            "[field split] groups {} | entries {} | index-provenance splits {}",
+            content.field_dupe_groups,
+            content.field_dupe_entries,
+            content.field_index_provenance_splits,
+        );
+        for line in &content.field_dupe_report {
+            eprintln!("[field split] {line}");
+        }
+        // Two walks of the same population that disagree on its size make
+        // every per-channel sum above unattributable.
+        if content.entries != dup.total {
+            eprintln!(
+                "[descriptor content] content walk saw {} entries, pool \
+                 census saw {} — the two walks disagree and every channel \
+                 sum above is suspect",
+                content.entries, dup.total
+            );
+        }
+        // The census asserts nothing until it is shown to have seen both
+        // shapes: a run with no `concrete` entry cannot have seen an
+        // over-split whatever `structurally_distinct` says.  Reported rather
+        // than asserted so a build still completes and says why.
+        if !dup.counts_reconcile() {
+            eprintln!(
+                "[descriptor pool] counts do not reconcile — the shape \
+                 classification lost entries; every field above is suspect"
+            );
+        } else if !dup.saw_both_shapes() {
+            eprintln!(
+                "[descriptor pool] census saw only one shape (concrete {}, \
+                 wildcard {}) — `structurally distinct` is NOT interpretable",
+                dup.concrete, dup.wildcard
+            );
+        }
+    }
 
     // RPython `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
     // Snapshot the assembler's shared `all_liveness` byte stream so the runtime

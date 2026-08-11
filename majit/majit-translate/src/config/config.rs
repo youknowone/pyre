@@ -1809,8 +1809,24 @@ mod tests {
     fn getpaths_include_groups_lists_descriptions_too() {
         let c = Config::new(translation_descr(), HashMap::new()).expect("config");
         let paths = c.getpaths(true);
-        assert!(paths.iter().any(|p| p == "translation"));
-        assert!(paths.iter().any(|p| p == "translation.verbose"));
+        // The whole list, in the description tree's declaration order — not
+        // alphabetical: `verbose` precedes `gc` because that is the order
+        // `translation_descr()` declares them in.
+        //
+        // The two membership checks this replaces covered 2 of the 5. `backend`,
+        // `type_system` and `gc` were never asserted, and nothing pinned that
+        // asking for groups adds exactly one entry (the bare "translation")
+        // rather than some other number.
+        assert_eq!(
+            paths,
+            [
+                "translation",
+                "translation.backend",
+                "translation.type_system",
+                "translation.verbose",
+                "translation.gc",
+            ]
+        );
     }
 
     #[test]

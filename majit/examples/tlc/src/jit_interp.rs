@@ -5,17 +5,49 @@
 /// `state_fields = { stackpos: int, stack: [int; virt] }` to mirror the
 /// virtualizable-stack shape used by tl.py/tla.py for the integer-only trace.
 ///
-/// Greens: [pc]
+/// Greens: [pc, program]
 /// Reds:   [stackpos, stack]
+///
+/// `greens = [pc, program]` is load-bearing, not documentation. With the list
+/// left empty, every arm that reads an operand out of `program` — PUSH, PICK,
+/// PUT, BR, BR_COND, PUSHARG — failed to lower and was emitted as an abort stub,
+/// so every trace aborted and `Traces compiled` stayed 0 for the whole suite:
+/// the JIT compiled nothing and the tests were green only because the legacy
+/// merge point discards the walk and lets the native loop answer. Declaring the
+/// greens leaves ROLL and PUSHARG as the only degraded arms.
 ///
 /// Only integer-stack opcodes are traced. Object opcodes (NIL, CONS, CAR, CDR,
 /// NEW, GETATTR, SETATTR, SEND) cause guard failure in RPython and are absent
 /// from this function, matching that behavior.
 use crate::interp::{self, ConstantPool};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ── State ──
 
 pub type Bytecode = [u8];
+
+/// Hot loops majit compiled. The only positive evidence the JIT tier is alive:
+/// a green suite, byte-identical output and an exact absolute trip count are all
+/// satisfied by the interpreter answering alone. This example ran 22/22 green at
+/// `Traces compiled: 0` for the whole suite before `greens` was declared.
+pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
+
+/// Ops in the last compiled loop body after optimization.
+///
+/// `COMPILES > 0` is necessary but NOT sufficient: an entirely empty dispatch
+/// still compiles a trace — one whose whole optimized body is `Finish()`, i.e.
+/// `ops_after == 1`. A compile counter counts TRACES, not WORK. This is the
+/// term that separates a compiled loop from a compiled nothing.
+pub static LAST_OPS_AFTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Shape of the last compiled loop body — see [`majit_metainterp::LoopBodyShape`].
+///
+/// Held as two flags rather than the struct itself so the recording stays
+/// lock-free on the compile path; the probe rebuilds the struct inside the same
+/// lock window it reads the counters in, because this is as process-global as
+/// they are.
+pub static LAST_HAS_JUMP: AtomicBool = AtomicBool::new(false);
+pub static LAST_ALWAYS_FAILS: AtomicBool = AtomicBool::new(false);
 
 #[expect(
     dead_code,
@@ -36,28 +68,11 @@ struct TlcState {
     stack: Vec<i64>,
 }
 
-/// Stack rotation — residual CALL in the trace.
+/// Rotates the live stack through a residual call.
 ///
-/// RPython parity: tlc.py:284 inlines `stack.insert(i, stack.pop())` and
-/// `stack.append(stack.pop(i))`. Under the rpython translator those list
-/// operations lower to `ll_list_insert` / `ll_list_pop_at` residual helpers
-/// (rpython/rtyper/lltypesystem/rlist.py), so the RPython trace ends up with
-/// two residual CALLs at this opcode. pyre's `#[jit_interp]` macro does not
-/// model state-field array ops with `state.stack.insert(i, ...)` / `.pop(i)`,
-/// so we hoist the shuffle into one `#[dont_look_inside]` residual helper;
-/// this is a packaging adaptation — the trace-level shape (single residual
-/// CALL on ROLL) is strictly simpler than RPython's two-residual sequence,
-/// and reverting to inline would require a state-field-array `insert`/`pop_at`
-/// lowering that the macro does not yet provide.
-///
-/// The hoisted residual is MAY-FORCE. Upstream reaches that row through
-/// `call.py:287-289 getcalldescr`, which consults `virtualizable_analyzer`
-/// before `_canraise`; there it does not fire, because tlc.py's `Frame` holds a
-/// plain list. This port models the stack as `stack: [int; virt]` (see the
-/// module header), so the array IS virtualizable here and a residual writing it
-/// through a raw base pointer takes that row. `#[dont_look_inside]` would
-/// instead assert `EF_CAN_RAISE` with an empty write set, which the mutation
-/// contradicts.
+/// This mirrors the RPython TLC list operations. Because it mutates the
+/// virtualizable array through a raw pointer, the call is may-force and the
+/// dispatch arm remains degraded until the trace can reload those effects.
 #[majit_macros::jit_may_force]
 extern "C" fn tlc_roll(stack_ptr: usize, stackpos: i64, r: i64) {
     let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stackpos as usize) };
@@ -117,6 +132,7 @@ const DEFAULT_THRESHOLD: u32 = 3;
 #[majit_macros::jit_interp(
     state = TlcState,
     env = Bytecode,
+    greens = [pc, program],
     auto_calls = true,
     state_fields = {
         stackpos: int,
@@ -127,6 +143,13 @@ const DEFAULT_THRESHOLD: u32 = 3;
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlcState> =
         majit_metainterp::JitDriver::new(threshold);
+    driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, opcodes| {
+        COMPILES.fetch_add(1, Ordering::Relaxed);
+        LAST_OPS_AFTER.store(ops_after, Ordering::Relaxed);
+        let shape = majit_metainterp::LoopBodyShape::of(opcodes);
+        LAST_HAS_JUMP.store(shape.has_jump, Ordering::Relaxed);
+        LAST_ALWAYS_FAILS.store(shape.has_always_fails, Ordering::Relaxed);
+    });
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
     // tlc.py:223 `self.stack = []` is a plain dynamic Python list (no
@@ -153,7 +176,26 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     }
 
     while pc < program.len() {
-        jit_merge_point!();
+        // The `; state` single-pass form. Reaching it took two fixes, because
+        // this file's `ROLL` and `PUSHARG` arms are abort stubs (see
+        // `jit_tier_is_alive`) and its post-loop expression stores:
+        //
+        // 1. A degraded-stub abort resumed at `opcode_pc + 1` — the shared
+        //    prologue advance below, not the instruction width — so the
+        //    aborting opcode applied nothing and was then skipped. Fixed by
+        //    resuming at the opcode's own boundary; the regression test is
+        //    `jit_interp_degraded_stub_abort_resume.rs`.
+        // 2. The walk ran this function's trailing expression, whose `stackpos`
+        //    store the write-back then pushed into native `state` for the
+        //    post-loop code to apply a second time — `fibo(7)` answered 8, the
+        //    entry one below the right one, instead of 13. Fixed by keeping a
+        //    *storing* trailing expression out of the walk; the regression test
+        //    is `jit_interp_halt_arm_post_loop_expression.rs`.
+        //
+        // Lowering the `ROLL` arm is still open (it needs a macro spelling for
+        // the base pointer of a `[int; virt]` state-field array), but it is no
+        // longer what blocks this merge point.
+        jit_merge_point!(driver, program, pc; state);
         let opcode = program[pc];
         pc += 1;
 
@@ -274,11 +316,23 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 pc = target;
                 continue;
             }
+            // Bare `break` bodies, never `{ …; break }`: `classify.rs`
+            // `is_break_expr` requires the arm body to be exactly `break`, so a
+            // composite body classifies `Lowerable` and its tail `break` reaches
+            // `lower_stmt_fallback`, which guards an enclosed `return` but not an
+            // enclosed `break` — the statement is inert and is silently dropped,
+            // leaving the lowered arm to fall through to the dispatch back-edge.
             RETURN => break,
             _ => break,
         }
     }
 
+    // Reads `state` and never `pc`, which is what the single-executor merge
+    // point will need when it lands: its `break` precedes the `pc` handoff, so
+    // `pc` there still names the position the walk started from. `stackpos` is a
+    // scalar state field and `stack` a virtualizable array field, so the
+    // walk-final values arrive through `writeback_scalar_state_fields` /
+    // `writeback_virt_array_state_fields` — no `ret` field is needed here.
     if state.stackpos == 0 {
         0
     } else {
@@ -317,6 +371,7 @@ impl JitTlcInterp {
 mod tests {
     use super::*;
     use crate::interp;
+    use majit_metainterp::{RefusalKind, refusal_kind};
 
     /// Fibonacci using ROLL -- pure integer loop, good JIT candidate.
     fn fibo_bytecode(pool: &mut ConstantPool) -> Vec<u8> {
@@ -326,12 +381,142 @@ mod tests {
         )
     }
 
+    /// [`COMPILES`] is process-global, so under the default parallel libtest
+    /// runner a concurrent run lands inside [`compile_probe`]'s store/run/load
+    /// window and the probe reads someone else's compile. The lock therefore
+    /// covers *every* call that can compile — [`run_jit`] and [`compile_probe`]
+    /// are the only two ways a test may enter the JIT, and neither may call the
+    /// other (a plain mutex re-entered on one thread deadlocks).
+    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// For tests that assert only on the result. They still compile, so they
+    /// must not run inside the probe's window. See [`PROBE_LOCK`].
+    fn run_jit(bc: &[u8], arg: i64, pool: &ConstantPool) -> i64 {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut jit = JitTlcInterp::new();
+        jit.run(bc, arg, pool)
+    }
+
+    /// Run with both counters reset, returning `(result, compiles, ops_after)`.
+    ///
+    /// [`LAST_OPS_AFTER`] is read here rather than at the call site, and reset
+    /// here rather than nowhere. Both counters are process-global, so both need
+    /// the same treatment [`PROBE_LOCK`] exists to give [`COMPILES`]: a load
+    /// taken after the guard drops can observe a concurrent test's compile, and
+    /// a counter that is never stored to zero retains whatever the last compile
+    /// anywhere in the process left behind. Unreset, a zero from this probe is
+    /// indistinguishable from an inherited value.
+    fn compile_probe(
+        bc: &[u8],
+        arg: i64,
+        pool: &ConstantPool,
+    ) -> (i64, usize, usize, majit_metainterp::LoopBodyShape) {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        COMPILES.store(0, Ordering::Relaxed);
+        LAST_OPS_AFTER.store(0, Ordering::Relaxed);
+        LAST_HAS_JUMP.store(false, Ordering::Relaxed);
+        LAST_ALWAYS_FAILS.store(false, Ordering::Relaxed);
+        let mut jit = JitTlcInterp::new();
+        let got = jit.run(bc, arg, pool);
+        (
+            got,
+            COMPILES.load(Ordering::Relaxed),
+            LAST_OPS_AFTER.load(Ordering::Relaxed),
+            majit_metainterp::LoopBodyShape {
+                has_jump: LAST_HAS_JUMP.load(Ordering::Relaxed),
+                has_always_fails: LAST_ALWAYS_FAILS.load(Ordering::Relaxed),
+            },
+        )
+    }
+
     #[test]
     fn jit_fibo_7() {
         let mut pool = ConstantPool::new();
         let bc = fibo_bytecode(&mut pool);
-        let mut jit = JitTlcInterp::new();
-        assert_eq!(jit.run(&bc, 7, &pool), 13);
+        assert_eq!(run_jit(&bc, 7, &pool), 13);
+    }
+
+    #[test]
+    fn jit_tier_is_alive() {
+        let mut pool = ConstantPool::new();
+        let bc = countdown_bytecode(&mut pool);
+        let (got, compiles, ops_after, shape) = compile_probe(&bc, 100, &pool);
+        // The body actually closes a loop — see `LoopBodyShape`. A compile
+        // count and an op count together still accept a body that bails out on
+        // its first pass; this is the term that does not. Sound HERE because
+        // this fixture loops: on a straight-line subject a `Jump`-less body is
+        // the right answer, not a defect.
+        assert!(
+            shape.closes_a_loop(),
+            "compiled {ops_after} ops but the body {} ({shape:?})",
+            shape.why_not().unwrap_or("closes a loop")
+        );
+        assert_eq!(got, 0, "countdown(100) must still answer 0");
+
+        let mut tlc_arms: Vec<_> = majit_metainterp::degraded_dispatch_arms()
+            .into_iter()
+            .filter(|a| a.interp == "TlcState")
+            .collect();
+        tlc_arms.sort_unstable_by_key(|a| a.arm);
+        let degraded: Vec<&str> = tlc_arms.iter().map(|a| a.arm).collect();
+        assert_eq!(
+            degraded,
+            ["PUSHARG", "ROLL"],
+            "the degraded-arm set moved. A NEW name means an arm silently \
+             stopped lowering and every trace reaching it now aborts; a MISSING \
+             name means that arm lowers again, so the abort that blocks the \
+             `; state` conversion may be gone — re-check the merge point"
+        );
+
+        let causes: Vec<(&str, RefusalKind)> = tlc_arms
+            .iter()
+            .map(|a| (a.arm, refusal_kind(a.reason)))
+            .collect();
+        for a in &tlc_arms {
+            eprintln!(
+                "[cause] {} {:?} — {}",
+                a.arm,
+                refusal_kind(a.reason),
+                a.reason
+            );
+        }
+        assert_eq!(
+            causes,
+            [
+                ("PUSHARG", RefusalKind::UnlowerableStmt),
+                ("ROLL", RefusalKind::GreenWriteback),
+            ],
+            "an arm still degrades but a different mechanism is refusing it. \
+             `RefusalKind::Unclassified` on either side means majit grew a \
+             refusal family the classifier does not know — add it in \
+             `majit-metainterp`, do not re-record this pin"
+        );
+
+        assert!(
+            tlc_arms[0].reason.contains("inputarg"),
+            "PUSHARG's refusal no longer names the loop-external input it \
+             stores: {}",
+            tlc_arms[0].reason
+        );
+
+        // Zero-vs-nonzero is the property; a later change that legitimately
+        // mints more than one artifact is not this regression.
+        assert!(
+            compiles >= 1,
+            "countdown(100) compiled {compiles} loops — the JIT tier is inert and \
+             the interpreter is answering alone, which every other assertion in \
+             this file would still pass"
+        );
+        assert_eq!(
+            ops_after, 10,
+            "compiled loop body is {ops_after} ops, not the pinned 10 — a value \
+             of 1 means the body is a bare `Finish()`, i.e. a dispatch that \
+             lowered nothing at all"
+        );
+        println!(
+            "[tier-alive] countdown(100) = {got}, compiled {compiles} loop(s) of \
+             {ops_after} ops, degraded = {degraded:?}"
+        );
     }
 
     #[test]
@@ -340,17 +525,14 @@ mod tests {
         let bc = fibo_bytecode(&mut pool);
         for n in [1, 2, 3, 5, 7, 10, 15] {
             let expected = interp::interp(&bc, 0, n, &pool);
-            let mut jit = JitTlcInterp::new();
-            let got = jit.run(&bc, n, &pool);
+            let got = run_jit(&bc, n, &pool);
             assert_eq!(got, expected, "fibo mismatch for n={n}");
         }
     }
 
     /// Simple integer countdown loop (no object ops).
-    #[test]
-    fn jit_countdown() {
-        let mut pool = ConstantPool::new();
-        let bc = interp::compile(
+    fn countdown_bytecode(pool: &mut ConstantPool) -> Vec<u8> {
+        interp::compile(
             "
             PUSHARG         # [n]
         loop:
@@ -360,10 +542,115 @@ mod tests {
             BR_COND loop    # [n-1] if n-1 != 0
             RETURN
         ",
+            pool,
+        )
+    }
+
+    #[test]
+    fn jit_countdown() {
+        let mut pool = ConstantPool::new();
+        let bc = countdown_bytecode(&mut pool);
+        assert_eq!(run_jit(&bc, 100, &pool), 0);
+    }
+
+    #[test]
+    fn jit_operand_less_degraded_arm_runs_every_pass() {
+        for n in [100i64, 101] {
+            let mut pool = ConstantPool::new();
+            let bc = interp::compile(
+                &format!(
+                    "
+                PUSH 0          # [acc]
+            loop:
+                PUSHARG         # [acc, 1]
+                ADD             # [acc+1]
+                PICK 0          # [acc, acc]
+                PUSH {n}        # [acc, acc, n]
+                LT              # [acc, acc < n]
+                BR_COND loop    # [acc]
+                RETURN
+            "
+                ),
+                &mut pool,
+            );
+            let got = run_jit(&bc, 1, &pool);
+            assert_eq!(
+                got, n,
+                "count-by-PUSHARG returned {got}, not {n} — a degraded arm's \
+                 abort dropped the opcode, so a pass ran without its increment"
+            );
+        }
+    }
+
+    /// Absolute trip-count gate on the JIT path.
+    ///
+    /// The accumulator gains 1 once per pass and the loop runs while it is still
+    /// below `n`, so the returned value names the number of passes exactly: `n`
+    /// passes answer `n`, and one extra pass answers `n + 1`. `LT` (rather than
+    /// `NE`) is what makes the overshoot observable instead of divergent.
+    ///
+    /// Agreement with `interp::interp` would not settle this — the two run the
+    /// same program — and neither would a byte-identical before/after output
+    /// comparison: a duplicated iteration of the *compiled* loop is invisible to
+    /// any check that does not assert an absolute count.
+    ///
+    /// Two lengths of different parity, because a peeled first iteration plus an
+    /// even/odd body count is exactly the shape an off-by-one hides in.
+    #[test]
+    fn jit_trip_count_gate() {
+        let mut pool = ConstantPool::new();
+        let bc = interp::compile(
+            "
+            PUSHARG         # [n]
+            PUSH 0          # [n, acc]
+        loop:
+            PUSH 1          # [n, acc, 1]
+            ADD             # [n, acc+1]
+            PICK 0          # [n, acc, acc]
+            PICK 2          # [n, acc, acc, n]
+            LT              # [n, acc, acc < n]
+            BR_COND loop    # [n, acc]
+            RETURN
+        ",
             &mut pool,
         );
-        let mut jit = JitTlcInterp::new();
-        assert_eq!(jit.run(&bc, 100, &pool), 0);
+        for n in [1001i64, 1002] {
+            let got = run_jit(&bc, n, &pool);
+            assert_eq!(
+                got, n,
+                "count_to({n}) = {got}, so the loop ran {got} passes rather than \
+                 {n} — an off-by-one trip count is the signature of a terminal \
+                 arm whose exit the trace dropped"
+            );
+            println!("[trip-count] count_to({n}) = {got} — exactly {n} passes");
+        }
+
+        // Non-vacuity: the same loop with the accumulator seeded at `n` instead
+        // of 0 runs one pass, overshoots to `n + 1`, and `LT` lets it out —
+        // exactly what a duplicated compiled iteration would do at the end. So
+        // the assertion above is one the program can fail, not one pinned to `n`
+        // by its own exit condition.
+        let overshoot = interp::compile(
+            "
+            PUSHARG         # [n]
+            PUSHARG         # [n, acc=n]
+        loop:
+            PUSH 1
+            ADD             # [n, acc+1]
+            PICK 0
+            PICK 2
+            LT              # [n, acc, acc < n]
+            BR_COND loop
+            RETURN
+        ",
+            &mut pool,
+        );
+        let got = run_jit(&overshoot, 1001, &pool);
+        assert_eq!(
+            got, 1002,
+            "the loop cannot leave above `n`, so the gate above cannot \
+             distinguish 1001 passes from 1002"
+        );
     }
 
     #[test]
@@ -390,9 +677,7 @@ mod tests {
         ",
             &mut pool,
         );
-        let mut jit = JitTlcInterp::new();
-        assert_eq!(jit.run(&bc, 10, &pool), 55);
-        let mut jit2 = JitTlcInterp::new();
-        assert_eq!(jit2.run(&bc, 100, &pool), 5050);
+        assert_eq!(run_jit(&bc, 10, &pool), 55);
+        assert_eq!(run_jit(&bc, 100, &pool), 5050);
     }
 }

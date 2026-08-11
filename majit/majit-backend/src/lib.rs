@@ -2321,7 +2321,7 @@ pub trait Backend: Send {
     /// the CA bridge entry as a method on the descr — `compile.py:706-732
     /// _trace_and_compile_from_bridge(self, deadframe, ...)`, where `self`
     /// IS the descr — so the metainterp receives the descr object directly
-    /// (`pyjitpl.py:2890 handle_guard_failure(self, resumedescr, ...)`)
+    /// (`pyjitpl.py:2914 handle_guard_failure(self, resumedescr, ...)`)
     /// without any addr→object lookup.  Pyre's bridge crosses native code
     /// through function pointers (`majit-backend-dynasm/src/lib.rs`
     /// `BlackholeFn = fn(usize, *const i64, usize, *const i64, usize) ->

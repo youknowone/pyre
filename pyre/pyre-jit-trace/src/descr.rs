@@ -2390,7 +2390,7 @@ fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
     // the first value field, e.g. `W_IntObject.intval`).
     Arc::new(PyreFieldDescr {
         offset: pyre_object::pyobject::W_CLASS_OFFSET,
-        // ⚠️`WORD` on paper — the field is a `*mut PyObject`, so 4 bytes on
+        // `WORD` on paper — the field is a `*mut PyObject`, so 4 bytes on
         // wasm32, and the build-time descr pool already sizes it that way
         // (`call.rs get_type_flag` → `layout::target_word_size()`). Deriving it
         // here to match makes `synth/exception_traceback_loop_forms` lose one
@@ -4712,7 +4712,7 @@ mod tests {
             is_field_signed: true,
             is_immutable: true,
             is_quasi_immutable: false,
-            index_in_parent: 1,
+            index_in_parent: Some(1),
             parent: Some(parent),
             name: "value".into(),
             owner: "Cell".into(),
@@ -4769,7 +4769,7 @@ mod tests {
             is_field_signed: capacity.is_field_signed,
             is_immutable: capacity.is_immutable,
             is_quasi_immutable: capacity.is_quasi_immutable,
-            index_in_parent: capacity.index_in_parent,
+            index_in_parent: Some(capacity.index_in_parent),
             parent: Some(parent),
             name: "capacity".into(),
             owner: "ItemsBlock".into(),
@@ -4805,7 +4805,7 @@ mod tests {
                 is_field_signed: false,
                 is_immutable: false,
                 is_quasi_immutable: false,
-                index_in_parent: 0,
+                index_in_parent: Some(0),
                 parent: None,
                 name: name.into(),
                 owner: "W_ListObject".into(),
@@ -4842,7 +4842,7 @@ mod tests {
                 is_field_signed: false,
                 is_immutable: false,
                 is_quasi_immutable: false,
-                index_in_parent: 0,
+                index_in_parent: Some(0),
                 parent: None,
                 name: name.into(),
                 owner: "W_ListObject".into(),
@@ -4883,7 +4883,7 @@ mod tests {
                 is_field_signed: false,
                 is_immutable: false,
                 is_quasi_immutable: false,
-                index_in_parent: 0,
+                index_in_parent: Some(0),
                 parent: None,
                 name: name.into(),
                 owner: "W_ListObject".into(),
@@ -4949,7 +4949,7 @@ mod tests {
                 is_field_signed: true,
                 is_immutable: false,
                 is_quasi_immutable: false,
-                index_in_parent: 2,
+                index_in_parent: Some(2),
                 parent: None,
                 name: name.into(),
                 owner: owner.into(),
@@ -4976,7 +4976,7 @@ mod tests {
             is_immutable: false,
             is_quasi_immutable: false,
             // slot 0 is `ob_type`; `w_class` is slot 1 of the header.
-            index_in_parent: 1,
+            index_in_parent: Some(1),
             parent: None,
             name: "w_class".into(),
             owner: owner.into(),
@@ -5246,9 +5246,16 @@ fn simple_descr_group_from_bh_size(
     )
 }
 
+/// `claimed_index` is the descr's own `index_in_parent` claim, passed beside
+/// `field` rather than read off it: `BhFieldSpec` is the shape of a PARENT's
+/// field-list entry, where every index is a real position, so its field is a
+/// plain `usize` and cannot carry the "never resolved a slot" state that a
+/// standalone `BhDescr::Field` can be in. Flattening it here is what made the
+/// unresolved-mint table unsplittable.
 fn field_descr_from_bh_field(
     field: &majit_translate::jitcode::BhFieldSpec,
     parent: Option<&majit_translate::jitcode::BhSizeSpec>,
+    claimed_index: Option<usize>,
 ) -> DescrRef {
     if let Some(parent) = parent {
         // `descr.py:218-239 get_field_descr` cache-hit: when the parent
@@ -5291,7 +5298,7 @@ fn field_descr_from_bh_field(
                     field.field_flag,
                     field.index,
                     false,
-                    field.index_in_parent,
+                    claimed_index,
                 );
                 return fd as DescrRef;
             }
@@ -5689,7 +5696,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             ..
         } => {
             let field_key = bh_field_cache_key(owner, name);
-            // #171 codewriter descr-bridge: `_handle_list_call`
+            // list-append codewriter descr-bridge: `_handle_list_call`
             // (codewriter/jtransform.rs) lowers Integer-strategy list
             // ops to fields on the dotted nested names
             // `int_items.{len,block}` (owner `W_ListObject`).
@@ -5781,7 +5788,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     _ => {}
                 }
             }
-            // #171 object-strategy capacity read: `list.obj_capacity` lowers
+            // list-append object-strategy capacity read: `list.obj_capacity` lowers
             // to getfield_gc_r(items) + getfield_gc_i(block.capacity). The
             // block's offset-0 GcArray length header IS the allocated
             // capacity (immutable for the block's lifetime).
@@ -5830,7 +5837,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     }
                 }
             }
-            // #171 codewriter descr-bridge: a codewriter-lowered body reads a
+            // list-append codewriter descr-bridge: a codewriter-lowered body reads a
             // box payload (`W_IntObject.intval` / `W_BoolObject.intval` /
             // `W_FloatObject.floatval`) through the producer's struct-layout
             // `SimpleFieldDescr` (header modeled, `index_in_parent` = 2).  The
@@ -5869,7 +5876,11 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // produces a `SimpleFieldDescr` whose `index()` matches the
             // upstream value rather than a `u32::MAX` sentinel.
             let field = majit_translate::jitcode::BhFieldSpec {
-                index: *index_in_parent as u32,
+                // `unwrap_or(0)` and not the `u32::MAX` "no index" sentinel
+                // used elsewhere in this file: `0` is the value this field has
+                // carried on this path all along, and swapping in the sentinel
+                // would change a descr's identity, not just measure it.
+                index: index_in_parent.unwrap_or(0) as u32,
                 field_key,
                 name: full_name,
                 offset: *offset,
@@ -5879,9 +5890,10 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 is_field_signed: *is_field_signed,
                 is_immutable: *is_immutable,
                 is_quasi_immutable: *is_quasi_immutable,
-                index_in_parent: *index_in_parent,
+                index_in_parent: index_in_parent.unwrap_or(0),
             };
-            field_descr_from_bh_field(&field, parent.as_ref())
+            // The claim itself goes beside the spec, unflattened.
+            field_descr_from_bh_field(&field, parent.as_ref(), *index_in_parent)
         }
         BhDescr::Array {
             base_size,
@@ -6134,7 +6146,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     name.clone(),
                     name,
                 )
-                .with_index_in_parent(index_in_parent),
+                .with_index_in_parent(index_in_parent.unwrap_or(0)),
             );
             // `descr.py:423-438 get_interiorfield_descr` cache-or-mint keyed on
             // the outer ARRAY identity, so the analyzer's
@@ -6461,7 +6473,9 @@ fn mint_field(
         *flag,
         u32::MAX,
         false,
-        *index_in_parent,
+        // The analyzer's `field_pos`, always computed — see the note above on
+        // its two-word header offset against the runtime publish's numbering.
+        Some(*index_in_parent),
     ))
 }
 

@@ -39,6 +39,7 @@ impl BytecodeExt for [u8] {
     state = RefTestState,
     env = Bytecode,
     state_fields = { a: int, sel: ref(Stack) },
+    greens = [],
 )]
 #[allow(clippy::self_assignment)]
 #[allow(unused_assignments, unused_variables)]

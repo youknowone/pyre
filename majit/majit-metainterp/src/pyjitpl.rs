@@ -629,7 +629,7 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::O
     // new_opref` for every inputarg + emitted op position in the bridge
     // trace. Snapshot/vable feeds that flow through here MUST reference
     // OpRefs the recorder produced for this bridge.
-    cache
+    let translated = cache
         .get(opref.raw() as usize)
         .and_then(|slot| slot.as_ref())
         .map(|b| b.to_opref())
@@ -638,7 +638,33 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::O
                 "translate_trace_iter_opref cache miss for {opref:?} (cache_len={})",
                 cache.len(),
             )
-        })
+        });
+    // `_cache` is indexed by `OpRef::raw()`, which drops the variant tag, so
+    // an Int-bank position and a Ref-bank position carrying the same payload
+    // share one slot. That is sound only while `InputArg*(pos)` positions are
+    // flat across banks — `OpRef::inputarg_refs` states the contract:
+    // position IS the slot index. When two numbering authorities issue into
+    // that one namespace the contract breaks, the lookup SUCCEEDS on the
+    // other bank's operand instead of missing, and the caller receives a
+    // well-formed box for an unrelated value. A ref reaching an int register
+    // this way is decoded as an integer and used as an array index.
+    //
+    // A cross-namespace hit is indistinguishable from a correct translation
+    // at this call site, so compare the banks and fail here rather than
+    // letting the wrong box travel into a snapshot.
+    if let (Some(from), Some(to)) = (opref.ty(), translated.ty())
+        && from != to
+    {
+        panic!(
+            "translate_trace_iter_opref bank mismatch: {opref:?} ({from:?}) resolved \
+             to {translated:?} ({to:?}) through shared raw slot {}. The trace-iterator \
+             cache is keyed by position alone, so two OpRef variants with the same \
+             payload collide; one of them was minted by a numbering authority that \
+             does not share this trace's inputarg space.",
+            opref.raw(),
+        );
+    }
+    translated
 }
 
 fn translate_trace_iter_box_map(
@@ -895,6 +921,29 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) front_target_source_positions: Option<Vec<usize>>,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
+    /// Loop-header bytecode pc this loop was compiled at. A bridge trace
+    /// (`is_bridge_trace`) closes by jumping to its parent loop, which lives at
+    /// this header pc — not at the bridge's own `resume_pc`.
+    ///
+    /// Held on the entry rather than in a green-key-keyed side table so it
+    /// cannot outlive the artifact it describes: a `u64` side table keyed by
+    /// `get_uhash` is keyed by a *hash*, and nothing makes its retirement
+    /// atomic with the loop's (merge-point PC). Every replace path must carry it forward
+    /// off the old entry — a retrace compiles the same loop at the same header,
+    /// so losing it here silently strands every bridge that closes on it.
+    ///
+    /// The five carry-forwards this needs (`compile_loop`, `compile_retrace`,
+    /// `finish_and_compile`, `compile_simple_loop`, `compile_entry_bridge`) are
+    /// **not covered by any test**, measured rather than assumed: deleting all
+    /// five leaves the whole `majit-metainterp` suite green at 1566/1566. The
+    /// old side table needed no carry-forward because a replace never touched
+    /// it, so this hazard is new with the move and is currently held by review
+    /// alone. Before editing a replace path, note that the compiler cannot help
+    /// you here and neither can the suite.
+    ///
+    /// `None` means no header pc was recorded, which is the normal state for an
+    /// entry installed by any path other than a loop close.
+    pub(crate) loop_header_pc: Option<usize>,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
     pub(crate) traces: indexmap::IndexMap<u64, CompiledTrace>,
     /// RPython parity: previous compiled entries for this green_key.
@@ -978,6 +1027,38 @@ impl<M> CompiledEntry<M> {
     pub(crate) fn live_token(&self) -> Option<std::sync::Arc<JitCellToken>> {
         self.token.upgrade()
     }
+
+    /// The state a replacement entry must inherit from the entry it displaces.
+    /// See `CarriedFields`.
+    pub(crate) fn carried_fields(&self) -> CarriedFields {
+        CarriedFields {
+            next_global_opref: self.next_global_opref,
+            loop_header_pc: self.loop_header_pc,
+        }
+    }
+}
+
+/// The fields **every** `compiled_loops` replace path must carry forward off the
+/// entry it displaces, bundled so they travel with the removal.
+///
+/// Both are entry-local state that describes the *green key*, not the artifact:
+/// `next_global_opref` keeps a later bridge's OpRefs disjoint from an earlier
+/// one's, and `loop_header_pc` is the header a closing bridge jumps to. A
+/// replacement that drops either strands work aimed at the key — silently, and
+/// see `loop_header_pc`'s own doc for why neither the compiler nor the suite
+/// will tell you.
+///
+/// These two are carried at **all five** replace paths. They are deliberately
+/// the *only* members: `front_target_tokens` is carried at exactly one site
+/// (`compile_entry_bridge`) because the other four **mint** fresh labels, so
+/// inheriting it elsewhere would be a behaviour change, not a fix. Likewise
+/// `migrate_bridges` is called at three of the five and must stay at the call
+/// sites. Adding a field here that is not universal re-introduces exactly the
+/// bug this type exists to prevent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CarriedFields {
+    pub(crate) next_global_opref: u32,
+    pub(crate) loop_header_pc: Option<usize>,
 }
 
 /// Compute the smallest fresh OpRef strictly above every position
@@ -1104,7 +1185,7 @@ fn default_issubclass(typeptr: i64, bounding_class: i64) -> bool {
 ///
 /// Bridge-origin descriptor carried from `start_retrace_from_guard`
 /// through `compile_trace_finish`.  RPython stores the equivalent on
-/// `self.resumekey` (`pyjitpl.py:2890 handle_guard_failure(self,
+/// `self.resumekey` (`pyjitpl.py:2914 handle_guard_failure(self,
 /// resumedescr, deadframe)`) — the descr Arc itself is the canonical
 /// bridge-source identity.  Pyre carries the same Arc in
 /// `source_descr`; `(trace_id, fail_index)` remain only as pyre-side
@@ -1135,7 +1216,7 @@ pub struct BridgeTraceInfo {
 /// `self.history` for the duration of a single trace.  Bridge origin
 /// state lives independently on `MetaInterp.bridge_info` so the
 /// bridge-resume entry can populate it without requiring an active
-/// session (`pyjitpl.py:2890` `handle_guard_failure` is called with
+/// session (`pyjitpl.py:2914` `handle_guard_failure` is called with
 /// `self.resumekey` set before the trace's `self.history` exists).
 pub struct ActiveTraceSession<M: Clone> {
     /// Frontend state snapshot captured at `force_start_tracing` /
@@ -1149,11 +1230,6 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
     pub(crate) compiled_loops: indexmap::IndexMap<u64, CompiledEntry<M>>,
-    /// Loop-header bytecode pc per compiled-loop green key. A bridge trace
-    /// (`is_bridge_trace`) closes by jumping to its parent loop, which lives
-    /// at this header pc — not at the bridge's own `resume_pc`. Recorded when
-    /// a loop compiles; queried at `start_bridge_tracing`.
-    pub(crate) loop_header_pcs: indexmap::IndexMap<u64, usize>,
     /// warmstate.py:564-582 `JitCell.get_jit_cell_at_key` analog for the
     /// merge-point green vocabulary: the header greens (`(ints, refs,
     /// floats)`) each compiled loop was traced under, keyed by its green key.
@@ -1165,16 +1241,33 @@ pub struct MetaInterp<M: Clone> {
     /// `TraceCtx::cut_inner_green_key`), rather than from a loop closing at its
     /// own header.
     ///
-    /// A cut loop's `front_target_tokens[0]` is not a general procedure entry.
-    /// For a loop compiled at its own header that slot is the PREAMBLE — the
-    /// peeled first iteration that re-derives, from the loop's entry state,
-    /// every invariant the specialized label carries — which is what makes
-    /// `jump_to_preamble` (unroll.py:238-242) sound as the fallback when no
-    /// specialized label matches. A cut has no such peeled entry: its first
-    /// target token is the cut prefix, whose entry invariants were established
-    /// by the guards the CUTTING trace had already executed before it reached
-    /// the cut point. Only that trace's own closing JUMP arrives with them
-    /// proven.
+    /// A cut loop's entry is not a general procedure entry, even though it is
+    /// structurally shaped like one. `cut_trace_from_with_consts` does run
+    /// (`[jit] cut_trace_from: start.op_index=40 original_boxes=33
+    /// trace_ops=77`) and the artifact does carry a peeled preamble —
+    /// `front_target_tokens` is `[preamble(no virtual state), specialized]`,
+    /// the same pair a loop compiled at its own header gets, which is what
+    /// makes `jump_to_preamble` (unroll.py:238-242) sound there.
+    ///
+    /// What the peel cannot restore is a fact the CUTTING trace proved in the
+    /// ops the cut discarded. `PreambleCompileData` re-optimizes the cut trace
+    /// from scratch, so it neither inherits those facts nor re-derives them —
+    /// it only replays the ops that survived, and an op the tracer recorded
+    /// WITHOUT a guard because the guard sat in the dropped prefix stays
+    /// unguarded. On cel's `batch_chain_eager_fold_traps` the cut trace opens
+    /// with exactly that:
+    ///
+    /// ```text
+    ///   v33 = IntAdd(v5, 1)
+    ///   v34 = IntMul(v33, 8)
+    ///   v35 = RawLoadI(v13, v34)      <- no bound guard; it was before the cut
+    ///   ...
+    ///   RawStore(v2, v55, v54)        <- likewise
+    /// ```
+    ///
+    /// so an entry that has not run the discarded prefix loads and stores out
+    /// of bounds. Only the cutting trace's own closing JUMP arrives with those
+    /// facts proven.
     pub(crate) cut_compiled_keys: indexmap::IndexSet<u64>,
     /// The [`Self::cut_compiled_keys`] entry the running `compile_loop_body`
     /// recorded on the way in, kept so `compile_loop` can retire it when the
@@ -1203,6 +1296,16 @@ pub struct MetaInterp<M: Clone> {
     /// `break` instead of resuming at the pc). `take`n by the `__merge` wrapper's
     /// caller.
     pub(crate) single_pass_finish: bool,
+    /// The FINISH arguments of a compiled run entered from a back edge, when
+    /// that run ended in FINISH rather than a back-edge JUMP or a guard
+    /// failure. `compile.py:623-638` `_DoneWithThisFrameDescr` sets
+    /// `final_descr = True`: a FINISH means the traced function has RETURNED,
+    /// and upstream `handle_fail` raises `jitexc.DoneWithThisFrame*` to unwind
+    /// the portal. There is no resume point past it, so front end B's
+    /// `Option<resume_pc>` back-edge signature cannot express the outcome —
+    /// this carries the result value out of band instead. Set by
+    /// `back_edge_internal`, `take`n by `JitDriver::take_back_edge_finish*`.
+    pub(crate) back_edge_finish: Option<Vec<Value>>,
     /// Single-pass tracing: the walk-final scalar state-field values captured
     /// off the still-live sym at the CloseLoop point (scalar state-field index
     /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
@@ -1344,7 +1447,7 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) exported_state: Option<crate::optimizeopt::unroll::ExportedState>,
     /// pyjitpl.py:2373: number of cancelled compilation attempts.
     pub(crate) cancel_count: u32,
-    /// issue #108: count of non-`InvalidLoop` panics caught during JIT
+    /// issue compilation-panic: count of non-`InvalidLoop` panics caught during JIT
     /// compilation (a JIT bug, not a legitimate trace abort). In strict
     /// builds these re-raise; in release they are swallowed for graceful
     /// degradation, so this counter is the telemetry that the JIT was
@@ -1654,7 +1757,7 @@ pub struct JitStats {
     pub loops_aborted: usize,
     pub bridges_compiled: usize,
     pub guard_failures: usize,
-    /// issue #108: non-`InvalidLoop` panics swallowed during compilation
+    /// issue compilation-panic: non-`InvalidLoop` panics swallowed during compilation
     /// (graceful degradation in release). Non-zero means the JIT was
     /// silently disabled for some traces by an internal bug.
     pub internal_compile_panics: u32,
@@ -1667,7 +1770,14 @@ pub struct JitStats {
 #[derive(Default)]
 pub struct JitHooks {
     /// Called when a loop is compiled. Args: (green_key, num_ops_before, num_ops_after).
-    pub on_compile_loop: Option<Box<dyn Fn(u64, usize, usize) + Send>>,
+    /// Fires once per successful loop compile with the green key, the op
+    /// count before and after optimization, and the optimized body's opcode
+    /// KINDS. The kinds are captured on the same line as the count, so the
+    /// two always describe the same list; a gate reading one can trust the
+    /// other. Kinds rather than whole operations because a gate wants to ask
+    /// shape questions (`Jump` present? `GuardAlwaysFails` absent?) and the
+    /// full `Op` carries a `ResumeGuardDescr` whose `Debug` is enormous.
+    pub on_compile_loop: Option<Box<dyn Fn(u64, usize, usize, &[OpCode]) + Send>>,
     /// Called when a bridge is compiled. Args: (green_key, fail_index, num_ops).
     pub on_compile_bridge: Option<Box<dyn Fn(u64, u32, usize) + Send>>,
     /// Called on guard failure. Args: (green_key, fail_index, fail_count).
@@ -2066,7 +2176,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// GC walker for the forced-virtual caches held in
-    /// [`Self::forced_virtuals`], standing in for the trace `jf_savedata` gets
+    /// `Self::forced_virtuals`, standing in for the trace `jf_savedata` gets
     /// as a real GCREF field (`majit-backend/src/jitframe.rs:354`).
     ///
     /// Only the ptr half is walked. The int half is `virtuals_int_cache` —
@@ -2740,13 +2850,13 @@ impl<M: Clone> MetaInterp<M> {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
             compiled_loops: indexmap::IndexMap::new(),
-            loop_header_pcs: indexmap::IndexMap::new(),
             loop_header_greens: indexmap::IndexMap::new(),
             cut_compiled_keys: indexmap::IndexSet::new(),
             speculative_cut_owned_key: None,
             tracing: None,
             single_pass_outcome: None,
             single_pass_finish: false,
+            back_edge_finish: None,
             single_pass_scalar_values: None,
             single_pass_virt_array_values: None,
             pending_abort_blackhole: None,
@@ -2984,6 +3094,27 @@ impl<M: Clone> MetaInterp<M> {
             .as_ref()
     }
 
+    /// Whether the driver in `jitdrivers_sd[index]` carries a
+    /// `virtualizable_info` — `false` is RPython's *novable* driver.
+    ///
+    /// `None` when `index` names no registered slot, which callers must treat
+    /// as "cannot attribute" rather than defaulting either way: a novable
+    /// driver's resume data has no vable section, so handing a decoder the
+    /// wrong answer either skips a section that is present or consumes one
+    /// that is not.
+    ///
+    /// Pairs with `JitCellToken::outermost_jitdriver_index`
+    /// (`compile.py:168 jitcell_token.outermost_jitdriver_sd = jitdriver_sd`):
+    /// a guard-failure consumer holding only a descr recovers the owning
+    /// driver through the token chain and asks this, instead of being handed
+    /// the answer by its caller.
+    pub fn jitdriver_has_vinfo(&self, index: usize) -> Option<bool> {
+        self.staticdata
+            .jitdrivers_sd
+            .get(index)
+            .map(|jd| jd.virtualizable_info.is_some())
+    }
+
     /// Copy a freshly-snapshotted `all_liveness`
     /// byte stream into `staticdata.liveness_info` without re-running
     /// the full `install_canonical_liveness` insn-id seeding.
@@ -3030,7 +3161,7 @@ impl<M: Clone> MetaInterp<M> {
         staticdata.liveness_info = all_liveness.to_vec();
     }
 
-    /// Install a fresh [`ActiveTraceSession`] seeded with the frontend
+    /// Install a fresh `ActiveTraceSession` seeded with the frontend
     /// trace metadata.  Called from `force_start_tracing` /
     /// `bound_reached` / `on_back_edge_typed` and the bridge-resume
     /// path.  Panics if a prior session was not cleared — mirrors
@@ -3041,10 +3172,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `profiler.start_tracing()` ↔ `end_tracing()` events fire at
     /// PyPy's `compile_and_run_once` / `handle_guard_failure` entry
     /// and finally — pyre routes those through
-    /// [`enter_profiler_tracing`] (called from
+    /// [`Self::enter_profiler_tracing`] (called from
     /// `prepare_trace_start_runtime` for roots and
     /// `start_retrace_from_guard` for bridges) and
-    /// [`leave_profiler_tracing`] (called from session-close paths).
+    /// [`Self::leave_profiler_tracing`] (called from session-close paths).
     pub fn begin_trace_session(&mut self, trace_meta: M) {
         debug_assert!(
             self.active_trace_session.is_none(),
@@ -3054,7 +3185,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Attach bridge-origin metadata.  Called once at bridge entry
-    /// (`pyjitpl.py:2890` `handle_guard_failure` sets `self.resumekey`).
+    /// (`pyjitpl.py:2914` `handle_guard_failure` sets `self.resumekey`).
     pub fn set_bridge_trace_info(&mut self, bridge: BridgeTraceInfo) {
         self.bridge_info = Some(bridge);
     }
@@ -3103,7 +3234,7 @@ impl<M: Clone> MetaInterp<M> {
     /// before calling `recorder.finish()` + backend compile.
     ///
     /// Does *not* fire `profiler.end_tracing()`: the profiler event
-    /// scope is owned by [`leave_profiler_tracing`] and matches PyPy's
+    /// scope is owned by [`Self::leave_profiler_tracing`] and matches PyPy's
     /// `compile_and_run_once` / `handle_guard_failure` `finally`
     /// boundary, which is reached *after* the finish-compile body
     /// runs.  Callers fire `leave_profiler_tracing` at the
@@ -3121,8 +3252,8 @@ impl<M: Clone> MetaInterp<M> {
     /// `prepare_trace_start_runtime` / `start_retrace_from_guard`.
     /// Both effects are bundled here because every trace-abort path
     /// reaches `clear_trace_session` (it is the structural close
-    /// point); success paths that drain via [`take_trace_meta`] fire
-    /// [`leave_profiler_tracing`] explicitly at the close-equivalent
+    /// point); success paths that drain via [`Self::take_trace_meta`] fire
+    /// [`Self::leave_profiler_tracing`] explicitly at the close-equivalent
     /// point and reach a no-op here.
     pub fn clear_trace_session(&mut self) {
         self.leave_profiler_tracing();
@@ -3137,7 +3268,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `compile_and_run_once` / `handle_guard_failure` are not
     /// re-entrant on the same MetaInterp).  The debug section and
     /// profiler event are issued together here because the
-    /// matching close lives in [`leave_profiler_tracing`]; both halves
+    /// matching close lives in [`Self::leave_profiler_tracing`]; both halves
     /// must move as a pair to keep the `debug_start`/`debug_stop`
     /// nesting balanced (PyPy convention).
     ///
@@ -3165,12 +3296,12 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Open the profiler tracing event scope assuming the
     /// `jit-tracing` debug section has *already* been opened upstream
-    /// by the caller.  Used by [`prepare_trace_start_runtime`] so the
+    /// by the caller.  Used by `prepare_trace_start_runtime` so the
     /// debug section can wrap `_setup_once` while the profiler event
     /// only opens after `_setup_once` completes — matching the
     /// `debug_start; _setup_once; start_tracing` order at
     /// `pyjitpl.py:2888-2892`.  The matching close still routes
-    /// through [`leave_profiler_tracing`].
+    /// through [`Self::leave_profiler_tracing`].
     pub fn open_profiler_tracing_inner(&mut self) {
         // Same release-build assertion contract as
         // [`enter_profiler_tracing`] — a second entry would leak a
@@ -3187,7 +3318,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `pyjitpl.py:2897 / 2934`
     /// `profiler.end_tracing(); debug_stop("jit-tracing")` parity —
     /// close the profiler event scope opened by
-    /// [`enter_profiler_tracing`], then the matching debug section
+    /// [`Self::enter_profiler_tracing`], then the matching debug section
     /// (LIFO unwind matching PyPy's nested `try/finally`).  No-op if
     /// the scope was already closed (mirrors PyPy's `finally`
     /// semantics: a path that never reached `start_tracing` still
@@ -3579,6 +3710,38 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             None
         };
+        // The `None` arm below mints `OpRef::input_arg_ref(box_ref_index)` — a
+        // ref-bank ordinal spelled into the flat trace-inputarg space, which is
+        // sound only at index 0. Two disjoint routes reach it: no declared bank
+        // index, and a declared index whose live position did not match.
+        //
+        // Nothing derives the index-0 property here. Two writers can supply
+        // `index_of_virtualizable`, and they reach zero for different reasons:
+        // `set_virtualizable_info` eagerly zeroes a driver whose reds are empty,
+        // while the `warmspot.py:534-538` port in `codewriter/call.rs` takes the
+        // virtualizable's reds-relative position, which is zero only when it is
+        // declared first among the reds. The driver resolved at this site is the
+        // placeholder at jd slot 0 — empty reds, no virtualizable name — so the
+        // eager zero is what holds; the reds-order route is not instantiated
+        // here rather than checked here. `warmspot.py:527-530` leaves the
+        // not-applicable case at -1, a sentinel that would fail loudly if it
+        // were ever used as an index.
+        //
+        // Assert it where the box is minted, naming both terms and the resolved
+        // slot: a failure has to say which driver was resolved and which of the
+        // two routes produced the fallback, or it cannot be told from an
+        // election problem.
+        assert!(
+            !(identity_index.is_none() && box_ref_index != 0),
+            "initialize_virtualizable: virtualizable red-slot convention violated \
+             on jitdriver slot {idx}: identity_index=None, \
+             identity_ref_bank_index={:?}, box_ref_index={} (expected 0 on the \
+             fallback arm). That arm mints `OpRef::input_arg_ref(box_ref_index)` \
+             in the flat inputarg space from a ref-bank ordinal; at a non-zero \
+             index the minted box names an unrelated value.",
+            info.identity_ref_bank_index,
+            box_ref_index,
+        );
         let virtualizable_box = match identity_index {
             Some(idx) => OpRef::input_arg_typed(idx as u32, Type::Ref),
             None => OpRef::input_arg_ref(box_ref_index as u32),
@@ -4094,7 +4257,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Set a callback for loop compilation events.
-    pub fn set_on_compile_loop(&mut self, f: impl Fn(u64, usize, usize) + Send + 'static) {
+    pub fn set_on_compile_loop(
+        &mut self,
+        f: impl Fn(u64, usize, usize, &[OpCode]) + Send + 'static,
+    ) {
         self.hooks.on_compile_loop = Some(Box::new(f));
     }
 
@@ -4383,12 +4549,21 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// `green_key_values` and `driver_descriptor` arrive unbuilt — a key
+    /// factory and a borrow — because only the `StartTracing` arm below
+    /// consumes them.  warmstate.py:446-511 `maybe_compile_and_run` orders the
+    /// decision the same way: greenargs, hash, `lookup_chain`, then
+    /// `jitcounter.tick` (`:467`), and only past the counter does it reach
+    /// `confirm_enter_jit` (`:501`) and the red-argument extraction loop
+    /// (`:503-506`).  `bound_reached` is handed `*args` raw for exactly this
+    /// reason.  Building either eagerly at the call site pays for both on the
+    /// `NotHot` / `RunCompiled` arms, which drop them unread.
     pub fn on_back_edge_typed(
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
-        green_key_values: Option<majit_ir::GreenKey>,
-        driver_descriptor: Option<JitDriverStaticData>,
+        green_key_values: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        driver_descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         if self.tracing.is_some() {
@@ -4411,11 +4586,17 @@ impl<M: Clone> MetaInterp<M> {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
+                // The only reader of either value.  The key factory closes over
+                // `Copy` locals bound once at the back edge
+                // (`jit_interp/mod.rs` `__green_slotN`), and the descriptor
+                // borrow points at a snapshot `Arc` built by
+                // `driver_descriptor_for`, so neither observes anything the
+                // counter consultation above may have changed.
                 self.setup_tracing(
                     green_key,
                     green_key_raw,
-                    green_key_values,
-                    driver_descriptor,
+                    green_key_values.map(|make_key| make_key()),
+                    driver_descriptor.cloned(),
                     live_values,
                 )
             }
@@ -4636,7 +4817,7 @@ impl<M: Clone> MetaInterp<M> {
     ///    routes `BC_CALL_ASSEMBLER_*` against the production
     ///    `Arc<JitCellToken>` rather than the `_by_number_typed` synth-Arc
     ///    fallback (borrows `compiled_loops` + `warm_state`);
-    /// 3. `recursive_target` — #184 green-key → `(Arc<JitCellToken>,
+    /// 3. `recursive_target` — recursive-call green-key → `(Arc<JitCellToken>,
     ///    green_key)` resolver for a recursive CALL_ASSEMBLER (mirrors
     ///    `get_loop_token_arc`; only already-compiled callees, the
     ///    pending-token window returns `None` → the dispatcher aborts);
@@ -4683,7 +4864,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             warm_state.find_token_by_number(n).map(Arc::clone)
         };
-        // #184 green-key → token resolver (pyjitpl.py:3593-3599
+        // recursive-call green-key → token resolver (pyjitpl.py:3593-3599
         // `get_assembler_token`).  Resolves only already-compiled callees
         // through `warm_state.get_compiled`; the pending-token convergence
         // window returns `None` so the dispatcher aborts and retries (a
@@ -4696,7 +4877,7 @@ impl<M: Clone> MetaInterp<M> {
                     .get_compiled(green_key)
                     .map(|arc| (Arc::clone(arc), green_key))
             };
-        // #184 recursive-portal inline decision, sharing
+        // recursive-call recursive-portal inline decision, sharing
         // `decide_recursive_inline` with `should_inline_core` so the
         // dispatch-side and metainterp-side decisions cannot drift.  The
         // `should_disable` (`dont_trace_here` → `disable_noninlinable_function`)
@@ -4733,7 +4914,7 @@ impl<M: Clone> MetaInterp<M> {
             );
             decision
         };
-        // #184 concrete recursive-callee execution: run the compiled loop
+        // recursive-call concrete recursive-callee execution: run the compiled loop
         // through the JITFRAME-ABI `execute_token_raw` and decode the int
         // FINISH output (mirrors `run_compiled_raw_detailed_with_values`).
         let recursive_exec = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
@@ -4786,7 +4967,6 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace
     }
 
-    // ── RPython opimpl_* equivalents for virtualizable ──────────────
     //
     // pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`
     // is implemented in `TraceCtx::is_nonstandard_virtualizable` with the
@@ -5610,7 +5790,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
     /// pyjitpl.py:2979-3036 `reached_loop_header` → `compile_loop` dispatch.
     ///
-    /// This public entry wraps [`Self::compile_loop_body`] so every exit
+    /// This public entry wraps `Self::compile_loop_body` so every exit
     /// path restores the RPython invariant that
     /// `active_trace_session.is_some()` iff `self.tracing.is_some()`.
     /// Upstream uses `self.history` as a shared mutable object — cancel
@@ -6195,6 +6375,10 @@ impl<M: Clone> MetaInterp<M> {
                         // re-invoked on the next reached_loop_header. Do NOT call
                         // abort_tracing — TRACING flag must stay active.
                         if !self.cancelled_too_many_times() {
+                            // Slot 72: the unrolled compile was abandoned and
+                            // tracing continues. Bumped per EVENT, so a single
+                            // key contributes once per cancelled attempt.
+                            crate::mc_diag_bump(72);
                             self.exported_state = None;
                             if crate::closedbg_enabled() {
                                 eprintln!("@@@CANCEL-SITE line={}", line!());
@@ -6275,6 +6459,13 @@ impl<M: Clone> MetaInterp<M> {
                             }));
                         match retry_result {
                             Ok(Ok(retry_ops)) => {
+                                // Slot 73: a loop is about to be compiled
+                                // WITHOUT the peel. This is the silent
+                                // degradation — the retry succeeds, so the
+                                // compile counters, the result and every
+                                // success-keyed gate read exactly as they do
+                                // for a healthy peeled loop.
+                                crate::mc_diag_bump(73);
                                 if crate::majit_log_enabled() {
                                     eprintln!(
                                         "[jit] retry without unroll succeeded at key={}",
@@ -6292,6 +6483,11 @@ impl<M: Clone> MetaInterp<M> {
                             }
                             Ok(Err(_invalid_loop)) => {
                                 // The unroll-free retry also abandoned the trace.
+                                // Slot 74: the only arm of the three that is
+                                // already loud — it ends in `Aborted`, so a
+                                // compile-count gate can see it. Counted anyway
+                                // so 72+73+74 totals the raised `InvalidLoop`s.
+                                crate::mc_diag_bump(74);
                                 if crate::majit_log_enabled() {
                                     eprintln!(
                                         "[jit] retry without unroll hit InvalidLoop at key={}",
@@ -6352,12 +6548,18 @@ impl<M: Clone> MetaInterp<M> {
         };
         let opt_time = Instant::now().saturating_duration_since(optimize_start);
         let num_ops_after = optimized_ops.len();
+        let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] post-opt: {} ops (before: {})",
                 num_ops_after, num_ops_before
             );
         }
+        crate::optimizeopt::optimizer::Optimizer::log_optimized_trace(
+            "compile_loop_body",
+            &optimized_ops,
+            &constants,
+        );
 
         // RPython compile.py keeps the root entry contract on the original
         // loop inputargs. Simple loops synthesize a LABEL from that contract;
@@ -6832,7 +7034,12 @@ impl<M: Clone> MetaInterp<M> {
                 // RPython parity: keep previous compiled tokens alive so
                 // external target_token JUMPs can redirect to them.
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                if let Some(old_entry) = self.compiled_loops.swap_remove(&green_key) {
+                // Carried forward because this replaces the entry at the same
+                // green key: the loop still closes at the header it closed at
+                // before, so dropping the pc here would strand every bridge
+                // that aims its closing JUMP at it.
+                let mut carried_loop_header_pc = None;
+                if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
@@ -6842,7 +7049,8 @@ impl<M: Clone> MetaInterp<M> {
                     // Box Identity Phase E.2b parity: preserve old entry's
                     // high-water so previously stored bridges' OpRefs stay
                     // disjoint from any future bridge.
-                    next_global_opref = next_global_opref.max(old_entry.next_global_opref);
+                    next_global_opref = next_global_opref.max(carried.next_global_opref);
+                    carried_loop_header_pc = carried.loop_header_pc;
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 if crate::debug::have_debug_prints() {
@@ -6851,10 +7059,25 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("compiled_loops.insert green_key={green_key}"),
                     );
                 }
-                if crate::jitdriver::spdiag_enabled() {
-                    eprintln!("@@@SPDIAG compiled_loops.insert green_key={green_key}");
-                }
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
+                if crate::jitdriver::spdiag_enabled() {
+                    let shape: Vec<String> = front_target_tokens
+                        .iter()
+                        .map(|target| {
+                            format!(
+                                "{}{}",
+                                if target.is_preamble_target { "P" } else { "S" },
+                                target.virtual_state.is_some() as u8,
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "@@@SPDIAG compiled_loops.insert green_key={green_key} \
+                         cut={} tokens=[{}] front_entry_index={front_entry_index:?}",
+                        self.cut_compiled_keys.contains(&green_key),
+                        shape.join(","),
+                    );
+                }
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.compiled_loops.insert(
                     green_key,
@@ -6865,6 +7088,7 @@ impl<M: Clone> MetaInterp<M> {
                         front_entry_index,
                         front_target_source_positions,
                         root_trace_id: trace_id,
+                        loop_header_pc: carried_loop_header_pc,
                         traces,
                         previous_tokens,
                         // Box Identity Phase E Step 1: record Phase 2's final
@@ -6892,7 +7116,7 @@ impl<M: Clone> MetaInterp<M> {
                 // explicit metainterp-side bump needed here.
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
-                    hook(green_key, num_ops_before, num_ops_after);
+                    hook(green_key, num_ops_before, num_ops_after, &opcodes_after);
                 }
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
@@ -6987,7 +7211,7 @@ impl<M: Clone> MetaInterp<M> {
         self.partial_trace.as_ref()
     }
 
-    /// See [`Self::keep_tracing_after_close`]. Read-and-clear: the answer is
+    /// See `Self::keep_tracing_after_close`. Read-and-clear: the answer is
     /// only meaningful to the close that just ran.
     pub fn take_keep_tracing_after_close(&mut self) -> bool {
         std::mem::take(&mut self.keep_tracing_after_close)
@@ -7063,6 +7287,31 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         self.keep_tracing_after_close = true;
+    }
+
+    /// Removes the `compiled_loops` entry at `green_key`, returning it together
+    /// with the state a replacement must inherit from it.
+    ///
+    /// This is the single door onto a replace: **obtaining the displaced entry
+    /// without also receiving its `CarriedFields` is not expressible.** That is
+    /// the whole point — the carry-forward used to be two hand-written lines
+    /// repeated at every replace path, and dropping them is invisible to the
+    /// compiler and to the suite alike.
+    ///
+    /// This does **not** mean the replace paths are tested. It removes one
+    /// class of omission; everything else those paths do (bridge migration,
+    /// label minting, retirement, snapshot handling) remains uncovered, because
+    /// nothing in this crate can drive a production compile path.
+    /// The caller still performs `retire_compiled_entry`, `migrate_bridges` and
+    /// any label carry itself, deliberately: those vary per site and flattening
+    /// them into here would change behaviour at the sites that omit them.
+    pub(crate) fn take_entry_for_replace(
+        &mut self,
+        green_key: u64,
+    ) -> Option<(CompiledEntry<M>, CarriedFields)> {
+        let old_entry = self.compiled_loops.swap_remove(&green_key)?;
+        let carried = old_entry.carried_fields();
+        Some((old_entry, carried))
     }
 
     /// compile.py: has_compiled_targets — check if a green key has
@@ -7239,7 +7488,7 @@ impl<M: Clone> MetaInterp<M> {
         //
         // `compile_bridge`'s `PendingBridgeRd` zip is likewise positional over
         // every bridge inputarg rather than a resume-walked subset. See
-        // task #37 for the live-filtered channel this site needs before the
+        // the live-filtered channel for the live-filtered channel this site needs before the
         // values can be carried again.
         let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
             .recorder
@@ -7345,7 +7594,7 @@ impl<M: Clone> MetaInterp<M> {
                         from_retry: false,
                     };
                 }
-                // `pyjitpl.py:2890` `handle_guard_failure(self,
+                // `pyjitpl.py:2914` `handle_guard_failure(self,
                 // resumedescr, deadframe)` parity: the source descr Arc
                 // is `self.resumekey` (== the descr
                 // `cpu.get_latest_descr(deadframe)` returned).  Pyre
@@ -7505,7 +7754,7 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py:392 resumekey.compile_and_attach(metainterp, loop,
         // inputargs)` — the resumekey decides how a finished retrace is
         // installed, and a retrace grown from a guard failure carries a
-        // `ResumeGuardDescr` (`pyjitpl.py:2890 handle_guard_failure(self,
+        // `ResumeGuardDescr` (`pyjitpl.py:2914 handle_guard_failure(self,
         // resumedescr, deadframe)` stores it as `self.resumekey`).
         let retrace_resumekey = self.bridge_info_cloned();
         let vable_config = self.current_virtualizable_optimizer_config();
@@ -7851,6 +8100,7 @@ impl<M: Clone> MetaInterp<M> {
         // since the descr-strict dispatch landed.
 
         let num_combined_ops = combined_ops.len();
+        let opcodes_after: Vec<OpCode> = combined_ops.iter().map(|op| op.opcode).collect();
         let has_guard = combined_ops.iter().any(|op| op.opcode.is_guard());
         if !has_guard {
             crate::debug::log_one("jit-abort", "compile_retrace: guardless loop");
@@ -8057,7 +8307,9 @@ impl<M: Clone> MetaInterp<M> {
                 );
 
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                if let Some(old_entry) = self.compiled_loops.swap_remove(&green_key) {
+                // Carried forward for the same reason as the compile_loop site.
+                let mut carried_loop_header_pc = None;
+                if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
@@ -8065,7 +8317,8 @@ impl<M: Clone> MetaInterp<M> {
                         self.backend.migrate_bridges(&old_tok, token.as_ref());
                     }
                     // Box Identity Phase E.2b parity: see compile_loop site.
-                    next_global_opref = next_global_opref.max(old_entry.next_global_opref);
+                    next_global_opref = next_global_opref.max(carried.next_global_opref);
+                    carried_loop_header_pc = carried.loop_header_pc;
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 if crate::debug::have_debug_prints() {
@@ -8095,6 +8348,7 @@ impl<M: Clone> MetaInterp<M> {
                         front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
+                        loop_header_pc: carried_loop_header_pc,
                         traces,
                         previous_tokens,
                         // Box Identity Phase E Step 1: see main compile site.
@@ -8114,7 +8368,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `CompiledLoopToken::new` (model.py:297 parity).
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
-                    hook(green_key, 0, num_combined_ops);
+                    hook(green_key, 0, num_combined_ops, &opcodes_after);
                 }
                 self.last_quasi_immutable_deps = quasi_immutable_deps;
                 true
@@ -8458,9 +8712,17 @@ impl<M: Clone> MetaInterp<M> {
         // `Counters.ABORT_*` reason; this is the catch that turns it into the
         // one accounting event, as `aborted_tracing(stb.reason)` does for the
         // reason the `SwitchToBlackhole` raise carried.
-        let reason = self
-            .take_pending_abort_reason()
-            .unwrap_or(AbortReason::Generic.as_int());
+        let reason = match self.take_pending_abort_reason() {
+            Some(r) => r,
+            None => {
+                // Nothing staged a reason, so this abort is unclassified rather
+                // than the bridge giveup that shares `ABORT_BRIDGE`'s slot.
+                // Name it where the fallback is chosen; slot 41 is their total
+                // and cannot separate them after the fact.
+                crate::mc_diag_bump(71);
+                AbortReason::Generic.as_int()
+            }
+        };
         self.aborted_tracing(reason);
     }
 
@@ -8567,10 +8829,10 @@ impl<M: Clone> MetaInterp<M> {
     /// * `true` → `compile_exit_frame_with_exception` (pyjitpl.py:3238-3245)
     ///   — descr = `sd.exit_frame_with_exception_descr_ref`.
     ///
-    /// Returns `Err(SwitchToBlackhole::bad_loop())` on optimizer
+    /// Returns `Err(SwitchToBlackhole::giveup())` on optimizer
     /// `InvalidLoop` or backend compile failure, matching
     /// pyjitpl.py:3220 `compile.giveup()` surfacing as
-    /// `SwitchToBlackhole(ABORT_BAD_LOOP)`.  The caller (typically
+    /// `SwitchToBlackhole(ABORT_BRIDGE)`.  The caller (typically
     /// `compile_finish_from_active_session`) propagates the error so
     /// `finishframe`/`finishframe_exception` can translate it into
     /// `aborted_tracing(reason)` per pyjitpl.py:2491.
@@ -8738,6 +9000,7 @@ impl<M: Clone> MetaInterp<M> {
         // new_operations naturally — no restoration needed.
         let optimized_ops = optimized_ops;
         let num_ops_after = optimized_ops.len();
+        let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
         optimizer.update_counters(&self.staticdata.profiler);
         // RPython compile.py:234 parity: transfer quasi-immutable deps
@@ -8760,6 +9023,11 @@ impl<M: Clone> MetaInterp<M> {
             eprintln!("--- finish trace (after opt, before unbox) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
+        crate::optimizeopt::optimizer::Optimizer::log_optimized_trace(
+            "finish_and_compile",
+            &optimized_ops,
+            &constants,
+        );
 
         // resume.py:411-417 parity: NONE entries in guard fail_args are
         // valid (TAGCONST/TAGVIRTUAL slots that resume reconstructs from
@@ -8948,11 +9216,14 @@ impl<M: Clone> MetaInterp<M> {
                         .map(|tok| tok.get_retraced_count())
                         .unwrap_or(0);
                     let _had_old = self.compiled_loops.contains_key(&green_key);
-                    if let Some(old_entry) = self.compiled_loops.swap_remove(&green_key) {
+                    // Carried forward for the same reason as the compile_loop site.
+                    let mut carried_loop_header_pc = None;
+                    if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                         // Box Identity Phase E.2b parity: preserve old entry's
                         // high-water so previously stored bridges' OpRefs stay
                         // disjoint from any future bridge.
-                        next_global_opref = next_global_opref.max(old_entry.next_global_opref);
+                        next_global_opref = next_global_opref.max(carried.next_global_opref);
+                        carried_loop_header_pc = carried.loop_header_pc;
                         previous_tokens =
                             self.retire_compiled_entry(green_key, old_entry, &mut traces);
                     }
@@ -8987,6 +9258,7 @@ impl<M: Clone> MetaInterp<M> {
                             front_entry_index,
                             front_target_source_positions: None,
                             root_trace_id: trace_id,
+                            loop_header_pc: carried_loop_header_pc,
                             traces,
                             previous_tokens,
                             next_global_opref,
@@ -9013,7 +9285,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 if let Some(ref hook) = self.hooks.on_compile_loop {
-                    hook(green_key, num_ops_before, num_ops_after);
+                    hook(green_key, num_ops_before, num_ops_after, &opcodes_after);
                 }
             }
             Err(e) => {
@@ -9161,6 +9433,7 @@ impl<M: Clone> MetaInterp<M> {
         self.last_quasi_immutable_deps = std::mem::take(&mut optimizer.quasi_immutable_deps);
 
         let num_ops_after = optimized_ops.len();
+        let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] compile_simple_loop: key={}, ops_before={}, ops_after={}",
@@ -9169,6 +9442,11 @@ impl<M: Clone> MetaInterp<M> {
             eprintln!("--- simple loop trace (after opt) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
+        crate::optimizeopt::optimizer::Optimizer::log_optimized_trace(
+            "compile_simple_loop",
+            &optimized_ops,
+            &constants,
+        );
 
         let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
@@ -9321,9 +9599,12 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                if let Some(old_entry) = self.compiled_loops.swap_remove(&green_key) {
+                // Carried forward for the same reason as the compile_loop site.
+                let mut carried_loop_header_pc = None;
+                if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
-                    next_global_opref = next_global_opref.max(old_entry.next_global_opref);
+                    next_global_opref = next_global_opref.max(carried.next_global_opref);
+                    carried_loop_header_pc = carried.loop_header_pc;
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 let front_target_tokens = vec![target_token];
@@ -9337,6 +9618,7 @@ impl<M: Clone> MetaInterp<M> {
                         front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
+                        loop_header_pc: carried_loop_header_pc,
                         traces,
                         previous_tokens,
                         next_global_opref,
@@ -9359,7 +9641,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 if let Some(ref hook) = self.hooks.on_compile_loop {
-                    hook(green_key, num_ops_before, num_ops_after);
+                    hook(green_key, num_ops_before, num_ops_after, &opcodes_after);
                 }
                 // compile.py:249: return target_token
                 self.compile_snapshot_refs.clear();
@@ -9398,13 +9680,27 @@ impl<M: Clone> MetaInterp<M> {
     /// Record the loop-header bytecode pc for a compiled-loop green key, so a
     /// later bridge whose guard belongs to this loop knows where its parent
     /// loop header lives (the close target of the bridge JUMP).
+    ///
+    /// A key with no `compiled_loops` entry is dropped rather than recorded:
+    /// the pc describes a compiled loop, so with no loop there is nothing for
+    /// it to describe and no reader that could act on it. Callers record after
+    /// a compile reports success, at which point the entry exists.
     pub fn record_loop_header_pc(&mut self, green_key: u64, header_pc: usize) {
-        self.loop_header_pcs.insert(green_key, header_pc);
+        if let Some(entry) = self.compiled_loops.get_mut(&green_key) {
+            entry.loop_header_pc = Some(header_pc);
+        }
     }
 
     /// Loop-header bytecode pc recorded for a compiled-loop green key.
+    ///
+    /// `None` covers both "no loop is compiled at this key" and "one is, but it
+    /// closed somewhere other than a loop header". Neither is an error: the
+    /// callers use the pc to aim a bridge's closing JUMP, and not having one is
+    /// a reason to decline the bridge, never to assume a pc.
     pub fn loop_header_pc_for(&self, green_key: u64) -> Option<usize> {
-        self.loop_header_pcs.get(&green_key).copied()
+        self.compiled_loops
+            .get(&green_key)
+            .and_then(|entry| entry.loop_header_pc)
     }
 
     /// Record the merge-point green constants a compiled loop was traced
@@ -9432,7 +9728,7 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py:269-270 parity: whether the loop at `green_key` was stored
     /// under a cross-loop cut's inner jitcell token.
     ///
-    /// See [`MetaInterp::cut_compiled_keys`] for why the distinction matters to
+    /// See `MetaInterp::cut_compiled_keys` for why the distinction matters to
     /// anything that wants to JUMP into the loop from outside the trace that
     /// cut it.
     pub fn is_cross_loop_cut_key(&self, green_key: u64) -> bool {
@@ -9924,7 +10220,7 @@ impl<M: Clone> MetaInterp<M> {
         })
     }
 
-    /// Typed-input counterpart to [`run_compiled_detailed`].
+    /// Typed-input counterpart to [`Self::run_compiled_detailed`].
     pub fn run_compiled_detailed_with_values(
         &mut self,
         green_key: u64,
@@ -10283,13 +10579,16 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Drop the per-loop side tables (`loop_header_pcs`, `loop_header_greens`)
-    /// when a loop is retired, so they cannot outlive `compiled_loops`.
-    /// `compiled_key_for_greens` already skips keys without compiled targets,
-    /// so a leftover entry could not mis-target a bridge — but keeping them
-    /// would grow both maps without bound over a long run.
+    /// Drop the per-loop side tables (`loop_header_greens`,
+    /// `cut_compiled_keys`) when a loop is retired, so they cannot outlive
+    /// `compiled_loops`. `compiled_key_for_greens` already skips keys without
+    /// compiled targets, so a leftover entry could not mis-target a bridge —
+    /// but keeping them would grow both maps without bound over a long run.
+    ///
+    /// The loop-header pc used to be retired here too; it now lives on
+    /// `CompiledEntry::loop_header_pc` and is dropped with the entry, so no
+    /// caller can forget it.
     fn forget_loop_side_tables(&mut self, green_key: u64) {
-        self.loop_header_pcs.swap_remove(&green_key);
         self.loop_header_greens.swap_remove(&green_key);
         self.cut_compiled_keys.swap_remove(&green_key);
     }
@@ -10456,8 +10755,6 @@ impl<M: Clone> MetaInterp<M> {
             old_token.record_jump_to(attach_token);
         }
     }
-
-    // ── Call Assembler Support ──────────────────────────────────
 
     /// Get the JitCellToken for a compiled loop (for CALL_ASSEMBLER).
     ///
@@ -10922,7 +11219,6 @@ impl<M: Clone> MetaInterp<M> {
     /// recompile that has not happened yet, not for the loops being dropped.
     pub fn clear_compiled_loops(&mut self) {
         self.compiled_loops.clear();
-        self.loop_header_pcs.clear();
         self.loop_header_greens.clear();
         self.cut_compiled_keys.clear();
     }
@@ -11224,8 +11520,6 @@ impl<M: Clone> MetaInterp<M> {
                 .unwrap_or(false)
         })
     }
-
-    // ── Bridge Compilation ──────────────────────────────────────
 
     /// pyjitpl.py:3195 finally: self.history.cut(cut_at) — undo tentative JUMP/FINISH.
     fn cut_tentative_op(&mut self, cut_at: crate::recorder::TracePosition) {
@@ -11675,6 +11969,7 @@ impl<M: Clone> MetaInterp<M> {
             orig_vable_ptr_entry,
         );
         let num_optimized_ops = optimized_ops.len();
+        let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let trace_id = self.alloc_trace_id();
@@ -11833,10 +12128,20 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|tok| tok.get_retraced_count())
                     .unwrap_or(0);
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                if let Some(old_entry) = self.compiled_loops.swap_remove(&original_green_key) {
+                // Carried forward for the same reason as `front_target_tokens`
+                // just below: the replacement entry inherits the retired loop's
+                // close target, and a key with labels but no header pc is just
+                // as unreachable to a closing bridge as one with neither.
+                let mut carried_loop_header_pc = None;
+                if let Some((old_entry, carried)) = self.take_entry_for_replace(original_green_key)
+                {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
-                    next_global_opref = next_global_opref.max(old_entry.next_global_opref);
+                    next_global_opref = next_global_opref.max(carried.next_global_opref);
+                    // Read off `old_entry`, not `carried`: this is the only one
+                    // of the five sites that inherits the retired loop's
+                    // labels, so it is not a `CarriedFields` member.
                     front_target_tokens = old_entry.front_target_tokens.clone();
+                    carried_loop_header_pc = carried.loop_header_pc;
                     if let Some(old_tok) = old_entry.live_token() {
                         self.backend.migrate_bridges(&old_tok, token.as_ref());
                     }
@@ -11854,6 +12159,7 @@ impl<M: Clone> MetaInterp<M> {
                         front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
+                        loop_header_pc: carried_loop_header_pc,
                         traces,
                         previous_tokens,
                         next_global_opref,
@@ -11871,7 +12177,12 @@ impl<M: Clone> MetaInterp<M> {
                 // `cpu.tracker.total_compiled_loops` is bumped inside
                 // `CompiledLoopToken::new` (model.py:297 parity).
                 if let Some(ref hook) = self.hooks.on_compile_loop {
-                    hook(original_green_key, bridge_ops.len(), num_optimized_ops);
+                    hook(
+                        original_green_key,
+                        bridge_ops.len(),
+                        num_optimized_ops,
+                        &opcodes_after,
+                    );
                 }
                 true
             }
@@ -12709,11 +13020,11 @@ impl<M: Clone> MetaInterp<M> {
     /// guard failure point. The resulting trace replaces the original guard.
     ///
     /// Returns true if retracing was started.
-    /// RPython pyjitpl.py:2890 handle_guard_failure parity:
+    /// RPython pyjitpl.py:2914 handle_guard_failure parity:
     /// Initialize bridge tracing from a guard failure point.
     /// Returns (success, is_exception_guard) so the caller can emit
     /// SAVE_EXC_CLASS + SAVE_EXCEPTION ops for exception bridges.
-    /// `pyjitpl.py:2890` `handle_guard_failure(self, resumedescr,
+    /// `pyjitpl.py:2914` `handle_guard_failure(self, resumedescr,
     /// deadframe)` parity: `descr_arc` is the source guard descr Arc
     /// (the value `cpu.get_latest_descr(deadframe)` returned) carried
     /// through as `self.resumekey`.
@@ -12850,7 +13161,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let fail_types = bridge_input_types.to_vec();
 
-        // `pyjitpl.py:2890` `handle_guard_failure(self, resumedescr,
+        // `pyjitpl.py:2914` `handle_guard_failure(self, resumedescr,
         // deadframe)` parity: stash `self.resumekey` on MetaInterp so
         // every downstream lookup (bridge close, compile_trace_inner,
         // ...) reads the source descr Arc directly instead of doing
@@ -12882,7 +13193,7 @@ impl<M: Clone> MetaInterp<M> {
     /// → force_from_resumedata() → materialize all virtuals → save on deadframe.
     ///
     /// The forced virtual caches (ptr, int) are stored on
-    /// [`Self::forced_virtuals`] for the blackhole resumption from the
+    /// `Self::forced_virtuals` for the blackhole resumption from the
     /// GUARD_NOT_FORCED — RPython's `AllVirtuals` via `cpu.set_savedata_ref()`.
     /// They are also returned, which only the unit tests below read.
     pub fn handle_async_forcing(
@@ -13164,8 +13475,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    // ── Guard Failure Recovery ─────────────────────────────────
-
     /// Handle a guard failure: recover interpreter state using resume data.
     ///
     /// This is the central guard failure handler, equivalent to RPython's
@@ -13371,8 +13680,6 @@ impl<M: Clone> MetaInterp<M> {
         })
     }
 
-    // ── Retrace Support ──────────────────────────────────────
-
     /// Start retracing from a guard failure point.
     ///
     /// When a guard fails too many times, the JIT can start a new trace
@@ -13410,8 +13717,6 @@ impl<M: Clone> MetaInterp<M> {
         self.start_retrace_from_guard(descr_arc, green_key, root_trace_id, fail_index, live_values)
             .is_some()
     }
-
-    // ── Inlining Support ──────────────────────────────────────
 
     /// Check if a function call should be inlined during tracing.
     ///
@@ -13576,7 +13881,6 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0)
     }
 
-    // ────────────────────────────────────────────────────────────────
     // Frame-management surface mirroring pyjitpl.py:2421-2477.
     //
     // perform_call → newframe → MIFrame::setup_call (pyjitpl.py:2421-
@@ -13597,7 +13901,6 @@ impl<M: Clone> MetaInterp<M> {
     //   MetaInterp::framestack), so the canonical body lives on
     //   MetaInterp<M> and acts on the current top-of-framestack
     //   frame implicitly.
-    // ────────────────────────────────────────────────────────────────
 
     /// pyjitpl.py:2421-2425 `MetaInterp.perform_call(jitcode, boxes, greenkey)`.
     ///
@@ -14901,13 +15204,6 @@ impl<M: Clone> MetaInterp<M> {
     /// ```
     ///
     /// Exception-flavored sibling of `compile_done_with_this_frame`.
-    /// TODO: shared with that method: the FINISH op
-    /// emit + `compile.compile_trace` happen at the trace-dispatch
-    /// `TraceAction::Finish` site (jitdriver.rs:1031), so this method
-    /// runs only the upstream skeleton — `store_token_in_vable` +
-    /// `make_fail_descr_typed` for the Ref result-type slot — and
-    /// surfaces `SwitchToBlackhole` to the caller exactly like
-    /// `compile_done_with_this_frame`.
     ///
     /// The primary exception exit path in pyre is dispatch.rs's
     /// `unwind_to_exception_handler` at BC_RAISE/BC_RERAISE: when the
@@ -14918,10 +15214,9 @@ impl<M: Clone> MetaInterp<M> {
     /// `pyjitpl.py:3238-3245`. This MetaInterp-side hook covers the
     /// rarer path where an exception surfaces during residual-call
     /// dispatch (miframe_execute_varargs / do_conditional_call); the
-    /// `FinishframeExceptionSignal::ExitFrameWithExceptionRef` return
-    /// from `handle_possible_exception` bubbles up, but the wiring
-    /// that converts it into a `TraceAction::Finish` dispatch at the
-    /// MetaInterp call chain is not yet complete (deferred epic).
+    /// `finishframe_exception` invokes this method when a residual call
+    /// drains the frame stack, so exceptional exits from both dispatch paths
+    /// reach the same FINISH compilation helper.
     pub fn compile_exit_frame_with_exception(
         &mut self,
         valuebox: Option<OpRef>,
@@ -14951,7 +15246,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py:3198-3220 + 3238-3245 shared compile-and-finish helper.
     ///
-    /// Consumes the [`ActiveTraceSession`] installed by
+    /// Consumes the `ActiveTraceSession` installed by
     /// `begin_trace_session` and drives `compile.compile_trace(self,
     /// self.resumekey, exits)` — the exact RPython call that
     /// `compile_done_with_this_frame` and
@@ -14963,7 +15258,7 @@ impl<M: Clone> MetaInterp<M> {
     /// - `bridge.is_none()` → `finish_and_compile(..., trace_meta)` —
     ///   the root-trace equivalent.
     ///
-    /// Returns `Err(SwitchToBlackhole::bad_loop())` if the compile
+    /// Returns `Err(SwitchToBlackhole::giveup())` if the compile
     /// gave up (matching `compile.giveup()`).  The caller
     /// (`compile_done_with_this_frame` / `compile_exit_frame_with_exception`)
     /// propagates the error so `finishframe` / `finishframe_exception`
@@ -15375,19 +15670,15 @@ impl<M: Clone> MetaInterp<M> {
     ///                                       valueconst, calldescr)
     /// ```
     ///
-    /// TODO: pyre has no `cpu.calldescrof_dynamic`,
-    /// no `CIF_DESCRIPTION_P` layout reader, and no
-    /// `ffisupport.get_arg_descr` — the upstream specialization
-    /// reaches into `rpython.rlib.jit_libffi` which has no Rust
-    /// equivalent in pyre.  The early-return contract for
+    /// MAJIT does not yet expose `cpu.calldescrof_dynamic`, a
+    /// `CIF_DESCRIPTION_P` layout reader, or `ffisupport.get_arg_descr`.
+    /// The early-return contract for
     /// `argboxes[1] not ConstInt` and `cif_description == NULL` is
     /// preserved so the dispatch in `do_residual_call` (pyjitpl.py:2061)
     /// falls through to `direct_call_release_gil` / `direct_call_may_force`
-    /// the same way it would when upstream's `direct_libffi_call`
-    /// declines to handle the call.  Pyre never produces an
-    /// `OopSpecIndex::LibffiCall` today, so the dispatch path is dead
-    /// in production; the contract is matched here for the day a host
-    /// adds libffi support.
+    /// the same way it does when upstream's `direct_libffi_call`
+    /// declines to handle the call. The generic residual call preserves
+    /// semantics; implementing these helpers enables the specialized trace.
     pub fn direct_libffi_call(
         &mut self,
         argboxes: &[OpRef],
@@ -16049,26 +16340,15 @@ impl<M: Clone> MetaInterp<M> {
             if let Some(ctx) = self.tracing.as_mut() {
                 ctx.heapcache_invalidate_caches_varargs(opnum1, Some(effectinfo), &opref_args);
             }
-            // pyjitpl.py:2074-2077: handle resbox void / make_result_of_lastop.
-            // The result must be installed before vable_after_residual_call
-            // and GUARD_NOT_FORCED capture their resume snapshot.  Otherwise
-            // a reused destination register still contains its pre-call
-            // value, and blackhole resume returns that stale value after an
-            // asynchronous force.
+            // pyjitpl.py:2074-2077: handle resbox void / make_result_of_lastop
+            // — make_result_of_lastop's target_index plumbing is not
+            // wired here yet; documented above on miframe_execute_varargs.
             let resbox_pair = match resbox {
                 Some(opref) if descr_view.result_type() != majit_ir::Type::Void => {
                     Some((opref, c_result))
                 }
                 _ => None,
             };
-            if let (Some((opref, concrete)), Some((kind, target_index))) = (resbox_pair, dst) {
-                self.framestack.current_mut().make_result_of_lastop(
-                    kind,
-                    target_index,
-                    opref,
-                    concrete,
-                );
-            }
             // pyjitpl.py:2078: vable_after_residual_call(funcbox)
             // SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)
             // surfaces here when the virtualizable escaped during the
@@ -16920,6 +17200,13 @@ impl SwitchToBlackhole {
     /// (pyjitpl.py:3028).  Reserved for callers distinguishing the
     /// loop-compile failure from the trace-compile (FINISH) failure,
     /// which is `giveup()` above.
+    ///
+    /// It has **no callers**: every compile-gave-up site raises `giveup()`,
+    /// so `ABORT_BAD_LOOP` reaches its counter only through the direct
+    /// `pending_abort_reason` write in `compile_trace`. Two doc comments used
+    /// to promise this constructor as those sites' return value and were
+    /// wrong about it; the distinction is still worth making, but nothing
+    /// makes it yet.
     pub fn bad_loop() -> Self {
         Self {
             reason: counters::ABORT_BAD_LOOP,
@@ -16953,9 +17240,7 @@ impl std::fmt::Display for ChangeFrame {
 
 impl std::error::Error for ChangeFrame {}
 
-// ════════════════════════════════════════════════════════════════════════
 // MetaInterpStaticData (pyjitpl.py:2190-2373)
-// ════════════════════════════════════════════════════════════════════════
 
 /// pyjitpl.py:2190 `class MetaInterpStaticData(object)`.
 ///
@@ -17152,7 +17437,7 @@ pub struct MetaInterpStaticData {
     /// PyPy keeps the equivalent cache on `gccache._cache_array`
     /// (`descr.py:348`).
     ///
-    /// Keyed on [`DispatchArrayDescrKey`], which captures the full
+    /// Keyed on `DispatchArrayDescrKey`, which captures the full
     /// lltype-discriminant shape carried on `BhDescr::Array`
     /// (`type_id`, `base_size`, `itemsize`, `len_offset`, `item_type`,
     /// `is_array_of_pointers`, `is_array_of_structs`, `is_item_signed`,
@@ -19028,10 +19313,6 @@ mod metainterp_static_data_tests {
         a + b * 1000
     }
 
-    extern "C" fn execute_varargs_ref_helper() -> i64 {
-        0xcafe
-    }
-
     extern "C" fn execute_varargs_void_helper() {}
 
     extern "C" fn execute_varargs_float_concrete_helper(a: i64) -> i64 {
@@ -19768,67 +20049,6 @@ mod metainterp_static_data_tests {
                 .any(|op| op.opcode == OpCode::GuardNotForced),
             "GUARD_NOT_FORCED must follow CALL_MAY_FORCE",
         );
-    }
-
-    #[test]
-    fn force_virtual_residual_call_installs_result_before_guard_snapshot() {
-        // pyjitpl.py:2074-2079 — make_result_of_lastop(resbox) precedes
-        // vable_after_residual_call and GUARD_NOT_FORCED.  The dispatch
-        // walker captures the guard's resume snapshot after this helper
-        // returns, so the destination register must already name the call
-        // result rather than its stale pre-call value.
-        use crate::BackEdgeAction;
-        use crate::jitcode::{JitArgKind, JitCodeBuilder};
-
-        let mut meta = MetaInterp::<()>::new(0);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let action =
-            meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(majit_ir::GcRef(0xdead))]);
-        assert!(matches!(action, BackEdgeAction::StartedTracing));
-
-        // Give make_result_of_lastop a real ref-typed destination at the
-        // frame's current post-call pc, matching the dispatcher's state on
-        // entry to do_residual_call_full.
-        let mut builder = JitCodeBuilder::new();
-        builder.load_const_r_value(0, 0);
-        builder.inline_call_irf_r(0, &[], &[], &[], Some(0));
-        let post_call_pc = builder.current_pos();
-        let mut frame =
-            crate::pyjitpl::MIFrame::new(std::sync::Arc::new(builder.finish()), post_call_pc);
-        frame.ref_regs[0] = Some(OpRef::input_arg_ref(0));
-        frame.ref_values[0] = Some(0xdead);
-        meta.framestack.push(frame);
-
-        let mut effect = majit_ir::EffectInfo::default();
-        effect.extraeffect = majit_ir::effectinfo::ExtraEffect::ForcesVirtualOrVirtualizable;
-        let descr_view = StubCallDescr {
-            arg_types: vec![],
-            result_type: majit_ir::Type::Ref,
-            effect: effect.clone(),
-        };
-        let descr_ref = majit_ir::descr::make_call_descr(vec![], majit_ir::Type::Ref, effect);
-        let fnaddr = execute_varargs_ref_helper as *const () as i64;
-        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
-        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
-
-        let (result_op, result_value) = meta
-            .do_residual_call_full(
-                funcbox,
-                &[],
-                descr_ref,
-                &descr_view,
-                post_call_pc,
-                false,
-                None,
-                Some((JitArgKind::Ref, 0)),
-            )
-            .expect("residual call must not abort")
-            .expect("ref call must produce a result");
-
-        assert_eq!(result_value, 0xcafe);
-        let frame = meta.framestack.current_mut();
-        assert_eq!(frame.ref_regs[0], Some(result_op));
-        assert_eq!(frame.ref_values[0], Some(0xcafe));
     }
 
     #[test]
@@ -21791,6 +22011,7 @@ mod tests {
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
+                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -21856,6 +22077,7 @@ mod tests {
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
+                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -22178,6 +22400,7 @@ mod tests {
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
+                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -22273,6 +22496,7 @@ mod tests {
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
+                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -22584,6 +22808,7 @@ mod tests {
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
+                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -23402,6 +23627,7 @@ mod tests {
                 root_trace_id: 0,
                 traces: indexmap::IndexMap::new(),
                 previous_tokens: Vec::new(),
+                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -23604,7 +23830,15 @@ mod tests {
             meta.opimpl_getarrayitem_vable_int(0, OpRef::input_arg_ref(0), index, 1, fd24, adesc);
         if let Some(ctx) = meta.trace_ctx() {
             let g = ctx.record_guard(OpCode::GuardTrue, &[item], 0);
-            ctx.capture_snapshot_for_last_guard(
+            // This trace HAS a virtualizable, so its guard snapshot must carry
+            // the vable section — `pyjitpl.py:2611-2614 capture_resumedata`
+            // passes `self.virtualizable_boxes` whenever `vinfo is not None`.
+            // The plain `capture_snapshot_for_last_guard` hardcodes an empty
+            // vable array, which encodes a 0-length section and trips the
+            // `resume.py:236-239` length check now armed in
+            // `store_final_boxes_in_guard`.
+            let (vable_boxes, vref_boxes) = ctx.build_snapshot_vable_vref_boxes();
+            ctx.capture_snapshot_for_last_guard_with_vable_vref(
                 &[
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
@@ -23612,6 +23846,9 @@ mod tests {
                 ],
                 0,
                 0,
+                0,
+                &vable_boxes,
+                &vref_boxes,
             );
             ctx.set_fail_args(
                 g,
@@ -23720,7 +23957,7 @@ mod tests {
         meta.finish_setup_descrs_for_jitdrivers();
         let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let events = compile_events.clone();
-        meta.set_on_compile_loop(move |green_key, ops_before, ops_after| {
+        meta.set_on_compile_loop(move |green_key, ops_before, ops_after, _opcodes| {
             events
                 .lock()
                 .unwrap()
@@ -23848,7 +24085,7 @@ mod tests {
         let trace_abort_count = Arc::new(Mutex::new(0u32));
 
         let cc = compile_count.clone();
-        meta.set_on_compile_loop(move |_, _, _| {
+        meta.set_on_compile_loop(move |_, _, _, _opcodes| {
             *cc.lock().unwrap() += 1;
         });
 
@@ -23922,7 +24159,7 @@ mod tests {
         meta.finish_setup_descrs_for_jitdrivers();
         let events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = events.clone();
-        meta.set_on_compile_loop(move |gk, before, after| {
+        meta.set_on_compile_loop(move |gk, before, after, _opcodes| {
             ev.lock().unwrap().push((gk, before, after));
         });
 
@@ -24143,6 +24380,7 @@ mod bridge_cell_token_tests {
                 root_trace_id: green_key,
                 traces: indexmap::IndexMap::new(),
                 previous_tokens: Vec::new(),
+                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -24196,6 +24434,7 @@ mod loop_side_table_tests {
             root_trace_id,
             traces: indexmap::IndexMap::new(),
             previous_tokens: Vec::new(),
+            loop_header_pc: None,
             next_global_opref: 0,
         }
     }
@@ -24209,7 +24448,7 @@ mod loop_side_table_tests {
     }
 
     fn has_side_tables(meta: &MetaInterp<()>, green_key: u64) -> bool {
-        meta.loop_header_pcs.contains_key(&green_key)
+        meta.loop_header_pc_for(green_key).is_some()
             || meta.loop_header_greens.contains_key(&green_key)
     }
 
@@ -24234,7 +24473,8 @@ mod loop_side_table_tests {
         meta.clear_compiled_loops();
 
         assert!(meta.compiled_loops.is_empty());
-        assert!(meta.loop_header_pcs.is_empty());
+        assert!(meta.loop_header_pc_for(7).is_none());
+        assert!(meta.loop_header_pc_for(8).is_none());
         assert!(meta.loop_header_greens.is_empty());
     }
 
@@ -24252,5 +24492,110 @@ mod loop_side_table_tests {
         assert!(!has_side_tables(&meta, 7));
         assert!(!has_side_tables(&meta, 8));
         assert!(has_side_tables(&meta, 9));
+    }
+
+    /// The header pc describes a compiled loop, so a key with no entry has
+    /// nothing to describe. Recording against one is dropped rather than
+    /// stored: the old `u64`-keyed side table accepted such a write and kept
+    /// it forever, since only a loop retirement swept the table and no loop
+    /// was ever there to retire.
+    #[test]
+    fn recording_a_header_pc_for_a_key_with_no_compiled_loop_stores_nothing() {
+        let mut meta = MetaInterp::<()>::new(1);
+
+        meta.record_loop_header_pc(7, 42);
+
+        assert_eq!(
+            meta.loop_header_pc_for(7),
+            None,
+            "no compiled loop at 7, so no header pc is retained"
+        );
+        assert!(meta.compiled_loops.is_empty(), "and no entry is conjured");
+    }
+
+    /// `take_entry_for_replace` is the one door onto a `compiled_loops`
+    /// replace, and the pair it returns is the mechanism: **the displaced entry
+    /// cannot be obtained without its carried state.** Ablation — drop either
+    /// member of `CarriedFields`, or stop copying one in `carried_fields()` —
+    /// and this goes red.
+    ///
+    /// Passing does **not** mean the five production replace paths are
+    /// covered. It pins the helper's contract, not its use. Nothing in this
+    /// crate can drive a production compile path, so a site that
+    /// simply never calls this is still invisible to the suite.
+    #[test]
+    fn take_entry_for_replace_returns_the_entry_with_both_carried_fields() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let mut entry = compiled_entry(101);
+        entry.next_global_opref = 37;
+        entry.loop_header_pc = Some(11);
+        meta.compiled_loops.insert(7, entry);
+
+        let (old_entry, carried) = meta
+            .take_entry_for_replace(7)
+            .expect("the key had an entry");
+
+        assert_eq!(old_entry.root_trace_id, 101, "the entry itself comes back");
+        assert_eq!(
+            carried,
+            CarriedFields {
+                next_global_opref: 37,
+                loop_header_pc: Some(11),
+            },
+            "and both carried fields travel with the removal"
+        );
+        assert!(
+            !meta.compiled_loops.contains_key(&7),
+            "the entry is removed, exactly as the bare swap_remove did"
+        );
+        assert!(
+            meta.take_entry_for_replace(7).is_none(),
+            "a key with no entry yields nothing to carry"
+        );
+    }
+
+    /// Pins the hazard every `compiled_loops` replace path has to defend
+    /// against: the pc now lives *on* the entry, so installing a fresh entry
+    /// at a key that already had one destroys the pc unless the caller copies
+    /// it across. `compile_retrace` / `finish_and_compile` /
+    /// `compile_simple_loop` / `compile_entry_bridge` all replace without
+    /// re-recording — only `compile_loop`'s caller records afterwards.
+    ///
+    /// If this test ever fails it means the entry-replacement contract moved.
+    /// If a *production* replace path drops the pc, this test still passes —
+    /// it builds its own entries and never routes through a compile path. That
+    /// blindness is why the carry is being moved behind
+    /// `take_entry_for_replace`, where omitting it is not expressible, rather
+    /// than left as two hand-written lines per site: a test that cannot catch a
+    /// dropped carry is an argument for making the drop unrepresentable, not
+    /// for repeating the carry. All five now go through the helper, so the pc
+    /// arrives at each site whether or not the site remembers to ask for it.
+    #[test]
+    fn installing_a_fresh_entry_at_a_live_key_drops_the_header_pc() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7, 100);
+        assert_eq!(meta.loop_header_pc_for(7), Some(7));
+
+        // A replace that does not carry the pc forward, as the production
+        // paths would if their `carried_loop_header_pc` were dropped.
+        meta.compiled_loops.insert(7, compiled_entry(101));
+
+        assert_eq!(
+            meta.loop_header_pc_for(7),
+            None,
+            "the pc lives on the entry, so a bare replace loses it"
+        );
+
+        // And the carry-forward the production sites perform restores it.
+        let carried = Some(7usize);
+        let mut fresh = compiled_entry(102);
+        fresh.loop_header_pc = carried;
+        meta.compiled_loops.insert(7, fresh);
+
+        assert_eq!(
+            meta.loop_header_pc_for(7),
+            Some(7),
+            "copying old_entry.loop_header_pc across keeps the close target"
+        );
     }
 }

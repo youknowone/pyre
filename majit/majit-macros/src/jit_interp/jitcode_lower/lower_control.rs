@@ -16,10 +16,9 @@ impl<'c> Lowerer<'c> {
     /// comparison — an `OpKind::BinopF` whose result register is int
     /// banked.  Float arithmetic writes a float result; only the value-
     /// form `float_lt/le/eq/ne/gt/ge` (`ff>i`) writes an int.  A float
-    /// comparison feeding a conditional guard grows a bridge that hangs
-    /// the compiled trace (a4e191f71b5), so the branch lowerers roll back
-    /// and bail to interpreter fallback when the condition lowered through
-    /// one.
+    /// comparison feeding a conditional guard grows a bridge that hangs the
+    /// compiled trace, so the branch lowerers roll back and use interpreter
+    /// fallback when the condition lowered through one.
     fn ops_since_contain_float_compare(&self, since: usize) -> bool {
         self.op_metadata[since..].iter().any(|op| {
             matches!(op.kind, OpKind::BinopF)
@@ -42,8 +41,6 @@ impl<'c> Lowerer<'c> {
             self.bindings = snap_bindings;
             return None;
         }
-        let else_label = self.alloc_label();
-        let end_label = self.alloc_label();
         let cond_reg = cond.reg;
         let then_seq = self.lower_branch_expr(&Expr::Block(syn::ExprBlock {
             attrs: Vec::new(),
@@ -55,6 +52,11 @@ impl<'c> Lowerer<'c> {
             None => LoweredSequence::default(),
         };
 
+        // Allocated below the branch lowerings, not above them: both labels are
+        // forward targets, so where they are defined carries no meaning, and
+        // either `?` above would otherwise return with `next_label` advanced.
+        let else_label = self.alloc_label();
+        let end_label = self.alloc_label();
         self.emit_aux(quote! { let #else_label = __builder.new_label(); });
         self.emit_aux(quote! { let #end_label = __builder.new_label(); });
         // RPython `flatten.py:259` `-live-` convention: every guard-bearing
@@ -96,9 +98,6 @@ impl<'c> Lowerer<'c> {
             return None;
         }
 
-        let end_label = self.alloc_label();
-        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
-
         // Separate literal/path arms from the wildcard/default arm.
         // Uses extract_pat_value_tokens (not extract_pat_literals) so
         // symbolic constants like OP_JMP are accepted alongside literals.
@@ -125,6 +124,13 @@ impl<'c> Lowerer<'c> {
                 }
             }
         }
+
+        // Allocated below the arm classification, not above it: `end_label` is
+        // a forward target, so where it is defined carries no meaning, and the
+        // `?`s above would otherwise return with `next_label` advanced.  The
+        // classification emits no ops, so the statement stream is unchanged.
+        let end_label = self.alloc_label();
+        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
 
         let disc_reg = discriminant.reg;
 
@@ -222,8 +228,6 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
-    // ── Loop lowering ────────────────────────────────────────────────
-
     /// Lower `while cond { body }` to a JitCode branch sequence:
     /// ```text
     /// loop_start:
@@ -240,6 +244,14 @@ impl<'c> Lowerer<'c> {
         let snap_label = self.next_label;
         let snap_bindings = self.bindings.clone();
 
+        // `loop_start` has to be marked *before* the condition lowers:
+        // `mark_label` records the builder's current bytecode position, the
+        // back edge re-enters there, and the condition must be re-tested on
+        // every iteration.  So these allocations cannot be deferred past the
+        // first fallible call the way `lower_if_with_loop_control` defers its
+        // own — both of that function's labels are forward targets, which is
+        // why it leaks nothing without a restore.  Here every exit below has
+        // to put `next_label` back itself.
         let loop_start = self.alloc_label();
         let loop_end = self.alloc_label();
 
@@ -248,7 +260,16 @@ impl<'c> Lowerer<'c> {
         self.emit_label_def(&loop_start);
 
         // Evaluate the condition
-        let cond = self.lower_value_expr(&expr_while.cond)?;
+        let Some(cond) = self.lower_value_expr(&expr_while.cond) else {
+            // Two labels and three statements are already emitted; drop them
+            // so an unlowerable condition leaves no gap in the label counter.
+            self.statements.truncate(snap_stmts);
+            self.op_metadata.truncate(snap_meta);
+            self.next_reg = snap_reg;
+            self.next_label = snap_label;
+            self.bindings = snap_bindings;
+            return None;
+        };
         if self.ops_since_contain_float_compare(snap_meta) {
             // Guard over a float comparison hangs the compiled trace; roll
             // back everything emitted for this loop and bail so the arm
@@ -434,10 +455,15 @@ impl<'c> Lowerer<'c> {
             auto_calls: self.auto_calls,
             inline_liveness_prebuild: Vec::new(),
             dispatch_tainted_reason: None,
+            body_failure_reason: None,
+            nested_failure_reasons: Vec::new(),
             opcode_var_name: self.opcode_var_name.clone(),
             in_dispatch_arm_body: self.in_dispatch_arm_body,
             dispatch_loop_label: self.dispatch_loop_label.clone(),
             pc_pinned: self.pc_pinned,
+            // Never inherited: a loop body statement is not the arm body's
+            // tail, so a `return` inside it must be rejected, not lowered.
+            inline_arm_tail_stmt: false,
         };
 
         for stmt in &block.stmts {
@@ -446,7 +472,12 @@ impl<'c> Lowerer<'c> {
                 .is_none()
             {
                 // Fall back: try normal lowering
-                nested.lower_stmt(stmt)?;
+                if nested.lower_stmt(stmt).is_none() {
+                    // Carry the diagnosis out before the child is dropped; a
+                    // bare `?` here propagates the failure and loses the reason.
+                    self.absorb_nested_failure(&mut nested);
+                    return None;
+                }
             }
         }
 
@@ -553,9 +584,7 @@ impl<'c> Lowerer<'c> {
             return None;
         }
 
-        let end_label = self.alloc_label();
         let result_reg = self.alloc_reg();
-        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
 
         let mut guarded_arms = Vec::new();
         let mut default_arm = None;
@@ -575,6 +604,13 @@ impl<'c> Lowerer<'c> {
                 }
             }
         }
+
+        // Allocated below the arm classification, not above it: `end_label` is
+        // a forward target, so where it is defined carries no meaning, and the
+        // `?` above would otherwise return with `next_label` advanced.  The
+        // classification emits no ops, so the statement stream is unchanged.
+        let end_label = self.alloc_label();
+        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
 
         let disc_reg = discriminant.reg;
 

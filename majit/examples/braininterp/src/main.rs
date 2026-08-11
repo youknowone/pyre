@@ -58,7 +58,37 @@ fn multiply_bf(a: u8, b: u8) -> Vec<u8> {
     prog
 }
 
+/// Checks the interpreted trip count for multiplication programs of different
+/// parity. This gate validates arithmetic output; JIT liveness is covered by
+/// the tests in `jit_interp`.
+fn trip_count_gate() {
+    for a in [113u8, 114] {
+        let b = 2u8;
+        let mut prog = multiply_bf(a, b);
+        prog.extend_from_slice(b">.");
+        let mut jit = jit_interp::JitBrainInterp::new();
+        let out = jit.run(&prog);
+        assert_eq!(
+            out.chars().count(),
+            1,
+            "multiply({a}*{b}) printed {out:?}; the gate expects exactly one cell"
+        );
+        let got = out.chars().next().unwrap() as u32;
+        let expected = u32::from(a) * u32::from(b);
+        assert_eq!(
+            got,
+            expected,
+            "multiply({a}*{b}) left {got} in cell 1, so the loop ran {} passes \
+             rather than {a}",
+            got / u32::from(b)
+        );
+        println!("[trip-count] multiply({a}*{b}) = {got} — exactly {a} passes");
+    }
+}
+
 fn main() {
+    trip_count_gate();
+
     // Benchmark 1: countdown (hot tight loop)
     let n = 100_000;
     let countdown = countdown_bf(n);

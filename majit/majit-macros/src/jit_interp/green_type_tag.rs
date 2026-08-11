@@ -1,15 +1,17 @@
 //! Per-green type tag parsing for `#[jit_interp(greens = ...)]`.
 //!
-//! Extends the bracketed `greens = [pc, code: str, env: ref]` syntax so each
-//! green can carry an optional type tag. Tagged greens override the trait
-//! dispatch in `green_key_expr` (mod.rs:912) so a `&str` green emits
-//! `(ptr_bits, GreenType::Str)` directly — letting `equal_whatever` /
-//! `hash_whatever` route through the hardcoded `default_str_eq` /
-//! `default_str_hash` / `default_unicode_hash` (`majit-ir/src/value.rs`)
-//! which mirror `rstr.LLHelpers.ll_streq` / `ll_strhash` over the
-//! `*const &'static str` slot ABI (warmstate.py:108-128 `lltype.Ptr`
-//! to `rstr.STR / rstr.UNICODE` parity, hardcoded with no frontend
-//! override).
+//! Extends the bracketed `greens = [pc, env: ref]` syntax so each green can
+//! carry an optional type tag. Tagged greens override the trait dispatch in
+//! `green_key_expr` (mod.rs:2105), forcing the `GreenType` bucket explicitly
+//! instead of letting `GreenAsI64` pick it.
+//!
+//! `str` and `unicode` parse but are refused. Their codegen ABI
+//! (a `*const &'static str` slot mirroring `rstr.STR` / `rstr.UNICODE`,
+//! warmstate.py:108-128) is implemented and kept in `mod.rs`, but the slot is
+//! `Box::leak`ed per merge-point hit rather than once per JitCell, so the
+//! refusal stands until the backing storage is owned by the cell. The refusal
+//! lives in `GreenSpec::parse` because that is the sole construction site for
+//! both tags.
 //!
 //! Untagged greens (the existing form) keep the
 //! `<_ as majit_ir::GreenAsI64>::__green_repr(<expr>)` path unchanged.
@@ -21,19 +23,26 @@ use syn::{
     punctuated::Punctuated,
 };
 
-/// Per-green type tag.  Maps to `majit_ir::GreenType` at codegen time
-/// at codegen time.  `Int / Ref / Float` are siblings of the `GreenAsI64`
-/// trait's automatic dispatch (the tag forces the bucket explicitly);
-/// `Str / Unicode` opt-in to content-comparison through the hardcoded
+/// Per-green type tag.  Maps to `majit_ir::GreenType` at codegen time.
+/// `Int / Ref / Float` are siblings of the `GreenAsI64` trait's automatic
+/// dispatch (the tag forces the bucket explicitly).
+///
+/// `Str / Unicode` would opt in to content-comparison through the hardcoded
 /// `default_str_eq` / `default_str_hash` / `default_unicode_hash` in
-/// `majit-ir/src/value.rs` (`warmstate.py:108-128 ll_streq` /
-/// `ll_strhash` parity, no frontend override).
+/// `majit-ir/src/value.rs` (`warmstate.py:108-128 ll_streq` / `ll_strhash`
+/// parity, no frontend override) — but both are refused at parse time, see
+/// the module doc. The variants are retained so the codegen arms and
+/// this mapping stay intact for whoever lifts the refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GreenTypeTag {
     Int,
     Ref,
     Float,
+    // The parser refuses these until string storage is JitCell-owned, but the
+    // variants keep the implemented codegen ABI explicit and testable.
+    #[allow(dead_code)]
     Str,
+    #[allow(dead_code)]
     Unicode,
 }
 
@@ -56,8 +65,29 @@ impl Parse for GreenSpec {
                 "int" => GreenTypeTag::Int,
                 "ref" => GreenTypeTag::Ref,
                 "float" => GreenTypeTag::Float,
-                "str" => GreenTypeTag::Str,
-                "unicode" => GreenTypeTag::Unicode,
+                // `str` / `unicode` are refused rather than warned about: a
+                // proc macro has no stable channel for emitting a warning, so
+                // the alternative is emitting the leaking code next to a
+                // comment nobody reads. This is the sole construction site for
+                // both tags, so refusing here refuses them everywhere; the
+                // codegen arms in `mod.rs` are kept as the shape to re-enable.
+                tag @ ("str" | "unicode") => {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!(
+                            "green type tag '{tag}' is not supported: the emitted \
+                             `make_str_slot` Box::leaks a fresh slot on EVERY merge-point hit, \
+                             not once per JitCell as rstr.STR does, so the leaks grow without \
+                             bound in a long-running program.\n\
+                             Lift this refusal once a str/unicode green's backing storage is \
+                             owned by the JitCell — i.e. once `GreenKey` carries owned string \
+                             storage for these greens instead of an i64 pointing at a leaked \
+                             slot, so `make_str_slot` is no longer called per hit.\n\
+                             Until then, pass the string's identity as a `ref` green, or key on \
+                             an interned index the interpreter already owns.",
+                        ),
+                    ));
+                }
                 other => {
                     return Err(syn::Error::new(
                         ident.span(),
@@ -111,12 +141,11 @@ mod tests {
 
     #[test]
     fn typed_specs_carry_their_tags() {
-        let specs = parse_specs("[pc, code: str, env: ref, val: int]").unwrap();
-        assert_eq!(specs.len(), 4);
+        let specs = parse_specs("[pc, env: ref, val: int]").unwrap();
+        assert_eq!(specs.len(), 3);
         assert_eq!(specs[0].type_tag, None);
-        assert_eq!(specs[1].type_tag, Some(GreenTypeTag::Str));
-        assert_eq!(specs[2].type_tag, Some(GreenTypeTag::Ref));
-        assert_eq!(specs[3].type_tag, Some(GreenTypeTag::Int));
+        assert_eq!(specs[1].type_tag, Some(GreenTypeTag::Ref));
+        assert_eq!(specs[2].type_tag, Some(GreenTypeTag::Int));
     }
 
     #[test]
@@ -140,9 +169,38 @@ mod tests {
     }
 
     #[test]
-    fn float_and_unicode_tags_round_trip() {
-        let specs = parse_specs("[scale: float, name: unicode]").unwrap();
+    fn float_tag_round_trips() {
+        let specs = parse_specs("[scale: float]").unwrap();
         assert_eq!(specs[0].type_tag, Some(GreenTypeTag::Float));
-        assert_eq!(specs[1].type_tag, Some(GreenTypeTag::Unicode));
+    }
+
+    #[test]
+    fn str_and_unicode_tags_name_the_leak_and_release_condition() {
+        for src in ["[code: str]", "[name: unicode]"] {
+            let err = match parse_specs(src) {
+                Ok(_) => panic!("{src} must be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("Box::leaks"),
+                "{src}: leak cause missing: {err}"
+            );
+            assert!(
+                err.contains("Lift this refusal once"),
+                "{src}: no release condition: {err}",
+            );
+        }
+    }
+
+    /// The refusal must not swallow the unknown-tag path: a typo still reports
+    /// as a typo, not as the string-storage refusal.
+    #[test]
+    fn an_unknown_tag_is_still_reported_as_unknown_not_as_the_str_refusal() {
+        let err = match parse_specs("[pc: string]") {
+            Ok(_) => panic!("expected an error for unknown tag 'string'"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unknown green type tag"), "{err}");
+        assert!(!err.contains("Box::leaks"), "{err}");
     }
 }

@@ -36,8 +36,6 @@
 use majit_metainterp::jitcode::insns::BC_LIVE;
 use majit_metainterp::{Assembler, JitCode, JitDriver, JitState as _};
 
-// ── Synthetic state ────────────────────────────────────────────────
-
 struct Polymorphic4State {
     a: i64,
     b: i64,
@@ -90,6 +88,7 @@ impl BytecodeExt for [u8] {
         c: int,
         d: int,
     },
+    greens = [],
 )]
 #[allow(unused_assignments, unused_variables)]
 fn polymorphic_mainloop(program: &Bytecode, threshold: u32) -> i64 {
@@ -139,8 +138,6 @@ fn polymorphic_mainloop(program: &Bytecode, threshold: u32) -> i64 {
     state.a
 }
 
-// ── Helpers ────────────────────────────────────────────────────────
-
 /// Walk a JitCode body and collect every BC_LIVE marker's 2-byte offset.
 fn collect_bc_live_offsets(jitcode: &JitCode) -> Vec<u16> {
     let code = &jitcode.code;
@@ -163,26 +160,8 @@ fn collect_bc_live_offsets(jitcode: &JitCode) -> Vec<u16> {
     offsets
 }
 
-// ── Tests ──────────────────────────────────────────────────────────
-
-/// Mirror the production install ordering from
-/// `codegen_state.rs::install_canonical_liveness`:
-/// 1. `set_canonical_liveness_triple` stages the canonical triple lazily.
-/// 2. `__prebuild_jitcode_liveness_*` writes the per-marker triples first
-///    (so they occupy the head of `all_liveness`).
-/// 3. `ensure_canonical_liveness_offset` registers the canonical triple
-///    at the tail — matching RPython `assembler.assemble` where per-marker
-///    `-live-` entries occupy the early offsets and pyre's canonical entry
-///    is a leading-dummy affordance bound after the IR walk.
-///
-/// The earlier shape here ran `_register_liveness_offset(canonical, …)`
-/// up front, which (a) forced canonical to offset 0 — the very layout the
-/// deferred-canonical patcher was introduced to remove — and (b) skipped
-/// the `set_canonical_liveness_triple` staging step entirely, so the
-/// `finalize_liveness` path the test was meant to validate ran against an
-/// uninitialised triple slot.  The new helper drives the same call sequence
-/// production goes through, so each test below validates the actual install
-/// order rather than a synthesised one.
+/// Mirrors production ordering: stage canonical liveness, prebuild per-marker
+/// entries, then bind the canonical entry after the IR walk.
 fn install_canonical_for_test(asm: &mut Assembler, canonical: &[u8]) {
     asm.set_canonical_liveness_triple(canonical.to_vec(), Vec::new(), Vec::new());
     __prebuild_jitcode_liveness_polymorphic_mainloop(asm);
@@ -289,11 +268,8 @@ fn distinct_arms_emit_distinct_bc_live_offsets() {
                 // only).  Skip — not a lowerable arm sub-JitCode.
                 continue;
             }
-            // Strip the leading canonical marker emitted by
-            // `live_placeholder()` at the head of every lowerable arm
-            // body.  The remaining offsets are per-pc markers from
-            // `live_placeholder_with_triple` inside the arm body
-            // (compute_per_marker_liveness output).
+            // The first offset is the canonical marker; the rest are per-pc
+            // liveness markers emitted inside the arm body.
             let per_pc: Vec<u16> = offs.into_iter().skip(1).collect();
             assert!(
                 !per_pc.is_empty(),

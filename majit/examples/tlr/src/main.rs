@@ -31,6 +31,34 @@ fn square_bytecode() -> Vec<u8> {
     ]
 }
 
+/// Absolute trip-count gate on the JIT path.
+///
+/// SQUARE adds `a` to the accumulator once per pass and decrements the counter
+/// once per pass, so the returned value names the number of passes exactly:
+/// `a` passes answer `a*a`, and one extra pass answers `a*a + a`. Agreement
+/// with `interp::interpret` alone would not settle this — the two run the same
+/// program, and a duplicated iteration of the *compiled* loop is invisible to
+/// any check that does not assert an absolute count.
+///
+/// Two lengths of different parity, because a peeled first iteration plus an
+/// even/odd body count is exactly the shape an off-by-one hides in.
+fn trip_count_gate() {
+    let bytecode = square_bytecode();
+    for a in [1001i64, 1002] {
+        let mut jit = jit_interp::JitTlrInterp::new();
+        let got = jit.run(&bytecode, a);
+        assert_eq!(
+            got,
+            a * a,
+            "square({a}) = {got}, so the loop ran {} passes rather than {a} — an \
+             off-by-one trip count is the signature of a terminal arm whose exit \
+             the trace dropped",
+            got / a
+        );
+        println!("[trip-count] square({a}) = {got} — exactly {a} passes");
+    }
+}
+
 fn main() {
     let a: i64 = std::env::args()
         .nth(1)
@@ -44,6 +72,8 @@ fn main() {
         let result = interp::interpret(&bytecode, 5);
         assert_eq!(result, 25, "5*5 should be 25");
     }
+
+    trip_count_gate();
 
     // Benchmark: interpreter
     println!("--- square({a}) [interpreter] ---");

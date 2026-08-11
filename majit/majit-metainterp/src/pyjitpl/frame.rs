@@ -88,15 +88,11 @@ pub struct MIFrame {
     pub float_regs: Vec<Option<OpRef>>,
     pub float_values: Vec<Option<i64>>,
     pub inline_frame: bool,
-    /// [FR] True when this is a recursive-portal INLINE frame that installed
-    /// its callee's fresh standard virtualizable; the frame's pop restores the
-    /// caller's saved vable via `TraceCtx::restore_saved_virtualizable`.
-    pub portal_vable_saved: bool,
-    /// [FR] Saved caller sym scalar/fixed-array state for a recursive-portal
+    /// \[FR\] Saved caller sym scalar/fixed-array state for a recursive-portal
     /// INLINE frame; restored into the shared sym when the frame returns so the
     /// callee's in-place mutation of the single sym doesn't corrupt the caller.
     pub portal_scalar_state: Option<Vec<(OpRef, i64)>>,
-    /// [FR] True only for a frame whose push recorded `ENTER_PORTAL_FRAME`
+    /// \[FR\] True only for a frame whose push recorded `ENTER_PORTAL_FRAME`
     /// (an inline-pushed portal, dispatch.rs). Its normal-return and
     /// exception-return pops record the matching `LEAVE_PORTAL_FRAME`, so every
     /// enter_portal_frame pairs with a leave_portal_frame (pyjitpl.py:2461-2492:
@@ -106,7 +102,7 @@ pub struct MIFrame {
     /// that record no ENTER and must record no LEAVE. The merge-point cut is the
     /// sole `leave_portal_frame=False` site and re-emits LEAVE itself.
     pub portal_entered: bool,
-    /// [FR] The jd_index carried in this frame's `LEAVE_PORTAL_FRAME` op, set at
+    /// \[FR\] The jd_index carried in this frame's `LEAVE_PORTAL_FRAME` op, set at
     /// the same push that set `portal_entered`. Unused when `portal_entered` is
     /// false.
     pub portal_jd: usize,
@@ -187,7 +183,6 @@ impl MIFrame {
             float_regs: vec![None; regs_and_consts_f],
             float_values: vec![None; regs_and_consts_f],
             inline_frame: false,
-            portal_vable_saved: false,
             portal_scalar_state: None,
             portal_entered: false,
             portal_jd: 0,
@@ -906,16 +901,31 @@ impl MIFrame {
                     SnapshotTagged::Const(0, Type::Int)
                 } else if skip_int_identity.is_some_and(|(b, e)| idx >= b && idx < e)
                     && idx < num_regs_i
-                    && self.int_regs[idx].is_none()
                 {
-                    // A non-root (inline split-dispatch) frame reserves the
-                    // virtualizable identity-slot prefix int[base..end) so its
-                    // register file spans them, but the resume seeder fills only
-                    // the ROOT frame's identity slots — here they are unwritten
-                    // holes. Emit a count-preserving Const(0) placeholder (the
-                    // liveness marker's length_i is baked, so dropping would
-                    // desync the decoder); deopt re-derives the real ptr/len
-                    // from the single reconstructed root virtualizable.
+                    // A non-root (inline) frame reserves the virtualizable
+                    // identity-slot prefix int[base..end) so its register file
+                    // spans them, but only the ROOT frame's identity slots are
+                    // meaningful: deopt re-derives the real ptr/len from the
+                    // single reconstructed root virtualizable. Emit a
+                    // count-preserving Const(0) placeholder (the liveness
+                    // marker's length_i is baked, so dropping would desync the
+                    // decoder).
+                    //
+                    // Blank the range UNCONDITIONALLY. An earlier version also
+                    // required `self.int_regs[idx].is_none()`, on the premise
+                    // that a sub-frame's identity slots are always unwritten
+                    // holes. That is false: dualtape's sub-frame at
+                    // `jitcode_pos=9` carries the virtualizable identity in
+                    // int reg 2, bit-identical to the root frame's ref reg 1
+                    // (`with_vable_input_ref_reg(1)`), so the slot is written
+                    // and the guard skipped the trim. The identity was then
+                    // seeded back as a live Int and used as an array index,
+                    // faulting in `handler_getarrayitem_vable_i`.
+                    //
+                    // `end` here is `int_identity_reserved_end()`, NOT
+                    // `int_identity_slots_end()` — see that method: the latter
+                    // spans the virt arrays' live element counts, and blanking
+                    // those would drop ordinary working registers.
                     SnapshotTagged::Const(0, Type::Int)
                 } else if idx < num_regs_i {
                     let opref = self.int_regs[idx]

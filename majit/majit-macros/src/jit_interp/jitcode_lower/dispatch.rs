@@ -1926,6 +1926,82 @@ fn pc_self_increment(expr: &Expr) -> Option<i64> {
     None
 }
 
+/// The return terminator for a `return` whose operand lowered to `binding`
+/// (`None` = no operand, or an operand that did not lower), as the
+/// `(reads, emitter)` pair `OpMeta::terminal` + `emit_op` consume.
+///
+/// `blackhole.py:841-857`: a typed return reads the source register of its
+/// declared kind, so the register must appear in the terminator's reads list —
+/// that list is what keeps it alive through the backward liveness walk.
+/// `blackhole.py:859-862`: `void_return` has no operand and therefore no reads.
+///
+/// Shared by both emission sites — the function-final return after the dispatch
+/// loop and the in-arm `return` — so the two cannot drift in which builder call
+/// a `BindingKind` maps to.
+pub(super) fn typed_return_terminator(
+    binding: Option<Binding>,
+) -> (Vec<Register>, proc_macro2::TokenStream) {
+    let Some(binding) = binding else {
+        return (Vec::new(), quote::quote! { __builder.void_return(); });
+    };
+    let reg = binding.reg;
+    match binding.kind {
+        BindingKind::Int => (
+            vec![Register::int(reg)],
+            quote::quote! { __builder.int_return(#reg as u16); },
+        ),
+        BindingKind::Ref => (
+            vec![Register::ref_(reg)],
+            quote::quote! { __builder.ref_return(#reg as u16); },
+        ),
+        BindingKind::Float => (
+            vec![Register::float(reg)],
+            quote::quote! { __builder.float_return(#reg as u16); },
+        ),
+    }
+}
+
+/// Whether `expr` contains a store — a plain `a = b` or a compound `a += b`.
+///
+/// Used to keep a *storing* function-final expression out of the walk; see the
+/// call site in `lower_dispatch_body` for why a store there is applied twice.
+fn expr_stores(expr: &Expr) -> bool {
+    use syn::visit::Visit;
+    struct FindStore {
+        hit: bool,
+    }
+    impl<'ast> Visit<'ast> for FindStore {
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            match e {
+                Expr::Assign(_) => self.hit = true,
+                Expr::Binary(b) if is_assign_op(&b.op) => self.hit = true,
+                _ => {}
+            }
+            syn::visit::visit_expr(self, e);
+        }
+    }
+    let mut finder = FindStore { hit: false };
+    finder.visit_expr(expr);
+    finder.hit
+}
+
+/// Whether `op` is a compound-assignment operator (`+=`, `-=`, ...).
+fn is_assign_op(op: &syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::AddAssign(_)
+            | syn::BinOp::SubAssign(_)
+            | syn::BinOp::MulAssign(_)
+            | syn::BinOp::DivAssign(_)
+            | syn::BinOp::RemAssign(_)
+            | syn::BinOp::BitXorAssign(_)
+            | syn::BinOp::BitAndAssign(_)
+            | syn::BinOp::BitOrAssign(_)
+            | syn::BinOp::ShlAssign(_)
+            | syn::BinOp::ShrAssign(_)
+    )
+}
+
 /// `Some(N)` if `body` is a pure forward-advancing dispatch arm: straight-line
 /// work followed by a single trailing `pc += N` (N > 0), with no back-edge
 /// (`can_enter_jit!` / `jit_merge_point!`), no early `return` / `continue` /
@@ -1951,6 +2027,16 @@ fn arm_is_pure_pc_advance(body: &Expr) -> Option<i64> {
         hit: bool,
     }
     impl<'ast> Visit<'ast> for Forbid {
+        // Load-bearing beyond "this arm is not a pure advance": a return arm
+        // must NEVER reach the split path.  `dispatch_arm_inline_call_tokens_i`
+        // wires the sub-JitCode's BC_INT_RETURN into the caller's
+        // `return_i_reg`, which for `split_dispatch` IS the dispatch loop's
+        // green pc register (`next_instr = self.OPCODE(oparg, next_instr)`).
+        // A `return <value>` lowered into that sub-JitCode would therefore
+        // write its return VALUE into the green pc — a miscompile that
+        // compiles clean, not a missing return.  Return arms stay force-inlined
+        // so `Lowerer::lower_return_stmt` emits the terminator in the dispatch
+        // JitCode itself, where it ends the walk instead of feeding a register.
         fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
             self.hit = true;
         }
@@ -2005,6 +2091,89 @@ fn arm_is_pure_pc_advance(body: &Expr) -> Option<i64> {
         }
     }
     Some(increment)
+}
+
+/// Tests for `arm_is_pure_pc_advance`, the predicate that gates `split_dispatch`.
+///
+/// These do not cover a path any crate in this repository takes. No tracked
+/// crate sets `split_dispatch = true` — `rg '^\s*split_dispatch\s*=\s*true'
+/// $(git ls-files)` returns nothing, tests included. The configuration is
+/// shipped only by out-of-tree consumers that path-depend on this crate. These
+/// tests are therefore the only in-repository coverage of that configuration.
+///
+/// The `^\s*` anchor is load-bearing; do not simplify it away. It restricts
+/// the match to the attribute-argument form, which is the only spelling that
+/// sets anything. Unanchored, the pattern matches the sentence above — this
+/// note is a tracked file, so a census over an unanchored pattern would count
+/// this prose as a setter. Anchoring rejects prose without rejecting the
+/// attribute spelling it exists to find.
+///
+/// The gap that leaves is on the more dangerous half.
+/// `dispatch_arm_inline_call_tokens_i` — the emitter these tests exist to keep
+/// `return` arms away from — has no test at all: it appears in this file only
+/// as its definition, one comment, and one call site. Misrouting a `return` arm
+/// into it writes the arm's return VALUE into the green pc, which compiles
+/// clean (see the note on `arm_is_pure_pc_advance`'s `visit_expr_return`).
+///
+/// Retirement: this note stops being true when
+/// `rg '^\s*split_dispatch\s*=\s*true' $(git ls-files)` returns a hit — i.e.
+/// when a tracked crate ships the configuration. Run it anchored, for the
+/// reason above: unanchored it reports a hit that is this note, and retires a
+/// note nothing has retired. At that point replace this note with a real test
+/// on the emitter rather than deleting it. `switch_dispatch`, set on the
+/// adjacent line by the same out-of-tree consumers, already has a tracked
+/// setter in `majit-metainterp/tests/jit_interp_dispatch_ir_shape.rs`, so this is a
+/// known-shaped piece of work rather than an aspiration.
+#[cfg(test)]
+mod arm_is_pure_pc_advance_tests {
+    use super::*;
+
+    fn body(src: &str) -> Expr {
+        syn::parse_str::<Expr>(src).unwrap()
+    }
+
+    #[test]
+    fn plain_forward_advance_is_pure() {
+        assert_eq!(arm_is_pure_pc_advance(&body("{ pc += 3; }")), Some(3));
+        assert_eq!(arm_is_pure_pc_advance(&body("{ pc = pc + 2; }")), Some(2));
+    }
+
+    /// A `return` arm must NEVER be routed to the split sub-JitCode path: the
+    /// paired `inline_call_<types>_i` wires the callee's BC_INT_RETURN into the
+    /// caller's `return_i_reg`, which under `split_dispatch` is the dispatch
+    /// loop's green pc register — so the arm would write its return VALUE into
+    /// the pc.  Return arms stay force-inlined, where
+    /// `Lowerer::lower_return_stmt` emits the terminator in the dispatch
+    /// JitCode itself.
+    #[test]
+    fn return_arm_is_never_a_pure_pc_advance() {
+        // Tail return, the shape every corpus interpreter writes.
+        assert_eq!(
+            arm_is_pure_pc_advance(&body("{ let r = program[pc + 1]; return state.regs[r]; }")),
+            None,
+        );
+        // Bare return, and a return that still ends with a forward advance:
+        // the advance must not make the arm look splittable.
+        assert_eq!(arm_is_pure_pc_advance(&body("{ return; }")), None);
+        assert_eq!(
+            arm_is_pure_pc_advance(&body("{ if done { return state.a; } pc += 2; }")),
+            None,
+        );
+    }
+
+    #[test]
+    fn branch_and_back_edge_arms_are_not_pure() {
+        assert_eq!(
+            arm_is_pure_pc_advance(&body("{ pc = tgt; continue; }")),
+            None
+        );
+        assert_eq!(
+            arm_is_pure_pc_advance(&body("{ can_enter_jit!(d, pc, s, p, || {}); pc += 1; }")),
+            None,
+        );
+        // Backward / zero advances are not forward progress.
+        assert_eq!(arm_is_pure_pc_advance(&body("{ pc += 0; }")), None);
+    }
 }
 
 impl<'c> Lowerer<'c> {
@@ -2141,34 +2310,56 @@ impl<'c> Lowerer<'c> {
     /// via `lower_stmt`, and on success drops the arm-local bindings so they
     /// do not leak into the next arm (matching the isolated sub-JitCode arm
     /// scope; emitted ops reference concrete registers, so this is safe).
-    /// Returns `false` and fully rolls back the partial emission when the
-    /// body does not lower cleanly, so the caller falls back to the
-    /// sub-JitCode path.
-    pub(super) fn try_inline_dispatch_arm(&mut self, body: &Expr) -> bool {
+    /// Returns [`InlineArmOutcome::Rejected`] and fully rolls back the partial
+    /// emission when the body does not lower cleanly, so the caller falls back
+    /// to the sub-JitCode path.
+    ///
+    /// The body's final statement is marked via `inline_arm_tail_stmt` so a
+    /// `return` there lowers to a typed return terminator
+    /// (`Lowerer::lower_return_stmt`); when one was emitted the outcome is
+    /// [`InlineArmOutcome::InlinedTerminal`] and the caller must suppress the
+    /// dispatch back-edge.
+    pub(super) fn try_inline_dispatch_arm(&mut self, body: &Expr) -> InlineArmOutcome {
         let stmts = extract_stmts(body);
         let snap_stmts = self.statements.len();
         let snap_meta = self.op_metadata.len();
         let snap_reg = self.next_reg;
+        // `next_label` belongs with `snap_stmts`: a lowerer that allocates a
+        // label and then fails leaves the counter advanced, and this is the
+        // one place that knows the whole attempt is being discarded.  Restoring
+        // it anywhere the statements survive would re-issue a bound ident (see
+        // `Lowerer::alloc_label`), so the two are snapshotted and put back
+        // together.
+        let snap_label = self.next_label;
         let snap_bindings = self.bindings.clone();
         let snap_opcode = self.opcode_var_name.clone();
 
         self.pc_pinned = true;
         let mut ok = true;
-        for stmt in &stmts {
+        for (idx, stmt) in stmts.iter().enumerate() {
+            // One-shot marker for the tail statement; `lower_stmt` takes it on
+            // entry, so only a `return` written directly as the body's last
+            // statement can reach the terminator emission.
+            self.inline_arm_tail_stmt = idx + 1 == stmts.len();
             if self.lower_stmt(stmt).is_none() {
                 ok = false;
                 break;
             }
         }
+        // Clear unconditionally: `lower_stmt` consumes the flag on entry, but a
+        // body whose tail statement never reached `lower_stmt` (the `break`
+        // above) would otherwise leave it set for the next arm.
+        self.inline_arm_tail_stmt = false;
         self.pc_pinned = false;
 
         if !ok {
             self.statements.truncate(snap_stmts);
             self.op_metadata.truncate(snap_meta);
             self.next_reg = snap_reg;
+            self.next_label = snap_label;
             self.bindings = snap_bindings;
             self.opcode_var_name = snap_opcode;
-            return false;
+            return InlineArmOutcome::Rejected;
         }
 
         if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
@@ -2195,8 +2386,48 @@ impl<'c> Lowerer<'c> {
         self.bindings = snap_bindings;
         self.opcode_var_name = snap_opcode;
         self.next_reg = snap_reg;
-        true
+
+        // Did the body end in a return terminator?  `lower_stmt` takes the
+        // one-shot tail marker, so only the body's final statement can emit
+        // one — assert that, because a terminator anywhere but last would mean
+        // the ops after it are unreachable.
+        let arm_ops = &self.op_metadata[snap_meta..];
+        match arm_ops
+            .iter()
+            .position(|m| matches!(m.control, ControlFlowClass::Terminal))
+        {
+            Some(pos) => {
+                debug_assert_eq!(
+                    pos,
+                    arm_ops.len() - 1,
+                    "a dispatch arm return terminator must be the arm's last op"
+                );
+                InlineArmOutcome::InlinedTerminal
+            }
+            None => InlineArmOutcome::Inlined,
+        }
     }
+}
+
+/// Result of [`Lowerer::try_inline_dispatch_arm`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum InlineArmOutcome {
+    /// Not inlined: the body did not lower cleanly and the partial emission was
+    /// rolled back.  The caller falls back to the sub-JitCode path.
+    Rejected,
+    /// Inlined; control falls out of the arm body and the caller emits the
+    /// dispatch back-edge.
+    Inlined,
+    /// Inlined, and the body ends in a typed return terminator.  The caller
+    /// must emit **neither** the loop back-edge nor the `default_label` jump:
+    /// the terminator is the arm's own control transfer.
+    ///
+    /// This differs from `ArmPattern::Halt`, which diverts to `default_label`
+    /// precisely *because* it has no operand of its own and must reach the
+    /// function-final typed return to produce one.  A returning arm already
+    /// carries its value, so routing it through `default_label` would re-lower
+    /// the function's trailing expression over it.
+    InlinedTerminal,
 }
 
 pub(super) fn lower_dispatch_chain(
@@ -2294,6 +2525,34 @@ pub(super) fn lower_dispatch_chain(
                             );
                         });
                     }
+                    // Skipping emits NOTHING — no test, no body, and (unlike the
+                    // three abort-stub sites below) no `record_degraded_arm`,
+                    // because that call lives at stub construction and there is
+                    // no stub here. So the arm used to vanish completely: the
+                    // opcode fell through to `default_label`, which is bound at
+                    // the typed-return terminator, meaning the trace *returns*
+                    // rather than aborting. An interpreter all of whose arms
+                    // took this path installed a dispatch whose entire optimized
+                    // body was that return, while `Traces compiled` and
+                    // `degraded_dispatch_arms()` both read healthy.
+                    //
+                    // Register it here so the next unsupported shape is named
+                    // instead of disappearing. This is a diagnostic, not a
+                    // repair: the arm is still absent from the dispatch, and the
+                    // silent return above is still what happens at runtime.
+                    let interp = &config.state_type_name;
+                    let arm_name = {
+                        let pat = &arm.pat;
+                        quote::quote!(#pat).to_string()
+                    };
+                    lowerer.emit_aux(quote::quote! {
+                        majit_metainterp::record_degraded_dispatch_arm(
+                            #interp,
+                            #arm_name,
+                            "dispatch arm pattern is not a shape the macro can lower to a \
+                             constant value; the arm was dropped from the dispatch entirely",
+                        );
+                    });
                     continue; // unsupported pattern shape — skip
                 }
             };
@@ -2366,7 +2625,7 @@ pub(super) fn lower_dispatch_chain(
             }
         }
 
-        // Green-pc gated inline (Option A, #184): when `pc` is a declared
+        // Green-pc gated inline (Option A, recursive-call): when `pc` is a declared
         // green, lower a Lowerable arm body DIRECTLY into this dispatch
         // JitCode so its pc-writes (operand `pc += N`, branch `pc = target`)
         // reach the dispatch loop's reg0.  A BC_INLINE_CALL into a sub-JitCode
@@ -2411,14 +2670,46 @@ pub(super) fn lower_dispatch_chain(
         } else {
             None
         };
-        let inlined = pc_return_increment.is_none()
+        let inline_outcome = if pc_return_increment.is_none()
             && pc_is_green(config)
             && matches!(
                 arm.pattern,
                 crate::jit_interp::classify::ArmPattern::Lowerable
             )
             && !lowerer.arm_body_has_infer_call(&arm.original_body)
-            && lowerer.try_inline_dispatch_arm(&arm.original_body);
+        {
+            lowerer.try_inline_dispatch_arm(&arm.original_body)
+        } else {
+            InlineArmOutcome::Rejected
+        };
+        let inlined = inline_outcome != InlineArmOutcome::Rejected;
+
+        // Install-time name for an arm that degrades to an abort stub.
+        //
+        // `MAJIT_MACRO_DEBUG` below is a proc-macro-time census of EVERY arm:
+        // it is invisible at install, absent from any rebuild that hits the
+        // incremental cache, and its `inlined` field does not answer this
+        // question — `inlined=false` only means "emitted as a sub-JitCode",
+        // and the `Some(layout)` path below builds a real one.  So the abort
+        // stubs get their own channel, keyed by the machine's `state = T`
+        // name and the arm's source spelling, staged with the reason at each
+        // emitting site (`majit_metainterp::record_degraded_dispatch_arm`).
+        // It is deliberately NOT a `MC_DIAG` bump: slot 41 is the
+        // `AbortReason::Generic` bucket `jitprof.rs` already documents as
+        // unclassified, and the `Counters.ABORT_*` ids it indexes mirror
+        // RPython's `Counters`, so there is no id to spend on this.
+        let degraded_interp_name = config.state_type_name.clone();
+        let degraded_arm_name = {
+            let pat = &arm.pat;
+            quote::quote!(#pat).to_string()
+        };
+        let record_degraded_arm = |reason: &str| {
+            let interp = &degraded_interp_name;
+            let arm_name = &degraded_arm_name;
+            quote::quote! {
+                majit_metainterp::record_degraded_dispatch_arm(#interp, #arm_name, #reason);
+            }
+        };
 
         if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
             let pat = &arm.pat;
@@ -2434,10 +2725,11 @@ pub(super) fn lower_dispatch_chain(
                 }
             };
             eprintln!(
-                "[majit-macro] dispatch arm {} pattern={} inlined={}",
+                "[majit-macro] dispatch arm {} pattern={} inlined={} outcome={:?}",
                 quote::quote!(#pat),
                 pattern_name,
                 inlined,
+                inline_outcome,
             );
         }
 
@@ -2493,7 +2785,7 @@ pub(super) fn lower_dispatch_chain(
                         .map(|(generated, layout)| (generated, layout, None)),
                     };
                     match generated_parts {
-                        Some((generated, layout, pc_return_reg)) => {
+                        Ok((generated, layout, pc_return_reg)) => {
                             let body = generated.body;
                             let liveness_prebuild = generated.liveness_prebuild;
                             lowerer.inline_liveness_prebuild.push(liveness_prebuild);
@@ -2539,6 +2831,9 @@ pub(super) fn lower_dispatch_chain(
                                 .map(|e| e.callee_reg + 1)
                                 .max()
                                 .unwrap_or(0);
+                            let record_degraded = record_degraded_arm(
+                                "arm body lowering resolved an unsupported call policy at install",
+                            );
                             (
                                 quote::quote! {
                                     // A runtime-resolved unsupported call policy
@@ -2575,6 +2870,7 @@ pub(super) fn lower_dispatch_chain(
                                             // shape so the paired BC_INLINE_CALL's
                                             // arg copies stay in bounds before the
                                             // BC_ABORT.
+                                            #record_degraded
                                             let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
                                             __sub_builder.ensure_i_regs(#min_i_regs);
                                             __sub_builder.ensure_r_regs(#min_r_regs);
@@ -2587,20 +2883,34 @@ pub(super) fn lower_dispatch_chain(
                                 inline_call_emit,
                             )
                         }
-                        None => (
-                            quote::quote! {
-                                {
-                                    let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                                    __sub_builder.abort();
-                                    __sub_builder.finish()
-                                }
-                            },
-                            dispatch_arm_inline_call_tokens(&[]),
-                        ),
+                        // The lowering already knows WHICH statement stopped it;
+                        // carry that reason to the install-time record instead
+                        // of collapsing every cause into one string, the same
+                        // way `ArmPattern::Unsupported(reason)` is carried below.
+                        Err(reason) => {
+                            let record_degraded = record_degraded_arm(&reason);
+                            (
+                                quote::quote! {
+                                    {
+                                        #record_degraded
+                                        let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                        __sub_builder.abort();
+                                        __sub_builder.finish()
+                                    }
+                                },
+                                dispatch_arm_inline_call_tokens(&[]),
+                            )
+                        }
                     }
                 }
                 // `break` arms (`Halt`) use the same empty body as Nop — no
                 // `BC_ABORT_PERMANENT` is emitted for this loop-exit path.
+                //
+                // Nop / Halt / AbortPermanent are DECLARED outcomes, not
+                // degradations: the source arm asked for exactly this, so
+                // none of them records a degraded arm.  Recording them would
+                // make the channel fire on every `_ => break` and
+                // `_ => panic!` in the corpus and stop discriminating.
                 crate::jit_interp::classify::ArmPattern::Nop => (
                     quote::quote! { majit_metainterp::JitCodeBuilder::new().finish() },
                     dispatch_arm_inline_call_tokens(&[]),
@@ -2619,16 +2929,23 @@ pub(super) fn lower_dispatch_chain(
                     },
                     dispatch_arm_inline_call_tokens(&[]),
                 ),
-                crate::jit_interp::classify::ArmPattern::Unsupported(_reason) => (
-                    quote::quote! {
-                        {
-                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                            __sub_builder.abort();
-                            __sub_builder.finish()
-                        }
-                    },
-                    dispatch_arm_inline_call_tokens(&[]),
-                ),
+                // `detect_unsupported_pattern` already produced a reason
+                // String here and it used to be dropped on the floor; carry
+                // it to the install-time record instead of restating it.
+                crate::jit_interp::classify::ArmPattern::Unsupported(reason) => {
+                    let record_degraded = record_degraded_arm(reason);
+                    (
+                        quote::quote! {
+                            {
+                                #record_degraded
+                                let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                __sub_builder.abort();
+                                __sub_builder.finish()
+                            }
+                        },
+                        dispatch_arm_inline_call_tokens(&[]),
+                    )
+                }
             };
             lowerer.emit_op(
                 OpMeta::linear(OpKind::InlineCall, arm_inline_call_reads, vec![]),
@@ -2669,7 +2986,16 @@ pub(super) fn lower_dispatch_chain(
         // `break` exits the source dispatch `while`, so its empty arm must
         // flow to the function's typed return. Re-entering the loop here
         // would execute the loop header with the post-HALT pc instead.
-        if matches!(arm.pattern, crate::jit_interp::classify::ArmPattern::Halt) {
+        //
+        // An arm that lowered its own `return` already emitted the terminator
+        // that ends the walk, so it gets NEITHER edge.  Note this is not the
+        // `Halt` treatment: `break` diverts to `default_label` because its arm
+        // has no operand and must reach the function-final typed return to get
+        // one, whereas a returning arm carries its own value and would have the
+        // function's trailing expression lowered over it.
+        if matches!(inline_outcome, InlineArmOutcome::InlinedTerminal) {
+            // No jump: the return terminator is the arm's control transfer.
+        } else if matches!(arm.pattern, crate::jit_interp::classify::ArmPattern::Halt) {
             lowerer.emit_jump(&default_label);
         } else {
             lowerer.emit_jump(loop_start_label);
@@ -3509,37 +3835,26 @@ pub(crate) fn lower_dispatch_body(
         syn::Stmt::Expr(e, None) => Some(e),
         _ => None,
     });
-    match return_expr.and_then(|e| lowerer.lower_value_expr(e)) {
-        Some(binding) => {
-            let reg = binding.reg;
-            // blackhole.py:841-857 — typed return reads the source register
-            // of its declared kind. Walker keeps `reg` alive upstream via
-            // OpMeta::terminal's reads list.
-            let (read_reg, emitter) = match binding.kind {
-                BindingKind::Int => (
-                    Register::int(reg),
-                    quote::quote! { __builder.int_return(#reg as u16); },
-                ),
-                BindingKind::Ref => (
-                    Register::ref_(reg),
-                    quote::quote! { __builder.ref_return(#reg as u16); },
-                ),
-                BindingKind::Float => (
-                    Register::float(reg),
-                    quote::quote! { __builder.float_return(#reg as u16); },
-                ),
-            };
-            lowerer.emit_op(OpMeta::terminal(vec![read_reg]), emitter);
-        }
-        None => {
-            // No lowerable return expr: emit void_return.
-            // blackhole.py:859-862 — void_return has no operand and no reads.
-            lowerer.emit_op(
-                OpMeta::terminal(Vec::new()),
-                quote::quote! { __builder.void_return(); },
-            );
-        }
-    }
+    // A trailing expression that STORES must not be lowered here. `jitdriver.rs`'s
+    // `TraceAction::Finish` arm hands the post-loop work to native execution and
+    // writes the walk-final state back for it to read, so a store lowered into the
+    // walk is applied twice: once on the walk's symbolic state (which the
+    // write-back then pushes into native `state`) and once by native code. A pure
+    // trailing expression is idempotent under that division and keeps its typed
+    // return, so this narrows only the storing case, which falls through to
+    // `void_return` and ends the walk at the loop exit.
+    //
+    // The check is syntactic. A store hidden inside a callee is not caught, but
+    // such an expression does not lower to a binding anyway and so already
+    // reaches `void_return`.
+    //
+    // A `None` binding here (no trailing expression, one that stores, or one
+    // that did not lower) falls through to `void_return`.
+    let binding = return_expr
+        .filter(|e| !expr_stores(e))
+        .and_then(|e| lowerer.lower_value_expr(e));
+    let (reads, emitter) = typed_return_terminator(binding);
+    lowerer.emit_op(OpMeta::terminal(reads), emitter);
 
     annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
     remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);

@@ -86,9 +86,7 @@ thread_local! {
         FlattenRecursion::new();
 }
 
-// ---------------------------------------------------------------------------
 // ClassDictEntry (classdesc.py:506 `{attr: Constant-or-Desc}`).
-// ---------------------------------------------------------------------------
 
 /// RPython `classdict[attr]` value type — upstream comment
 /// (classdesc.py:506) states `{attr: Constant-or-Desc}`. Upstream relies
@@ -115,9 +113,7 @@ impl ClassDictEntry {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Error marker (classdesc.py:466-468).
-// ---------------------------------------------------------------------------
 
 /// RPython `class NoSuchAttrError(AnnotatorError)` (classdesc.py:466-468).
 ///
@@ -146,9 +142,7 @@ impl std::fmt::Display for NoSuchAttrError {
 
 impl std::error::Error for NoSuchAttrError {}
 
-// ---------------------------------------------------------------------------
 // BuiltinTypeDesc (classdesc.py:479-485).
-// ---------------------------------------------------------------------------
 
 /// RPython `class BuiltinTypeDesc(object)` (classdesc.py:479-485).
 ///
@@ -171,9 +165,7 @@ impl BuiltinTypeDesc {
     }
 }
 
-// ---------------------------------------------------------------------------
 // is_mixin / is_primitive_type helpers (classdesc.py:471-476).
-// ---------------------------------------------------------------------------
 
 /// RPython `is_mixin(cls)` (classdesc.py:471-472).
 ///
@@ -214,9 +206,7 @@ pub fn is_primitive_type(cls: &HostObject) -> bool {
         )
 }
 
-// ---------------------------------------------------------------------------
 // FORCE_ATTRIBUTES_INTO_CLASSES (classdesc.py:957-961).
-// ---------------------------------------------------------------------------
 
 thread_local! {
     /// RPython `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-968).
@@ -339,10 +329,8 @@ fn forced_attributes_for(qualname: &str) -> Option<indexmap::IndexMap<String, So
     FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| cell.borrow().get(qualname).cloned())
 }
 
-// ---------------------------------------------------------------------------
 // AttrSource (classdesc.py: implicit via duck-typing on InstanceSource /
 // ClassDesc).
-// ---------------------------------------------------------------------------
 
 /// RPython dispatch between class-level sources and prebuilt-instance
 /// sources inside `Attribute.add_constant_source` (classdesc.py:87-93)
@@ -389,9 +377,7 @@ impl AttrSource {
     }
 }
 
-// ---------------------------------------------------------------------------
 // InstanceSource (classdesc.py:435-464).
-// ---------------------------------------------------------------------------
 
 /// RPython `class InstanceSource(object)` (classdesc.py:435-464).
 ///
@@ -506,9 +492,7 @@ impl InstanceSource {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Attribute (classdesc.py:72-134).
-// ---------------------------------------------------------------------------
 
 /// RPython `class Attribute(object)` (classdesc.py:72-134).
 ///
@@ -685,9 +669,7 @@ impl Attribute {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ClassDesc (classdesc.py:488-600).
-// ---------------------------------------------------------------------------
 
 /// RPython `class ClassDesc(Desc)` (classdesc.py:488-600).
 ///
@@ -816,11 +798,9 @@ impl ClassDesc {
         false
     }
 
-    // -----------------------------------------------------------------------
     // Full __init__ body + add_source_attribute / add_mixins /
     // add_sources_for_class / _init_classdef / getuniqueclassdef —
     // c2 step 2c-ii.
-    // -----------------------------------------------------------------------
 
     /// RPython `ClassDesc.__init__(self, bookkeeper, cls, name=None,
     /// basedesc=None, classdict=None)` (classdesc.py:494-588).
@@ -2134,9 +2114,7 @@ impl ClassDesc {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
     // Private helpers.
-    // -----------------------------------------------------------------------
 
     /// Upstream classdesc.py:528-535 — parse `_immutable_fields_` as a
     /// sequence of names, rejecting str inputs.
@@ -2201,9 +2179,7 @@ impl ClassDesc {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ClassDef (classdesc.py:136-431).
-// ---------------------------------------------------------------------------
 
 /// RPython `class ClassDef(object)` — "Wraps a user class."
 /// (classdesc.py:136-431).
@@ -2388,9 +2364,7 @@ impl ClassDef {
         ClassDef::new(&bk, &desc)
     }
 
-    // -----------------------------------------------------------------------
     // Read-only structural methods.
-    // -----------------------------------------------------------------------
 
     /// RPython `ClassDef.__repr__` (classdesc.py:242-243).
     pub fn repr_str(&self) -> String {
@@ -2510,9 +2484,7 @@ impl ClassDef {
         ))
     }
 
-    // -----------------------------------------------------------------------
     // Mutable structural methods.
-    // -----------------------------------------------------------------------
 
     /// RPython `ClassDef.setup(self, sources)` (classdesc.py:161-166).
     fn setup(
@@ -3078,9 +3050,7 @@ impl ClassDef {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -3170,18 +3140,33 @@ mod tests {
         let result = ClassDef::read_attr__class__(&parent_cd);
         match &result {
             SomeValue::PBC(pbc) => {
-                let names: Vec<String> = pbc
+                // `descriptions` is a `BTreeMap` keyed by pointer identity, so
+                // its iteration order is an allocation artefact rather than a
+                // property of this fixture — sort before comparing.
+                //
+                // Mapping every entry, rather than `filter_map`ping to the
+                // classes, is what lets one assertion carry the kind check too:
+                // a non-class description used to be dropped here and caught
+                // only by a separate `.all()`, and now reads as
+                // `<not-a-class>` in the diff.
+                let mut entries: Vec<(String, DescKind)> = pbc
                     .descriptions
                     .values()
-                    .filter_map(|d| d.as_class())
-                    .map(|cd| cd.borrow().name.clone())
+                    .map(|d| {
+                        let name = d
+                            .as_class()
+                            .map(|cd| cd.borrow().name.clone())
+                            .unwrap_or_else(|| String::from("<not-a-class>"));
+                        (name, d.kind())
+                    })
                     .collect();
-                assert!(names.iter().any(|n| n == "pkg.Parent"));
-                assert!(names.iter().any(|n| n == "pkg.Child"));
-                assert!(
-                    pbc.descriptions
-                        .values()
-                        .all(|d| d.kind() == DescKind::Class)
+                entries.sort();
+                assert_eq!(
+                    entries,
+                    [
+                        (String::from("pkg.Child"), DescKind::Class),
+                        (String::from("pkg.Parent"), DescKind::Class),
+                    ]
                 );
             }
             _ => panic!("read_attr__class__ must return a SomePBC"),
@@ -3260,10 +3245,14 @@ mod tests {
         let obj = HostObject::new_instance(cls, vec![]);
         obj.instance_set("dyn", ConstValue::Int(1));
         let src = InstanceSource::new(&bk, obj);
-        let attrs = src.all_instance_attributes().unwrap();
-        assert!(attrs.iter().any(|attr| attr == "dyn"));
-        assert!(attrs.iter().any(|attr| attr == "slot_a"));
-        assert!(attrs.iter().any(|attr| attr == "base_slot"));
+        // `all_instance_attributes` starts from `instance_dict_keys()`, which
+        // reads a `HashMap`, so the order is not stable across runs — sort
+        // before comparing. What the three membership checks could not see is
+        // an *extra* attribute: the instance dict, this class's `__slots__`
+        // and the base's `__slots__` contribute exactly one entry each.
+        let mut attrs = src.all_instance_attributes().unwrap();
+        attrs.sort();
+        assert_eq!(attrs, ["base_slot", "dyn", "slot_a"]);
     }
 
     #[test]

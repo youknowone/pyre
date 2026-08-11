@@ -284,6 +284,9 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_wrapping_int_method_call(call) {
                     return Some(binding);
                 }
+                if let Some(binding) = self.lower_float_bitcast_method_call(call) {
+                    return Some(binding);
+                }
                 self.lower_method_call_value(call)
             }
             Expr::Struct(s) => self.lower_struct_value(s),
@@ -291,66 +294,97 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    /// `convert_float_bytes_to_longlong` for an already-lowered float source.
+    fn emit_convert_float_bytes_to_longlong(&mut self, src: Binding) -> Option<Binding> {
+        if !matches!(src.kind, BindingKind::Float) {
+            return None;
+        }
+        let src_reg = src.reg;
+        let dst = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::UnaryI,
+                vec![Register::float(src_reg)],
+                vec![Register::int(dst)],
+            ),
+            quote! { __builder.record_convert_float_bytes_to_longlong(#dst, #src_reg); },
+        );
+        Some(Binding {
+            reg: dst,
+            kind: BindingKind::Int,
+            depends_on_stack: src.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// `convert_longlong_bytes_to_float` for an already-lowered int source.
+    fn emit_convert_longlong_bytes_to_float(&mut self, src: Binding) -> Option<Binding> {
+        if !matches!(src.kind, BindingKind::Int) {
+            return None;
+        }
+        let src_reg = src.reg;
+        let dst = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::UnaryI,
+                vec![Register::int(src_reg)],
+                vec![Register::float(dst)],
+            ),
+            quote! { __builder.record_convert_longlong_bytes_to_float(#dst, #src_reg); },
+        );
+        Some(Binding {
+            reg: dst,
+            kind: BindingKind::Float,
+            depends_on_stack: src.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
     /// Lower the float<->int bitcast intrinsics: `majit_f64_to_bits(f)` (float
     /// argument → its i64 bit pattern, `convert_float_bytes_to_longlong`) and
     /// `majit_bits_to_f64(i)` (int bits → float, `convert_longlong_bytes_to_float`).
     /// Both reinterpret the 64-bit pattern (no value change); a branchless float
     /// bit-select uses them to stay bit-exact where an arithmetic blend cannot.
+    ///
+    /// `f64::to_bits` / `f64::from_bits` are the same two conversions and are
+    /// accepted here in their UFCS spelling (the method spelling `x.to_bits()`
+    /// is `lower_float_bitcast_method_call`).  Recognizing only the free
+    /// functions made an arm that reached for the inherent method degrade to an
+    /// abort stub with nothing naming it — cel's `OP_RETURN_F` and its
+    /// `OP_LOAD_CONST_F` mirror, the second of which the interpreter had already
+    /// worked around by hoisting the op out of the traced loop body.
     fn lower_float_bitcast_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
-        let segments = canonical_expr_segments(&call.func)?;
-        match segments.last()?.as_str() {
-            "majit_f64_to_bits" => {
-                if call.args.len() != 1 {
-                    return None;
-                }
-                let src = self.lower_value_expr(&call.args[0])?;
-                if !matches!(src.kind, BindingKind::Float) {
-                    return None;
-                }
-                let src_reg = src.reg;
-                let dst = self.alloc_reg();
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::UnaryI,
-                        vec![Register::float(src_reg)],
-                        vec![Register::int(dst)],
-                    ),
-                    quote! { __builder.record_convert_float_bytes_to_longlong(#dst, #src_reg); },
-                );
-                Some(Binding {
-                    reg: dst,
-                    kind: BindingKind::Int,
-                    depends_on_stack: src.depends_on_stack,
-                    struct_type: None,
-                })
-            }
-            "majit_bits_to_f64" => {
-                if call.args.len() != 1 {
-                    return None;
-                }
-                let src = self.lower_value_expr(&call.args[0])?;
-                if !matches!(src.kind, BindingKind::Int) {
-                    return None;
-                }
-                let src_reg = src.reg;
-                let dst = self.alloc_reg();
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::UnaryI,
-                        vec![Register::int(src_reg)],
-                        vec![Register::float(dst)],
-                    ),
-                    quote! { __builder.record_convert_longlong_bytes_to_float(#dst, #src_reg); },
-                );
-                Some(Binding {
-                    reg: dst,
-                    kind: BindingKind::Float,
-                    depends_on_stack: src.depends_on_stack,
-                    struct_type: None,
-                })
-            }
-            _ => None,
+        if call.args.len() != 1 {
+            return None;
         }
+        let segments = canonical_expr_segments(&call.func)?;
+        let owner = segments
+            .len()
+            .checked_sub(2)
+            .map(|i| segments[i].as_str())
+            .unwrap_or("");
+        let to_bits = match (owner, segments.last()?.as_str()) {
+            (_, "majit_f64_to_bits") | ("f64", "to_bits") => true,
+            (_, "majit_bits_to_f64") | ("f64", "from_bits") => false,
+            _ => return None,
+        };
+        let src = self.lower_value_expr(&call.args[0])?;
+        if to_bits {
+            self.emit_convert_float_bytes_to_longlong(src)
+        } else {
+            self.emit_convert_longlong_bytes_to_float(src)
+        }
+    }
+
+    /// The inherent-method spelling of `majit_f64_to_bits`: `<f64>.to_bits()`.
+    /// There is no method spelling of the reverse — `f64::from_bits` is an
+    /// associated function and reaches `lower_float_bitcast_call`.
+    fn lower_float_bitcast_method_call(&mut self, call: &ExprMethodCall) -> Option<Binding> {
+        if call.method != "to_bits" || !call.args.is_empty() {
+            return None;
+        }
+        let src = self.lower_value_expr(&call.receiver)?;
+        self.emit_convert_float_bytes_to_longlong(src)
     }
 
     /// Lower the unsigned integer intrinsics. Both operands are read from the
@@ -2230,14 +2264,24 @@ impl<'c> Lowerer<'c> {
             auto_calls: self.auto_calls,
             inline_liveness_prebuild: Vec::new(),
             dispatch_tainted_reason: None,
+            body_failure_reason: None,
+            nested_failure_reasons: Vec::new(),
             opcode_var_name: self.opcode_var_name.clone(),
             in_dispatch_arm_body: self.in_dispatch_arm_body,
             dispatch_loop_label: self.dispatch_loop_label.clone(),
             pc_pinned: self.pc_pinned,
+            // Never inherited: a nested block statement is not the arm body's
+            // tail, so a `return` inside it must be rejected, not lowered.
+            inline_arm_tail_stmt: false,
         };
 
         for stmt in &stmts {
-            nested.lower_stmt(stmt)?;
+            if nested.lower_stmt(stmt).is_none() {
+                // Carry the diagnosis out before the child is dropped; a bare
+                // `?` here propagates the failure and loses the reason.
+                self.absorb_nested_failure(&mut nested);
+                return None;
+            }
         }
 
         self.next_reg = self.next_reg.max(nested.next_reg);
@@ -2261,13 +2305,23 @@ impl<'c> Lowerer<'c> {
             auto_calls: self.auto_calls,
             inline_liveness_prebuild: Vec::new(),
             dispatch_tainted_reason: None,
+            body_failure_reason: None,
+            nested_failure_reasons: Vec::new(),
             opcode_var_name: self.opcode_var_name.clone(),
             in_dispatch_arm_body: self.in_dispatch_arm_body,
             dispatch_loop_label: self.dispatch_loop_label.clone(),
             pc_pinned: self.pc_pinned,
+            // Never inherited: a branch arm's value expression is not the arm
+            // body's tail, so a `return` inside it must be rejected.
+            inline_arm_tail_stmt: false,
         };
 
-        let binding = nested.lower_scoped_value_expr(expr)?;
+        let Some(binding) = nested.lower_scoped_value_expr(expr) else {
+            // Carry the diagnosis out before the child is dropped; a bare `?`
+            // here propagates the failure and loses the reason.
+            self.absorb_nested_failure(&mut nested);
+            return None;
+        };
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
         Some((

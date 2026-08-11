@@ -243,15 +243,24 @@ impl<'c> Lowerer<'c> {
         }
         let member_name = named_member(&field.member)?;
         let &(array_index, item_type) = config.vable_arrays.get(&member_name)?;
-        if matches!(item_type, ValueKind::Ref) {
-            return None;
-        }
+        let opcode = match item_type {
+            ValueKind::Float => opcode_for_assign_binop_f(&binary.op)?,
+            ValueKind::Int => opcode_for_assign_binop(&binary.op)?,
+            ValueKind::Ref => return None,
+        };
         let vable_reg = self.vable_base_reg()?;
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         if !matches!(idx_binding.kind, BindingKind::Int) {
             return None;
         }
         let idx_reg = idx_binding.reg;
+        let rhs = self.lower_value_expr(&binary.right)?;
+        match item_type {
+            ValueKind::Float if !matches!(rhs.kind, BindingKind::Float) => return None,
+            ValueKind::Int if !matches!(rhs.kind, BindingKind::Int) => return None,
+            ValueKind::Ref => unreachable!(),
+            _ => {}
+        }
         let ai = array_index as u16;
         let lhs_reg = self.alloc_reg();
 
@@ -279,37 +288,24 @@ impl<'c> Lowerer<'c> {
             ValueKind::Ref => unreachable!(),
         }
 
-        let rhs = self.lower_value_expr(&binary.right)?;
         let dst = self.alloc_reg();
         match item_type {
-            ValueKind::Float => {
-                if !matches!(rhs.kind, BindingKind::Float) {
-                    return None;
-                }
-                let opcode = opcode_for_assign_binop_f(&binary.op)?;
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::BinopF,
-                        vec![Register::float(lhs_reg), Register::float(rhs.reg)],
-                        vec![Register::float(dst)],
-                    ),
-                    binop_f_emit_tokens(dst, &opcode, lhs_reg, rhs.reg),
-                );
-            }
-            ValueKind::Int => {
-                if !matches!(rhs.kind, BindingKind::Int) {
-                    return None;
-                }
-                let opcode = opcode_for_assign_binop(&binary.op)?;
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::BinopI,
-                        Register::ints(&[lhs_reg, rhs.reg]),
-                        vec![Register::int(dst)],
-                    ),
-                    binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs.reg),
-                );
-            }
+            ValueKind::Float => self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopF,
+                    vec![Register::float(lhs_reg), Register::float(rhs.reg)],
+                    vec![Register::float(dst)],
+                ),
+                binop_f_emit_tokens(dst, &opcode, lhs_reg, rhs.reg),
+            ),
+            ValueKind::Int => self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopI,
+                    Register::ints(&[lhs_reg, rhs.reg]),
+                    vec![Register::int(dst)],
+                ),
+                binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs.reg),
+            ),
             ValueKind::Ref => unreachable!(),
         }
 

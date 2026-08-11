@@ -1,7 +1,6 @@
 use super::*;
 
-// ── Loop control detection ───────────────────────────────────────────
-
+// Loop control detection
 /// Check if a block contains break or continue at the top level (not nested in inner loops).
 pub(super) fn block_has_loop_control(block: &Block) -> bool {
     block.stmts.iter().any(stmt_has_loop_control)
@@ -32,8 +31,7 @@ pub(super) fn expr_has_loop_control(expr: &Expr) -> bool {
     }
 }
 
-// ── Helper functions ─────────────────────────────────────────────────
-
+// Helper functions
 /// Extract the get_mut argument from a pool.get_mut(arg) expression.
 pub(super) fn extract_stmts(expr: &Expr) -> Vec<Stmt> {
     match expr {
@@ -42,22 +40,38 @@ pub(super) fn extract_stmts(expr: &Expr) -> Vec<Stmt> {
     }
 }
 
+/// The integer value of a literal appearing as a dispatch-arm pattern.
+///
+/// `b'>'` and `'>'` are integer constants that happen to be spelled as
+/// characters: a frontend whose opcodes are characters (Brainfuck's `b'>'`,
+/// `b'['`, `b']'`) dispatches on exactly the `u8` an `OP_*: u8` constant would
+/// produce. Accepting only `Lit::Int` here made every such arm fail extraction,
+/// and the caller drops an arm it cannot extract *before* any abort stub is
+/// built — so the arm registered nowhere, `degraded_dispatch_arms()` stayed
+/// empty, and an interpreter written entirely in byte literals installed a
+/// dispatch with no arms at all. Its whole optimized body was the `Finish()`
+/// the default label emits.
+fn pat_lit_int_value(lit: &Lit) -> Option<i64> {
+    match lit {
+        Lit::Int(int_lit) => int_lit.base10_parse::<i64>().ok(),
+        Lit::Byte(byte_lit) => Some(i64::from(byte_lit.value())),
+        // `char` is a Unicode scalar value; go through `u32` so the cast is the
+        // code point rather than a sign-extension of anything.
+        Lit::Char(char_lit) => Some(i64::from(char_lit.value() as u32)),
+        _ => None,
+    }
+}
+
 /// Extract integer literal values from a match arm pattern.
 ///
-/// Supports `Pat::Lit` (integer literals), `Pat::Or` (multiple patterns
-/// like `1 | 2 | 3`), and `Pat::Path` (constant paths — evaluated at
-/// compile time via `#pat as i64`).
+/// Supports `Pat::Lit` (integer, byte and char literals — see
+/// [`pat_lit_int_value`]), `Pat::Or` (multiple patterns like `1 | 2 | 3`), and
+/// `Pat::Path` (constant paths — evaluated at compile time via `#pat as i64`).
 ///
 /// Returns `None` if the pattern contains unsupported constructs.
 pub(super) fn extract_pat_literals(pat: &Pat) -> Option<Vec<i64>> {
     match pat {
-        Pat::Lit(expr_lit) => {
-            if let Lit::Int(int_lit) = &expr_lit.lit {
-                Some(vec![int_lit.base10_parse::<i64>().ok()?])
-            } else {
-                None
-            }
-        }
+        Pat::Lit(expr_lit) => Some(vec![pat_lit_int_value(&expr_lit.lit)?]),
         Pat::Or(pat_or) => {
             let mut values = Vec::new();
             for case in &pat_or.cases {
@@ -83,12 +97,8 @@ pub(super) fn extract_pat_literals(pat: &Pat) -> Option<Vec<i64>> {
 pub(super) fn extract_pat_value_tokens(pat: &Pat) -> Option<Vec<TokenStream>> {
     match pat {
         Pat::Lit(expr_lit) => {
-            if let Lit::Int(int_lit) = &expr_lit.lit {
-                let val: i64 = int_lit.base10_parse().ok()?;
-                Some(vec![quote! { #val as i64 }])
-            } else {
-                None
-            }
+            let val = pat_lit_int_value(&expr_lit.lit)?;
+            Some(vec![quote! { #val as i64 }])
         }
         Pat::Path(pp) => {
             let path = &pp.path;

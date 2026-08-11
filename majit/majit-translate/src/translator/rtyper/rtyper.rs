@@ -2338,7 +2338,6 @@ fn is_primitive_lowleveltype(lltype: &LowLevelType) -> bool {
     )
 }
 
-// ____________________________________________________________
 // HighLevelOp — `rtyper.py:617-779`.
 
 /// RPython `HighLevelOp.inputarg(converted_to, arg)` accepts either a
@@ -2893,7 +2892,6 @@ pub enum SliceKind {
     StartStop,
 }
 
-// ____________________________________________________________
 // LowLevelOpList — `rtyper.py:783-871+`.
 
 /// RPython `class LowLevelOpList(list)` (rtyper.py:783-809) — mutable
@@ -7386,22 +7384,39 @@ mod tests {
                     ..
                 }) if *n == upper_bound
             ));
-            assert!(upper.exits.iter().any(|link| {
-                bool_exitcase(link) == Some(true)
-                    && link
-                        .borrow()
-                        .target
-                        .as_ref()
-                        .is_some_and(|target| BlockKey::of(target) == BlockKey::of(&returnblock))
-            }));
-            assert!(upper.exits.iter().any(|link| {
-                bool_exitcase(link) == Some(false)
-                    && link
-                        .borrow()
-                        .target
-                        .as_ref()
-                        .is_some_and(|target| BlockKey::of(target) == BlockKey::of(&exceptblock))
-            }));
+            // One equality, not two membership checks. Two `.any()`s pinned
+            // that both expected exits are PRESENT and said nothing about how
+            // many there are — a spurious third exit, a duplicate, or the two
+            // swapped all passed. The sibling startblock assertion above
+            // already pins its length for exactly that reason; this block had
+            // no length pin at all.
+            //
+            // The ORDER is contractual rather than incidental:
+            // `lowlevel_range_check_helper_graph` closes this block with a
+            // single vec literal — `closeblock(vec![Link(Bool(true) →
+            // returnblock), Link(Bool(false) → exceptblock)])` — so the
+            // producer's own container decides the equality, and it is an
+            // ordered one.
+            let upper_exits: Vec<(Option<bool>, Option<BlockKey>)> = upper
+                .exits
+                .iter()
+                .map(|link| {
+                    (
+                        bool_exitcase(link),
+                        link.borrow().target.as_ref().map(BlockKey::of),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                upper_exits,
+                vec![
+                    (Some(true), Some(BlockKey::of(&returnblock))),
+                    (Some(false), Some(BlockKey::of(&exceptblock))),
+                ],
+                "the upper-bound check must have exactly two exits, in the \
+                 order the producer writes them: true → returnblock, \
+                 false → exceptblock"
+            );
         }
     }
 
@@ -7455,14 +7470,39 @@ mod tests {
             .map(|op| op.opname.as_str())
             .collect();
         assert_eq!(opnames, vec!["int_eq", "int_eq", "int_and"]);
-        assert!(start.exits.iter().any(|link| {
-            bool_exitcase(link) == Some(true)
-                && link
+        // One equality, not a membership check. `.any()` pinned that the
+        // overflow exit is PRESENT and said nothing about how many exits there
+        // are, so a spurious third exit or a duplicate passed — and the `find`
+        // below takes the FIRST `false` exit, which made a second one invisible.
+        //
+        // The ORDER is contractual rather than incidental:
+        // `lowlevel_overflow_check_wrapper_graph` closes this block with a
+        // single vec literal — `closeblock(vec![Link(Bool(true) → exceptblock),
+        // Link(Bool(false) → callblock)])` — so the producer's own container
+        // decides the equality. Note the true-target is the OPPOSITE of the
+        // sibling assertion above, which reads true → returnblock.
+        //
+        // The second element is pinned as "does not target the exceptblock"
+        // rather than by name: `callblock` is OBTAINED from these exits just
+        // below, so naming it here would assert nothing.
+        let start_exits: Vec<(Option<bool>, bool)> = start
+            .exits
+            .iter()
+            .map(|link| {
+                let targets_exceptblock = link
                     .borrow()
                     .target
                     .as_ref()
-                    .is_some_and(|target| BlockKey::of(target) == BlockKey::of(&exceptblock))
-        }));
+                    .is_some_and(|target| BlockKey::of(target) == BlockKey::of(&exceptblock));
+                (bool_exitcase(link), targets_exceptblock)
+            })
+            .collect();
+        assert_eq!(
+            start_exits,
+            vec![(Some(true), true), (Some(false), false)],
+            "the overflow check must have exactly two exits, in the order the \
+             producer writes them: true → exceptblock, false → the call path"
+        );
         let callblock = start
             .exits
             .iter()

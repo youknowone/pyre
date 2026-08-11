@@ -125,6 +125,21 @@ impl<'c> Lowerer<'c> {
                         .iter()
                         .any(|s| self.stmt_references_unknown_local(s))
             }
+            // See the `while`/`loop` note in `expr_modifies_jit_state`: without
+            // these two arms a loop whose body names user locals the trace
+            // function does not carry reported no reference at all (compilation-panic).
+            Expr::While(w) => {
+                self.expr_references_unknown_local(&w.cond)
+                    || w.body
+                        .stmts
+                        .iter()
+                        .any(|s| self.stmt_references_unknown_local(s))
+            }
+            Expr::Loop(l) => l
+                .body
+                .stmts
+                .iter()
+                .any(|s| self.stmt_references_unknown_local(s)),
             // Literals, returns without expression, etc. are safe.
             _ => false,
         }
@@ -246,13 +261,21 @@ impl<'c> Lowerer<'c> {
                 self.expr_modifies_jit_state(&f.expr)
                     || f.body.stmts.iter().any(|s| self.stmt_modifies_jit_state(s))
             }
+            // `while` and `loop` descend for the same reason `for` does. They
+            // answered `false` unconditionally until compilation-panic: a body writing jit
+            // state was reported as writing none, and since the two sibling
+            // probes were blind in the same way, `lower_stmt_fallback` scored
+            // the whole loop inert and dropped it from a lowered arm.
+            Expr::While(w) => {
+                self.expr_modifies_jit_state(&w.cond)
+                    || w.body.stmts.iter().any(|s| self.stmt_modifies_jit_state(s))
+            }
+            Expr::Loop(l) => l.body.stmts.iter().any(|s| self.stmt_modifies_jit_state(s)),
             Expr::Field(_)
             | Expr::Index(_)
             | Expr::Path(_)
             | Expr::Lit(_)
             | Expr::Try(_)
-            | Expr::Loop(_)
-            | Expr::While(_)
             | Expr::Break(_)
             | Expr::Continue(_)
             | Expr::Return(_)
@@ -335,6 +358,21 @@ impl<'c> Lowerer<'c> {
                         .iter()
                         .any(|stmt| self.stmt_touches_jit_state(stmt))
             }
+            // See the `while`/`loop` note in `expr_modifies_jit_state`: the
+            // third sibling probe was blind the same way, so nothing in the
+            // inert conjunction could see a loop body at all (compilation-panic).
+            Expr::While(w) => {
+                self.expr_has_jit_state_reference(&w.cond)
+                    || w.body
+                        .stmts
+                        .iter()
+                        .any(|stmt| self.stmt_touches_jit_state(stmt))
+            }
+            Expr::Loop(l) => l
+                .body
+                .stmts
+                .iter()
+                .any(|stmt| self.stmt_touches_jit_state(stmt)),
             _ => false,
         }
     }
@@ -390,6 +428,4 @@ impl<'c> Lowerer<'c> {
             _ => false,
         }
     }
-
-    // ── Core lowering (unchanged logic) ──────────────────────────────
 }

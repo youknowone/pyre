@@ -836,7 +836,7 @@ pub fn materialize_bridge_virtual(
 }
 
 /// resume.py:1245-1264 `decode_box` symbolic parity for an already-decoded
-/// [`RebuiltValue`]: mint the bridge `OpRef` (typed `InputArg` for a live box,
+/// [`majit_ir::resumedata::RebuiltValue`]: mint the bridge `OpRef` (typed `InputArg` for a live box,
 /// const for a pooled const, recursively materialized virtual for a virtual).
 pub fn rebuilt_value_to_opref(
     ctx: &mut crate::TraceCtx,

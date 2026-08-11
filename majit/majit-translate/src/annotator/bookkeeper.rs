@@ -382,7 +382,7 @@ pub struct Bookkeeper {
     pub pyre_trait_unique_impls: RefCell<HashMap<String, String>>,
     /// Trait qualified-path (`name_path()`) → base `HostObject` for a
     /// receiver-driven method-dispatch family registered through
-    /// [`Self::register_trait_family`] (issue #346).
+    /// [`Self::register_trait_family`] (receiver-dispatch configuration).
     /// `derive_subject_inputcells` seeds a `dyn Trait` receiver whose
     /// `class_root` is a key here with the base `ClassDef`, so
     /// `getattr(receiver, method)` resolves the impl-subclass
@@ -3960,9 +3960,7 @@ fn lookup_zero_arg_method(
 /// (`ConstValue::Tuple([Int(cnt), Tuple([Str(k0), …]), Bool(star)])`,
 /// see `flowcontext::build_call_shape_constant`) and reconstructs a
 /// CallShape + tail `args_s[1..]`.
-// =====================================================================
 // check_no_flags_on_instances walker (bookkeeper.py:124-147)
-// =====================================================================
 
 /// Entry point for the recursive sanity walk — inspects a `ClassDef`
 /// and recurses through its attributes. `seen_classdefs` /
@@ -4640,8 +4638,26 @@ mod tests {
         // the leaf → module origin so `canonical_struct_name(leaf)` lands
         // on the same `module::Enum` spelling.  Without that origin the
         // bare leaf passes through and the two sides mint sibling
-        // classdefs.  Uses a unique leaf so replacing the process-global
-        // `STRUCT_ORIGIN_REGISTRY` cannot perturb a concurrent test.
+        // classdefs.
+        //
+        // The unique leaf below does NOT make the write below safe against a
+        // concurrent test, and an earlier version of this comment claimed it
+        // did. A unique KEY protects a concurrent reader looking up a
+        // DIFFERENT key; `register_struct_origins` is `*guard = origins`, so it
+        // discards the whole table, and what it destroys is whatever some other
+        // test registered — a direction key uniqueness cannot reach.
+        //
+        // What actually holds today is narrower and needs re-checking before it
+        // is relied on: this is the ONLY `#[test]` in the `majit-translate`
+        // lib-test binary that writes `STRUCT_ORIGIN_REGISTRY`, so there is no
+        // second writer to race. Adding one re-opens the hazard.
+        //
+        // Not hypothetical: the sibling registry `STRUCT_ID_BY_NAME` gained a
+        // second lib-binary `#[test]` writer and the pair then failed 9 runs in
+        // 12, while passing in isolation and under `--test-threads=1`. The
+        // remedy used there is `register_struct_ids_serialized`
+        // (`codewriter/assembler.rs`, in its `mod tests`); mirror it here
+        // rather than reasoning about key collisions.
         use crate::front::StructFieldRegistry;
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
@@ -6544,7 +6560,7 @@ mod tests {
     }
 
     /// Fixture for the methods-on-classdef capability that `dyn Trait`
-    /// receiver-driven dispatch (issue #346, aheui LinkedList) needs.
+    /// receiver-driven dispatch (receiver-dispatch configuration, aheui LinkedList) needs.
     ///
     /// A ≥2-impl trait family registered through `register_trait_family`
     /// must (a) link a base ClassDef to its impl subclasses, (b) carry the

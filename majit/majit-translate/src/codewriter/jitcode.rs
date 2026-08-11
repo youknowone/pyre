@@ -1253,7 +1253,23 @@ pub enum BhDescr {
         is_field_signed: bool,
         is_immutable: bool,
         is_quasi_immutable: bool,
-        index_in_parent: usize,
+        /// The producer's `descr.py:228` slot claim, `None` when it never
+        /// resolved one.
+        ///
+        /// `Option` rather than `usize` because the two states have to survive
+        /// the crossing to the runtime and a literal `0` cannot carry them:
+        /// pyre mints in the build process and resolves in another
+        /// (`pyre-jit-trace/build.rs`), so `descrs.bin` is the only channel,
+        /// and an unwritten mint and a real slot-0 claim serialize to the same
+        /// bytes the moment this is a plain integer. `derive_index_in_parent`
+        /// then reports both as `caller_index=0` and the `unresolved` table
+        /// cannot say which rows are slot claims at all.
+        ///
+        /// It is deliberately NOT a separate `index_resolved: bool` beside a
+        /// `usize`: that pair can represent `resolved = false` next to a
+        /// nonzero index, a state with no meaning, and nothing would stop a
+        /// later edit from writing it.
+        index_in_parent: Option<usize>,
         parent: Option<BhSizeSpec>,
         name: String,
         owner: String,
@@ -1406,6 +1422,263 @@ pub enum BhDescr {
         trait_root: String,
         method_name: String,
     },
+}
+
+/// descriptor census: the length-bearing content of the serialized descr pool.
+///
+/// C0 measured the entry *count* stable across two generations (4537 both)
+/// while `descrs.bin` moved −2,226 bytes, first difference at offset 1182.
+/// Same number of entries, different total bytes ⇒ at least one entry
+/// serialized to a different **length**.  In a bincode encoding only the
+/// variable-length components can do that: `String` payloads, `Vec`
+/// membership, and enum discriminants selecting differently-sized arms.
+///
+/// Each channel is summed separately so a second generation names *which*
+/// one moved rather than only that the file did.  The pool-population
+/// counters ([`crate::codewriter::assembler::DescrPoolDuplication`]) cannot
+/// see any of this — they measure how many entries there are, not how long
+/// each one is.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DescrPoolContent {
+    /// Must equal the pool census `total`.  A mismatch means this walk and
+    /// the pool walk disagree about the population, and nothing below is
+    /// interpretable.
+    pub entries: usize,
+    /// Entries per variant.  A `BTreeMap` rather than a `HashMap` so the
+    /// printed order is deterministic — a hash-ordered instrument would be
+    /// a source of the very non-determinism it is measuring.
+    pub kind_counts: std::collections::BTreeMap<&'static str, usize>,
+    /// The string channel: count and total bytes of every `String` /
+    /// `Option<String>` payload reachable from an entry.
+    pub string_count: usize,
+    pub string_bytes: usize,
+    /// The `Vec` channel, excluding descr-set membership below.
+    pub vec_members: usize,
+    /// `descr_set_keys` membership summed over all six sets of every
+    /// concrete `EffectInfo`.  This is what separates "a set gained or lost
+    /// a member" from "a string changed length".
+    pub descr_set_members: usize,
+    /// Entries whose `descr_set_keys` is the `EF_RANDOM_EFFECTS` wildcard,
+    /// which contributes no membership.  Reported so `descr_set_members`
+    /// has a denominator and a zero cannot be read as "no sets present".
+    pub wildcard_effects: usize,
+    /// `Field` pool slots that exist ONLY because `index_in_parent` is an
+    /// `Option` — entries that would merge with another if `None` collapsed
+    /// back to `Some(0)`.
+    ///
+    /// This is the cost of carrying provenance in the pool key, measured
+    /// rather than argued, and in one build rather than an A/B: the `Option`
+    /// adds exactly one distinction over the old `usize` key (`None` vs
+    /// `Some(0)`), so the entries a collapse would remove ARE the difference
+    /// the old key would have shown. **Zero means the key change split
+    /// nothing** — no entry count moved, so no downstream count keyed on the
+    /// pool population moved either.
+    ///
+    /// It is an UPPER BOUND, not an exact count, and the asymmetry is what
+    /// makes it usable. The collapsed key spells the parent through
+    /// `all_fielddescrs.len()` rather than the list itself, while
+    /// `AssemblerDescrKey::Field` carries the whole `BhSizeSpec` — so two
+    /// entries under same-shaped but differently-populated parents merge HERE
+    /// and not in the real pool. That can only inflate the number. **Zero is
+    /// therefore exact**: nothing merged under a coarser key means nothing
+    /// would merge under the finer one either. A nonzero reading is a ceiling
+    /// on the split and needs `field_dupe_report` to say what actually varied.
+    pub field_index_provenance_splits: usize,
+    /// Order-independent digest of every `path_hash`-derived `type_id`.
+    ///
+    /// Addition is commutative, so this moves only if the *set* of hashed
+    /// struct paths changes — not if the same paths are visited in a
+    /// different order.  That is exactly the discriminator the suspect
+    /// needs: `path_hash` uses fixed SipHash keys and cannot vary per
+    /// process, so the open question is *which* path gets hashed.
+    pub type_id_sum: u64,
+    pub type_id_count: usize,
+    /// Logical fields `(owner, name)` holding more than one pool entry.
+    ///
+    /// The pool key is injective over `BhDescr::Field`, so a group of size
+    /// two is one logical field emitted under two different payloads — which
+    /// is exactly the +1 that makes `descrs.len()` differ between runs.
+    /// Expected 0 in a run that reproduces the smaller pool.
+    pub field_dupe_groups: usize,
+    pub field_dupe_entries: usize,
+    /// The groups themselves, one header line per group followed by the
+    /// indented spellings. This is the payload that names the varying
+    /// component; without it a nonzero `field_dupe_groups` says only that
+    /// something split.
+    pub field_dupe_report: Vec<String>,
+}
+
+fn account_effect(effect: &majit_ir::descr::EffectInfo, out: &mut DescrPoolContent) {
+    match &effect.descr_set_keys {
+        None => out.wildcard_effects += 1,
+        Some(keys) => {
+            out.descr_set_members += keys.readonly_fields.len()
+                + keys.write_fields.len()
+                + keys.readonly_arrays.len()
+                + keys.write_arrays.len()
+                + keys.readonly_interiorfields.len()
+                + keys.write_interiorfields.len();
+        }
+    }
+}
+
+/// Census the length-bearing content of exactly the slice that gets
+/// serialized to `descrs.bin` — see [`DescrPoolContent`].
+pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
+    let mut out = DescrPoolContent {
+        entries: descrs.len(),
+        ..Default::default()
+    };
+    // `AssemblerDescrKey::Field` carries every component of `BhDescr::Field`,
+    // so the pool key is injective over the variant: two entries can only
+    // coexist by differing somewhere. Grouping on the logical identity
+    // `(owner, name)` therefore turns a cross-run count difference into a
+    // SINGLE-run observation — the run with the extra entry has a group of
+    // size two, and the two spellings name the component that varied.
+    let mut fields_by_identity: std::collections::BTreeMap<(&str, &str), Vec<String>> =
+        std::collections::BTreeMap::new();
+    // Keyed by the pre-`Option` spelling of the same entry; see
+    // `DescrPoolContent::field_index_provenance_splits`.
+    let mut collapsed_field_keys: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for descr in descrs {
+        let kind = match descr {
+            BhDescr::Field {
+                offset,
+                field_size,
+                field_type,
+                field_flag,
+                is_field_signed,
+                is_immutable,
+                is_quasi_immutable,
+                index_in_parent,
+                name,
+                owner,
+                parent,
+            } => {
+                out.string_count += 2;
+                out.string_bytes += name.len() + owner.len();
+                if let Some(spec) = parent {
+                    out.type_id_sum = out.type_id_sum.wrapping_add(spec.type_id);
+                    out.type_id_count += 1;
+                }
+                let parent_spelling = match parent {
+                    None => "none".to_string(),
+                    Some(spec) => format!(
+                        "size={} type_id={:#x} vtable={:#x} gc={} headerless={} nfields={}",
+                        spec.size,
+                        spec.type_id,
+                        spec.vtable,
+                        spec.is_gc_managed,
+                        spec.headerless,
+                        spec.all_fielddescrs.len(),
+                    ),
+                };
+                // `none` and `0` are printed distinctly on purpose: a spelling
+                // that rendered both as `0` would hide exactly the distinction
+                // this field was widened to carry.
+                let idx_spelling = match index_in_parent {
+                    None => "none".to_string(),
+                    Some(i) => i.to_string(),
+                };
+                // The same entry with the `Option` collapsed back to the old
+                // `usize` key. Two entries sharing this string are two pool
+                // slots the pre-`Option` key would have merged.
+                collapsed_field_keys
+                    .entry(format!(
+                        "{owner}.{name} off={offset} sz={field_size} ty={field_type:?} \
+                         flag={field_flag:?} signed={is_field_signed} imm={is_immutable} \
+                         qi={is_quasi_immutable} idx={} parent[{parent_spelling}]",
+                        index_in_parent.unwrap_or(0)
+                    ))
+                    .and_modify(|n| *n += 1)
+                    .or_insert(1usize);
+                fields_by_identity
+                    .entry((owner.as_str(), name.as_str()))
+                    .or_default()
+                    .push(format!(
+                        "off={offset} sz={field_size} ty={field_type:?} flag={field_flag:?} \
+                         signed={is_field_signed} imm={is_immutable} qi={is_quasi_immutable} \
+                         idx={idx_spelling} parent[{parent_spelling}]"
+                    ));
+                "field"
+            }
+            BhDescr::Array {
+                type_id,
+                array_type_id,
+                interior_fields,
+                ..
+            } => {
+                out.type_id_sum = out.type_id_sum.wrapping_add(*type_id);
+                out.type_id_count += 1;
+                if let Some(spelling) = array_type_id {
+                    out.string_count += 1;
+                    out.string_bytes += spelling.len();
+                }
+                out.vec_members += interior_fields.len();
+                "array"
+            }
+            BhDescr::Size {
+                type_id,
+                owner,
+                all_fielddescrs,
+                ..
+            } => {
+                out.type_id_sum = out.type_id_sum.wrapping_add(*type_id);
+                out.type_id_count += 1;
+                out.string_count += 1;
+                out.string_bytes += owner.len();
+                out.vec_members += all_fielddescrs.len();
+                "size"
+            }
+            BhDescr::Switch {
+                const_keys_in_order,
+                ..
+            } => {
+                out.vec_members += const_keys_in_order.len();
+                "switch"
+            }
+            BhDescr::VtableMethod {
+                trait_root,
+                method_name,
+            } => {
+                out.string_count += 2;
+                out.string_bytes += trait_root.len() + method_name.len();
+                "vtable_method"
+            }
+            BhDescr::Call { calldescr } => {
+                account_effect(&calldescr.extra_info, &mut out);
+                "call"
+            }
+            BhDescr::JitCode { calldescr, .. } => {
+                account_effect(&calldescr.extra_info, &mut out);
+                "jitcode"
+            }
+            BhDescr::InteriorField { .. } => "interior_field",
+            BhDescr::VableField { .. } => "vable_field",
+            BhDescr::VableArray { .. } => "vable_array",
+        };
+        *out.kind_counts.entry(kind).or_default() += 1;
+    }
+    for ((owner, name), mut spellings) in fields_by_identity {
+        if spellings.len() < 2 {
+            continue;
+        }
+        out.field_dupe_groups += 1;
+        out.field_dupe_entries += spellings.len();
+        spellings.sort();
+        out.field_dupe_report
+            .push(format!("{owner}::{name} ×{}", spellings.len()));
+        out.field_dupe_report
+            .extend(spellings.into_iter().map(|s| format!("    {s}")));
+    }
+    // Slots beyond the first in each collapsed group are the ones the
+    // pre-`Option` key would not have minted.
+    out.field_index_provenance_splits = collapsed_field_keys
+        .into_values()
+        .map(|n| n.saturating_sub(1))
+        .sum();
+    out
 }
 
 impl BhDescr {
@@ -1659,7 +1932,13 @@ impl BhDescr {
             is_field_signed: spec.is_field_signed,
             is_immutable: spec.is_immutable,
             is_quasi_immutable: spec.is_quasi_immutable,
-            index_in_parent: spec.index_in_parent,
+            // `Some`, not a carried provenance: the source here is a LIVE
+            // `FieldDescr`, whose index `get_field_descr` already reconciled
+            // against its parent. Whatever the original mint claimed, this
+            // number is the reader's answer and is resolved by construction.
+            // The unresolved state exists only between `fielddescrof` and that
+            // reconciliation.
+            index_in_parent: Some(spec.index_in_parent),
             // Resume/blackhole reconstruct identity from structural
             // fields only; the parent SizeDescr backref is not surfaced
             // by the live `FieldDescr` trait.

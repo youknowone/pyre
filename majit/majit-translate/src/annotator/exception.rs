@@ -144,19 +144,81 @@ pub(crate) fn standard_exception_classdefs(
 mod tests {
     use super::*;
 
+    /// The whole resolved sequence, in order.
+    ///
+    /// These names are **measured**, not derived from
+    /// [`STANDARD_EXCEPTION_NAMES`]. `standard_exception_classes` transforms
+    /// that constant twice — `resolve` maps a name to whatever `HOST_ENV`
+    /// bootstraps, and the `identity_id()` dedup then drops repeats — so the
+    /// output is not the input, and two entries differ:
+    ///
+    /// - **16 names in, 15 classes out.** `IOError` has no distinct host class;
+    ///   it resolves to the `OSError` object and is deduped. It is the `IOError`
+    ///   slot that survives (it comes first), so the list has one `OSError`
+    ///   entry, not two, and no `IOError` entry at all.
+    /// - **`_StackOverflow` reads back as `StackOverflow`.** The bootstrap
+    ///   lookup key keeps the underscore; the qualname does not.
+    ///
+    /// The order is a property of the producer, not an accident: `classes` is a
+    /// `Vec` pushed in `STANDARD_EXCEPTION_NAMES` order, and the `HashSet` is
+    /// consulted for membership only. Pinning it ordered therefore also pins
+    /// that a reorder of the constant is a visible change.
+    const RESOLVED_EXCEPTION_NAMES: [&str; 15] = [
+        "TypeError",
+        "OverflowError",
+        "ValueError",
+        "ZeroDivisionError",
+        "MemoryError",
+        "OSError",
+        "StopIteration",
+        "KeyError",
+        "IndexError",
+        "AssertionError",
+        "RuntimeError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "NotImplementedError",
+        "StackOverflow",
+    ];
+
     #[test]
     fn standard_exception_classes_have_expected_names() {
         let excs = standard_exception_classes();
-        // Spot-check a few entries so rename-away regressions fire.
         let names: Vec<String> = excs.iter().map(|c| c.qualname().to_string()).collect();
-        assert!(names.iter().any(|n| n == "TypeError"));
-        assert!(names.iter().any(|n| n == "OverflowError"));
-        assert!(names.iter().any(|n| n == "MemoryError"));
-        assert!(names.iter().any(|n| n == "UnicodeDecodeError"));
-        assert!(names.iter().any(|n| n == "UnicodeEncodeError"));
+        assert_eq!(names, RESOLVED_EXCEPTION_NAMES);
+    }
+
+    /// The dedup is the reason the set is 15 and not 16, so pin it at its cause
+    /// rather than only at the length: `IOError` and `OSError` must still name
+    /// one object.
+    ///
+    /// Without this, a bootstrap that grew a distinct `IOError` class would fail
+    /// `standard_exception_classes_have_expected_names` with a diff that looks
+    /// like a naming change, and the obvious repair — add `"IOError"` to the
+    /// expected list — would restore green while silently changing what the
+    /// annotator treats as one exception.
+    #[test]
+    fn io_error_and_os_error_resolve_to_one_class() {
+        STANDARD_EXCEPTION_OBJECTS.with(|objects| {
+            assert_eq!(
+                objects.resolve("IOError").identity_id(),
+                objects.resolve("OSError").identity_id(),
+                "IOError is no longer an OSError alias, so the standard set is \
+                 16 classes and the dedup no longer fires"
+            );
+        });
+    }
+
+    /// `_StackOverflow` is bootstrapped under a name the qualname does not
+    /// carry, so a name-keyed check alone cannot show the two spellings are one
+    /// object.
+    #[test]
+    fn stack_overflow_entry_is_the_bootstrapped_builtin() {
+        let excs = standard_exception_classes();
         let stack_overflow = HOST_ENV
             .lookup_builtin("_StackOverflow")
             .expect("HOST_ENV _StackOverflow bootstrap");
+        assert_eq!(stack_overflow.qualname(), "StackOverflow");
         assert!(
             excs.iter()
                 .any(|cls| cls.identity_id() == stack_overflow.identity_id())

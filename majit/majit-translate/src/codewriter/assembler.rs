@@ -266,7 +266,7 @@ pub struct Assembler {
     /// RPython: Assembler.num_liveness_ops (assembler.py:32).
     pub num_liveness_ops: usize,
     /// State-field JIT canonical "all-live" liveness triple, set once at
-    /// `__JitMeta::install_canonical_liveness` time (RPython
+    /// `__JitMeta_<fn>::install_canonical_liveness` time (RPython
     /// `assembler.py:218-231 get_liveness_info` flat-state adaptation).
     /// `JitCodeBuilder::live_placeholder` defers patching of the leading
     /// `BC_LIVE` slot at the start of every per-opcode JitCode until
@@ -321,7 +321,7 @@ impl Assembler {
 
     /// Stage the state-field JIT canonical "all-live" triple for lazy
     /// registration by `ensure_canonical_liveness_offset`.  Called once
-    /// per `__JitMeta::install_canonical_liveness` invocation, before any
+    /// per `__JitMeta_<fn>::install_canonical_liveness` invocation, before any
     /// per-pc JitCode is built.
     pub fn set_canonical_liveness_triple(
         &mut self,
@@ -1796,7 +1796,7 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // The allocation result is ALWAYS a fresh GC ref ('r').  #314:
+                // The allocation result is ALWAYS a fresh GC ref ('r').  fresh-reference:
                 // assert the regalloc result kind structurally (mirror the
                 // getarrayitem invariant), so an Int-banked result fails loud at
                 // emit time instead of silently miscompiling.
@@ -3811,7 +3811,14 @@ fn fielddescrof(
     };
     let mut is_immutable = false;
     let mut is_quasi_immutable = false;
-    let mut index_in_parent = 0usize;
+    // `None` until a lookup arm actually resolves a slot. The minted descr still
+    // carries `0` for the unresolved case (`unwrap_or(0)` at the bottom), so the
+    // emitted `BhDescr::Field` is unchanged; what the `Option` adds is that the
+    // two states stop being the same bytes while they are still separable.
+    // Written as a literal `0`, an unresolved mint and a mint that resolved to
+    // slot 0 are indistinguishable the moment this function returns, and every
+    // census downstream inherits that.
+    let mut index_in_parent: Option<usize> = None;
     let mut parent = None;
     let field_key = if let Some(owner) = field.owner_root.as_deref() {
         let prefix = format!("{owner}.");
@@ -3853,7 +3860,7 @@ fn fielddescrof(
                 is_field_signed = spec.is_field_signed;
                 is_immutable = spec.is_immutable;
                 is_quasi_immutable = spec.is_quasi_immutable;
-                index_in_parent = spec.index_in_parent;
+                index_in_parent = Some(spec.index_in_parent);
             }
             BhFieldLookup::Layout(layout_field) => {
                 offset = layout_field.offset;
@@ -3908,9 +3915,15 @@ fn fielddescrof(
             && let Some(parent_spec) = parent.as_ref()
             && let Some(pos) = unique_slot_at_offset(&parent_spec.all_fielddescrs, offset)
         {
-            index_in_parent = pos;
+            index_in_parent = Some(pos);
         }
     }
+
+    // Outside every `parent` check above, deliberately. This is the only census
+    // that fires when the mint never had a usable parent at all — the case where
+    // the placeholder survives unrepaired and both of the existing counters are
+    // silent by construction. See `census_mint_index_provenance`.
+    majit_ir::descr::census_mint_index_provenance(index_in_parent.is_some());
 
     // The descr's two halves, counted where they are produced rather than at a
     // reader that would repair them (`GcCache::derive_index_in_parent`
@@ -3942,6 +3955,9 @@ fn fielddescrof(
         is_field_signed,
         is_immutable,
         is_quasi_immutable,
+        // Carried as-is: the `None` is the whole point. Collapsing it to `0`
+        // here is what made the split underivable at the reader, and this is
+        // the last place that still knows the difference.
         index_in_parent,
         parent,
         name: field_key,
@@ -4677,6 +4693,82 @@ impl Assembler {
             .collect()
     }
 
+    /// descriptor census: how much of the descr pool is content-duplicate.
+    ///
+    /// `emit_descr` dedups on [`AssemblerDescrKey`], whose `Call` arms carry an
+    /// [`EffectInfoKey`] keyed on `Arc::as_ptr` ptr-ids. Upstream can key on
+    /// `id(descr)` (`effectinfo.py:152-164`) because one gccache per process
+    /// canonicalises every descr, so `id()` *is* content identity. Pyre can
+    /// mint the same logical descr more than once, so two EffectInfos that
+    /// agree on content can disagree on ptr-id and take separate pool slots.
+    ///
+    /// **That over-split is a real unsoundness but it is NOT the cause of
+    /// descriptor census's byte non-determinism, and this census is what refuted it.**
+    /// Measured across two generations: `structurally_distinct` equals
+    /// `comparable` (229 == 229), so every effect-keyed entry is already
+    /// pairwise distinct under the structural key — re-keying on
+    /// `descr_set_keys` would yield the same entries. And `total` was
+    /// identical (4537) in both generations while `descrs.bin` still moved
+    /// −2,226 bytes. The pool population does not move; entry *lengths* do.
+    /// See [`crate::codewriter::jitcode::descr_pool_content`], which measures
+    /// the channel that does.
+    ///
+    /// Retained because a *stable* over-split is still worth knowing about,
+    /// and because this function is the control proving the population is not
+    /// the mover. Measurable in ONE run.
+    pub fn descr_pool_duplication(&self) -> DescrPoolDuplication {
+        let mut out = DescrPoolDuplication {
+            total: self.descrs.len(),
+            ..Default::default()
+        };
+        let mut seen: std::collections::HashSet<(String, EffectInfoStructuralKey)> =
+            std::collections::HashSet::new();
+        for descr in &self.descrs {
+            let (shape, effect) = match descr {
+                AssemblerDescr::Ready(crate::jitcode::BhDescr::Call { calldescr }) => (
+                    format!(
+                        "call|{}|{}|{}|{}|{:?}",
+                        calldescr.arg_classes,
+                        calldescr.result_type,
+                        calldescr.result_signed,
+                        calldescr.result_size,
+                        calldescr.result_erased
+                    ),
+                    &calldescr.extra_info,
+                ),
+                AssemblerDescr::Ready(crate::jitcode::BhDescr::JitCode {
+                    jitcode_index,
+                    fnaddr,
+                    calldescr,
+                }) => (
+                    format!(
+                        "jitcode|{jitcode_index}|{fnaddr}|{}|{}|{}|{}|{:?}",
+                        calldescr.arg_classes,
+                        calldescr.result_type,
+                        calldescr.result_signed,
+                        calldescr.result_size,
+                        calldescr.result_erased
+                    ),
+                    &calldescr.extra_info,
+                ),
+                _ => continue,
+            };
+            out.effect_keyed += 1;
+            match DescrSetShape::of(effect) {
+                DescrSetShape::InvariantViolation => {
+                    out.invariant_violations += 1;
+                    continue;
+                }
+                DescrSetShape::Concrete => out.concrete += 1,
+                DescrSetShape::Wildcard => out.wildcard += 1,
+            }
+            out.comparable += 1;
+            seen.insert((shape, EffectInfoStructuralKey::from_effect_info(effect)));
+        }
+        out.structurally_distinct = seen.len();
+        out
+    }
+
     pub fn finished(&mut self, callinfocollection: &CallInfoCollection) {
         for func_addr in callinfocollection.all_function_addresses_as_int() {
             // RPython: see_raw_object(func.ptr)
@@ -4717,6 +4809,129 @@ struct EffectInfoKey {
     can_invalidate: bool,
     can_collect: bool,
     call_release_gil_target: (u64, i32),
+}
+
+/// [`EffectInfoKey`] re-spelled structurally, for the descriptor census census only.
+///
+/// Identical except that the six raw descr sets are read from
+/// `EffectInfo::descr_set_keys` — the `DescrSetMember` projection that already
+/// crosses the build/runtime boundary — instead of `Arc::as_ptr` ptr-ids.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EffectInfoStructuralKey {
+    extraeffect: majit_ir::descr::ExtraEffect,
+    oopspecindex: majit_ir::descr::OopSpecIndex,
+    descr_set_keys: Option<majit_ir::effectinfo::DescrSetKeys>,
+    can_invalidate: bool,
+    can_collect: bool,
+    call_release_gil_target: (u64, i32),
+}
+
+impl EffectInfoStructuralKey {
+    fn from_effect_info(effect: &majit_ir::descr::EffectInfo) -> Self {
+        Self {
+            extraeffect: effect.extraeffect,
+            oopspecindex: effect.oopspecindex,
+            descr_set_keys: effect.descr_set_keys.clone(),
+            can_invalidate: effect.can_invalidate,
+            can_collect: effect.can_collect,
+            call_release_gil_target: effect.call_release_gil_target,
+        }
+    }
+}
+
+/// Which shape an `EffectInfo`'s `descr_set_keys` takes (descriptor census).
+///
+/// `effectinfo.rs:149-161` states the rule and names its upstream source:
+/// `effectinfo.py:149-162` makes the six raw sets `None` **iff** the EI is
+/// `EF_RANDOM_EFFECTS`. So the population partitions in two, and the third
+/// class below is unrepresentable rather than merely rare.
+///
+/// An earlier version of this file folded [`Self::Wildcard`] and
+/// [`Self::Concrete`] into one `is_informative` predicate and excluded only
+/// [`Self::InvariantViolation`]. Because those two disjuncts *partition* the
+/// population, that predicate was identically `true` and its exclusion count
+/// identically zero — a counter that cannot fire, reported as if it were the
+/// census's control. Splitting the two shapes is what makes the control real:
+/// the census is only trustworthy if it can be shown to have seen both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescrSetShape {
+    /// `descr_set_keys: Some(_)` — the structural projection is present. The
+    /// only shape where two `Arc`s for one logical descr can split a key.
+    Concrete,
+    /// `descr_set_keys: None` with all six raw sets `None` — the
+    /// `EF_RANDOM_EFFECTS` wildcard. Its ptr-id projection is `None` too, so
+    /// it is already canonical under the ptr-keyed dict and cannot move.
+    Wildcard,
+    /// Keys absent while a raw set is present. **The invariant above forbids
+    /// this**; counted so the census *asserts* the invariant rather than
+    /// assuming it. Expected zero — and a zero here means only that, not that
+    /// the census works.
+    InvariantViolation,
+}
+
+impl DescrSetShape {
+    fn of(effect: &majit_ir::descr::EffectInfo) -> Self {
+        if effect.descr_set_keys.is_some() {
+            return Self::Concrete;
+        }
+        let raw_sets_absent = effect._readonly_descrs_fields.is_none()
+            && effect._write_descrs_fields.is_none()
+            && effect._readonly_descrs_arrays.is_none()
+            && effect._write_descrs_arrays.is_none()
+            && effect._readonly_descrs_interiorfields.is_none()
+            && effect._write_descrs_interiorfields.is_none();
+        if raw_sets_absent {
+            Self::Wildcard
+        } else {
+            Self::InvariantViolation
+        }
+    }
+}
+
+/// Output of [`Assembler::descr_pool_duplication`] (descriptor census).
+#[derive(Debug, Default)]
+pub struct DescrPoolDuplication {
+    /// `descrs.len()` — the bincode `Vec` length that opens `descrs.bin`.
+    pub total: usize,
+    /// Entries whose `_descr_dict` key carries an `EffectInfoKey`, i.e. the
+    /// ones keyed partly on `Arc::as_ptr`.
+    pub effect_keyed: usize,
+    /// Of those, [`DescrSetShape::Concrete`] — the only sub-population the
+    /// ptr-keyed dict can over-split, and the only one the fix can move.
+    pub concrete: usize,
+    /// Of those, [`DescrSetShape::Wildcard`] — already canonical under both
+    /// keys, so inert for the defect signal and load-bearing as the control.
+    pub wildcard: usize,
+    /// `concrete + wildcard`. Entries carrying a well-defined structural key.
+    pub comparable: usize,
+    /// Distinct structural keys among `comparable`. **Lower than `comparable`
+    /// means the ptr-keyed dict over-split: the pool holds entries that agree
+    /// on content and disagree only on which `Arc` instance they reached.**
+    pub structurally_distinct: usize,
+    /// [`DescrSetShape::InvariantViolation`] — expected zero *by construction*.
+    /// It asserts the `effectinfo.py:149-162` invariant; it does **not**
+    /// certify the census.
+    pub invariant_violations: usize,
+}
+
+impl DescrPoolDuplication {
+    /// Whether the census observed both shapes, so `structurally_distinct` can
+    /// be read at all.
+    ///
+    /// This is the control the earlier `ambiguous == 0` was mistaken for. A
+    /// census that saw no `Concrete` entry cannot have seen an over-split
+    /// whatever it reports, and one that saw no `Wildcard` entry is walking a
+    /// population that does not match the enumerated construction sites.
+    pub fn saw_both_shapes(&self) -> bool {
+        self.concrete > 0 && self.wildcard > 0
+    }
+
+    /// The partition identity. False means the classification lost entries and
+    /// every other field is suspect.
+    pub fn counts_reconcile(&self) -> bool {
+        self.concrete + self.wildcard + self.invariant_violations == self.effect_keyed
+            && self.comparable == self.concrete + self.wildcard
+    }
 }
 
 impl EffectInfoKey {
@@ -4763,7 +4978,12 @@ enum AssemblerDescrKey {
         is_field_signed: bool,
         is_immutable: bool,
         is_quasi_immutable: bool,
-        index_in_parent: usize,
+        /// `Option`, matching `BhDescr::Field`, so `None` and `Some(0)` keep
+        /// separate pool slots. Two mints that agree on every other component
+        /// while one resolved a slot and the other did not are not the same
+        /// descr, and collapsing them here would hand the runtime whichever
+        /// provenance happened to be minted first.
+        index_in_parent: Option<usize>,
         parent: Option<crate::jitcode::BhSizeSpec>,
         name: String,
         owner: String,
@@ -5064,6 +5284,45 @@ mod tests {
         );
     }
 
+    /// Publish `table` into the process-global name → `StructId` map and hold
+    /// every other registering test out until the returned guard drops.
+    ///
+    /// `register_struct_ids` REPLACES the whole table (`majit-ir/src/descr.rs`,
+    /// `*guard = table`), which is right for production — the front end
+    /// populates it once per program, and merging would leak one program's
+    /// names into the next — and hostile to `cargo test`'s default
+    /// parallelism, where a second registering test wipes the first one's only
+    /// entry while that test is still running. The victim does not fail where
+    /// it registered: its `fielddescrof` silently takes a different arm and
+    /// returns a wrong `offset`.
+    ///
+    /// Measured, not inferred: the two tests below, run as a pair with default
+    /// threads, failed 9 of 12 runs; in the full 3141-test binary the same race
+    /// surfaced once in 6, because the scheduler rarely puts them adjacent.
+    /// Both pass in isolation and under `--test-threads=1`, so neither the
+    /// isolated run nor the serial run can see this.
+    ///
+    /// Scope is one test BINARY, which is the whole racing population: other
+    /// crates' tests run in their own processes and cannot reach this table.
+    ///
+    /// The lock is poison-tolerant. A test that panics mid-body would
+    /// otherwise convert one real failure into a cascade of unrelated ones.
+    ///
+    /// Bind the result to a NAMED local (`let _registry = …`). A bare
+    /// `let _ = …` drops the guard at once and restores exactly the race this
+    /// exists to remove — while still compiling, and still passing in
+    /// isolation.
+    #[must_use = "the returned guard holds the registry lock for the rest of \
+                  the test; dropping it immediately re-opens the race"]
+    fn register_struct_ids_serialized(
+        table: HashMap<String, Option<majit_ir::descr::StructId>>,
+    ) -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        majit_ir::descr::register_struct_ids(table);
+        guard
+    }
+
     #[test]
     fn fielddescrof_resolves_the_slot_when_the_offset_comes_from_the_layout_registry() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
@@ -5071,7 +5330,8 @@ mod tests {
 
         let owner = "assembler_fielddescrof_layout_registry_test::Owner";
         let owner_id = majit_ir::descr::StructId::from_canonical(owner);
-        majit_ir::descr::register_struct_ids(HashMap::from([(owner.to_string(), Some(owner_id))]));
+        let _registry =
+            register_struct_ids_serialized(HashMap::from([(owner.to_string(), Some(owner_id))]));
 
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
@@ -5134,10 +5394,124 @@ mod tests {
         };
 
         assert_eq!(offset, 8);
-        assert_eq!(index_in_parent, 1);
+        assert_eq!(index_in_parent, Some(1));
         assert_eq!(
-            parent.as_ref().unwrap().all_fielddescrs[index_in_parent].offset,
+            parent.as_ref().unwrap().all_fielddescrs[index_in_parent.unwrap()].offset,
             offset
+        );
+    }
+
+    /// The pair the mint census exists for: two `fielddescrof` calls whose
+    /// `index_in_parent` is the SAME NUMBER and means opposite things.
+    ///
+    /// The first half is the load-bearing one. Both descrs carry the INTEGER
+    /// `0` — one because no lookup arm ever ran, one because the field really
+    /// is at slot 0 — so any counter that reads only the value
+    /// (`census_attached_index`, `derive_index_in_parent`,
+    /// `census_spec_positions`) is blind to the difference by construction, not
+    /// by oversight. Asserting that the integers agree is what makes the rest
+    /// mean anything: a census that splits
+    /// two already-distinguishable cases would prove nothing.
+    #[test]
+    fn mint_census_splits_a_placeholder_index_from_a_real_slot_zero() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "assembler_mint_census_test::Owner";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry =
+            register_struct_ids_serialized(HashMap::from([(owner.to_string(), Some(owner_id))]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("visible_zero".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 8,
+                fields: vec![StructFieldLayout {
+                    name: "visible_zero".to_string(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+            },
+        );
+
+        let index_of = |descr: crate::jitcode::BhDescr| {
+            let crate::jitcode::BhDescr::Field {
+                index_in_parent, ..
+            } = descr
+            else {
+                panic!("fielddescrof must produce a field descriptor");
+            };
+            index_in_parent
+        };
+
+        // A real slot-0 claim: the name is in the flattened list at position 0,
+        // so the `Parent` arm writes the index.
+        let before = majit_ir::descr::GcCache::mint_index_census();
+        let claimed_index = index_of(fielddescrof(
+            &FieldDescriptor::new("visible_zero", Some(owner.to_string())),
+            &crate::model::ValueType::Int,
+            Some(&cc),
+        ));
+        let after_claimed = majit_ir::descr::GcCache::mint_index_census();
+
+        // A placeholder: with no `CallControl` the whole lookup block is
+        // skipped, so nothing ever writes the index and the initialiser rides
+        // out on the descr.
+        let placeholder_index = index_of(fielddescrof(
+            &FieldDescriptor::new("visible_zero", Some(owner.to_string())),
+            &crate::model::ValueType::Int,
+            None,
+        ));
+        let after_placeholder = majit_ir::descr::GcCache::mint_index_census();
+
+        // The two mints must land on the SAME integer and still be separable,
+        // or neither half of this test is testing anything: identical integers
+        // are what made the population underivable, and the `Option` is what
+        // makes them tellable apart. Assert both, in that order.
+        assert_eq!(
+            claimed_index.unwrap_or(0),
+            placeholder_index.unwrap_or(0),
+            "the two mints must agree on the integer, or this pair is splitting \
+             something that was already visible without the provenance bit"
+        );
+        assert_eq!(claimed_index, Some(0), "the lookup arm resolved slot 0");
+        assert_eq!(
+            placeholder_index, None,
+            "a mint whose lookup block never ran must carry no claim; if this \
+             is `Some(0)` the provenance was flattened somewhere on the way out"
+        );
+
+        // And separable on the census: each call moved its own arm.
+        //
+        // `>=`, not `==`, and the reason is measured rather than defensive —
+        // the counters are process-global and other tests in this binary mint
+        // field descrs concurrently, so an exact delta read `[3, 0]` where the
+        // call itself contributed `[1, 0]`. Concurrency can only ADD, so a
+        // lower bound on the arm the call must move stays sound: an instrument
+        // wired to one constant arm, or wired to the wrong one, leaves the
+        // expected arm at zero and fails here.
+        //
+        // What this cannot assert, for the same reason: that the call did
+        // NOT also move the other arm. No assertion over a shared counter can,
+        // while the suite runs in parallel. The deterministic half above is the
+        // one that does not depend on it.
+        assert!(
+            after_claimed[0] - before[0] >= 1,
+            "a resolved slot must count as claimed"
+        );
+        assert!(
+            after_placeholder[1] - after_claimed[1] >= 1,
+            "a mint that resolved nothing must count as a placeholder"
         );
     }
 
@@ -5474,7 +5848,7 @@ mod tests {
             is_field_signed: false,
             is_immutable: false,
             is_quasi_immutable: false,
-            index_in_parent: 0,
+            index_in_parent: Some(0),
             parent: None,
             name: "value".into(),
             owner: "Cell".into(),
@@ -5487,7 +5861,7 @@ mod tests {
             is_field_signed: false,
             is_immutable: false,
             is_quasi_immutable: false,
-            index_in_parent: 0,
+            index_in_parent: Some(0),
             parent: None,
             name: "value".into(),
             owner: "Cell".into(),
@@ -5500,7 +5874,7 @@ mod tests {
             is_field_signed: false,
             is_immutable: false,
             is_quasi_immutable: false,
-            index_in_parent: 1,
+            index_in_parent: Some(1),
             parent: None,
             name: "mutate_value".into(),
             owner: "Cell".into(),
@@ -5670,7 +6044,7 @@ mod tests {
 
     #[test]
     fn assemble_fused_goto_if_not_routes_to_reserved_opcode() {
-        // gh #37: a `FlatOp::GotoIfNotOp` assembles through the
+        // the GotoIfNotOp lowering: a `FlatOp::GotoIfNotOp` assembles through the
         // registered `goto_if_not_<op>/<argcodes>` jitcode key — the
         // per-arg register kinds form the argcodes, and the key must
         // resolve to the reserved opcode the metainterp blackhole

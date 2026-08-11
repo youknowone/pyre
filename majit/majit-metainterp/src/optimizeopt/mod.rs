@@ -740,6 +740,12 @@ pub struct OptContext {
     pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
     pub snapshot_vable_boxes: SnapshotBoxes,
+    /// resume.py:399-402 `minimum_virtualizable_size`, handed to
+    /// `memo.number()` in `store_final_boxes_in_guard`. `-1` disables the
+    /// `resume.py:236-239` length check; a non-negative value arms it.
+    /// Copied from `Optimizer::minimum_virtualizable_size`, which
+    /// `default_pipeline_with_virtualizable` derives from the vable config.
+    pub minimum_virtualizable_size: i64,
     /// Per-guard virtualref boxes from tracing-time snapshots.
     /// resume.py:243-247 _number_boxes consumes vref_array as a section
     /// after vable_array. opencoder.py:767 records vref_boxes here.
@@ -1688,6 +1694,9 @@ impl OptContext {
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
+            // resume.py:401-402: `-1` until an Optimizer built with a vable
+            // config overwrites it in `optimize_with_constants_and_inputs_at`.
+            minimum_virtualizable_size: -1,
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
@@ -2307,6 +2316,9 @@ impl OptContext {
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
+            // resume.py:401-402: `-1` until an Optimizer built with a vable
+            // config overwrites it in `optimize_with_constants_and_inputs_at`.
+            minimum_virtualizable_size: -1,
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
@@ -3062,7 +3074,7 @@ impl OptContext {
                 // `materialize_operand_at`, not `from_bound_op`: a
                 // const-folded entry carries an inline-Const pos,
                 // which resolves to its Const operand. The map keys by this
-                // res operand (#146/S8); the single-op re-export lookup
+                // res operand (unsupported-green-type/S8); the single-op re-export lookup
                 // (pure.rs) reproduces it via `materialize_operand_at(source)`.
                 // The operand's identity is the canonical `_forwarded` host
                 // Rc (a synthetic producer registered on first
@@ -3189,7 +3201,7 @@ impl OptContext {
         // `produced` (OpRef dual-key: source + result_opref) is internal
         // scaffolding for `dep_or_materialize` below, which resolves a
         // dependency arg by its replay position. `builder_entries` is the
-        // #146/S8 builder map: ONE entry per short box keyed by the Phase-1
+        // unsupported-green-type/S8 builder map: ONE entry per short box keyed by the Phase-1
         // carried res box (`produced_op.res`, the same Rc the produce loop
         // reads as `self.res`). The carried box is invariant to the
         // invented-name replay-position aliasing the dual key compensates for,
@@ -4305,7 +4317,7 @@ impl OptContext {
             .push((opcode, result, arg0, Some(descr)));
     }
 
-    /// info.py:557 pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))
+    /// info.py:557 `pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))`
     pub fn pure_from_args_arraylen(&mut self, array_ref: OpRef, length: i64) {
         let len_ref = self.emit_constant_int(length);
         self.register_pure_from_args1(OpCode::ArraylenGc, array_ref, len_ref);
@@ -4794,14 +4806,16 @@ impl OptContext {
         }
     }
 
-    /// Native `Operand`-in / `Operand`-out resolver: the [`Operand`] form of
-    /// [`resolve_box_box`](Self::resolve_box_box). Resolves an operand to its
+    /// Native `Operand`-in / `Operand`-out resolver. Resolves an operand to its
     /// `_forwarded` terminal WITHOUT minting a wrapper — the box-native walk
     /// (`arg.get_box_replacement`) and the `OpRef`-store fallback
-    /// ([`get_box_replacement_operand`](Self::get_box_replacement_operand)) both
-    /// stay on the `Operand` carrier. Mirrors `resolve_box_box`'s two arms: a
-    /// bound / const operand walks its own chain and defers to the store only
-    /// when it self-resolves; an unbound operand resolves positionally.
+    /// (`get_box_replacement_operand`) both
+    /// stay on the `Operand` carrier. Two arms: a bound / const operand walks
+    /// its own chain and defers to the store only when it self-resolves; an
+    /// unbound operand resolves positionally.
+    ///
+    /// `Operand` is the only carrier — the Box-carrier resolver family this
+    /// used to be described against was removed with `BoxRef` itself.
     ///
     /// The heal keys on the bound `Op` host directly off the `Operand`; the
     /// native walk (`arg.get_box_replacement`) is byte-identical to the legacy
@@ -4823,12 +4837,12 @@ impl OptContext {
         }
     }
 
-    /// `Option`-returning native sibling of [`resolve_operand_operand`], the
-    /// [`Operand`] form of [`resolve_box_box_opt`](Self::resolve_box_box_opt):
+    /// `Option`-returning native sibling of
+    /// [`resolve_operand_operand`](Self::resolve_operand_operand):
     /// `None` when the operand is a NONE / unresolved position so callers can
     /// supply their own unbound fallback (a sentinel arg box, a
     /// `materialize_*` mint) instead of tripping the position-only panic in the
-    /// total [`get_box_replacement_operand`](Self::get_box_replacement_operand).
+    /// total `get_box_replacement_operand`.
     pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
         self.heal_arg_to_canonical(arg);
 
@@ -5013,8 +5027,8 @@ impl OptContext {
     /// ```
     ///
     /// The full lazy-install path (missing-info → `IntBound.unbounded()`)
-    /// lives in [`Self::getintbound`]; this snapshot is the side-effect-
-    /// free reader used by gates and read-only intersect comparisons.
+    /// lives in [`Self::getintbound_handle`]; this snapshot is the side-
+    /// effect-free reader used by gates and read-only intersect comparisons.
     pub fn peek_intbound_box(
         &self,
         op: &Operand,
@@ -5031,7 +5045,7 @@ impl OptContext {
     /// Clones the inner `PtrInfo` out of its `Rc<RefCell<>>` cell, so
     /// the result is independent of subsequent mutations.  For RPython
     /// object identity (`same_info`, in-place mutation propagation),
-    /// use [`peek_ptr_info_handle`] which returns the live `Rc`.
+    /// use [`Operand::ptr_info_handle`], which returns the live `Rc`.
     pub fn peek_ptr_info(&self, op: &Operand) -> Option<crate::optimizeopt::info::PtrInfo> {
         op.get_box_replacement(false).ptr_info().map(|p| p.clone())
     }
@@ -6338,7 +6352,14 @@ impl OptContext {
         // resume.py:389-452: delegate to ResumeDataVirtualAdder.finish()
         let env = OptBoxEnv { ctx: self };
         let mut memo = ResumeDataLoopMemo::new();
-        let Ok(numb_state) = memo.number(&snapshot, &env, -1) else {
+        // resume.py:403-405 passes `minimum_virtualizable_size` here, which
+        // arms the `resume.py:236-239` length check inside `number()`. This
+        // call site used to hardcode `-1`, so the check — ported faithfully at
+        // `resume.rs:3951-3958` — was disabled for every guard ever numbered,
+        // and a 0-length vable section reached the backend unremarked. It then
+        // surfaced only if the guard was actually deopted, as
+        // `assert!(vable_size > 0)` at `resume.rs:7030`.
+        let Ok(numb_state) = memo.number(&snapshot, &env, self.minimum_virtualizable_size) else {
             return;
         };
 

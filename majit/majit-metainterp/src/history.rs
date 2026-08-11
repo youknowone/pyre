@@ -46,7 +46,7 @@ pub struct TargetToken {
     /// is the `jump_target_descr` Arc address.
     pub token_id: u64,
     /// compile.py: start_descr — the preamble target token has no virtual
-    /// state and lives at target_tokens[0].
+    /// state and lives at `target_tokens[0]`.
     pub is_preamble_target: bool,
     /// Virtual state at this loop entry point.
     /// Used by _jump_to_existing_trace to check compatibility.
@@ -1323,10 +1323,8 @@ mod tests {
         assert_eq!(trace.inputargs[2].tp, Type::Float);
     }
 
-    // ══════════════════════════════════════════════════════════════════
     // History / TreeLoop parity tests
     // Local parity coverage for history.py TreeLoop structure.
-    // ══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_trace_structure_inputargs_and_ops() {
@@ -1505,9 +1503,7 @@ mod tests {
         );
     }
 
-    // ══════════════════════════════════════════════════════════════════
     // History breadth tests — deeper parity with test_history.py
-    // ══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_trace_ops_with_descrs() {
@@ -1960,9 +1956,7 @@ mod tests {
         assert_eq!(types, vec![Type::Int, Type::Ref, Type::Float]);
     }
 
-    // ══════════════════════════════════════════════════════════════════
     // cut_trace_from tests — opencoder.py CutTrace parity
-    // ══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_cut_trace_from_no_escaped_refs() {
@@ -2401,10 +2395,8 @@ mod tests {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════
     // History / TreeLoop parity tests
     // Local parity coverage for history.py/opencoder.py trace materialization.
-    // ══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_trace_has_inputargs_ops_structure() {
@@ -2542,7 +2534,6 @@ mod tests {
     }
 }
 
-// ── TraceCtx recording API (History role) ───────────────────────────────
 //
 // Moved from `trace_ctx.rs` — these are the **History role** of `TraceCtx`,
 // mirroring RPython's `history.py` `History` class: operation recording,
@@ -2812,7 +2803,7 @@ impl TraceCtx {
         self.set_last_guard_resume_position(snapshot_id);
     }
 
-    /// Like [`capture_snapshot_for_last_guard_with_vable_vref`] but stamps
+    /// Like [`Self::capture_snapshot_for_last_guard_with_vable_vref`] but stamps
     /// the resume position on the most-recent *guard* op rather than the
     /// last recorded op.  Used when a guard is emitted inside a helper
     /// (the `_nonstandard_virtualizable` PTR_EQ promote) that records
@@ -2840,7 +2831,7 @@ impl TraceCtx {
         self.set_last_guard_op_resume_position(snapshot_id);
     }
 
-    /// Multi-frame variant of [`capture_snapshot_for_last_guard`].
+    /// Multi-frame variant of [`Self::capture_snapshot_for_last_guard`].
     ///
     /// `frames` must be ordered **outermost-first** — `frames[0]` is the
     /// outermost (root) frame and the last element is the top (currently
@@ -2866,7 +2857,7 @@ impl TraceCtx {
 
     /// `capture_snapshot_for_last_guard_multi_frame` extended with
     /// virtualizable / virtualref payloads — see
-    /// [`capture_snapshot_for_last_guard_with_vable_vref`] for the
+    /// [`Self::capture_snapshot_for_last_guard_with_vable_vref`] for the
     /// upstream parity rationale.  Multi-frame snapshots that capture a
     /// guard with a live virtualizable need to carry vable/vref boxes on
     /// the top (currently-executing) frame so the resume reader's
@@ -2899,10 +2890,10 @@ impl TraceCtx {
         self.set_last_guard_resume_position(snapshot_id);
     }
 
-    /// Like [`capture_snapshot_for_last_guard_multi_frame_with_vable_vref`] but
+    /// Like [`Self::capture_snapshot_for_last_guard_multi_frame_with_vable_vref`] but
     /// stamps the resume position on the most-recent *guard* op rather than the
     /// last recorded op — the multi-frame analog of
-    /// [`capture_snapshot_for_last_guard_op_with_vable_vref`].  Used when a
+    /// [`Self::capture_snapshot_for_last_guard_op_with_vable_vref`].  Used when a
     /// guard emitted inside a helper (the `_nonstandard_virtualizable` PTR_EQ
     /// promote) records further non-guard ops (`emit_force_virtualizable`'s
     /// GETFIELD_GC / PTR_NE / COND_CALL) before the caller captures, yet the
@@ -3066,7 +3057,6 @@ impl TraceCtx {
         opref
     }
 
-    // ── Step 2e.2a: split-borrow helpers ──────────────────────────────
     //
     // Private `do_*` helpers take `(&mut Trace, ...)` so the caller
     // performs an explicit field borrow of `self.recorder`.
@@ -3384,15 +3374,57 @@ impl TraceCtx {
     /// still holding the reserved index is a missed re-stamp, and
     /// `frame_value_count_at` (`pyre-jit-trace`) names it there.
     ///
+    /// This doc used to claim the empty boxes were safe, on the grounds
+    /// that every guard reaching here is constant-narrowed at optimization
+    /// time — "the array index is a function of the already-promoted-constant
+    /// `stackpos`" — so `optimize_guard_value` removes it (`rewrite.rs:653`,
+    /// `actual == expected → Remove`) and it "never reaches the backend, so
+    /// these empty boxes are never numbered or consumed". **That was false,
+    /// and it is why the empty `vable_boxes` shipped as a defect.** It holds
+    /// for an index derived from a promoted-constant `stackpos`, which does
+    /// fold; it does not hold for a `[T; virt]` array subscripted by a
+    /// mutable runtime scalar (`state.tape[state.pointer]`), where the
+    /// `GUARD_VALUE` survives, is numbered, and encodes a **0-length vable
+    /// section**. Measured across the example crates: five shipped that
+    /// record and three of them had green suites, because a malformed resume
+    /// record is only observable through a guard that actually deopts.
+    ///
+    /// The vable-array index is now promoted at the walker instead, by
+    /// `implement_guard_value` (`pyjitpl/dispatch.rs`,
+    /// `pyjitpl.py:1916-1927`), which routes through `record_state_guard` and
+    /// therefore captures the live framestack AND the per-trace
+    /// virtualizable / virtualref boxes.
+    ///
+    /// That hoist narrows this path, it does not close it, and the
+    /// difference is worth stating because the doc above was already once
+    /// wrong in exactly this direction. `get_arrayitem_vable_index` still
+    /// carries its `promote_int` call; it is guarded by `index.is_constant()`
+    /// and so fires only for an index that did not arrive constant. What the
+    /// hoist bought is that the `pyjitpl/dispatch.rs` family is const *by
+    /// construction* at all of its index reads. The
+    /// `jitcode_dispatch/vable_ops.rs` family is gated only on the index
+    /// having a recorded concrete value (`concrete_of_opref`), which a
+    /// non-constant `OpRef` can satisfy — and `PYRE_VABLE_IDX_PROBE`'s own
+    /// caveat, beside that call, says a `NONCONST == 0` reading cannot
+    /// separate "that family is constant" from "that family was never
+    /// reached", because the const-by-construction callers dilute it.
+    ///
+    /// ⇒ The minimal snapshot is load-bearing ONLY for the
+    /// `rd_resume_position >= 0` invariant above. Do not read that as "the
+    /// contents do not matter": they matter to any guard that survives
+    /// optimization, and whether one survives is a property of the traced
+    /// program, not of this function. A promote whose argument might not
+    /// fold belongs at the dispatch layer, not here.
+    ///
     /// The genuinely load-bearing promote (`state.<scalar> = promote(...)`)
     /// does NOT use this path — it lowers to `BC_*_GUARD_VALUE →
     /// record_state_guard → build_state_field_snapshot`
     /// (`pyjitpl/dispatch.rs`), the full-framestack capture already at parity
     /// with `generate_guard`. Threading the live framestack into this recorder
     /// would only matter at framestack depth > 1 (inlined frames), which
-    /// cannot arise until the trace-into machinery exists; a
-    /// partial box list would otherwise positionally misalign the resume
-    /// reader's per-frame register layout, so the snapshot stays minimal.
+    /// cannot arise until the trace-into machinery exists; a partial box list
+    /// would otherwise positionally misalign the resume reader's per-frame
+    /// register layout, so the snapshot stays minimal.
     fn record_guard_with_snapshot(
         &mut self,
         opcode: OpCode,
@@ -3496,8 +3528,6 @@ impl TraceCtx {
         self.record_guard(OpCode::GuardNotInvalidated, &[], num_live)
     }
 
-    // ── Generic typed call ──────────────────────────────────────────
-
     /// Record a function call with explicit argument and return types.
     ///
     /// `opcode` selects the call family (CallI/R/F/N, CallPureI/R/F/N, etc.).
@@ -3576,7 +3606,7 @@ impl TraceCtx {
         let _ = self.call_typed(OpCode::CallN, func_ptr, args, arg_types, Type::Void);
     }
 
-    /// [`call_void_typed`] for hand-written `extern "C"` helpers whose C
+    /// [`Self::call_void_typed`] for hand-written `extern "C"` helpers whose C
     /// signature returns a dummy machine word (`-> i64`, value ignored).
     /// Records the same `CallN` op through a descr that carries the true
     /// callee ABI (`make_call_descr_void_word_abi`) so a signature-exact
@@ -3638,11 +3668,11 @@ impl TraceCtx {
         );
     }
 
-    /// Pure-call analog of [`call_typed_with_effect`] that mirrors
+    /// Pure-call analog of [`Self::call_typed_with_effect`] that mirrors
     /// `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes,
     /// descr, exc=False, pure=True)` for `EF_ELIDABLE_CANNOT_RAISE`
     /// callees: records the initial `Call{I,R,F,N}` op, then patches
-    /// it via [`record_result_of_call_pure`] so the trace ends up with
+    /// it via [`Self::record_result_of_call_pure`] so the trace ends up with
     /// `CallPure*` (or a `Const` when all args fold) AND the
     /// `call_pure_results` cache is populated for cross-trace
     /// constant folding by the optimizer's pure pass
@@ -3691,8 +3721,8 @@ impl TraceCtx {
     }
 
     /// Elidable-can-raise (`EF_ELIDABLE_CAN_RAISE`) counterpart of
-    /// [`call_typed_with_effect_pure`]: records the `Call{I,R,F,N}` and patches
-    /// it to `CallPure*` via [`record_result_of_call_pure`] (same pure-folding
+    /// [`Self::call_typed_with_effect_pure`]: records the `Call{I,R,F,N}` and patches
+    /// it to `CallPure*` via [`Self::record_result_of_call_pure`] (same pure-folding
     /// path), but the callee may raise, so the **caller must emit a trailing
     /// `GuardNoException`** (`pyjitpl.py:2082 handle_possible_exception`,
     /// `do_residual_call`'s `elif cr:` branch) — **except when the returned
@@ -4034,8 +4064,6 @@ impl TraceCtx {
     ) -> OpRef {
         self.call_typed(OpCode::CallPureI, func_ptr, args, arg_types, Type::Int)
     }
-
-    // ── Ref/Float call variants ─────────────────────────────────────
 
     /// Record a ref-returning function call (CallR).
     pub fn call_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
@@ -4966,8 +4994,6 @@ impl TraceCtx {
         result
     }
 
-    // ── CALL_ASSEMBLER ────────────────────────────────────────────
-
     #[cfg(test)]
     fn call_assembler_typed(
         &mut self,
@@ -5169,10 +5195,14 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
     }
 
-    /// Arc-carrying sibling of [`Self::call_assembler_red_only_ref`].
-    /// RPython records the target `JitCellToken` object directly on
+    /// Records a red-args-only CALL_ASSEMBLER against a resolved
+    /// `JitCellToken`. RPython records the target token object directly on
     /// CALL_ASSEMBLER ops (`compile.py:187`), so production walker paths use
     /// this once they have resolved or synthesized the token object.
+    ///
+    /// The `target_number`-taking form, `call_assembler_red_only_ref`, is
+    /// `#[cfg(test)]` — this is the only variant that exists in a production
+    /// build, so it has no sibling to be described against.
     pub fn call_assembler_red_only_ref_arc(
         &mut self,
         target_arc: std::sync::Arc<JitCellToken>,
@@ -5275,8 +5305,6 @@ impl TraceCtx {
         )
     }
 
-    // ── Exception handling ──────────────────────────────────────────
-
     /// Record GUARD_EXCEPTION: assert that the pending exception matches
     /// the given class, and produce a ref to the exception value.
     pub fn guard_exception(&mut self, exc_class: OpRef, num_live: usize) -> OpRef {
@@ -5299,8 +5327,6 @@ impl TraceCtx {
         self.record_op(OpCode::RestoreException, &[exc_class, exc_value]);
     }
 
-    // ── Object allocation ───────────────────────────────────────────
-
     /// Record NEW: allocate a new object described by `descr`.
     pub fn record_new(&mut self, descr: DescrRef) -> OpRef {
         self.record_op_with_descr(OpCode::New, &[], descr)
@@ -5320,8 +5346,6 @@ impl TraceCtx {
     pub fn record_new_array_clear(&mut self, length: OpRef, descr: DescrRef) -> OpRef {
         self.record_op_with_descr(OpCode::NewArrayClear, &[length], descr)
     }
-
-    // ── Virtual references ────────────────────────────────────────
 
     /// Record VIRTUAL_REF_R: create a virtual reference (ref-typed result).
     ///
@@ -5354,8 +5378,6 @@ impl TraceCtx {
         self.record_op(OpCode::ForceToken, &[])
     }
 
-    // ── Overflow-checked arithmetic ────────────────────────────────
-
     /// Record overflow-checked integer add + GuardNoOverflow.
     ///
     /// Returns the result OpRef. On overflow at trace time, the caller
@@ -5379,8 +5401,6 @@ impl TraceCtx {
         self.record_guard(OpCode::GuardNoOverflow, &[], num_live);
         result
     }
-
-    // ── String operations ───────────────────────────────────────────
 
     /// Record NEWSTR: allocate a new string with given length.
     pub fn newstr(&mut self, length: OpRef) -> OpRef {

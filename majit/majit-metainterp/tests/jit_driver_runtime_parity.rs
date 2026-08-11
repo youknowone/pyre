@@ -1346,13 +1346,29 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
 
     assert!(
         driver
-            .back_edge_structured(green_key.clone(), 7, &mut state, &(), || {})
+            .back_edge_structured(
+                green_key.hash_u64(),
+                || green_key.clone(),
+                7,
+                &mut state,
+                &(),
+                || {}
+            )
             .is_none()
     );
-    assert!(
-        driver
-            .back_edge_structured(green_key.clone(), 7, &mut state, &(), || {})
-            .is_none()
+    // Crossing the threshold starts tracing, which returns the target pc so the
+    // caller re-enters the dispatch loop where the trace heads. `None` would
+    // mean no trace started at all.
+    assert_eq!(
+        driver.back_edge_structured(
+            green_key.hash_u64(),
+            || green_key.clone(),
+            7,
+            &mut state,
+            &(),
+            || {}
+        ),
+        Some(7)
     );
     assert!(driver.is_tracing());
 
@@ -1383,10 +1399,12 @@ fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_gr
             .back_edge_keyed(key, 11, &mut state, &(), || {})
             .is_none()
     );
-    assert!(
-        driver
-            .back_edge_keyed(key, 11, &mut state, &(), || {})
-            .is_none()
+    // Crossing the threshold starts tracing, which returns the target pc so the
+    // caller re-enters the dispatch loop where the trace heads. `None` would
+    // mean no trace started at all.
+    assert_eq!(
+        driver.back_edge_keyed(key, 11, &mut state, &(), || {}),
+        Some(11)
     );
     assert!(driver.is_tracing());
 
@@ -1424,11 +1442,14 @@ fn declarative_driver_trait_builds_runtime_driver_without_manual_descriptor_plum
             .expect("green key should build")
             .is_none()
     );
-    assert!(
+    // Crossing the threshold starts tracing, which returns the target pc so the
+    // caller re-enters the dispatch loop where the trace heads. `None` would
+    // mean no trace started at all.
+    assert_eq!(
         driver
             .back_edge_declarative::<DeclarativeDriver>(&[13, 21], 13, &mut state, &(), || {})
-            .expect("green key should build")
-            .is_none()
+            .expect("green key should build"),
+        Some(13)
     );
     assert!(driver.is_tracing());
 
@@ -1526,11 +1547,14 @@ fn declarative_driver_preserves_typed_red_inputargs_on_trace_start() {
             .expect("green key should build")
             .is_none()
     );
-    assert!(
+    // Crossing the threshold starts tracing, which returns the target pc so the
+    // caller re-enters the dispatch loop where the trace heads. `None` would
+    // mean no trace started at all.
+    assert_eq!(
         driver
             .back_edge_declarative::<TypedDeclarativeDriver>(&[17, 23], 17, &mut state, &(), || {})
-            .expect("green key should build")
-            .is_none()
+            .expect("green key should build"),
+        Some(17)
     );
     assert!(driver.is_tracing());
 

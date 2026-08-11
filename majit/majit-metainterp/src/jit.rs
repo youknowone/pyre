@@ -372,7 +372,6 @@ impl std::fmt::Display for InvalidVirtualRef {
 
 impl std::error::Error for InvalidVirtualRef {}
 
-// ---------- implementation-specific ----------
 // rlib/jit.py:493
 
 // ── DirectVRef ──
@@ -856,7 +855,7 @@ pub fn record_exact_class<V: RecordExactClassValue>(value: V, cls: usize) {
 ///
 /// rtyper/debug.py:23-26 — `assert x is not None; return x`
 ///
-/// In Rust there is no Python `None` per se; the Option<&T> / Option<Box<T>>
+/// In Rust there is no Python `None` per se; the `Option<&T>` / `Option<Box<T>>`
 /// shape is the closest analog, and `Option::expect("ll_assert_not_none")`
 /// preserves the upstream assertion semantics. The standalone identity
 /// form (`x.assert_not_none()` on already-non-None Rust values) is a

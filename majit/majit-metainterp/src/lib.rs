@@ -135,7 +135,7 @@ pub use jitdriver::{
 pub use majit_backend::CompiledTraceInfo;
 pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 // Re-export the canonical translate-side Assembler so macro-emitted
-// state-field JIT setup (e.g. `__JitMeta::install_canonical_liveness`)
+// state-field JIT setup (e.g. `__JitMeta_<fn>::install_canonical_liveness`)
 // can build a fresh Assembler without forcing each user crate to
 // declare a `majit-translate` dependency.  The same pattern is used
 // for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs:4`).
@@ -205,7 +205,6 @@ pub fn jit_strict_mode() -> bool {
     *STRICT
 }
 
-// ── Cached diagnostic env-var helpers ────────────────────────────────
 //
 // Each env var is read once and cached via OnceLock so hot paths
 // (back-edge, guard-failure, optimizer) never re-acquire the global
@@ -229,6 +228,15 @@ pub fn callee_rca_enabled() -> bool {
 pub fn nbody_debug_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("PYRE_NBODY_DEBUG").is_some())
+}
+
+/// Constness of every index arriving at `TraceCtx::get_arrayitem_vable_index`.
+/// See that function for what the counts do and do not establish — in
+/// particular, it is a shared callee and the reading cannot be attributed to a
+/// caller family without pairing it with a call-site probe.
+pub fn vable_idx_probe_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_VABLE_IDX_PROBE").is_some())
 }
 
 pub fn mptrace_enabled() -> bool {
@@ -323,6 +331,271 @@ pub fn step_limit() -> u64 {
             .unwrap_or(8_000_000)
     });
     *VAL
+}
+
+/// A dispatch arm whose body `#[jit_interp]` could not lower, so the macro
+/// substituted a bare `BC_ABORT` sub-JitCode for it.
+///
+/// The substitution is deliberate — `make_jitcodes()` builds the portal even
+/// when one opcode lowers to a residual the tracer cannot follow, so that
+/// opcode aborts the trace instead of disabling the JIT for every other
+/// opcode.  What was missing is any record of WHICH opcode.  At execution the
+/// only surviving signal is `abort_trace` falling back to
+/// `AbortReason::Generic` → `counters::ABORT_BRIDGE` → `MC_DIAG` slot 41,
+/// which `jitprof.rs` documents as overwhelmingly unclassified; by then the
+/// arm's identity is gone.  This channel keeps it, named, from the point the
+/// stub is built.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DegradedDispatchArm {
+    /// The machine's declared `state = T` type name (`VmStateF`), which is
+    /// what identifies one `#[jit_interp]` mainloop among several.
+    pub interp: &'static str,
+    /// The arm's match pattern as written in the source (`OP_RETURN_F`).
+    pub arm: &'static str,
+    /// Why the body did not lower, staged by the macro at the emitting site.
+    pub reason: &'static str,
+}
+
+/// The mechanism that refused a dispatch arm, as a value a gate can compare.
+///
+/// [`DegradedDispatchArm::reason`] is prose staged by the macro at the emitting
+/// site, naming both the refusing mechanism and the offending source. A gate
+/// pinning the whole string breaks on every rewording; a gate pinning only the
+/// arm NAME cannot see a change of mechanism at all.
+///
+/// Pinning only the arm name is insufficient because the arm can remain
+/// degraded while its refusing mechanism changes. Tests that care about the
+/// mechanism compare this enum as well as the arm name.
+// `Ord` so a gate can sort `(arm, RefusalKind)` pairs into a stable order before
+// comparing. Arm names lead every such tuple, so the derived variant order never
+// decides a comparison; it exists to make the pair sortable at all.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum RefusalKind {
+    /// The arm writes a green this lowering path cannot carry back to the
+    /// caller.  This refusal stops lowering, so it is the arm's OUTERMOST
+    /// blocker; any later ones are reported behind it in the same `reason`.
+    /// Read them with [`refusal_kinds`], not [`refusal_kind`].
+    GreenWriteback,
+    /// The lowerer has no expression for one of the arm's statements.
+    UnlowerableStmt,
+    /// The arm encloses a `break`/`continue` that cannot be lowered in place.
+    EnclosedBreakContinue,
+    /// The arm encloses a `return` that cannot be lowered in place.  Sibling of
+    /// [`Self::EnclosedBreakContinue`]; the lowerer guards the two separately.
+    EnclosedReturn,
+    /// The arm body has no statements to lower.
+    EmptyBody,
+    /// The arm has no `pc` binding for the pc-return writeback.
+    NoPcBinding,
+    /// Lowering resolved an unsupported call policy at install time.
+    ///
+    /// The only family raised at INSTALL rather than by the statement lowerer,
+    /// so it carries no `arm body {what}: {spelling}` shape and names no
+    /// offending statement — a gate keyed on a source snippet gets nothing here.
+    UnsupportedCallPolicy,
+    /// The lowerer's fallback wording, reached when a refusal site never set a
+    /// specific reason.
+    ///
+    /// Deliberately its own variant rather than folded into
+    /// [`Self::Unclassified`]: the fallback's own doc keeps the exact old string
+    /// so that sites a refactor never reached stay greppable.  Reaching it means
+    /// "some refusal site is still unconverted", which is a different fact from
+    /// "majit grew a mechanism nobody has classified".
+    UnreachedLoweringFallback,
+    /// No known fragment matched.
+    ///
+    /// Deliberate, and the reason this is an enum with an explicit fallthrough
+    /// rather than a permissive default: bucketing an unrecognised reason into a
+    /// known family reproduces the defect this type exists to close — a new
+    /// mechanism arriving under an unchanged value, invisible to every gate.
+    /// Reaching this variant should fail a gate, not be tolerated by one.
+    Unclassified,
+}
+
+/// Classify a [`DegradedDispatchArm::reason`] by the mechanism that refused it.
+///
+/// Keyed on the shortest fragment that names the mechanism, so rewording the
+/// prose around it does not break the gates.  Rewording a *fragment* is
+/// expected to require an edit here: re-point it rather than relaxing a caller's
+/// assertion.
+///
+/// One home, because the alternative was measured too — this classifier existed
+/// as four copied literals across the example gates and was headed for nine.  N
+/// copies of a predicate drift apart silently and no single reader can see the
+/// divergence, which is the same disease the gates themselves exist to catch.
+/// `tests/degraded_arm_refusal_kind.rs` pins the mapping against reasons
+/// recorded from the example crates.
+/// The families are the macro's whole reachable refusal vocabulary, read off the
+/// producers rather than off the reasons that happen to be emitted today — three
+/// of the eight are observed in the example corpus and five are not.  Listing
+/// only the observed ones would make [`RefusalKind::Unclassified`] mean "not
+/// seen yet" instead of "majit grew a mechanism", which is the false alarm this
+/// type exists to avoid.
+/// Joins the refusals accumulated into one [`DegradedDispatchArm::reason`].
+///
+/// Cross-crate contract: mirrors `REFUSAL_SEPARATOR` in majit-macros'
+/// `jitcode_lower::lower_stmt`. A proc-macro crate cannot export a value to its
+/// runtime, so the two literals are kept in step by
+/// `accumulated_reason_splits_into_its_refusals` in
+/// `tests/degraded_arm_refusal_kind.rs`, which splits a reason recorded by a
+/// real crate and would read one segment where it expects two.
+pub const REFUSAL_SEPARATOR: &str = " || ";
+
+/// The refusals in `reason`, in the order lowering hit them.
+pub fn refusal_reasons(reason: &str) -> impl Iterator<Item = &str> {
+    reason.split(REFUSAL_SEPARATOR)
+}
+
+/// Every refusal's family, in order. `refusal_kind(r) == refusal_kinds(r)[0]`.
+///
+/// This is the accessor that makes the family distribution a measurement rather
+/// than a lower bound: an arm reports its outermost refusal in `reason`'s head,
+/// and the rest of the string is what lowering found behind it.
+pub fn refusal_kinds(reason: &str) -> Vec<RefusalKind> {
+    refusal_reasons(reason).map(refusal_kind_of_one).collect()
+}
+
+/// Classify the FIRST refusal.
+///
+/// Must split before matching, and this is not a stylistic preference. The
+/// classifier below is an ORDERED chain of `contains` tests, so on an
+/// accumulated reason an un-split match would answer with whichever fragment
+/// the chain tests earliest — not with the refusal lowering actually hit first.
+/// Keeping the first refusal at the head of the string is necessary for that
+/// and not sufficient: without this split, adding accumulation silently
+/// re-classifies every previously landed pin.
+pub fn refusal_kind(reason: &str) -> RefusalKind {
+    refusal_kind_of_one(refusal_reasons(reason).next().unwrap_or(reason))
+}
+
+fn refusal_kind_of_one(reason: &str) -> RefusalKind {
+    if reason.contains("encloses a `return`") {
+        RefusalKind::EnclosedReturn
+    } else if reason.contains("encloses a `break`") {
+        RefusalKind::EnclosedBreakContinue
+    } else if reason.contains("writes a green") {
+        RefusalKind::GreenWriteback
+    } else if reason.contains("cannot express") {
+        RefusalKind::UnlowerableStmt
+    } else if reason.contains("no statements to lower") {
+        RefusalKind::EmptyBody
+    } else if reason.contains("no `pc` binding") {
+        RefusalKind::NoPcBinding
+    } else if reason.contains("unsupported call policy") {
+        RefusalKind::UnsupportedCallPolicy
+    } else if reason.contains("could not be lowered to a sub-JitCode") {
+        RefusalKind::UnreachedLoweringFallback
+    } else {
+        RefusalKind::Unclassified
+    }
+}
+
+static DEGRADED_DISPATCH_ARMS: std::sync::Mutex<Vec<DegradedDispatchArm>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record that `arm` of `interp` was emitted as an abort stub.
+///
+/// Called from the `__dispatch_jitcode_*` body, so it fires when the dispatch
+/// JitCode is installed rather than when the trace later walks into the stub.
+/// Entries are deduplicated by content: a dispatch JitCode may be built more
+/// than once per process, and the fact reported is per-arm, not per-build.
+pub fn record_degraded_dispatch_arm(interp: &'static str, arm: &'static str, reason: &'static str) {
+    let entry = DegradedDispatchArm {
+        interp,
+        arm,
+        reason,
+    };
+    let mut arms = DEGRADED_DISPATCH_ARMS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if arms.contains(&entry) {
+        return;
+    }
+    if majit_log_enabled() {
+        eprintln!(
+            "[jit] degraded dispatch arm: {}::{} lowered to an abort stub ({})",
+            entry.interp, entry.arm, entry.reason
+        );
+    }
+    arms.push(entry);
+}
+
+/// Snapshot of every dispatch arm recorded as degraded so far.
+pub fn degraded_dispatch_arms() -> Vec<DegradedDispatchArm> {
+    DEGRADED_DISPATCH_ARMS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// The shape of a compiled loop body, as a tier gate needs to read it.
+///
+/// A compile counter says a trace was *compiled*; an op count says the body is
+/// not the degenerate `Finish()`. Neither says the body is a **loop**. A body
+/// can be several ops long, carry no back edge, and be cut short by a guard
+/// whose only outcome is a bail-out — a compiled trace that can never run a
+/// second iteration. That is what a bare `compiles > 0 && ops_after > 1`
+/// recipe accepts, and it is what this type is for.
+///
+/// Build it from the opcodes `JitDriver::set_on_compile_loop` hands the
+/// callback, and read it in the same lock window as the counters: the shape is
+/// as process-global as they are.
+///
+/// Only meaningful when the gate's subject **contains a loop**. On a
+/// straight-line program a body with no back edge is the correct answer, not a
+/// defect, and asserting [`Self::closes_a_loop`] there rejects a healthy
+/// compile.
+///
+/// `Label` is deliberately not part of this. An optimized body can close its
+/// back edge without one — tinyframe's carries a `Jump` and no `Label` — so a
+/// predicate that also demanded a `Label` would reject a healthy body.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoopBodyShape {
+    /// The body carries a `Jump`: it reaches its own back edge.
+    pub has_jump: bool,
+    /// The body carries a `GuardAlwaysFails`: a guard with no passing outcome,
+    /// so control leaves the compiled body where it sits.
+    pub has_always_fails: bool,
+}
+
+impl LoopBodyShape {
+    /// Read the shape off an optimized body.
+    pub fn of(opcodes: &[majit_ir::OpCode]) -> Self {
+        Self {
+            has_jump: opcodes.contains(&majit_ir::OpCode::Jump),
+            has_always_fails: opcodes.contains(&majit_ir::OpCode::GuardAlwaysFails),
+        }
+    }
+
+    /// The body reaches a back edge and is not cut short by a guard that
+    /// cannot pass.
+    pub fn closes_a_loop(self) -> bool {
+        self.has_jump && !self.has_always_fails
+    }
+
+    /// Why [`Self::closes_a_loop`] is false, phrased for an assertion message.
+    /// `None` when it is true.
+    ///
+    /// Both fields get their own arm, including the one where both are false at
+    /// once. A first-match chain would report only `has_jump` there, and that is
+    /// the weaker of the two facts: "no `Jump`" is true of every straight-line
+    /// body, while `GuardAlwaysFails` names the specific pathology. The reader
+    /// of a failing gate has nothing but this string.
+    pub fn why_not(self) -> Option<&'static str> {
+        match (self.has_jump, self.has_always_fails) {
+            (true, false) => None,
+            (true, true) => {
+                Some("carries a `GuardAlwaysFails`, so control leaves it rather than looping")
+            }
+            (false, true) => Some(
+                "carries no `Jump` AND carries a `GuardAlwaysFails`: it neither reaches a back \
+                 edge nor has a passing outcome at that guard",
+            ),
+            // Also the [`Default`] value, which the gates reset to before the
+            // hook runs — so this arm reads as "the hook never fired" too.
+            (false, false) => Some("carries no `Jump`, so it never reaches a back edge"),
+        }
+    }
 }
 
 /// Result of tracing a single instruction.
@@ -544,10 +817,22 @@ pub fn green_key_hash(values: &[i64]) -> u64 {
 /// as identity over the pointer bits.  Mirrors the typed schema that
 /// `#[jit_interp]` macro-emitted code now produces via
 /// `GreenKey::with_types`.
+///
+/// Folds `green_uhash_step` over the slices directly rather than building a
+/// [`majit_ir::GreenKey`] to hash and drop — the key was never returned, so the
+/// two `to_vec()`s were pure overhead. Equals
+/// `GreenKey::with_types(values.to_vec(), types.to_vec()).hash_u64()`,
+/// including the short-`types` padding: `GreenKey::get_uhash` reads types with
+/// `.get(i).unwrap_or(Int)`, so a ragged call pads rather than truncates.
 #[inline]
 pub fn green_key_hash_typed(values: &[i64], types: &[majit_ir::GreenType]) -> u64 {
     debug_assert_eq!(values.len(), types.len());
-    majit_ir::GreenKey::with_types(values.to_vec(), types.to_vec()).hash_u64()
+    let mut x = majit_ir::GREEN_UHASH_SEED;
+    for (i, &value) in values.iter().enumerate() {
+        let tp = types.get(i).copied().unwrap_or(majit_ir::GreenType::Int);
+        x = majit_ir::green_uhash_step(x, tp, value);
+    }
+    x
 }
 
 // ── we_are_jitted / JIT mode flag ──
@@ -588,7 +873,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 61;
+pub const MC_DIAG_SLOTS: usize = 75;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -642,6 +927,24 @@ pub const MC_DIAG_SLOTS: usize = 61;
 /// optimizer deferred an `InvalidLoop` on the root trace, 48 = the root
 /// `compile_loop` returned `Err`, 49 = a bridge compile came back `Aborted`.
 ///
+/// 70 completes that decomposition from the other end: the abort where *no*
+/// reason was staged at all and the code fell back to `AbortReason::Generic`,
+/// counted where the fallback is chosen (`pyjitpl.rs abort_trace`,
+/// `jitdriver.rs`'s reason ladder). Slot 41 is the total of every
+/// `aborted_tracing(ABORT_BRIDGE)` and cannot separate a real bridge giveup
+/// from that default, which is what made `abrt_bridge=1` read as evidence of
+/// bridge activity that was not there.
+///
+/// 70 is NOT `41 - (47+48+49)`, and that subtraction must not be used:
+/// 47-49 are bumped at the RAISE, immediately before
+/// `return Err(SwitchToBlackhole::giveup())`, while 41 is bumped at the CATCH
+/// inside `aborted_tracing`. A giveup raised on a path that never reaches a
+/// catch is counted by one and not the other, in a direction nothing
+/// announces. Each slot counts its own event at its own site, so a
+/// disagreement between them is readable rather than silent — if 47+48+49 ever
+/// exceeds what 41 can account for, that difference is a giveup that was
+/// raised and never accounted, which has no other detector.
+///
 /// 50 = `close_bridge` declined while closing a bridge, 51 = bridge close found
 /// no compiled target, 52 = abort after a declined bridge attempt, 53 =
 /// `compile_trace` called `compile_bridge` and it returned false.
@@ -676,7 +979,115 @@ pub const MC_DIAG_SLOTS: usize = 61;
 /// skipped its close, and `find_biggest_function` mis-sizes every frame after
 /// it.  A `debug_assert!` cannot see that; the imbalance is only visible across
 /// a whole run.
+///
+/// 61-63 are `maybe_start_tracing`'s two early returns and their denominator,
+/// which is 61 and is bumped unconditionally at entry so the two refusals can
+/// be read as fractions rather than bare totals: 62 = `sync_before` returned
+/// false, 63 = `live_values_match_descriptor` returned false. Both return
+/// before `on_back_edge_typed`, so `61 - 62 - 63` is the number of calls that
+/// reach the hotness counter at all. The two are counted separately because a
+/// deferral past the counter is worth the cost of whichever refusal dominates,
+/// and nothing currently says which does; a slot reading 0 across the corpus
+/// says its refusal never fires, which is a different design than one that
+/// fires often.
+///
+/// 64-66 split slot 23, which is bumped on the disjunction
+/// `cell.is_compiled() || cell.is_tracing()` and so cannot attribute: the
+/// `is_compiled()` term fires on every function-entry probe of every
+/// already-compiled key, which is the normal high-rate case, so slot 23
+/// climbs in a healthy tree. Slot 23 stays their total. The two terms are
+/// evaluated independently rather than short-circuited, and both are counted,
+/// so a cell that is compiled *and* tracing bumps 64 and 65 both — they
+/// partition nothing and must not be subtracted from each other.
+/// 64 = the `is_compiled()` term was true, 65 = the `is_tracing()` term was
+/// true.
+///
+/// CORRECTED. An earlier version of this legend said 66 was the
+/// discriminator and 65 alone was not, on the premise that "a cell's
+/// `JC_TRACING` is legitimately set while a trace is genuinely running, so a
+/// non-zero 65 is the healthy reading". **That premise is false at the only
+/// production call site.** `should_trace_function_entry` is reached from
+/// exactly one production caller, `pyre-jit`'s `try_function_entry_jit`, which
+/// guards on `!driver.is_tracing()`. That resolves to
+/// `MetaInterp::tracing.is_some()` — one global `Option`, not a per-cell flag —
+/// so while the engine is tracing the caller returns a frame earlier and this
+/// gate is never reached.
+///
+/// ⇒ **In production, every bump of 65 is a cell holding `JC_TRACING` while no
+/// trace is running.** 65 is itself the leak signal; there is no healthy 65 at
+/// this site. (The function can still be called mid-trace directly, and the
+/// unit tests do, so the distinction is production-path-specific.)
+///
+/// 66 splits those leaks by AGE rather than into leak-vs-healthy. It counts the
+/// subset of 65 whose `cell.tracing_generation` is strictly older than the warm
+/// state's, i.e. a session a later `start_tracing_cell` superseded. Only
+/// `start_tracing_cell`/`start_tracing_cell_for_key` increment the generation;
+/// the `mark_as_being_traced` pair stamp it without incrementing. So `65 > 0`
+/// with `66 == 0` is a flag leaking from the most recent session — if anything
+/// the more direct miss, since that is exactly the clear the tracing teardown
+/// is responsible for.
+///
+/// A stale `JC_TRACING` can only sit on a cell that once started tracing. The
+/// door counters alone do not prove that the examined cell ever started a
+/// trace. `caro_funcentry` must also be nonzero. The keys that trace at back
+/// edges are distinct from function-entry keys because `pc` is folded as a green
+/// (`majit_ir::pypyjit_greenkey_uhash`), so a loop-header pc and an entry pc
+/// are different keys. The probed set and the ever-traced set were disjoint.
+///
+/// ⇒ **TWO WITNESSES ARE NEEDED AND THEY ARE NOT THE SAME.**
+///
+/// * DOOR-RAN: slots 23, 24 and 25 are each bumped at exactly one site, all
+///   three inside `should_trace_function_entry`, so `23 + 24 + 25 > 0` proves
+///   the gate executed. **Necessary, not sufficient.** It is also a LOWER BOUND
+///   on entries, not a denominator — two `DONT_TRACE_HERE` exits are uncounted
+///   — so it cannot carry a rate either.
+/// * ARMED: `caro_funcentry` (slot 19) must be `> 0`, or no probed cell was
+///   ever in a position to hold the flag. The bump sits at the top of
+///   pyre-jit's `compile_and_run_once` above every early return, so a zero
+///   means that call was never reached, not that it returned early. But the
+///   CALL is unconditional while the SLOT is selected by the `start` arm
+///   (`BackEdge => 18`, `FunctionEntry => 19`, `eval.rs:8991-8994`), so 19
+///   counts function-entry starts ONLY — a back-edge-only workload leaves 19
+///   at 0 while 18 climbs. Read 19, never 18 + 19, and never "the arm was
+///   entered".
+///
+/// The two witnesses sit in one function and in this order:
+/// `try_function_entry_jit` calls the door at `eval.rs:9397` and reaches
+/// `compile_and_run_once(.., FunctionEntry)` 235 lines later at `:9632`. So in
+/// the worked example above the door ran 2540 times and control never once
+/// reached the compile call — every probe declined at the door or between it
+/// and `:9632`. That is the mechanism behind "the probed set and the
+/// ever-traced set were disjoint", and it is also why 23 + 24 + 25 cannot
+/// stand in for 19: they are counted on the near side of that gap.
+///
+/// `65 == 0` refutes only with **both**. With either missing the reading is
+/// NOT EXERCISED — never "clean". The general form, from the first three
+/// revisions of this legend, which failed the same way: an exercise witness
+/// must witness the ARMING POPULATION, not that the instrument ran.
+///
+/// CORRECTED A THIRD TIME, and this one is a different failure. The
+/// condition above was right; the sentence describing slot 19 said it was
+/// "bumped unconditionally at the top of `compile_and_run_once`", which
+/// drops the arm selection and so describes a witness with twice the
+/// coverage of the one that exists. The verdict does not move — `19 == 0`
+/// is still NOT EXERCISED either way — but the reader's model of the run
+/// does, in two ways that matter. On a back-edge workload `18 > 0` with
+/// `19 == 0` is flatly impossible under the wrong reading, so a reader
+/// resolves the contradiction by distrusting a healthy instrument or the
+/// run itself; and a reader who believes any `compile_and_run_once` entry
+/// bumps 19 will accept `18` (or `18 + 19`) as an arming witness, which it
+/// is not. **A witness's stated domain is part of the witness, and it is
+/// the part that gets applied.** (Found by sizes-2 against a census of
+/// production readouts; re-verified here at `eval.rs:8991-8994`.)
+///
+/// And 64 is narrower than "a compiled callee was probed": the caller has
+/// already excluded `has_runnable_compiled_loop` (a driver-side meta table)
+/// while 64 reads `cell.is_compiled()` (the warmstate cell token). The two
+/// disagree in both directions, so **64 counts cell-vs-meta disagreement.**
 pub static MC_DIAG: [std::sync::atomic::AtomicU64; MC_DIAG_SLOTS] = {
+    // `AtomicU64` is not `Copy`, but a repeat expression accepts a path to a
+    // const item, so the length is taken from `MC_DIAG_SLOTS` rather than from
+    // a spelled-out row of elements that has to be recounted by hand.
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [Z; MC_DIAG_SLOTS]
 };
@@ -745,6 +1156,59 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     "ptp_push",
     "ptp_pop",
     "forced_never_compiled",
+    "mst_entered",
+    "mst_sync_before_false",
+    "mst_live_values_mismatch",
+    "stfe_declined_compiled",
+    "stfe_declined_tracing",
+    "stfe_declined_tracing_stale",
+    // Appended, never inserted: a slot's index is its position here, and every
+    // `mc_diag_bump(N)` in the tree names that position.
+    "bridge_unattempted_close",
+    // The producer side of the cross-loop close, which slots 50 and 67 consume.
+    // They sum: 68 = 69 + (target not compiled), and 69 = 70 + (already latched
+    // declined). Without 68 a zero at 70 cannot say whether the decision was
+    // never reached or was reached and answered no — and the corpus reads the
+    // second case, not the first.
+    "xloop_close_decision_reached",
+    "xloop_close_target_compiled",
+    "xloop_close_published",
+    "abrt_unclassified_default",
+    // The three outcomes of one `InvalidLoop` reaching `compile_loop`'s handler.
+    // They PARTITION that event: the handler either cancels (72) or runs the
+    // unroll-free retry, which rescues (73) or abandons (74). So
+    // `72 + 73 + 74` is the number of `InvalidLoop`s raised anywhere in the
+    // optimizer — a total that `MAJIT_LOG=1` prints independently as
+    // `[jit] abort trace at key=… (InvalidLoop: …)`, which makes these three
+    // cross-checkable against a channel that does not go through them.
+    //
+    // They are sited at the CONVERGENCE point, not at any raise site. The
+    // optimizer constructs `InvalidLoop` at ~24 places across six files, in at
+    // least two families that reach different crates, so a counter at any one
+    // raise site measures its own family and reads as a corpus figure. Every
+    // one of those sites arrives here.
+    //
+    // WHICH OF 72 AND 73 ANSWERS "how often was the unrolled compile
+    // abandoned" IS DECIDED BY `max_unroll_loops`, AND AT A LIMIT OF 0 IT IS
+    // 73. The handler cancels while `cancelled_too_many_times()` is false, i.e.
+    // while `cancel_count <= max_unroll_loops`, so at a limit of L:
+    //
+    //   L > 0  — the first L events for a key land in 72 and tracing continues;
+    //            only the L+1'th runs the retry. 73 then counts keys that
+    //            reached the retry rather than abandoned compiles, and a key
+    //            that never exceeds L never appears in 73 at all.
+    //   L == 0 — `1 > 0` holds on the very first `InvalidLoop`, so 72 is never
+    //            bumped and every abandoned unrolled compile goes straight to
+    //            the retry. 73 is then EXACT, and a zero in 72 is 0-out-of-0
+    //            rather than a report that nothing was abandoned.
+    //
+    // A crate that never passes `"max_unroll_loops"` to `jit::set_param` takes
+    // L from `warmstate::DEFAULT_MAX_UNROLL_LOOPS`, so read that constant before
+    // reading 72. `TraceCtx::declined_cross_loop_closes` draws its own
+    // consequence from the same one.
+    "unroll_cancelled_invalid_loop",
+    "unroll_free_retry_rescued",
+    "unroll_free_retry_failed",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.
@@ -962,6 +1426,104 @@ mod tests {
             vec![majit_ir::GreenType::Float, majit_ir::GreenType::Int],
         );
         assert_eq!(hash, gk.hash_u64());
+    }
+
+    /// The direct fold must equal the `GreenKey`-building form it replaced, at
+    /// every arity and type mix — not just the one pair pinned above.
+    ///
+    /// Str / Unicode are excluded: `hash_whatever` routes them through a
+    /// registered resolver, so they are not hashable from a bare i64 here.
+    ///
+    /// The short-`types` padding branch (`.get(i).unwrap_or(Int)`) is NOT
+    /// covered: `debug_assert_eq!` makes a ragged call panic in a test build,
+    /// so that branch is reachable only in release. It is preserved by
+    /// construction, mirroring `GreenKey::get_uhash`.
+    #[test]
+    fn green_key_hash_typed_equals_the_greenkey_form_across_arities_and_types() {
+        use majit_ir::GreenType;
+        let palette = [GreenType::Int, GreenType::Float, GreenType::Ref];
+        let values: [i64; 6] = [0, 1, -1, i64::MAX, i64::MIN, (2.5f64).to_bits() as i64];
+
+        let mut checked = 0usize;
+        for arity in 0..=values.len() {
+            for (offset, tp) in palette.iter().enumerate() {
+                let vals: Vec<i64> = values[..arity].to_vec();
+                // Rotate the type assignment so a given arity is exercised with
+                // several distinct type vectors, not one uniform one.
+                let types: Vec<GreenType> = (0..arity)
+                    .map(|i| palette[(i + offset) % palette.len()])
+                    .collect();
+                let folded = green_key_hash_typed(&vals, &types);
+                let built = majit_ir::GreenKey::with_types(vals.clone(), types.clone()).hash_u64();
+                assert_eq!(
+                    folded, built,
+                    "arity {arity}, offset {offset} (lead {tp:?}): fold {folded} != built {built}",
+                );
+                checked += 1;
+            }
+        }
+        // Guard the guard: a silently empty sweep would assert nothing.
+        assert_eq!(checked, 7 * 3, "sweep did not cover the intended cases");
+    }
+
+    /// All four `(has_jump, has_always_fails)` combinations, because the
+    /// both-false one is the arm a first-match chain loses and it is the only
+    /// one that has to name two facts.
+    #[test]
+    fn why_not_names_every_false_term() {
+        let shape = |has_jump, has_always_fails| LoopBodyShape {
+            has_jump,
+            has_always_fails,
+        };
+
+        assert_eq!(shape(true, false).why_not(), None);
+        assert!(shape(true, false).closes_a_loop());
+
+        let jump_and_fails = shape(true, true).why_not().expect("does not close a loop");
+        assert!(
+            jump_and_fails.contains("GuardAlwaysFails") && !jump_and_fails.contains("no `Jump`"),
+            "a body with a back edge must not be told it has none: {jump_and_fails}",
+        );
+
+        let neither = shape(false, true).why_not().expect("does not close a loop");
+        assert!(
+            neither.contains("no `Jump`") && neither.contains("GuardAlwaysFails"),
+            "both terms are false, so both must be named: {neither}",
+        );
+
+        let no_jump = shape(false, false)
+            .why_not()
+            .expect("does not close a loop");
+        assert!(
+            no_jump.contains("no `Jump`") && !no_jump.contains("GuardAlwaysFails"),
+            "nothing failed at a guard here, so the message must not claim one: {no_jump}",
+        );
+
+        // The reset sentinel the gates write before the hook runs is this arm.
+        assert_eq!(LoopBodyShape::default().why_not(), Some(no_jump));
+    }
+
+    /// `of()` reads both fields off the same slice, so a body carrying both
+    /// opcodes must set both — the census that feeds every gate.
+    #[test]
+    fn shape_of_reads_both_opcodes() {
+        use majit_ir::OpCode;
+
+        assert_eq!(LoopBodyShape::of(&[]), LoopBodyShape::default());
+        assert_eq!(
+            LoopBodyShape::of(&[OpCode::Jump]),
+            LoopBodyShape {
+                has_jump: true,
+                has_always_fails: false,
+            },
+        );
+        assert_eq!(
+            LoopBodyShape::of(&[OpCode::GuardAlwaysFails, OpCode::Jump]),
+            LoopBodyShape {
+                has_jump: true,
+                has_always_fails: true,
+            },
+        );
     }
 }
 pub(crate) mod resumecode;

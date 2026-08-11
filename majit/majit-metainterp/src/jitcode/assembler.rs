@@ -766,7 +766,8 @@ impl JitCodeBuilder {
             is_field_signed,
             is_immutable: false,
             is_quasi_immutable: false,
-            index_in_parent: 0,
+            // Same as the vable synthesizers: no parent, so no slot claim.
+            index_in_parent: None,
             parent: None,
             name: String::new(),
             owner: String::new(),
@@ -818,9 +819,13 @@ impl JitCodeBuilder {
         // it becomes the descr's `_cache_field` key downstream, so naming the
         // aggregate hands the leaf's access the aggregate's descr.
         let slot = field_slot_in(&parent_spec.all_fielddescrs, field_name, offset);
+        // The miss stays `None`. Collapsing it to `0` here is the same defect
+        // `fielddescrof` carried: slot 0 of the parent's list is some other
+        // field, and once the descr is minted nothing downstream can tell a
+        // failed lookup from a field genuinely at slot 0.
         let (index_in_parent, name) = slot
-            .map(|idx| (idx, parent_spec.all_fielddescrs[idx].name.clone()))
-            .unwrap_or((0, String::new()));
+            .map(|idx| (Some(idx), parent_spec.all_fielddescrs[idx].name.clone()))
+            .unwrap_or((None, String::new()));
         // The registered layout is the record of what `descr.py:218-239
         // get_field_descr` derives from FIELDTYPE, so a field it names supplies
         // its own width and signedness.  The IR bank the access lands in
@@ -1748,7 +1753,7 @@ impl JitCodeBuilder {
     /// `add_gc_byte_array_descr` so a wider env element type (`&[i64]`,
     /// `item_size = 8`) reads the element at byte offset `item_size * index`
     /// instead of the raw byte at `index`.  `base_size = 0` because Rust
-    /// slice (`&[T]`) data pointers point directly at items[0] with no GC
+    /// slice (`&[T]`) data pointers point directly at `items[0]` with no GC
     /// header; the structural tuple (base_size=0, itemsize, item_type=Int,
     /// signedness) uniquely identifies the descr for `add_bh_descr` dedup.
     /// For an 8-byte item signedness is moot (full-word load), but for `&[u8]`
@@ -2449,7 +2454,7 @@ impl JitCodeBuilder {
     }
 
     /// RPython jtransform.py:1714-1718 handle_jit_marker__loop_header emits
-    /// SpaceOperation('loop_header', [c_index], None) with
+    /// `SpaceOperation('loop_header', [c_index], None)` with
     /// `Constant(jd.index, lltype.Signed)`. blackhole.py:1063
     /// bhimpl_loop_header(jdindex) is a no-op; pyjitpl.py:1527
     /// opimpl_loop_header records the jitdriver index for the trace.
@@ -2521,7 +2526,7 @@ impl JitCodeBuilder {
     /// `BC_LIVE` slot at the start of every per-pc JitCode (which has no
     /// per-marker triple of its own — it points at the canonical "all
     /// live" entry).  The 2-byte slot is written as `0x0000` here and
-    /// back-patched during [`finalize_liveness`] via
+    /// back-patched during [`Self::finalize_liveness`] via
     /// `Assembler::ensure_canonical_liveness_offset`.  Returns the operand
     /// offset so callers may chain into a custom patcher if needed.
     pub fn live_placeholder(&mut self) -> usize {
@@ -2538,9 +2543,9 @@ impl JitCodeBuilder {
 
     /// Deferred-patch entry point: emit a `live/`
     /// opcode followed by a 2-byte placeholder offset (mirroring
-    /// [`live_placeholder`]) and record the per-marker
+    /// [`Self::live_placeholder`]) and record the per-marker
     /// `(live_i, live_r, live_f)` triple in `pending_live_triples` so
-    /// [`finalize_liveness`] can later resolve and patch the offset.
+    /// [`Self::finalize_liveness`] can later resolve and patch the offset.
     ///
     /// Each `live_*` slice must be a sorted+dedup register-set view
     /// matching the macro lowerer's
@@ -2567,7 +2572,7 @@ impl JitCodeBuilder {
     /// Finalisation step: register every pending
     /// per-marker liveness triple into `asm` (deduplicating against the
     /// shared `all_liveness_positions`) and rewrite each corresponding
-    /// `live/<offset>` BC_LIVE slot via [`patch_live_offset`].
+    /// `live/<offset>` BC_LIVE slot via [`Self::patch_live_offset`].
     ///
     /// Mirrors `assembler.py:146-158`'s per-marker
     /// `_encode_liveness(live_i, live_r, live_f) → encode_offset(pos)`
@@ -2672,7 +2677,7 @@ impl JitCodeBuilder {
     ///
     /// assembler.py:181-196 parity: encodes jdindex + 6 typed register
     /// lists (greens_i, greens_r, greens_f, reds_i, reds_r, reds_f).
-    /// Each list is [length:u8][reg_indices:u8...].
+    /// Each list is `[length:u8][reg_indices:u8...]`.
     ///
     /// jdindex is emitted per assembler.py:163,312 USE_C_FORM rules —
     /// `'c'` (raw signed byte) when fitting in `i8`, otherwise `'i'`
@@ -2899,7 +2904,7 @@ impl JitCodeBuilder {
 
     /// Void-result sibling of [`Self::recursive_call_int`]
     /// (`opimpl_recursive_call_v`).  Carries no result register — the
-    /// `result_dst` slot is emitted as the [`jitcode::NO_RETURN_REG`] "no
+    /// `result_dst` slot is emitted as the `jitcode::NO_RETURN_REG` "no
     /// result" sentinel the dispatcher decodes to `None`.
     pub fn recursive_call_void(
         &mut self,
@@ -3867,7 +3872,7 @@ impl JitCodeBuilder {
 
     /// float-result sibling.  Always uses `IRF_F` per
     /// `resoperation.py:1238-1248` ("no such thing" `R_F` / `IR_F`)
-    /// and goes through [`Self::emit_canonical_call_typed_irf_f`] so
+    /// and goes through `Self::emit_canonical_call_typed_irf_f` so
     /// the F list count byte is always present.
     #[allow(dead_code)]
     pub fn residual_call_float_canonical_via_target(
@@ -4508,8 +4513,6 @@ impl JitCodeBuilder {
         self.num_regs_frozen = true;
     }
 
-    // ── Ref-typed builder methods ─────────────────────────────
-
     pub fn load_const_r_value(&mut self, dst: u16, value: i64) {
         let const_idx = self.add_const_r(value);
         self.load_const_r(dst, const_idx);
@@ -4620,8 +4623,6 @@ impl JitCodeBuilder {
             dst,
         );
     }
-
-    // ── Float-typed builder methods ───────────────────────────
 
     pub fn load_const_f_value(&mut self, dst: u16, value: i64) {
         let const_idx = self.add_const_f(value);
@@ -4922,7 +4923,7 @@ impl JitCodeBuilder {
     /// distinct entries; in practice the same helper is registered with
     /// a single classification and the dedup matches the `add_call_target`
     /// path verbatim.  `save_err` defaults to `0` (`RFFI_ERR_NONE`,
-    /// `rffi.py:80`); release-gil callees use [`add_call_target_with_save_err`]
+    /// `rffi.py:80`); release-gil callees use [`Self::add_call_target_with_save_err`]
     /// to thread the wrapper's `_call_aroundstate_target_[1]`
     /// (`rffi.py:228`) into the dedup key.
     pub fn add_call_target_with_slot(
@@ -5593,8 +5594,7 @@ impl JitCodeBuilder {
             let target = match self.labels.get(label_idx).copied().flatten() {
                 Some(target) => target as u16,
                 None => {
-                    // Diagnostic for issue #112 scope #3: a label was
-                    // *referenced* (a goto / switch / forwarder operand was
+                    // A label was *referenced* (a goto / switch / forwarder operand was
                     // emitted at these code offsets) but never *marked* (its
                     // target block's `Label` was never emitted).  The orthodox
                     // cause is an un-simplified graph reaching flatten — a
@@ -5603,8 +5603,7 @@ impl JitCodeBuilder {
                     // offending label index, every referencing code offset, and
                     // the marked/total label counts so the origin can be traced
                     // before the panic, then point at the `simplify_graph`
-                    // passes that remove the shape.  Scope #3 concluded that the
-                    // walker-safe subset wired ahead of flatten
+                    // passes that remove the shape. The walker-safe subset wired ahead of flatten
                     // (`eliminate_empty_blocks` + `constfold_exitswitch` +
                     // `remove_trivial_links`, see `pyre-jit/src/jit/simplify.rs`
                     // module doc) already removes every shape that produces an
@@ -5621,8 +5620,8 @@ impl JitCodeBuilder {
                     panic!(
                         "jitcode label {label_idx} was never marked \
                          (referenced at code offsets {referencing_offsets:?}; \
-                         {marked}/{total} labels marked). Issue #112 unmarked-label \
-                         gap: a goto/switch/forwarder targets a block whose Label \
+                         {marked}/{total} labels marked). A goto/switch/forwarder \
+                         targets a block whose Label \
                          was never emitted — typically an un-simplified dead/trivial \
                          forwarder or dead switch arm reaching flatten. The orthodox \
                          fix is graph normalization via simplify_graph \
@@ -5732,7 +5731,7 @@ impl JitCodeBuilder {
             let Some(idx) = field_slot_in(&p.all_fielddescrs, name, *offset) else {
                 continue;
             };
-            *index_in_parent = idx;
+            *index_in_parent = Some(idx);
             name.clone_from(&p.all_fielddescrs[idx].name);
         }
     }
@@ -5791,19 +5790,21 @@ impl JitCodeBuilder {
             match field_slot_in(&p.all_fielddescrs, name, *offset) {
                 Some(idx) => {
                     let slot = &p.all_fielddescrs[idx];
-                    if *index_in_parent != idx || *name != slot.name {
+                    if *index_in_parent != Some(idx) || *name != slot.name {
                         return Some(format!(
                             "field descr at offset {offset} of type_id {:#x} claims slot \
-                             {index_in_parent} named {name:?}, but that offset is slot {idx} \
+                             {index_in_parent:?} named {name:?}, but that offset is slot {idx} \
                              named {:?}",
                             p.type_id, slot.name,
                         ));
                     }
                 }
-                None if *index_in_parent != 0 || !name.is_empty() => {
+                // The unresolved fallback is now a type, not a convention:
+                // `None` beside an empty name.
+                None if index_in_parent.is_some() || !name.is_empty() => {
                     return Some(format!(
                         "field descr at offset {offset} does not resolve in type_id {:#x}'s \
-                         layout yet carries slot {index_in_parent} named {name:?} instead of \
+                         layout yet carries slot {index_in_parent:?} named {name:?} instead of \
                          the unresolved fallback",
                         p.type_id,
                     ));
@@ -6162,8 +6163,8 @@ mod tests {
                 "the parent is the final merged spec, not the mint-time prefix",
             );
             let (expected_index, expected_name) = match offset {
-                8 => (0, "lo"),
-                16 => (1, "hi"),
+                8 => (Some(0), "lo"),
+                16 => (Some(1), "hi"),
                 other => panic!("unexpected field offset {other}"),
             };
             assert_eq!(
@@ -6172,7 +6173,8 @@ mod tests {
             );
             assert_eq!(name, expected_name, "and name from that same layout");
             assert_eq!(
-                parent.all_fielddescrs[index_in_parent].offset, offset,
+                parent.all_fielddescrs[index_in_parent.expect("resolved above")].offset,
+                offset,
                 "`all_fielddescrs[index_in_parent]` must be this very field \
                  (`heaptracker.py:60-72` / `:96-112` share one walker upstream)",
             );
@@ -6237,15 +6239,17 @@ mod tests {
         let (idx, name) = field_of("leaf");
         assert_eq!(
             (idx, name.as_str()),
-            (1, "leaf"),
+            (Some(1), "leaf"),
             "the emit site's `fieldname` names the field the shared offset cannot",
         );
         let (idx, name) = field_of("");
         assert_eq!(
             (idx, name.as_str()),
-            (0, ""),
+            (None, ""),
             "without a name the ambiguous offset resolves to nothing, so the \
-             mint's `unwrap_or((0, String::new()))` fallback stands",
+             mint's `unwrap_or((None, String::new()))` fallback stands — and \
+             `None` rather than `0` is the point: the miss must not spell \
+             itself as a claim on the parent's first slot",
         );
     }
 

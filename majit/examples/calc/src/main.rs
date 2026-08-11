@@ -1,10 +1,10 @@
-/// Toy calculator interpreter — the first test target for the majit JIT.
+/// Toy calculator interpreter. This example currently runs without a JIT tier.
 ///
 /// Supports:
-/// - Integer arithmetic (+, -, *, /, %)
-/// - Variables (a-z, 26 registers)
-/// - Comparison operators (<, <=, ==, !=, >, >=)
-/// - While loops via conditional/unconditional jumps
+/// - Integer arithmetic (`+`, `-`, `*`, `/`, `%`)
+/// - Variables (`a`-`z`, 26 registers)
+/// - Comparison operators (`<`, `<=`, `==`, `!=`, `>`, `>=`)
+/// - While loops via conditional and unconditional jumps
 /// - A simple bytecode format
 pub mod bytecode;
 pub mod interp;

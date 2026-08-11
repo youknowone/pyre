@@ -488,7 +488,7 @@ pub const LOOPINVARIANT_EFFECT_INFO: EffectInfo =
 pub enum EffectInfoSlot {
     /// `EF_CAN_RAISE` — `call.py:300-301 elif self._canraise(op):`
     /// branch of `getcalldescr`, resolved through
-    /// [`can_raise_effect_info()`]: `CanRaise` + `Some(empty)` raw sets
+    /// `can_raise_effect_info()`: `CanRaise` + `Some(empty)` raw sets
     /// and bitstrings.
     ///
     /// Picked by producers that classified the callee by hand — the
@@ -593,7 +593,7 @@ pub fn default_effect_for_opcode(opcode: majit_ir::OpCode) -> EffectInfo {
 /// * [`make_call_descr_from_target_slot`] when a resolved
 ///   [`crate::jitcode::JitCallTarget`] is available — threads the
 ///   macro-time [`EffectInfoSlot`] (`call.py:282-303 getcalldescr` parity).
-/// * [`make_call_descr_for_opcode`] when only the call opcode family is
+/// * `make_call_descr_for_opcode` when only the call opcode family is
 ///   known (`pyjitpl.py:1991-1995 do_residual_or_indirect_call`'s
 ///   `EF_LOOPINVARIANT` / `EF_ELIDABLE_*` reverse-mapping).
 /// * [`make_call_descr_with_effect`] when an explicit `EffectInfo` has

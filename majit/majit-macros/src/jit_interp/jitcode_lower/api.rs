@@ -183,10 +183,10 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     body: &Expr,
     config: Option<&LowererConfig>,
     caller_locals: &[(String, Binding)],
-) -> Option<(GeneratedJitCodeBody, Vec<CallerLocalLayout>)> {
+) -> Result<(GeneratedJitCodeBody, Vec<CallerLocalLayout>), String> {
     let stmts = extract_stmts(body);
     if stmts.is_empty() {
-        return None;
+        return Err("arm body has no statements to lower".to_string());
     }
 
     let mut lowerer = Lowerer::new(config);
@@ -223,8 +223,24 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
         .max(split_identity_floor(config))
         .max(float_identity_floor(config));
 
-    for stmt in &stmts {
-        lowerer.lower_stmt(stmt)?;
+    for (i, stmt) in stmts.iter().enumerate() {
+        if lowerer.lower_stmt(stmt).is_none() {
+            // The body is already doomed. Keep walking the REMAINING statements
+            // for their reasons only, discarding whatever they lower, so
+            // `reason` enumerates the arm's blockers instead of naming whichever
+            // check happened to fire first. Nothing downstream sees the partial
+            // state: we return Err below either way.
+            //
+            // This reports one reason per offending STATEMENT, never two for
+            // one statement — each refusal site still returns from `lower_stmt`
+            // at its first hit. An arm whose blockers all sit inside a single
+            // statement (dualtape's `b']'` is one `if`/`else`) still reports
+            // exactly one.
+            for rest in &stmts[i + 1..] {
+                let _ = lowerer.lower_stmt(rest);
+            }
+            return Err(lowerer.take_body_failure_reason());
+        }
     }
 
     annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
@@ -234,7 +250,7 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     let liveness_prebuild =
         liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
     let statements = lowerer.statements;
-    Some((
+    Ok((
         GeneratedJitCodeBody {
             body: quote! {
                 #(#statements)*
@@ -261,11 +277,13 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
     config: Option<&LowererConfig>,
     caller_locals: &[(String, Binding)],
     increment: i64,
-) -> Option<(GeneratedJitCodeBody, Vec<CallerLocalLayout>)> {
+) -> Result<(GeneratedJitCodeBody, Vec<CallerLocalLayout>), String> {
     let stmts = extract_stmts(body);
     // The predicate (`arm_is_pure_pc_advance`) guarantees a trailing `pc += N`,
     // which is replaced by the explicit pc-return below.  Lower only the work.
-    let (_pc_advance, work) = stmts.split_last()?;
+    let Some((_pc_advance, work)) = stmts.split_last() else {
+        return Err("arm body has no statements to lower".to_string());
+    };
 
     let mut lowerer = Lowerer::new(config);
     lowerer.in_dispatch_arm_body = true;
@@ -289,14 +307,37 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
         .max(split_identity_floor(config))
         .max(float_identity_floor(config));
 
-    for stmt in work {
-        lowerer.lower_stmt(stmt)?;
+    for (i, stmt) in work.iter().enumerate() {
+        if lowerer.lower_stmt(stmt).is_none() {
+            // Same accumulation as the parts entry above: enumerate the arm's
+            // blockers rather than reporting whichever check fired first.
+            //
+            // `work` is `stmts.split_last()`, so the trailing pc-advance is
+            // NOT in this loop and contributes no reason here. That is correct
+            // for this entry point — reaching it at all means the advance is
+            // the arm's final statement and IS the channel out, which is
+            // exactly the case the green-write refusal does not fire on.
+            //
+            // No crate in the tree reaches this loop: it is selected by
+            // `pc_return_increment`, which is `Some` only under
+            // `split_dispatch = true`, and a tracked-file sweep finds zero
+            // crates setting it (positive control: the same sweep reads 3
+            // example files for `jit_interp`). Patched for consistency, not for
+            // yield — the measured yield is all on the parts entry above.
+            for rest in &work[i + 1..] {
+                let _ = lowerer.lower_stmt(rest);
+            }
+            return Err(lowerer.take_body_failure_reason());
+        }
     }
 
     // `pc` is collected as a caller-local (the trailing `pc += N` references it),
     // so it is pre-bound at its callee reg; the work statements only read it, so
     // the binding still holds the incoming pc.  Return pc + increment.
-    let pc_reg = lowerer.bindings.get("pc")?.reg;
+    let Some(pc_binding) = lowerer.bindings.get("pc") else {
+        return Err("arm body has no `pc` binding for the pc-return writeback".to_string());
+    };
+    let pc_reg = pc_binding.reg;
     let tmp_reg = lowerer.alloc_reg();
     lowerer.emit_op(
         OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(tmp_reg)]),
@@ -332,7 +373,7 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
     let liveness_prebuild =
         liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
     let statements = lowerer.statements;
-    Some((
+    Ok((
         GeneratedJitCodeBody {
             body: quote! {
                 #(#statements)*

@@ -1,29 +1,8 @@
-//! cell-majit de-risk kill-test (issue #357). Contains ZERO CEL code.
+//! Arithmetic-loop benchmark for the MAJIT CEL prototype.
 //!
-//! Question: does a compiled majit trace of a straight-line arithmetic body,
-//! evaluated over a stream of distinct inputs, beat a CLEAN interpreter of the
-//! same bytecode by the >=3x bar cometkim's cel-jit hit on simple_arithmetic
-//! (8.3x)? If majit cannot clear 3x here — on its structural best case, a tight
-//! arithmetic loop — applying it to cel-rust is dead before any CEL work.
-//!
-//! FAITHFULNESS: the "input" per row must be data-dependent, not derived from
-//! the loop counter. A counter-driven polynomial lets the optimizer
-//! strength-reduce / vectorize the whole loop into near-nothing (an early
-//! version measured a bogus 406x this way). So each row's input `x` is advanced
-//! by an LCG (`x = x*A + C`), an inherently serial recurrence the compiler
-//! cannot fold or vectorize — modelling a real stream of distinct CEL inputs.
-//! The body then computes `f(x) = ((x*3)+7)*(x-2)` and accumulates it.
-//!
-//! Three measurements, all on the identical bytecode:
-//!   (a) majit JIT-on   — the compiled trace (small threshold).
-//!   (b) clean interp   — a plain `match` loop, NO majit macro/instrumentation.
-//!                        The honest baseline: a good non-JIT implementation.
-//!   (c) majit JIT-off  — the same instrumented mainloop, compilation disabled
-//!                        (`u32::MAX` threshold). Shows jit_merge_point cost.
-//! The meaningful ratio is (b)/(a): clean interpreter vs compiled trace.
-//!
-//! RELEASE ONLY: `acc`/`x` wrap i64 and all three paths must wrap identically
-//! (`+`/`*` in release), so the equality gate needs overflow checks off.
+//! A serial LCG supplies data-dependent inputs so the loop cannot collapse to
+//! a counter-derived closed form. The same bytecode runs through JIT, clean
+//! interpreter, and JIT-disabled paths for result and timing comparisons.
 
 use crate::common::*;
 use std::hint::black_box;
@@ -52,7 +31,7 @@ struct VmState {
 fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<VmState> =
         majit_metainterp::JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
+    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after, _opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
     });
     let mut pc: usize = 0;

@@ -463,6 +463,16 @@ pub struct Optimizer {
     pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
     pub snapshot_vable_boxes: SnapshotBoxes,
+    /// resume.py:399-402 `minimum_virtualizable_size`, propagated to
+    /// OptContext for the `memo.number()` call in
+    /// `store_final_boxes_in_guard`.
+    ///
+    /// `-1` disables the check (`resume.py:236-239`); a non-negative value
+    /// arms it. `virtualizable.py:123-124 minimum_size()` is
+    /// `num_static_fields`, and the comparison is `>` rather than `>=`
+    /// because the virtualizable identity occupies one array entry of its
+    /// own on top of the static fields.
+    pub minimum_virtualizable_size: i64,
     /// Per-guard virtualref boxes from tracing-time snapshots.
     /// resume.py:243-247 _number_boxes reads vref_array as a separate
     /// section. opencoder.py:767 create_top_snapshot records vref_boxes
@@ -1456,6 +1466,8 @@ impl Optimizer {
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
+            // resume.py:401-402: `-1` for a jitdriver with no virtualizable.
+            minimum_virtualizable_size: -1,
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
             phase1_emit_ops: Vec::new(),
@@ -2085,19 +2097,35 @@ impl Optimizer {
             .count()
     }
 
-    /// optimizer.py: log_loop(ops)
-    /// Log the optimized trace for debugging/profiling.
-    pub fn log_optimized_trace(ctx: &OptContext) {
-        if crate::log_opt_enabled() {
-            eprintln!(
-                "[MAJIT] optimized trace: {} ops, {} guards",
-                ctx.new_operations.len(),
-                ctx.new_operations
-                    .iter()
-                    .filter(|op| op.opcode.is_guard())
-                    .count()
-            );
+    /// logger.py:33 `Logger.log_loop(inputargs, operations, ...)`, called once
+    /// a trace's operation list is final — compile.py:474, :557, :562.
+    ///
+    /// Dumps the operation list, not just a count. A count separates a compiled
+    /// body from a compiled nothing; it cannot separate a working body from a
+    /// dead one, because deadness is a property of shape. A body that opens by
+    /// failing a guard has no back edge and runs zero iterations while
+    /// reporting a healthy-looking op total.
+    ///
+    /// `label` names which of the three compile paths produced the trace, since
+    /// they differ in whether the body was unrolled.
+    pub fn log_optimized_trace<V, T, C>(label: &str, ops: &[T], constants: &C)
+    where
+        V: std::fmt::Debug,
+        T: AsRef<Op>,
+        C: majit_ir::resoperation::ConstLookup<V>,
+    {
+        if !crate::log_opt_enabled() {
+            return;
         }
+        eprintln!(
+            "[MAJIT] optimized trace ({}): {} ops, {} guards",
+            label,
+            ops.len(),
+            ops.iter()
+                .filter(|op| op.as_ref().opcode.is_guard())
+                .count()
+        );
+        eprint!("{}", majit_ir::format_trace(ops, constants));
     }
 
     /// optimizer.py:127-135 `getnullness(op)` parity (line-by-line port).
@@ -2535,6 +2563,7 @@ impl Optimizer {
         ctx.snapshot_boxes = std::mem::take(&mut self.snapshot_boxes);
         ctx.snapshot_frame_sizes = std::mem::take(&mut self.snapshot_frame_sizes);
         ctx.snapshot_vable_boxes = std::mem::take(&mut self.snapshot_vable_boxes);
+        ctx.minimum_virtualizable_size = self.minimum_virtualizable_size;
         ctx.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
         ctx.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
 
@@ -5452,6 +5481,26 @@ impl Optimizer {
     /// Create an optimizer with virtualizable config for frame field tracking.
     pub(crate) fn default_pipeline_with_virtualizable(config: VirtualizableConfig) -> Self {
         let mut opt = Self::new();
+        // resume.py:399-402:
+        //     if self.optimizer.jitdriver_sd.virtualizable_info:
+        //         minimum_virtualizable_size = \
+        //             self.optimizer.jitdriver_sd.virtualizable_info.minimum_size()
+        //     else:
+        //         minimum_virtualizable_size = -1
+        //
+        // `virtualizable.py:123-124 minimum_size()` returns `num_static_fields`,
+        // which is what `static_field_offsets` enumerates.
+        //
+        // Deviation, deliberate: RPython gates on the STATIC per-jitdriver
+        // `virtualizable_info`, while this gates on the PER-TRACE config, which
+        // exists only when `has_virtualizable_boxes()` held at
+        // `make_optimizer`. Ours is therefore strictly narrower — it cannot
+        // fire on a trace that never installed a shadow. That direction is the
+        // safe one (no false positives), but it does mean a trace whose
+        // `virtualizable_boxes` is `None` while the driver's `vinfo` is `Some`
+        // still slips past here and is caught only by the reader's
+        // `assert!(vable_size > 0)` at `resume.rs:7030`.
+        opt.minimum_virtualizable_size = config.static_field_offsets.len() as i64;
         opt.add_pass(Box::new(OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
         opt.add_pass(Box::new(OptVirtualize::with_virtualizable(config)));
@@ -7095,18 +7144,39 @@ mod tests {
         let _ = opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
 
         assert!(!ctx.in_final_emission);
-        assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
-        assert!(ctx.new_operations.iter().any(|op| {
-            op.opcode == OpCode::SetfieldGc
-                && op.arg(1).to_opref() == OpRef::int_op(11)
-                && op.has_descr()
-        }));
-        // info.py:146-151: force_box emits the ORIGINAL box op, so the
-        // forced GuardNonnull keeps arg(0) = OpRef::ref_op(10) (matches the virtual's
-        // original identity). force_box_impl preserves `new_op.pos = opref`.
-        assert!(ctx.new_operations.iter().any(
-            |op| op.opcode == OpCode::GuardNonnull && op.arg(0).to_opref() == OpRef::ref_op(10)
-        ));
+
+        // The whole emission, in order. The three membership checks this
+        // replaces could see neither the count nor the ordering, and ordering
+        // is the property under test: forcing the virtual must emit its New and
+        // SetfieldGc BEFORE the guard that consumes it.
+        //
+        // info.py:146-151: force_box emits the ORIGINAL box op, so the forced
+        // GuardNonnull keeps arg(0) = OpRef::ref_op(10) (the virtual's original
+        // identity). force_box_impl preserves `new_op.pos = opref`, which is
+        // why New lands at RefOp(10) rather than at a fresh position.
+        let emitted: Vec<(OpCode, Vec<OpRef>, bool)> = ctx
+            .new_operations
+            .iter()
+            .map(|op| {
+                (
+                    op.opcode,
+                    (0..op.num_args()).map(|i| op.arg(i).to_opref()).collect(),
+                    op.has_descr(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            emitted,
+            [
+                (OpCode::New, vec![], true),
+                (
+                    OpCode::SetfieldGc,
+                    vec![OpRef::ref_op(10), OpRef::int_op(11)],
+                    true
+                ),
+                (OpCode::GuardNonnull, vec![OpRef::ref_op(10)], true),
+            ]
+        );
     }
 
     #[test]

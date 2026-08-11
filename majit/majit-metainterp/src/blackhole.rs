@@ -63,14 +63,12 @@ impl ExceptionState {
     }
 }
 
-// ============================================================================
 // RPython blackhole.py parity: BlackholeInterpreter
 //
 // Jitcode-based blackhole execution. When a guard fails in compiled code,
 // resume_in_blackhole reconstructs execution frames from resume data and
 // runs jitcode bytecodes with concrete values, following ALL code paths
 // (unlike trace IR which only has the traced path).
-// ============================================================================
 
 use crate::jitcode::{self, JitArgKind, JitCode, JitCodeRuntimeExt};
 use crate::pyjitpl::{MIFrame, MIFrameStack};
@@ -78,8 +76,7 @@ use crate::pyjitpl::{
     call_int_function, call_ref_function, call_void_function, eval_binop_f, eval_binop_i,
 };
 
-// ── BlackholeInterpBuilder: setup_insns infrastructure ──────────────
-//
+// BlackholeInterpBuilder instruction setup
 // RPython `blackhole.py:52-103` `class BlackholeInterpBuilder` combines
 // pool management AND dispatch setup. pyre's existing
 // `BlackholeInterpBuilder` (below, at the pool management section) is the
@@ -1642,9 +1639,7 @@ impl BlackholeInterpreter {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // bhimpl_*_call_* family (blackhole.py:1095-1320)
-// ════════════════════════════════════════════════════════════════════════
 //
 // These methods mirror RPython's blackhole call dispatch table. Each
 // variant unpacks one of the three calling-convention shapes
@@ -2809,12 +2804,22 @@ mod tests {
     }
 
     #[test]
-    fn state_field_layout_tlr_regs_fixed_array() {
-        // tlr: `a: int` (scalar 0) + `regs: [int]` (fixed array, here len 8).
+    fn state_field_layout_one_scalar_then_one_fixed_array() {
+        // One `int` scalar (slot 0) followed by one fixed array of 8 cells.
+        //
+        // Deliberately synthetic, and deliberately unattributed: the layout is
+        // built from counts, so this test never reads any crate's declaration
+        // and cannot notice one changing. Naming a crate here would assert a
+        // shape nothing derives — the previous name and comment claimed this
+        // was tlr's `a: int` + `regs: [int]`, while tlr declares
+        // `regs: [int; virt]`, a different `StateFieldKind` on a different
+        // code path. That false attribution outlived the shape it described
+        // and was read as evidence that fixed arrays are common in the corpus;
+        // they are not, and no example crate declares one.
         let layout = StateFieldLayout::new(1, vec![8], 0, 0);
         assert_eq!(layout.total_slots(), 1 + 8);
         assert_eq!(layout.scalar_slot(0), 0);
-        // regs[0..8] occupy slots 1..9.
+        // The array's 8 cells occupy slots 1..9.
         assert_eq!(layout.array_elem_slot(0, 0), 1);
         assert_eq!(layout.array_elem_slot(0, 7), 8);
     }
@@ -3252,10 +3257,8 @@ mod tests {
         assert_eq!(exec_binop(OpCode::UintMulHigh, -1, 1), 0);
     }
 
-    // ══════════════════════════════════════════════════════════════════
     // Executor edge-case parity tests
     // Ported from rpython/jit/metainterp/test/test_executor.py
-    // ══════════════════════════════════════════════════════════════════
 
     // ── Integer overflow boundaries ──
 
@@ -3416,11 +3419,9 @@ mod tests {
         }
     }
 
-    // ================================================================
     // Tests for jitcode-based BlackholeInterpreter.
     // Upstream parity anchor: `rpython/jit/metainterp/test/test_blackhole.py`
     // plus the dispatch-loop setup in `rpython/jit/metainterp/blackhole.py`.
-    // ================================================================
 
     mod bh_interp_tests {
         use super::super::*;
@@ -4908,8 +4909,7 @@ mod tests {
     }
 }
 
-// ── bhimpl_* methods (RPython blackhole.py:452+) ────────────────────
-//
+// Blackhole operation handlers (`blackhole.py:452+`)
 // RPython defines each bhimpl_* as a static method decorated with
 // @arguments("i", "i", returns="i") etc. The handler closure generated
 // by _get_method decodes args from the bytecode stream and calls the
@@ -4919,8 +4919,7 @@ mod tests {
 // BhOpcodeHandler wrappers. The handler decodes operands, calls the
 // bhimpl fn, stores the result, and returns the updated position.
 
-// ── handler generators for common patterns ──────────────────────────
-
+// Handler generators for common argument patterns
 /// Decode pattern `@arguments("i", "i", returns="i")` — argcodes `"ii>i"`.
 ///
 /// Read 2 int-register indices, call bhimpl fn, write result, advance by 3.
@@ -4973,8 +4972,7 @@ macro_rules! bhhandler_iii_i {
     };
 }
 
-// ── bhimpl methods (line-by-line from RPython blackhole.py) ─────────
-
+// Blackhole operations ported from `blackhole.py`
 /// blackhole.py:454-456 `bhimpl_int_same_as`.
 fn bhimpl_int_same_as(a: i64) -> i64 {
     a
@@ -5474,7 +5472,7 @@ impl StateFieldLayout {
         }
     }
 
-    /// Like [`new`] but with ref-typed scalar fields in the ref bank,
+    /// Like [`Self::new`] but with ref-typed scalar fields in the ref bank,
     /// starting at `ref_scalar_base`.
     pub fn with_ref_scalars(
         num_scalars: usize,
@@ -5793,11 +5791,10 @@ bhhandler_ii_i!(handler_int_ne, bhimpl_int_ne);
 bhhandler_ii_i!(handler_int_gt, bhimpl_int_gt);
 bhhandler_ii_i!(handler_int_ge, bhimpl_int_ge);
 
-// ── control flow + copy handlers ─────────────────────────────────────
-
 // blackhole.py:638-640 `bhimpl_int_copy(a): return a` — @arguments("i", returns="i").
 // Decoded as `i>i` (same as int_same_as). Already have handler_int_same_as.
 // Wire as alias.
+// Control flow and copy handlers
 bhhandler_i_i!(handler_int_copy, bhimpl_int_same_as);
 
 // `int_copy/c>i` — `c`-argcode source: `int_copy` is in USE_C_FORM
@@ -6035,11 +6032,10 @@ fn handler_void_return(
     Err(DispatchError::LeaveFrame)
 }
 
-// ── float bhimpl methods (RPython blackhole.py:676-808) ─────────────
-
 // RPython stores floats as longlong (i64 bits). pyre stores f64 in
 // registers_f directly. The bhimpl methods work on f64 values.
 
+// Float operations (`blackhole.py:676-808`)
 fn bhimpl_float_neg(a: f64) -> f64 {
     -a
 }
@@ -6361,8 +6357,7 @@ bhhandler_ff_i!(handler_float_ne, |a: f64, b: f64| a != b);
 bhhandler_ff_i!(handler_float_gt, |a: f64, b: f64| a > b);
 bhhandler_ff_i!(handler_float_ge, |a: f64, b: f64| a >= b);
 
-// ── unsigned comparison bhimpl (RPython blackhole.py:571-582) ────────
-
+// Unsigned comparisons (`blackhole.py:571-582`)
 fn bhimpl_uint_lt(a: i64, b: i64) -> i64 {
     ((a as u64) < (b as u64)) as i64
 }
@@ -6529,8 +6524,7 @@ fn bhimpl_goto(target: usize) -> usize {
     target
 }
 
-// ── ref operations (RPython blackhole.py:584-610) ───────────────────
-
+// Reference operations (`blackhole.py:584-610`)
 fn bhimpl_ptr_eq(a: i64, b: i64) -> i64 {
     (a == b) as i64
 }
@@ -6613,12 +6607,12 @@ fn handler_float_return(
     Err(DispatchError::LeaveFrame)
 }
 
-// ── guard_value — no-op in blackhole (blackhole.py:648-656) ─────────
+// Guard-value no-ops (`blackhole.py:648-656`)
 bhhandler_i_v!(handler_int_guard_value, bhimpl_int_guard_value);
 bhhandler_r_v!(handler_ref_guard_value, bhimpl_ref_guard_value);
 bhhandler_f_v!(handler_float_guard_value, bhimpl_float_guard_value);
 
-// ── push/pop (blackhole.py:661-679) ─────────────────────────────────
+// Push and pop (`blackhole.py:661-679`)
 bhhandler_self_i_v!(handler_int_push, bhimpl_int_push);
 bhhandler_self_r_v!(handler_ref_push, bhimpl_ref_push);
 bhhandler_self_f_v!(handler_float_push, bhimpl_float_push);
@@ -6626,20 +6620,19 @@ bhhandler_self_v_i!(handler_int_pop, bhimpl_int_pop);
 bhhandler_self_v_r!(handler_ref_pop, bhimpl_ref_pop);
 bhhandler_self_v_f!(handler_float_pop, bhimpl_float_pop);
 
-// ── record_exact_class/value — no-op (blackhole.py:616-636) ─────────
+// Exact-class and exact-value recording no-ops (`blackhole.py:616-636`)
 bhhandler_ri_v!(handler_record_exact_class, bhimpl_record_exact_class);
 bhhandler_rr_v!(handler_record_exact_value_r, bhimpl_record_exact_value_r);
 bhhandler_ii_v!(handler_record_exact_value_i, bhimpl_record_exact_value_i);
 
-// ── cast operations (blackhole.py:800-831) ──────────────────────────
+// Cast operations (`blackhole.py:800-831`)
 bhhandler_f_i!(handler_cast_float_to_int, bhimpl_cast_float_to_int);
 bhhandler_i_f!(handler_cast_int_to_float, bhimpl_cast_int_to_float);
 
-// ── int_signext (blackhole.py:566-569) ──────────────────────────────
+// Integer sign extension (`blackhole.py:566-569`)
 bhhandler_ii_i!(handler_int_signext, bhimpl_int_signext);
 
-// ── overflow ops (blackhole.py:478-497) ─────────────────────────────
-
+// Overflow operations (`blackhole.py:478-497`)
 /// blackhole.py:478-483 `bhimpl_int_add_jump_if_ovf(label, a, b)`.
 /// On overflow: returns `(None, target)` so the handler jumps to label.
 /// On success: returns `(Some(sum), pc)` so the handler stores sum at the
@@ -6694,8 +6687,7 @@ bhhandler_ovf_jump_ii!(handler_int_add_jump_if_ovf, bhimpl_int_add_jump_if_ovf);
 bhhandler_ovf_jump_ii!(handler_int_sub_jump_if_ovf, bhimpl_int_sub_jump_if_ovf);
 bhhandler_ovf_jump_ii!(handler_int_mul_jump_if_ovf, bhimpl_int_mul_jump_if_ovf);
 
-// ── misc simple ops ─────────────────────────────────────────────────
-
+// Miscellaneous simple operations
 bhhandler_r_v!(handler_assert_not_none, bhimpl_assert_not_none);
 
 bhhandler_r_r!(handler_virtual_ref, bhimpl_virtual_ref);
@@ -6745,13 +6737,13 @@ fn handler_unreachable(
     bhimpl_unreachable()
 }
 
-// ── cpu-dependent field/array operations ─────────────────────────────
 //
 // RPython blackhole.py:1432-1481: bhimpl_getfield_gc_*/setfield_gc_*
 // These call `cpu.bh_getfield_gc_i(struct_ptr, descr)` etc.
 // The 'd' argcode is a 2-byte descriptor index into `bh.descrs`.
 // In pyre, descrs[index] resolves to a field offset (usize).
 
+// CPU-dependent field and array operations
 /// RPython `blackhole.py:150-157`: read a 2-byte descriptor index from
 /// bytecode and return `(descr_object, new_position)`.
 ///
@@ -6833,7 +6825,10 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
             is_field_signed: false,
             is_immutable: false,
             is_quasi_immutable: false,
-            index_in_parent: 0,
+            // No parent list, so there is no slot to claim — `None` rather than a
+            // `0` that reads as a claim on the first field of a list that does
+            // not exist here.
+            index_in_parent: None,
             parent: None,
             name: String::new(),
             owner: String::new(),
@@ -6883,7 +6878,10 @@ fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
             is_field_signed: false,
             is_immutable: false,
             is_quasi_immutable: false,
-            index_in_parent: 0,
+            // No parent list, so there is no slot to claim — `None` rather than a
+            // `0` that reads as a claim on the first field of a list that does
+            // not exist here.
+            index_in_parent: None,
             parent: None,
             name: String::new(),
             owner: String::new(),
@@ -7058,9 +7056,9 @@ fn handler_arraylen_gc(
     Ok(pos + 1)
 }
 
-// ── getarrayitem_gc (blackhole.py:1329-1341) ────────────────────────
 // @arguments("cpu", "r", "i", "d", returns="X")
 
+// GC array reads (`blackhole.py:1329-1341`)
 fn handler_getarrayitem_gc_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7098,9 +7096,9 @@ fn handler_getarrayitem_gc_r(
     Ok(pos + 1)
 }
 
-// ── setarrayitem_gc (blackhole.py:1350-1358) ────────────────────────
 // @arguments("cpu", "r", "i", "X", "d")
 
+// GC array writes (`blackhole.py:1350-1358`)
 fn handler_setarrayitem_gc_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7166,7 +7164,7 @@ fn handler_setarrayitem_gc_i_c(
     Ok(pos)
 }
 
-// ── getfield_raw (blackhole.py:1464-1472) ───────────────────────────
+// Raw field reads (`blackhole.py:1464-1472`)
 fn handler_getfield_raw_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7190,7 +7188,7 @@ fn handler_getfield_raw_f(
     Ok(pos + 1)
 }
 
-// ── setfield_raw (blackhole.py:1497-1502) ───────────────────────────
+// Raw field writes (`blackhole.py:1497-1502`)
 fn handler_setfield_raw_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7279,7 +7277,7 @@ fn handler_new_array_clear_c(
     Ok(pos + 1)
 }
 
-// ── string operations (blackhole.py:1200-1283) ──────────────────────
+// String operations (`blackhole.py:1200-1283`)
 fn handler_strlen(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7367,7 +7365,7 @@ fn handler_newunicode(
     Ok(position + 2)
 }
 
-// ── exception handling (blackhole.py:969-1009) ──────────────────────
+// Exception handling (`blackhole.py:969-1009`)
 fn handler_catch_exception(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
@@ -7377,7 +7375,7 @@ fn handler_catch_exception(
     Ok(position + 2)
 }
 
-// ── misc no-ops (blackhole.py:1017-1049) ────────────────────────────
+// Miscellaneous no-ops (`blackhole.py:1017-1049`)
 fn handler_jit_debug(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
@@ -7395,8 +7393,8 @@ bhhandler_v_v!(
     bhimpl_jit_leave_portal_frame
 );
 
-// ── interiorfield_gc (blackhole.py:1411-1429) ───────────────────────
 // @arguments("cpu", "r", "i", "d", returns="X")
+// Interior GC fields (`blackhole.py:1411-1429`)
 fn handler_getinteriorfield_gc_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7422,8 +7420,6 @@ fn handler_setinteriorfield_gc_i(
     cpu.bh_setinteriorfield_gc_i(array, index, value, descr);
     Ok(pos)
 }
-
-// ── call operations (blackhole.py:1224-1276) ────────────────────────
 
 #[inline]
 fn read_list_i(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>, usize) {
@@ -7549,6 +7545,7 @@ fn bh_null_arg_report(bh: &BlackholeInterpreter, ar: &[i64], position: usize) {
     }
 }
 
+// Call operations (`blackhole.py:1224-1276`)
 fn handler_residual_call_irf_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -9344,7 +9341,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // before jitcode emission, so neither key reaches `wire_handler`.
 }
 
-// ── goto_if_not_float (blackhole.py:751-798) ────────────────────────
+// Floating-point conditional branches (`blackhole.py:751-798`)
 macro_rules! bhhandler_goto_if_not_ff {
     ($name:ident, $cmp:expr) => {
         fn $name(
@@ -9702,11 +9699,11 @@ fn handler_current_trace_length(
     Ok(p + 1)
 }
 
-// ── vable field operations (blackhole.py:1446-1495) ─────────────────
 // RPython: fielddescr.get_vinfo().clear_vable_token(struct)
 //          return cpu.bh_getfield_gc_*(struct, fielddescr)
 // pyre: read_descr_vable_field resolves VableField.index → byte offset via VirtualizableInfo.
 
+// Virtualizable field operations (`blackhole.py:1446-1495`)
 fn handler_getfield_vable_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -9849,7 +9846,6 @@ fn handler_setfield_vable_f(
     Ok(p)
 }
 
-// ── vable array operations (blackhole.py:1374-1409) ─────────────────
 // @arguments("cpu", "r", "i", "d", "d", returns="X")
 // Two descriptors: fielddescr (VableArray) + arraydescr (Array).
 // RPython: fielddescr.get_vinfo().clear_vable_token(vable)
@@ -9900,6 +9896,7 @@ fn vable_clear_token_and_get_vinfo(
     vinfo
 }
 
+// Virtualizable array operations (`blackhole.py:1374-1409`)
 fn handler_getarrayitem_vable_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10034,7 +10031,7 @@ fn handler_setarrayitem_raw_i(
     Ok(p)
 }
 
-// ── conditional call (blackhole.py:1257-1276) ───────────────────────
+// Conditional calls (`blackhole.py:1257-1276`)
 fn handler_conditional_call_ir_v(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10155,7 +10152,7 @@ fn handler_setlistitem_gc_r(
     Ok(p)
 }
 
-// ── switch (blackhole.py:954-960) ───────────────────────────────────
+// Switch dispatch (`blackhole.py:954-960`)
 /// RPython `blackhole.py:954-960`:
 /// ```python
 /// @arguments("i", "d", "pc", returns="L")
@@ -10215,8 +10212,8 @@ fn handler_check_resizable_neg_index(
     Ok(p + 1)
 }
 
-// ── getarrayitem_gc_f / setarrayitem_gc_f ───────────────────────────
 // blackhole.py:1336-1337 bhimpl_getarrayitem_gc_f
+// Floating-point GC array operations
 fn handler_getarrayitem_gc_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],

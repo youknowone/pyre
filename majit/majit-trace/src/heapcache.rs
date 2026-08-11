@@ -355,7 +355,7 @@ pub struct HeapCache {
     /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
     seen_allocation: BitSet,
 
-    /// RPython: FrontendOp flag. Vec<u8> indexed by OpRef.0.
+    /// RPython: FrontendOp flag. `Vec<u8>` indexed by OpRef.0.
     /// 0 = unknown, 1 = non-null, 2 = null.
     known_nullity: Vec<u8>,
 
@@ -400,7 +400,7 @@ pub struct HeapCache {
 
     head_version: u32,
     likely_virtual_version: u32,
-    /// RPython: FrontendOp flags. Vec<u32> indexed by OpRef.0.
+    /// RPython: FrontendOp flags. `Vec<u32>` indexed by OpRef.0.
     heapc_flags: Vec<u32>,
 }
 

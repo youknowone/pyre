@@ -1,28 +1,9 @@
-//! cell-majit de-risk — COLUMNAR read kill-test (issue #357). ZERO CEL text.
+//! Column-read benchmark for the MAJIT CEL prototype.
 //!
-//! The `probe`/`policy` machines proved majit beats a clean interpreter on batches
-//! whose per-row inputs are SYNTHESIZED in-trace by an LCG. The open question
-//! blocking a REAL cel batch evaluator: can a compiled majit trace read an
-//! actual external i64 data column at a RED (data-dependent) row index and
-//! still CLOSE THE LOOP / compile?
-//!
-//! ANSWER (this example): YES — via the `raw_load_i` intrinsic the wasmi majit
-//! kernel already uses, provided the buffer BASE address is a loop-invariant
-//! held in the virtualizable register file (`regs`), NOT a scalar `int` state
-//! field. A scalar-field base forces the virtualizable frame to a real Ref and
-//! trips `VirtualStatesCantMatch` (slot-0 Ref vs Int) at loop close; a register
-//! base is a plain loop-invariant int input the optimizer hoists — exactly how
-//! PyPy carries a loop-invariant `rffi` pointer. `majit_raw_load_i64(base, i*8)`
-//! at the red row counter then reads `col[i]` and the loop compiles.
-//!
-//! Two programs over REAL i64 data columns (LCG-filled Vecs, read identically
-//! by every tier so the 3-way equality gate is a genuine columnar-read
-//! faithfulness check, not a synthesis):
-//!   * SUM     — `acc += col[i]`                (one column)
-//!   * POLICY  — `acc += (col_a[i] >= col_b[i])` (two columns + compare)
-//! Three measurements each: (a) JIT-on, (b) clean hand interp (honest
-//! baseline, also reads raw memory), (c) JIT-off. Meaningful ratio = (b)/(a).
-//! RELEASE ONLY (i64 wrap; 3-way equality gate).
+//! The programs load real external `i64` columns at data-dependent row
+//! indices through `raw_load_i`, then compare JIT, clean-interpreter, and
+//! JIT-disabled execution. The fixtures cover a one-column sum and a
+//! two-column comparison policy.
 
 use crate::common::*;
 use std::hint::black_box;
@@ -52,7 +33,7 @@ struct VmState {
 fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<VmState> =
         majit_metainterp::JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
+    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after, _opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
     });
     driver.set_on_trace_abort(|_green_key, _permanent| {

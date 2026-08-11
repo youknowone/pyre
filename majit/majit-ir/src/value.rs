@@ -666,6 +666,136 @@ pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
     let _ = UNICODE_HASH.set(hash);
 }
 
+/// Frontend hooks that keep a `GreenType::Ref` green's referent alive for as
+/// long as a cell stores it.
+///
+/// Unlike every other citation in this file, this pair ports an INVARIANT
+/// and not a function.  There is no upstream symbol to point at: RPython's
+/// `JitCell.__init__` (warmstate.py:568-573) does
+///
+/// ```python
+/// for attrname, _ in green_args_name_spec:
+///     setattr(self, attrname, greenargs[i])
+/// ```
+///
+/// and a `setattr` of a gc pointer simply *is* an owning store — the GC is
+/// universal, so ownership needs no code.  Do not "fix" this comment by
+/// citing a `warmstate.py` helper; none exists, and a faithful citation over
+/// unfaithful code is worse than no citation.
+///
+/// The invariant it restores: `equal_whatever(Ref, ..)` and
+/// `hash_whatever(Ref, ..)` both reduce a `Ref` green to its raw address, and
+/// **address equality is a correct identity only while both addresses are kept
+/// alive by their owners** — two distinct *live* objects cannot share an
+/// address.  Upstream satisfies this because the cell that stores the key is
+/// the owner.  Without these hooks a freed referent's address can be recycled
+/// by a different object, whose green key is then byte-identical to the dead
+/// one's: a true collision in the identity that no comparator can resolve.
+///
+/// Ownership belongs to the **stored** key, not to [`GreenKey`] as a type.
+/// A key built to *look up* a cell is transient and the caller is executing
+/// the very code it names, so it needs no retain; `pyjitpl`'s decision key is
+/// a reused thread-local whose slots are overwritten in place, and giving
+/// `GreenKey` a `Drop` would leak the old referent and fail to retain the new
+/// one on every back edge.  Retain where the cell takes its copy, which is
+/// also where upstream's `setattr` runs.
+pub type RefRetainFn = fn(i64);
+pub type RefReleaseFn = fn(i64);
+
+static REF_RETAIN: std::sync::OnceLock<RefRetainFn> = std::sync::OnceLock::new();
+static REF_RELEASE: std::sync::OnceLock<RefReleaseFn> = std::sync::OnceLock::new();
+
+/// Frontend-registered `Ref` green ownership hooks.  Same init-once contract
+/// as [`set_str_resolver`].  Register at JitDriver startup, before any cell
+/// stores a typed green key.
+pub fn set_ref_resolver(retain: RefRetainFn, release: RefReleaseFn) {
+    let _ = REF_RETAIN.set(retain);
+    let _ = REF_RELEASE.set(release);
+}
+
+/// OPEN POLICY FORK — the one place that decides what an unregistered
+/// frontend gets.  Today: today's behaviour, i.e. no retain, which leaves the
+/// address-recycling hazard exactly as it is rather than changing it.
+///
+/// This is deliberately NOT [`set_str_resolver`]'s panic-on-unregistered
+/// contract.  That contract is right for STR because comparing a STR green
+/// without the frontend's decoder yields a *wrong answer*, so refusing is
+/// strictly better.  A `Ref` green compares correctly without a retainer; it
+/// is only unsound once a referent is freed and its address reused.  Copying
+/// the panic here would break every frontend in the tree on day one for a
+/// hazard most of them may not have.
+///
+/// The alternative under consideration is to require an explicit declaration —
+/// either [`set_ref_resolver`] or an explicit "unmanaged" opt-out — and panic
+/// when a `Ref` green is stored with neither, converting a silent assumption
+/// into a checkable one.  Until that is decided, registering is opt-in: a
+/// frontend that registers gets the invariant, one that does not is no worse
+/// off than before.
+fn ref_hooks() -> Option<(RefRetainFn, RefReleaseFn)> {
+    match (REF_RETAIN.get(), REF_RELEASE.get()) {
+        (Some(retain), Some(release)) => Some((*retain, *release)),
+        _ => None,
+    }
+}
+
+/// Owning handle over the `Ref`-typed greens of one stored [`GreenKey`].
+///
+/// Retains on construction and releases on drop, so a cell holding one keeps
+/// its referents alive for exactly the cell's lifetime.  Deliberately not
+/// `Clone`: a second owner would need a second retain, and every store site
+/// should be visible as its own [`RetainedGreens::retain`] call.
+///
+/// `GreenType::Str` / `GreenType::Unicode` are the same hazard class — they
+/// are pointers too, and `green_type_to_type` maps both to [`Type::Ref`] — but
+/// they are not retained here because `majit-macros` refuses those tags at
+/// parse time today.  If that refusal is lifted, this is the site that must
+/// grow with it.
+#[derive(Debug, Default)]
+pub struct RetainedGreens {
+    retained: Vec<i64>,
+}
+
+impl RetainedGreens {
+    /// Retain every non-null `Ref` green in `key`.  A null slot is skipped:
+    /// `hash_whatever` already folds null to 0 and there is nothing to own.
+    pub fn retain(key: &GreenKey) -> Self {
+        let Some((retain, _)) = ref_hooks() else {
+            return RetainedGreens::default();
+        };
+        let mut retained = Vec::new();
+        for (i, &value) in key.values.iter().enumerate() {
+            if key.types.get(i).copied().unwrap_or(GreenType::Int) == GreenType::Ref && value != 0 {
+                retain(value);
+                retained.push(value);
+            }
+        }
+        RetainedGreens { retained }
+    }
+
+    /// Number of referents this handle owns.  Feeds the pinned-population
+    /// counter: the memory an unbounded cell table now holds live is exactly
+    /// the sum of this over all cells, and it must be readable rather than
+    /// showing up only as RSS.
+    pub fn len(&self) -> usize {
+        self.retained.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.retained.is_empty()
+    }
+}
+
+impl Drop for RetainedGreens {
+    fn drop(&mut self) {
+        let Some((_, release)) = ref_hooks() else {
+            return;
+        };
+        for &value in &self.retained {
+            release(value);
+        }
+    }
+}
+
 /// Pyre canonical `ll_streq` analog for `GreenType::Str` / `GreenType::Unicode`.
 ///
 /// Public so consumers can register it at startup via
@@ -924,6 +1054,33 @@ pub fn hash_whatever(tp: GreenType, value: i64) -> u64 {
     }
 }
 
+/// Seed of `JitCell.get_uhash` — `x = r_uint(-1888132534)`
+/// (warmstate.py:586).
+pub const GREEN_UHASH_SEED: u64 = (-1888132534_i64) as u64;
+
+/// Multiplier of `JitCell.get_uhash` — `x = (x ^ y) * r_uint(1405695061)`
+/// (warmstate.py:591).
+pub const GREEN_UHASH_MULT: u64 = 1405695061;
+
+/// One `get_uhash` fold step over a single green.
+///
+/// Upstream never materialises the greens: `get_uhash(*greenargs)` unrolls
+/// over `green_args_name_spec`, which is fixed per JitCell class at
+/// translation time (warmstate.py:584-593). A caller that likewise knows its
+/// greens statically folds with this instead of building a [`GreenKey`] —
+/// [`pypyjit_greenkey_uhash`] for pyre's fixed portal tuple, and the
+/// `#[jit_interp]` macro, whose green count and types are known at expansion
+/// time.
+///
+/// Shared with [`GreenKey::get_uhash`] so an unrolled caller and the
+/// vector-based key cannot drift apart: a divergence here would file a loop
+/// under a key nothing enters, which reads as a performance result rather
+/// than a defect.
+#[inline(always)]
+pub fn green_uhash_step(x: u64, tp: GreenType, value: i64) -> u64 {
+    (x ^ hash_whatever(tp, value)).wrapping_mul(GREEN_UHASH_MULT)
+}
+
 /// Structured green key — represents the exact values and types of all
 /// green variables at a particular program point.
 ///
@@ -1013,11 +1170,10 @@ impl GreenKey {
     ///         x = (x ^ y) * r_uint(1405695061)
     ///     return x
     pub fn get_uhash(&self) -> u64 {
-        let mut x: u64 = (-1888132534_i64) as u64;
+        let mut x: u64 = GREEN_UHASH_SEED;
         for i in 0..self.values.len() {
             let tp = self.types.get(i).copied().unwrap_or(GreenType::Int);
-            let y = hash_whatever(tp, self.values[i]);
-            x = (x ^ y).wrapping_mul(1405695061);
+            x = green_uhash_step(x, tp, self.values[i]);
         }
         x
     }
@@ -1036,11 +1192,35 @@ impl GreenKey {
 /// merge-point hook hashes this per back-edge, so the hot path must not
 /// allocate (warmstate.py:584-593 `JitCell.get_uhash`).
 pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64) -> u64 {
-    let mut x: u64 = (-1888132534_i64) as u64;
-    x = (x ^ hash_whatever(GreenType::Int, pc as i64)).wrapping_mul(1405695061);
-    x = (x ^ hash_whatever(GreenType::Int, is_being_profiled as i64)).wrapping_mul(1405695061);
-    x = (x ^ hash_whatever(GreenType::Ref, code_ptr as i64)).wrapping_mul(1405695061);
+    let mut x: u64 = GREEN_UHASH_SEED;
+    x = green_uhash_step(x, GreenType::Int, pc as i64);
+    x = green_uhash_step(x, GreenType::Int, is_being_profiled as i64);
+    x = green_uhash_step(x, GreenType::Ref, code_ptr as i64);
     x
+}
+
+/// The typed pypyjit portal green tuple `[next_instr:Int,
+/// is_being_profiled:Int, pycode:Ref]` (interp_jit.py:67-70) that
+/// [`pypyjit_greenkey_uhash`] hashes.
+///
+/// The two are a pair and must stay one: the uhash form is the hot
+/// back-edge path (it must not allocate), this form is what a cell read
+/// compares against (`JitCell.comparekey`, warmstate.py:575-582).  Sites
+/// that only need to *find a bucket* take the uhash; sites that need to
+/// know *which cell in it* take this.  Building the tuple here rather
+/// than open-coding `vec![pc, 0, code]` at each caller is what keeps the
+/// slot order and the `Ref` tag on the pycode from drifting apart — a
+/// swapped slot still hashes to something, just not to the same cell.
+///
+/// `is_being_profiled` is a real green in the spec even though pyre's
+/// JIT path always passes `false`; it is a parameter and not a folded
+/// constant so a future profiled portal does not silently share cells
+/// with the unprofiled one.
+pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> GreenKey {
+    GreenKey::with_types(
+        vec![pc as i64, is_being_profiled as i64, code_ptr as i64],
+        vec![GreenType::Int, GreenType::Int, GreenType::Ref],
+    )
 }
 
 /// Macro-emitted bridge used by `#[jit_interp]` to build a typed
@@ -1160,6 +1340,85 @@ mod tests {
         assert_ne!(k1.hash_u64(), k3.hash_u64());
     }
 
+    /// An unrolled [`green_uhash_step`] fold must equal
+    /// [`GreenKey::get_uhash`] over the same greens, for every arity and
+    /// type mix.
+    ///
+    /// This is the contract that lets a caller who knows its greens
+    /// statically skip building the key's `values` / `types` vectors —
+    /// upstream's shape, where `get_uhash(*greenargs)` unrolls over a
+    /// per-JitCell-class spec (warmstate.py:584-593). The `#[jit_interp]`
+    /// macro emits exactly this fold.
+    ///
+    /// It is a correctness test, not a performance one: the two spellings
+    /// disagreeing would file a loop under a key nothing enters, so
+    /// `has_compiled_loop` misses forever and every back edge re-arms
+    /// tracing. That surfaces as "the JIT got slower", not as a failure —
+    /// which is why the equality is pinned rather than assumed.
+    ///
+    /// `Str` / `Unicode` are excluded here because `hash_whatever` routes
+    /// them through a resolver a frontend must register first; they are
+    /// covered in `tests/green_key_str_content_equality.rs`, which does
+    /// register one.
+    #[test]
+    fn unrolled_fold_equals_greenkey_get_uhash() {
+        // Deterministic sweep — no RNG seed to drift, and every case is
+        // reproducible by index. Boundary values first: `hash_whatever`
+        // special-cases 0 for Ref, and Float reinterprets the bits.
+        let sample_values: [i64; 9] = [
+            0,
+            1,
+            -1,
+            42,
+            i64::MAX,
+            i64::MIN,
+            (1.0_f64).to_bits() as i64,
+            (-0.0_f64).to_bits() as i64,
+            (f64::NAN).to_bits() as i64,
+        ];
+        let sample_types = [
+            GreenType::Int,
+            GreenType::Float,
+            GreenType::Ref,
+            GreenType::Void,
+        ];
+
+        let mut checked = 0usize;
+        // Arity 0 (the empty key) through 8, covering every type at every
+        // position via an offset walk over both sample tables.
+        for arity in 0..=8usize {
+            for offset in 0..sample_values.len() * sample_types.len() {
+                let mut values = Vec::with_capacity(arity);
+                let mut types = Vec::with_capacity(arity);
+                for i in 0..arity {
+                    values.push(sample_values[(offset + i) % sample_values.len()]);
+                    types.push(sample_types[(offset + 3 * i) % sample_types.len()]);
+                }
+
+                // The unrolled form: what a static caller emits.
+                let mut unrolled = GREEN_UHASH_SEED;
+                for i in 0..arity {
+                    unrolled = green_uhash_step(unrolled, types[i], values[i]);
+                }
+
+                let via_key = GreenKey::with_types(values.clone(), types.clone()).get_uhash();
+                assert_eq!(
+                    unrolled, via_key,
+                    "unrolled fold diverged from GreenKey::get_uhash at \
+                     arity={arity} offset={offset} values={values:?} types={types:?}",
+                );
+                checked += 1;
+            }
+        }
+
+        // Guard the guard: an empty sweep would assert nothing.
+        assert_eq!(
+            checked,
+            9 * 36,
+            "sweep did not run the expected number of cases",
+        );
+    }
+
     #[test]
     fn green_repr_returns_per_type_green_type() {
         assert_eq!(7i64.__green_repr(), (7i64, GreenType::Int));
@@ -1227,6 +1486,11 @@ mod tests {
             (7, true, 0xdead_beef),
             (123456, false, 0x7fff_ffff_ffff_fff0),
             (1, true, 1),
+            // Width boundaries: `pc` widens usize -> i64 and `code_ptr`
+            // u64 -> i64, so a sign-extension slip shows up here and
+            // nowhere in the cases above.
+            (usize::MAX, false, u64::MAX),
+            (usize::MAX, true, 0),
         ];
         for &(pc, profiled, code) in cases {
             let key = GreenKey::with_types(
@@ -1237,6 +1501,22 @@ mod tests {
                 pypyjit_greenkey_uhash(pc, profiled, code),
                 key.get_uhash(),
                 "uhash mismatch for (pc={pc}, profiled={profiled}, code={code:#x})"
+            );
+            // The constructor is checked against the hand-written literal
+            // above, not against the uhash it is paired with: comparing the
+            // two functions to each other would pass just as happily if both
+            // agreed on a wrong slot order. `values` and `types` are asserted
+            // separately because `GreenKey`'s `PartialEq` routes through
+            // `equal_whatever`, which is exactly the layout-sensitive thing
+            // under test.
+            let built = pypyjit_greenkey(pc, profiled, code);
+            assert_eq!(
+                built.values, key.values,
+                "greenkey values mismatch for (pc={pc}, profiled={profiled}, code={code:#x})"
+            );
+            assert_eq!(
+                built.types, key.types,
+                "greenkey types mismatch for (pc={pc}, profiled={profiled}, code={code:#x})"
             );
         }
     }

@@ -1,3 +1,4 @@
+use super::lower_stmt::REFUSAL_SEPARATOR;
 use super::*;
 
 pub(super) struct Lowerer<'c> {
@@ -33,6 +34,29 @@ pub(super) struct Lowerer<'c> {
     /// requirement that an unrecognized inner while must NOT silently
     /// pass the existing `BC_GETARRAYITEM_GC_I`-presence gate.
     pub(super) dispatch_tainted_reason: Option<&'static str>,
+    /// Why this body's lowering refused, recorded by the FIRST site that
+    /// returns `None` so the cause survives the `?` that discards it.
+    ///
+    /// Without it every refusal reaches `record_degraded_dispatch_arm` as the
+    /// single string "arm body could not be lowered to a sub-JitCode", which
+    /// covers at least three unrelated causes — an unsupported statement, an
+    /// enclosed `return`, and an enclosed `break`/`continue` — so an install
+    /// -time reader cannot tell which arm needs which lowering rule.
+    pub(super) body_failure_reason: Option<String>,
+    /// Diagnoses carried up from child lowerers that refused, held back until
+    /// [`Lowerer::take_body_failure_reason`] so they can never take the head.
+    ///
+    /// A child lowers a nested block *before* this lowerer reaches its own
+    /// guard for the statement containing it, so merging a child's reason at
+    /// the failure site would make the innermost blocker the head. The head is
+    /// contractually the OUTERMOST refusal — every landed `.contains()` pin and
+    /// every `refusal_kind` assertion reads it — so child reasons are stashed
+    /// here and appended behind it instead.
+    ///
+    /// Dropped when the statement lowers anyway: a failed inner attempt that
+    /// another strategy recovers from is not a blocker, and reporting it would
+    /// name a statement that played no part in the refusal.
+    pub(super) nested_failure_reasons: Vec<String>,
     /// Name of the LHS variable that received the opcode-fetch
     /// result, set by `try_lower_opcode_fetch_stmt` when it recognises
     /// `let <name> = program[<idx>]` (or the method-call form
@@ -74,6 +98,20 @@ pub(super) struct Lowerer<'c> {
     /// the sub-JitCode arm path (BC_INLINE_CALL copies args caller→callee
     /// only, so a sub-JitCode pc-write cannot reach the dispatch reg0).
     pub(super) pc_pinned: bool,
+    /// One-shot marker for "the statement `lower_stmt` is about to lower is
+    /// the inline dispatch arm body's FINAL statement".  Set per-statement by
+    /// `try_inline_dispatch_arm` and **consumed** (`mem::take`) at the top of
+    /// `lower_stmt`, so it is observable for exactly one statement.
+    ///
+    /// Only a `return` in that position lowers to a typed return terminator.
+    /// The take-on-entry is what bounds the scope: `lower_control` lowers an
+    /// `if` / loop body's statements through `self.lower_stmt` on this same
+    /// `Lowerer`, so a nested statement always observes `false` and a `return`
+    /// there is rejected outright rather than having its operand lowered and
+    /// its control transfer dropped.  Deliberately NOT copied into the nested
+    /// `Lowerer`s built by `lower_control` / `lower_value` (unlike
+    /// `pc_pinned`) for the same reason.
+    pub(super) inline_arm_tail_stmt: bool,
 }
 
 impl<'c> Lowerer<'c> {
@@ -99,13 +137,74 @@ impl<'c> Lowerer<'c> {
             auto_calls: config.map(|cfg| cfg.auto_calls).unwrap_or(false),
             inline_liveness_prebuild: Vec::new(),
             dispatch_tainted_reason: None,
+            body_failure_reason: None,
+            nested_failure_reasons: Vec::new(),
             opcode_var_name: None,
             in_dispatch_arm_body: false,
             dispatch_loop_label: None,
             pc_pinned: false,
+            inline_arm_tail_stmt: false,
         };
         this.install_vable_input_binding();
         this
+    }
+
+    /// Consume the recorded refusal reason, falling back to the historical
+    /// generic string when a refusal site has not been taught to record one.
+    ///
+    /// The fallback is deliberately the old wording: a site that still reports
+    /// it is one this change has not reached, and keeping the exact string
+    /// makes those sites greppable rather than disguising them as classified.
+    pub(super) fn take_body_failure_reason(&mut self) -> String {
+        let mut reasons: Vec<String> = Vec::new();
+        // The parent's own refusals first, so the head is unchanged by
+        // propagation: a child reason can extend the string, never re-head it.
+        if let Some(existing) = self.body_failure_reason.take() {
+            reasons.extend(existing.split(REFUSAL_SEPARATOR).map(str::to_string));
+        }
+        for carried in std::mem::take(&mut self.nested_failure_reasons) {
+            reasons.extend(carried.split(REFUSAL_SEPARATOR).map(str::to_string));
+        }
+        // Same dedup rule the single-entry path uses, applied across the join:
+        // a child re-visits statements the parent also walked, so without this
+        // one blocker can appear twice and a count-based reader would take the
+        // repeat for a second mechanism.
+        let mut seen: Vec<&str> = Vec::new();
+        let mut joined = String::new();
+        for reason in &reasons {
+            if seen.contains(&reason.as_str()) {
+                continue;
+            }
+            seen.push(reason);
+            if !joined.is_empty() {
+                joined.push_str(REFUSAL_SEPARATOR);
+            }
+            joined.push_str(reason);
+        }
+        if joined.is_empty() {
+            // Deliberately the old wording — see this function's doc.
+            "arm body could not be lowered to a sub-JitCode".to_string()
+        } else {
+            joined
+        }
+    }
+
+    /// Carry a refused child lowerer's diagnosis into this one.
+    ///
+    /// Call at every site that discards a child after it returned `None`. The
+    /// `?` there propagates the failure faithfully and drops the reason with
+    /// the child, which is the whole defect: control flow stays correct while
+    /// the diagnosis is lost, so the arm reports only its outermost refusal and
+    /// the statement that actually needs a lowering rule is never named.
+    ///
+    /// Transitive on purpose — a child's own carried reasons come up too, so
+    /// depth does not decide whether a blocker is reportable.
+    pub(super) fn absorb_nested_failure(&mut self, nested: &mut Lowerer<'_>) {
+        if let Some(reason) = nested.body_failure_reason.take() {
+            self.nested_failure_reasons.push(reason);
+        }
+        self.nested_failure_reasons
+            .append(&mut nested.nested_failure_reasons);
     }
 
     pub(super) fn install_vable_input_binding(&mut self) {
@@ -145,6 +244,26 @@ impl<'c> Lowerer<'c> {
         reg
     }
 
+    /// Allocate the ident for a new label.
+    ///
+    /// The counter is macro-side bookkeeping only — the runtime label comes
+    /// from the `__builder.new_label()` statement `emit_aux` pushes beside the
+    /// ident — so a gap in it costs nothing, right up to `u16::MAX`, where
+    /// `saturating_add` stops moving and every further allocation hands back
+    /// the same ident: labels then alias instead of the counter panicking.
+    ///
+    /// Rolling `next_label` back is sound only where the statements are
+    /// truncated with it. The ident is already bound by the emitted
+    /// `let __jit_label_N = __builder.new_label();`, so restoring the counter
+    /// while that statement stands re-issues a live ident: the second `let`
+    /// shadows the first, uses written before it bind to one runtime label and
+    /// uses after it to another, and the first can be created without ever
+    /// being marked. Every restore site pairs the two writes for that reason.
+    ///
+    /// A lowerer that fails below its first `alloc_label` with the labels
+    /// already consumed therefore leaves the counter alone; it is put back by
+    /// `try_inline_dispatch_arm`, which discards the statement stream in the
+    /// same block.
     pub(super) fn alloc_label(&mut self) -> syn::Ident {
         let label = self.next_label;
         self.next_label = self.next_label.saturating_add(1);

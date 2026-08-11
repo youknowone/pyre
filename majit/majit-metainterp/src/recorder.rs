@@ -69,7 +69,7 @@ pub struct Snapshot {
 
 /// `jitcode_index` for a frame the recorder minted with no real coordinate.
 ///
-/// [`crate::history::TraceCtx::record_guard_with_snapshot`] attaches a
+/// `crate::history::TraceCtx::record_guard_with_snapshot` attaches a
 /// one-frame snapshot to the interpreter-side promotes purely to satisfy
 /// `resume.py:396-397`'s `assert resume_position >= 0`.  That layer is the
 /// recorder-side trace buffer and holds no `MIFrameStack`, so it has no
@@ -138,7 +138,7 @@ pub struct SnapshotFrame {
 /// is therefore intentionally absent — adding a virtual-tagged source
 /// requires a dedicated resume enum, not this snapshot type.
 ///
-/// TAGBOX(n)    → value lives in fail_args[n] (deadframe slot n)
+/// TAGBOX(n)    → value lives in `fail_args[n]` (deadframe slot n)
 /// TAGCONST(v)  → compile-time constant (i64 value)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotTagged {
@@ -554,7 +554,7 @@ impl Trace {
 
     /// opencoder.py:567-568 `cut_point()` — the recorder's local slice of
     /// the 5-tuple. `snapshot_data_len` / `snapshot_array_data_len` come
-    /// from `TraceCtx` (which owns the pyre-only Vec<Snapshot> side
+    /// from `TraceCtx` (which owns the pyre-only `Vec<Snapshot>` side
     /// table); callers should use `TraceCtx::get_trace_position` for a
     /// fully-populated position.
     pub fn get_position(&self) -> TracePosition {
@@ -964,10 +964,8 @@ mod tests {
         assert_eq!(guards[0].opcode, OpCode::GuardTrue);
     }
 
-    // ══════════════════════════════════════════════════════════════════
     // Opencoder parity tests
     // Ported from rpython/jit/metainterp/test/test_opencoder.py
-    // ══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_simple_iterator() {
@@ -1274,9 +1272,7 @@ mod tests {
         rec.record_input_arg(Type::Int);
     }
 
-    // ══════════════════════════════════════════════════════════════════
     // Opencoder breadth tests — deeper parity with test_opencoder.py
-    // ══════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_recorder_const_int_via_constant_oprefs() {

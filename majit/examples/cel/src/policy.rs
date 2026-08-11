@@ -1,34 +1,9 @@
-//! cell-majit de-risk — CEL-subset policy prototype (issue #357). ZERO CEL text.
+//! Slot-resolved policy benchmark for the MAJIT CEL prototype.
 //!
-//! The kill-test (`probe`) proved majit beats a clean interpreter ~10x on a
-//! straight-line ARITHMETIC batch. This prototype takes the next step: a
-//! realistic POLICY PREDICATE with comparisons + boolean AND over slot-resolved
-//! context fields, probing whether slot-resolution defeats the "member_access
-//! wall" (cometkim measured member_access at only 1.1x because context hashmap
-//! lookups dominate and the JIT cannot remove them).
-//!
-//! Modelled policy: `account.balance >= txn.amount && !account.frozen`.
-//! SLOT-RESOLVED context = the fields are pre-resolved to int register slots
-//! (no hashmap): the AST's `account.balance` compiles to a direct slot read.
-//! Each row's slots are synthesized by an LCG (distinct, data-dependent inputs;
-//! a counter-derived value would let the optimizer strength-reduce the loop).
-//! The predicate is a branchless AND of two comparisons (`t0*t1`, both in
-//! {0,1}); `acc` counts passing rows (a real "count rows matching policy").
-//!
-//! Two data regimes probe the guard behavior meta-tracing has but a tree-walk
-//! does not:
-//!   * SKEWED   — comparisons against extreme constants (`bal >= i64::MIN+1`,
-//!                `draw >= i64::MAX`) so the predicate is ~always true yet the
-//!                comparisons are GENUINE, data-dependent, and NOT constant-
-//!                foldable. Guard-stable best case = realistic skewed policy
-//!                data (a policy usually returns the same verdict).
-//!   * UNBIASED — bal, amt, frozen independent full-range LCG draws, so each
-//!                comparison is ~50/50. Guards fail constantly: the
-//!                trace-tree/bridge stress case.
-//!
-//! Three measurements per regime, identical bytecode:
-//!   (a) majit JIT-on, (b) clean hand interp (honest baseline), (c) JIT-off.
-//! Meaningful ratio = (b)/(a). RELEASE ONLY (i64 wrap; 3-way equality gate).
+//! It models `account.balance >= txn.amount && !account.frozen` with fields
+//! pre-resolved to register slots. Skewed and unbiased data sets exercise both
+//! guard-stable and frequent-guard-failure behavior across JIT, clean
+//! interpreter, and JIT-disabled execution.
 
 use crate::common::*;
 use std::hint::black_box;
@@ -63,7 +38,7 @@ struct VmState {
 fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<VmState> =
         majit_metainterp::JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
+    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after, _opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
     });
     let mut pc: usize = 0;

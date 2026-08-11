@@ -9,6 +9,9 @@
 //! - ArrayRead on virtualizable arrays → VableArrayRead marker
 //! - Call classification → elidable/residual/may_force tagging
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 
 use crate::call::CallDescriptor;
@@ -141,12 +144,83 @@ pub enum CallEffectKind {
     Elidable,
     Residual,
     MayForce,
+    /// A callee whose effects row is stated by the override table rather than
+    /// derived from a graph (callee census) — upstream's `analyze_external_call` answer
+    /// (`graphanalyze.py:104-108`).
+    ///
+    /// The three variants above are shorthands for three particular rows;
+    /// this one carries the row.
+    Declared(DeclaredCallEffects),
+}
+
+/// `effectinfo.py:17-24` `EF_*`, minus `EF_RANDOM_EFFECTS`.
+///
+/// The omission is the enforcement. `EF_RANDOM_EFFECTS` is top — the answer
+/// for a callee nobody can describe — so it is not something a declaration
+/// can say, and leaving it out makes upstream's
+/// `assert not (elidable_function and random_effects_on_gcobjs)`
+/// (`rpython/rtyper/lltypesystem/rffi.py:160`) hold by construction. The
+/// pairing that assert forbids cannot be spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeclaredExtraEffect {
+    ElidableCannotRaise,
+    LoopInvariant,
+    CannotRaise,
+    ElidableOrMemoryError,
+    ElidableCanRaise,
+    CanRaise,
+    ForcesVirtualOrVirtualizable,
+}
+
+impl From<DeclaredExtraEffect> for ExtraEffect {
+    fn from(declared: DeclaredExtraEffect) -> Self {
+        match declared {
+            DeclaredExtraEffect::ElidableCannotRaise => ExtraEffect::ElidableCannotRaise,
+            DeclaredExtraEffect::LoopInvariant => ExtraEffect::LoopInvariant,
+            DeclaredExtraEffect::CannotRaise => ExtraEffect::CannotRaise,
+            DeclaredExtraEffect::ElidableOrMemoryError => ExtraEffect::ElidableOrMemoryError,
+            DeclaredExtraEffect::ElidableCanRaise => ExtraEffect::ElidableCanRaise,
+            DeclaredExtraEffect::CanRaise => ExtraEffect::CanRaise,
+            DeclaredExtraEffect::ForcesVirtualOrVirtualizable => {
+                ExtraEffect::ForcesVirtualOrVirtualizable
+            }
+        }
+    }
+}
+
+/// One declared effects row.
+///
+/// The six read/write descr sets stay at `EffectInfo`'s default (empty).
+/// The override table is built before the descr universe exists, so it has no
+/// way to name a descr. Empty is the right row for a callee that touches no
+/// field or array and the wrong row for anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredCallEffects {
+    pub extra: DeclaredExtraEffect,
+    /// `effectinfo.py:125 can_collect`.
+    pub can_collect: bool,
+    pub can_invalidate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallEffectOverride {
     /// `op.args[0]`-equivalent funcptr identity used to match the
     /// override against a call site.
+    ///
+    /// Spell this the way the **resolver** spells it at the call site, which
+    /// is not necessarily a name the source artifact declares. Reading the
+    /// `.ullbc` cannot tell you: it registers `opcode_binary_op` under both a
+    /// bare and a module-qualified name, and every one of the 38 opcode call
+    /// sites resolves to the qualified `["pyre_interpreter", "pyopcode",
+    /// "opcode_binary_op"]`. A row written with the bare name is legitimate
+    /// against the artifact and still matches nothing, because non-`Method`
+    /// patterns are compared by full structural equality.
+    ///
+    /// The spelling a call site actually carries is what `PYRE_CALLEE_CENSUS=1`
+    /// prints in its `with_graph` table (set `PYRE_CALLEE_CENSUS_ROWS=all`;
+    /// the default cap is 25 rows). Confirm a new row against the per-entry
+    /// match counter in the same output — a row that reads `0x INERT` is not
+    /// installed, whatever it looks like here.
     pub target: CallTarget,
     /// `calldescr`-equivalent EffectInfo wrapper attached to the call.
     pub descriptor: CallDescriptor,
@@ -171,6 +245,11 @@ fn effect_info_for_kind(effect: CallEffectKind) -> EffectInfo {
             ExtraEffect::ForcesVirtualOrVirtualizable,
             OopSpecIndex::None,
         ),
+        CallEffectKind::Declared(declared) => EffectInfo {
+            can_collect: declared.can_collect,
+            can_invalidate: declared.can_invalidate,
+            ..EffectInfo::new(declared.extra.into(), OopSpecIndex::None)
+        },
     }
 }
 
@@ -2337,8 +2416,6 @@ impl<'a> Transformer<'a> {
         }
     }
 
-    // ── helpers ──────────────────────────────────────────────
-
     /// RPython: `Transformer.make_three_lists(vars)` (jtransform.py:437-445).
     /// Split args into three lists by kind (int, ref, float) keyed on
     /// the backing [`crate::flowspace::model::Variable`] (orthodox per
@@ -2570,8 +2647,6 @@ impl<'a> Transformer<'a> {
             }],
         )
     }
-
-    // ── rewrite_op_* methods ──────────────────────────────────
 
     /// RPython: `Transformer.rewrite_op_hint(op)`.
     /// Dispatches based on the hint kind (access_directly, force_virtualizable,
@@ -5860,7 +5935,7 @@ impl<'a> Transformer<'a> {
 ///   `Constant::with_concretetype(ConstValue::Bool(b), lltype.Bool)`,
 ///   carrying the `lltype.Bool` concretetype upstream stamps.
 //
-// gh #37: called from `optimize_block` (jtransform.py:123); the fused
+// the GotoIfNotOp lowering: called from `optimize_block` (jtransform.py:123); the fused
 // `ExitSwitch::Fused` is lowered to `FlatOp::GotoIfNotOp` in flatten.
 fn optimize_goto_if_not(graph: &mut FunctionGraph, block_idx: usize) -> bool {
     use crate::flowspace::model::{ConstValue, Constant};
@@ -6832,6 +6907,27 @@ fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
 /// `resolved_path` — by comparing the pattern against the path's
 /// `impl_type_prefix()`, directly or via leaf-suffix `canonical_leaf`
 /// (the `::`-joined path's trailing segment).
+///
+/// # Do not relax this into a leaf-name comparison
+///
+/// An override whose pattern never matches is **inert**: the call keeps the
+/// effects the analysis derived for it. An override that matches the *wrong*
+/// callee installs **another function's declared effects** on the call, which
+/// the analysis then trusts. Inert is safe; wrong is a miscompile. The two are
+/// one relaxation apart, and the relaxation is the obvious-looking repair when
+/// a row reads 0 matches.
+///
+/// Measured against the registered graphs, matching on the trailing segment
+/// alone would make an `RBigInt::sub` row also capture `time::Instant::sub`,
+/// `core::ops::arith::<Impl>::sub` and `buffer::Buffer::sub`, and an
+/// `RBigInt::hash` row capture 16 unrelated `hash` impls. Same failure class as
+/// registering a callee family that cannot be proven closed.
+///
+/// A row that reads 0 is telling you its *spelling* is wrong, not that the
+/// predicate is too strict. Every non-`Method` pattern is compared by full
+/// structural equality below, so the pattern must carry the same segmentation
+/// the resolver produces at the call site — see `CallEffectOverride`'s own docs
+/// for how to obtain it.
 fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool {
     match (pattern, target) {
         (
@@ -7038,6 +7134,164 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
     }
 }
 
+/// Call sites matched, per `call_effects` override entry.
+///
+/// `call_target_matches_loose` reports a non-match by returning `false`, and
+/// `classify_call` then falls through to the ordinary `describe_call` path.
+/// So an entry that matches nothing behaves exactly like an entry that is
+/// absent: the build is green, no test fails, and the effects row it was
+/// written to publish is simply never attached. This counter is the only
+/// channel that separates the two.
+///
+/// Keyed by the target's `Debug` rendering, never its `Display`: `Display`
+/// joins a `FunctionPath`'s segments with `::`, and the segmentation is what
+/// the match keys on — see
+/// `function_path_override_matches_only_its_own_segmentation`.
+///
+/// `BTreeMap` so two runs of one program print the same bytes.
+static OVERRIDE_MATCHES: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+/// The key `OVERRIDE_MATCHES` files a target under.
+fn override_key(target: &CallTarget) -> String {
+    format!("{target:?}")
+}
+
+/// Every `Method` target `classify_call` was actually invoked on, and the
+/// total number of invocations.
+///
+/// `OVERRIDE_MATCHES` counts *successful* matches, so a zero there has two
+/// causes it cannot tell apart: the predicate was consulted and said no, or
+/// the call site never reached the predicate at all. The census's own
+/// `method_shapes` table cannot settle it either — it walks every registered
+/// graph, which is a different and much larger population than the one
+/// `transform_graph` visits. This pair is the consumer-side denominator, so
+/// "no such call site was ever classified" becomes falsifiable.
+///
+/// Gated on the census env var: `classify_call` is hot, and an unconditional
+/// lock here would tax every build to answer a question nobody is asking.
+static CLASSIFY_SEEN_METHODS: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+/// The same denominator for `FunctionPath`, keyed by segments.
+///
+/// Needed for the same reason: knowing an override's spelling differs from the
+/// call site's is only half an explanation if that call site is never
+/// classified either. Without this, a spelling fix reads as unblocking a row
+/// that would stay inert regardless.
+static CLASSIFY_SEEN_PATHS: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+static CLASSIFY_SEEN_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn record_classify_seen(target: &CallTarget) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("PYRE_CALLEE_CENSUS").is_some_and(|v| v == "1")) {
+        return;
+    }
+    CLASSIFY_SEEN_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => {
+            *CLASSIFY_SEEN_METHODS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(format!("name={name:?} receiver_root={receiver_root:?}"))
+                .or_insert(0) += 1;
+        }
+        CallTarget::FunctionPath { segments, .. } => {
+            *CLASSIFY_SEEN_PATHS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(format!("{segments:?}"))
+                .or_insert(0) += 1;
+        }
+        _ => {}
+    }
+}
+
+fn record_override_match(pattern: &CallTarget) {
+    *OVERRIDE_MATCHES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(override_key(pattern))
+        .or_insert(0) += 1;
+}
+
+/// Every entry of `overrides` with the number of call sites it matched,
+/// heaviest first, zero-match entries last.
+///
+/// The table is passed in rather than remembered, because the finding this
+/// exists to surface is an entry with **no** matches — and an entry that
+/// matched nothing leaves no trace in the counter to enumerate. Reading the
+/// rows off the caller's table is what makes a `0` printable.
+///
+/// The header carries `entries` beside `matched`, so an empty list cannot be
+/// read as a clean table when it is really a run where no override table was
+/// installed at all.
+pub fn call_effect_override_census(overrides: &[CallEffectOverride]) -> Vec<String> {
+    let matches = OVERRIDE_MATCHES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut rows: Vec<(String, usize)> = overrides
+        .iter()
+        .map(|override_| {
+            let key = override_key(&override_.target);
+            let hits = matches.get(&key).copied().unwrap_or(0);
+            (key, hits)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // A key counted but absent from this table means two different override
+    // tables were installed in one process. That makes every count below a
+    // partial figure, so it is reported rather than dropped.
+    let listed: std::collections::BTreeSet<&String> = rows.iter().map(|(key, _)| key).collect();
+    let unlisted: Vec<&String> = matches.keys().filter(|key| !listed.contains(key)).collect();
+    let seen_methods = CLASSIFY_SEEN_METHODS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut lines = vec![
+        format!(
+            "call_effect_overrides entries={} matched={} inert={} sites={} unlisted={}",
+            overrides.len(),
+            rows.iter().filter(|(_, hits)| *hits > 0).count(),
+            rows.iter().filter(|(_, hits)| *hits == 0).count(),
+            matches.values().sum::<usize>(),
+            unlisted.len(),
+        ),
+        // The denominator for every zero above: without it, "no entry
+        // matched" and "the predicate was never consulted" print identically.
+        format!(
+            "classify_call_seen total={} method_sites={} method_shapes={}",
+            CLASSIFY_SEEN_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+            seen_methods.values().sum::<usize>(),
+            seen_methods.len(),
+        ),
+    ];
+    for (key, hits) in seen_methods.iter() {
+        lines.push(format!("classify_call_method {hits:>6}  {key}"));
+    }
+    let seen_paths = CLASSIFY_SEEN_PATHS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    lines.push(format!(
+        "classify_call_seen_paths sites={} shapes={}",
+        seen_paths.values().sum::<usize>(),
+        seen_paths.len(),
+    ));
+    for (key, hits) in seen_paths.iter() {
+        lines.push(format!("classify_call_path {hits:>6}  {key}"));
+    }
+    lines.extend(rows.iter().map(|(key, hits)| {
+        let verdict = if *hits == 0 { " INERT" } else { "" };
+        format!("call_effect_override {hits:>7}x{verdict}  {key}")
+    }));
+    lines.extend(
+        unlisted
+            .iter()
+            .map(|key| format!("call_effect_override UNLISTED  {key}")),
+    );
+    lines
+}
+
 /// Classify a call's side-effect level.
 ///
 /// RPython equivalent: jtransform.py effect classification
@@ -7056,11 +7310,13 @@ fn classify_call(
         }
     }
 
-    if let Some(descriptor) = overrides
+    record_classify_seen(target);
+    if let Some(override_) = overrides
         .iter()
         .find(|override_| call_target_matches_loose(&override_.target, target))
-        .map(|override_| override_.descriptor.clone())
     {
+        record_override_match(&override_.target);
+        let descriptor = override_.descriptor.clone();
         let effect = classify_effect_info(&descriptor.get_extra_info());
         return Some((descriptor, effect));
     }
@@ -7093,7 +7349,100 @@ mod tests {
         assert_eq!(keep_operation_unchanged(&transformer, &op), op);
     }
 
-    /// gh #37 Stage 1: `int_lt(a, b); exitswitch = t` fuses into a
+    /// A `FunctionPath` override matches its own segmentation and nothing
+    /// else, and a non-match is silent.
+    ///
+    /// `call_target_matches_loose` is loose only on the `Method` arm; a
+    /// `FunctionPath` pattern falls through to `_ => pattern == target`,
+    /// structural equality with no leaf-suffix tolerance. Both spellings
+    /// below `Display` as `core::ptr::null`, and owner-segmentation records that pyre's
+    /// two registration writers really do produce owner-split and
+    /// owner-unsplit paths for one function. So an override table written
+    /// from a `::`-joined listing is a guess about which split the call site
+    /// carries, and guessing wrong costs a `false` and no diagnostic — the
+    /// row is simply never consulted.
+    #[test]
+    fn function_path_override_matches_only_its_own_segmentation() {
+        let split = CallTarget::FunctionPath {
+            segments: vec!["core".into(), "ptr".into(), "null".into()],
+        };
+        let unsplit = CallTarget::FunctionPath {
+            segments: vec!["core::ptr".into(), "null".into()],
+        };
+        assert_eq!(split.to_string(), unsplit.to_string());
+        assert!(call_target_matches_loose(&split, &split));
+        assert!(!call_target_matches_loose(&split, &unsplit));
+        assert!(!call_target_matches_loose(&unsplit, &split));
+    }
+
+    /// A declared row reaches `EffectInfo` intact, and the `RandomEffects`
+    /// pairing upstream forbids cannot be written.
+    ///
+    /// The row below is the one a primitive like `core::ptr::null` wants:
+    /// elidable, cannot raise, allocates nothing. Upstream's constraint is
+    /// `assert not (elidable_function and random_effects_on_gcobjs)`
+    /// (`rffi.py:160`), and `random_effects_on_gcobjs` derives from
+    /// "releases the GIL or runs a callback" — neither of which this does. So
+    /// elidable-with-a-concrete-row is the orthodox state, not a liberty, and
+    /// the type must keep it expressible while `DeclaredExtraEffect` having
+    /// no `RandomEffects` member makes the forbidden pairing unspellable.
+    #[test]
+    fn declared_effects_reach_the_effect_info_intact() {
+        let info = effect_info_for_kind(CallEffectKind::Declared(DeclaredCallEffects {
+            extra: DeclaredExtraEffect::ElidableCannotRaise,
+            can_collect: false,
+            can_invalidate: false,
+        }));
+        assert_eq!(info.extraeffect, ExtraEffect::ElidableCannotRaise);
+        assert!(info.check_is_elidable());
+        assert!(!info.can_collect);
+        assert!(!info.can_invalidate);
+        // The default row says `can_collect: true`, so the assertion above is
+        // reading the declaration and not the default.
+        assert!(EffectInfo::default().can_collect);
+    }
+
+    /// The override census names an entry that matched nothing.
+    ///
+    /// Both entries below are well-formed and differ only in segmentation, so
+    /// the build cannot tell them apart and neither can any existing test:
+    /// one attaches its effects row, the other is consulted, declined, and
+    /// forgotten. The census has to print the second as `INERT`, which is the
+    /// whole reason it exists.
+    ///
+    /// Asserts on this test's own rows rather than the header totals —
+    /// `OVERRIDE_MATCHES` is process-global and the lib tests run in
+    /// parallel, so a total is not this test's to own. The segment names are
+    /// deliberately unique so no other test can touch these two keys.
+    #[test]
+    fn override_census_names_an_entry_that_matched_nothing() {
+        let live = CallTarget::FunctionPath {
+            segments: vec!["__probe135".into(), "live".into(), "leaf".into()],
+        };
+        let inert = CallTarget::FunctionPath {
+            segments: vec!["__probe135::inert".into(), "leaf".into()],
+        };
+        let overrides = vec![
+            CallEffectOverride::new(live.clone(), CallEffectKind::Elidable),
+            CallEffectOverride::new(inert.clone(), CallEffectKind::Elidable),
+        ];
+        assert!(classify_call(&live, &overrides).is_some());
+
+        let lines = call_effect_override_census(&overrides);
+        let row = |target: &CallTarget| {
+            let key = override_key(target);
+            lines
+                .iter()
+                .find(|line| line.ends_with(&key))
+                .unwrap_or_else(|| panic!("census has no row for {key}"))
+                .clone()
+        };
+        assert!(row(&live).contains("1x"), "{}", row(&live));
+        assert!(!row(&live).contains("INERT"), "{}", row(&live));
+        assert!(row(&inert).contains("0x INERT"), "{}", row(&inert));
+    }
+
+    /// the GotoIfNotOp lowering Stage 1: `int_lt(a, b); exitswitch = t` fuses into a
     /// `Fused { opname: "int_lt", args: [a, b] }` switch, the `int_lt`
     /// op is removed, and the `t` riding a link's args is replaced by
     /// that link's bool constant (`jtransform.py:196-234`).
@@ -7175,7 +7524,7 @@ mod tests {
         );
     }
 
-    /// gh #37 Stage 1: a non-supported result op (`int_add`) is NOT
+    /// the GotoIfNotOp lowering Stage 1: a non-supported result op (`int_add`) is NOT
     /// fusable — `optimize_goto_if_not` returns false and leaves the
     /// block untouched (`jtransform.py:206-209` opname gate).
     #[test]
@@ -11042,7 +11391,6 @@ mod tests {
         );
     }
 
-    // ── RPython indirect_call plumbing tests — parity guard ──────────
     //
     // RPython upstream: `jtransform.py:538-553 handle_regular_indirect_
     // call` emits `[-live-, int_guard_value, residual_call +

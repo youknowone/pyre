@@ -25,10 +25,32 @@ enum LoopInvariantEntry {
 /// Yield the `OptimizationResult::InvalidLoop` control value so the driver
 /// (`propagate_from_pass_range`) converts it to `Err(InvalidLoop)` at the
 /// pass barrier.  RPython `raise InvalidLoop`; threaded as a value here so
-/// it works under `panic=abort`.  Use as `return raise_invalid_loop(msg)`.
+/// it works under `panic=abort`.  Use as `return raise_invalid_loop(msg, op, ctx)`.
+///
+/// The payload is a `&'static str`, so the abandon reason is structurally
+/// unable to carry the operation it was raised on: the driver prints
+/// `[jit] abort trace at key=… (InvalidLoop: <msg>)`, which names a rule and
+/// no subject, and nothing downstream can rejoin the two.  Every caller here
+/// decides on `arg(0)`, so log that operand and the constant it resolved to
+/// at the point of decision — that resolved value *is* the proof the guard
+/// can never pass, and it is gone by the time the driver sees the reason.
 #[cold]
 #[inline(never)]
-fn raise_invalid_loop(msg: &'static str) -> OptimizationResult {
+fn raise_invalid_loop(msg: &'static str, op: &Op, ctx: &OptContext) -> OptimizationResult {
+    if crate::majit_log_enabled() {
+        let arg0 = op.arg(0);
+        let resolved = ctx
+            .resolve_operand_operand_opt(&arg0)
+            .and_then(|b| ctx.get_constant_int_or_bound_box(&b));
+        eprintln!(
+            "[jit] InvalidLoop raised at {:?} pos={:?}: {} (arg0={:?} resolved_const={:?})",
+            op.opcode,
+            op.pos.get(),
+            msg,
+            arg0.get_box_replacement(false).to_opref(),
+            resolved,
+        );
+    }
     OptimizationResult::InvalidLoop(msg)
 }
 
@@ -657,7 +679,7 @@ impl OptRewrite {
             if val != 0 {
                 return OptimizationResult::Remove;
             }
-            return raise_invalid_loop("GUARD_TRUE proven to always fail");
+            return raise_invalid_loop("GUARD_TRUE proven to always fail", op, ctx);
         }
 
         OptimizationResult::PassOn
@@ -675,7 +697,7 @@ impl OptRewrite {
             if val == 0 {
                 return OptimizationResult::Remove;
             }
-            return raise_invalid_loop("GUARD_FALSE proven to always fail");
+            return raise_invalid_loop("GUARD_FALSE proven to always fail", op, ctx);
         }
 
         OptimizationResult::PassOn
@@ -714,7 +736,7 @@ impl OptRewrite {
                 if actual_int == expected_int {
                     return OptimizationResult::Remove;
                 }
-                return raise_invalid_loop("GUARD_VALUE proven to always fail");
+                return raise_invalid_loop("GUARD_VALUE proven to always fail", op, ctx);
             }
         } else if let (Some(actual), Some(expected)) = (
             ctx.resolve_operand_operand_opt(&arg0)
@@ -727,7 +749,7 @@ impl OptRewrite {
             }
             match actual {
                 Value::Int(_) | Value::Ref(_) => {
-                    return raise_invalid_loop("GUARD_VALUE proven to always fail");
+                    return raise_invalid_loop("GUARD_VALUE proven to always fail", op, ctx);
                 }
                 Value::Float(_) => {
                     return OptimizationResult::Remove;
@@ -743,7 +765,7 @@ impl OptRewrite {
         let obj_info = obj_box.as_ref().and_then(|b| ctx.getptrinfo(b));
         if let Some(info) = obj_info {
             if info.is_virtual() {
-                return raise_invalid_loop("promote of a virtual");
+                return raise_invalid_loop("promote of a virtual", op, ctx);
             }
             // rewrite.py:307-347: replace_old_guard_with_guard_value
             if let Some(old_guard) = obj_box
@@ -771,6 +793,8 @@ impl OptRewrite {
                     if !c_nonnull {
                         return raise_invalid_loop(
                             "GUARD_VALUE(..., NULL) follows some other guard that it is not NULL",
+                            op,
+                            ctx,
                         );
                     }
                     // rewrite.py:324-332: previous_classbox = info.get_known_class(cpu)
@@ -785,6 +809,8 @@ impl OptRewrite {
                     {
                         return raise_invalid_loop(
                             "GUARD_VALUE proven to always fail (class mismatch)",
+                            op,
+                            ctx,
                         );
                     }
                     // rewrite.py:333-334: can_replace_guards check.
@@ -891,7 +917,7 @@ impl OptRewrite {
                 }
                 // rewrite.py:404-407: known class mismatch is a
                 // proven-fail guard — abort the trace.
-                return raise_invalid_loop("GUARD_CLASS proven to always fail");
+                return raise_invalid_loop("GUARD_CLASS proven to always fail", op, ctx);
             }
         }
         // rewrite.py:408-427: guard strengthening.
@@ -1788,7 +1814,7 @@ impl Optimization for OptRewrite {
                         return OptimizationResult::Remove;
                     }
                     if info.is_null() {
-                        return raise_invalid_loop("GUARD_NONNULL proven to always fail");
+                        return raise_invalid_loop("GUARD_NONNULL proven to always fail", op, ctx);
                     }
                 }
                 // rewrite.py:280-282 postprocess_GUARD_NONNULL:
@@ -1816,7 +1842,7 @@ impl Optimization for OptRewrite {
                         return OptimizationResult::Remove;
                     }
                     if info.is_nonnull() {
-                        return raise_invalid_loop("GUARD_ISNULL proven to always fail");
+                        return raise_invalid_loop("GUARD_ISNULL proven to always fail", op, ctx);
                     }
                 }
                 // rewrite.py:197-198 postprocess_GUARD_ISNULL:
@@ -1839,7 +1865,11 @@ impl Optimization for OptRewrite {
                 if let Some(info) = ctx.getptrinfo(&op.arg(0).get_box_replacement(false))
                     && info.is_null()
                 {
-                    return raise_invalid_loop("GUARD_NONNULL_CLASS proven to always fail");
+                    return raise_invalid_loop(
+                        "GUARD_NONNULL_CLASS proven to always fail",
+                        op,
+                        ctx,
+                    );
                 }
                 self.optimize_guard_class(op, ctx)
             }

@@ -65,6 +65,16 @@ pub struct JitInterpConfig {
     pub auto_calls: bool,
     /// Optional structured green-key expressions for marker rewrite.
     pub greens: Vec<Expr>,
+    /// Whether the attribute spelled a `greens` key at all, as opposed to
+    /// declaring `greens = []`.
+    ///
+    /// `greens` alone cannot answer that: both spellings produce an empty
+    /// `Vec`, and the merge-point refusal needs to tell them apart. An
+    /// omitted key is an author who has not considered greens; `greens = []`
+    /// is an author who has, and says so — the encoded merge point is
+    /// identical either way, so this is the only place the difference
+    /// survives.
+    pub greens_declared: bool,
     /// Slice (audit Issue #6) — explicit red declarations for the
     /// dispatch JitCode `BC_JIT_MERGE_POINT` payload.  RPython
     /// `jtransform.py:1700 make_three_lists(op.args[2+num_green_args:])`
@@ -707,6 +717,11 @@ impl Parse for JitInterpConfig {
             ));
         }
 
+        // Read the presence of the key BEFORE the `Option` is collapsed:
+        // `unwrap_or_default()` below maps an absent `greens` and an explicit
+        // `greens = []` onto the same empty `Vec`, and downstream there is
+        // nothing left to recover the difference from.
+        let greens_declared = greens.is_some();
         let greens_specs = greens.unwrap_or_default();
         let (green_exprs, green_type_tags): (Vec<Expr>, Vec<Option<green_type_tag::GreenTypeTag>>) =
             greens_specs
@@ -721,6 +736,7 @@ impl Parse for JitInterpConfig {
             calls,
             auto_calls: auto_calls.unwrap_or(false),
             greens: green_exprs,
+            greens_declared,
             reds: reds.unwrap_or_default(),
             green_type_tags,
             virtualizable_decl,
@@ -1234,14 +1250,31 @@ fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<CallEntry>> {
 }
 
 /// Reject a plain `[int]` state-array that is stored-to inside the traced
-/// loop. Such an array is *loop-carried*: its elements live only in trace
-/// registers and are NOT restored to the array on a guard deopt — they read
-/// back as the pre-loop value, silently producing a wrong result. The
-/// supported mechanism for a mutated, loop-carried array is `[int; virt]`,
-/// whose stores write through to the heap-backing `Vec` that the deopt path
-/// reads directly. A plain `[int]` array that is only *read* in the loop (or
-/// only written before it) is loop-invariant and stays valid, so the check
+/// loop. Such an array is *loop-carried*, and the observable — measured on
+/// `majit/examples/tinyframe` with this refusal disabled — is that the element
+/// does not read back its heap value: three committed value tests answer 0
+/// where the program answers 40, 40 and 5, and they answer 0 whatever the
+/// array held, including when the register is seeded through the mainloop's
+/// own input ahead of every candidate arming pc. The supported declaration for
+/// a mutated, loop-carried array is `[int; virt]`, which answers correctly on
+/// the same fixtures. A plain `[int]` array that is only *read* in the loop
+/// (or only written before it) is loop-invariant and stays valid, so the check
 /// fires solely on stores reached by the dispatch loop the lowerer traces.
+///
+/// Do not read the refusal as asking for a restore path. In the measured
+/// subject the trace carries no array operation at all — the recorded body is
+/// `IntAdd, IntGt, GuardTrue, GuardFutureCondition, Jump`, the register file
+/// is traced as loop-carried inputargs, and nothing lowers to a state-array
+/// load or store — so there is no array write for a deopt to fail to restore.
+/// What the 0 actually is remains UNMEASURED: the `[int; virt]` arm was never
+/// logged beside the plain one, so the two op inventories and the two guards'
+/// resume payloads have never been compared.
+///
+/// `validate_rejects_loop_carried_plain_array`, `validate_accepts_virt_array`
+/// and `validate_accepts_read_only_plain_array` grade *which declarations this
+/// function refuses*; none of them grades whether the refused declaration
+/// miscompiles. This is a selector with no classifier, and the readback above
+/// is the first witness it has ever had.
 fn validate_state_fields(config: &JitInterpConfig, func: &ItemFn) -> syn::Result<()> {
     let Some(sf) = &config.state_fields else {
         return Ok(());
@@ -1270,10 +1303,10 @@ fn validate_state_fields(config: &JitInterpConfig, func: &ItemFn) -> syn::Result
             span,
             format!(
                 "state field `{name}` is a plain `[int]` array stored inside the traced loop, \
-                 so it is loop-carried. A plain `[int]` element is held in a trace register and \
-                 is not restored to the array when a guard deopts (it reads back as the pre-loop \
-                 value, silently miscompiling). Declare it as `[int; virt]`: a virtualizable \
-                 array writes through to the heap-backing Vec that the deopt path reads directly."
+                 so it is loop-carried. A loop-carried plain `[int]` element does not read back \
+                 its heap value: the traced loop answers as if the element were 0, whatever the \
+                 array holds, silently miscompiling. Declare it as `[int; virt]`, which answers \
+                 correctly on the same program."
             ),
         ));
     }
@@ -1437,7 +1470,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 // the dispatcher's BC_CALL_ASSEMBLER_* path can route
                 // through the production `Arc<JitCellToken>` rather
                 // than the synth-Arc `_by_number_typed` fallback.  The
-                // helper also hands over the #184 recursive-call seams
+                // helper also hands over the recursive-call recursive-call seams
                 // (green-key target resolver, inline decision, and the
                 // `execute_token_raw` concrete executor) wired to the
                 // production warmstate / backend.
@@ -1839,12 +1872,15 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     }
 
     // Rewrite the function body, replacing marker macros
+    let finish_return = finish_return_for(&sig.output);
     let body = rewrite_body(
         &block,
         &merge_fn_name,
         &config.greens,
+        config.greens_declared,
         &config.green_type_tags,
         config.recursive_entry.as_ref(),
+        finish_return.as_ref(),
     );
 
     quote! {
@@ -1855,13 +1891,94 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     }
 }
 
+/// How a compiled run that ended in FINISH is returned from the portal.
+///
+/// `compile.py:623-638` marks a FINISH descr `final_descr = True`: the traced
+/// function has RETURNED, and upstream unwinds the portal by raising
+/// `jitexc.DoneWithThisFrame*`. `back_edge*` reports `Option<resume_pc>`, which
+/// has no variant for that, so the result travels out of band in the driver
+/// (`take_back_edge_finish_*`) and the expansion turns it back into the portal's
+/// own `return`. Which projection applies is decided by the portal's declared
+/// return type.
+#[derive(Clone, Copy)]
+enum FinishReturnKind {
+    Int,
+    Float,
+}
+
+#[derive(Clone)]
+struct FinishReturn {
+    kind: FinishReturnKind,
+    /// The portal's return type, when it is not the projection's own word type
+    /// (`i64` / `f64`) and therefore needs a cast. `None` means no cast.
+    cast_to: Option<syn::Type>,
+}
+
+/// Classify a portal's return type into a FINISH projection, or `None` when the
+/// expansion cannot build that type out of a `majit_ir::Value` (for example a
+/// portal returning `String`). `None` leaves the back edge exactly as it was:
+/// the driver still returns `Some(target_pc)` on FINISH for those portals.
+fn finish_return_for(output: &syn::ReturnType) -> Option<FinishReturn> {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+    let syn::Type::Path(type_path) = ty.as_ref() else {
+        return None;
+    };
+    if type_path.qself.is_some() {
+        return None;
+    }
+    let segment = type_path.path.segments.last()?;
+    if !segment.arguments.is_none() {
+        return None;
+    }
+    let (kind, is_word_type) = match segment.ident.to_string().as_str() {
+        "i64" => (FinishReturnKind::Int, true),
+        "i8" | "i16" | "i32" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
+            (FinishReturnKind::Int, false)
+        }
+        "f64" => (FinishReturnKind::Float, true),
+        "f32" => (FinishReturnKind::Float, false),
+        _ => return None,
+    };
+    Some(FinishReturn {
+        kind,
+        cast_to: (!is_word_type).then(|| ty.as_ref().clone()),
+    })
+}
+
+impl FinishReturn {
+    /// The statement that drains the driver's FINISH latch and returns it as the
+    /// portal's result. Emitted immediately after the `back_edge*` call whose
+    /// compiled run may have set it, and BEFORE that call's `Some(resume_pc)` is
+    /// used: on FINISH that pc is the back edge, so resuming there would re-run
+    /// the loop the compiled run already completed.
+    fn drain(&self, driver_expr: &Expr) -> TokenStream {
+        let take = match self.kind {
+            FinishReturnKind::Int => quote! { take_back_edge_finish_int },
+            FinishReturnKind::Float => quote! { take_back_edge_finish_float },
+        };
+        let returned = match &self.cast_to {
+            Some(ty) => quote! { __finish_value as #ty },
+            None => quote! { __finish_value },
+        };
+        quote! {
+            if let Some(__finish_value) = #driver_expr.#take() {
+                return #returned;
+            }
+        }
+    }
+}
+
 /// Rewrite function body: replace jit_merge_point!() and can_enter_jit!() calls.
 fn rewrite_body(
     block: &syn::Block,
     merge_fn_name: &Ident,
     default_greens: &[Expr],
+    greens_declared: bool,
     default_green_type_tags: &[Option<green_type_tag::GreenTypeTag>],
     recursive_entry: Option<&Path>,
+    finish_return: Option<&FinishReturn>,
 ) -> TokenStream {
     use syn::visit_mut::VisitMut;
 
@@ -2054,8 +2171,32 @@ fn rewrite_body(
         }
     }
 
+    /// `interp_jit.py:117-119` `can_enter_jit(next_instr=jumpto, pycode=...)`:
+    /// the greens a back edge hands the driver name the interpreter state at the
+    /// JUMP TARGET, not at the back-edge instruction.  `jumpto` is passed for
+    /// `next_instr` — there is no second, current-position green.
+    ///
+    /// The `#[jit_interp]` marker form takes the target positionally and fills
+    /// the greens from the declaration, so a declared position green (`pc`)
+    /// would otherwise be read at the back edge.  Substituting the target for
+    /// it is what makes `back_edge_structured`'s key equal the key the merge
+    /// point at that target derives (`TraceCtx::merge_point_green_key_hash`) —
+    /// which is the key `compile_loop` files the loop under
+    /// (pyjitpl.py:3183-3189 `original_boxes[:num_green_args]`).  Without it the
+    /// loop is stored under a key nothing enters: the interpreter's
+    /// `has_compiled_loop` misses forever, every back edge re-arms tracing, and
+    /// the compiled artifact is never executed.
+    fn subst_target_for_pc<'a>(expr: &'a Expr, pc: &Expr, target: &'a Expr) -> &'a Expr {
+        if quote!(#expr).to_string() == quote!(#pc).to_string() {
+            target
+        } else {
+            expr
+        }
+    }
+
     fn green_key_expr(
         target: &Expr,
+        pc: &Expr,
         greens: &[Expr],
         green_type_tags: &[Option<green_type_tag::GreenTypeTag>],
     ) -> Option<TokenStream> {
@@ -2085,16 +2226,57 @@ fn rewrite_body(
                 .enumerate()
                 .map(|(i, expr)| {
                     let tag = green_type_tags.get(i).copied().flatten();
-                    emit_green_repr(expr, tag)
+                    emit_green_repr(subst_target_for_pc(expr, pc, target), tag)
                 })
                 .collect();
+            // Each green's `(i64, GreenType)` pair is bound to a local
+            // ONCE — the green expressions must not be re-evaluated, so
+            // the deferred key builder below closes over these `Copy`
+            // locals rather than over the expressions.
+            let all_reprs: Vec<TokenStream> =
+                std::iter::once(quote! { <_ as majit_ir::GreenAsI64>::__green_repr(#target) })
+                    .chain(green_reprs)
+                    .collect();
+            let slots: Vec<syn::Ident> = (0..all_reprs.len())
+                .map(|i| {
+                    syn::Ident::new(&format!("__green_slot{i}"), proc_macro2::Span::call_site())
+                })
+                .collect();
+            let bind: Vec<TokenStream> = slots
+                .iter()
+                .zip(&all_reprs)
+                .map(|(slot, repr)| quote! { let #slot = #repr; })
+                .collect();
+            // `get_uhash` unrolled over the declared greens — the count and
+            // types are known here, exactly as upstream's
+            // `green_args_name_spec` is fixed per JitCell class at
+            // translation time (warmstate.py:584-593). No `values` /
+            // `types` vectors are built to hash.
+            let fold: Vec<TokenStream> = slots
+                .iter()
+                .map(|slot| {
+                    quote! {
+                        __green_hash =
+                            majit_ir::green_uhash_step(__green_hash, #slot.1, #slot.0);
+                    }
+                })
+                .collect();
+            let values: Vec<TokenStream> = slots.iter().map(|slot| quote! { #slot.0 }).collect();
+            let types: Vec<TokenStream> = slots.iter().map(|slot| quote! { #slot.1 }).collect();
+            // `(hash, make_key)`: the hash is needed on every back edge, the
+            // typed key only where a cell is installed.
             Some(quote! {
                 {
-                    let (__values, __types): (Vec<i64>, Vec<majit_ir::GreenType>) = vec![
-                        <_ as majit_ir::GreenAsI64>::__green_repr(#target),
-                        #(#green_reprs),*
-                    ].into_iter().unzip();
-                    majit_ir::GreenKey::with_types(__values, __types)
+                    #(#bind)*
+                    let mut __green_hash: u64 = majit_ir::GREEN_UHASH_SEED;
+                    #(#fold)*
+                    (
+                        __green_hash,
+                        move || majit_ir::GreenKey::with_types(
+                            ::std::vec![#(#values),*],
+                            ::std::vec![#(#types),*],
+                        ),
+                    )
                 }
             })
         }
@@ -2103,8 +2285,13 @@ fn rewrite_body(
     struct MarkerRewriter {
         merge_fn_name: Ident,
         default_greens: Vec<Expr>,
+        /// Whether the attribute spelled a `greens` key. `default_greens` being
+        /// empty does not answer this: an omitted key and `greens = []` both
+        /// arrive here as an empty `Vec`, and only one of them is a mistake.
+        greens_declared: bool,
         default_green_type_tags: Vec<Option<green_type_tag::GreenTypeTag>>,
         recursive_entry: Option<Path>,
+        finish_return: Option<FinishReturn>,
     }
 
     impl VisitMut for MarkerRewriter {
@@ -2271,6 +2458,79 @@ fn rewrite_body(
                             }
                         }
                     };
+                    // `; state` selects the single-executor close: the native
+                    // loop resumes at the green pc the merge point reports.  A
+                    // driver with no declared greens reports none, and the
+                    // failure is silent in release —
+                    // `run_pending_abort_blackhole` reaches
+                    // `ContinueRunningNormally` with an empty `green_int`
+                    // (`jitdriver.rs:2041-2059`), sets `single_pass_finish`, and
+                    // the dispatch loop ends after exactly `threshold` passes,
+                    // returning a truncated result that still looks plausible.
+                    // The `debug_assert!` naming that contract is compiled out
+                    // in release, so only the ungated `eprintln!` beside it ever
+                    // fires.  Refuse at compile time rather than truncate at
+                    // run time.
+                    //
+                    // Wrapped in a block rather than replacing the expansion:
+                    // `parse2` below wants exactly one `Stmt`, and keeping the
+                    // original tokens means the error reported is this one
+                    // instead of a cascade of unresolved names.
+                    // A missing `greens` key is refused below. An explicit
+                    // `greens = []` remains supported, so the diagnostic also
+                    // explains the degenerate trace shape of that deliberate case.
+                    if self.default_greens.is_empty() {
+                        // This is emitted once per macro expansion because an
+                        // explicitly empty green set cannot provide a resume pc.
+                        let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| {
+                            "<crate unknown: CARGO_PKG_NAME unset>".to_string()
+                        });
+                        let site = self
+                            .merge_fn_name
+                            .to_string()
+                            .strip_prefix("__merge_")
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| self.merge_fn_name.to_string());
+                        eprintln!(
+                            "warning: [{}] `fn {}` expands with an empty green set on its \
+                             `#[jit_interp]` attribute. Its merge point (`{}`) reports no \
+                             concrete pc, so the tracing walk never advances and every \
+                             trace attempt re-records one guard triple. Where the \
+                             attempts survive, that reaches `trace_limit * 4/5` and \
+                             ships a segmented trace whose compiled loop runs zero \
+                             iterations; where an arm on the loop's back edge is a \
+                             degraded stub, they abort inside it and nothing compiles \
+                             at all. Both outcomes are degenerate. The remedy is to \
+                             declare the greens the loop is keyed on, e.g. \
+                             `greens = [pc, program]` — that does not by itself make \
+                             the back edge lower, which is separate work. If the emptiness is deliberate and spelled \
+                             `greens = []`, this line is the expected report for it and \
+                             there is nothing to change.",
+                            krate,
+                            site,
+                            quote!(#driver)
+                        );
+                    }
+                    let new_tokens = if !self.greens_declared {
+                        let driver_name = quote!(#driver).to_string();
+                        // State the required metadata rather than enumerating
+                        // merge-point spellings, which may grow independently.
+                        let msg = format!(
+                            "`jit_merge_point!` on `{driver_name}` requires a `greens` key \
+                             on the enclosing `#[jit_interp]` attribute, and this attribute \
+                             has none. A merge point resumes the interpreter at the green \
+                             pc it reports; with no greens declared it reports none, so \
+                             the tracing walk never advances and what the JIT ships is \
+                             degenerate — a compiled loop that runs zero iterations, or \
+                             nothing at all. Declare the greens the loop is keyed on, e.g. \
+                             `greens = [pc, program]`. If the empty set is deliberate — a \
+                             fixture grading the empty-greens encoding — spell it \
+                             `greens = []`, which is supported and is not refused here."
+                        );
+                        quote! { { compile_error!(#msg); #new_tokens } }
+                    } else {
+                        new_tokens
+                    };
                     *stmt =
                         syn::parse2(new_tokens).expect("failed to parse merge_point replacement");
                 }
@@ -2411,24 +2671,44 @@ fn rewrite_body(
                                 (args.greens.clone(), self.default_green_type_tags.clone())
                             };
                             // compile.py:711 parity: back_edge returns
-                            // Some(resume_pc) on guard failure (blackhole
-                            // resume) or FINISH (loop header re-entry).
+                            // Some(resume_pc) on a guard failure (blackhole
+                            // resume) or a back-edge JUMP.
                             // state.restore_values already restores all
                             // state fields (including stacksize) from the
                             // compiled loop's exit state, so no explicit
                             // stacksize reset is needed here.
-                            let back_edge: TokenStream = if let Some(green_key) =
-                                green_key_expr(target_expr, &greens, &green_type_tags)
+                            //
+                            // A run that ended in FINISH is NOT a resume: the
+                            // traced function returned, so the driver's FINISH
+                            // latch is drained first and turned into this
+                            // portal's own `return`. The resume_pc offered
+                            // alongside it is the back edge, and taking it
+                            // would re-run the loop the compiled run already
+                            // completed — once per remaining iteration.
+                            let finish_drain: TokenStream = self
+                                .finish_return
+                                .as_ref()
+                                .map(|finish_return| finish_return.drain(driver_expr))
+                                .unwrap_or_default();
+                            let call: TokenStream = if let Some(green_key) =
+                                green_key_expr(target_expr, &pc_expr, &greens, &green_type_tags)
                             {
                                 quote! {
-                                    if let Some(__resume_pc) = #driver_expr.back_edge_structured(#green_key, #target_expr, #state_expr, #env_expr, #pre_run_expr) {
-                                        #pc_expr = __resume_pc;
-                                        continue;
+                                    {
+                                        let (__green_hash, __green_key) = #green_key;
+                                        #driver_expr.back_edge_structured(__green_hash, __green_key, #target_expr, #state_expr, #env_expr, #pre_run_expr)
                                     }
                                 }
                             } else {
                                 quote! {
-                                    if let Some(__resume_pc) = #driver_expr.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr) {
+                                    #driver_expr.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr)
+                                }
+                            };
+                            let back_edge: TokenStream = quote! {
+                                {
+                                    let __back_edge_resume = #call;
+                                    #finish_drain
+                                    if let Some(__resume_pc) = __back_edge_resume {
                                         #pc_expr = __resume_pc;
                                         continue;
                                     }
@@ -2456,8 +2736,10 @@ fn rewrite_body(
     let mut rewriter = MarkerRewriter {
         merge_fn_name: merge_fn_name.clone(),
         default_greens: default_greens.to_vec(),
+        greens_declared,
         default_green_type_tags: default_green_type_tags.to_vec(),
         recursive_entry: recursive_entry.cloned(),
+        finish_return: finish_return.cloned(),
     };
     rewriter.visit_block_mut(&mut cloned_block);
 
@@ -2732,7 +3014,7 @@ mod tests {
     }
 
     /// A plain `[int]` array stored inside the traced loop must be rejected:
-    /// the loop-carried element is lost on a guard deopt.
+    /// the loop-carried element does not read back its heap value.
     #[test]
     fn validate_rejects_loop_carried_plain_array() {
         let func: ItemFn = parse_quote! {
@@ -2809,5 +3091,179 @@ mod tests {
             func,
         )
         .expect("read-only plain [int] array must be accepted");
+    }
+
+    /// A merge point whose enclosing attribute omits the `greens` key must be
+    /// refused at expansion time.
+    ///
+    /// The second arm is the whole point of the test, not a bonus assertion.
+    /// The two expansions differ by exactly one attribute entry, so a fixture
+    /// that stops expanding for some unrelated reason emits `compile_error!`
+    /// for *both* — and only the `with_greens` assertion notices. Checked on
+    /// its own, the first assertion passes just as happily on a typo'd
+    /// attribute as on a working guard, which would make this an oracle that
+    /// cannot fail.
+    ///
+    /// THE THIRD ARM IS NOT A THIRD COPY OF THE SECOND. `greens = []` and
+    /// `greens = [pc, program]` are both "not refused", but they are not
+    /// refused for different reasons: the second declares greens, the third
+    /// declares that there are none. The refusal reads the KEY, not the value,
+    /// and the third arm is the only thing in this crate that says so — drop
+    /// it and re-keying the guard on `default_greens.is_empty()` passes every
+    /// remaining assertion here while making the empty-greens fixtures in
+    /// `majit-metainterp` unrepresentable.
+    #[test]
+    fn merge_point_without_a_greens_key_is_refused() {
+        fn expand(greens: proc_macro2::TokenStream) -> String {
+            let config: JitInterpConfig = syn::parse2(quote! {
+                state = S,
+                env = Bytecode,
+                #greens
+                state_fields = { acc: int },
+            })
+            .expect("fixture attribute must parse");
+            let func: ItemFn = parse_quote! {
+                fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                    let mut driver: majit_metainterp::JitDriver<S> =
+                        majit_metainterp::JitDriver::new(threshold);
+                    let mut pc: usize = 0;
+                    let mut state = S { acc: 0 };
+                    while pc < program.len() {
+                        jit_merge_point!(driver, program, pc; state);
+                        let op = program[pc];
+                        pc += 1;
+                        match op {
+                            0 => { state.acc += 1; }
+                            _ => break,
+                        }
+                    }
+                    state.acc
+                }
+            };
+            transform_jit_interp(config, func).to_string()
+        }
+
+        let without_greens = expand(quote! {});
+        assert!(
+            without_greens.contains("compile_error"),
+            "an attribute with no `greens` key must expand to a compile_error; \
+             without one the merge point reports no concrete pc and the tracing \
+             walk never advances. Expansion was:\n{without_greens}"
+        );
+        assert!(
+            without_greens.contains("greens"),
+            "the refusal must name `greens` so the reader knows what to add:\n\
+             {without_greens}"
+        );
+
+        let with_greens = expand(quote! { greens = [pc, program], });
+        assert!(
+            !with_greens.contains("compile_error"),
+            "the same interpreter with `greens = [pc, program]` must expand \
+             cleanly. A compile_error here means the fixture itself is broken, \
+             which would make the assertions above vacuous. Expansion was:\n\
+             {with_greens}"
+        );
+
+        let empty_greens = expand(quote! { greens = [], });
+        assert!(
+            !empty_greens.contains("compile_error"),
+            "`greens = []` is a DECLARATION of emptiness and must expand \
+             cleanly. The refusal keys on the absence of the key, not on the \
+             emptiness of the list: `majit-metainterp`'s dispatch-IR fixtures \
+             spell `greens = []` precisely to grade the empty-greens encoding \
+             (`num_green_args == 0`, and no `BC_*_GUARD_VALUE` in the prefix, \
+             mirroring `jtransform.py:1693-1714 promote_greens`), so refusing \
+             this spelling deletes the only tests of the state the refusal \
+             above is about. Expansion was:\n{empty_greens}"
+        );
+    }
+
+    /// The refusal above reaches EVERY merge-point form, the bare
+    /// `jit_merge_point!()` included.
+    ///
+    /// THIS ASSERTION USED TO RUN THE OTHER WAY, and the inversion is the
+    /// record of a real change rather than a tidy-up. The guard was
+    /// `args.state.is_some() && default_greens.is_empty()`, and the first
+    /// conjunct confined it to a form a greens-less driver cannot be written
+    /// in — so it never fired on a crate that needed it. This test pinned that
+    /// gap, said in its own text that dropping the conjunct must invert the
+    /// second assertion, and the conjunct is now gone. Anyone re-narrowing the
+    /// guard reds here and has to invert it back deliberately.
+    ///
+    /// A `contains` assertion arms itself and a `!contains` one does not,
+    /// so the two arms are no longer symmetric in what they prove. Both arms
+    /// now expect the refusal, which means a fixture that stopped reaching
+    /// this handler entirely would fail LOUDLY rather than pass quietly — the
+    /// failure direction is the safe one. The `is_tracing()` count is kept on
+    /// the bare arm anyway: it reads whether the bare form was processed at
+    /// all, independently of what the guard decided, and it is the only thing
+    /// here that can tell "refused" from "never expanded" if the refusal ever
+    /// moves again.
+    ///
+    /// Do not fold this into the test above as a duplicate — that one varies
+    /// the greens with the form fixed, this one varies the form with the
+    /// greens fixed, and neither substitutes for the other.
+    #[test]
+    fn no_greens_refusal_reaches_every_merge_point_form() {
+        fn expand(merge_point: proc_macro2::TokenStream) -> String {
+            let config: JitInterpConfig = syn::parse2(quote! {
+                state = S,
+                env = Bytecode,
+                state_fields = { acc: int },
+            })
+            .expect("fixture attribute must parse");
+            let func: ItemFn = parse_quote! {
+                fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                    let mut driver: majit_metainterp::JitDriver<S> =
+                        majit_metainterp::JitDriver::new(threshold);
+                    let mut pc: usize = 0;
+                    let mut state = S { acc: 0 };
+                    while pc < program.len() {
+                        #merge_point
+                        let op = program[pc];
+                        pc += 1;
+                        match op {
+                            0 => { state.acc += 1; }
+                            _ => break,
+                        }
+                    }
+                    state.acc
+                }
+            };
+            transform_jit_interp(config, func).to_string()
+        }
+
+        let state_form = expand(quote! { jit_merge_point!(driver, program, pc; state); });
+        assert!(
+            state_form.contains("compile_error"),
+            "the `; state` arm is this test's positive control: with no greens \
+             it must still be refused, otherwise the bare-form assertion below \
+             is measuring a detector that is not running. Expansion was:\n\
+             {state_form}"
+        );
+
+        let bare_form = expand(quote! { jit_merge_point!(); });
+        assert_eq!(
+            bare_form.matches("is_tracing").count(),
+            1,
+            "arming for the assertion below, which is a `!contains` and cannot \
+             arm itself. `is_tracing()` is emitted from exactly two places in \
+             this crate, both of them the merge-point handler's own arms, so \
+             one occurrence is the fixture's one merge point having been \
+             processed. A zero here means the bare form never reached the \
+             handler, and the absent `compile_error` below would then be \
+             measuring nothing. Expansion was:\n{bare_form}"
+        );
+        assert!(
+            bare_form.contains("compile_error"),
+            "the bare form with no `greens` key must be refused too. This \
+             assertion was inverted when the `args.state.is_some()` conjunct \
+             was dropped; if it now fails, the guard has been re-narrowed to \
+             some subset of the merge-point forms. Widen it back rather than \
+             inverting this line — a form-dependent refusal cannot fire on the \
+             crates that need it, which is what the conjunct did for as long as \
+             it stood. Expansion was:\n{bare_form}"
+        );
     }
 }

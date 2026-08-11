@@ -978,6 +978,21 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_NO_CACHE`,
 `PYRE_WASM_STARTUP_TRACE`.
 
+## §7 — General MAJIT gates
+
+These translator and metainterpreter controls are inert unless explicitly set,
+except for the function-pointer lowering switch, which is a build configuration
+input.
+
+| gate | default polarity | what it gates / retirement condition |
+|---|---|---|
+| `PYRE_CALLEE_CENSUS` | OFF | build-time census of resolved and unresolved callees; retire when all supported callees are classified without this diagnostic |
+| `PYRE_CALLEE_CENSUS_ROWS` | OFF | row cap for that census; retire with `PYRE_CALLEE_CENSUS` |
+| `PYRE_DESCR_POOL_CENSUS` | OFF | reports descriptor interning and duplication; retire when descriptor identity is covered by ordinary tests |
+| `PYRE_FNPTR_INDIRECT` | OFF | enables indirect function-pointer lowering; retained as a build configuration switch |
+| `PYRE_PROBE14` | OFF | reports discarded reference-constant relocations; retire when relocation preservation is covered by ordinary tests |
+| `PYRE_VABLE_IDX_PROBE` | OFF | reports whether virtualizable array indices are constant; retire when all supported index shapes are covered by ordinary tests |
+
 ## Summary
 
 | bucket | count |

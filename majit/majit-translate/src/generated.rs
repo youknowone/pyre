@@ -92,8 +92,12 @@
 //! - NOT a new key schema. The canonical key is `CallPath` (matching
 //!   `CallControl.jitcodes`, which is `rpython/jit/codewriter/call.py:87
 //!   self.jitcodes` keyed by graph identity).
-//! - NOT a variant-keyed map. No `HashMap<Instruction, …>` exists under
-//!   `majit/majit-translate/src/` (`rg "HashMap<Instruction"` = 0).
+//! - NOT a variant-keyed map. JitCode maps are keyed by `CallPath`, never by
+//!   an opcode variant. The scope is every crate under `majit/*/src`, not
+//!   this crate alone, and `test_epic_acceptance_greps` re-measures it on
+//!   every run — read the selector list there rather than restating one
+//!   here, since a recipe quoted beside its subject cannot disagree with
+//!   the tree.
 //! - NOT a new opname family. Every handler is transformed through the
 //!   existing `CodeWriter::transform_graph_to_jitcode` without per-arm
 //!   special cases.

@@ -10,6 +10,10 @@ const ADD_R_TO_A: u8 = 5;
 const RETURN_A: u8 = 6;
 const ALLOCATE: u8 = 7;
 const NEG_A: u8 = 8;
+/// Two-byte little-endian immediate, the shift-or form. Exists so a wide
+/// immediate read from the green bytecode can be exercised inside a loop that
+/// actually closes a trace; see `jit_interp`'s `jit_wide_immediate_folds`.
+const SET_A_WIDE: u8 = 9;
 
 pub fn interpret(bytecode: &[u8], a: i64) -> i64 {
     let mut regs: Vec<i64> = Vec::new();
@@ -51,6 +55,9 @@ pub fn interpret(bytecode: &[u8], a: i64) -> i64 {
             regs = vec![0; n];
         } else if opcode == NEG_A {
             a = -a;
+        } else if opcode == SET_A_WIDE {
+            a = (bytecode[pc] as i64) | ((bytecode[pc + 1] as i64) << 8);
+            pc += 2;
         }
     }
 }

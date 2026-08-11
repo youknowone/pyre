@@ -3,6 +3,24 @@ mod call_spec;
 #[path = "../../../pyre/pyre-jit-trace/src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
+/// Carry one declared `EF_*` from the pyre-owned spec to the translator's
+/// own enum. Mirrors `pyre-jit-trace/build.rs`, which does the same walk for
+/// the production pipeline; both enumerate the arms so a new member is a
+/// compile error rather than a silent re-mapping.
+fn declared_extra_effect(extra: call_spec::DeclaredExtraEffect) -> crate::DeclaredExtraEffect {
+    use crate::DeclaredExtraEffect as Translate;
+    use call_spec::DeclaredExtraEffect as Spec;
+    match extra {
+        Spec::ElidableCannotRaise => Translate::ElidableCannotRaise,
+        Spec::LoopInvariant => Translate::LoopInvariant,
+        Spec::CannotRaise => Translate::CannotRaise,
+        Spec::ElidableOrMemoryError => Translate::ElidableOrMemoryError,
+        Spec::ElidableCanRaise => Translate::ElidableCanRaise,
+        Spec::CanRaise => Translate::CanRaise,
+        Spec::ForcesVirtualOrVirtualizable => Translate::ForcesVirtualOrVirtualizable,
+    }
+}
+
 pub(crate) fn pyre_pipeline_config() -> crate::PipelineConfig {
     crate::PipelineConfig {
         transform: crate::GraphTransformConfig {
@@ -41,6 +59,13 @@ pub(crate) fn pyre_pipeline_config() -> crate::PipelineConfig {
                     let effect = match spec.effect {
                         call_spec::CallEffectKind::Elidable => crate::CallEffectKind::Elidable,
                         call_spec::CallEffectKind::Residual => crate::CallEffectKind::Residual,
+                        call_spec::CallEffectKind::Declared(declared) => {
+                            crate::CallEffectKind::Declared(crate::DeclaredCallEffects {
+                                extra: declared_extra_effect(declared.extra),
+                                can_collect: declared.can_collect,
+                                can_invalidate: declared.can_invalidate,
+                            })
+                        }
                     };
                     crate::CallEffectOverride::new(target, effect)
                 })

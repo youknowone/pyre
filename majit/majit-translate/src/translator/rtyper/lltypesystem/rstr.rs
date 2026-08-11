@@ -469,7 +469,6 @@ pub fn ll_getnextindex() -> Result<(), TyperError> {
     Err(rstr_deferred("ll_getnextindex"))
 }
 
-// ____________________________________________________________
 // LLHelpers — `lltypesystem/rstr.py:307` `class LLHelpers(AbstractLLHelpers)`.
 //
 // Each helper is synthesised as a single-block low-level graph the
@@ -9720,23 +9719,40 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        for opname in [
-            "getsubstruct",
-            "getarraysize",
-            "cast_char_to_int",
-            "int_ge",
-            "int_le",
-            "int_lt",
-            "int_eq",
-            "int_sub",
-            "int_mul",
-            "int_add",
-        ] {
-            assert!(
-                all_ops.iter().any(|op| op == opname),
-                "ll_int graph must contain {opname}"
+        // Counts, not memberships. `.any()` pinned each opname as PRESENT and
+        // discarded multiplicity, so deleting nine of the ten `int_add`s passed.
+        //
+        // `getarrayitem` is new to this list. It is emitted five times and was
+        // asserted nowhere — the only one-directional gap in the set, and the
+        // reason the length check below could not have been written before.
+        let op_counts: [(&str, usize); 11] = [
+            ("int_add", 10),
+            ("int_eq", 6),
+            ("cast_char_to_int", 5),
+            ("getarrayitem", 5),
+            ("int_ge", 5),
+            ("int_le", 4),
+            ("int_lt", 4),
+            ("int_sub", 3),
+            ("int_mul", 2),
+            ("getarraysize", 1),
+            ("getsubstruct", 1),
+        ];
+        for (opname, expected) in op_counts {
+            assert_eq!(
+                all_ops.iter().filter(|op| op.as_str() == opname).count(),
+                expected,
+                "ll_int graph must contain {expected} {opname}"
             );
         }
+        // Derived from the table rather than restated, so a count that moves
+        // cannot leave a stale total beside it. This is what makes the set
+        // two-directional: a twelfth opname reds here instead of passing.
+        assert_eq!(
+            all_ops.len(),
+            op_counts.iter().map(|(_, n)| n).sum::<usize>(),
+            "the pinned opnames must account for every operation in the graph"
+        );
 
         let raises_value_error = blocks.iter().any(|block| {
             block.borrow().exits.iter().any(|link| {

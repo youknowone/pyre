@@ -18,6 +18,8 @@ pub mod rawbuffer;
 pub mod resoperation;
 pub mod resumecode;
 pub mod resumedata;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod value;
 
 // Re-export key types at crate root for convenience.
@@ -43,7 +45,9 @@ pub use resoperation::{
     Op, OpCode, OpRc, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
-    Const, FAILARGS_LIMIT, GcRef, GreenAsI64, GreenKey, GreenType, InputArg, InputArgRc,
-    JitDriverVar, SharedConstPool, StrEqFn, StrHashFn, Type, Value, VarKind, green_type_to_ir,
-    make_str_slot, pypyjit_greenkey_uhash, set_str_resolver, set_unicode_resolver,
+    Const, FAILARGS_LIMIT, GREEN_UHASH_MULT, GREEN_UHASH_SEED, GcRef, GreenAsI64, GreenKey,
+    GreenType, InputArg, InputArgRc, JitDriverVar, RefReleaseFn, RefRetainFn, RetainedGreens,
+    SharedConstPool, StrEqFn, StrHashFn, Type, Value, VarKind, green_type_to_ir, green_uhash_step,
+    make_str_slot, pypyjit_greenkey, pypyjit_greenkey_uhash, set_ref_resolver, set_str_resolver,
+    set_unicode_resolver,
 };

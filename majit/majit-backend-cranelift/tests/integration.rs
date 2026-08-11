@@ -8,18 +8,14 @@ use majit_backend::{
     Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
 };
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
+use majit_ir::test_support::{RecordedTrace, Trace};
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
 };
-use majit_metainterp::history::TreeLoop;
-use majit_metainterp::recorder::Trace;
 
-/// Materialize a `Vec<InputArg>` view of a `TreeLoop`'s inputargs for backend
-/// APIs that take `&[InputArg]`. `TreeLoop::inputargs` stores `InputArgRc`
-/// so optimizer/short-preamble/resume metadata observe a single shared
-/// identity; backend boundaries that don't traffic in `_forwarded` accept
-/// the deref-and-clone projection.
-fn inputargs_view(t: &TreeLoop) -> Vec<InputArg> {
+/// Materialize owned input arguments for backend APIs that do not traffic in
+/// the recorder's shared input identities.
+fn inputargs_view(t: &RecordedTrace) -> Vec<InputArg> {
     t.inputargs
         .iter()
         .map(|rc| (**rc).fresh_value_copy())

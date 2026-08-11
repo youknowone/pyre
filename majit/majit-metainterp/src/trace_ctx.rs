@@ -64,7 +64,9 @@ fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
         is_field_signed: f.is_field_signed(),
         is_immutable: f.is_immutable(),
         is_quasi_immutable: descr.is_quasi_immutable(),
-        index_in_parent: f.index_in_parent(),
+        // A live `FieldDescr` reached `get_field_descr` already, so its index
+        // is the parent's arbitrated answer, not an unresolved claim.
+        index_in_parent: Some(f.index_in_parent()),
         parent: None,
         name: String::new(),
         owner: String::new(),
@@ -278,17 +280,6 @@ pub struct TraceCtx {
     virtualizable_info: Option<std::sync::Arc<VirtualizableInfo>>,
     /// Lengths of each virtualizable array field, needed for flat index computation.
     virtualizable_array_lengths: Option<Vec<usize>>,
-    /// [FR] Saved standard-virtualizable state, pushed when a recursive-portal
-    /// INLINE frame installs its callee's fresh vable and popped when that
-    /// frame returns — the single standard vable nested across the inline call.
-    #[allow(clippy::type_complexity)]
-    portal_vable_saves: Vec<(
-        Option<Vec<OpRef>>,
-        Option<Vec<Value>>,
-        Option<std::sync::Arc<VirtualizableInfo>>,
-        Option<Vec<usize>>,
-        Option<Vec<bool>>,
-    )>,
     /// Live virtualizable heap pointer (pyjitpl.py:3446 write_boxes target).
     /// Mirrored from `MetaInterp::vable_ptr` at trace/bridge-entry.  Used by
     /// `synchronize_virtualizable` to write `virtualizable_values` back to
@@ -356,7 +347,7 @@ pub struct TraceCtx {
     pub has_compiled_targets_fn: Option<Box<dyn Fn(u64) -> bool>>,
     /// pyjitpl.py:3005 `ptoken = self.get_procedure_token(greenboxes)` for the
     /// greens of the merge point just reached, in the same `(ints, refs,
-    /// floats)` slot grouping as [`Self::close_greens`]. `Some(key)` iff a
+    /// floats)` slot grouping as `Self::close_greens`. `Some(key)` iff a
     /// compiled loop with jumpable targets already lives at those greens
     /// (`MetaInterp::compiled_key_for_greens`, which folds in
     /// `has_compiled_targets`).
@@ -374,7 +365,7 @@ pub struct TraceCtx {
     /// `start_bridge_tracing` and leaves the default `false` for
     /// primary entries.
     ///
-    /// ⚠️This is NOT `self.partial_trace`. That flag is set only by
+    /// This is NOT `self.partial_trace`. That flag is set only by
     /// `retrace_needed` (pyjitpl.py:2438-2439) and means "this is a
     /// RETRACE"; a bridge from a guard failure has `partial_trace = None`
     /// and takes every `if not self.partial_trace:` branch. Pyre has no
@@ -487,6 +478,21 @@ pub struct TraceCtx {
     /// `MetaInterp::single_pass_outcome` (set before `compile_loop` drains the
     /// ctx) to the merge-point hook.
     pub walk_final_pc: Option<usize>,
+    /// Interpreter pc named by the most recent root-frame merge point the walk
+    /// passed through — the last position at which the interpreter was, by
+    /// construction, re-enterable.
+    ///
+    /// Distinct from [`Self::walk_final_pc`], which the abort path derives from
+    /// the root frame's i0 and which therefore names the position AFTER the
+    /// opcode the walk stopped in. The two agree only when the walk stopped at
+    /// an opcode boundary. `trace_jitcode_with_args_and_runtime` prefers this
+    /// one for a degraded-stub abort, where the opcode provably applied
+    /// nothing.
+    ///
+    /// `None` for a driver that declares no greens: its merge point yields no
+    /// concrete pc, so there is nothing to record and the correction that reads
+    /// this does not apply.
+    pub last_mp_green_pc: Option<usize>,
     /// Set when the abort came out of a panic caught around `run_one_step`
     /// rather than a decision the walk took.  The unwind can leave the frame's
     /// `code_cursor` anywhere inside the panicking instruction, so the frames
@@ -953,7 +959,7 @@ impl TraceCtx {
 
     /// `executor.py:200 do_getfield_raw_{i,r,f}` analog — read a raw
     /// field at `struct_ptr + descr.offset` via `cpu.bh_getfield_raw_*`.
-    /// Distinct from [`field_sanity_load`] which dispatches the GC
+    /// Distinct from [`Self::field_sanity_load`] which dispatches the GC
     /// variant (`executor.py:188 do_getfield_gc_*`).  Used when the
     /// recorded opcode is `GetfieldRaw{I,R,F}` rather than
     /// `GetfieldGc{I,R,F}`.
@@ -993,7 +999,7 @@ impl TraceCtx {
 
     /// `executor.py:132 do_getarrayitem_raw_{i,f}` analog — read a raw
     /// array element via `cpu.bh_getarrayitem_raw_*`.  Distinct from
-    /// [`array_sanity_load`] which dispatches the GC variant
+    /// [`Self::array_sanity_load`] which dispatches the GC variant
     /// (`executor.py:117 do_getarrayitem_gc_*`).  Raw arrays carry the
     /// array pointer as an `int` (`arraybox.getint()` upstream), not a
     /// `getref_base()` projection — callers must pass the raw pointer
@@ -1029,7 +1035,7 @@ impl TraceCtx {
         }
     }
 
-    /// Array-side analogue of [`field_sanity_load`].  `executor.execute`
+    /// Array-side analogue of [`Self::field_sanity_load`].  `executor.execute`
     /// dispatches GETARRAYITEM_GC_{I,R,F} through `do_getarrayitem_gc_*`
     /// (executor.py:206-212); pyre's `kind` selects between the three
     /// variants.  Returns `Some(value)` when `self.cpu` is wired and the
@@ -1076,7 +1082,7 @@ impl TraceCtx {
     /// Extracts the index ConstInt's `getint()` value (returns `None`
     /// on non-ConstInt operands, matching the upstream early-out at
     /// `heapcache.py:543`) and routes the lookup through the indexcache
-    /// (heap_array_cache[descr][index_value]).  Inside the indexcache,
+    /// (`heap_array_cache[descr][index_value]`).  Inside the indexcache,
     /// `array` is canonicalised by `_unique_const_heuristic` against
     /// the per-CacheEntry `last_const_box` (heapcache.py:96-104) so two
     /// distinct ConstPtr OpRefs for the same gcref share the same
@@ -1511,7 +1517,7 @@ impl TraceCtx {
         )
     }
 
-    /// Like [`for_test_types`] but seeds the trace green key (and thus
+    /// Like [`Self::for_test_types`] but seeds the trace green key (and thus
     /// `root_green_key`).  A unit test that drives a loop-closing
     /// `jit_merge_point` uses this to model the trace as having STARTED at
     /// that loop header.
@@ -1559,7 +1565,6 @@ impl TraceCtx {
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
-            portal_vable_saves: Vec::new(),
             virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
@@ -1585,6 +1590,7 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
+            last_mp_green_pc: None,
             abort_after_panic: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
@@ -1645,7 +1651,6 @@ impl TraceCtx {
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
-            portal_vable_saves: Vec::new(),
             virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
@@ -1671,6 +1676,7 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
+            last_mp_green_pc: None,
             abort_after_panic: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
@@ -2052,7 +2058,7 @@ impl TraceCtx {
         }
     }
 
-    /// See [`TraceCtx::close_jump_into_key`].  Read-and-clear: the answer is only
+    /// See `TraceCtx::close_jump_into_key`.  Read-and-clear: the answer is only
     /// meaningful to the close that just set it.
     pub fn take_close_jump_into_key(&mut self) -> Option<u64> {
         self.close_jump_into_key.take()
@@ -2061,7 +2067,7 @@ impl TraceCtx {
     /// Mark that the current back-edge was reached inside an inline callee
     /// frame and must not be unrolled (opimpl_jit_merge_point
     /// portal_call_depth>0). The trace step drains this via
-    /// [`take_inline_loop_abort`] and aborts the trace.
+    /// [`Self::take_inline_loop_abort`] and aborts the trace.
     pub fn request_inline_loop_abort(&mut self) {
         self.inline_loop_abort_pending = true;
     }
@@ -2235,7 +2241,7 @@ impl TraceCtx {
     /// static field + array element in the same flat layout as
     /// `VirtualizableInfo::get_index_in_array`. `vable_ref` / `vable_ref_value`
     /// are the OpRef and concrete of the virtualizable object (frame pointer).
-    /// Boxes layout: [field0, ..., fieldN, arr[0], ..., arr[M], vable_ref]
+    /// Boxes layout: `[field0, ..., fieldN, arr[0], ..., arr[M], vable_ref]`
     /// where `boxes[-1]` is the standard virtualizable identity (RPython parity).
     pub fn init_virtualizable_boxes(
         &mut self,
@@ -2272,37 +2278,11 @@ impl TraceCtx {
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
     }
 
-    /// [FR] The current standard virtualizable's info (shape), if any.  A
+    /// \[FR\] The current standard virtualizable's info (shape), if any.  A
     /// recursive-portal INLINE callee shares the caller's vable shape (same
     /// kernel), so it seeds its fresh vable with this same info.
     pub fn current_virtualizable_info(&self) -> Option<std::sync::Arc<VirtualizableInfo>> {
         self.virtualizable_info.clone()
-    }
-
-    /// [FR] Save the current standard-virtualizable state onto the portal
-    /// nesting stack, before a recursive-portal INLINE frame installs its
-    /// callee's fresh vable via `init_virtualizable_boxes`.
-    pub fn push_saved_virtualizable(&mut self) {
-        self.portal_vable_saves.push((
-            self.virtualizable_boxes.clone(),
-            self.virtualizable_values.clone(),
-            self.virtualizable_info.clone(),
-            self.virtualizable_array_lengths.clone(),
-            self.virtualizable_live_null_slots.clone(),
-        ));
-    }
-
-    /// [FR] Restore the caller's standard-virtualizable state when a
-    /// recursive-portal INLINE frame returns.  No-op if the stack is empty.
-    pub fn restore_saved_virtualizable(&mut self) {
-        if let Some((boxes, values, info, lengths, live_null_slots)) = self.portal_vable_saves.pop()
-        {
-            self.virtualizable_boxes = boxes;
-            self.virtualizable_values = values;
-            self.virtualizable_live_null_slots = live_null_slots;
-            self.virtualizable_info = info;
-            self.virtualizable_array_lengths = lengths;
-        }
     }
 
     /// Collect the current virtualizable boxes (for close_loop / finish).
@@ -2417,7 +2397,7 @@ impl TraceCtx {
         boxes[..end].copy_from_slice(elements);
     }
 
-    /// [`collect_virtualizable_boxes`] with each slot paired with its declared
+    /// [`Self::collect_virtualizable_boxes`] with each slot paired with its declared
     /// [`Type`] (`virtualizable_slot_type`); identity LAST, as always.
     ///
     /// pyjitpl.py:2981-2989 builds ONE `live_arg_boxes` and hands it to both
@@ -2698,7 +2678,7 @@ impl TraceCtx {
         }
     }
 
-    /// Field-aware variant of [`synchronize_virtualizable`] for the bridge
+    /// Field-aware variant of [`Self::synchronize_virtualizable`] for the bridge
     /// resume convergence path.  Differs from the generic-bits version in
     /// two ways that match `sync_virtualizable_after_guard_failure`
     /// (`pyre-jit/src/eval.rs:5709`):
@@ -2959,10 +2939,23 @@ impl TraceCtx {
     }
 
     /// Length of the symbolic virtualizable shadow, or `None` when no
-    /// virtualizable is bound.  Probe-only accessor used by the
-    /// `MAJIT_PROBE_BRIDGE`-gated logging in pyre's bridge setup +
-    /// `push_typed_value` to surface bound-check off-by-ones before
-    /// `set_virtualizable_entry_at` panics.
+    /// virtualizable is bound.
+    ///
+    /// NOT probe-only, whatever an older revision of this comment said. Three
+    /// callers, all on correctness paths, none diagnostic:
+    ///
+    /// * `pyre-jit-trace/src/trace_opcode.rs` — bounds check whose failure calls
+    ///   `request_trace_abort()`, so a trace resolves through the interpreter
+    ///   instead of `set_virtualizable_entry_at` panicking.
+    /// * `pyre-jit-trace/src/jitcode_dispatch/mod.rs` — `append_virtualizable_boxes`,
+    ///   the shape fix that makes the merge-point `live_arg_boxes` match the
+    ///   JUMP `close_loop_args_at` records.
+    /// * the same file's register-bank candidate fill, which needs the length to
+    ///   decide what liveness left unfilled.
+    ///
+    /// The `MAJIT_PROBE_BRIDGE` logging this once served is gone — no such gate
+    /// is read anywhere. Deleting this accessor as dead probe scaffolding would
+    /// take the abort guard with it.
     pub fn virtualizable_boxes_len(&self) -> Option<usize> {
         self.virtualizable_boxes.as_ref().map(|boxes| boxes.len())
     }
@@ -2977,7 +2970,7 @@ impl TraceCtx {
     /// / `_list_of_boxes` returning a 0-length array).
     /// Walker precondition for [`Self::build_snapshot_vable_vref_boxes`]:
     /// every virtualizable box (including the identity at `[-1]`) must carry
-    /// `OpRef::ty()` — the invariant [`crate::pyjitpl::build_vable_snapshot_boxes`]
+    /// `OpRef::ty()` — the invariant `crate::pyjitpl::build_vable_snapshot_boxes`
     /// enforces by panicking.  A deeper inlined / recursive frame can leave
     /// the identity box untyped, so the full-body walker calls this before
     /// recording a guard snapshot and aborts the trace into the trait
@@ -3137,18 +3130,23 @@ impl TraceCtx {
 
     /// Drop the tracing-time virtualizable_boxes mirror.
     ///
-    /// Used at bridge entry: `init_symbolic` seeds the cache with OpRefs
+    /// **Dormant — no caller.** The bridge-entry protocol below describes what
+    /// this is *for*, not what currently happens; nothing invokes it, so no
+    /// bridge entry clears the mirror today. The upstream counterpart it is
+    /// modelled on is real, so the disposition is to wire it rather than delete
+    /// it — see `rpython/jit/metainterp/pyjitpl.py:3400-3430`.
+    ///
+    /// Intended use is bridge entry: `init_symbolic` seeds the cache with OpRefs
     /// derived from the *parent* loop's `vable_array_base`, but the
     /// bridge owns a fresh inputarg stream (its own `OpRef::from_raw(0..N)` bound
-    /// to parent-guard fail_args). Keeping the parent seed makes
+    /// to parent-guard fail_args). Keeping the parent seed would make
     /// subsequent `vable_getarrayitem_*` / `vable_setarrayitem_*` reads
-    /// return stale parent-loop OpRefs; clearing forces the vable path
+    /// return stale parent-loop OpRefs; clearing would force the vable path
     /// to fall through to the raw `GetarrayitemGc` / `SetarrayitemGc`
     /// (`ctx.has_virtualizable_boxes() == false` branch) until the
-    /// bridge itself reseeds via resume data — matching
-    /// rpython/jit/metainterp/pyjitpl.py:3400-3430 where the
-    /// `virtualizable_boxes` are rebuilt from the guard's resume data
-    /// before the bridge replays any vable op.
+    /// bridge itself reseeds via resume data — matching the upstream site
+    /// above, where the `virtualizable_boxes` are rebuilt from the guard's
+    /// resume data before the bridge replays any vable op.
     pub fn clear_virtualizable_boxes(&mut self) {
         self.virtualizable_boxes = None;
     }
@@ -4486,6 +4484,39 @@ impl TraceCtx {
         index_runtime_value: i64,
         fdescr: &DescrRef,
     ) -> Option<usize> {
+        // `PYRE_VABLE_IDX_PROBE`: does a non-constant index ever arrive here?
+        //
+        // Prints on BOTH branches deliberately. A probe that prints only on
+        // the branch it is hunting cannot distinguish "never taken" from
+        // "never reached" — both read as silence.
+        //
+        // Reading the counts. This is a SHARED CALLEE, and its callers do
+        // not agree about constness:
+        //   - `pyjitpl/dispatch.rs` hoists `implement_guard_value` at all six
+        //     of its sites, so every index arriving from there is CONST *by
+        //     construction* and carries no information.
+        //   - `jitcode_dispatch/specialize.rs` passes a `const_int` literal,
+        //     likewise CONST by construction.
+        //   - `jitcode_dispatch/vable_ops.rs` passes a raw int register,
+        //     gated only on the index having a recorded *concrete value*
+        //     (`concrete_of_opref`), which a non-constant OpRef can satisfy.
+        //     That is the only family whose constness is an open question.
+        // So `NONCONST > 0` is conclusive, but `NONCONST == 0` is NOT
+        // evidence that the open family is constant — it is equally
+        // consistent with that family never being reached, since the
+        // constant-by-construction callers dilute the reading. To attribute,
+        // pair this with a probe at the `vable_ops.rs` index read itself.
+        //
+        // Measured readings: dualtape CONST=7204 NONCONST=0 (all from the
+        // hoisted dispatch.rs family, i.e. the hoist working as designed).
+        if crate::vable_idx_probe_enabled() {
+            let constness = if index.is_constant() {
+                "CONST"
+            } else {
+                "NONCONST"
+            };
+            eprintln!("[vable-idx-probe] {constness} pc={pc} value={index_runtime_value}");
+        }
         // indexbox = self.implement_guard_value(indexbox, pc)
         let promoted_index = if index.is_constant() {
             index
@@ -5174,8 +5205,6 @@ mod tests {
             self.float_value
         }
     }
-
-    // ── M1 · opref_to_box bridge tests ─────────────────────────────────
 
     /// M1: non-constant OpRefs (inputargs + recorded op results) map
     /// straight to Box::ResOp(opref.raw()).  No constant-pool lookup.

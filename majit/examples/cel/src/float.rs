@@ -63,7 +63,7 @@ struct VmState {
 fn mainloop(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) -> f64 {
     let mut driver: majit_metainterp::JitDriver<VmState> =
         majit_metainterp::JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
+    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after, _opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
     });
     driver.set_on_trace_abort(|_green_key, _permanent| {
@@ -192,11 +192,11 @@ fn clean_interp(program: &Code, base_a: i64, base_b: i64, n: i64) -> f64 {
     }
 }
 
-// ── Float comparison policy machine ──────────────────────────────────────
 // Mirrors the real cel flagship shape: transient float column loads, a float
 // comparison MATERIALIZED to an int bool, and an int count — no float bank.
 // A separate `#[jit_interp]` machine lives in its own module (the macro emits
 // module-level items that would collide with the value machine above).
+// Float comparison policy machine
 mod count {
     use super::*;
 
@@ -227,7 +227,7 @@ mod count {
     fn mainloop_count(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) -> i64 {
         let mut driver: majit_metainterp::JitDriver<CountState> =
             majit_metainterp::JitDriver::new(threshold);
-        driver.set_on_compile_loop(|_green_key, _ob, _oa| {
+        driver.set_on_compile_loop(|_green_key, _ob, _oa, _opcodes| {
             COMPILES.fetch_add(1, Ordering::Relaxed);
         });
         driver.set_on_trace_abort(|_green_key, _permanent| {
@@ -363,12 +363,12 @@ mod count {
     }
 } // mod count
 
-// ── Two-bank general register machine (the cel VM shape for S3) ───────────
 // The linchpin de-risk for a general float S3: a single state carrying BOTH
 // an int virt-array bank (addressing, bool results, count) AND a float
 // virt-array bank (column values), with a float compare crossing banks
 // (float operands -> int bool). If this compiles and traces bit-exact, cel's
 // VM can gain a float bank the general lowering can target.
+// Two-bank general register machine
 mod twobank {
     use super::*;
 
@@ -414,7 +414,7 @@ mod twobank {
     fn mainloop_twobank(program: &Code, threshold: u32) -> i64 {
         let mut driver: majit_metainterp::JitDriver<TwoBankState> =
             majit_metainterp::JitDriver::new(threshold);
-        driver.set_on_compile_loop(|_g, _a, _b| {
+        driver.set_on_compile_loop(|_g, _a, _b, _opcodes| {
             COMPILES.fetch_add(1, Ordering::Relaxed);
         });
         driver.set_on_trace_abort(|_g, _p| {

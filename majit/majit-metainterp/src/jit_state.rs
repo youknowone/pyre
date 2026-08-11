@@ -109,7 +109,7 @@ impl DeoptMaterializationCache {
 #[derive(Debug, Clone)]
 pub struct ResumeDataResult {
     /// resume.py:1057: per-frame decoded values from rd_numb.
-    /// Each RebuiltValue::Box(i, kind) → liveboxes[i] in RPython.
+    /// Each RebuiltValue::Box(i, kind) → `liveboxes[i]` in RPython.
     pub frames: Vec<majit_ir::resumedata::RebuiltFrame>,
     /// resume.py:1045: virtualizable boxes (decoded from vable section).
     pub virtualizable_values: Vec<majit_ir::resumedata::RebuiltValue>,
@@ -202,6 +202,60 @@ pub trait JitState: Sized {
     /// branch decisions during tracing use the real runtime values.
     fn initialize_sym(&self, _sym: &mut Self::Sym, _meta: &Self::Meta) {}
 
+    /// Drop every symbolic inputarg binding `create_sym` minted, leaving the
+    /// concrete value mirrors `initialize_sym` seeded intact.
+    ///
+    /// `create_sym` numbers each state field `InputArg{Ty}(offset)` by walking
+    /// the declaration order, and `record_input_arg` numbers the trace's own
+    /// inputargs from its `op_count`. Both start at 0 and both issue into the
+    /// one flat position space `OpRef::raw()` addresses, so the two agree only
+    /// while they enumerate the same sequence. On a loop trace they do:
+    /// `extract_live` / `live_value_types` emit the same partition in the same
+    /// order that `create_sym` advances its offset, so field `k` and inputarg
+    /// `k` name the same value.
+    ///
+    /// A bridge breaks that. `Trace::with_input_types(fail_descr.fail_arg_types())`
+    /// numbers the bridge's inputargs in the guard's failarg order, which has no
+    /// relation to declaration order, while `create_sym` runs unchanged and
+    /// mints the same 0-based positions it would for a loop. Each surviving mint
+    /// is then a well-formed position in a space it was not issued from:
+    /// `TraceIterator`'s `_cache` is indexed by `raw()` alone, so the lookup
+    /// resolves against whatever the bridge put at that position and hands back
+    /// a box for an unrelated value instead of missing.
+    ///
+    /// `setup_bridge_sym` is the bridge's binding authority — it decodes each
+    /// field from the resume data and rebinds it into the failarg space. It
+    /// binds scalars only, and skips any field the resume frame does not carry,
+    /// so calling it does not by itself retire the stale mints. Clearing them
+    /// first makes an unbound field read as absent rather than as a live
+    /// reference to someone else's slot; `resume.py` has no counterpart to
+    /// preserve, because upstream a field the resume data did not resurrect
+    /// simply has no box.
+    ///
+    /// The default is a no-op: a `Sym` that holds no `OpRef` has nothing to
+    /// clear, and the unit-`Sym` test drivers are in that class.
+    fn clear_sym_inputarg_bindings(_sym: &mut Self::Sym) {}
+
+    /// How many of `sym`'s `OpRef` fields are still bound, or `None` if this
+    /// state cannot say.
+    ///
+    /// This exists to grade the *call* to `clear_sym_inputarg_bindings`, not
+    /// the function. Nothing downstream can: `setup_bridge_sym` rebinds a
+    /// field to the same value whether the previous one was `OpRef::NONE` or
+    /// a stale loop-shaped mint, and an overwrite that ignores its target
+    /// erases the difference. The only place the two states are
+    /// distinguishable is the window between the two calls, so the check has
+    /// to be sited there.
+    ///
+    /// `None` rather than `0` for the default deliberately. A state that
+    /// cannot report has to be skipped, not read as clean — zero bound and
+    /// no way to count spell the same number, and a default of `0` would
+    /// make every state that never overrides this pass the assertion in
+    /// silence.
+    fn count_bound_sym_inputargs(_sym: &Self::Sym) -> Option<usize> {
+        None
+    }
+
     /// pyjitpl.py:3062-3070 `_unpack_boxes` parity: read concrete values
     /// from the live boxes at a successful close-loop back-edge before the
     /// trace history is cleared.
@@ -232,7 +286,7 @@ pub trait JitState: Sized {
     }
 
     /// The code object pointer for green key computation.
-    /// RPython: jitdriver_sd.jitcodes[jitcode_pos]
+    /// RPython: `jitdriver_sd.jitcodes[jitcode_pos]`
     fn code_ptr(&self) -> usize {
         0
     }
@@ -333,7 +387,7 @@ pub trait JitState: Sized {
 
     /// Restore from all three typed register banks separately. The default
     /// preserves existing int/ref interpreters by forwarding to
-    /// [`restore_banked`] and ignoring the float slice.
+    /// `restore_banked` and ignoring the float slice.
     fn restore_banked3(
         &mut self,
         meta: &Self::Meta,
@@ -398,7 +452,7 @@ pub trait JitState: Sized {
         Vec::new()
     }
 
-    /// Ref-bank sibling of [`collect_scalar_state_field_values`], in ref-scalar
+    /// Ref-bank sibling of `collect_scalar_state_field_values`, in ref-scalar
     /// state-field index order (idx `0..num_ref_scalars`). Raw pointer bits, the
     /// encoding `registers_r` holds. Read off the same still-live sym, for the
     /// same reason: the walk keeps ref state fields on the sym and native
@@ -427,10 +481,10 @@ pub trait JitState: Sized {
     /// native state.
     fn writeback_live_scalar_state_field(&mut self, _field_idx: usize, _value: i64) {}
 
-    /// Ref-bank sibling of [`writeback_live_scalar_state_field`].
+    /// Ref-bank sibling of `writeback_live_scalar_state_field`.
     fn writeback_live_ref_scalar_state_field(&mut self, _field_idx: usize, _value: i64) {}
 
-    /// Float-bank sibling of [`writeback_live_scalar_state_field`]. `value`
+    /// Float-bank sibling of `writeback_live_scalar_state_field`. `value`
     /// is the raw f64 bit carrier from `registers_f`; generated impls convert
     /// with `f64::from_bits`.
     fn writeback_live_float_scalar_state_field(&mut self, _field_idx: usize, _value: i64) {}

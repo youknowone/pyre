@@ -838,7 +838,7 @@ impl VirtualizableInfo {
         &self._array_field_descrs
     }
 
-    /// virtualizable.py:81: vinfo.static_field_by_descrs[fielddescr]
+    /// virtualizable.py:81: `vinfo.static_field_by_descrs[fielddescr]`
     /// Descriptor-identity lookup (linear scan via IndexMap).
     pub fn static_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.static_field_by_descrs
@@ -846,7 +846,7 @@ impl VirtualizableInfo {
             .copied()
     }
 
-    /// virtualizable.py:83: vinfo.array_field_by_descrs[arrayfielddescr]
+    /// virtualizable.py:83: `vinfo.array_field_by_descrs[arrayfielddescr]`
     /// Descriptor-identity lookup (linear scan via IndexMap).
     pub fn array_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.array_field_by_descrs
@@ -942,6 +942,36 @@ impl VirtualizableInfo {
             array_field_descrs: self.array_field_descrs().to_vec(),
             array_lengths: vec![],
             vable_input_offset: 0,
+            // Same declaration the resume path reads
+            // (`MetaInterp::identity_live_position`): the loop's inputargs are
+            // its reds, so the identity's position among the reds IS its flat
+            // input-arg slot.
+            //
+            // `identity_live_index == None` is overloaded, so the layout
+            // decides what it means. `identity_ref_bank_index` is the same
+            // structural discriminator `elements_carried_via_shadow` uses:
+            //
+            // - `None` — the legacy frame-first (PyFrame) layout, whose reds are
+            //   `[frame, extra_reds.., vable_scalars.., array_items..]`. The
+            //   frame IS flat slot 0, so slot 0 is the answer, not a fallback.
+            // - `Some(_)` — the banked-identity (macro state-field) layout,
+            //   whose reds are `[int scalars.., fixed-array cells.., identity]`.
+            //   Slot 0 there is an int scalar. Only a declaration names the
+            //   identity, and the macro can emit one only when the state has no
+            //   fixed array (`codegen_state.rs` `identity_live_index_stmt`) —
+            //   with one present the position depends on that array's runtime
+            //   length. `MetaInterp::current_virtualizable_optimizer_config`
+            //   patches in the position the trace resolved against `vable_ptr`;
+            //   absent both, this stays `None` and `VirtualizableTracker`
+            //   declines to track. Declining costs optimization; probing slot 0
+            //   costs correctness — it installs `PtrInfo::Virtualizable` on an
+            //   Int scalar and the loop-close Jump then fails to match the
+            //   Ref-typed preview (`VirtualStatesCantMatch`), so nothing
+            //   compiles at all.
+            identity_input_index: match self.identity_ref_bank_index {
+                None => Some(0),
+                Some(_) => self.identity_live_index,
+            },
             track_array_elements: !self.elements_carried_via_shadow(),
         }
     }
@@ -970,7 +1000,7 @@ impl VirtualizableInfo {
         self.array_fields.iter().position(|a| a.name == name)
     }
 
-    /// virtualizable.py:71: self.static_field_descrs[field_index]
+    /// virtualizable.py:71: `self.static_field_descrs[field_index]`
     /// Returns the cached FieldDescr for a static field.
     /// Descriptors are built once in set_parent_descr(), not per-call.
     pub fn static_field_descr(&self, field_index: usize) -> DescrRef {
@@ -993,7 +1023,7 @@ impl VirtualizableInfo {
             .expect("token_field_descr called before set_parent_descr")
     }
 
-    /// virtualizable.py:73: self.array_field_descrs[array_index]
+    /// virtualizable.py:73: `self.array_field_descrs[array_index]`
     /// Returns the cached FieldDescr for an array pointer field.
     pub fn array_pointer_field_descr(&self, array_index: usize) -> DescrRef {
         self._array_field_descrs[array_index].clone()
@@ -1007,7 +1037,7 @@ impl VirtualizableInfo {
         self._array_field_struct_descrs[array_index].clone()
     }
 
-    /// virtualizable.py:58: self.array_descrs[array_index]
+    /// virtualizable.py:58: `self.array_descrs[array_index]`
     /// Returns the pre-built array descriptor for the given array field.
     pub fn array_item_descr(&self, array_index: usize) -> DescrRef {
         self.array_descrs[array_index].clone()
@@ -1262,7 +1292,7 @@ impl VirtualizableInfo {
     ///
     /// RPython equivalent: `vinfo.load_list_of_boxes(virtualizable)`
     ///
-    /// Returns a flat array: [field0, field1, ..., array0[0], ..., array0[N], ...]
+    /// Returns a flat array: `[field0, field1, ..., array0[0], ..., array0[N], ...]`
     /// Array lengths are read from the actual object (not from a side-channel).
     ///
     /// # Safety
@@ -2383,6 +2413,41 @@ mod tests {
         assert!(config.array_lengths.is_empty());
     }
 
+    /// `identity_live_index == None` means two different things, and the layout
+    /// — not the absent declaration — decides which.
+    #[test]
+    fn test_to_optimizer_config_identity_slot_is_layout_discriminated() {
+        // Legacy frame-first (PyFrame): the frame IS flat slot 0, so an absent
+        // declaration is not a gap.
+        let legacy = VirtualizableInfo::new(0);
+        assert_eq!(legacy.identity_ref_bank_index, None);
+        assert_eq!(legacy.identity_live_index, None);
+        assert_eq!(
+            legacy.to_optimizer_config().identity_input_index,
+            Some(0),
+            "the frame-first layout leads with the identity",
+        );
+
+        // Banked-identity (macro state-field) with a declaration: honour it.
+        let mut declared = VirtualizableInfo::without_vable_token();
+        declared.identity_ref_bank_index = Some(1);
+        declared.identity_live_index = Some(3);
+        assert_eq!(declared.to_optimizer_config().identity_input_index, Some(3));
+
+        // Banked-identity with NO declaration — what the macro emits for a state
+        // carrying a fixed `[int]` array, whose identity slot depends on that
+        // array's runtime length. Slot 0 is an int scalar there, so the config
+        // must carry no slot at all and let `VirtualizableTracker` decline.
+        let mut undeclared = VirtualizableInfo::without_vable_token();
+        undeclared.identity_ref_bank_index = Some(1);
+        assert_eq!(undeclared.identity_live_index, None);
+        assert_eq!(
+            undeclared.to_optimizer_config().identity_input_index,
+            None,
+            "an undeclared banked identity must not fall back to slot 0",
+        );
+    }
+
     #[test]
     fn test_load_list_of_boxes_reads_from_object() {
         // RPython parity: vinfo.load_list_of_boxes() reads from actual object.
@@ -2883,6 +2948,36 @@ pub(crate) unsafe fn bhimpl_arraylen_vable(vable_ptr: *const u8, array: &VableAr
     }
 }
 
+/// Address of item 0 of a virtualizable array field.
+///
+/// The three storage kinds reach the items through different indirections, and
+/// both the item read and the item write below resolved that separately. They
+/// now share this, so an item access and a whole-array access can never
+/// disagree about where the items start.
+///
+/// Null when the owning pointer is null; callers must keep treating that as
+/// "no items", not as address zero.
+pub(crate) unsafe fn bhimpl_arraybase_vable(
+    vable_ptr: *const u8,
+    array: &VableArrayInfo,
+) -> *const u8 {
+    unsafe {
+        match array.storage {
+            VableArrayStorage::EmbeddedArray { ptr_offset } => {
+                let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                *(container.add(ptr_offset) as *const *const u8)
+            }
+            VableArrayStorage::DirectPointer => {
+                let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                arr_ptr.add(array.items_offset)
+            }
+            VableArrayStorage::RustVec { data_ptr_fn, .. } => {
+                data_ptr_fn(vable_ptr as *mut u8) as *const u8
+            }
+        }
+    }
+}
+
 /// Read a value from a virtualizable array item.
 /// blackhole.py:1374-1387 bhimpl_getarrayitem_vable_* parity.
 pub(crate) unsafe fn vable_read_array_item(
@@ -2895,19 +2990,7 @@ pub(crate) unsafe fn vable_read_array_item(
         // `size_of::<usize>()` (4 bytes on wasm32) while an `i64` payload
         // array is a fixed 8, regardless of word width.
         let item_size = array.item_size;
-        let data_ptr = match array.storage {
-            VableArrayStorage::EmbeddedArray { ptr_offset } => {
-                let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
-                *(container.add(ptr_offset) as *const *const u8)
-            }
-            VableArrayStorage::DirectPointer => {
-                let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
-                arr_ptr.add(array.items_offset)
-            }
-            VableArrayStorage::RustVec { data_ptr_fn, .. } => {
-                data_ptr_fn(vable_ptr as *mut u8) as *const u8
-            }
-        };
+        let data_ptr = bhimpl_arraybase_vable(vable_ptr, array);
         if data_ptr.is_null() {
             0
         } else {
@@ -2934,22 +3017,17 @@ pub(crate) unsafe fn vable_write_array_item(
         // `size_of::<usize>()` (4 bytes on wasm32) while an `i64` payload
         // array is a fixed 8, regardless of word width.
         let item_size = array.item_size;
+        let data_ptr = bhimpl_arraybase_vable(vable_ptr, array) as *mut u8;
         // `owner_ptr` is the block base the GC would know, i.e. before the
         // items offset — the barrier argument.  `data_ptr` is items-adjusted
-        // and is not a valid object address.
-        let (data_ptr, owner_ptr) = match array.storage {
-            VableArrayStorage::EmbeddedArray { ptr_offset } => {
-                let container = *(vable_ptr.add(array.field_offset) as *const *mut u8);
-                let data = *(container.add(ptr_offset) as *const *mut u8);
-                (data, data)
-            }
+        // and is not a valid object address, so the two only coincide where
+        // there is no items offset to undo.
+        let owner_ptr = match array.storage {
+            VableArrayStorage::EmbeddedArray { .. } => data_ptr,
             VableArrayStorage::DirectPointer => {
-                let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *mut u8);
-                (arr_ptr.add(array.items_offset), arr_ptr)
+                *(vable_ptr.add(array.field_offset) as *const *mut u8)
             }
-            VableArrayStorage::RustVec { data_ptr_fn, .. } => {
-                (data_ptr_fn(vable_ptr) as *mut u8, std::ptr::null_mut())
-            }
+            VableArrayStorage::RustVec { .. } => std::ptr::null_mut(),
         };
         if !data_ptr.is_null() {
             let dest = data_ptr.add(index * item_size);
