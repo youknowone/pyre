@@ -946,6 +946,10 @@ struct GuardToken {
 pub struct CompiledCode {
     /// Executable memory buffer (keeps code alive).
     pub buffer: ExecutableBuffer,
+    /// `llmodel.py:252 asmmemmgr_blocks` lifetime accounting token for this
+    /// executable allocation. It is stored on the same object that owns the
+    /// buffer, matching AsmMemoryManager's block ownership upstream.
+    pub(crate) _asmmemmgr_block: Option<majit_backend::AsmMemoryBlock>,
     /// Entry point offset within the buffer.
     pub entry_offset: AssemblyOffset,
     /// Fail descriptors for guards + FINISH ops.
@@ -2623,6 +2627,7 @@ impl<'a> Assembler386<'a> {
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
+            _asmmemmgr_block: None,
             entry_offset: entry,
             fail_descrs: self.fail_descrs.into_boxed_slice(),
             input_types: self.input_types,
@@ -2775,6 +2780,7 @@ impl<'a> Assembler386<'a> {
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
+            _asmmemmgr_block: None,
             entry_offset: entry,
             fail_descrs: self.fail_descrs.into_boxed_slice(),
             input_types: self.input_types,

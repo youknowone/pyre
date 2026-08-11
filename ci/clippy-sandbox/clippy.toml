@@ -36,6 +36,19 @@ disallowed-methods = [
     { path = "std::fs::copy", reason = "host FS mutation is forbidden in the sandbox" },
     { path = "std::fs::hard_link", reason = "host FS mutation is forbidden in the sandbox" },
     { path = "std::fs::set_permissions", reason = "host FS mutation is forbidden in the sandbox" },
+    # `Path`'s inherent probes. Each is a thin wrapper over one of the `std::fs`
+    # free functions above, but `disallowed-methods` matches the path that is
+    # written, so listing only the free function lets `path.exists()` through.
+    { path = "std::path::Path::exists", reason = "raw host FS stat; route through crate::host_seam::ops" },
+    { path = "std::path::Path::try_exists", reason = "raw host FS stat; route through crate::host_seam::ops" },
+    { path = "std::path::Path::metadata", reason = "raw host FS stat; route through crate::host_seam::ops" },
+    { path = "std::path::Path::symlink_metadata", reason = "raw host FS lstat; route through crate::host_seam::ops" },
+    { path = "std::path::Path::is_file", reason = "raw host FS stat; route through crate::host_seam::ops" },
+    { path = "std::path::Path::is_dir", reason = "raw host FS stat; route through crate::host_seam::ops" },
+    { path = "std::path::Path::is_symlink", reason = "raw host FS lstat; route through crate::host_seam::ops" },
+    { path = "std::path::Path::read_dir", reason = "raw host FS listdir; route through crate::host_seam::ops" },
+    { path = "std::path::Path::read_link", reason = "raw host FS access; route through crate::host_seam::ops" },
+    { path = "std::path::Path::canonicalize", reason = "raw host FS access; route through crate::host_seam::ops" },
     # Process environment
     { path = "std::env::var", reason = "raw process env; route through crate::host_seam::ops::getenv" },
     { path = "std::env::var_os", reason = "raw process env; route through crate::host_seam::ops::getenv" },

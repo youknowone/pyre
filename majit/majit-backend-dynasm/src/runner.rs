@@ -322,11 +322,23 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
     majit_gc::set_active_collect_full(Some(dynasm_collect_full));
+    majit_gc::set_active_collect_step(Some(dynasm_collect_step));
     majit_gc::set_active_get_objects(Some(dynasm_get_objects));
     majit_gc::set_active_get_referents(Some(dynasm_get_referents));
     majit_gc::set_active_is_tracked(Some(dynasm_is_tracked));
+    majit_gc::set_active_get_rpy_memory_usage(Some(dynasm_get_rpy_memory_usage));
+    majit_gc::set_active_get_rpy_type_index(Some(dynasm_get_rpy_type_index));
+    majit_gc::set_active_get_rpy_roots(Some(dynasm_get_rpy_roots));
+    majit_gc::set_active_get_rpy_referents(Some(dynasm_get_rpy_referents));
+    majit_gc::set_active_is_app_level_object(Some(dynasm_is_app_level_object));
+    majit_gc::set_active_dump_rpy_heap(Some(dynasm_dump_rpy_heap));
+    majit_gc::set_active_get_typeids_text(Some(dynasm_get_typeids_text));
+    majit_gc::set_active_get_typeids_list(Some(dynasm_get_typeids_list));
+    majit_gc::set_active_add_memory_pressure(Some(dynasm_add_memory_pressure));
+    majit_gc::set_active_total_memory_pressure(Some(dynasm_total_memory_pressure));
     majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
+    majit_gc::set_active_gc_memory_stats(Some(dynasm_gc_memory_stats));
     majit_gc::set_active_major_threshold_reached(Some(dynasm_major_threshold_reached));
     majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
@@ -649,6 +661,13 @@ fn dynasm_collect_full() {
     majit_gc::gc_sync::gc_op(|g| g.collect_full());
 }
 
+fn dynasm_collect_step() -> majit_gc::GcStepTransition {
+    if let Some(transition) = gc_box::with_mut(|g| g.collect_step()) {
+        return transition;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.collect_step())
+}
+
 /// Takes `format_args!` rather than a built `String`: the callers sit on the
 /// per-residual-call and per-trace-entry paths, where formatting the site name
 /// for a diagnostic that is off costs a heap allocation every time.
@@ -704,6 +723,76 @@ fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
     majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.is_tracked(obj))
 }
 
+fn dynasm_get_rpy_memory_usage(obj: majit_ir::GcRef) -> Option<usize> {
+    if let Some(size) = gc_box::with_mut(|g| g.get_rpy_memory_usage(obj)) {
+        return size;
+    }
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_rpy_memory_usage(obj))
+}
+
+fn dynasm_get_rpy_type_index(obj: majit_ir::GcRef) -> Option<usize> {
+    if let Some(index) = gc_box::with_mut(|g| g.get_rpy_type_index(obj)) {
+        return index;
+    }
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_rpy_type_index(obj))
+}
+
+fn dynasm_get_rpy_roots(visitor: majit_gc::GetObjectsVisitorFn) -> bool {
+    let mut visit = visitor;
+    if let Some(supported) = gc_box::with_mut(|g| g.get_rpy_roots(&mut visit)) {
+        return supported;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.get_rpy_roots(&mut visit))
+}
+
+fn dynasm_get_rpy_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisitorFn) -> bool {
+    let mut visit = visitor;
+    if let Some(supported) = gc_box::with_mut(|g| g.get_rpy_referents(obj, &mut visit)) {
+        return supported;
+    }
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_rpy_referents(obj, &mut visit))
+}
+
+fn dynasm_is_app_level_object(obj: majit_ir::GcRef) -> bool {
+    if let Some(is_object) = gc_box::with_mut(|g| g.is_app_level_object(obj)) {
+        return is_object;
+    }
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.is_app_level_object(obj))
+}
+
+fn dynasm_dump_rpy_heap(fd: i32) -> Result<bool, i32> {
+    if let Some(result) = gc_box::with_mut(|g| g.dump_rpy_heap(fd)) {
+        return result;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.dump_rpy_heap(fd))
+}
+
+fn dynasm_get_typeids_text() -> Option<Vec<u8>> {
+    with_dynasm_active_gc(|g| g.get_typeids_text()).flatten()
+}
+
+fn dynasm_get_typeids_list() -> Option<Vec<usize>> {
+    with_dynasm_active_gc(|g| g.get_typeids_list()).flatten()
+}
+
+fn dynasm_add_memory_pressure(size: isize, object: GcRef) {
+    if gc_box::with_mut(|g| g.add_memory_pressure(size, object)).is_some() {
+        return;
+    }
+    if object.is_null() {
+        majit_gc::gc_sync::gc_op(|g| g.add_memory_pressure(size, object));
+    } else {
+        majit_gc::gc_sync::gc_op_with_root(object, |g, object| g.add_memory_pressure(size, object));
+    }
+}
+
+fn dynasm_total_memory_pressure() -> isize {
+    if let Some(result) = gc_box::with_mut(|g| g.total_memory_pressure()) {
+        return result;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.total_memory_pressure())
+}
+
 /// Non-moving old-gen-only major. Reclaims stable-allocated interp int/float
 /// without moving the nursery, so the interpreter safepoint can fire it under
 /// an active JIT (nursery non-empty) — unlike [`dynasm_collect_full`], whose
@@ -729,6 +818,13 @@ fn dynasm_heap_stats() -> (usize, usize) {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.heap_byte_stats())
+}
+
+fn dynasm_gc_memory_stats() -> majit_gc::GcMemoryStats {
+    if let Some(r) = gc_box::with_mut(|g| g.gc_memory_stats()) {
+        return r;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.gc_memory_stats())
 }
 
 /// Report whether the GC wants a major collection, for the interpreter GC
@@ -1263,6 +1359,11 @@ pub struct DynasmBackend {
     /// / [`CompiledLoopToken::compiling_a_bridge`] hit one shared
     /// store.
     cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
+    /// `llsupport/asmmemmgr.py:38-40` `cpu.asmmemmgr` parity.  The
+    /// manager is owned by this CPU/backend and shared with every compiled
+    /// code block and per-CPU helper buffer so `get_stats()` observes the
+    /// same allocation/lifetime boundary as upstream.
+    asm_memory_stats: Arc<majit_backend::AsmMemoryManagerStats>,
     /// Next unique trace ID.
     next_trace_id: u64,
     /// Next header PC (green key).
@@ -1366,8 +1467,10 @@ impl DynasmBackend {
         // singletons are attached later by
         // `compile.make_and_attach_done_descrs([self, cpu])` during
         // `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222).
+        let asm_memory_stats = Arc::new(majit_backend::AsmMemoryManagerStats::default());
         DynasmBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
+            asm_memory_stats: Arc::clone(&asm_memory_stats),
             next_trace_id: 1,
             next_header_pc: 0,
             constants: majit_ir::ConstMap::new(),
@@ -1375,7 +1478,7 @@ impl DynasmBackend {
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
             )),
-            arch_cpu_ext: ArchCpuExt::new(),
+            arch_cpu_ext: ArchCpuExt::new(asm_memory_stats),
         }
     }
 
@@ -2237,6 +2340,10 @@ impl Backend for DynasmBackend {
         &self.cpu_tracker
     }
 
+    fn assembler_memory_stats(&self) -> (usize, usize) {
+        self.asm_memory_stats.get_stats()
+    }
+
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
@@ -2331,7 +2438,11 @@ impl Backend for DynasmBackend {
             asm.set_gc_table_base(table.base_addr());
         }
         asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&token.invalidated) as usize);
-        let compiled = asm.assemble_loop()?;
+        let mut compiled = asm.assemble_loop()?;
+        compiled._asmmemmgr_block = Some(
+            self.asm_memory_stats
+                .record_block(compiled.buffer.size(), compiled.buffer.len()),
+        );
 
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
@@ -2597,7 +2708,11 @@ impl Backend for DynasmBackend {
                 .expect("guard_descr is FailDescr"),
             inputargs,
         );
-        let compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
+        let mut compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
+        compiled._asmmemmgr_block = Some(
+            self.asm_memory_stats
+                .record_block(compiled.buffer.size(), compiled.buffer.len()),
+        );
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();

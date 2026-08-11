@@ -30,18 +30,15 @@
 //! these arrays are re-synced by hand, so a stale entry would misreport an
 //! admissible opname as "unknown" (or vice versa).
 //!
-//! Placement note: this fires only when a graph reaches the rtyper-success
-//! return inside `specialize_legacy_graph_with_registry_returning_value_to_var`
-//! (`cutover.rs`), which the dual-gate reaches only on `DualGateOutcome::Match`;
-//! graphs that fall back to the legacy walker (`DualGateOutcome::Skip`) never
-//! reach it.  As of the producer baseline the whole production opcode corpus
-//! Skips (the real rtyper does not yet complete on it — cross-block
-//! body-`Input` threading, annotator-fixpoint, undefined-slot, and
-//! unregistered-call shapes dominate; those Skip reasons surface under
-//! `PYRE_RTYPER_VERBOSE`), so this gauge reads zero until the rtype-coverage
-//! workstream lands Match graphs.  That makes the report a readiness gauge for
-//! the opname-dispatch convergence: the first non-empty histogram marks the
-//! first graph that becomes consumable by an opname-dispatching jtransform.
+//! Placement note: the fused path reports only after `drive_subject(...,
+//! do_rtype=true)` finishes specialization. The production two-phase path
+//! retains each Phase-A `GraphRef`, specializes it in place during Phase B,
+//! then reports only graphs absent from `rtype_skipped`. Reporting during
+//! Phase A would be wrong: `simple_call` / `getattr` are still high-level
+//! operations there and are not an opname-jtransform backlog. Graphs that
+//! fall back to the legacy walker never reach the report. The resulting
+//! histogram is the actual per-handler migration backlog for successfully
+//! rtyped graphs.
 
 use std::collections::{BTreeMap, HashSet};
 

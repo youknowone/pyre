@@ -548,13 +548,13 @@ def pyre_env():
     # removes it on both native backends and does not in the guest, which reads
     # `recursive_call_frame_relocation` 638 and `closure_per_call` 420 against
     # their 636 and 414 — the same knife edge described above, one step along
-    # it. The two run different interpreter allocation models, so one program
-    # presents the collector with two different old-gen totals: `PYRE_GC_INTERP`
-    # (`pyre-object/src/gc_interp.rs`) is off natively, where `w_int_new` /
-    # `w_float_new` take an untracked `alloc_with_gc_header` that
-    # `threshold_reached` never sees, and on in the guest, where the same
-    # objects are collector-allocated and counted. So the guest reaches a
-    # threshold the native backends do not, from the same fixture.
+    # it. Historically the two ran different interpreter allocation models:
+    # `PYRE_GC_INTERP` was off natively and on in the guest, so only the guest
+    # counted interpreter-created int/float boxes toward the old-gen threshold.
+    # The gate is now default-on everywhere and the allocation model is shared;
+    # this note remains because the recorded wasm memory/counter boundary below
+    # predates that convergence and still explains why the 256MB floor was
+    # chosen instead of tuning a platform-specific overlay.
     #
     # Left where it is deliberately. 384MB and above does land the guest exactly
     # on the native counts, but it buys agreement with memory: `closure_per_call`
@@ -1533,33 +1533,48 @@ class Check:
         # source (pyre/bench/<name>.<backend>.jitstats), not in the gitignored
         # check.snap scratch tree that holds the local .out/.time snapshots.
         #
-        # A `<name>.<backend>.<platform>.jitstats` beside it wins on that
-        # platform. This is for the counter a host genuinely disagrees on, and
-        # it keeps the comparison exact everywhere instead of widening the gate
-        # for everyone: a band that tolerated the disagreement would tolerate it
-        # on every fixture and all three backends, and the band this gate
-        # replaced is exactly what let eight baselines go stale unnoticed.
+        # A `<name>.<backend>.<platform>.github-actions.jitstats` beside it wins
+        # on that GitHub runner; otherwise a
+        # `<name>.<backend>.<platform>.jitstats` wins on the platform. These are
+        # for counters a host genuinely disagrees on, and keep the comparison
+        # exact everywhere instead of widening the gate for everyone: a band
+        # that tolerated the disagreement would tolerate it on every fixture
+        # and all three backends, and the band this gate replaced is exactly
+        # what let eight baselines go stale unnoticed.
         #
-        # Measured, not assumed, and read back from the windows job rather than
-        # predicted. `closure_per_call` is the one fixture that carries an
-        # overlay: windows-latest cranelift reports guard_failures 416 where
-        # macos-latest and ubuntu-24.04 both report 415, every other counter
-        # identical, on every windows run since exact equality replaced the
-        # tolerance band — including the runs taken after PYTHONSAFEPATH moved
-        # the ambient import loop. `PYPY_GC_NURSERY` is pinned above, so the
-        # nursery is not the differing variable, and the same windows host
-        # passes its dynasm leg in full. What is left is that the allocation
-        # footprint differs, hence when a collection lands, hence how often the
-        # back-edge eval-breaker poll bails out; the specific cause is not
-        # identified. An overlay is therefore recording a fact about the host,
-        # and the shared file still gates the other two.
+        # Measured, not assumed, and read back from the runner jobs rather than
+        # predicted. A fresh local build and ubuntu-24.04 report str_fstring
+        # guard_failures 658/659 on dynasm/cranelift. macos-latest reports the
+        # inverse 659/658, and windows-latest reports 658/658. Every other gated
+        # counter is identical (six loops and three bridges), and each mismatch
+        # reproduced in both stability reruns.
+        #
+        # This is a collection-schedule boundary, not a compile-shape change.
+        # On a local arm64 macOS cranelift build, adding check.py's two wasm
+        # environment keys (ignored semantically by the native backend) moves
+        # 658 -> 659 while the number of major collections stays at 11. The
+        # guard sequence gains one trace-6 fail-5 exit; the compiled-trace log
+        # maps it to the GuardFalse on the eval-breaker poll. Thus the knife edge
+        # is where a collection-triggered breaker lands, not how many loops or
+        # bridges compile. The runner did not enable either census, so exactly
+        # which host input moves that placement remains unidentified; the
+        # observed counter and stable runner split are direct measurements. The
+        # fresh local macOS build matches ubuntu rather than the macOS runner,
+        # which is why these are GitHub-runner overlays rather than
+        # platform-wide ones.
         #
         # An overlay shadows the shared baseline permanently, so one written
         # against a value that later converges becomes a failure main does not
         # have: `recursive_call_frame_relocation` was given one for 637, and
-        # windows has reported the shared 638 on every run since. Read the value
-        # back from the latest windows job before adding another.
+        # windows later converged on its shared value. Read all three runners
+        # back before adding or retaining another.
         source = Path(script)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            github_runner = source.with_name(
+                f"{source.stem}.{backend}.{sys.platform}.github-actions.jitstats"
+            )
+            if github_runner.exists():
+                return github_runner
         per_platform = source.with_name(f"{source.stem}.{backend}.{sys.platform}.jitstats")
         if per_platform.exists():
             return per_platform

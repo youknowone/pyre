@@ -5398,6 +5398,21 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         // register read means exactly `registers_r[index]`;
                         // where ownership is unprovable the virtualizable
                         // shadow remains authoritative.
+                        //
+                        // "Authoritative" deliberately does NOT extend to a NULL
+                        // shadow slot.  Upstream reads the operand stack out of
+                        // one list — `create_top_snapshot(frame, vable_boxes,
+                        // ...)` (`opencoder.py:767`) and `live_arg_boxes +=
+                        // self.virtualizable_boxes` (`pyjitpl.py:2987`) are the
+                        // same object — so it is tempting to let the shadow
+                        // answer here too and keep a post-header snapshot inside
+                        // the merge point's published set.  Measured: it is
+                        // wrong.  Letting the NULL answer makes
+                        // `synth/nested_break_not_hot` raise `TypeError:
+                        // comparison on null operand` in `plain_break`, because
+                        // the traced arm has already popped a slot the guard's
+                        // resume target still reads.  The shadow under-reports
+                        // that slot; the walk register carries its live box.
                         let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
                         let walk_real =
                             walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));

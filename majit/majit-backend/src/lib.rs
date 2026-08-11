@@ -1704,6 +1704,93 @@ impl CpuDescrAttachments {
 /// the extern-C trampoline can dereference it later.
 pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
 
+/// `llsupport/asmmemmgr.py:AsmMemoryManager` accounting owned by one CPU.
+/// `total_memory_allocated` is the mapped capacity and never shrinks
+/// (`asmmemmgr.py:90` bumps it and nothing subtracts); `total_mallocs` is live
+/// code bytes and is released with each compiled block, exactly like
+/// `AsmMemoryManager.free(start, stop)` (`asmmemmgr.py:47-50`).
+///
+/// The counters are upstream's, but the allocator under them is not.
+/// `total_memory_allocated` is monotonic there because the arena it counts is
+/// *retained*: `free` puts the range back on a reuse list and the mapping
+/// stays, so the figure is the capacity the process still holds. Here every
+/// compiled block instead carries its own executable mapping, unmapped when
+/// the block is reaped, so the same monotonic figure over-reports once code is
+/// freed and grows without bound across compile/invalidate cycles. The fix is
+/// the missing allocator — a real reusable `AsmMemoryManager` with the free
+/// list of `asmmemmgr.py:53-90` — not a subtraction here, which would make the
+/// number honest while leaving the semantics further from upstream.
+#[derive(Default)]
+pub struct AsmMemoryManagerStats {
+    total_memory_allocated: AtomicUsize,
+    total_mallocs: AtomicUsize,
+}
+
+/// The same accounting summed over every CPU in the process.
+///
+/// `jit_hooks.stats_asmmemmgr_{allocated,used}` reads the assembler memory
+/// manager of the one CPU an RPython process owns, so the numbers it reports
+/// are process totals. Pyre builds an independent backend — and with it an
+/// independent [`AsmMemoryManagerStats`] — per mutator thread, so no single
+/// instance answers that question: a query from one thread would omit every
+/// block another thread's compiler owns. Each instance therefore mirrors its
+/// counters here, and process-level consumers read this.
+static PROCESS_ASM_MEMORY_STATS: AsmMemoryManagerStats = AsmMemoryManagerStats {
+    total_memory_allocated: AtomicUsize::new(0),
+    total_mallocs: AtomicUsize::new(0),
+};
+
+/// `jit_hooks.stats_asmmemmgr_allocated` / `_used` — the whole process, not
+/// the calling thread. See [`PROCESS_ASM_MEMORY_STATS`].
+pub fn process_assembler_memory_stats() -> (usize, usize) {
+    PROCESS_ASM_MEMORY_STATS.get_stats()
+}
+
+impl AsmMemoryManagerStats {
+    pub fn record_block(self: &Arc<Self>, allocated: usize, used: usize) -> AsmMemoryBlock {
+        self.total_memory_allocated
+            .fetch_add(allocated, Ordering::Relaxed);
+        self.total_mallocs.fetch_add(used, Ordering::Relaxed);
+        PROCESS_ASM_MEMORY_STATS
+            .total_memory_allocated
+            .fetch_add(allocated, Ordering::Relaxed);
+        PROCESS_ASM_MEMORY_STATS
+            .total_mallocs
+            .fetch_add(used, Ordering::Relaxed);
+        AsmMemoryBlock {
+            owner: Arc::clone(self),
+            used,
+        }
+    }
+
+    pub fn get_stats(&self) -> (usize, usize) {
+        (
+            self.total_memory_allocated.load(Ordering::Relaxed),
+            self.total_mallocs.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Lifetime token stored beside the executable buffer it accounts for.
+pub struct AsmMemoryBlock {
+    owner: Arc<AsmMemoryManagerStats>,
+    used: usize,
+}
+
+impl Drop for AsmMemoryBlock {
+    fn drop(&mut self) {
+        // `used` only, as `free` does at `asmmemmgr.py:47-50`. The capacity
+        // stays charged; see [`AsmMemoryManagerStats`] for what that costs
+        // without the arena upstream keeps it in.
+        self.owner
+            .total_mallocs
+            .fetch_sub(self.used, Ordering::Relaxed);
+        PROCESS_ASM_MEMORY_STATS
+            .total_mallocs
+            .fetch_sub(self.used, Ordering::Relaxed);
+    }
+}
+
 /// The backend trait — implemented by Cranelift (or other code generators).
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.
@@ -1730,6 +1817,13 @@ pub trait Backend: Send {
     fn cpu_tracker(&self) -> &Arc<CpuTotalTracker> {
         static FALLBACK_ARC: std::sync::OnceLock<Arc<CpuTotalTracker>> = std::sync::OnceLock::new();
         FALLBACK_ARC.get_or_init(|| Arc::new(CpuTotalTracker::default()))
+    }
+
+    /// `jit_hooks.stats_asmmemmgr_{allocated,used}` through the CPU-owned
+    /// assembler memory manager. Backends without executable native memory
+    /// retain the zero default.
+    fn assembler_memory_stats(&self) -> (usize, usize) {
+        (0, 0)
     }
 
     /// Compile a loop trace into native code.
@@ -3357,5 +3451,20 @@ mod tests {
         // accessor must not panic when called before registration.
         let v = memory_error_singleton_ref();
         assert!(v == 0 || v != 0, "accessor must not panic");
+    }
+
+    #[test]
+    fn asm_memory_manager_stats_match_upstream_block_lifetimes() {
+        // asmmemmgr.py:30/44/50: allocated capacity is cumulative, while
+        // total_mallocs is the sum of live block byte ranges.
+        let manager = Arc::new(AsmMemoryManagerStats::default());
+        let first = manager.record_block(4096, 120);
+        let second = manager.record_block(8192, 300);
+        assert_eq!(manager.get_stats(), (12_288, 420));
+
+        drop(first);
+        assert_eq!(manager.get_stats(), (12_288, 300));
+        drop(second);
+        assert_eq!(manager.get_stats(), (12_288, 0));
     }
 }

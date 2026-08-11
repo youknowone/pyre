@@ -11,14 +11,133 @@ use majit_ir::GcRef;
 use std::collections::VecDeque;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+/// Monotonic source for the durations the collector reports to its hooks.
+///
+/// `wasm32-unknown-unknown` has no clock: `Instant::now` panics with "time not
+/// implemented on this platform", which is also why the interpreter does not
+/// install its `time` module on that target. Report a zero duration there
+/// rather than taking the panic — `duration`, `duration_min`, and
+/// `duration_max` only reach `hook.py`'s stats objects and the `total_gc_time`
+/// counter, and no collection decision reads any of them.
+struct GcClock {
+    #[cfg(not(target_arch = "wasm32"))]
+    start: std::time::Instant,
+}
+
+impl GcClock {
+    fn start() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            start: std::time::Instant::now(),
+        }
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.start.elapsed().as_secs_f64()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0.0
+        }
+    }
+}
 
 use crate::address_dict::AddressMap;
 use crate::flags;
 use crate::header::{GcHeader, header_of};
+use crate::hook::GcHooks;
 use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
 use crate::oldgen::OldGen;
 use crate::trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, TypeRegistry};
 use crate::{FinalizerTriggerFn, GcAllocator};
+
+/// `inspector.py:209 HeapDumper.BUFSIZE` raw signed-word writer. Keeping the
+/// fixed-size buffer here avoids materializing the full heap dump in memory.
+struct HeapDumpWriter {
+    fd: i32,
+    buffer: Vec<isize>,
+}
+
+// POSIX EIO. `libc`'s wasm32-unknown-unknown surface exposes no errno
+// constants, but inspector.py uses EIO for a short raw write on every target.
+const HEAP_DUMP_EIO: i32 = 5;
+
+impl HeapDumpWriter {
+    const BUFSIZE: usize = 8192;
+
+    fn new(fd: i32) -> Self {
+        Self {
+            fd,
+            buffer: Vec::with_capacity(Self::BUFSIZE),
+        }
+    }
+
+    fn write(&mut self, value: isize) -> Result<(), i32> {
+        self.buffer.push(value);
+        if self.buffer.len() == Self::BUFSIZE {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn write_marker(&mut self) -> Result<(), i32> {
+        for value in [0, 0, 0, -1] {
+            self.write(value)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), i32> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let byte_len = self.buffer.len() * std::mem::size_of::<isize>();
+        // Neither `write` nor `_write` exists here, so no call was made and
+        // `errno` still names some unrelated earlier one. Report the dump's own
+        // failure code instead of reading a stale `errno`.
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (byte_len, self.fd);
+            return Err(HEAP_DUMP_EIO);
+        }
+        #[cfg(any(unix, windows))]
+        {
+            #[cfg(unix)]
+            let written: isize = unsafe {
+                libc::write(
+                    self.fd,
+                    self.buffer.as_ptr().cast::<libc::c_void>(),
+                    byte_len,
+                )
+            };
+            // The CRT entry point is `_write`, but `libc` exports it under the
+            // POSIX name with a `#[link_name = "_write"]` alias, so the Rust
+            // path is `libc::write` on this target as well. It takes a
+            // `c_uint` count and returns `c_int`, unlike the `size_t`/`ssize_t`
+            // unix signature above.
+            #[cfg(windows)]
+            let written: isize = unsafe {
+                libc::write(
+                    self.fd,
+                    self.buffer.as_ptr().cast::<libc::c_void>(),
+                    byte_len as libc::c_uint,
+                ) as isize
+            };
+            if written < 0 {
+                return Err(std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(HEAP_DUMP_EIO));
+            }
+            if written as usize != byte_len {
+                return Err(HEAP_DUMP_EIO);
+            }
+            self.buffer.clear();
+            Ok(())
+        }
+    }
+}
 
 /// Host predicate answering whether the consumer of a deferred major request
 /// would act on one right now. Unset = never arm.
@@ -99,6 +218,7 @@ pub struct GcConfig {
 /// nothing in this file reads them.
 pub const GC_ENV_NAMES: &[&str] = &[
     "PYPY_GC_NURSERY",
+    "PYPY_GC_MAX_PINNED",
     "PYPY_GC_INCREMENT_STEP",
     "PYPY_GC_MAJOR_COLLECT",
     "PYPY_GC_GROWTH",
@@ -181,6 +301,32 @@ fn read_uint_from_env(varname: &str) -> Option<usize> {
     (bytes.is_finite() && bytes > 0.0).then_some(bytes as usize)
 }
 
+/// incminimark.py:516-528 `PYPY_GC_MAX_PINNED`.  Unlike the byte-sized GC
+/// options this is a plain integer count: an absent or empty value selects the
+/// nursery-derived default, while an invalid or negative value leaves the
+/// constructor's initial zero in place and therefore disables pinning.
+///
+/// A value too large for `usize` saturates. `int()` is unbounded upstream, so
+/// the limit it installs there is simply larger than any reachable pin count —
+/// which is what `usize::MAX` is here. The field is a `usize`, so saturating is
+/// the only representable reading of "a cap this program can never hit".
+fn read_max_number_of_pinned_objects() -> Option<usize> {
+    let raw = env_var("PYPY_GC_MAX_PINNED")?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with('-') {
+        return Some(0);
+    }
+    Some(
+        value
+            .parse::<u128>()
+            .map(|count| count.min(usize::MAX as u128) as usize)
+            .unwrap_or(0),
+    )
+}
+
 /// env.py:46-50 `read_float_from_env`: the plain float, but only when no size
 /// factor was given (`factor != 1` → unset). Callers apply their own `> 1.0`
 /// threshold gate.
@@ -193,9 +339,10 @@ fn read_float_from_env(varname: &str) -> Option<f64> {
 }
 
 /// env.py:387-411 `get_darwin_sysctl_signed`: read a signed integer sysctl by
-/// name; 0 on any error.
-#[cfg(target_os = "macos")]
-fn get_darwin_sysctl_signed(name: &[u8]) -> i64 {
+/// name; 0 on any error.  Upstream reuses this helper for FreeBSD's
+/// `hw.usermem` probe as well as the Darwin cache/memory probes.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn get_sysctl_signed(name: &[u8]) -> i64 {
     let mut val: i64 = 0;
     let mut len = std::mem::size_of::<i64>();
     let rc = unsafe {
@@ -222,18 +369,187 @@ fn get_darwin_sysctl_signed(name: &[u8]) -> i64 {
 /// legacy `hw.l2cachesize` fallback.
 #[cfg(target_os = "macos")]
 fn get_l2cache() -> i64 {
-    let mut l2cache = get_darwin_sysctl_signed(b"hw.perflevel0.l2cachesize\0");
+    let mut l2cache = get_sysctl_signed(b"hw.perflevel0.l2cachesize\0");
     if l2cache <= 0 {
-        l2cache = get_darwin_sysctl_signed(b"hw.l2cachesize\0");
+        l2cache = get_sysctl_signed(b"hw.l2cachesize\0");
     }
-    let mangled = l2cache + get_darwin_sysctl_signed(b"hw.l3cachesize\0");
+    let mangled = l2cache + get_sysctl_signed(b"hw.l3cachesize\0");
     if mangled > 0 { mangled } else { -1 }
 }
 
+/// env.py:149-210 `get_L2cache_linux2_cpuinfo`: find the smallest cache-size
+/// entry across CPUs.  The label must begin immediately after a newline, and
+/// the value must be expressed in K/kilobytes, exactly like upstream.
+fn l2cache_from_cpuinfo(data: &[u8], label: &[u8]) -> i64 {
+    let mut smallest = i64::MAX;
+    for (line_index, line) in data.split(|byte| *byte == b'\n').enumerate() {
+        // `_findend(data, '\n' + label, ...)` does not inspect the first line.
+        if line_index == 0 || !line.starts_with(label) {
+            continue;
+        }
+        let mut pos = label.len();
+        while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+        if line.get(pos) != Some(&b':') {
+            continue;
+        }
+        pos += 1;
+        while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+        let start = pos;
+        while pos < line.len() && line[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        if start == pos {
+            continue;
+        }
+        let Ok(number) = std::str::from_utf8(&line[start..pos])
+            .unwrap_or("")
+            .parse::<i64>()
+        else {
+            continue;
+        };
+        while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+        if !matches!(line.get(pos), Some(b'K' | b'k')) {
+            continue;
+        }
+        if let Some(bytes) = number.checked_mul(1024) {
+            smallest = smallest.min(bytes);
+        }
+    }
+    if smallest < i64::MAX { smallest } else { -1 }
+}
+
+/// File half of env.py:149-210 `get_L2cache_linux2_cpuinfo`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn get_l2cache_linux_cpuinfo(filename: &str, label: &[u8]) -> i64 {
+    std::fs::read(filename)
+        .ok()
+        .map_or(-1, |data| l2cache_from_cpuinfo(&data, label))
+}
+
+/// Parse the leading decimal plus K/k form used by Linux sysfs cache sizes.
+fn parse_sysfs_cache_size(data: &[u8]) -> Option<i64> {
+    let end = data.iter().position(|byte| !byte.is_ascii_digit())?;
+    if end == 0 || !matches!(data.get(end), Some(b'K' | b'k')) {
+        return None;
+    }
+    std::str::from_utf8(&data[..end])
+        .ok()?
+        .parse::<i64>()
+        .ok()?
+        .checked_mul(1024)
+}
+
+/// env.py:287-356 `get_L2cache_linux2_system_cpu_index`: walk every
+/// `cpuN/cache/indexM`, take the smallest L2 and L3, then sum them.  Missing
+/// either level deliberately overflows the signed sentinel to a non-positive
+/// value, matching translated RPython's `sys.maxint` arithmetic and fallback.
+fn get_l2cache_linux_system_cpu_index(sys_cpu_root: &str) -> i64 {
+    let mut cpu = 0usize;
+    let mut l2cache = i64::MAX;
+    let mut l3cache = i64::MAX;
+    loop {
+        let mut index = 0usize;
+        loop {
+            let cachedir = format!("{sys_cpu_root}/cpu{cpu}/cache/index{index}");
+            let Ok(level_data) = std::fs::read(format!("{cachedir}/level")) else {
+                break;
+            };
+            let Ok(level) = std::str::from_utf8(&level_data)
+                .unwrap_or("")
+                .trim()
+                .parse::<i64>()
+            else {
+                break;
+            };
+            if level != 2 && level != 3 {
+                index += 1;
+                continue;
+            }
+            let Ok(size_data) = std::fs::read(format!("{cachedir}/size")) else {
+                break;
+            };
+            if let Some(number) = parse_sysfs_cache_size(&size_data) {
+                if level == 2 {
+                    l2cache = l2cache.min(number);
+                } else {
+                    l3cache = l3cache.min(number);
+                }
+            }
+            index += 1;
+        }
+        if index == 0 {
+            break;
+        }
+        cpu += 1;
+    }
+    let mangled = l2cache.wrapping_add(l3cache);
+    if mangled > 0 { mangled } else { -1 }
+}
+
+/// env.py:251-285 `get_L2cache_linux2_sparc`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn get_l2cache_linux_sparc(sys_cpu_root: &str) -> i64 {
+    let mut cpu = 0usize;
+    let mut smallest = i64::MAX;
+    loop {
+        let filename = format!("{sys_cpu_root}/cpu{cpu}/l2_cache_size");
+        let Ok(data) = std::fs::read(filename) else {
+            break;
+        };
+        let Ok(number) = std::str::from_utf8(&data)
+            .unwrap_or("")
+            .trim()
+            .parse::<i64>()
+        else {
+            break;
+        };
+        smallest = smallest.min(number);
+        cpu += 1;
+    }
+    if smallest < i64::MAX { smallest } else { -1 }
+}
+
+/// env.py:126-146 `get_L2cache_linux2`: select the literal upstream probe by
+/// machine architecture.  Rust's architecture spellings differ slightly from
+/// `os.uname()[4]`, so include both forms where the target exists.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn get_l2cache_linux_for(arch: &str, cpuinfo: &str, sys_cpu_root: &str) -> i64 {
+    if arch.ends_with("86") || arch == "x86_64" {
+        return get_l2cache_linux_cpuinfo(cpuinfo, b"cache size");
+    }
+    if matches!(arch, "alpha" | "ppc" | "powerpc") {
+        return get_l2cache_linux_cpuinfo(cpuinfo, b"L2 cache");
+    }
+    if matches!(arch, "ia64" | "aarch64") {
+        return get_l2cache_linux_system_cpu_index(sys_cpu_root);
+    }
+    if matches!(arch, "parisc" | "parisc64") {
+        return get_l2cache_linux_cpuinfo(cpuinfo, b"D-cache");
+    }
+    if matches!(arch, "sparc" | "sparc64") {
+        return get_l2cache_linux_sparc(sys_cpu_root);
+    }
+    -1
+}
+
+#[cfg(target_os = "linux")]
+fn get_l2cache() -> i64 {
+    get_l2cache_linux_for(
+        std::env::consts::ARCH,
+        "/proc/cpuinfo",
+        "/sys/devices/system/cpu",
+    )
+}
+
 /// env.py:437-438 `get_L2cache = globals().get('get_L2cache_' + sys.platform,
-/// lambda: -1)`. Non-macOS probes are not yet ported, so -1 (the 4MB
-/// unknown-cache fallback applies).
-#[cfg(not(target_os = "macos"))]
+/// lambda: -1)`.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn get_l2cache() -> i64 {
     -1
 }
@@ -270,11 +586,11 @@ fn default_nursery_size() -> usize {
 /// the real total-memory probe is unavailable or larger.
 const ADDRESSABLE_SIZE: f64 = 9_223_372_036_854_775_808.0; // 2**63
 
-/// env.py:100-110 `get_total_memory_darwin`. Clamp the probed total memory:
+/// env.py:100-110 `get_total_memory_darwin`. Clamp a sysctl-probed total:
 /// fall back to the addressable size when the probe failed (`<= 0`) and cap it
 /// at the addressable size otherwise.
-#[cfg(target_os = "macos")]
-fn get_total_memory_darwin(result: i64) -> f64 {
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn get_total_memory_sysctl(result: i64) -> f64 {
     if result <= 0 {
         ADDRESSABLE_SIZE
     } else {
@@ -323,10 +639,9 @@ fn get_total_memory_linux(filename: &str) -> f64 {
 }
 
 /// env.py:113-127 `get_total_memory`. Total physical memory in bytes.
-/// Linux reads `/proc/meminfo`; macOS reads `hw.memsize` via `sysctl`. The
-/// FreeBSD `hw.usermem` probe (env.py:121-123) is not ported (like
-/// `get_l2cache` non-macOS), so every other platform returns the addressable
-/// size (env.py:125-127).
+/// Linux reads `/proc/meminfo`; macOS reads `hw.memsize`; FreeBSD reads
+/// `hw.usermem`; every other platform returns the addressable size
+/// (env.py:113-127).
 #[cfg(target_os = "linux")]
 fn get_total_memory() -> f64 {
     get_total_memory_linux("/proc/meminfo")
@@ -334,10 +649,15 @@ fn get_total_memory() -> f64 {
 
 #[cfg(target_os = "macos")]
 fn get_total_memory() -> f64 {
-    get_total_memory_darwin(get_darwin_sysctl_signed(b"hw.memsize\0"))
+    get_total_memory_sysctl(get_sysctl_signed(b"hw.memsize\0"))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "freebsd")]
+fn get_total_memory() -> f64 {
+    get_total_memory_sysctl(get_sysctl_signed(b"hw.usermem\0"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 fn get_total_memory() -> f64 {
     ADDRESSABLE_SIZE
 }
@@ -419,16 +739,23 @@ impl Default for RootSet {
 pub const DEFAULT_CARD_PAGE_SHIFT: u32 = 7;
 
 /// incminimark.py:2390-2634 major-collection state machine.
-///
-/// incminimark's `STATE_FINALIZING` is intentionally absent.  Pyre exposes
-/// explicit FinalizerQueue death deques and trigger callbacks, but has no
-/// collector-run `execute_finalizers`; incminimark.py:2623-2631 therefore
-/// reduces to setting `Scanning` before firing those triggers in the same step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GcState {
     Scanning,
     Marking,
     Sweeping,
+    Finalizing,
+}
+
+impl GcState {
+    fn encoded(self) -> u8 {
+        match self {
+            Self::Scanning => crate::GcStepTransition::SCANNING,
+            Self::Marking => crate::GcStepTransition::MARKING,
+            Self::Sweeping => crate::GcStepTransition::SWEEPING,
+            Self::Finalizing => crate::GcStepTransition::FINALIZING,
+        }
+    }
 }
 
 /// State for incremental major marking.
@@ -438,8 +765,15 @@ enum GcState {
 /// piggybacks an incremental marking step that processes a bounded
 /// number of objects from the gray stack.
 struct IncrementalMarkState {
-    /// Objects still to be scanned (gray set).
+    /// incminimark.py `objects_to_trace`: objects discovered by the ordinary
+    /// marking walk.
     gray_stack: Vec<usize>,
+    /// incminimark.py `more_objects_to_trace`: objects exposed or modified by
+    /// the mutator while MARKING.  Keeping this separate is the termination
+    /// mechanism at incminimark.py:2453-2470: only when the ordinary worklist
+    /// consumed less than half its step does the collector swap this list in
+    /// and drain it without a budget.
+    more_gray_stack: Vec<usize>,
     /// Number of objects marked so far in this cycle.
     objects_marked: usize,
     /// Target number of bytes to trace per increment.
@@ -466,6 +800,7 @@ impl IncrementalMarkState {
             .max(1);
         IncrementalMarkState {
             gray_stack: Vec::new(),
+            more_gray_stack: Vec::new(),
             objects_marked: 0,
             mark_budget_per_step,
             mark_offsets: Vec::new(),
@@ -570,6 +905,14 @@ pub struct MiniMarkGC {
     pub minor_collections: usize,
     /// Count of major collections performed.
     pub major_collections: usize,
+    /// `incminimark.py:self.hooks`, supplied by the translated standalone
+    /// target and restricted to its allocation-free low-level surface.
+    hooks: GcHooks,
+    /// Hook accounting captured at the MARKING -> SWEEPING seam.
+    stat_ac_arenas_count: usize,
+    stat_rawmalloced_total_size: usize,
+    /// incminimark.py:387 `total_gc_time`, in seconds.
+    total_gc_time: f64,
     /// incminimark.py:2390-2634 `gc_state`.
     gc_state: GcState,
     /// State for incremental major collection.
@@ -625,6 +968,15 @@ pub struct MiniMarkGC {
     /// incremental major cycle starts once `get_total_memory_used()` reaches
     /// this value (`threshold_reached`).
     next_major_collection_threshold: f64,
+    /// incminimark.py:2492,3011-3020 `self.kept_alive_by_finalizer`.
+    ///
+    /// During finalization ordering, unreachable object graphs are marked so
+    /// their app-level finalizers can still run.  They remain physically live
+    /// after this sweep, but upstream excludes exactly these bytes from the
+    /// survivor baseline used to size the next major threshold; otherwise a
+    /// workload consisting mostly of finalizable garbage grows that threshold
+    /// forever (PyPy issue #2590).
+    kept_alive_by_finalizer: usize,
     /// Bytes promoted to old gen since the current incremental cycle started.
     ///
     /// Mirrors incminimark's `size_objects_made_old`.
@@ -634,8 +986,22 @@ pub struct MiniMarkGC {
     ///
     /// Mirrors incminimark's `threshold_objects_made_old`.
     threshold_bytes_made_old: usize,
+    /// incminimark.py:1816,2174,2232 `nursery_surviving_size`: allocator-size
+    /// bytes promoted by the most recent minor collection.  The MARKING step
+    /// traces at least twice this many bytes so a high-survival nursery cannot
+    /// make the gray frontier grow faster than it is consumed.
+    nursery_surviving_size: usize,
     /// Pinned nursery objects that must not be moved during minor collection.
     pinned_objects: IndexSet<usize>,
+    /// incminimark.py:426-440 pin-liveness state. Each minor collection
+    /// rebuilds `surviving_pinned_objects` from actual traced edges; old
+    /// parents found along those edges are revisited by the next minor.
+    surviving_pinned_objects: IndexSet<usize>,
+    old_objects_pointing_to_pinned: Vec<usize>,
+    /// incminimark.py:311,430 `max_number_of_pinned_objects` and
+    /// `pinned_objects_in_nursery`.
+    max_number_of_pinned_objects: usize,
+    pinned_objects_in_nursery: usize,
     /// minimark.py:338 `nursery_objects_shadows = AddressDict()`.
     /// Maps nursery object payload address → pre-allocated old-gen
     /// shadow payload address.  When `id()` or `identityhash()` is
@@ -716,6 +1082,15 @@ impl MiniMarkGC {
         min_heap_size = min_heap_size.max(nursery_size as f64 * major_collection_threshold);
 
         let nursery = Nursery::new(config.nursery_size);
+        // incminimark.py:516-528. `nonlarge_max + 1` is the large-object
+        // cutoff; pyre stores that cutoff directly in the configuration.
+        let max_number_of_pinned_objects =
+            read_max_number_of_pinned_objects().unwrap_or_else(|| {
+                config
+                    .nursery_size
+                    .checked_div(config.large_object_threshold.saturating_mul(2))
+                    .unwrap_or(0)
+            });
         let published_nursery_top = Box::new(AtomicUsize::new(nursery.top_ptr() as usize));
         let mut gc = MiniMarkGC {
             nursery,
@@ -740,6 +1115,10 @@ impl MiniMarkGC {
             config,
             minor_collections: 0,
             major_collections: 0,
+            hooks: GcHooks,
+            stat_ac_arenas_count: 0,
+            stat_rawmalloced_total_size: 0,
+            total_gc_time: 0.0,
             gc_state: GcState::Scanning,
             incr_state: IncrementalMarkState::new(nursery_size),
             major_collection_threshold,
@@ -754,9 +1133,15 @@ impl MiniMarkGC {
             // then refined by set_major_threshold_from(0.0) below.
             next_major_collection_initial: min_heap_size,
             next_major_collection_threshold: min_heap_size,
+            kept_alive_by_finalizer: 0,
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
+            nursery_surviving_size: 0,
             pinned_objects: IndexSet::new(),
+            surviving_pinned_objects: IndexSet::new(),
+            old_objects_pointing_to_pinned: Vec::new(),
+            max_number_of_pinned_objects,
+            pinned_objects_in_nursery: 0,
             nursery_objects_shadows: AddressMap::default(),
             compiled_code_registry: CompiledCodeRegistry::new(),
             vtable_to_type_id: AddressMap::default(),
@@ -1713,6 +2098,7 @@ impl MiniMarkGC {
     /// 3. Iteratively process newly discovered references until stable.
     /// 4. Reset nursery.
     pub fn do_collect_nursery(&mut self) {
+        let start = GcClock::start();
         let _stw = if crate::gc_sync::stw_required() {
             Some(crate::gc_sync::quiesce_mutators())
         } else {
@@ -1734,6 +2120,37 @@ impl MiniMarkGC {
         // paths that reset it all run after the sample is taken below.
         let drain_sample = crate::drain_census_enabled()
             .then(|| (self.nursery.used(), self.bytes_made_old_since_cycle));
+        // incminimark.py:1816: this is the survivor count for this minor only;
+        // every promotion below adds its allocator-sized object extent.
+        self.nursery_surviving_size = 0;
+        // incminimark.py:1779-1785: pinning does not keep an object alive.
+        // Rebuild both the survivor set and count from traced edges below.
+        self.surviving_pinned_objects.clear();
+        self.pinned_objects_in_nursery = 0;
+        // incminimark.py:1800-1807: a black old parent may expose an unpinned
+        // child that will move during this minor, so make the parent gray
+        // again before the active major marking cycle can sweep that child.
+        if self.gc_state == GcState::Marking {
+            for &obj_addr in &self.old_objects_pointing_to_pinned {
+                let hdr = unsafe { header_of(obj_addr) };
+                if unsafe { (*hdr).has_flag(flags::VISITED) } {
+                    self.incr_state.more_gray_stack.push(obj_addr);
+                }
+            }
+        }
+        // incminimark.py:1826-1832: replace the list before anything can append
+        // to it, so parents discovered during this minor accumulate in the
+        // fresh one instead of in the copy being drained. Upstream performs the
+        // swap after `collect_roots_in_nursery` because its root callback
+        // passes a NULL parent and therefore records nothing; the
+        // old-generation jitframe arm of Phase 1c below traces with a real
+        // parent, so here the swap has to come first. A parent recorded after
+        // the swap keeps `GCFLAG_PINNED_OBJECT_PARENT_KNOWN` for the rest of
+        // the minor and would not be re-recorded when the drained copy is
+        // visited, which would drop it from the list permanently and leave the
+        // flag set for good.
+        let old_parents_pointing_to_pinned =
+            std::mem::take(&mut self.old_objects_pointing_to_pinned);
         crate::bh_probe_clear_traced();
         // Phase 1: Process roots — copy nursery objects they point to.
         // We use raw pointers to avoid borrow checker issues since
@@ -1857,6 +2274,14 @@ impl MiniMarkGC {
             crate::shadow_stack::ExtraRootWalkKind::Major,
         );
 
+        // incminimark.py:1820-1832: old parents that reached a pinned child in
+        // the previous minor must be traced again. `copy_nursery_object`
+        // repopulates the list swapped in above, and only for parents that
+        // still point to a pinned object.
+        for obj_addr in old_parents_pointing_to_pinned {
+            self.trace_and_update_object(obj_addr, "minor_old_parent_pinned");
+        }
+
         // incminimark parity: during an active marking cycle, old objects
         // remembered by the write barrier may already be black. Requeue
         // those black objects so the major collector rescans their new
@@ -1866,7 +2291,7 @@ impl MiniMarkGC {
             for obj_addr in remembered_now {
                 let hdr = unsafe { header_of(obj_addr) };
                 if unsafe { (*hdr).has_flag(flags::VISITED) } {
-                    self.incr_state.gray_stack.push(obj_addr);
+                    self.incr_state.more_gray_stack.push(obj_addr);
                 }
             }
         }
@@ -1931,18 +2356,19 @@ impl MiniMarkGC {
             self.deal_with_young_objects_with_destructors();
         }
 
-        // incminimark.py:1876-1882: clear the shadow map now that all
-        // nursery objects have been forwarded (or died).  Without pinned
-        // objects every nursery object was dragged out (into its shadow
-        // if any), so the whole map is dropped.  With pinned objects,
-        // upstream rebuilds a fresh `AddressDict` from
-        // `surviving_pinned_objects` via `record_pinned_object_with_shadow`
-        // (incminimark.py:1738); pyre pins explicitly through `pin`/`unpin`
-        // (a liveness contract that keeps the object in the nursery until
-        // released, never reclaimed by a collection), so `pinned_objects`
-        // IS the surviving-pinned set and an in-place `retain` keeping those
-        // entries yields the same map contents as the upstream rebuild —
-        // every non-pinned shadow was already consumed by the copy above.
+        // incminimark.py:1876-1882,1900-1944: replace the pin set with exactly
+        // the objects reached this collection, then preserve identity shadows
+        // and nursery barriers only for those survivors. Clear their temporary
+        // VISITED bit while the addresses are still valid.
+        self.pinned_objects = std::mem::take(&mut self.surviving_pinned_objects);
+        debug_assert_eq!(self.pinned_objects_in_nursery, self.pinned_objects.len());
+        for &obj_addr in &self.pinned_objects {
+            unsafe { (*header_of(obj_addr)).clear_flag(flags::VISITED) };
+        }
+
+        // Clear this mapping now that every unpinned nursery object was
+        // forwarded (or died). Upstream rebuilds it from the same surviving
+        // pinned collection via `record_pinned_object_with_shadow`.
         // A pinned object's shadow is its stable identity address and MUST
         // survive the clear, else the next `id_or_identityhash`
         // re-allocates a fresh shadow and the identity hash changes.
@@ -1989,7 +2415,22 @@ impl MiniMarkGC {
         } else {
             self.reset_nursery_with_pinned();
         }
+        // incminimark.py:1949-1951: the PINNED bit is reused on old objects as
+        // PINNED_OBJECT_PARENT_KNOWN only within one minor collection.
+        for &obj_addr in &self.old_objects_pointing_to_pinned {
+            unsafe { (*header_of(obj_addr)).clear_flag(flags::PINNED) };
+        }
         self.refresh_published_nursery_top();
+
+        // incminimark.py:1962-1974 — report the completed minor before the
+        // wrapper advances the incremental major state machine.
+        let duration = start.elapsed_secs();
+        self.total_gc_time += duration;
+        self.hooks.fire_gc_minor(
+            duration,
+            self.get_total_memory_used(),
+            self.pinned_objects_in_nursery,
+        );
 
         // Minor collections must also drive incremental major-collection
         // progress. Like incminimark, take one or more major steps until
@@ -2272,8 +2713,28 @@ impl MiniMarkGC {
         holder_addr: usize,
         slot_addr: usize,
     ) -> GcRef {
-        // Pinned objects must stay in the nursery.
+        // incminimark.py:2188-2210: a pinned object stays in the nursery, but
+        // pinning is not a root. Record it only when a real traced edge reaches
+        // it, and remember an old parent so that edge is revisited next minor.
         if self.pinned_objects.contains(&obj_addr) {
+            // incminimark.py:2194-2199 records an old parent. The list outlives
+            // the nursery reset at the end of this minor and is dereferenced in
+            // the next one, so a nursery holder would become a read of recycled
+            // nursery bytes; `is_managed_heap_object` alone accepts one.
+            if holder_addr != 0
+                && self.is_managed_heap_object(holder_addr)
+                && !self.is_in_nursery(holder_addr)
+            {
+                let holder_hdr = unsafe { header_of(holder_addr) };
+                if unsafe { !(*holder_hdr).has_flag(flags::PINNED) } {
+                    self.old_objects_pointing_to_pinned.push(holder_addr);
+                    unsafe { (*holder_hdr).set_flag(flags::PINNED) };
+                }
+            }
+            if self.surviving_pinned_objects.insert(obj_addr) {
+                unsafe { (*header_of(obj_addr)).set_flag(flags::VISITED) };
+                self.pinned_objects_in_nursery += 1;
+            }
             return GcRef(obj_addr);
         }
 
@@ -2386,6 +2847,7 @@ impl MiniMarkGC {
         );
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
+        self.nursery_surviving_size = self.nursery_surviving_size.saturating_add(total_size);
 
         // Set TRACK_YOUNG_PTRS on the new old-gen object. (The source header was
         // copied from the nursery object, which does not carry it.)
@@ -2469,12 +2931,12 @@ impl MiniMarkGC {
             "minor_root",
             "minor_root",
         );
-        let pinned = self.pinned_objects.contains(&gcref.0);
-        if self.is_nursery_object_start(gcref.0) && !pinned {
+        if self.is_nursery_object_start(gcref.0) {
             let slot_addr = gcref as *mut GcRef as usize;
             *gcref =
                 self.copy_nursery_object(gcref.0, "minor_root_target", "minor_root", 0, slot_addr);
         }
+        let pinned = self.pinned_objects.contains(&gcref.0);
         // incminimark.py:2140-2143: append iff (VISITED | PINNED) == 0. pyre's
         // marking convention sets VISITED at push time (see `seed_major_root`
         // / `mark_object`), so set it here rather than at pop.
@@ -2482,7 +2944,7 @@ impl MiniMarkGC {
             let hdr = unsafe { header_of(gcref.0) };
             if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                 unsafe { (*hdr).set_flag(flags::VISITED) };
-                self.incr_state.gray_stack.push(gcref.0);
+                self.incr_state.more_gray_stack.push(gcref.0);
                 self.note_nonmoving_nursery_mark(gcref.0);
             }
         }
@@ -2636,6 +3098,7 @@ impl MiniMarkGC {
     pub fn start_incremental_cycle(&mut self) {
         debug_assert_eq!(self.gc_state, GcState::Scanning);
         self.incr_state.gray_stack.clear();
+        self.incr_state.more_gray_stack.clear();
         self.incr_state.objects_marked = 0;
 
         self.seed_major_roots();
@@ -3022,6 +3485,225 @@ impl MiniMarkGC {
         }
     }
 
+    /// `inspector.py:26-37 get_rpy_roots`: enumerate the raw root values
+    /// exactly once, without the reachability traversal used by
+    /// `rgc.do_get_objects`.
+    pub fn do_get_rpy_roots(&mut self, visitor: &mut dyn FnMut(GcRef)) -> bool {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        for root in self.enumerate_all_root_values() {
+            if !root.is_null() {
+                visitor(root);
+            }
+        }
+        true
+    }
+
+    /// `inspector.py:51-72 get_rpy_referents`: trace only the direct raw
+    /// fields of `obj`.  In contrast, `do_get_referents` below recursively
+    /// looks through non-object implementation nodes.
+    pub fn do_get_rpy_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) -> bool {
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return true;
+        }
+        if self.is_in_nursery(obj.0) && unsafe { (*header_of(obj.0)).is_forwarded() } {
+            return true;
+        }
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        self.visit_referents(obj.0, visitor);
+        true
+    }
+
+    /// `inspector.py:209-272 HeapDumper`, preserving its two-phase walk:
+    /// roots are emitted first, then `[0, 0, 0, -1]`, then the remaining
+    /// reachable objects. `GCFLAG_EXTRA` is the forwarded/PtrInfo-equivalent
+    /// visited slot used by upstream, so no address side table is introduced.
+    pub fn do_dump_rpy_heap(&mut self, fd: i32) -> Result<bool, i32> {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        let roots = self.enumerate_all_root_values();
+        let mut root_pending = Vec::new();
+        for &root in &roots {
+            self.heap_dump_add(root, &mut root_pending);
+        }
+        let mut pending = Vec::new();
+        let mut writer = HeapDumpWriter::new(fd);
+        let result = (|| {
+            while let Some(obj) = root_pending.pop() {
+                self.heap_dump_writeobj(obj, &mut writer, &mut pending)?;
+            }
+            writer.write_marker()?;
+            while let Some(obj) = pending.pop() {
+                self.heap_dump_writeobj(obj, &mut writer, &mut pending)?;
+            }
+            writer.flush()?;
+            Ok(true)
+        })();
+
+        // inspector.py:166-184 finish_processing: restore GCFLAG_EXTRA by
+        // repeating the reachability walk from roots, including on write error
+        // so a bad fd cannot poison later inspector calls.
+        self.heap_dump_clear_gcflag(roots);
+        result
+    }
+
+    /// `incminimark.py:1102-1110 raw_malloc_memory_pressure`, including the
+    /// framework transform's object-owned field store
+    /// (`gctransform/framework.py:861-878`). A negative size releases
+    /// previously reported pressure just as upstream does.
+    pub fn do_add_memory_pressure(&mut self, size: isize, object: GcRef) {
+        // The forced-top store below rewrites the same published free/top words
+        // compiled code reads inline, so park the other mutators for it the way
+        // every other entry point that mutates published allocator state does.
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        if !object.is_null() && self.is_managed_heap_object(object.0) {
+            let type_id = unsafe { (*header_of(object.0)).type_id() };
+            if (type_id as usize) < self.types.len() {
+                if let Some(offset) = self.types.get(type_id).memory_pressure_offset {
+                    unsafe {
+                        *((object.0 + offset) as *mut isize) = size;
+                    }
+                }
+            }
+        }
+
+        // incminimark.py:1103-1106: account for the raw allocation plus a
+        // small per-allocation overhead so many tiny allocations still drive
+        // a major collection.
+        self.next_major_collection_threshold -=
+            (size as f64) + (2 * std::mem::size_of::<usize>()) as f64;
+        if self.next_major_collection_threshold < 0.0 {
+            // incminimark.py:1107-1110: make the next nursery allocation take
+            // collect_and_reserve. Both the runtime and JIT read these same
+            // published free/top words.
+            let free = self.nursery.free_ptr();
+            unsafe { self.nursery.set_top_ptr(free.cast_const()) };
+            self.refresh_published_nursery_top();
+        }
+    }
+
+    /// `inspector.py:178-195 MemoryPressureCounter`: walk the root-reachable
+    /// heap, summing each type's translated `special_memory_pressure` field.
+    /// `GCFLAG_EXTRA` is the upstream walker slot; no address side table is
+    /// introduced.
+    pub fn do_count_memory_pressure(&mut self) -> isize {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        let roots = self.enumerate_all_root_values();
+        let mut pending = Vec::new();
+        for &root in &roots {
+            self.heap_dump_add(root, &mut pending);
+        }
+        let mut count = 0isize;
+        while let Some(obj) = pending.pop() {
+            let type_id = unsafe { (*header_of(obj.0)).type_id() };
+            if (type_id as usize) < self.types.len() {
+                if let Some(offset) = self.types.get(type_id).memory_pressure_offset {
+                    count = count.wrapping_add(unsafe { *((obj.0 + offset) as *const isize) });
+                }
+            }
+            let mut referents = Vec::new();
+            self.visit_referents(obj.0, &mut |child| referents.push(child));
+            for child in referents {
+                self.heap_dump_add(child, &mut pending);
+            }
+        }
+        self.heap_dump_clear_gcflag(roots);
+        count
+    }
+
+    fn heap_dump_add(&self, obj: GcRef, pending: &mut Vec<GcRef>) {
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return;
+        }
+        let hdr = unsafe { header_of(obj.0) };
+        if unsafe { (*hdr).has_flag(flags::EXTRA) } {
+            return;
+        }
+        unsafe { (*hdr).set_flag(flags::EXTRA) };
+        pending.push(obj);
+    }
+
+    fn heap_dump_writeobj(
+        &self,
+        obj: GcRef,
+        writer: &mut HeapDumpWriter,
+        pending: &mut Vec<GcRef>,
+    ) -> Result<(), i32> {
+        let type_id = unsafe { (*header_of(obj.0)).type_id() };
+        writer.write(obj.0 as isize)?;
+        writer.write((type_id as isize) + 1)?;
+        writer.write(self.rpy_memory_usage(obj).unwrap_or(0) as isize)?;
+        let mut referents = Vec::new();
+        self.visit_referents(obj.0, &mut |child| referents.push(child));
+        for child in referents {
+            writer.write(child.0 as isize)?;
+            self.heap_dump_add(child, pending);
+        }
+        writer.write(-1)
+    }
+
+    fn heap_dump_clear_gcflag(&self, roots: Vec<GcRef>) {
+        let mut pending = roots;
+        while let Some(obj) = pending.pop() {
+            if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+                continue;
+            }
+            let hdr = unsafe { header_of(obj.0) };
+            if unsafe { !(*hdr).has_flag(flags::EXTRA) } {
+                continue;
+            }
+            unsafe { (*hdr).clear_flag(flags::EXTRA) };
+            self.visit_referents(obj.0, &mut |child| pending.push(child));
+        }
+    }
+
+    /// `referents.py:17-33 try_cast_gcref_to_w_root`.  The translated
+    /// `T_IS_RPYTHON_INSTANCE` bit is `TypeInfo::is_object`; the explicit hide
+    /// bit covers internal structs that share a Python-object prefix but have
+    /// no app-level typedef.
+    ///
+    /// This is the single predicate behind every app-level inspector — the
+    /// `gc.get_objects` filter, the `get_rpy_*` wrap decision, and the walk
+    /// terminator in [`Self::do_get_referents`] — because upstream passes the
+    /// one `try_cast_gcref_to_w_root` to all three.
+    fn is_app_level_object_ref(&self, obj: GcRef) -> bool {
+        // `referents.py:18 rgc.get_gcflag_dummy(gcref)`: a dummy stands in for
+        // an object the collector no longer holds, so it is never an app-level
+        // object however its type reads.  Only a managed object carries the
+        // header the flag lives in.
+        if self.is_managed_heap_object(obj.0)
+            && unsafe { (*header_of(obj.0)).has_flag(flags::DUMMY) }
+        {
+            return false;
+        }
+        let Some(type_id) = self.get_actual_typeid(obj) else {
+            return false;
+        };
+        if type_id as usize >= self.types.len() {
+            return false;
+        }
+        let info = self.types.get(type_id);
+        info.is_object && !info.hide_from_app_level_inspector
+    }
+
     /// `pypy/module/gc/referents.py:53-78 _list_w_obj_referents`: visit the
     /// app-level objects `obj` refers to directly, looking through the
     /// interpreter-internal structs in between. A visited app-level object
@@ -3070,9 +3752,7 @@ impl MiniMarkGC {
             while i < pending.len() {
                 parent = pending[i];
                 i += 1;
-                let hdr = unsafe { header_of(parent.0) };
-                let type_id = unsafe { (*hdr).type_id() };
-                if !unsafe { (*hdr).has_flag(flags::DUMMY) } && self.types.get(type_id).is_object {
+                if self.is_app_level_object_ref(parent) {
                     result.push(parent);
                 } else {
                     expand = true;
@@ -3140,7 +3820,7 @@ impl MiniMarkGC {
         loop {
             self.major_collection_step();
 
-            // incminimark.py:849-855 target (A1), with FINALIZING collapsed.
+            // incminimark.py:849-855 target (A1).
             if self.gc_state == GcState::Scanning {
                 break;
             }
@@ -3156,6 +3836,9 @@ impl MiniMarkGC {
 
     /// incminimark.py:2390-2634 `major_collection_step`.
     fn major_collection_step(&mut self) {
+        let start = GcClock::start();
+        let old_state = self.gc_state.encoded();
+        let oom_was_pending = self.oom_pending;
         self.debug_check_consistency();
 
         // incminimark.py:2406-2436: each state-machine step grants half a
@@ -3177,6 +3860,22 @@ impl MiniMarkGC {
                 self.incremental_mark_step();
             }
             GcState::Sweeping => self.incremental_sweep_step(),
+            GcState::Finalizing => {
+                // incminimark.py:2623-2631: recursive collections from a
+                // handler must see a collector ready to start a new scan.
+                self.gc_state = GcState::Scanning;
+                self.execute_finalizer_triggers();
+            }
+        }
+
+        // incminimark.py:2634-2644. A max-heap MemoryError exits upstream
+        // before this site; pyre communicates it through `oom_pending`, so
+        // suppress the transition event when this step newly raised it.
+        if self.oom_pending == oom_was_pending {
+            let duration = start.elapsed_secs();
+            self.total_gc_time += duration;
+            self.hooks
+                .fire_gc_collect_step(duration, old_state, self.gc_state.encoded());
         }
     }
 
@@ -3199,18 +3898,46 @@ impl MiniMarkGC {
     /// Returns `true` if marking is complete (gray stack exhausted).
     pub fn incremental_mark_step(&mut self) -> bool {
         debug_assert_eq!(self.gc_state, GcState::Marking);
-        let mut budget = self.incr_state.mark_budget_per_step;
-        let mut processed_any = false;
-        while budget > 0 || !processed_any {
-            let Some(obj_addr) = self.incr_state.gray_stack.pop() else {
-                self.finish_incremental_marking();
-                return true; // marking complete
-            };
+        // incminimark.py:2453-2457: a nursery with many survivors raises this
+        // increment's byte budget so promotion cannot outrun tracing.
+        let estimate = self
+            .incr_state
+            .mark_budget_per_step
+            .max(self.nursery_surviving_size.saturating_mul(2))
+            .max(1);
+        let mut remaining = estimate;
+        while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
             let obj_size = self.object_total_size(obj_addr);
             self.mark_object(obj_addr);
             self.incr_state.objects_marked += 1;
-            budget = budget.saturating_sub(obj_size.max(1));
-            processed_any = true;
+            if obj_size > remaining {
+                remaining = 0;
+                break;
+            }
+            remaining -= obj_size;
+        }
+
+        // incminimark.py:2458-2470: if the ordinary frontier used less than
+        // half the step, swap in every object exposed by concurrent mutation
+        // and drain that worklist completely.  This deliberately trades some
+        // incrementality for termination.
+        if self.incr_state.gray_stack.is_empty()
+            && remaining >= estimate / 2
+            && !self.incr_state.more_gray_stack.is_empty()
+        {
+            std::mem::swap(
+                &mut self.incr_state.gray_stack,
+                &mut self.incr_state.more_gray_stack,
+            );
+            while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+                self.mark_object(obj_addr);
+                self.incr_state.objects_marked += 1;
+            }
+        }
+
+        if self.incr_state.gray_stack.is_empty() && self.incr_state.more_gray_stack.is_empty() {
+            self.finish_incremental_marking();
+            return true;
         }
         false // more work to do
     }
@@ -3226,6 +3953,41 @@ impl MiniMarkGC {
             type_info.size
         };
         GcHeader::SIZE + payload_size
+    }
+
+    /// `base.py:135-141 get_size` / `inspector.py:76-77
+    /// get_rpy_memory_usage`.  The inspector reports the translated object
+    /// size, not the collector header.  Fixed-size rows are already rounded by
+    /// `gctypelayout.encode_type_shape`; variable-size rows are rounded after
+    /// reading the live length.
+    fn rpy_memory_usage(&self, obj: GcRef) -> Option<usize> {
+        let type_id = self.get_actual_typeid(obj)?;
+        if type_id as usize >= self.types.len() {
+            return None;
+        }
+        let type_info = self.types.get(type_id);
+        if type_info.item_size == 0 {
+            return Some(type_info.size);
+        }
+        let length = unsafe { *((obj.0 + type_info.length_offset) as *const usize) };
+        let size = type_info
+            .item_size
+            .checked_mul(length)?
+            .checked_add(type_info.size)?;
+        let align_mask = GcHeader::ALIGN - 1;
+        size.checked_add(align_mask).map(|size| size & !align_mask)
+    }
+
+    /// `inspector.py:79-81 get_rpy_type_index`.  Pyre's compact type table
+    /// stores one paired TYPE_INFO/CLASSTYPE row per type, so its zero-based
+    /// row number differs from RPython's group-member index only by the dummy
+    /// member that `TypeLayoutBuilder.make_type_info_group` installs at zero.
+    fn rpy_type_index(&self, obj: GcRef) -> Option<usize> {
+        let type_id = self.get_actual_typeid(obj)?;
+        if type_id as usize >= self.types.len() {
+            return None;
+        }
+        (type_id as usize).checked_add(1)
     }
 
     /// Total size of `addr`, or `None` when its header does not decode to a
@@ -3595,6 +4357,10 @@ impl MiniMarkGC {
         // finalizers, weakrefs, and sweep inspect VISITED.
         self.rescan_major_nonstack_roots_and_drain();
         self.mark_ephemeron_values_to_fixed_point();
+        // incminimark.py:2492: this counter belongs to one finalization-order
+        // pass.  `_bump_finalization_state_from_0_to_1` below repopulates it
+        // with every otherwise-dead object retained for a finalizer.
+        self.kept_alive_by_finalizer = 0;
         // incminimark.py:2961-2965 (and :2495-2499) — clear weak
         // pointers to dying objects before the sweep frees them. The
         // VISITED bit on every old-gen object is still meaningful at
@@ -3661,11 +4427,16 @@ impl MiniMarkGC {
         // allocate into fresh lists and are not candidates in this cycle.
         self.oldgen.sweep_prepare();
 
-        // incminimark.py:2516-2526 maintains an
-        // `old_objects_pointing_to_pinned` stack. Pyre's explicit pin contract
-        // keeps pinned objects nursery-resident and records their old-gen
-        // identity shadows directly, so it has no equivalent stack to filter.
-        // incminimark.py:2528-2529 rawrefcount integration is likewise absent.
+        // incminimark.py:2516-2526: dead old parents must leave the pin-parent
+        // stack before arena sweep invalidates their addresses. Survivors have
+        // VISITED set at this point; the oldgen sweep clears it later.
+        self.old_objects_pointing_to_pinned
+            .retain(|&obj_addr| unsafe { (*header_of(obj_addr)).has_flag(flags::VISITED) });
+        // incminimark.py:2528-2529 rawrefcount integration is absent.
+        // incminimark.py:2531-2532 — snapshot the pre-sweep accounting after
+        // the candidate sets have been frozen and before the state changes.
+        self.stat_ac_arenas_count = self.oldgen.arenas_count();
+        self.stat_rawmalloced_total_size = self.oldgen.rawmalloced_bytes();
         self.gc_state = GcState::Sweeping;
     }
 
@@ -3697,8 +4468,8 @@ impl MiniMarkGC {
         }
     }
 
-    /// incminimark.py:2560-2631: complete SWEEPING, compute the next threshold
-    /// from post-sweep accounting, then collapse FINALIZING back to SCANNING.
+    /// incminimark.py:2560-2621: complete SWEEPING, compute the next threshold
+    /// from post-sweep accounting, then enter FINALIZING.
     fn finish_incremental_cycle(&mut self) {
         debug_assert_eq!(self.gc_state, GcState::Sweeping);
         debug_assert!(!self.oldgen.rawmalloc_sweep_pending());
@@ -3719,10 +4490,12 @@ impl MiniMarkGC {
         // incminimark.py:2566-2577 — set the threshold for the next major
         // collection to `major_collection_threshold` times the surviving
         // size, but no more than `max_delta` above it, floored at
-        // `min_heap_size` by set_major_threshold_from. (pyre has no
-        // `kept_alive_by_finalizer` accounting, so `total_memory_used` is the
-        // post-sweep old-gen size directly.)
-        let total_memory_used = self.get_total_memory_used() as f64;
+        // `min_heap_size` by set_major_threshold_from. incminimark.py:2570-2573
+        // subtracts objects that survived only so their finalizers can run;
+        // clamp at zero exactly as upstream does after the subtraction.
+        let total_memory_used = self
+            .get_total_memory_used()
+            .saturating_sub(self.kept_alive_by_finalizer) as f64;
         // incminimark.py:2574-2577 — capped next-major threshold. `reserving_size`
         // is the byte size of the allocation that triggered this collection,
         // carried on the collector across `do_collect_nursery` (see
@@ -3738,10 +4511,18 @@ impl MiniMarkGC {
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
 
-        // incminimark.py:2617-2631: pyre has explicit death deques but no
-        // collector-run execute_finalizers phase. Make recursive collections
-        // see SCANNING first, then fire the queue-notification triggers below.
-        self.gc_state = GcState::Scanning;
+        // incminimark.py:2592-2600 — report post-sweep accounting after the
+        // next threshold is computed, but before the max-heap check and the
+        // transition into FINALIZING.
+        self.hooks.fire_gc_collect(
+            self.major_collections,
+            self.stat_ac_arenas_count,
+            self.oldgen.arenas_count(),
+            self.oldgen.arenas_bytes(),
+            self.stat_rawmalloced_total_size,
+            self.oldgen.rawmalloced_bytes(),
+            self.pinned_objects_in_nursery,
+        );
 
         // incminimark.py:2601-2615 — max heap size (PYPY_GC_MAX). If the capped
         // threshold was bounded by `max_heap_size` and the heap has already
@@ -3758,15 +4539,16 @@ impl MiniMarkGC {
             }
             self.max_heap_size_already_raised = true;
             self.oom_pending = true;
-            // incminimark.py:2614-2615: STATE_SCANNING (set above) then an
+            // incminimark.py:2614-2615: STATE_SCANNING then an
             // immediate `raise MemoryError` exits `major_collection_step`
             // before the finalizing phase. Return before the queue-notification
             // triggers so none fire ahead of the `MemoryError` the pending NULL
             // will raise.
+            self.gc_state = GcState::Scanning;
             return;
         }
 
-        self.execute_finalizer_triggers();
+        self.gc_state = GcState::Finalizing;
     }
 
     /// incminimark.py:3105-3126 `invalidate_old_weakrefs(self)`.
@@ -3903,6 +4685,22 @@ impl MiniMarkGC {
                 match self.finalization_state(addr) {
                     0 => {
                         unsafe { (*header_of(addr)).set_flag(flags::FINALIZATION_ORDERING) };
+                        // incminimark.py:3011-3020
+                        //
+                        // Upstream reaches this seam only after a minor has
+                        // emptied the nursery, so every `addr` contributes to
+                        // `get_total_memory_used()`. Pyre's non-moving
+                        // interpreter major deliberately skips that minor and
+                        // may trace a young child here. The threshold metric
+                        // likewise excludes nursery bytes, so subtract only
+                        // the old-gen subset of the otherwise-dead graph.
+                        if self.oldgen.contains(addr) {
+                            self.kept_alive_by_finalizer = self
+                                .kept_alive_by_finalizer
+                                .wrapping_add(OldGen::allocation_size(
+                                    self.object_total_size(addr),
+                                ));
+                        }
                         pending.extend(self.finalizer_children(addr));
                     }
                     2 => self.recursively_clear_finalization_ordering(addr),
@@ -4043,6 +4841,30 @@ impl MiniMarkGC {
             self.start_incremental_cycle();
         }
         self.gc_step_until_scanning_with_minors();
+    }
+
+    /// incminimark.py:810-822 `collect_step`.
+    pub fn collect_step(&mut self) -> crate::GcStepTransition {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        let old_state = self.gc_state;
+
+        // `_minor_collection`, not `minor_collection_with_major_progress`:
+        // the explicit `major_collection_step` below is the one and only
+        // state transition performed by this call.
+        let was_enabled = self.enabled;
+        self.enabled = false;
+        self.do_collect_nursery();
+        self.enabled = was_enabled;
+        self.major_collection_step();
+
+        crate::GcStepTransition {
+            old_state: old_state.encoded(),
+            new_state: self.gc_state.encoded(),
+        }
     }
 
     /// Reclaim dead old-gen objects WITHOUT moving the nursery.
@@ -4465,7 +5287,7 @@ impl MiniMarkGC {
             // sweep to reclaim.
             if self.gc_state == GcState::Marking {
                 unsafe { (*hdr).set_flag(flags::VISITED) };
-                self.incr_state.gray_stack.push(obj);
+                self.incr_state.more_gray_stack.push(obj);
             }
         }
     }
@@ -4594,33 +5416,48 @@ impl MiniMarkGC {
         }
     }
 
-    /// Pin a nursery object so it won't be moved during minor collection.
-    /// Sets the PINNED flag in the object header and records the address.
-    /// Returns true if pinning succeeded, false if the object is null or
-    /// not in the nursery.
+    /// incminimark.py:1121-1148 `pin`.
     pub fn pin(&mut self, obj: GcRef) -> bool {
+        if self.pinned_objects_in_nursery >= self.max_number_of_pinned_objects {
+            return false;
+        }
         if obj.is_null() || !self.is_nursery_object_start(obj.0) {
+            return false;
+        }
+        if self.is_pinned(obj) {
+            return false;
+        }
+        let type_id = unsafe { (*header_of(obj.0)).type_id() };
+        self.validate_type_id(type_id, obj.0, "pin");
+        let info = self.types.get(type_id);
+        // gctypelayout.py:89-92 `q_cannot_pin`: GC-pointer-bearing types,
+        // weakrefs, and `customdata` (custom trace / destructor / finalizer)
+        // cannot be pinned. A registered finalizer is represented by the
+        // per-object flag in pyre's dynamic finalizer-queue surface.
+        if info.has_gc_ptrs
+            || info.is_weakref
+            || info.custom_trace.is_some()
+            || info.destructor.is_some()
+            || unsafe { (*header_of(obj.0)).has_flag(flags::FINALIZER_REGISTERED) }
+        {
             return false;
         }
         unsafe {
             (*header_of(obj.0)).set_flag(flags::PINNED);
         }
         self.pinned_objects.insert(obj.0);
+        self.pinned_objects_in_nursery += 1;
         true
     }
 
-    /// Unpin a previously pinned object.
+    /// incminimark.py:1151-1155 `unpin`.
     pub fn unpin(&mut self, obj: GcRef) {
-        if obj.is_null() {
-            return;
-        }
-        // Clear the header flag if the object is still in the nursery.
-        if self.is_nursery_object_start(obj.0) {
-            unsafe {
-                (*header_of(obj.0)).clear_flag(flags::PINNED);
-            }
+        assert!(self.is_pinned(obj), "unpin: object is already not pinned");
+        unsafe {
+            (*header_of(obj.0)).clear_flag(flags::PINNED);
         }
         self.pinned_objects.swap_remove(&obj.0);
+        self.pinned_objects_in_nursery -= 1;
     }
 
     /// Check if an object is currently pinned.
@@ -5023,6 +5860,10 @@ impl GcAllocator for MiniMarkGC {
         self.do_collect_full();
     }
 
+    fn collect_step(&mut self) -> crate::GcStepTransition {
+        self.collect_step()
+    }
+
     fn get_objects(&mut self, generation: i8, visitor: &mut dyn FnMut(GcRef)) {
         self.do_get_objects(generation, visitor)
     }
@@ -5033,6 +5874,46 @@ impl GcAllocator for MiniMarkGC {
 
     fn is_tracked(&mut self, obj: GcRef) -> bool {
         self.object_is_tracked(obj.0)
+    }
+
+    fn get_rpy_memory_usage(&mut self, obj: GcRef) -> Option<usize> {
+        self.rpy_memory_usage(obj)
+    }
+
+    fn get_rpy_type_index(&mut self, obj: GcRef) -> Option<usize> {
+        self.rpy_type_index(obj)
+    }
+
+    fn get_rpy_roots(&mut self, visitor: &mut dyn FnMut(GcRef)) -> bool {
+        self.do_get_rpy_roots(visitor)
+    }
+
+    fn get_rpy_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) -> bool {
+        self.do_get_rpy_referents(obj, visitor)
+    }
+
+    fn dump_rpy_heap(&mut self, fd: i32) -> Result<bool, i32> {
+        self.do_dump_rpy_heap(fd)
+    }
+
+    fn get_typeids_text(&self) -> Option<Vec<u8>> {
+        Some(self.types.typeids_text())
+    }
+
+    fn get_typeids_list(&self) -> Option<Vec<usize>> {
+        Some(self.types.typeids_list())
+    }
+
+    fn add_memory_pressure(&mut self, size: isize, object: GcRef) {
+        self.do_add_memory_pressure(size, object);
+    }
+
+    fn total_memory_pressure(&mut self) -> isize {
+        self.do_count_memory_pressure()
+    }
+
+    fn is_app_level_object(&mut self, obj: GcRef) -> bool {
+        self.is_app_level_object_ref(obj)
     }
 
     fn collect_oldgen_nonmoving(&mut self) {
@@ -5169,6 +6050,24 @@ impl GcAllocator for MiniMarkGC {
         (self.get_total_memory_used(), self.nursery.used())
     }
 
+    fn gc_memory_stats(&self) -> crate::GcMemoryStats {
+        // incminimark.py:3128-3154. The nursery contribution is its reserved
+        // capacity, not its current bump-pointer fill.
+        let nursery_size = self.config.nursery_size;
+        crate::GcMemoryStats {
+            total_gc_memory: self.get_total_memory_used() + nursery_size,
+            total_allocated_memory: self.oldgen.total_allocated_bytes() + nursery_size,
+            peak_memory: self.oldgen.peak_used_bytes() + nursery_size,
+            peak_allocated_memory: self.oldgen.peak_allocated_bytes() + nursery_size,
+            total_arena_memory: self.oldgen.arenas_bytes(),
+            total_rawmalloced_memory: self.oldgen.rawmalloced_bytes(),
+            peak_arena_memory: self.oldgen.peak_arena_bytes(),
+            peak_rawmalloced_memory: self.oldgen.peak_rawmalloced_bytes(),
+            nursery_size,
+            total_gc_time_ms: (self.total_gc_time * 1000.0) as usize,
+        }
+    }
+
     fn major_threshold_reached(&self) -> bool {
         self.threshold_reached(0)
     }
@@ -5260,16 +6159,14 @@ impl GcAllocator for MiniMarkGC {
         MiniMarkGC::is_tagged_immediate(self, addr)
     }
 
-    /// `rgc.can_move` (rpython/rlib/rgc.py:229). MiniMark mapping: an
-    /// object can still move iff it is a young (nursery) object that is
-    /// not pinned. Old-generation objects, prebuilt/foreign addresses
-    /// outside the nursery, and pinned nursery objects never move
-    /// (minimark.py keeps pinned objects in place across a minor cycle).
+    /// incminimark.py:1117-1119 `can_move`: nursery membership alone. Pinning
+    /// temporarily prevents a move but deliberately does not change this
+    /// answer; callers use it to decide whether pinning is meaningful.
     fn can_move(&self, gcref: GcRef) -> bool {
         if gcref.is_null() || self.is_tagged_immediate(gcref.0) {
             return false;
         }
-        self.is_in_nursery(gcref.0) && !self.pinned_objects.contains(&gcref.0)
+        self.is_in_nursery(gcref.0)
     }
 
     /// gc.py:592 `get_translated_info_for_typeinfo` parity.
@@ -5449,6 +6346,79 @@ mod tests {
         assert!(roots.is_empty());
     }
 
+    #[test]
+    fn gc_memory_stats_follow_incminimark_selectors() {
+        let nursery_size = 4096;
+        let mut gc = test_gc(nursery_size);
+        let initial = GcAllocator::gc_memory_stats(&gc);
+        assert_eq!(initial.nursery_size, nursery_size);
+        assert_eq!(initial.total_gc_memory, nursery_size);
+        assert_eq!(initial.total_allocated_memory, nursery_size);
+        assert_eq!(initial.total_gc_time_ms, 0);
+
+        let tid = gc.register_type(TypeInfo::object(64));
+        let _small = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 64);
+        let _large = gc.alloc_in_oldgen(
+            tid,
+            gc.oldgen.small_request_threshold() + std::mem::size_of::<usize>(),
+        );
+        let after = GcAllocator::gc_memory_stats(&gc);
+        assert_eq!(
+            after.total_gc_memory,
+            gc.get_total_memory_used() + nursery_size
+        );
+        assert_eq!(after.total_arena_memory, gc.oldgen.arenas_bytes());
+        assert_eq!(
+            after.total_rawmalloced_memory,
+            gc.oldgen.rawmalloced_bytes()
+        );
+        assert!(after.peak_memory >= after.total_gc_memory);
+        assert!(after.peak_allocated_memory >= after.total_allocated_memory);
+
+        gc.do_collect_nursery();
+        assert!(GcAllocator::gc_memory_stats(&gc).total_gc_time_ms <= 60_000);
+    }
+
+    #[test]
+    fn memory_pressure_matches_framework_field_and_incminimark_threshold() {
+        let word = std::mem::size_of::<isize>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(word).with_memory_pressure_offset(0));
+        assert_ne!(
+            crate::trace::encode_type_shape(gc.types.get(tid), tid)
+                & TypeInfoLayout::T_HAS_MEMORY_PRESSURE,
+            0
+        );
+
+        let mut object = gc.alloc_with_type(tid, word);
+        unsafe { gc.roots.add(&mut object) };
+        let threshold = gc.next_major_collection_threshold;
+        gc.do_add_memory_pressure(123, object);
+        assert_eq!(unsafe { *(object.0 as *const isize) }, 123);
+        assert_eq!(gc.do_count_memory_pressure(), 123);
+        assert_eq!(
+            gc.next_major_collection_threshold,
+            threshold - 123.0 - (2 * std::mem::size_of::<usize>()) as f64
+        );
+
+        // The object-bearing transform uses bare_setfield, not +=, and a
+        // negative estimate releases the object's previously owned pressure.
+        gc.do_add_memory_pressure(-7, object);
+        assert_eq!(gc.do_count_memory_pressure(), -7);
+
+        // Upstream forces the next nursery slow path once pressure drives the
+        // threshold below zero.
+        gc.next_major_collection_threshold = 0.0;
+        let free = gc.nursery.free_ptr();
+        gc.do_add_memory_pressure(1, GcRef::NULL);
+        assert_eq!(gc.nursery.top_ptr(), free.cast_const());
+        assert_eq!(
+            gc.published_nursery_top.load(Ordering::Acquire),
+            free as usize
+        );
+        gc.roots.clear();
+    }
+
     /// A born-old allocation that crosses the next-major threshold asks for a
     /// collection the way `external_malloc` (incminimark.py:987-994) does — and
     /// asks the consumer first, every time.
@@ -5549,6 +6519,112 @@ mod tests {
         gc.roots.clear();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dump_rpy_heap_uses_native_words_root_marker_and_type_indexes() {
+        use std::os::fd::AsRawFd;
+
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let holder_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(ptr_size, vec![0]));
+        let leaf_tid = gc.register_type(TypeInfo::object(ptr_size));
+        let leaf = gc.alloc_with_type(leaf_tid, ptr_size);
+        let mut holder = gc.alloc_with_type(holder_tid, ptr_size);
+        unsafe {
+            *(holder.0 as *mut GcRef) = leaf;
+            gc.roots.add(&mut holder);
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "majit-gc-heap-dump-{}-{:p}",
+            std::process::id(),
+            &gc
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(gc.do_dump_rpy_heap(file.as_raw_fd()), Ok(true));
+        drop(file);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(bytes.len() % std::mem::size_of::<isize>(), 0);
+        let words: Vec<isize> = bytes
+            .chunks_exact(std::mem::size_of::<isize>())
+            .map(|chunk| isize::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect();
+        let marker = words.windows(4).position(|w| w == [0, 0, 0, -1]).unwrap();
+
+        let holder_pos = words
+            .iter()
+            .position(|&word| word == holder.0 as isize)
+            .unwrap();
+        assert!(holder_pos < marker);
+        assert_eq!(words[holder_pos + 1], holder_tid as isize + 1);
+        assert_eq!(words[holder_pos + 2], ptr_size as isize);
+        assert_eq!(words[holder_pos + 3], leaf.0 as isize);
+        let leaf_pos = marker
+            + 4
+            + words[marker + 4..]
+                .iter()
+                .position(|&word| word == leaf.0 as isize)
+                .unwrap();
+        assert!(leaf_pos > marker);
+        assert_eq!(words[leaf_pos + 1], leaf_tid as isize + 1);
+        assert_eq!(words[leaf_pos + 3], -1);
+
+        assert_eq!(gc.do_dump_rpy_heap(-1), Err(libc::EBADF));
+        for object in [holder, leaf] {
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+        }
+        assert!(gc.types.typeids_text().starts_with(b"member0"));
+        assert_eq!(gc.types.typeids_list(), vec![0, 0, 1]);
+        gc.roots.clear();
+    }
+
+    /// `referents.py:66-70` terminates a branch on `try_cast_gcref_to_w_root`,
+    /// so the two rejections that helper opens with — the dummy flag and the
+    /// missing typedef — look *through* a node here rather than reporting it.
+    #[test]
+    fn get_referents_looks_through_a_hidden_or_dummy_node() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(ptr_size, vec![0]));
+        let mut hidden_info = TypeInfo::object_with_gc_ptrs(ptr_size, vec![0]);
+        hidden_info.hide_from_app_level_inspector = true;
+        let hidden_tid = gc.register_type(hidden_info);
+
+        // holder -> hidden -> leaf, and holder -> dummy -> tail.
+        let leaf = gc.alloc_with_type(object_tid, ptr_size);
+        let tail = gc.alloc_with_type(object_tid, ptr_size);
+        let hidden = gc.alloc_with_type(hidden_tid, ptr_size);
+        let dummy = gc.alloc_with_type(object_tid, ptr_size);
+        let mut holder = gc.alloc_with_type(object_tid, ptr_size);
+        unsafe {
+            (*header_of(dummy.0)).set_flag(flags::DUMMY);
+            *(hidden.0 as *mut GcRef) = leaf;
+            *(dummy.0 as *mut GcRef) = tail;
+            *(holder.0 as *mut GcRef) = hidden;
+            gc.roots.add(&mut holder);
+        }
+
+        let mut referents = Vec::new();
+        gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents, vec![leaf]);
+
+        unsafe { *(holder.0 as *mut GcRef) = dummy };
+        let mut referents = Vec::new();
+        gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents, vec![tail]);
+
+        for object in [holder, hidden, dummy, leaf, tail] {
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+        }
+        gc.roots.clear();
+    }
+
     #[test]
     fn get_referents_looks_through_rpython_structs_and_stops_at_objects() {
         let ptr_size = std::mem::size_of::<GcRef>();
@@ -5592,6 +6668,39 @@ mod tests {
     }
 
     #[test]
+    fn rpy_inspector_keeps_raw_roots_and_referents_unexpanded() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let raw_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(ptr_size, vec![0]));
+        let mut hidden_info = TypeInfo::object(ptr_size);
+        hidden_info.hide_from_app_level_inspector = true;
+        let hidden_tid = gc.register_type(hidden_info);
+
+        let leaf = gc.alloc_with_type(object_tid, ptr_size);
+        let raw = gc.alloc_with_type(raw_tid, ptr_size);
+        let hidden = gc.alloc_with_type(hidden_tid, ptr_size);
+        let mut holder = gc.alloc_with_type(object_tid, ptr_size);
+        unsafe {
+            *(raw.0 as *mut GcRef) = leaf;
+            *(holder.0 as *mut GcRef) = raw;
+            gc.roots.add(&mut holder);
+        }
+
+        let mut roots = Vec::new();
+        assert!(gc.do_get_rpy_roots(&mut |root| roots.push(root)));
+        assert!(roots.contains(&holder));
+
+        let mut referents = Vec::new();
+        assert!(gc.do_get_rpy_referents(holder, &mut |child| { referents.push(child) }));
+        assert_eq!(referents, vec![raw]);
+        assert!(gc.is_app_level_object_ref(holder));
+        assert!(!gc.is_app_level_object_ref(raw));
+        assert!(!gc.is_app_level_object_ref(hidden));
+        gc.roots.clear();
+    }
+
+    #[test]
     fn is_tracked_follows_the_type_not_the_heap_the_instance_landed_in() {
         let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
@@ -5622,6 +6731,30 @@ mod tests {
         let mut off_heap = 0usize;
         assert!(!gc.object_is_tracked(&mut off_heap as *mut usize as usize));
         gc.roots.clear();
+    }
+
+    #[test]
+    fn rpy_introspection_reports_payload_size_and_positive_type_group_index() {
+        let mut gc = test_gc(4096);
+        let fixed_tid = gc.register_type(TypeInfo::simple(24));
+        let var_tid = gc.register_type(TypeInfo::varsize(8, 3, 0, false, Vec::new()));
+
+        let fixed = gc.alloc_with_type(fixed_tid, 24);
+        let var = gc.alloc_varsize_typed(var_tid, 8, 3, 2);
+        unsafe { *(var.0 as *mut usize) = 2 };
+
+        // inspector.py:get_rpy_memory_usage calls get_size_incl_hash, whose
+        // incminimark implementation excludes the GC header. Variable objects
+        // are rounded for the following arena allocation (8 + 2 * 3 -> 16).
+        assert_eq!(gc.rpy_memory_usage(fixed), Some(24));
+        assert_eq!(gc.rpy_memory_usage(var), Some(16));
+        assert_eq!(gc.object_total_size(fixed.0), GcHeader::SIZE + 24);
+
+        // TypeLayoutBuilder reserves group member zero as a dummy.
+        assert_eq!(gc.rpy_type_index(fixed), Some(1));
+        assert_eq!(gc.rpy_type_index(var), Some(2));
+        assert_eq!(gc.rpy_memory_usage(GcRef::NULL), None);
+        assert_eq!(gc.rpy_type_index(GcRef::NULL), None);
     }
 
     #[test]
@@ -5690,7 +6823,8 @@ mod tests {
         // object. The old fallback returned an old-gen object here, violating
         // the fresh nursery allocation contract used by the GC rewrite.
         let mut gc = test_gc(1024);
-        let (result_tid, pinned) = arrange_pinned_tail(&mut gc);
+        let (result_tid, mut pinned) = arrange_pinned_tail(&mut gc);
+        unsafe { gc.roots.add(&mut pinned) };
         let result = gc.alloc_with_type(result_tid, 400);
         assert!(gc.is_in_nursery(result.0));
         assert!(result.0 < pinned.0);
@@ -5699,11 +6833,13 @@ mod tests {
             pinned.0 - GcHeader::SIZE,
             "compiled allocators must stop at the same pinned barrier",
         );
+        gc.roots.clear();
 
         // The rooted slow path has the same collect-and-reserve contract and
         // must continue reporting that initialization needs no write barrier.
         let mut gc = test_gc(1024);
-        let (result_tid, pinned) = arrange_pinned_tail(&mut gc);
+        let (result_tid, mut pinned) = arrange_pinned_tail(&mut gc);
+        unsafe { gc.roots.add(&mut pinned) };
         let mut root = GcRef::NULL;
         let mut needs_write_barrier = true;
         let result = unsafe {
@@ -5712,6 +6848,7 @@ mod tests {
         assert!(gc.is_in_nursery(result.0));
         assert!(result.0 < pinned.0);
         assert!(!needs_write_barrier);
+        gc.roots.clear();
     }
 
     /// incminimark.py:2601-2615 `PYPY_GC_MAX` out-of-memory policy: a bounded
@@ -5761,6 +6898,64 @@ mod tests {
         gc.finish_incremental_cycle();
         assert!(!gc.max_heap_size_already_raised);
         assert!(!gc.oom_pending);
+        assert_eq!(gc.gc_state, GcState::Finalizing);
+    }
+
+    /// incminimark.py:2617-2631 keeps finalizer execution in its own major
+    /// step. In particular, a handler cannot run in the SWEEPING ->
+    /// FINALIZING transition; the following step first publishes SCANNING and
+    /// only then invokes it, so a recursive collection can start safely.
+    #[test]
+    fn finalizer_triggers_run_in_a_distinct_finalizing_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static TRIGGERS: AtomicUsize = AtomicUsize::new(0);
+        fn trigger() {
+            TRIGGERS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        TRIGGERS.store(0, Ordering::Relaxed);
+        let mut gc = test_gc(4096);
+        gc.finalizer_handlers.push(FinalizerHandler {
+            deque: VecDeque::from([0xfeed]),
+            trigger,
+        });
+        gc.gc_state = GcState::Sweeping;
+
+        gc.finish_incremental_cycle();
+        assert_eq!(gc.gc_state, GcState::Finalizing);
+        assert_eq!(TRIGGERS.load(Ordering::Relaxed), 0);
+
+        gc.major_collection_step();
+        assert_eq!(gc.gc_state, GcState::Scanning);
+        assert_eq!(TRIGGERS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn explicit_collect_step_runs_one_minor_and_one_major_transition() {
+        use crate::GcStepTransition as Step;
+
+        let mut gc = test_gc(4096);
+        gc.disable();
+        let mut transitions = Vec::new();
+        loop {
+            let transition = gc.collect_step();
+            transitions.push((transition.old_state, transition.new_state));
+            if transition.is_done() {
+                break;
+            }
+        }
+        assert_eq!(
+            transitions,
+            vec![
+                (Step::SCANNING, Step::MARKING),
+                (Step::MARKING, Step::SWEEPING),
+                (Step::SWEEPING, Step::FINALIZING),
+                (Step::FINALIZING, Step::SCANNING),
+            ]
+        );
+        assert!(!gc.isenabled());
+        assert_eq!(gc.minor_collections, 4);
     }
 
     #[test]
@@ -6960,7 +8155,8 @@ mod tests {
 
         assert_eq!(root, old);
         assert!(unsafe { (*hdr).has_flag(flags::VISITED) });
-        assert_eq!(gc.incr_state.gray_stack.pop(), Some(old.0));
+        assert!(gc.incr_state.gray_stack.is_empty());
+        assert_eq!(gc.incr_state.more_gray_stack.pop(), Some(old.0));
     }
 
     // ── Card marking tests ──
@@ -7501,8 +8697,11 @@ mod tests {
         assert!(!gc.is_in_nursery(head.0));
 
         // Start incremental cycle with a tiny byte budget so each step still
-        // processes exactly one object.
+        // processes exactly one object.  Clear the previous minor's survivor
+        // sample: incminimark normally raises the step budget to twice that
+        // sample, which is covered independently below.
         gc.set_mark_budget(2);
+        gc.nursery_surviving_size = 0;
         gc.start_incremental_cycle();
         assert!(gc.is_incremental_marking());
 
@@ -7517,6 +8716,53 @@ mod tests {
         assert_eq!(gc.incremental_objects_marked(), 2);
 
         gc.roots.clear();
+    }
+
+    #[test]
+    fn incremental_marking_uses_twice_the_latest_minor_survivors_as_its_budget() {
+        // incminimark.py:2453-2457: even an explicitly tiny increment must
+        // keep up with a high-survival minor collection.
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        let mut head = GcRef::NULL;
+        for _ in 0..4 {
+            let obj = gc.alloc_with_type(tid, ptr_size);
+            unsafe { *(obj.0 as *mut GcRef) = head };
+            head = obj;
+        }
+        unsafe { gc.roots.add(&mut head) };
+        gc.do_collect_nursery();
+        assert!(gc.nursery_surviving_size > 0);
+
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+        gc.incremental_mark_step();
+
+        assert_eq!(gc.incremental_objects_marked(), 4);
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn incremental_marking_drains_the_separate_mutation_worklist() {
+        // incminimark.py:2458-2470: an empty primary list means the ordinary
+        // walk consumed less than half the step, so more_objects_to_trace is
+        // swapped in and drained completely.
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let modified = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16);
+        unsafe { (*header_of(modified.0)).set_flag(flags::VISITED) };
+
+        gc.gc_state = GcState::Marking;
+        gc.incr_state.gray_stack.clear();
+        gc.incr_state.more_gray_stack.push(modified.0);
+        gc.nursery_surviving_size = 0;
+
+        assert!(gc.incremental_mark_step());
+        assert_eq!(gc.incremental_objects_marked(), 1);
+        assert!(gc.incr_state.gray_stack.is_empty());
+        assert!(gc.incr_state.more_gray_stack.is_empty());
     }
 
     #[test]
@@ -8452,6 +9698,60 @@ mod tests {
         assert!(gc.can_optimize_cond_call());
     }
 
+    /// env.py:149-210 `get_L2cache_linux2_cpuinfo`: use the smallest valid
+    /// per-CPU K/k value, ignore another unit and malformed lines, and retain
+    /// the upstream `_findend('\n' + label)` first-line behavior.
+    #[test]
+    fn linux_cpuinfo_cache_probe_matches_upstream_parser() {
+        let data = b"cache size : 1 KB\n\
+processor : 0\n\
+cache size : 32768 KB\n\
+cache size : 16 MB\n\
+cache size = 8 KB\n\
+processor : 1\n\
+cache size\t: 8192 kB\n";
+        assert_eq!(l2cache_from_cpuinfo(data, b"cache size"), 8 * 1024 * 1024);
+        assert_eq!(l2cache_from_cpuinfo(data, b"L2 cache"), -1);
+    }
+
+    /// env.py:287-356 `get_L2cache_linux2_system_cpu_index`: L2 and L3 are
+    /// minimized independently across CPUs and then added.
+    #[test]
+    fn linux_sysfs_cache_probe_sums_smallest_l2_and_l3() {
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "majit-gc-cache-fixture-{}-{serial}",
+            std::process::id()
+        ));
+
+        let entries = [
+            (0, 0, "1\n", "64K\n"),
+            (0, 1, "2\n", "2048K\n"),
+            (0, 2, "3\n", "8192K\n"),
+            (1, 0, "2\n", "1024K\n"),
+            (1, 1, "3\n", "4096K\n"),
+        ];
+        for (cpu, index, level, size) in entries {
+            let dir = root.join(format!("cpu{cpu}/cache/index{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("level"), level).unwrap();
+            std::fs::write(dir.join("size"), size).unwrap();
+        }
+
+        let result = get_l2cache_linux_system_cpu_index(root.to_str().unwrap());
+        assert_eq!(result, 5 * 1024 * 1024);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn linux_sysfs_cache_size_requires_leading_decimal_kilobytes() {
+        assert_eq!(parse_sysfs_cache_size(b"2048K\n"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_sysfs_cache_size(b"512k\n"), Some(512 * 1024));
+        assert_eq!(parse_sysfs_cache_size(b"2M\n"), None);
+        assert_eq!(parse_sysfs_cache_size(b" K\n"), None);
+    }
+
     #[test]
     fn test_estimate_best_nursery_size() {
         // env.py:443-456 — half the L2 cache when it exceeds 8MB, else the
@@ -8636,10 +9936,10 @@ mod tests {
         assert!(gc.is_in_nursery(obj.0));
         assert!(gc.can_move(obj));
 
-        // A pinned nursery object will not move (rgc.py:233-235); unpin
-        // restores movability.
+        // incminimark.py:1117-1119 answers by nursery membership even while
+        // the object's PINNED flag temporarily prevents an actual move.
         assert!(gc.pin(obj));
-        assert!(!gc.can_move(obj));
+        assert!(gc.can_move(obj));
         gc.unpin(obj);
         assert!(gc.can_move(obj));
 
@@ -8700,6 +10000,10 @@ mod tests {
         assert!(gc.pin(obj));
         assert!(gc.is_pinned(obj));
 
+        // incminimark.py:1129-1134 rejects a second pin rather than keeping a
+        // reference count whose first unpin could invalidate the second pin.
+        assert!(!gc.pin(obj));
+
         // Null cannot be pinned.
         assert!(!gc.pin(GcRef(0)));
         assert!(!gc.is_pinned(GcRef(0)));
@@ -8707,6 +10011,132 @@ mod tests {
         // Unpin.
         gc.unpin(obj);
         assert!(!gc.is_pinned(obj));
+    }
+
+    #[test]
+    fn test_pin_enforces_capacity_and_cannot_pin_type_query() {
+        unsafe fn noop_destructor(_obj_addr: usize) {}
+        fn trigger() {}
+
+        let mut gc = test_gc(4096);
+        gc.max_number_of_pinned_objects = 1;
+        let plain_tid = gc.register_type(TypeInfo::simple(16));
+        let gcptr_tid = gc.register_type(TypeInfo::with_gc_ptrs(16, vec![0]));
+        let weakref_tid = gc.register_type(TypeInfo::weakref());
+        let destructor_tid = gc.register_type(TypeInfo::with_destructor(16, noop_destructor));
+
+        let first = gc.alloc_with_type(plain_tid, 16);
+        let second = gc.alloc_with_type(plain_tid, 16);
+        assert!(gc.pin(first));
+        assert_eq!(gc.pinned_objects_in_nursery, 1);
+        // incminimark.py:1122-1123 checks the configured count first.
+        assert!(!gc.pin(second));
+        gc.unpin(first);
+        assert_eq!(gc.pinned_objects_in_nursery, 0);
+
+        // gctypelayout.py:89-92 `q_cannot_pin`.
+        let with_gcptr = gc.alloc_with_type(gcptr_tid, 16);
+        let weakref = gc.alloc_with_type(weakref_tid, crate::weakref::SIZEOF_WEAKREF);
+        let with_destructor = gc.alloc_with_type(destructor_tid, 16);
+        assert!(!gc.pin(with_gcptr));
+        assert!(!gc.pin(weakref));
+        assert!(!gc.pin(with_destructor));
+
+        // Pyre's finalizer queue is registered dynamically rather than
+        // encoded as RPython `customdata`, so the header bit supplies the same
+        // rejection once registration has occurred.
+        let finalizable = gc.alloc_with_type(plain_tid, 16);
+        GcAllocator::register_finalizer(&mut gc, 0, finalizable, trigger);
+        assert!(!gc.pin(finalizable));
+    }
+
+    #[test]
+    fn test_unreachable_pin_is_not_an_implicit_root() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        assert!(gc.pin(obj));
+
+        // incminimark.py:1777-1785: the survivor stack is populated only by
+        // traced references. With no such reference, the pinned object dies.
+        gc.do_collect_nursery();
+        assert!(!gc.is_pinned(obj));
+        assert_eq!(gc.pinned_objects_in_nursery, 0);
+    }
+
+    #[test]
+    fn test_old_parent_is_retraced_while_it_points_to_a_pin() {
+        let mut gc = test_gc(4096);
+        let child_tid = gc.register_type(TypeInfo::simple(16));
+        let parent_tid = gc.register_type(TypeInfo::with_gc_ptrs(16, vec![0]));
+        let child = gc.alloc_with_type(child_tid, 16);
+        let mut parent = gc.alloc_with_type(parent_tid, 16);
+        unsafe { *(parent.0 as *mut GcRef) = child };
+        assert!(gc.pin(child));
+        unsafe { gc.roots.add(&mut parent) };
+
+        // The parent promotes, but its pinned child stays at the same nursery
+        // address and records the old parent for the following minor.
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(parent.0));
+        assert!(gc.is_pinned(child));
+        assert_eq!(unsafe { *(parent.0 as *const GcRef) }, child);
+        assert_eq!(gc.old_objects_pointing_to_pinned, vec![parent.0]);
+
+        // No remembered-set entry is needed: the dedicated PyPy parent list
+        // revisits the edge and keeps the child alive for another cycle.
+        gc.do_collect_nursery();
+        assert!(gc.is_pinned(child));
+        assert_eq!(gc.old_objects_pointing_to_pinned, vec![parent.0]);
+
+        // Once that edge disappears, the next minor does not rediscover the
+        // child and pinning alone no longer preserves it.
+        unsafe { *(parent.0 as *mut GcRef) = GcRef::NULL };
+        gc.do_collect_nursery();
+        assert!(!gc.is_pinned(child));
+        assert_eq!(gc.pinned_objects_in_nursery, 0);
+        assert!(gc.old_objects_pointing_to_pinned.is_empty());
+        gc.roots.clear();
+    }
+
+    /// The sibling above only ever discovers the parent *after* the list is
+    /// swapped out. Phase 1c traces an old-generation jitframe directly, with
+    /// itself as the holder, and that runs earlier — so a parent found there
+    /// would be re-flagged before the drained copy is visited, never make it
+    /// into the fresh list, and keep `PINNED` set for good.
+    #[test]
+    fn test_old_parent_found_before_the_swap_stays_in_the_list() {
+        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        crate::shadow_stack::clear();
+        let mut gc = test_gc(4096);
+        let child_tid = gc.register_type(TypeInfo::simple(16));
+        let parent_tid = gc.register_type(TypeInfo::with_gc_ptrs(16, vec![0]));
+        let child = gc.alloc_with_type(child_tid, 16);
+        let mut parent = gc.alloc_with_type(parent_tid, 16);
+        unsafe { *(parent.0 as *mut GcRef) = child };
+        assert!(gc.pin(child));
+        unsafe { gc.roots.add(&mut parent) };
+
+        gc.do_collect_nursery();
+        assert!(gc.oldgen.contains(parent.0));
+        assert!(gc.is_pinned(child));
+        assert_eq!(gc.old_objects_pointing_to_pinned, vec![parent.0]);
+
+        // Publish the promoted parent as a jitframe root so the minor below
+        // reaches it through the pre-swap old-generation arm as well.
+        crate::shadow_stack::push_jf(parent);
+        gc.do_collect_nursery();
+        assert_eq!(gc.old_objects_pointing_to_pinned, vec![parent.0]);
+        assert!(gc.is_pinned(child));
+
+        // The edge is still the child's only reference, so losing the parent
+        // record above would let this minor reclaim it.
+        gc.do_collect_nursery();
+        assert!(gc.is_pinned(child));
+        assert_eq!(unsafe { *(parent.0 as *const GcRef) }, child);
+
+        crate::shadow_stack::pop_jf_to(0);
+        gc.roots.clear();
     }
 
     #[test]
@@ -9239,6 +10669,93 @@ mod tests {
         // can stay true for a freed block while the current arena is retained.
         // The allocator's exact live count verifies reclamation here.
         assert_eq!(gc.oldgen.object_count(), 0);
+    }
+
+    /// incminimark.py:2492,2570-2573,3011-3020: objects marked solely to
+    /// make a finalizer runnable remain allocated after the sweep, but their
+    /// bytes are not survivor growth for the next-major threshold.  Counting
+    /// them made a workload of mostly-finalizable garbage raise its threshold
+    /// forever (the upstream issue #2590 invariant).
+    #[test]
+    fn finalizer_kept_graph_is_excluded_from_next_major_threshold() {
+        fn trigger() {}
+
+        let mut gc = test_gc(4096);
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let allocation_size = OldGen::allocation_size(GcHeader::SIZE + ptr_size);
+
+        // Remove the production threshold floor and growth cap so this test
+        // observes the survivor baseline itself.  One ordinary rooted object
+        // remains real live data; the unreachable finalizer object and its
+        // child survive only for finalization ordering.
+        gc.min_heap_size = 0.0;
+        gc.next_major_collection_initial = 1_000_000_000.0;
+        gc.next_major_collection_threshold = 1_000_000_000.0;
+        gc.max_delta = f64::MAX;
+
+        let live = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+        let child = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+        let finalizable = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+        unsafe {
+            *(live.0 as *mut GcRef) = GcRef::NULL;
+            *(child.0 as *mut GcRef) = GcRef::NULL;
+            *(finalizable.0 as *mut GcRef) = child;
+        }
+        let mut live_root = live;
+        unsafe { gc.roots.add(&mut live_root) };
+        GcAllocator::register_finalizer(&mut gc, 0, finalizable, trigger);
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert_eq!(gc.kept_alive_by_finalizer, 2 * allocation_size);
+        assert_eq!(gc.get_total_memory_used(), 3 * allocation_size);
+        let expected = allocation_size as f64 * gc.major_collection_threshold;
+        assert_eq!(gc.next_major_collection_threshold, expected);
+        assert_eq!(
+            GcAllocator::finalizer_next_dead(&mut gc, 0),
+            Some(finalizable)
+        );
+    }
+
+    /// `do_collect_oldgen_nonmoving` is a pyre adaptation: unlike upstream's
+    /// major seam it can order a finalizer graph while nursery objects still
+    /// exist. Nursery bytes are absent from `get_total_memory_used`, so they
+    /// must also be absent from the amount subtracted from that metric.
+    #[test]
+    fn finalizer_threshold_accounting_excludes_live_nursery_children() {
+        fn trigger() {}
+
+        let mut gc = test_gc(4096);
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let allocation_size = OldGen::allocation_size(GcHeader::SIZE + ptr_size);
+        gc.min_heap_size = 0.0;
+        gc.next_major_collection_initial = 1_000_000_000.0;
+        gc.next_major_collection_threshold = 1_000_000_000.0;
+        gc.max_delta = f64::MAX;
+
+        let live = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+        let finalizable = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+        let young_child = gc.alloc_with_type(tid, ptr_size);
+        assert!(gc.is_in_nursery(young_child.0));
+        unsafe {
+            *(live.0 as *mut GcRef) = GcRef::NULL;
+            *(young_child.0 as *mut GcRef) = GcRef::NULL;
+            *(finalizable.0 as *mut GcRef) = young_child;
+        }
+        gc.do_write_barrier(finalizable);
+        let mut live_root = live;
+        unsafe { gc.roots.add(&mut live_root) };
+        GcAllocator::register_finalizer(&mut gc, 0, finalizable, trigger);
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert_eq!(gc.kept_alive_by_finalizer, allocation_size);
+        assert_eq!(gc.get_total_memory_used(), 2 * allocation_size);
+        let expected = allocation_size as f64 * gc.major_collection_threshold;
+        assert_eq!(gc.next_major_collection_threshold, expected);
+        assert!(gc.is_in_nursery(young_child.0));
     }
 
     /// `rgc.py:648-649` contracts `register_finalizer` to run at most once per

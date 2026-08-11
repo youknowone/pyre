@@ -192,8 +192,8 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
 /// (born-old, collectable) and the value is a GC-managed [`UnicodeValueStorage`]
 /// box greyed by the header's `value` gc-pointer edge and reclaimed by the box
 /// tid's drop glue on sweep (tid 34 carries **no** header destructor — the box
-/// is the sole reclaimer).  Gated on `gc_interp::enabled()`; when off (native
-/// default) or the alloc hook is absent it falls back to the immortal
+/// is the sole reclaimer). Gated on `gc_interp::enabled()`; when the explicit
+/// rollback switch is off or the alloc hook is absent it falls back to the immortal
 /// [`w_str_from_wtf8_immortal`] so a managed header never pairs with a
 /// non-greyable value.  Mirrors [`w_str_subclass_from_wtf8`]'s value handling.
 pub fn w_str_new_managed(s: &str) -> PyObjectRef {

@@ -820,11 +820,12 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 | PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
-| PYRE_GC_ITEMSBLOCK, PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP_COLLECT | GC-managed items / prebuilt minor-skip / interp collect A/B | WS3 / #355 / F3 GC rework |
+| PYRE_GC_ITEMSBLOCK, PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP, PYRE_GC_INTERP_COLLECT | GC-managed items / prebuilt minor-skip / interpreter allocation + collect rollback | WS3 / #355 / F3 GC rework |
 | PYRE_CL_NO_CLOSING_JUMP | cranelift attached-loop closing jump | #245 cranelift perf (explicit rollback hatch) |
 
-`PYRE_GC_INTERP` is default-ON on wasm32 only (`unwrap_or(cfg!(wasm32))`),
-default-OFF on native — not a clean removal candidate.
+`PYRE_GC_INTERP` is default-ON on every target. Its OFF path still selects the
+unmanaged `malloc_typed` stepping-stone allocation and remains a rollback hatch
+until translated shadow-stack roots make the ordinary moving-nursery path safe.
 
 ## §5 — Other live gates (not removal targets by the "already-ON" criterion)
 
@@ -1003,7 +1004,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 | retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 11 + 1 |
 | not gates (identifiers) | 12 |
 | dead (no read site) | 10 |
-| live default-ON, kept until epic closes | 9 (+ `PYRE_GC_INTERP`, wasm32-only) |
+| live default-ON, kept until epic closes | 9 |
 | diagnostics (OFF) | ~34 |
 | default-OFF experiments (all keep — adoption targets) | 3 |
 | config / value / master | ~17 |

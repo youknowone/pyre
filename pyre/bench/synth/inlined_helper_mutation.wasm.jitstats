@@ -12,3 +12,4 @@ guard_failures=3
 internal_compile_panics=0
 loops_aborted=0
 loops_compiled=4
+retraces_compiled=0

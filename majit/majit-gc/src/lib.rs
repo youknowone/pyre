@@ -16,6 +16,7 @@ pub mod collector;
 pub mod gc_sync;
 pub mod gcreftracer;
 pub mod header;
+pub mod hook;
 pub mod hook_cell;
 pub mod minimarkpage;
 pub mod nursery;
@@ -302,6 +303,45 @@ impl WriteBarrierDescr {
 /// GC allocator interface.
 ///
 /// Provides allocation and collection primitives.
+/// One `incminimark.py:810-822 collect_step` state transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GcStepTransition {
+    pub old_state: u8,
+    pub new_state: u8,
+}
+
+impl GcStepTransition {
+    pub const SCANNING: u8 = 0;
+    pub const MARKING: u8 = 1;
+    pub const SWEEPING: u8 = 2;
+    pub const FINALIZING: u8 = 3;
+
+    /// `rgc.py:52-60 is_done__states`: a major collection is done when the
+    /// step ended in the starting state *and* did not begin there. A step that
+    /// found no work reports `(SCANNING, SCANNING)`, which completes nothing.
+    pub const fn is_done(self) -> bool {
+        self.old_state != Self::SCANNING && self.new_state == Self::SCANNING
+    }
+}
+
+/// `incminimark.py:3128-3154 get_stats` values owned by the collector.
+/// Every byte count includes the nursery where upstream's corresponding
+/// `rgc.get_stats` selector does.  JIT assembler accounting is deliberately
+/// outside this struct, as it is upstream (`jit_hooks.stats_asmmemmgr_*`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GcMemoryStats {
+    pub total_gc_memory: usize,
+    pub total_allocated_memory: usize,
+    pub peak_memory: usize,
+    pub peak_allocated_memory: usize,
+    pub total_arena_memory: usize,
+    pub total_rawmalloced_memory: usize,
+    pub peak_arena_memory: usize,
+    pub peak_rawmalloced_memory: usize,
+    pub nursery_size: usize,
+    pub total_gc_time_ms: usize,
+}
+
 pub trait GcAllocator: Send {
     fn debug_validate_oldgen_freeblocks(&self, _site: &str) {}
 
@@ -579,6 +619,24 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
+    /// `incminimark.py:810-822 collect_step`: perform one minor collection
+    /// and exactly one major-collection state transition, independently of
+    /// the automatic-collection enabled flag.
+    ///
+    /// The default is `rgc.py:20-31`'s non-incremental answer: a collector
+    /// with no state machine does the whole collection at once and reports
+    /// `_encode_states(1, 0)`, a transition [`GcStepTransition::is_done`]
+    /// accepts. Reporting the starting state on both sides would instead say
+    /// the collection is still in progress, so a caller stepping until done
+    /// would run a full collection on every iteration and never stop.
+    fn collect_step(&mut self) -> GcStepTransition {
+        self.collect_full();
+        GcStepTransition {
+            old_state: GcStepTransition::MARKING,
+            new_state: GcStepTransition::SCANNING,
+        }
+    }
+
     /// `rpython/rlib/rgc.py:1224 do_get_objects`: walk every object reachable
     /// from the GC roots and visit the `rclass.OBJECT` instances selected by
     /// the generation argument. The visitor runs before the collector releases
@@ -597,6 +655,69 @@ pub trait GcAllocator: Send {
     /// Whether the collector traverses references out of `obj` — what
     /// `gc.is_tracked` reports. Collectors without an inspector track nothing.
     fn is_tracked(&mut self, _obj: GcRef) -> bool {
+        false
+    }
+
+    /// `inspector.py:get_rpy_memory_usage`: size of the object's translated
+    /// payload, excluding the GC header and anything reachable from it.
+    /// `None` is the untranslated equivalent of inspector.py returning `-1`
+    /// for a collector that does not implement the operation.
+    fn get_rpy_memory_usage(&mut self, _obj: GcRef) -> Option<usize> {
+        None
+    }
+
+    /// `inspector.py:get_rpy_type_index`: positive member index in the
+    /// translated type-info group.  Index zero is deliberately unused by
+    /// RPython's `TypeLayoutBuilder.make_type_info_group`.
+    fn get_rpy_type_index(&mut self, _obj: GcRef) -> Option<usize> {
+        None
+    }
+
+    /// `inspector.py:get_rpy_roots`: visit the collector's raw roots without
+    /// expanding interpreter-internal objects.  `false` means the collector
+    /// does not implement the inspector operation.
+    fn get_rpy_roots(&mut self, _visitor: &mut dyn FnMut(GcRef)) -> bool {
+        false
+    }
+
+    /// `inspector.py:get_rpy_referents`: visit the raw pointers traced from
+    /// one object, without the app-level expansion performed by
+    /// [`GcAllocator::get_referents`].
+    fn get_rpy_referents(&mut self, _obj: GcRef, _visitor: &mut dyn FnMut(GcRef)) -> bool {
+        false
+    }
+
+    /// `inspector.py:265-272 dump_rpy_heap`. The fd receives native signed
+    /// machine words; `Ok(false)` denotes a collector without an inspector.
+    fn dump_rpy_heap(&mut self, _fd: i32) -> Result<bool, i32> {
+        Ok(false)
+    }
+
+    /// Translation-time type-info metadata returned by `get_typeids_z` and
+    /// `get_typeids_list`. `None` denotes a collector without this operation.
+    fn get_typeids_text(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn get_typeids_list(&self) -> Option<Vec<usize>> {
+        None
+    }
+
+    /// `incminimark.raw_malloc_memory_pressure(size, adr)`. When `object` is
+    /// non-null, the translated `special_memory_pressure` field on that
+    /// object is set to `size` before the collection threshold is adjusted.
+    fn add_memory_pressure(&mut self, _size: isize, _object: GcRef) {}
+
+    /// `inspector.count_memory_pressure`: sum the pressure fields on all
+    /// root-reachable objects. Collectors without translated type metadata
+    /// report zero.
+    fn total_memory_pressure(&mut self) -> isize {
+        0
+    }
+
+    /// Whether a raw inspector node is an app-level `W_Root` rather than an
+    /// interpreter-internal GC struct that must be wrapped in `GcRef`.
+    fn is_app_level_object(&mut self, _obj: GcRef) -> bool {
         false
     }
 
@@ -771,6 +892,11 @@ pub trait GcAllocator: Send {
     /// allocators with no byte accounting.
     fn heap_byte_stats(&self) -> (usize, usize) {
         (0, 0)
+    }
+
+    /// Full incminimark memory/time statistics. Stub allocators report zeros.
+    fn gc_memory_stats(&self) -> GcMemoryStats {
+        GcMemoryStats::default()
     }
 
     /// incminimark.py:1288-1290 `threshold_reached(0)`: whether the memory the
@@ -1122,6 +1248,9 @@ impl GcAllocator for GcHandle {
     fn collect_full(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_full())
     }
+    fn collect_step(&mut self) -> GcStepTransition {
+        gc_sync::gc_op(|gc| gc.collect_step())
+    }
     fn get_objects(&mut self, generation: i8, visitor: &mut dyn FnMut(GcRef)) {
         gc_sync::gc_op(|gc| gc.get_objects(generation, visitor))
     }
@@ -1137,6 +1266,40 @@ impl GcAllocator for GcHandle {
         // Same exposure as `get_referents`: a forwarded address is not a
         // managed-heap object of the type the answer is read out of.
         gc_sync::gc_op_with_root(obj, |gc, obj| gc.is_tracked(obj))
+    }
+    fn get_rpy_memory_usage(&mut self, obj: GcRef) -> Option<usize> {
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_memory_usage(obj))
+    }
+    fn get_rpy_type_index(&mut self, obj: GcRef) -> Option<usize> {
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_type_index(obj))
+    }
+    fn get_rpy_roots(&mut self, visitor: &mut dyn FnMut(GcRef)) -> bool {
+        gc_sync::gc_op(|gc| gc.get_rpy_roots(visitor))
+    }
+    fn get_rpy_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) -> bool {
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_referents(obj, visitor))
+    }
+    fn dump_rpy_heap(&mut self, fd: i32) -> Result<bool, i32> {
+        gc_sync::gc_op(|gc| gc.dump_rpy_heap(fd))
+    }
+    fn get_typeids_text(&self) -> Option<Vec<u8>> {
+        gc_sync::gc_query_reentrant(|gc| gc.get_typeids_text())
+    }
+    fn get_typeids_list(&self) -> Option<Vec<usize>> {
+        gc_sync::gc_query_reentrant(|gc| gc.get_typeids_list())
+    }
+    fn add_memory_pressure(&mut self, size: isize, object: GcRef) {
+        if object.is_null() {
+            gc_sync::gc_op(|gc| gc.add_memory_pressure(size, object));
+        } else {
+            gc_sync::gc_op_with_root(object, |gc, object| gc.add_memory_pressure(size, object));
+        }
+    }
+    fn total_memory_pressure(&mut self) -> isize {
+        gc_sync::gc_op(|gc| gc.total_memory_pressure())
+    }
+    fn is_app_level_object(&mut self, obj: GcRef) -> bool {
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.is_app_level_object(obj))
     }
     fn collect_oldgen_nonmoving(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())
@@ -1221,6 +1384,9 @@ impl GcAllocator for GcHandle {
     }
     fn heap_byte_stats(&self) -> (usize, usize) {
         gc_sync::gc_query_reentrant(|gc| gc.heap_byte_stats())
+    }
+    fn gc_memory_stats(&self) -> GcMemoryStats {
+        gc_sync::gc_query_reentrant(|gc| gc.gc_memory_stats())
     }
     fn major_threshold_reached(&self) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.major_threshold_reached())
@@ -2159,6 +2325,30 @@ pub fn collect_full() {
     }
 }
 
+/// Active-backend trampoline for `incminimark.py:810-822 collect_step`.
+pub type CollectStepFn = fn() -> GcStepTransition;
+
+global_hook!(static ACTIVE_COLLECT_STEP: CollectStepFn);
+
+pub fn set_active_collect_step(hook: Option<CollectStepFn>) {
+    ACTIVE_COLLECT_STEP.set(hook);
+}
+
+/// With no backend installed there is no state machine and nothing to step, so
+/// this reports the same completed transition the trait default does
+/// (`rgc.py:20-31`'s `_encode_states(1, 0)`). Reporting the starting state on
+/// both sides would say a collection is still in progress, and a caller
+/// stepping until [`GcStepTransition::is_done`] would never stop.
+pub fn collect_step() -> GcStepTransition {
+    ACTIVE_COLLECT_STEP.get().map_or(
+        GcStepTransition {
+            old_state: GcStepTransition::MARKING,
+            new_state: GcStepTransition::SCANNING,
+        },
+        |step| step(),
+    )
+}
+
 /// Active-backend trampoline for `rpython/rlib/rgc.py:1224
 /// do_get_objects`. The generation values are CPython 3.14's public
 /// `gc.get_objects` convention. The backend must invoke the visitor while its
@@ -2212,6 +2402,125 @@ pub fn is_tracked(obj: GcRef) -> bool {
     }
 }
 
+/// Active-backend trampolines for `inspector.py:get_rpy_memory_usage` and
+/// `get_rpy_type_index`.  The `Option` is the Rust spelling of upstream's
+/// negative result for a missing collector operation.
+pub type GetRpyIntrospectionFn = fn(GcRef) -> Option<usize>;
+
+global_hook!(static ACTIVE_GET_RPY_MEMORY_USAGE: GetRpyIntrospectionFn);
+global_hook!(static ACTIVE_GET_RPY_TYPE_INDEX: GetRpyIntrospectionFn);
+
+pub fn set_active_get_rpy_memory_usage(hook: Option<GetRpyIntrospectionFn>) {
+    ACTIVE_GET_RPY_MEMORY_USAGE.set(hook);
+}
+
+pub fn set_active_get_rpy_type_index(hook: Option<GetRpyIntrospectionFn>) {
+    ACTIVE_GET_RPY_TYPE_INDEX.set(hook);
+}
+
+pub fn get_rpy_memory_usage(obj: GcRef) -> Option<usize> {
+    ACTIVE_GET_RPY_MEMORY_USAGE.get().and_then(|f| f(obj))
+}
+
+pub fn get_rpy_type_index(obj: GcRef) -> Option<usize> {
+    ACTIVE_GET_RPY_TYPE_INDEX.get().and_then(|f| f(obj))
+}
+
+pub type GetRpyRootsFn = fn(GetObjectsVisitorFn) -> bool;
+pub type GetRpyReferentsFn = fn(GcRef, GetObjectsVisitorFn) -> bool;
+pub type IsAppLevelObjectFn = fn(GcRef) -> bool;
+
+global_hook!(static ACTIVE_GET_RPY_ROOTS: GetRpyRootsFn);
+global_hook!(static ACTIVE_GET_RPY_REFERENTS: GetRpyReferentsFn);
+global_hook!(static ACTIVE_IS_APP_LEVEL_OBJECT: IsAppLevelObjectFn);
+
+pub fn set_active_get_rpy_roots(hook: Option<GetRpyRootsFn>) {
+    ACTIVE_GET_RPY_ROOTS.set(hook);
+}
+
+pub fn set_active_get_rpy_referents(hook: Option<GetRpyReferentsFn>) {
+    ACTIVE_GET_RPY_REFERENTS.set(hook);
+}
+
+pub fn set_active_is_app_level_object(hook: Option<IsAppLevelObjectFn>) {
+    ACTIVE_IS_APP_LEVEL_OBJECT.set(hook);
+}
+
+pub fn get_rpy_roots(visitor: GetObjectsVisitorFn) -> bool {
+    ACTIVE_GET_RPY_ROOTS.get().is_some_and(|f| f(visitor))
+}
+
+pub fn get_rpy_referents(obj: GcRef, visitor: GetObjectsVisitorFn) -> bool {
+    ACTIVE_GET_RPY_REFERENTS
+        .get()
+        .is_some_and(|f| f(obj, visitor))
+}
+
+pub fn is_app_level_object(obj: GcRef) -> bool {
+    ACTIVE_IS_APP_LEVEL_OBJECT.get().is_some_and(|f| f(obj))
+}
+
+pub type DumpRpyHeapFn = fn(i32) -> Result<bool, i32>;
+pub type GetTypeidsTextFn = fn() -> Option<Vec<u8>>;
+pub type GetTypeidsListFn = fn() -> Option<Vec<usize>>;
+
+global_hook!(static ACTIVE_DUMP_RPY_HEAP: DumpRpyHeapFn);
+global_hook!(static ACTIVE_GET_TYPEIDS_TEXT: GetTypeidsTextFn);
+global_hook!(static ACTIVE_GET_TYPEIDS_LIST: GetTypeidsListFn);
+
+pub fn set_active_dump_rpy_heap(hook: Option<DumpRpyHeapFn>) {
+    ACTIVE_DUMP_RPY_HEAP.set(hook);
+}
+
+pub fn set_active_get_typeids_text(hook: Option<GetTypeidsTextFn>) {
+    ACTIVE_GET_TYPEIDS_TEXT.set(hook);
+}
+
+pub fn set_active_get_typeids_list(hook: Option<GetTypeidsListFn>) {
+    ACTIVE_GET_TYPEIDS_LIST.set(hook);
+}
+
+pub fn dump_rpy_heap(fd: i32) -> Result<bool, i32> {
+    ACTIVE_DUMP_RPY_HEAP
+        .get()
+        .map_or(Ok(false), |hook| hook(fd))
+}
+
+pub fn get_typeids_text() -> Option<Vec<u8>> {
+    ACTIVE_GET_TYPEIDS_TEXT.get().and_then(|hook| hook())
+}
+
+pub fn get_typeids_list() -> Option<Vec<usize>> {
+    ACTIVE_GET_TYPEIDS_LIST.get().and_then(|hook| hook())
+}
+
+/// Active-backend trampolines for `rgc.add_memory_pressure` and
+/// `inspector.count_memory_pressure`. The object-bearing form is retained for
+/// translated callers even though `__pypy__.add_memory_pressure` passes NULL.
+pub type AddMemoryPressureFn = fn(isize, GcRef);
+pub type TotalMemoryPressureFn = fn() -> isize;
+
+global_hook!(static ACTIVE_ADD_MEMORY_PRESSURE: AddMemoryPressureFn);
+global_hook!(static ACTIVE_TOTAL_MEMORY_PRESSURE: TotalMemoryPressureFn);
+
+pub fn set_active_add_memory_pressure(hook: Option<AddMemoryPressureFn>) {
+    ACTIVE_ADD_MEMORY_PRESSURE.set(hook);
+}
+
+pub fn set_active_total_memory_pressure(hook: Option<TotalMemoryPressureFn>) {
+    ACTIVE_TOTAL_MEMORY_PRESSURE.set(hook);
+}
+
+pub fn add_memory_pressure(size: isize, object: GcRef) {
+    if let Some(hook) = ACTIVE_ADD_MEMORY_PRESSURE.get() {
+        hook(size, object);
+    }
+}
+
+pub fn total_memory_pressure() -> isize {
+    ACTIVE_TOTAL_MEMORY_PRESSURE.get().map_or(0, |hook| hook())
+}
+
 /// Process-global callback running a non-moving old-gen-only major collection
 /// (`GcAllocator::collect_oldgen_nonmoving`). The interpreter GC safepoint
 /// reaches it to reclaim stable-allocated interp int/float without moving the
@@ -2257,6 +2566,39 @@ pub fn active_heap_stats() -> (usize, usize) {
         Some(f) => f(),
         None => (0, 0),
     }
+}
+
+/// Active-backend trampoline for `incminimark.py:get_stats`.
+pub type GcMemoryStatsFn = fn() -> GcMemoryStats;
+
+global_hook!(static ACTIVE_GC_MEMORY_STATS: GcMemoryStatsFn);
+
+pub fn set_active_gc_memory_stats(hook: Option<GcMemoryStatsFn>) {
+    ACTIVE_GC_MEMORY_STATS.set(hook);
+}
+
+pub fn active_gc_memory_stats() -> GcMemoryStats {
+    match ACTIVE_GC_MEMORY_STATS.get() {
+        Some(f) => f(),
+        None => GcMemoryStats::default(),
+    }
+}
+
+/// Active JIT CPU's `AsmMemoryManager.get_stats()` pair, exposed here so the
+/// interpreter-level `gc` module does not acquire a dependency on a concrete
+/// machine-code backend (`pypy/module/gc/referents.py:_get_stats`).
+pub type JitBackendMemoryStatsFn = fn() -> (usize, usize);
+
+global_hook!(static ACTIVE_JIT_BACKEND_MEMORY_STATS: JitBackendMemoryStatsFn);
+
+pub fn set_active_jit_backend_memory_stats(hook: Option<JitBackendMemoryStatsFn>) {
+    ACTIVE_JIT_BACKEND_MEMORY_STATS.set(hook);
+}
+
+pub fn active_jit_backend_memory_stats() -> (usize, usize) {
+    ACTIVE_JIT_BACKEND_MEMORY_STATS
+        .get()
+        .map_or((0, 0), |hook| hook())
 }
 
 /// Process-global callback reporting the active GC's `major_threshold_reached`
@@ -2539,6 +2881,15 @@ pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
 /// on the process-global GC.
 pub fn gc_set_enabled(enabled: bool) {
     gc_sync::gc_op(|gc| if enabled { gc.enable() } else { gc.disable() })
+}
+
+/// rgc.isenabled — read the flag [`gc_set_enabled`] writes.
+///
+/// `incminimark.py:831-832` is the only reader that matters: the automatic
+/// major-progress path returns early while it is clear, and an explicit
+/// `gc.collect()` passes `force_enabled` to get past it.
+pub fn gc_isenabled() -> bool {
+    gc_sync::gc_query_reentrant(|gc| gc.isenabled())
 }
 
 /// Process-global callback that performs a host-side write barrier through

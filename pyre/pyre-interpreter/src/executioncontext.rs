@@ -476,6 +476,7 @@ impl ExecutionContext {
             let action = UserDelAction::new(self.space, &mut self.actionflag);
             self.user_del_action = Box::into_raw(action);
         }
+        crate::module::gc::hook::initialize(self.space, &mut self.actionflag);
         pyre_object::gc_hook::register_maybe_finalizer_hook(maybe_register_user_finalizer);
     }
 
@@ -2054,6 +2055,35 @@ pub trait AsyncActionOps {
     fn async_action(&self) -> &AsyncAction;
     /// Composition accessor: shared `AsyncAction` state.
     fn async_action_mut(&mut self) -> &mut AsyncAction;
+
+    /// `AsyncAction.__init__`'s non-periodic registration, for a concrete
+    /// action embedded in another stable-address owner.  PyPy can register
+    /// `self` during ordinary object construction; Rust must wait until the
+    /// outer owner has reached its final address, then initialize the same
+    /// `_action_index`/`bitmask`/`space.actionflag` fields in place.
+    fn register_nonperiodic_action(
+        &mut self,
+        space: PyObjectRef,
+        actionflag: &mut (dyn ActionFlagOps + 'static),
+    ) where
+        Self: Sized + 'static,
+    {
+        // `AsyncAction.__init__` runs once per action upstream. Here the call
+        // is a separate step, so a second one would leave the list entry made
+        // by the first pointing at an action whose `bitmask` has moved on.
+        debug_assert_eq!(
+            self.async_action()._action_index,
+            -1,
+            "register_nonperiodic_action called twice for one action"
+        );
+        let action_ptr: *mut dyn AsyncActionOps = self;
+        let index = actionflag.register_nonperiodic_action(action_ptr);
+        let base = self.async_action_mut();
+        base.space = space;
+        base.actionflag = actionflag as *mut dyn ActionFlagOps;
+        base._action_index = index;
+        base.bitmask = 1usize << (index as usize);
+    }
 
     /// pypy/interpreter/executioncontext.py:602-606 `AsyncAction.fire`:
     ///

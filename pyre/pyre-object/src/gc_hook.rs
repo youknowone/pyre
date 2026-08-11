@@ -279,6 +279,28 @@ pub fn try_gc_collect() {
     }
 }
 
+/// `incminimark.py:810-822 collect_step` callback. The pair is the encoded
+/// `(old_state, new_state)` transition; keeping the hook in primitive terms
+/// avoids making pyre-object depend on majit-gc.
+pub type GcCollectStepHookFn = fn() -> (u8, u8);
+
+majit_gc::global_hook!(static GC_COLLECT_STEP_HOOK: GcCollectStepHookFn);
+
+pub fn register_gc_collect_step_hook(hook: GcCollectStepHookFn) {
+    GC_COLLECT_STEP_HOOK.set(Some(hook));
+}
+
+pub fn clear_gc_collect_step_hook() {
+    GC_COLLECT_STEP_HOOK.set(None);
+}
+
+#[majit_macros::dont_look_inside]
+pub fn try_gc_collect_step() -> (u8, u8) {
+    GC_COLLECT_STEP_HOOK
+        .get()
+        .map_or((0, 0), |collect_step| collect_step())
+}
+
 /// Signature of the host-side non-moving old-gen-only major callback.
 /// Reclaims stable-allocated interp int/float without moving the nursery, so
 /// the interpreter safepoint can drive it under an active JIT (non-empty
@@ -333,6 +355,37 @@ pub fn clear_gc_set_enabled_hook() {
 pub fn try_gc_set_enabled(enabled: bool) {
     if let Some(f) = GC_SET_ENABLED_HOOK.get() {
         f(enabled);
+    }
+}
+
+/// Read side of [`try_gc_set_enabled`].
+pub type GcIsEnabledHookFn = fn() -> bool;
+
+majit_gc::global_hook!(static GC_ISENABLED_HOOK: GcIsEnabledHookFn);
+
+/// Install the automatic major-progress state query.
+pub fn register_gc_isenabled_hook(hook: GcIsEnabledHookFn) {
+    GC_ISENABLED_HOOK.set(Some(hook));
+}
+
+/// Remove the automatic major-progress state query.
+pub fn clear_gc_isenabled_hook() {
+    GC_ISENABLED_HOOK.set(None);
+}
+
+/// Whether automatic major-collection progress is enabled, via the installed
+/// hook. `true` when none is installed: nothing has been disabled, and the
+/// callers that ask reach a collection hook that is itself a no-op there.
+///
+/// Reads the runtime-mutable `GC_ISENABLED_HOOK` fn-pointer cell, not a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`, the [`try_gc_major_threshold_reached`] twin).
+/// The `-> bool` return fits a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_isenabled() -> bool {
+    match GC_ISENABLED_HOOK.get() {
+        Some(f) => f(),
+        None => true,
     }
 }
 

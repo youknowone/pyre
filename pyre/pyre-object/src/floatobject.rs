@@ -84,11 +84,11 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
 /// managed heap so it can be reclaimed.
 ///
 /// [`w_float_new`] gates its managed allocation on
-/// [`crate::gc_interp::enabled`], which is off unless `PYRE_GC_INTERP` is
-/// set, so it falls back to an unreclaimable `malloc_typed` box. A subclass
-/// instance cannot: `register_finalizer` drops anything outside the managed
-/// heap, so such an instance would never die and its `__del__` would never
-/// run. See [`crate::intobject::w_int_subclass_new`].
+/// [`crate::gc_interp::enabled`], whose `PYRE_GC_INTERP=0` rollback mode falls
+/// back to an unreclaimable `malloc_typed` box. A subclass instance cannot:
+/// `register_finalizer` drops anything outside the managed heap, so such an
+/// instance would never die and its `__del__` would never run. See
+/// [`crate::intobject::w_int_subclass_new`].
 pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
     let obj = W_FloatObject {
         ob_header: PyObject {

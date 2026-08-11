@@ -183,10 +183,9 @@ impl TypeEntry {
 ///   bits 26..31 : T_KEY_VALUE  (T_KEY_MASK sanity check)
 /// ```
 ///
-/// majit's `TypeInfo` doesn't carry every concept RPython encodes
-/// (no memory pressure surface), so the corresponding bits stay
-/// zero — but the bits we DO have are mapped one-for-one against
-/// the RPython source for line-by-line parity:
+/// majit's `TypeInfo` carries the same structural flags the collector
+/// inspector consumes. The bits are mapped one-for-one against the
+/// RPython source for line-by-line parity:
 ///
 /// ```python
 ///   infobits = index
@@ -246,6 +245,11 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> u64 {
     // gctypelayout.py:245-257 destructor surface).
     if info.destructor.is_some() {
         infobits |= TypeInfoLayout::T_HAS_DESTRUCTOR;
+    }
+    // gctypelayout.py:254-257: the translated type's custom data points at
+    // its inherited `special_memory_pressure` field.
+    if info.memory_pressure_offset.is_some() {
+        infobits |= TypeInfoLayout::T_HAS_MEMORY_PRESSURE;
     }
     // gctypelayout.py:296 — T_KEY_VALUE sanity tag.
     infobits | TypeInfoLayout::T_KEY_VALUE
@@ -418,6 +422,11 @@ pub struct TypeInfo {
     /// payloads owning non-GC heap memory get their drop glue run. See
     /// [`DestructorFn`].
     pub destructor: Option<DestructorFn>,
+    /// `gctypelayout.get_memory_pressure_ofs(TYPE)` parity. `Some(offset)`
+    /// marks a fixed-size type carrying the inherited
+    /// `special_memory_pressure` signed field read by
+    /// `inspector.count_memory_pressure`.
+    pub memory_pressure_offset: Option<usize>,
 }
 
 impl TypeInfo {
@@ -439,6 +448,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -463,6 +473,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: Some(destructor),
+            memory_pressure_offset: None,
         }
     }
 
@@ -474,6 +485,24 @@ impl TypeInfo {
     /// `W_MemoryView` header owning its `*const BufferView` box.
     pub fn with_destructor_fn(mut self, destructor: DestructorFn) -> Self {
         self.destructor = Some(destructor);
+        self
+    }
+
+    /// Attach the translated `special_memory_pressure` field offset.
+    /// `gctypelayout.has_special_memory_pressure` rejects varsize types;
+    /// preserve that invariant at registration time.
+    pub fn with_memory_pressure_offset(mut self, offset: usize) -> Self {
+        assert_eq!(
+            self.item_size, 0,
+            "memory-pressure types must be fixed-size"
+        );
+        assert!(
+            offset
+                .checked_add(std::mem::size_of::<isize>())
+                .is_some_and(|end| end <= self.size),
+            "memory-pressure field exceeds the object payload"
+        );
+        self.memory_pressure_offset = Some(offset);
         self
     }
 
@@ -506,6 +535,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: true,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -536,6 +566,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -565,6 +596,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -592,6 +624,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -628,6 +661,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -654,6 +688,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -677,6 +712,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -704,6 +740,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -727,6 +764,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -766,6 +804,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            memory_pressure_offset: None,
         }
     }
 
@@ -1035,6 +1074,38 @@ impl TypeRegistry {
     /// address.
     pub fn type_info_table(&self) -> &[TypeEntry] {
         &self.layout_table
+    }
+
+    /// Translation-time `framework.py:735-761 write_typeid_list` metadata.
+    /// Pyre's type-info group contains one row per registered type after the
+    /// dummy member, so line `type_id + 1` is the index written to heap dumps.
+    pub fn typeids_text(&self) -> Vec<u8> {
+        let mut text = String::from("member0    ?\n");
+        for (type_id, info) in self.entries.iter().enumerate() {
+            use std::fmt::Write as _;
+            let member = type_id + 1;
+            if info.item_size == 0 {
+                let _ = writeln!(
+                    text,
+                    "member{member:<4} GcStruct pyre_type_{type_id} {{ size={}, gcptr_offsets={:?} }}",
+                    info.size, info.gc_ptr_offsets,
+                );
+            } else {
+                let _ = writeln!(
+                    text,
+                    "member{member:<4} GcArray pyre_type_{type_id} {{ base_size={}, item_size={}, gcptr_offsets={:?} }}",
+                    info.size, info.item_size, info.gc_ptr_offsets,
+                );
+            }
+        }
+        text.into_bytes()
+    }
+
+    /// `framework.py:739-747 list_data`: map each group-member index back to
+    /// the type-id representation stored in object headers. Member zero is the
+    /// dummy; pyre headers use the compact zero-based registry row directly.
+    pub fn typeids_list(&self) -> Vec<usize> {
+        std::iter::once(0).chain(0..self.entries.len()).collect()
     }
 }
 

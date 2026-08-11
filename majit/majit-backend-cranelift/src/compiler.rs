@@ -393,11 +393,23 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
     majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
+    majit_gc::set_active_collect_step(Some(collect_step_via_active_runtime));
     majit_gc::set_active_get_objects(Some(get_objects_via_active_runtime));
     majit_gc::set_active_get_referents(Some(get_referents_via_active_runtime));
     majit_gc::set_active_is_tracked(Some(is_tracked_via_active_runtime));
+    majit_gc::set_active_get_rpy_memory_usage(Some(get_rpy_memory_usage_via_active_runtime));
+    majit_gc::set_active_get_rpy_type_index(Some(get_rpy_type_index_via_active_runtime));
+    majit_gc::set_active_get_rpy_roots(Some(get_rpy_roots_via_active_runtime));
+    majit_gc::set_active_get_rpy_referents(Some(get_rpy_referents_via_active_runtime));
+    majit_gc::set_active_is_app_level_object(Some(is_app_level_object_via_active_runtime));
+    majit_gc::set_active_dump_rpy_heap(Some(dump_rpy_heap_via_active_runtime));
+    majit_gc::set_active_get_typeids_text(Some(get_typeids_text_via_active_runtime));
+    majit_gc::set_active_get_typeids_list(Some(get_typeids_list_via_active_runtime));
+    majit_gc::set_active_add_memory_pressure(Some(add_memory_pressure_via_active_runtime));
+    majit_gc::set_active_total_memory_pressure(Some(total_memory_pressure_via_active_runtime));
     majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
     majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
+    majit_gc::set_active_gc_memory_stats(Some(gc_memory_stats_via_active_runtime));
     majit_gc::set_active_major_threshold_reached(Some(major_threshold_reached_via_active_runtime));
     majit_gc::set_active_root_hooks(
         Some(gc_add_root_via_active_runtime),
@@ -1723,6 +1735,13 @@ fn collect_full_via_active_runtime() {
     with_cranelift_gc(|gc| gc.collect_full());
 }
 
+fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {
+    with_cranelift_gc(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
+        old_state: majit_gc::GcStepTransition::SCANNING,
+        new_state: majit_gc::GcStepTransition::SCANNING,
+    })
+}
+
 fn get_objects_via_active_runtime(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
     with_cranelift_gc(|gc| gc.get_objects(generation, &mut visit));
@@ -1751,6 +1770,91 @@ fn is_tracked_via_active_runtime(obj: GcRef) -> bool {
     false
 }
 
+fn get_rpy_memory_usage_via_active_runtime(obj: GcRef) -> Option<usize> {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.get_rpy_memory_usage(obj)).flatten()
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_memory_usage(obj))
+    } else {
+        None
+    }
+}
+
+fn get_rpy_type_index_via_active_runtime(obj: GcRef) -> Option<usize> {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.get_rpy_type_index(obj)).flatten()
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_type_index(obj))
+    } else {
+        None
+    }
+}
+
+fn get_rpy_roots_via_active_runtime(visitor: majit_gc::GetObjectsVisitorFn) -> bool {
+    let mut visit = visitor;
+    with_cranelift_gc(|gc| gc.get_rpy_roots(&mut visit)).unwrap_or(false)
+}
+
+fn get_rpy_referents_via_active_runtime(
+    obj: GcRef,
+    visitor: majit_gc::GetObjectsVisitorFn,
+) -> bool {
+    let mut visit = visitor;
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.get_rpy_referents(obj, &mut visit)).unwrap_or(false)
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_referents(obj, &mut visit))
+    } else {
+        false
+    }
+}
+
+fn is_app_level_object_via_active_runtime(obj: GcRef) -> bool {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.is_app_level_object(obj)).unwrap_or(false)
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.is_app_level_object(obj))
+    } else {
+        false
+    }
+}
+
+fn dump_rpy_heap_via_active_runtime(fd: i32) -> Result<bool, i32> {
+    if gc_box::present() {
+        return with_cranelift_gc(|gc| gc.dump_rpy_heap(fd)).unwrap_or(Ok(false));
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|gc| gc.dump_rpy_heap(fd));
+    }
+    Ok(false)
+}
+
+fn get_typeids_text_via_active_runtime() -> Option<Vec<u8>> {
+    with_cranelift_gc(|gc| gc.get_typeids_text()).flatten()
+}
+
+fn get_typeids_list_via_active_runtime() -> Option<Vec<usize>> {
+    with_cranelift_gc(|gc| gc.get_typeids_list()).flatten()
+}
+
+fn add_memory_pressure_via_active_runtime(size: isize, object: GcRef) {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.add_memory_pressure(size, object));
+    } else if majit_gc::gc_sync::is_initialized() {
+        if object.is_null() {
+            majit_gc::gc_sync::gc_op(|gc| gc.add_memory_pressure(size, object));
+        } else {
+            majit_gc::gc_sync::gc_op_with_root(object, |gc, object| {
+                gc.add_memory_pressure(size, object)
+            });
+        }
+    }
+}
+
+fn total_memory_pressure_via_active_runtime() -> isize {
+    with_cranelift_gc(|gc| gc.total_memory_pressure()).unwrap_or(0)
+}
+
 /// Non-moving old-gen-only major trampoline — sweeps dead old-gen objects
 /// without moving the nursery, so the interpreter safepoint can drive it under
 /// an active JIT (non-empty nursery). Unlike [`collect_full_via_active_runtime`]
@@ -1774,6 +1878,10 @@ fn finalizer_next_dead_via_active_runtime(fq_index: usize) -> Option<GcRef> {
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
 fn heap_stats_via_active_runtime() -> (usize, usize) {
     with_cranelift_gc(|gc| gc.heap_byte_stats()).unwrap_or((0, 0))
+}
+
+fn gc_memory_stats_via_active_runtime() -> majit_gc::GcMemoryStats {
+    with_cranelift_gc(|gc| gc.gc_memory_stats()).unwrap_or_default()
 }
 
 /// Report whether the GC wants a major collection, for the interpreter GC
@@ -3892,6 +4000,18 @@ pub unsafe extern "C" fn cranelift_realloc_frame(old_jf: *mut i64, new_depth: us
         // llmodel.py:141 — frame.jf_forward = new_frame.
         *((old_base + JF_FORWARD_OFS as usize) as *mut *mut i64) = new_jf;
     }
+
+    // llmodel.py:150 `llop.gc_writebarrier(lltype.Void, new_frame)` covers the
+    // header words and frame items copied above; `frame.jf_forward = new_frame`
+    // (llmodel.py:141) is an ordinary GC-struct field assignment, so the
+    // framework transform emits its barrier as well.  Both stores are raw
+    // pointer writes here, and either frame can already sit in the old
+    // generation — a minor collection that runs while the loop executes
+    // promotes the frame it finds on the shadow stack.  Without the barriers
+    // the copied ref slots and the `jf_forward` link are old→young edges that
+    // no remembered-set entry names, so the next minor reclaims their targets.
+    write_barrier_if_managed(GcRef(new_base));
+    write_barrier_if_managed(GcRef(old_base));
 
     if majit_ir::debug::have_debug_prints() {
         majit_ir::debug::log_one(
@@ -7903,6 +8023,20 @@ pub struct CraneliftBackend {
     /// counterpart for the shared-Arc pairing rationale with the
     /// metainterp `JitProfiler`.
     cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
+    /// `asmmemmgr.py:28` `AsmMemoryManager` parity — the CPU owns the
+    /// accounting `jit_hooks.stats_asmmemmgr_{allocated,used}` reads. Cranelift
+    /// has no `AsmMemoryManager` of its own: `JITModule` owns the executable
+    /// mapping and does not publish its arena size, so `record_block` is given
+    /// the finalized code size for both figures rather than a page-rounded
+    /// number nothing measured.
+    asm_memory_stats: Arc<majit_backend::AsmMemoryManagerStats>,
+    /// Lifetime tokens for the blocks recorded above. `JITModule` frees its
+    /// mapping when this backend drops, so holding the tokens for the
+    /// backend's whole life gives back `used` at exactly the point the code
+    /// stops existing. `allocated` is not given back, which is
+    /// `asmmemmgr.py:90`'s shape: an arena counts once and is never
+    /// un-counted.
+    asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
     module: JITModule,
     func_ctx: FunctionBuilderContext,
     /// Constant pool keyed by OpRef raw index. Each `Const` carries its
@@ -8157,6 +8291,8 @@ impl CraneliftBackend {
 
         CraneliftBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
+            asm_memory_stats: Arc::new(majit_backend::AsmMemoryManagerStats::default()),
+            asm_memory_blocks: Vec::new(),
             module,
             func_ctx,
             constants: majit_ir::ConstMap::new(),
@@ -14512,6 +14648,12 @@ impl CraneliftBackend {
             self.module.clear_context(&mut ctx);
             return Err(BackendError::CompilationFailed(format!("{e}\n{e:?}")));
         }
+        // `asmmemmgr.py:37` counts the block a `materialize` handed out, so
+        // read the emitted size before `clear_context` discards it.
+        let body_code_bytes = ctx
+            .compiled_code()
+            .map(|code| code.code_info().total_size as usize)
+            .unwrap_or(0);
         self.module.clear_context(&mut ctx);
 
         // Build trace_N_entry wrapper: forwards jf_ptr to body via call_indirect,
@@ -14574,9 +14716,22 @@ impl CraneliftBackend {
                 "wrapper: {e}\n{e:?}"
             )));
         }
+        let wrapper_code_bytes = wrapper_compile_ctx
+            .compiled_code()
+            .map(|code| code.code_info().total_size as usize)
+            .unwrap_or(0);
         self.module.clear_context(&mut wrapper_compile_ctx);
 
         self.module.finalize_definitions().unwrap();
+        // `JITModule` owns the executable mapping and publishes no arena size,
+        // so `allocated` and `used` are both the finalized code size. The token
+        // is kept for this backend's lifetime because that is exactly how long
+        // the mapping lives.
+        let code_bytes = body_code_bytes + wrapper_code_bytes;
+        if code_bytes != 0 {
+            let block = self.asm_memory_stats.record_block(code_bytes, code_bytes);
+            self.asm_memory_blocks.push(block);
+        }
 
         let body_ptr = self.module.get_finalized_function(func_id);
         let code_ptr = self.module.get_finalized_function(entry_id);
@@ -15725,6 +15880,10 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn cpu_tracker(&self) -> &Arc<majit_backend::CpuTotalTracker> {
         &self.cpu_tracker
+    }
+
+    fn assembler_memory_stats(&self) -> (usize, usize) {
+        self.asm_memory_stats.get_stats()
     }
 
     fn compile_loop(
@@ -17791,6 +17950,73 @@ mod tests {
         let backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
         install_call_assembler_test_layout();
         backend
+    }
+
+    /// `llmodel.py:150` `llop.gc_writebarrier(lltype.Void, new_frame)`, and the
+    /// barrier the framework transform emits for the ordinary GC-struct field
+    /// store `frame.jf_forward = new_frame` (`llmodel.py:141`).
+    ///
+    /// `cranelift_realloc_frame` moves the old frame's ref slots into the new
+    /// frame through raw pointer writes, and a frame reaches the old generation
+    /// as soon as one minor collection promotes the one it finds on the shadow
+    /// stack.  `large_object_threshold` here sits below the frame size, so both
+    /// frames are born old and start with `TRACK_YOUNG_PTRS` set —
+    /// `remember_young_pointer` clearing that flag is the observable, since an
+    /// old-generation object can only lose it by being recorded in the
+    /// remembered set.
+    #[test]
+    fn realloc_frame_write_barriers_both_frames() {
+        let depth = 8usize;
+        let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+        let payload_bytes = (header_words + depth) * 8;
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 64,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let _backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+
+        let type_id = cranelift_jitframe_type_id().expect("JITFRAME type id must be registered");
+        let old = with_cranelift_gc_required(|gc| {
+            gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
+        });
+        assert_ne!(old.0, 0, "old frame allocation failed");
+        unsafe {
+            std::ptr::write_bytes(old.0 as *mut u8, 0, payload_bytes);
+            *((old.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = depth;
+        }
+
+        let tracks_young =
+            |addr: usize| unsafe { (*header_of(addr)).has_flag(flags::TRACK_YOUNG_PTRS) };
+        let in_nursery = |addr: usize| with_cranelift_gc_required(|gc| gc.is_nursery_object(addr));
+
+        assert!(
+            !in_nursery(old.0),
+            "the old frame must be born old-gen here"
+        );
+        assert!(
+            tracks_young(old.0),
+            "an old-generation object starts out tracking young pointers"
+        );
+
+        let new_jf = unsafe { cranelift_realloc_frame(old.0 as *mut i64, depth * 2) };
+        assert!(!new_jf.is_null(), "realloc returned no frame");
+
+        assert!(
+            !in_nursery(new_jf as usize),
+            "the new frame must be born old-gen here, or the barrier under test \
+             has nothing to record"
+        );
+        assert!(
+            !tracks_young(new_jf as usize),
+            "the copied frame items are old→young edges the barrier must remember"
+        );
+        assert!(
+            !tracks_young(old.0),
+            "`jf_forward` points at the new frame and must be remembered too"
+        );
     }
 
     #[derive(Default)]

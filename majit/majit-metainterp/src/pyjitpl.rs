@@ -1178,6 +1178,18 @@ pub struct MetaInterp<M: Clone> {
     /// the cut point. Only that trace's own closing JUMP arrives with them
     /// proven.
     pub(crate) cut_compiled_keys: indexmap::IndexSet<u64>,
+    /// The [`Self::cut_compiled_keys`] entry the running `compile_loop_body`
+    /// recorded on the way in, kept so `compile_loop` can retire it when the
+    /// body returns without installing a loop.
+    ///
+    /// The marker has to be written before the ctx carrying
+    /// `cut_inner_green_key` is drained, which puts it ahead of every give-up
+    /// the body can still take. Nothing else retires it: `forget_loop_side_tables`
+    /// is keyed on a loop that in that case never existed, so a marker left
+    /// behind makes `is_cross_loop_cut_key` answer true forever and
+    /// `jitdriver.rs`'s target-lookup miss decline every later
+    /// interpreter-origin entry bridge at that key.
+    pub(crate) speculative_cut_owned_key: Option<u64>,
     pub(crate) tracing: Option<TraceCtx>,
     /// Single-pass tracing: the `(walk_final_pc, walk_final_reds)` snapshot
     /// copied off the active `TraceCtx` at the CloseLoop point BEFORE
@@ -2740,6 +2752,7 @@ impl<M: Clone> MetaInterp<M> {
             loop_header_pcs: indexmap::IndexMap::new(),
             loop_header_greens: indexmap::IndexMap::new(),
             cut_compiled_keys: indexmap::IndexSet::new(),
+            speculative_cut_owned_key: None,
             tracing: None,
             single_pass_outcome: None,
             single_pass_finish: false,
@@ -5636,6 +5649,7 @@ impl<M: Clone> MetaInterp<M> {
     /// halves stay live for continued tracing.
     pub fn compile_loop(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
         let outcome = self.compile_loop_body(jump_args, meta);
+        self.retire_speculative_cut_key(outcome);
         self.compile_snapshot_refs.clear();
         // pyjitpl.py:3015-3032 parity: once the body has taken the trace
         // ctx (tracing=None), drop the matching frontend session so the
@@ -5649,6 +5663,21 @@ impl<M: Clone> MetaInterp<M> {
             self.clear_trace_session();
         }
         outcome
+    }
+
+    /// Settle the claim `compile_loop_body` staked on the cut's inner key.
+    ///
+    /// The body marks that key as cut-owned before it can know whether a loop
+    /// will be stored there, and every give-up after that point returns
+    /// without one. Retiring here rather than at each of those exits keeps the
+    /// rule in one place: the ownership claim is about a compiled loop, so it
+    /// only survives an outcome that installed one.
+    fn retire_speculative_cut_key(&mut self, outcome: CompileOutcome) {
+        if let Some(cut_key) = self.speculative_cut_owned_key.take()
+            && !matches!(outcome, CompileOutcome::Compiled { .. })
+        {
+            self.cut_compiled_keys.swap_remove(&cut_key);
+        }
     }
 
     fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
@@ -5886,6 +5915,7 @@ impl<M: Clone> MetaInterp<M> {
         // it with the loop.
         if let Some(cut_key) = cut_inner_green_key {
             self.cut_compiled_keys.insert(cut_key);
+            self.speculative_cut_owned_key = Some(cut_key);
         }
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
@@ -16447,6 +16477,12 @@ impl<M: Clone> MetaInterp<M> {
         &self.backend
     }
 
+    /// `cpu.asmmemmgr.get_stats()` used by
+    /// `pypy/module/gc/referents.py:_get_stats`.
+    pub fn assembler_memory_stats(&self) -> (usize, usize) {
+        self.backend.assembler_memory_stats()
+    }
+
     /// Access the backend mutably (for advanced operations).
     pub fn backend_mut(&mut self) -> &mut BackendImpl {
         &mut self.backend
@@ -20754,6 +20790,44 @@ mod metainterp_static_data_tests {
         for _ in 0..n {
             ctx.record_op(majit_ir::OpCode::PtrEq, &[]);
         }
+    }
+
+    /// A cut key claimed on the way in survives exactly the outcome that
+    /// stored a loop under it. `forget_loop_side_tables` is the only other
+    /// retirement and it is keyed on a loop, so a marker left behind by a
+    /// give-up would make `is_cross_loop_cut_key` answer true forever and
+    /// decline every later interpreter-origin entry bridge at that key.
+    #[test]
+    fn only_a_compiled_outcome_keeps_the_cut_ownership_marker() {
+        const CUT_KEY: u64 = 0xc0ff_ee00;
+        let seeded = |meta: &mut MetaInterp<()>| {
+            meta.cut_compiled_keys.insert(CUT_KEY);
+            meta.speculative_cut_owned_key = Some(CUT_KEY);
+            assert!(meta.is_cross_loop_cut_key(CUT_KEY));
+        };
+
+        for outcome in [CompileOutcome::Cancelled, CompileOutcome::Aborted] {
+            let (mut meta, _jc) = meta_with_recursive_portal();
+            seeded(&mut meta);
+            meta.retire_speculative_cut_key(outcome);
+            assert!(
+                !meta.is_cross_loop_cut_key(CUT_KEY),
+                "{outcome:?} stored no loop, so the claim must go"
+            );
+            assert!(meta.speculative_cut_owned_key.is_none());
+        }
+
+        let (mut meta, _jc) = meta_with_recursive_portal();
+        seeded(&mut meta);
+        meta.retire_speculative_cut_key(CompileOutcome::Compiled {
+            green_key: CUT_KEY,
+            from_retry: false,
+        });
+        assert!(
+            meta.is_cross_loop_cut_key(CUT_KEY),
+            "a loop was stored under this key, so it stays cut-owned"
+        );
+        assert!(meta.speculative_cut_owned_key.is_none());
     }
 
     #[test]

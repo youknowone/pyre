@@ -133,6 +133,11 @@ fn pyre_object_gc_collect_trampoline() {
     majit_gc::collect_full();
 }
 
+fn pyre_object_gc_collect_step_trampoline() -> (u8, u8) {
+    let transition = majit_gc::collect_step();
+    (transition.old_state, transition.new_state)
+}
+
 /// Non-moving old-gen-only major trampoline for the interpreter GC safepoint.
 /// Bridges pyre-object's `try_gc_collect_oldgen` to
 /// `majit_gc::collect_oldgen_nonmoving`. Unlike the full-collect trampoline it
@@ -151,6 +156,10 @@ fn pyre_object_gc_major_threshold_reached_trampoline() -> bool {
 
 fn pyre_object_gc_set_enabled_trampoline(enabled: bool) {
     majit_gc::gc_set_enabled(enabled);
+}
+
+fn pyre_object_gc_isenabled_trampoline() -> bool {
+    majit_gc::gc_isenabled()
 }
 
 fn pyre_object_gc_register_finalizer_trampoline(
@@ -3472,11 +3481,39 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_json::W_Encoder
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `pypy/module/gc/referents.py:11-15 W_GcRef`: the wrapper's raw gcref
+    // field is a normal traced edge so an internal object stays live and is
+    // forwarded in place.  Register it before the target-gated DirEntry slot;
+    // this keeps every unconditional type id identical on native and wasm.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::gc::gcref::W_GcRef
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // `pypy/module/gc/hook.py:70 W_AppLevelHooks`: the process-owned hooks
+    // singleton keeps the three app callbacks in ordinary traced fields.
+    // Append it after GcRef so every pre-existing unconditional id remains
+    // stable, and before the remaining unconditional GC classes.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::gc::hook::W_AppLevelHooks
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    // `pypy/module/gc/referents.py:190 W_GcStats`: scalar statistics live on
+    // the W_Root itself; register the class even though it has no trace edges.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::gc::stats::W_GcStats
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // `posix.DirEntry`: four inline GC edges (`w_name`/`w_path` and the cached
     // `w_stat`/`w_lstat`, the latter two NULL until first requested).  Appended
-    // after the last vtable-bearing object (`W_Encoder`) so no established GC
-    // id moves; only the trailing bare-`with_gc_ptrs` ids (twister, leaf
-    // storage boxes) shift, and those carry no census alias.  `posix` is
+    // after the last unconditional vtable-bearing object (`W_GcStats`) so only
+    // the trailing bare-`with_gc_ptrs` ids (twister, leaf storage boxes) shift,
+    // and those carry no census alias.  `posix` is
     // compiled out on wasm32, so this registration and its census aliases are
     // gated to match — which is why it stays last among the rclass
     // registrations: an unconditional type after it would take a different id
@@ -4075,6 +4112,7 @@ fn register_thread_root_areas() {
 /// they only store function pointers in pyre-object's thread-local
 /// `Cell` slots and do not touch interpreter state.
 fn install_pyre_object_hooks() {
+    majit_gc::set_active_jit_backend_memory_stats(Some(active_jit_backend_memory_stats));
     pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
     pyre_object::register_gc_alloc_with_placement_hook(
         pyre_object_gc_alloc_with_placement_trampoline,
@@ -4087,11 +4125,13 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_alloc_collecting_rooted_trampoline,
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
+    pyre_object::gc_hook::register_gc_collect_step_hook(pyre_object_gc_collect_step_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
     pyre_object::gc_hook::register_gc_major_threshold_reached_hook(
         pyre_object_gc_major_threshold_reached_trampoline,
     );
     pyre_object::gc_hook::register_gc_set_enabled_hook(pyre_object_gc_set_enabled_trampoline);
+    pyre_object::gc_hook::register_gc_isenabled_hook(pyre_object_gc_isenabled_trampoline);
     pyre_object::gc_hook::register_gc_finalizer_hooks(
         pyre_object_gc_register_finalizer_trampoline,
         pyre_object_gc_finalizer_next_dead_trampoline,
@@ -4242,6 +4282,18 @@ pub fn init_gc_root_walkers() {
 
 thread_local! {
     static JIT_DRIVER: UnsafeCell<Option<JitDriverPair>> = const { UnsafeCell::new(None) };
+}
+
+/// `jit_hooks.stats_asmmemmgr_{allocated,used}` parity.  The upstream stats
+/// object reads the assembler memory manager of the single CPU an RPython
+/// process owns, so its numbers cover all compiled code.  Pyre builds a
+/// backend per mutator thread (`JIT_DRIVER` is thread-local), and reading the
+/// caller's entry would report zero from a thread that never compiled and omit
+/// every block a worker's compiler owns.  Read the process-wide mirror the
+/// per-CPU managers feed instead; it also answers before any driver exists,
+/// so `gc.get_stats()` still creates none.
+fn active_jit_backend_memory_stats() -> (usize, usize) {
+    majit_backend::process_assembler_memory_stats()
 }
 
 fn build_jit_driver_pair() -> JitDriverPair {

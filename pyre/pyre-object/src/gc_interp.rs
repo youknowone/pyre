@@ -1,12 +1,11 @@
-//! Interpreter-path GC integration (experimental, `PYRE_GC_INTERP`).
+//! Interpreter-path GC integration (`PYRE_GC_INTERP`).
 //!
-//! Objects the bytecode interpreter creates via [`crate::lltype::malloc_typed`]
-//! (`w_int_new` / `w_float_new`) go through `alloc_with_gc_header`, a bare
-//! `std::alloc::alloc` that is never tracked by the collector and never freed —
-//! a permanent leak. The JIT-compiled path avoids this because it allocates in
-//! the managed nursery; the interpreter path does not, so an interpreter-heavy
-//! workload (the wasm benches, or any native run with the JIT cold) grows RSS
-//! linearly with the number of objects created.
+//! The `PYRE_GC_INTERP=0` rollback path creates interpreter boxes through
+//! [`crate::lltype::malloc_typed`] (`w_int_new` / `w_float_new`), whose
+//! `alloc_with_gc_header` is a bare `std::alloc::alloc` that is never tracked by
+//! the collector and never freed — a permanent leak. The default path below
+//! instead makes those boxes collector-owned. JIT-compiled boxing already uses
+//! the managed nursery.
 //!
 //! The faithful fix is RPython's model: allocate young objects in the moving
 //! nursery and let the allocator trigger a minor collection when it fills. pyre
@@ -28,13 +27,15 @@
 //! asks that question in the allocator; pyre asks it here because here is where
 //! it can act on the answer.
 //!
-//! Gated off by default on native; enabled with `PYRE_GC_INTERP=1`. On wasm it
-//! is on by default — the env read returns nothing there, and the interp-path
-//! old-gen leak is exactly what makes the wasm benches OOM, so the safepoint
-//! major is the mechanism that bounds heap growth. `PYRE_GC_INTERP=0` still
-//! turns it off where the env is readable.
+//! Enabled by default on every target. RPython never has a mode in which
+//! ordinary interpreter boxes sit outside the collector, and the full native
+//! synthetic corpus exercises this born-old stepping stone without a semantic
+//! or root-liveness failure. `PYRE_GC_INTERP=0` remains the explicit rollback
+//! switch while the translated shadow-stack pass replaces the stepping stone
+//! with ordinary moving-nursery allocation.
 
 use std::cell::Cell;
+use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Tri-state: 0 = not yet read from env, 1 = disabled, 2 = enabled.
@@ -184,8 +185,11 @@ pub fn poll_due() -> bool {
     })
 }
 
-/// Whether `PYRE_GC_INTERP` routes int/float allocations through the GC and
-/// arms the dispatch-loop safepoint. Reads the env once, then caches.
+/// Whether interpreter allocations are routed through the GC and the
+/// dispatch-loop safepoint is armed. This is on by default, matching RPython's
+/// single collector-owned object model; `PYRE_GC_INTERP=0` is the temporary
+/// rollback switch for the born-old interpreter stepping stone. Reads the env
+/// once, then caches.
 ///
 /// Reads (and lazily initialises) the runtime `STATE` atomic; the value is not
 /// a build-time constant, so the JIT residualises the call instead of tracing
@@ -196,13 +200,23 @@ pub fn enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var_os("PYRE_GC_INTERP")
-                .map(|v| !v.is_empty() && v != "0")
-                .unwrap_or(cfg!(target_arch = "wasm32"));
+            let value = std::env::var_os("PYRE_GC_INTERP");
+            let on = enabled_from_env(value.as_deref());
             STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
     }
+}
+
+/// Pure half of [`enabled`] and [`collect_enabled`], kept separate so the
+/// default-on contract is testable without racing process-global environment
+/// mutation, and shared so the two switches cannot drift apart.
+fn enabled_from_env(value: Option<&OsStr>) -> bool {
+    // Exactly `0`, and nothing else, takes the rollback path. An empty value is
+    // what a launcher produces from an unset variable (`PYRE_GC_INTERP=$FOO`),
+    // and treating it as the off switch would route those processes onto the
+    // born-old stepping stone, which leaks every interpreter allocation.
+    value != Some(OsStr::new("0"))
 }
 
 /// Whether a collection reaching this safepoint right now would be performed.
@@ -213,12 +227,22 @@ pub fn enabled() -> bool {
 /// stays reached until a major completes
 /// (`majit_gc::collector::set_deferred_major_request_probe`).
 ///
+/// `gc.disable()` is among the questions. This is the automatic path, the one
+/// `incminimark.py:831-832` returns from while the flag is clear; only an
+/// explicit `gc.collect()` carries `force_enabled` past it. The collection this
+/// safepoint runs is `do_collect_oldgen_nonmoving`, which drives a full cycle
+/// whatever the flag says, so the flag has to be read here or a
+/// `gc.disable()` region would still be collected.
+///
 /// Plain rather than `@dont_look_inside`: both callers are already outside
 /// traced code — [`safepoint`] is itself a residual, and the allocator reaches
-/// this through an installed `fn` pointer — and each of the three questions it
+/// this through an installed `fn` pointer — and each of the four questions it
 /// asks carries the attribute in its own right.
 pub fn would_collect() -> bool {
-    enabled() && collect_enabled() && at_outermost_activation()
+    enabled()
+        && collect_enabled()
+        && crate::gc_hook::try_gc_isenabled()
+        && at_outermost_activation()
 }
 
 /// Dispatch-loop safepoint: when the collector says it has reached the
@@ -330,11 +354,27 @@ pub fn collect_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var_os("PYRE_GC_INTERP_COLLECT")
-                .map(|v| !v.is_empty() && v != "0")
-                .unwrap_or(true);
+            let value = std::env::var_os("PYRE_GC_INTERP_COLLECT");
+            let on = enabled_from_env(value.as_deref());
             COLLECT_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enabled_from_env;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn interpreter_gc_is_default_on_with_explicit_off_switch() {
+        assert!(enabled_from_env(None));
+        assert!(!enabled_from_env(Some(OsStr::new("0"))));
+        assert!(enabled_from_env(Some(OsStr::new("1"))));
+        // An unset variable expanded by a launcher arrives as an empty value;
+        // it must not select the leaking rollback path, nor — through the
+        // `collect_enabled` sharing this predicate — silence the safepoint.
+        assert!(enabled_from_env(Some(OsStr::new(""))));
     }
 }
