@@ -1717,9 +1717,9 @@ fn truncate_code_points(text: rustpython_wtf8::Wtf8Buf, limit: usize) -> rustpyt
 
 fn sre_match_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
-    Ok(pyre_object::w_str_from_wtf8(sre_match_repr_str(
-        m as PyObjectRef,
-    )?))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        sre_match_repr_str(m as PyObjectRef)?,
+    ))
 }
 
 /// `copy_identity_w` (interp_sre.py:701-702) — match results are
