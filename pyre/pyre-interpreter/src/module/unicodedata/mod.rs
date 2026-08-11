@@ -271,7 +271,17 @@ fn normalize(args: &[PyObjectRef]) -> PyResult {
     }
     let form = normalize_form("normalize", args[0])?;
     let text = normalize_text("normalize", args[1])?;
-    Ok(w_str_from_wtf8(ucd_core::normalize(form, text)))
+    // interp_ucd.py:175-178 returns `space.newutf8(content, strlen)` for
+    // ASCII.  PyPy's W_UnicodeObject.is_w treats wrappers sharing that UTF-8
+    // buffer as identical; returning the exact base str preserves that O(1)
+    // identity without copying Pyre's owned Wtf8Buf.  A subclass must still
+    // be converted to a base str, just like `space.newutf8`.
+    if text.as_bytes().is_ascii()
+        && unsafe { pyre_object::is_exact_type(args[1], &pyre_object::STR_TYPE) }
+    {
+        return Ok(args[1]);
+    }
+    Ok(w_str_from_wtf8_managed(ucd_core::normalize(form, text)))
 }
 
 fn is_normalized(args: &[PyObjectRef]) -> PyResult {
