@@ -1737,7 +1737,8 @@ fn collect_full_via_active_runtime() {
 
 fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {
     with_cranelift_gc(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
-        old_state: majit_gc::GcStepTransition::SCANNING,
+        // `rgc.py:20-31`: SCANNING on both sides would never report completion.
+        old_state: majit_gc::GcStepTransition::MARKING,
         new_state: majit_gc::GcStepTransition::SCANNING,
     })
 }

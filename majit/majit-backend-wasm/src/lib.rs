@@ -616,7 +616,8 @@ fn wasm_collect_full() {
 
 fn wasm_collect_step() -> majit_gc::GcStepTransition {
     with_wasm_active_gc_mut(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
-        old_state: majit_gc::GcStepTransition::SCANNING,
+        // `rgc.py:20-31`: SCANNING on both sides would never report completion.
+        old_state: majit_gc::GcStepTransition::MARKING,
         new_state: majit_gc::GcStepTransition::SCANNING,
     })
 }
