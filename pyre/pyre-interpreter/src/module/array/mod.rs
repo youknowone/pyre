@@ -954,7 +954,9 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
 
 fn array_repr_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 1, "array.__repr__")?;
-    Ok(pyre_object::w_str_from_wtf8(array_repr_wtf8(args[0])?))
+    Ok(pyre_object::w_str_from_wtf8_managed(array_repr_wtf8(
+        args[0],
+    )?))
 }
 
 // `interp_array.py compare_arrays`: compare each element with the requested
