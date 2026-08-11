@@ -4186,16 +4186,30 @@ impl Optimizer {
         }
         ctx.current_pass_idx = saved_pass_idx;
 
-        // unroll.py:203-211: after `flush()` + `force_box_for_end_of_preamble`,
-        // `_newoperations` holds the flushed heap writebacks and forced boxes.
-        // RPython does NOT clear that buffer when `jump_to_existing_trace`
-        // raises InvalidLoop — `jump_to_preamble` appends the JUMP onto it and
-        // returns `self._newoperations[:]` (unroll.py:210-211). The
-        // fallback-to-preamble paths below therefore truncate back to this
-        // length (dropping only a retarget attempt's partial emissions)
-        // instead of clearing, which would drop the flush writebacks and leave
-        // loop-carried locals unwritten at the bridge's resume.
-        let post_force_len = ctx.new_operations.len();
+        // A failed match attempt's operations stay in `new_operations`.
+        // unroll.py:305-318 `jump_to_existing_trace` states the choice
+        // outright — "leaving the bogus operations at the end of the trace is
+        // not great, but should be safe: at worst, they just always do a bit
+        // of stuff and then fail" — and its only stopgap is
+        // `cant_replace_guards`, so the guards may not be hoisted earlier but
+        // do stay. `optimize_bridge` never trims either: `jump_to_preamble`
+        // appends the JUMP onto the buffer as it stands (unroll.py:210-211).
+        //
+        // Trimming would be unsound, because it drops the buffer but not the
+        // optimizer state those operations installed: `propagate_postprocess`
+        // (rewrite.rs) runs `make_constant_arg` for an emitted GuardTrue /
+        // GuardFalse / GuardValue, and GuardClass / GuardNonNull install
+        // PtrInfo. The forwarding outlives the deletion, so the optimizer goes
+        // on believing a fact that no operation in the compiled bridge
+        // establishes — for the JUMP re-sent below through
+        // `send_extra_operation` -> force_box -> get_box_replacement, for the
+        // `force_boxes=true` retry, and for the int bounds any later
+        // comparison is folded against.
+        //
+        // Not hypothetical: `generate_guards` emits an `IntLe` + `GuardTrue`
+        // pair for a length relation, and the GuardTrue's postprocess pins the
+        // comparison result to 1. Trimming deleted both while keeping that
+        // pin.
 
         // unroll.py:206-211: jump_to_existing_trace(force_boxes=False)
         // RPython iterates ALL target_tokens; preamble (virtual_state=None)
@@ -4216,11 +4230,6 @@ impl Optimizer {
             // RPython: self.jump_to_preamble → send_extra_operation
             Err(()) => {
                 if !front_target_tokens.is_empty() {
-                    ctx.new_operations.truncate(post_force_len);
-                    // The rolled-back attempt left stale entries for the
-                    // truncated ops; `send_extra_operation` below queries
-                    // `find_producer_op`, so resync the index to the survivors.
-                    ctx.rebuild_new_operations_index();
                     // unroll.py:196,238-242 jump_to_preamble parity: the jump-to
                     // jitcell is `jump_op.getdescr()` = terminal_jump's own
                     // recorded descr, the preamble of the loop the trace closed
@@ -4271,10 +4280,6 @@ impl Optimizer {
         // `_jump_to_existing_trace(..., force_boxes=True)` (unroll.py:222);
         // VS is recomputed inside that call from the current (post-force)
         // jump_op.getarglist() — no pre-snapshot is reused.
-        ctx.new_operations.truncate(post_force_len);
-        // `try_jump_to_existing_trace` below queries `find_producer_op`;
-        // resync the index to the post-truncate survivors first.
-        ctx.rebuild_new_operations_index();
         let vs2 = match Self::try_jump_to_existing_trace(
             &opt_unroll,
             &jump_args,
@@ -4309,10 +4314,6 @@ impl Optimizer {
             );
         }
         if !front_target_tokens.is_empty() {
-            ctx.new_operations.truncate(post_force_len);
-            // Resync the index to the survivors before `send_extra_operation`
-            // queries `find_producer_op` (drops the rolled-back attempt's ops).
-            ctx.rebuild_new_operations_index();
             // unroll.py:196,238-242 jump_to_preamble parity: keep jump_op's own
             // (forced) args so send_extra_operation's Virtualize pass forces the
             // still-virtual ref args, AND keep its recorded descr. That descr is
