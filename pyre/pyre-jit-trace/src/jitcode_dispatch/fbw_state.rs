@@ -397,6 +397,7 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
     FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(None));
     FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = None);
+    FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = None);
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.set(None));
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
     // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
@@ -1234,6 +1235,18 @@ pub(crate) fn fbw_qmut_abort_stack_latch(py_pc: usize, stack: Vec<OpRef>) {
 /// leg to decline and the legacy replay to stand.
 pub(crate) fn fbw_qmut_abort_stack_take() -> Option<(usize, Vec<OpRef>)> {
     FBW_QMUT_ABORT_STACK.with(|c| c.borrow_mut().take())
+}
+
+/// Preserve the complete MIFrame-equivalent operand stack for a kept-stack
+/// branch abort.  The caller has already proved the mirror valid and trims it
+/// to the depth on entry to `py_pc`.
+pub(crate) fn fbw_branch_abort_stack_latch(py_pc: usize, stack: Vec<OpRef>) {
+    FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = Some((py_pc, stack)));
+}
+
+/// Consume the kept-stack branch-abort carrier above.
+pub(crate) fn fbw_branch_abort_stack_take() -> Option<(usize, Vec<OpRef>)> {
+    FBW_BRANCH_ABORT_STACK.with(|c| c.borrow_mut().take())
 }
 
 /// Record the executed-effect odometer as the walk enters Python opcode

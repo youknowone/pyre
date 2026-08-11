@@ -1535,7 +1535,12 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
 /// ([`flush_qmut_abort_state`]): both resume the interpreter
 /// mid-expression, where the vable shadow's stack region reads NULL and only the
 /// walk's own mirror can say what the operands are.
-fn flush_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize, oprefs: &[OpRef]) -> bool {
+pub(crate) fn flush_with_latched_stack(
+    ctx: &TraceCtx,
+    frame: usize,
+    py_pc: usize,
+    oprefs: &[OpRef],
+) -> bool {
     {
         let mut stack = Vec::with_capacity(oprefs.len());
         for &opref in oprefs.iter() {
@@ -3571,6 +3576,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                             recorded,
                             majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
                         );
+                        // `pyjitpl.py` keeps the residual CALL result in the
+                        // MIFrame Ref register consumed by the enclosing
+                        // Python opcode.  This direct-record path bypasses
+                        // `write_ref_reg`, so publish the same last-Ref value
+                        // to the operand-stack mirror explicitly.  Without
+                        // it a CALL returning None leaves a NULL hole at the
+                        // following POP_TOP and an abort cannot flush past an
+                        // already-executed mutation such as `seen.add(w)`.
+                        ctx.vstack_last_ref = recorded;
                     }
                     majit_ir::Type::Float => {
                         ctx.trace_ctx.set_opref_concrete(

@@ -5018,7 +5018,11 @@ pub(crate) fn flush_walk_end_state_to_frame_with_item(
     resume_py_pc: usize,
     push: Option<(PyObjectRef, usize)>,
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, push, &[], None, false)
+    // This handoff is selected only for a proven FOR_ITER header.  Like the
+    // ordinary loop-end handoff above, its kept stack can legitimately carry
+    // a PUSH_NULL call sentinel from an enclosing expression; accept it when
+    // the recorded box independently proves the same concrete null.
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, push, &[], None, true)
 }
 
 pub(crate) fn flush_walk_end_state_to_frame_with_stack_overrides(

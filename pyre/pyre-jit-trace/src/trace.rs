@@ -4568,11 +4568,28 @@ fn run_perfn_walk<Sym: WalkSym>(
             } else if let Some(resume_py_pc) =
                 crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
             {
+                let mirror = crate::jitcode_dispatch::fbw_branch_abort_stack_take()
+                    .filter(|(py_pc, _)| *py_pc == resume_py_pc)
+                    .map(|(_, stack)| stack);
                 // Two kept-stack branch aborts reach this leg (`is_unsupported`
                 // came from the `kept_stack_abort_pc` match).  Both resume at a
                 // FOR_ITER header whose walk already advanced the iterator; they
                 // differ in whether the consumed item's body ran.
-                let committed = if is_unsupported {
+                let committed = if let Some(ref stack) = mirror {
+                    // RPython converts the current MIFrame — including its
+                    // register-held mid-expression operands — directly into a
+                    // blackhole frame (`blackhole.py:1711-1727`).  The vable
+                    // array is only complete at merge points, so prefer the
+                    // exact-coordinate walk mirror here.  Resolution and GC
+                    // rooting are shared with the established escape/qmut
+                    // mid-expression handoff.
+                    crate::jitcode_dispatch::flush_with_latched_stack(
+                        ctx,
+                        cf_addr,
+                        resume_py_pc,
+                        stack,
+                    )
+                } else if is_unsupported {
                     if crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
                         cf_addr,
                         resume_py_pc,

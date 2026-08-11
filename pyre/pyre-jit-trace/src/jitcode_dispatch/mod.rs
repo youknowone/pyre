@@ -5986,6 +5986,19 @@ thread_local! {
     static FBW_QMUT_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
         const { std::cell::RefCell::new(None) };
 
+    /// Kept-stack branch-abort resume carrier: `(py_pc, complete operand-stack
+    /// OpRef mirror)` captured from the live MIFrame-equivalent walk context
+    /// before it is dropped.
+    ///
+    /// Like the quasiimmutable carrier above, this is needed only for a
+    /// mid-expression abort: the virtualizable array is authoritative at merge
+    /// points, while RPython resumes a blackhole from the MIFrame register
+    /// image at the exact abort point (`blackhole.py:1711-1727`).  The trace
+    /// epilogue accepts this carrier only when its Python coordinate exactly
+    /// matches the decoded abort resume pc.
+    static FBW_BRANCH_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
+        const { std::cell::RefCell::new(None) };
+
     /// [`FBW_EXECUTED_EFFECT_COUNT`] sampled as the walk ENTERED the Python
     /// opcode it is currently inside, as `(py_pc, odometer)`.
     ///
