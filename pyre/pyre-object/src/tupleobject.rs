@@ -213,7 +213,7 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 ///
 /// Arity-2 tuples are routed through `makespecialisedtuple2`
 /// (`pypy/objspace/std/specialisedtupleobject.py:161-167`), except that
-/// Python 3.14's pointer identity requires exact float references to remain
+/// Python 3.14's pointer identity requires exact numeric references to remain
 /// boxed. Other arities use the array-backed `W_TupleObject`.
 ///
 /// Residualized: tuple construction drives the moving collector through
@@ -223,10 +223,13 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     if items.len() == 2 {
-        // PyPy can use `_ff` here because its object space gives plain floats
-        // value identity.  Pyre follows Python 3.14 pointer identity: `(x, x)`
-        // must contain the exact `x` object, not two freshly boxed copies.
-        if unsafe { is_plain_float_strict(items[0]) && is_plain_float_strict(items[1]) } {
+        // PyPy can use `_ii`/`_ff` because its object space gives plain
+        // numerics value identity. Python 3.14 requires `(x, x)` to retain
+        // the exact `x` object rather than reboxing two equal values.
+        if unsafe {
+            (is_plain_int1(items[0]) && is_plain_int1(items[1]))
+                || (is_plain_float_strict(items[0]) && is_plain_float_strict(items[1]))
+        } {
             return w_specialised_tuple_oo_new(items[0], items[1]);
         }
         return makespecialisedtuple2(items[0], items[1]);
@@ -682,8 +685,7 @@ mod tests {
         let items = vec![w_int_new(10), w_int_new(20)];
         let tup = w_tuple_new(items);
         unsafe {
-            // Arity-2 int-int specialisation is active.
-            assert!(is_specialised_tuple_ii(tup));
+            assert!(is_specialised_tuple_oo(tup));
             assert!(is_tuple(tup));
             let item = w_tuple_getitem(tup, -1).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(item), 20);
@@ -711,16 +713,28 @@ mod tests {
     }
 
     #[test]
-    fn test_arity2_int_int_routes_to_specialised_ii() {
-        let tup = w_tuple_new(vec![w_int_new(7), w_int_new(11)]);
+    fn test_arity2_int_int_preserves_boxed_identity() {
+        let lhs = w_int_new(7);
+        let rhs = w_int_new(11);
+        let tup = w_tuple_new(vec![lhs, rhs]);
         unsafe {
-            assert!(is_specialised_tuple_ii(tup));
+            assert!(is_specialised_tuple_oo(tup));
             assert!(is_tuple(tup));
             assert_eq!(w_tuple_len(tup), 2);
-            let v0 = w_tuple_getitem(tup, 0).unwrap();
-            let v1 = w_tuple_getitem(tup, 1).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(v0), 7);
-            assert_eq!(crate::intobject::w_int_get_value(v1), 11);
+            assert_eq!(w_tuple_getitem(tup, 0).unwrap(), lhs);
+            assert_eq!(w_tuple_getitem(tup, 1).unwrap(), rhs);
+        }
+    }
+
+    #[test]
+    fn test_explicit_specialised_int_pair_keeps_pypy_ii_layout() {
+        let tup = makespecialisedtuple2(w_int_new(7), w_int_new(11));
+        unsafe {
+            assert!(is_specialised_tuple_ii(tup));
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_tuple_getitem(tup, 0).unwrap()),
+                7
+            );
         }
     }
 
@@ -834,24 +848,19 @@ mod tests {
         }
     }
 
-    /// `specialisedtupleobject.py:172-175` `is_plain_int1` accepts both
-    /// exact `W_IntObject` and fits-int `W_LongObject`. A tuple of two
-    /// fits-int longs must therefore land on `Cls_ii`, with the inline
-    /// payload carrying the unwrapped i64 values.
+    /// Fits-int `W_LongObject`s are also Python ints, so the public tuple
+    /// constructor must retain their exact wrappers for 3.14 identity.
     #[test]
-    fn test_arity2_long_long_fits_int_routes_to_specialised_ii() {
+    fn test_arity2_long_long_fits_int_preserves_boxed_identity() {
         use crate::longobject::w_long_new;
         use majit_rlib::rbigint::RBigInt as BigInt;
-        let tup = w_tuple_new(vec![
-            w_long_new(BigInt::from(7)),
-            w_long_new(BigInt::from(11)),
-        ]);
+        let lhs = w_long_new(BigInt::from(7));
+        let rhs = w_long_new(BigInt::from(11));
+        let tup = w_tuple_new(vec![lhs, rhs]);
         unsafe {
-            assert!(is_specialised_tuple_ii(tup));
-            let v0 = w_tuple_getitem(tup, 0).unwrap();
-            let v1 = w_tuple_getitem(tup, 1).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(v0), 7);
-            assert_eq!(crate::intobject::w_int_get_value(v1), 11);
+            assert!(is_specialised_tuple_oo(tup));
+            assert_eq!(w_tuple_getitem(tup, 0).unwrap(), lhs);
+            assert_eq!(w_tuple_getitem(tup, 1).unwrap(), rhs);
         }
     }
 

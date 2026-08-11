@@ -13260,7 +13260,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(w_list_new(items))
 }
 
-/// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
+/// `id(obj)` — CPython 3.14 `builtin_id_impl` / PyPy `space.id`.
 fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
@@ -13268,9 +13268,8 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    // `space.id` (baseobjspace.py): a plain `int` yields its
-    // value-derived `immutable_unique_id`; every other object falls back
-    // to `compute_unique_id` — its address.
+    // Python 3.14 numeric objects use their address.  Only immutable objects
+    // pyre actually canonicalizes retain PyPy's stable unique-id hook.
     let obj = args[0];
     Ok(match crate::function::immutable_unique_id(obj) {
         Some(w_id) => w_id,

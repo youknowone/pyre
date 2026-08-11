@@ -2682,58 +2682,19 @@ pub unsafe fn fdel_func_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe { function_del_doc(obj) }
 }
 
-/// `pypy/objspace/std/util.py:6-13` — `id()` of a plain `int` / `float`
-/// / `complex` is its value tagged `(value << IDTAG_SHIFT) | IDTAG_*`;
-/// the unique-ified immutables (empty/short `bytes`/`str`, empty
-/// `tuple`/`frozenset`) use `IDTAG_SPECIAL`.
+/// PyPy's unique-ified immutable objects use a tagged stable id.  Pyre follows
+/// Python 3.14's pointer identity for numeric objects, so only the actually
+/// canonicalized empty/short `bytes`/`str`, empty `tuple`/`frozenset` cases
+/// use this path.
 const IDTAG_SHIFT: i64 = 4;
-const IDTAG_INT: i64 = 1;
-const IDTAG_FLOAT: i64 = 5;
-const IDTAG_COMPLEX: i64 = 7;
 const IDTAG_SPECIAL: i64 = 11;
 
 #[inline]
 pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
-    // `W_AbstractIntObject.immutable_unique_id` (intobject.py:55-60): a
-    // plain `int` — `W_IntObject` or the BigInt-backed `W_LongObject` —
-    // has a value-derived id `(bigint_w << IDTAG_SHIFT) | IDTAG_INT`,
-    // wrapped as an `int` (a `long` when it overflows i64).
-    // `W_FloatObject.immutable_unique_id` (floatobject.py:206-215) does
-    // the same with the float bit pattern (`float2longlong`) and
-    // `IDTAG_FLOAT`. `bool` (`W_BoolObject.immutable_unique_id` returns
-    // None, boolobject.py:28) and `int`/`float` subclasses
-    // (`user_overridden_class`) return `None`, so `space.id` falls back
-    // to the address-based uid.
+    // CPython 3.14 `Py_Is` is pointer equality and `builtin_id_impl` returns
+    // the object's address.  Do not port PyPy's value-derived numeric ids:
+    // separately unmarshalled equal ints/floats are distinct objects in 3.14.
     unsafe {
-        if is_exact_type(obj, &INT_TYPE) {
-            // `b.lshift(IDTAG_SHIFT).int_or_(IDTAG_INT)`; the shifted
-            // value is even, so `| IDTAG_INT` equals `+ IDTAG_INT`.
-            let b = (pyre_object::functional::range_obj_to_bigint(obj) << IDTAG_SHIFT as usize)
-                + majit_rlib::rbigint::RBigInt::from(IDTAG_INT);
-            return Some(pyre_object::functional::range_bigint_to_obj(b));
-        }
-        if is_exact_type(obj, &FLOAT_TYPE) {
-            // `float2longlong(float_w(self))` reinterprets the f64 bits as
-            // a signed i64; the same `| IDTAG_FLOAT` == `+ IDTAG_FLOAT`.
-            let bits = pyre_object::floatobject::w_float_get_value(obj).to_bits() as i64;
-            let b = (majit_rlib::rbigint::RBigInt::from(bits) << IDTAG_SHIFT as usize)
-                + majit_rlib::rbigint::RBigInt::from(IDTAG_FLOAT);
-            return Some(pyre_object::functional::range_bigint_to_obj(b));
-        }
-        if is_exact_type(obj, &COMPLEX_TYPE) {
-            // `(real_b << 64 | imag_b) << IDTAG_SHIFT | IDTAG_COMPLEX`
-            // (complexobject.py:303-314): the real bits are signed
-            // (`float2longlong`), the imag bits unsigned (`r_ulonglong`);
-            // the high/low 64-bit halves don't overlap, so each `|` is a
-            // `+`.
-            let real_bits = pyre_object::complexobject::w_complex_get_real(obj).to_bits() as i64;
-            let imag_bits = pyre_object::complexobject::w_complex_get_imag(obj).to_bits();
-            let combined = (majit_rlib::rbigint::RBigInt::from(real_bits) << 64usize)
-                + majit_rlib::rbigint::RBigInt::from(imag_bits);
-            let b = (combined << IDTAG_SHIFT as usize)
-                + majit_rlib::rbigint::RBigInt::from(IDTAG_COMPLEX);
-            return Some(pyre_object::functional::range_bigint_to_obj(b));
-        }
         if is_exact_type(obj, &TUPLE_TYPE) {
             // `W_AbstractTupleObject.immutable_unique_id`
             // (tupleobject.py:57-62): only the empty tuple is unique-ified
