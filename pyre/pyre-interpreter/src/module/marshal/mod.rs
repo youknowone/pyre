@@ -211,13 +211,26 @@ fn write_object(
             out.write_u64(w_complex_get_imag(obj).to_bits());
         } else if !is_heap_type && is_str(obj) {
             let value = w_str_get_wtf8(obj).as_bytes();
-            out.write_u8(b'u');
-            out.write_u32(
-                value
-                    .len()
-                    .try_into()
-                    .map_err(|_| PyError::value_error("object too large to marshal"))?,
-            );
+            let interned = unicodeobject::is_interned_exact_str(obj);
+            let ascii = value.iter().all(u8::is_ascii);
+            if version >= 4 && ascii && value.len() < 256 {
+                out.write_u8(if interned { b'Z' } else { b'z' });
+                out.write_u8(value.len() as u8);
+            } else {
+                out.write_u8(if version >= 4 && ascii {
+                    if interned { b'A' } else { b'a' }
+                } else if version >= 3 && interned {
+                    b't'
+                } else {
+                    b'u'
+                });
+                out.write_u32(
+                    value
+                        .len()
+                        .try_into()
+                        .map_err(|_| PyError::value_error("object too large to marshal"))?,
+                );
+            }
             out.write_slice(value);
         } else if let Some(value) = marshal_buffer_bytes(obj)? {
             out.write_u8(b's');
@@ -479,6 +492,11 @@ impl wire::MarshalBag for PyreMarshalBag {
 
     fn make_str(&self, value: &Wtf8) -> Rooted {
         Rooted::new(w_str_from_wtf8(value.to_owned()))
+    }
+
+    fn make_interned_str(&self, value: &Wtf8) -> Rooted {
+        let value = Rooted::new(w_str_from_wtf8(value.to_owned()));
+        Rooted::new(unsafe { unicodeobject::intern_exact_str(value.get()) })
     }
 
     fn make_bytes(&self, value: &[u8]) -> Rooted {

@@ -578,6 +578,22 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     obj
 }
 
+/// CPython 3.14 `PyUnicode_CHECK_INTERNED`: true only when `obj` itself is the
+/// canonical value stored in the process-wide intern table.
+///
+/// # Safety
+/// `obj` must be an exact `str`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn is_interned_exact_str(obj: PyObjectRef) -> bool {
+    debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
+    let table = STRING_INTERN_TABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    table
+        .get(unsafe { w_str_get_wtf8(obj) })
+        .is_some_and(|slot| **slot as PyObjectRef == obj)
+}
+
 /// Box a string constant into a heap Python str object.
 ///
 /// Reads the process-global intern table the tracer cannot model; the JIT

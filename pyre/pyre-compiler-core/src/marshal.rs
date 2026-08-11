@@ -546,6 +546,10 @@ pub trait MarshalBag: Copy {
 
     fn make_str(&self, value: &Wtf8) -> Self::Value;
 
+    fn make_interned_str(&self, value: &Wtf8) -> Self::Value {
+        self.make_str(value)
+    }
+
     fn make_bytes(&self, value: &[u8]) -> Self::Value;
 
     fn make_int(&self, value: BigInt) -> Self::Value;
@@ -859,15 +863,25 @@ fn deserialize_value_typed<R: Read, Bag: MarshalBag>(
             let value = Complex64 { re, im };
             bag.make_complex(value)
         }
-        Type::Ascii | Type::AsciiInterned | Type::Unicode | Type::Interned => {
+        Type::Ascii | Type::Unicode => {
             let len = rdr.read_u32()?;
             let value = rdr.read_wtf8(len)?;
             bag.make_str(value)
         }
-        Type::ShortAscii | Type::ShortAsciiInterned => {
+        Type::AsciiInterned | Type::Interned => {
+            let len = rdr.read_u32()?;
+            let value = rdr.read_wtf8(len)?;
+            bag.make_interned_str(value)
+        }
+        Type::ShortAscii => {
             let len = rdr.read_u8()? as u32;
             let value = rdr.read_wtf8(len)?;
             bag.make_str(value)
+        }
+        Type::ShortAsciiInterned => {
+            let len = rdr.read_u8()? as u32;
+            let value = rdr.read_wtf8(len)?;
+            bag.make_interned_str(value)
         }
         Type::SmallTuple => {
             let len = rdr.read_u8()? as usize;
