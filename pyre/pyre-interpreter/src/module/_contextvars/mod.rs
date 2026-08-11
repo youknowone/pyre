@@ -384,7 +384,9 @@ fn token_repr_string(token: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, cra
 }
 
 fn token_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(pyre_object::w_str_from_wtf8(token_repr_string(args[0])?))
+    Ok(pyre_object::w_str_from_wtf8_managed(token_repr_string(
+        args[0],
+    )?))
 }
 
 fn token_enter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
