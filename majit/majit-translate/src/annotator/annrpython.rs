@@ -15,6 +15,7 @@ use indexmap::{IndexMap, IndexSet};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::super::flowspace::model::{
     BlockKey, BlockRef, GraphKey, GraphRef, Hlvalue, LinkKey, LinkRef, Variable, checkgraph,
@@ -30,6 +31,38 @@ use crate::translator::translator::TranslationContext;
 /// (`rpython/tool/ansi_print.py` parity port); both unconditionally
 /// route output to stderr.
 pub static LOG: AnsiLogger = AnsiLogger::new("annrpython");
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static REFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn reflow_count() -> u64 {
+    REFLOW_COUNT.load(Ordering::Relaxed)
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static PROCESSBLOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn processblock_count() -> u64 {
+    PROCESSBLOCK_COUNT.load(Ordering::Relaxed)
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static REFLOW_FROM_NOTIFY: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn reflow_from_notify_count() -> u64 {
+    REFLOW_FROM_NOTIFY.load(Ordering::Relaxed)
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static NOTIFY_HIT_ON_REUSED: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn notify_hit_on_reused_count() -> u64 {
+    NOTIFY_HIT_ON_REUSED.load(Ordering::Relaxed)
+}
 
 /// One entry of [`RPythonAnnotator::notify`].
 pub(crate) struct NotifyEntry {
@@ -2130,6 +2163,7 @@ impl RPythonAnnotator {
     /// the shared `notify` map, leaving a position whose `Weak<Block>`
     /// still upgrades against a session-retained `Rc`.
     pub(crate) fn reflowfromposition(&self, position_key: &PositionKey) {
+        REFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
         // upstream: `graph, block, index = position_key`
         let Some(graph) = position_key.graph() else {
             return;
@@ -2908,6 +2942,16 @@ impl RPythonAnnotator {
             match notify.get(&bkey) {
                 Some(entry) => {
                     debug_assert_eq!(BlockKey::of(&entry.block), bkey);
+                    if crate::determinism_trace_enabled()
+                        && crate::flowspace::model::block_address_was_reused(block)
+                    {
+                        NOTIFY_HIT_ON_REUSED.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "[DTRACE-REUSE] notify hit on recycled block addr={} npos={}",
+                            bkey.as_usize(),
+                            entry.positions.len()
+                        );
+                    }
                     entry.positions.iter().cloned().collect()
                 }
                 None => Vec::new(),
@@ -2915,6 +2959,7 @@ impl RPythonAnnotator {
         };
         for position in positions {
             // upstream: `self.reflowfromposition(position)`
+            REFLOW_FROM_NOTIFY.fetch_add(1, Ordering::Relaxed);
             self.reflowfromposition(&position);
         }
 
@@ -2950,6 +2995,7 @@ impl RPythonAnnotator {
         graph: &GraphRef,
         block: &BlockRef,
     ) -> Result<(), crate::annotator::model::AnnotatorError> {
+        PROCESSBLOCK_COUNT.fetch_add(1, Ordering::Relaxed);
         let bkey = BlockKey::of(block);
         // upstream: `self.annotated[block] = graph`.
         self.annotated

@@ -2232,7 +2232,7 @@ fn build_stub_pygraph_with_result_shell(
     )));
     startblock.closeblock(vec![link]);
     Rc::new(PyGraph {
-        graph: Rc::new(RefCell::new(graph_inner)),
+        graph: graph_inner.into_ref(),
         func,
         signature: RefCell::new(signature),
         defaults: RefCell::new(Some(Vec::new())),
@@ -3255,11 +3255,35 @@ fn emit_disposition_histogram(phase: &str, reasons: &[String]) {
     }
 }
 
+// Exists to localise prepass nondeterminism (gh#1139).
+fn emit_determinism_trace(phase: &str, index: usize, canonical_key: &str) {
+    eprintln!(
+        "[DTRACE] {phase} {index} {canonical_key} var={} const={} reflow={} block={} rf_list={} rf_sub={} rf_attr={} rf_pbc={} rf_notify={} widen={} nupd={} breuse={} greuse={} nhitreused={}",
+        crate::flowspace::model::next_var_id(),
+        crate::flowspace::model::next_constant_id(),
+        crate::annotator::annrpython::reflow_count(),
+        crate::annotator::annrpython::processblock_count(),
+        crate::annotator::listdef::reflow_from_listitem_count(),
+        crate::annotator::classdesc::reflow_from_subclass_count(),
+        crate::annotator::bookkeeper::reflow_from_attr_count(),
+        crate::annotator::bookkeeper::reflow_from_pbc_count(),
+        crate::annotator::annrpython::reflow_from_notify_count(),
+        crate::annotator::listdef::listitem_widen_count(),
+        crate::annotator::listdef::listitem_notify_update_count(),
+        crate::flowspace::model::block_addr_reuse_count(),
+        crate::flowspace::model::graph_addr_reuse_count(),
+        crate::annotator::annrpython::notify_hit_on_reused_count(),
+    );
+}
+
 fn run_two_phase_prepass_inner(
     call_registry: &PyreCallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
 ) {
+    // Exists to localise prepass nondeterminism (gh#1139).
+    let determinism_trace = crate::determinism_trace_enabled();
+
     // Deterministic order (R3): candidate_graphs is a HashSet; iterating it
     // directly would make classdef numbering (and thus Match/Skip
     // classification) vary run-to-run.
@@ -3271,11 +3295,14 @@ fn run_two_phase_prepass_inner(
 
     // ── Phase A — annotate-all over the portal closure ───────────────
     let mut phase_a_reasons: Vec<String> = Vec::new();
-    for path in &paths {
+    for (index, path) in paths.iter().enumerate() {
         let Some(legacy) = function_graphs.get(path) else {
             continue;
         };
         let session_at_entry = SubjectSessionSnapshot::capture(call_registry);
+        if determinism_trace {
+            emit_determinism_trace("phaseA", index, &path.canonical_key());
+        }
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drive_subject(legacy, call_registry, /* do_rtype = */ false)
         }));
@@ -3383,7 +3410,7 @@ fn run_two_phase_prepass_inner(
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial
     // progress survives even if this call is cut short.
-    run_phase_b_rtype_isolated(call_registry, function_graphs);
+    run_phase_b_rtype_isolated(call_registry, function_graphs, determinism_trace, &paths);
 }
 
 /// Phase B: rtype every annotated block in one whole-program pass, tolerant of
@@ -3397,12 +3424,31 @@ fn run_two_phase_prepass_inner(
 fn run_phase_b_rtype_isolated(
     call_registry: &PyreCallRegistry,
     lift_sources: &crate::codewriter::call::GraphStore,
+    determinism_trace: bool,
+    paths: &[&crate::parse::CallPath],
 ) {
     use crate::flowspace::model::{BlockRef, GraphKey, GraphRef};
     let Ok((annotator, rtyper)) = call_registry.ensure_session() else {
         return;
     };
     let mut phase_b_reasons: Vec<String> = Vec::new();
+    // Exists to localise prepass nondeterminism (gh#1139).
+    let phase_b_trace_paths = determinism_trace.then(|| {
+        let cache = call_registry.two_phase();
+        paths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                let canonical_key = path.canonical_key();
+                cache
+                    .subjects
+                    .get(&canonical_key)
+                    .map(|subject| (subject.graph_key.clone(), (index, canonical_key)))
+            })
+            .collect::<Vec<_>>()
+    });
+    // Exists to localise prepass nondeterminism (gh#1139).
+    let mut phase_b_traced = determinism_trace.then(Vec::new);
 
     // Upstream `RPythonTyper.specialize()` step 1 (rtyper.py:180-181):
     // `if not dont_simplify_again: self.annotator.simplify()`. pyre's
@@ -3428,18 +3474,63 @@ fn run_phase_b_rtype_isolated(
     {
         use crate::flowspace::model::BlockKey;
         use crate::translator::transform::{
-            fully_annotated_blocks, transform_dead_code, transform_dead_op_vars,
+            cutoff_block_trace, fully_annotated_blocks, transform_dead_code, transform_dead_op_vars,
         };
         let annotated_blocks = fully_annotated_blocks(&annotator);
+
+        if determinism_trace {
+            use md5::{Digest, Md5};
+
+            let graph_names: Vec<String> = {
+                let annotated = annotator.annotated.borrow();
+                annotated_blocks
+                    .iter()
+                    .map(|block| {
+                        annotated
+                            .get(&BlockKey::of(block))
+                            .and_then(|graph| graph.as_ref())
+                            .map(|graph| graph.borrow().name.clone())
+                            .unwrap_or_else(|| "<unowned>".to_string())
+                    })
+                    .collect()
+            };
+            let mut digest = Md5::new();
+            for name in &graph_names {
+                digest.update((name.len() as u64).to_le_bytes());
+                digest.update(name.as_bytes());
+            }
+            eprintln!(
+                "[DTRACE-CUTSET] count={} md5={:x} first={:?}",
+                graph_names.len(),
+                digest.finalize(),
+                &graph_names[..graph_names.len().min(20)],
+            );
+        }
 
         // Pass 1 — `transform_dead_code` (transform.py:145): prune the
         // unfollowed const-switch dead arms. Per-block panic isolation
         // (`cutoff_alwaysraising_block`'s consistency asserts can fire on an
         // unrelated malformed always-raising block).
+        let mut cutoff_panics = 0usize;
         for block in &annotated_blocks {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let trace = determinism_trace.then(|| cutoff_block_trace(&annotator, block));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 transform_dead_code(&annotator, std::slice::from_ref(block));
             }));
+            if let Err(payload) = result {
+                cutoff_panics += 1;
+                if let Some(trace) = trace {
+                    let payload = payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    eprintln!("[DTRACE-CUTPANIC] {trace} payload={payload:?}");
+                }
+            }
+        }
+        if determinism_trace {
+            eprintln!("[DTRACE-CUTPANIC] total={cutoff_panics}");
         }
 
         // Pass 2 — `transform_dead_op_vars` (simplify.py:422, transform.py:137):
@@ -3515,6 +3606,20 @@ fn run_phase_b_rtype_isolated(
                 continue;
             }
             let session_at_entry = SubjectSessionSnapshot::capture_fixed_only(call_registry);
+            if let (Some(g), Some(trace_paths), Some(traced)) =
+                (&gopt, &phase_b_trace_paths, &mut phase_b_traced)
+            {
+                let graph_key = GraphKey::of(g);
+                if !traced.contains(&graph_key) {
+                    traced.push(graph_key.clone());
+                    if let Some((_, (index, canonical_key))) = trace_paths
+                        .iter()
+                        .find(|(candidate, _)| candidate == &graph_key)
+                    {
+                        emit_determinism_trace("phaseB", *index, canonical_key);
+                    }
+                }
+            }
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 rtyper.specialize_block(&block)
             }));

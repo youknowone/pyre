@@ -3208,7 +3208,7 @@ pub(crate) fn helper_pygraph_from_graph(
     func: GraphFunc,
 ) -> PyGraph {
     PyGraph {
-        graph: Rc::new(RefCell::new(graph)),
+        graph: graph.into_ref(),
         func,
         signature: RefCell::new(Signature::new(argnames, None, None)),
         defaults: RefCell::new(Some(Vec::new())),

@@ -57,6 +57,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
 use super::description::ClassAttrFamily;
@@ -66,6 +67,14 @@ use crate::flowspace::model::{
 };
 use crate::tool::flattenrec::FlattenRecursion;
 use crate::translator::rtyper::rclass::ClassRepr;
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static REFLOW_FROM_SUBCLASS: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn reflow_from_subclass_count() -> u64 {
+    REFLOW_FROM_SUBCLASS.load(Ordering::Relaxed)
+}
 
 thread_local! {
     /// RPython `ClassDef._see_instance_flattenrec = FlattenRecursion()`
@@ -721,7 +730,9 @@ pub struct ClassDesc {
     /// (classdesc.py:506). The [`ClassDictEntry`] sum carries either
     /// constant values or stored `DescEntry`s produced by
     /// `add_source_attribute`'s mixin-FunctionType branch.
-    pub(crate) classdict: HashMap<String, ClassDictEntry>,
+    /// The ordered container is required because a `HashMap`'s iteration
+    /// order varies per process and these keys produce a work order.
+    pub(crate) classdict: IndexMap<String, ClassDictEntry>,
     /// RPython `self.immutable_fields` — `set(cls._immutable_fields_)`.
     pub immutable_fields: HashSet<String>,
     /// RPython class attribute `instance_level = False`
@@ -749,7 +760,7 @@ impl ClassDesc {
             basedesc: None,
             classdef: None,
             all_enforced_attrs: None,
-            classdict: HashMap::new(),
+            classdict: IndexMap::new(),
             immutable_fields: HashSet::new(),
             instance_level: false,
             detect_invalid_attrs: None,
@@ -824,7 +835,8 @@ impl ClassDesc {
         cls: HostObject,
         name: Option<String>,
         basedesc: Option<Rc<RefCell<ClassDesc>>>,
-        classdict: Option<HashMap<String, ClassDictEntry>>,
+        // The ordered container preserves the source class-dict insertion order.
+        classdict: Option<IndexMap<String, ClassDictEntry>>,
     ) -> Result<Rc<RefCell<Self>>, AnnotatorError> {
         // classdesc.py:497-498 — __NOT_RPYTHON__ guard.
         if cls.class_has("__NOT_RPYTHON__") {
@@ -1218,7 +1230,20 @@ impl ClassDesc {
         this: &Rc<RefCell<Self>>,
         cls: &HostObject,
     ) -> Result<(), AnnotatorError> {
-        for (name, value) in cls.class_dict_items() {
+        let items = cls.class_dict_items();
+        if crate::determinism_trace_enabled() {
+            let attrs = items
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "[DTRACE-CLASS] add_sources_for_class cls={} n={} attrs={attrs}",
+                cls.qualname(),
+                items.len()
+            );
+        }
+        for (name, value) in items {
             Self::add_source_attribute(this, &name, value, false)?;
         }
         Ok(())
@@ -1313,7 +1338,9 @@ impl ClassDesc {
         // classdesc.py:686-689 — classsources = {attr: self for attr in classdict}.
         let source = AttrSource::Class(Rc::downgrade(this));
         let attr_names: Vec<String> = this.borrow().classdict.keys().cloned().collect();
-        let mut classsources: HashMap<String, AttrSource> = HashMap::new();
+        // The ordered container is required because a `HashMap`'s iteration
+        // order varies per process and this map produces a work order.
+        let mut classsources: IndexMap<String, AttrSource> = IndexMap::new();
         for n in attr_names {
             classsources.insert(n, source.clone());
         }
@@ -2490,7 +2517,8 @@ impl ClassDef {
     /// RPython `ClassDef.setup(self, sources)` (classdesc.py:161-166).
     fn setup(
         this: &Rc<RefCell<ClassDef>>,
-        sources: HashMap<String, AttrSource>,
+        // The ordered container preserves the source-attribute work order.
+        sources: IndexMap<String, AttrSource>,
     ) -> Result<(), AnnotatorError> {
         for (name, source) in sources {
             Self::add_source_for_attribute(this, &name, source)?;
@@ -2591,7 +2619,7 @@ impl ClassDef {
         if let Some(cdef) = Self::get_owner(this, attr) {
             return Ok(cdef);
         }
-        Self::generalize_attr_internal(this, attr, None)?;
+        Self::generalize_attr_internal(this, attr, None, "locate")?;
         Ok(this.clone())
     }
 
@@ -2901,9 +2929,9 @@ impl ClassDef {
         s_value: Option<SomeValue>,
     ) -> Result<(), AnnotatorError> {
         if let Some(cdef) = Self::get_owner(this, attr) {
-            Self::generalize_attr_internal(&cdef, attr, s_value)
+            Self::generalize_attr_internal(&cdef, attr, s_value, "owner")
         } else {
-            Self::generalize_attr_internal(this, attr, s_value)
+            Self::generalize_attr_internal(this, attr, s_value, "self")
         }
     }
 
@@ -2913,7 +2941,14 @@ impl ClassDef {
         this: &Rc<RefCell<ClassDef>>,
         attr: &str,
         s_value: Option<SomeValue>,
+        trace_source: &'static str,
     ) -> Result<(), AnnotatorError> {
+        if crate::determinism_trace_enabled() {
+            eprintln!(
+                "[DTRACE-ATTR] generalize class={} attr={attr} via={trace_source}",
+                this.borrow().name
+            );
+        }
         let mut newattr = Attribute::new(attr);
         if let Some(sv) = s_value {
             newattr.s_value = sv;
@@ -3032,6 +3067,7 @@ impl ClassDef {
             && let Some(ann) = bk.annotator.borrow().upgrade()
         {
             for position in positions {
+                REFLOW_FROM_SUBCLASS.fetch_add(1, Ordering::Relaxed);
                 ann.reflowfromposition(&position);
             }
         }

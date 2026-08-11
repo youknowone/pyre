@@ -6,6 +6,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use indexmap::IndexMap;
+
 use super::flowcontext::{FlowContextError, FlowingError};
 use super::model::{
     Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc,
@@ -67,12 +69,12 @@ pub fn make_generatoriterator_class(func: &GraphFunc, var_names: &[String]) -> H
     let entry = HostObject::new_class_with_members(
         format!("{}.Entry", func.name),
         vec![],
-        HashMap::from([("varnames".to_string(), tuple_of_strings(var_names))]),
+        IndexMap::from([("varnames".to_string(), tuple_of_strings(var_names))]),
     );
     HostObject::new_class_with_members(
         format!("{}.GeneratorIterator", func.name),
         vec![],
-        HashMap::from([("Entry".to_string(), ConstValue::HostObject(entry))]),
+        IndexMap::from([("Entry".to_string(), ConstValue::HostObject(entry))]),
     )
 }
 
@@ -439,7 +441,7 @@ pub fn tweak_generator_body_graph(
             let resume = HostObject::new_class_with_members(
                 format!("Resume{}", mappings.len()),
                 vec![],
-                HashMap::from([("_attrs_".to_string(), tuple_of_strings(&resume_varnames))]),
+                IndexMap::from([("_attrs_".to_string(), tuple_of_strings(&resume_varnames))]),
             );
             // upstream generator.py:140-142 — `Resume.block = newblock;
             // mappings.append(Resume)`. Carry both into our list so the

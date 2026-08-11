@@ -29,6 +29,7 @@ use indexmap::{IndexMap, IndexSet};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::argument::{ArgumentsForTranslation, simple_args};
 use super::classdesc::{ClassDef, ClassDesc};
@@ -49,6 +50,22 @@ use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::cpython_code_signature;
 use crate::flowspace::model::{BlockRef, ConstValue, Constant, GraphKey, GraphRef, HostObject};
 use crate::tool::algo::unionfind::UnionFind;
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static REFLOW_FROM_ATTR: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn reflow_from_attr_count() -> u64 {
+    REFLOW_FROM_ATTR.load(Ordering::Relaxed)
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static REFLOW_FROM_PBC: AtomicU64 = AtomicU64::new(0);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn reflow_from_pbc_count() -> u64 {
+    REFLOW_FROM_PBC.load(Ordering::Relaxed)
+}
 
 /// RPython `bookkeeper.position_key` (bookkeeper.py:147) — the tuple
 /// identifying "where in the flow graph the annotator is currently
@@ -1152,8 +1169,17 @@ impl Bookkeeper {
         // upstream: `locations.add(self.position_key)`
         if let Some(pk) = self.current_position_key() {
             let mut classdef_mut = classdef.borrow_mut();
+            let trace_class_name =
+                crate::determinism_trace_enabled().then(|| classdef_mut.name.clone());
             if let Some(attrdef) = classdef_mut.attrs.get_mut(attrname) {
-                attrdef.read_locations.insert(pk);
+                if attrdef.read_locations.insert(pk) {
+                    if let Some(class_name) = trace_class_name {
+                        eprintln!(
+                            "[DTRACE-ATTR] record_getattr class={class_name} attr={attrname} nloc={}",
+                            attrdef.read_locations.len()
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -1183,6 +1209,13 @@ impl Bookkeeper {
         let classdesc = clsdef.borrow().classdesc.clone();
         // upstream: `locations = self.getattr_locations(clsdef.classdesc, attrdef.name)`
         let locations = self.getattr_locations(&classdesc, attr_name)?;
+        if crate::determinism_trace_enabled() {
+            eprintln!(
+                "[DTRACE-ATTR] update_attr class={} attr={attr_name} nloc={}",
+                clsdef.borrow().name,
+                locations.len()
+            );
+        }
         // upstream: `for position in locations: self.annotator.reflowfromposition(position)`
         let Some(ann) = self.annotator.borrow().upgrade() else {
             // upstream always has `self.annotator`; if the backlink is
@@ -1192,6 +1225,7 @@ impl Bookkeeper {
             return Ok(());
         };
         for position in locations {
+            REFLOW_FROM_ATTR.fetch_add(1, Ordering::Relaxed);
             ann.reflowfromposition(&position);
         }
         // upstream: `attrdef.validate(homedef=clsdef)`
@@ -1778,6 +1812,11 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        let determinism_trace = crate::determinism_trace_enabled();
+        let trace_root = root;
+        if determinism_trace {
+            eprintln!("[DTRACE-CLASS] struct_root root={trace_root}");
+        }
         let redirected = self.redirect_withdrawn_struct_leaf(root);
         let root: &str = redirected.as_deref().unwrap_or(root);
         // Pass 1 — traverse the registry's struct-field graph from `root`,
@@ -1853,6 +1892,13 @@ impl Bookkeeper {
             // `n` is no longer borrowed (registry lookup done); move it into
             // the ordered result list without a clone.
             graph.push(n);
+        }
+        if determinism_trace {
+            eprintln!(
+                "[DTRACE-CLASS] struct_graph root={trace_root} n={} structs={}",
+                graph.len(),
+                graph.join(",")
+            );
         }
         // Pass 2 — project each reachable node's fields into its
         // `classdef.attrs`.  All nodes are published from pass 1, so a
@@ -1977,8 +2023,9 @@ impl Bookkeeper {
     pub fn register_trait_family(
         self: &Rc<Self>,
         base_root: &str,
-        base_members: HashMap<String, ConstValue>,
-        impls: Vec<(String, HashMap<String, ConstValue>)>,
+        // The ordered containers preserve the host class-dict insertion order.
+        base_members: IndexMap<String, ConstValue>,
+        impls: Vec<(String, IndexMap<String, ConstValue>)>,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
         // Base first — its identity-keyed HostObject must be published in
         // `pyre_struct_root_classes` before the subclasses intern, so each
@@ -2976,6 +3023,7 @@ impl Bookkeeper {
             let positions = pbc_family.read_locations();
             if let Some(ann) = self.annotator.borrow().upgrade() {
                 for pos in positions {
+                    REFLOW_FROM_PBC.fetch_add(1, Ordering::Relaxed);
                     ann.reflowfromposition(&pos);
                 }
             }
@@ -6514,7 +6562,7 @@ mod tests {
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::rpbc::MethodsPBCRepr;
         use crate::translator::rtyper::rtyper::RPythonTyper;
-        use std::collections::HashMap;
+        use indexmap::IndexMap;
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let bk = ann.bookkeeper.clone();
@@ -6532,11 +6580,12 @@ mod tests {
         // Base trait `T` with a default-body method `shared`; three impls
         // A/B/C each override `shared`.  This is the ≥2-impl multi-impl
         // family shape that annotates classdef-less today.
-        let mut base_members = HashMap::new();
+        // The ordered container preserves the host class-dict insertion order.
+        let mut base_members = IndexMap::new();
         base_members.insert("shared".to_string(), member("T::shared"));
         let mut impls = Vec::new();
         for impl_name in ["A", "B", "C"] {
-            let mut m = HashMap::new();
+            let mut m = IndexMap::new();
             m.insert(
                 "shared".to_string(),
                 member(&format!("{impl_name}::shared")),
@@ -6608,7 +6657,7 @@ mod tests {
     fn register_trait_family_subclass_only_method_surfaces_on_base() {
         use crate::annotator::classdesc::ClassDef;
         use crate::annotator::model::SomeValue;
-        use std::collections::HashMap;
+        use indexmap::IndexMap;
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let bk = ann.bookkeeper.clone();
@@ -6623,12 +6672,13 @@ mod tests {
         // required-method-with-no-default-body shape.
         let mut impls = Vec::new();
         for impl_name in ["A", "B", "C"] {
-            let mut m = HashMap::new();
+            // The ordered container preserves the host class-dict insertion order.
+            let mut m = IndexMap::new();
             m.insert("req".to_string(), member(&format!("{impl_name}::req")));
             impls.push((impl_name.to_string(), m));
         }
         let base_cd = bk
-            .register_trait_family("T", HashMap::new(), impls)
+            .register_trait_family("T", IndexMap::new(), impls)
             .expect("register_trait_family must succeed");
 
         ClassDef::check_missing_attribute_update(&base_cd, "req").expect("attr population");

@@ -3704,7 +3704,7 @@ pub fn function_graph_to_flowspace(
         exceptblock_ref.borrow_mut().inputargs = except_inputargs;
     }
 
-    let graph_ref = Rc::new(RefCell::new(graph));
+    let graph_ref = graph.into_ref();
 
     // Map the canonical finals so any legacy Link targeting them
     // resolves to the flowspace finals constructed above.

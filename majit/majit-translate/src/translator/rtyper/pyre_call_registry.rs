@@ -60,6 +60,7 @@
 //! (`pair_simple_call → FunctionDesc.specialize → cachedgraph →
 //! FunctionRepr.call`) all see the registry's entries.
 
+use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -335,14 +336,15 @@ impl PyreCallRegistry {
         families: &[crate::codewriter::call::TraitFamilyRegistration],
     ) {
         for family in families {
-            let impls: Vec<(String, HashMap<String, ConstValue>)> = family
+            // The ordered container preserves the host class-dict insertion order.
+            let impls: Vec<(String, IndexMap<String, ConstValue>)> = family
                 .impl_roots
                 .iter()
-                .map(|root| (root.clone(), HashMap::new()))
+                .map(|root| (root.clone(), IndexMap::new()))
                 .collect();
             if let Err(e) =
                 self.bookkeeper
-                    .register_trait_family(&family.base_root, HashMap::new(), impls)
+                    .register_trait_family(&family.base_root, IndexMap::new(), impls)
             {
                 eprintln!(
                     "register_trait_families: base {:?} failed: {e:?}",
@@ -415,12 +417,19 @@ impl PyreCallRegistry {
         // each registry root on its post-crate suffix.
         let mut full_by_stripped: std::collections::HashMap<&str, &str> =
             std::collections::HashMap::new();
-        for key in reg.fields.keys() {
+        let mut field_keys: Vec<_> = reg.fields.keys().collect();
+        // Pin HashMap order so first-writer-wins suffix resolution is stable.
+        field_keys.sort();
+        for key in field_keys {
             if let Some((_, rest)) = key.split_once("::") {
                 full_by_stripped.entry(rest).or_insert(key.as_str());
             }
         }
-        for (key, entry) in self.entries.borrow().iter() {
+        let entries = self.entries.borrow();
+        let mut sorted_entries: Vec<_> = entries.iter().collect();
+        // Pin HashMap order because class_set preserves member insertion order.
+        sorted_entries.sort_by_cached_key(|(key, _)| key.segments().join("::"));
+        for (key, entry) in sorted_entries {
             let segs = key.segments();
             let [.., owner, method] = segs else {
                 continue;
@@ -659,7 +668,11 @@ impl PyreCallRegistry {
         &self,
         graph: &crate::flowspace::model::GraphRef,
     ) -> Option<(FunctionPathKey, Rc<PyreFunctionEntry>)> {
-        for (key, entry) in self.entries.borrow().iter() {
+        let entries = self.entries.borrow();
+        let mut sorted_entries: Vec<_> = entries.iter().collect();
+        // Pin HashMap order so the first matching cached graph is stable.
+        sorted_entries.sort_by_cached_key(|(key, _)| key.segments().join("::"));
+        for (key, entry) in sorted_entries {
             let fd = entry.function_desc.borrow();
             let cache = fd.cache.borrow();
             if cache.values().any(|pg| Rc::ptr_eq(&pg.graph, graph)) {
@@ -746,7 +759,7 @@ impl PyreCallRegistry {
             .skip(1)
             .all(|s| !starts_with_uppercase(s));
         let entries_borrow = self.entries.borrow();
-        let matches: Vec<&Rc<PyreFunctionEntry>> = entries_borrow
+        let mut matches: Vec<(&FunctionPathKey, &Rc<PyreFunctionEntry>)> = entries_borrow
             .iter()
             .filter(|(k, e)| {
                 if !e.host_object.is_user_function() {
@@ -784,10 +797,11 @@ impl PyreCallRegistry {
                 }
                 true
             })
-            .map(|(_, e)| e)
             .collect();
+        // Pin HashMap order so a converged leaf match selects a stable entry.
+        matches.sort_by_cached_key(|(key, _)| key.segments().join("::"));
         if matches.len() == 1 {
-            return Some(matches[0].clone());
+            return Some(matches[0].1.clone());
         }
         if !matches.is_empty() {
             // Multi-alias convergence: free-function registration
@@ -797,10 +811,12 @@ impl PyreCallRegistry {
             // (`HostObject`'s `PartialEq` is Arc-pointer equality at
             // `flowspace/model.rs:208`), the alias cluster is
             // unambiguous.
-            let first_host = matches[0].host_object.clone();
-            let all_same = matches.iter().all(|e| e.host_object == first_host);
+            let first_host = matches[0].1.host_object.clone();
+            let all_same = matches
+                .iter()
+                .all(|(_, entry)| entry.host_object == first_host);
             if all_same {
-                return Some(matches[0].clone());
+                return Some(matches[0].1.clone());
             }
         }
         None

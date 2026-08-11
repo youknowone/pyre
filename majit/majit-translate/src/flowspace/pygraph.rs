@@ -15,7 +15,6 @@
 //!   inheritance provides upstream.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 
 use super::argument::Signature;
 use super::bytecode::HostCode;
@@ -81,7 +80,7 @@ impl PyGraph {
 
         // upstream: `self.signature = code.signature` / `self.defaults = ...`.
         PyGraph {
-            graph: Rc::new(RefCell::new(graph)),
+            graph: graph.into_ref(),
             signature: RefCell::new(code.signature.clone()),
             defaults: RefCell::new(Some(func.defaults.clone())),
             access_directly: Cell::new(false),

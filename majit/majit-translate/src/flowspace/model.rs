@@ -22,15 +22,88 @@
 //!   Rust has no class-mutable-state, this is the minimum deviation.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
+use indexmap::IndexMap;
+
 use super::bytecode::HostCode;
 use crate::annotator::model::SomeValue;
 use crate::translator::rtyper::lltypesystem::lltype::_ptr;
+
+// Exists to localise prepass nondeterminism (gh#1139).
+static BLOCK_ADDR_REUSE: AtomicU64 = AtomicU64::new(0);
+// Exists to localise prepass nondeterminism (gh#1139).
+static GRAPH_ADDR_REUSE: AtomicU64 = AtomicU64::new(0);
+// Exists to localise prepass nondeterminism (gh#1139).
+static SEEN_BLOCK_ADDRS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+// Exists to localise prepass nondeterminism (gh#1139).
+static REUSED_BLOCK_ADDRS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+// Exists to localise prepass nondeterminism (gh#1139).
+static SEEN_GRAPH_ADDRS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+
+// Exists to localise prepass nondeterminism (gh#1139).
+fn record_block_address(block: &BlockRef) {
+    if !crate::determinism_trace_enabled() {
+        return;
+    }
+    let addr = Rc::as_ptr(block) as usize;
+    let inserted = SEEN_BLOCK_ADDRS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("block address-reuse detector mutex poisoned")
+        .insert(addr);
+    if !inserted {
+        BLOCK_ADDR_REUSE.fetch_add(1, Ordering::Relaxed);
+        REUSED_BLOCK_ADDRS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("reused-block address detector mutex poisoned")
+            .insert(addr);
+    }
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+fn record_graph_address(graph: &GraphRef) {
+    if !crate::determinism_trace_enabled() {
+        return;
+    }
+    let addr = Rc::as_ptr(graph) as usize;
+    let inserted = SEEN_GRAPH_ADDRS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("graph address-reuse detector mutex poisoned")
+        .insert(addr);
+    if !inserted {
+        GRAPH_ADDR_REUSE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn block_addr_reuse_count() -> u64 {
+    BLOCK_ADDR_REUSE.load(Ordering::Relaxed)
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn graph_addr_reuse_count() -> u64 {
+    GRAPH_ADDR_REUSE.load(Ordering::Relaxed)
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn block_address_was_reused(block: &BlockRef) -> bool {
+    if !crate::determinism_trace_enabled() {
+        return false;
+    }
+    let addr = Rc::as_ptr(block) as usize;
+    REUSED_BLOCK_ADDRS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("reused-block address detector mutex poisoned")
+        .contains(&addr)
+}
 
 // RPython `Variable.annotation` holds a `SomeObject` subclass instance
 // (annotator/model.py:SomeObject). Rust stores `Option<Rc<SomeValue>>`
@@ -106,7 +179,9 @@ enum HostObjectKind {
     /// function, property, …)이므로 `ConstValue` carrier 로 담는다.
     Class {
         bases: Vec<HostObject>,
-        members: Mutex<HashMap<String, ConstValue>>,
+        /// The ordered container is required because a `HashMap`'s iteration
+        /// order varies per process and these entries produce a work order.
+        members: Mutex<IndexMap<String, ConstValue>>,
         reusable_prebuilt_instance: OnceLock<HostObject>,
     },
     /// Python module object. `members` 는 module dict — `getattr` 조회
@@ -129,7 +204,9 @@ enum HostObjectKind {
     Instance {
         class_obj: HostObject,
         args: Vec<ConstValue>,
-        instance_dict: Mutex<HashMap<String, ConstValue>>,
+        /// The ordered container is required because a `HashMap`'s iteration
+        /// order varies per process and these keys produce a work order.
+        instance_dict: Mutex<IndexMap<String, ConstValue>>,
     },
     /// `Constant.value` 에 담긴 임의의 host object — flowspace 가 구조
     /// 를 모르지만 보존해야 하는 값(예: 포팅되지 않은 `ConstantData`
@@ -495,7 +572,7 @@ impl HostObject {
                 module_name,
                 kind: HostObjectKind::Class {
                     bases,
-                    members: Mutex::new(HashMap::new()),
+                    members: Mutex::new(IndexMap::new()),
                     reusable_prebuilt_instance: OnceLock::new(),
                 },
             }),
@@ -510,7 +587,8 @@ impl HostObject {
     pub fn new_class_with_members(
         qualname: impl Into<String>,
         bases: Vec<HostObject>,
-        members: HashMap<String, ConstValue>,
+        // The ordered container preserves the caller's class-dict insertion order.
+        members: IndexMap<String, ConstValue>,
     ) -> Self {
         let qualname = qualname.into();
         let (name, module_name) = split_attr_name_module(&qualname);
@@ -644,7 +722,7 @@ impl HostObject {
                 kind: HostObjectKind::Instance {
                     class_obj,
                     args,
-                    instance_dict: Mutex::new(HashMap::new()),
+                    instance_dict: Mutex::new(IndexMap::new()),
                 },
             }),
         }
@@ -2702,6 +2780,11 @@ fn clean_name(name: &str) -> String {
 /// returns a *new* Variable with the same prefix).
 static NEXT_VAR_ID: AtomicU64 = AtomicU64::new(0);
 
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn next_var_id() -> u64 {
+    NEXT_VAR_ID.load(Ordering::Relaxed)
+}
+
 fn alloc_var_id() -> u64 {
     NEXT_VAR_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -3008,8 +3091,9 @@ pub struct Constant {
 impl Constant {
     /// RPython `Constant.__init__(value, concretetype=None)`.
     pub fn new(value: ConstValue) -> Self {
+        let id = alloc_constant_id(&value);
         Constant {
-            id: NEXT_CONSTANT_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             value,
             concretetype: None,
         }
@@ -3017,8 +3101,9 @@ impl Constant {
 
     /// RPython `Constant.__init__(value, concretetype)`.
     pub fn with_concretetype(value: ConstValue, concretetype: ConcretetypePlaceholder) -> Self {
+        let id = alloc_constant_id(&value);
         Constant {
-            id: NEXT_CONSTANT_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             value,
             concretetype: Some(concretetype),
         }
@@ -3117,6 +3202,96 @@ impl Constant {
 }
 
 static NEXT_CONSTANT_ID: AtomicU64 = AtomicU64::new(1);
+
+// Exists to localise prepass nondeterminism (gh#1139).
+fn alloc_constant_id(value: &ConstValue) -> u64 {
+    let id = NEXT_CONSTANT_ID.fetch_add(1, Ordering::Relaxed);
+    let Some(&(from, to)) = constant_trace_window() else {
+        return id;
+    };
+    if id < from || id >= to {
+        return id;
+    }
+
+    let mut debug_value = format!("{value:?}");
+    if let Some((byte_index, _)) = debug_value.char_indices().nth(120) {
+        debug_value.truncate(byte_index);
+    }
+    eprintln!(
+        "[DTRACE-CONST] id={id} kind={} val={debug_value}",
+        const_value_variant_name(value)
+    );
+    if constant_trace_backtrace_enabled() {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        eprintln!("[DTRACE-CONST-BT] id={id}\n{backtrace}\n[DTRACE-CONST-BT-END] id={id}");
+    }
+    id
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+fn constant_trace_backtrace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PYRE_DTRACE_CONST_BT")
+            .as_deref()
+            .is_ok_and(|value| value == "1")
+    })
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+fn constant_trace_window() -> Option<&'static (u64, u64)> {
+    static WINDOW: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    WINDOW
+        .get_or_init(|| {
+            if !crate::determinism_trace_enabled() {
+                return None;
+            }
+            let from = std::env::var("PYRE_DTRACE_CONST_FROM")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let to = std::env::var("PYRE_DTRACE_CONST_TO")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            (to != 0).then_some((from, to))
+        })
+        .as_ref()
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+fn const_value_variant_name(value: &ConstValue) -> &'static str {
+    match value {
+        ConstValue::Atom(_) => "Atom",
+        ConstValue::Placeholder => "Placeholder",
+        ConstValue::Int(_) => "Int",
+        ConstValue::Int128(_) => "Int128",
+        ConstValue::UInt128(_) => "UInt128",
+        ConstValue::Float(_) => "Float",
+        ConstValue::Dict(_) => "Dict",
+        ConstValue::ByteStr(_) => "ByteStr",
+        ConstValue::UniStr(_) => "UniStr",
+        ConstValue::Tuple(_) => "Tuple",
+        ConstValue::List(_) => "List",
+        ConstValue::Bool(_) => "Bool",
+        ConstValue::None => "None",
+        ConstValue::Code(_) => "Code",
+        ConstValue::Function(_) => "Function",
+        ConstValue::Graphs(_) => "Graphs",
+        ConstValue::LowLevelType(_) => "LowLevelType",
+        ConstValue::LLPtr(_) => "LLPtr",
+        ConstValue::LLAddress(_) => "LLAddress",
+        ConstValue::HostObject(_) => "HostObject",
+        ConstValue::AddressOffset(_) => "AddressOffset",
+        ConstValue::SpecTag(_) => "SpecTag",
+        ConstValue::InheritanceId { .. } => "InheritanceId",
+    }
+}
+
+// Exists to localise prepass nondeterminism (gh#1139).
+pub fn next_constant_id() -> u64 {
+    NEXT_CONSTANT_ID.load(Ordering::Relaxed)
+}
 
 impl PartialEq for Constant {
     fn eq(&self, other: &Self) -> bool {
@@ -3828,7 +4003,9 @@ impl Block {
     /// graph types take `Rc<RefCell<Block>>`, so callers usually
     /// want `Block::shared(...)` instead of `Block::new(...)`.
     pub fn shared(inputargs: Vec<Hlvalue>) -> BlockRef {
-        Rc::new(RefCell::new(Block::new(inputargs)))
+        let block = Rc::new(RefCell::new(Block::new(inputargs)));
+        record_block_address(&block);
+        block
     }
 
     /// RPython `Block.is_final_block()` — `self.operations == ()`.
@@ -4309,6 +4486,14 @@ pub struct FunctionGraph {
 }
 
 impl FunctionGraph {
+    /// Wrap this graph in the shared reference used throughout the
+    /// translation pipeline.
+    pub fn into_ref(self) -> GraphRef {
+        let graph = Rc::new(RefCell::new(self));
+        record_graph_address(&graph);
+        graph
+    }
+
     /// RPython `FunctionGraph.__init__(name, startblock,
     /// return_var=None)`.
     pub fn new(name: impl Into<String>, startblock: BlockRef) -> Self {
@@ -5888,13 +6073,27 @@ mod tests {
 
     #[test]
     fn new_class_with_members_seeds_initial_dict() {
-        let mut seed: HashMap<String, ConstValue> = HashMap::new();
+        // The ordered container is required because a `HashMap`'s iteration
+        // order varies per process and these entries produce a work order.
+        let mut seed: IndexMap<String, ConstValue> = IndexMap::new();
         seed.insert("_mixin_".into(), ConstValue::Bool(true));
+        seed.insert("second".into(), ConstValue::Int(2));
         let cls = HostObject::new_class_with_members("pkg.Foo", vec![], seed);
         match cls.class_get("_mixin_") {
             Some(ConstValue::Bool(true)) => {}
             other => panic!("expected Bool(true), got {other:?}"),
         }
+        assert_eq!(cls.class_dict_keys(), vec!["_mixin_", "second"]);
+    }
+
+    #[test]
+    fn instance_dict_keys_preserve_insertion_order() {
+        let cls = HostObject::new_class("pkg.Foo", vec![]);
+        let instance = HostObject::new_instance(cls, vec![]);
+        instance.instance_set("second", ConstValue::Int(2));
+        instance.instance_set("first", ConstValue::Int(1));
+
+        assert_eq!(instance.instance_dict_keys(), vec!["second", "first"]);
     }
 
     #[test]

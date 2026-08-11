@@ -396,7 +396,7 @@ impl TranslationContext {
             // gating.
         }
         let pygraph = Rc::new(PyGraph {
-            graph: Rc::new(RefCell::new(graph)),
+            graph: graph.into_ref(),
             func: graph_func.clone(),
             signature: RefCell::new(code.signature.clone()),
             defaults: RefCell::new(Some(graph_func.defaults.clone())),

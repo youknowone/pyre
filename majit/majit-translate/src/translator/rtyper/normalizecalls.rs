@@ -1104,7 +1104,7 @@ pub fn create_instantiate_function(
     // returnblock/exceptblock allocated inside the ctor.
     let graph = FunctionGraph::new(name, block.clone());
     let returnblock = graph.returnblock.clone();
-    let graph_rc = Rc::new(RefCell::new(graph));
+    let graph_rc = graph.into_ref();
 
     // upstream: `block.closeblock(Link([v], graph.returnblock))`.
     let link = Link::new(vec![v_result.clone()], Some(returnblock.clone()), None);

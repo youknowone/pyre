@@ -2733,7 +2733,7 @@ impl SmallFunctionSetPBCRepr {
         // The dispatcher graph is synthesized — no host-side Python
         // function backing — so we deliberately do not wrap it in a
         // `PyGraph` (which expects a real `GraphFunc + HostCode`).
-        Ok(Rc::new(RefCell::new(graph)))
+        Ok(graph.into_ref())
     }
 
     /// RPython `compression_function(r_set)` (rpbc.py:529-545).
@@ -3005,7 +3005,7 @@ impl SmallFunctionSetPBCRepr {
         startblock.closeblock(vec![entry_link]);
         graph.startblock = startblock;
 
-        Ok(Rc::new(RefCell::new(graph)))
+        Ok(graph.into_ref())
     }
 
     /// RPython `SmallFunctionSetPBCRepr.convert_desc(self, funcdesc)`

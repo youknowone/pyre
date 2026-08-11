@@ -428,7 +428,7 @@ impl MemoTable {
         // entrypoint); self.graph.defaults = self.funcdesc.defaults`.
         let signature = Signature::new(argnames.clone(), None, None);
         let pygraph = Rc::new(PyGraph {
-            graph: Rc::new(RefCell::new(fg)),
+            graph: fg.into_ref(),
             func,
             signature: RefCell::new(signature),
             defaults: RefCell::new(Some(defaults)),
@@ -738,7 +738,7 @@ impl MemoSynth<'_> {
         )));
         let signature = Signature::new(sub_argnames.clone(), None, None);
         let pygraph = Rc::new(PyGraph {
-            graph: Rc::new(RefCell::new(fg)),
+            graph: fg.into_ref(),
             func: func.clone(),
             signature: RefCell::new(signature),
             defaults: RefCell::new(Some(Vec::new())),

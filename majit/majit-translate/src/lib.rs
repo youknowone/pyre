@@ -65,6 +65,14 @@ pub use pipeline::{
 
 use serde::{Deserialize, Serialize};
 
+// Exists to localise prepass nondeterminism (gh#1139).
+pub(crate) fn determinism_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PYRE_DETERMINISM_TRACE").is_some_and(|value| value == "1")
+    })
+}
+
 /// Configuration for the canonical graph/pipeline analyzer.
 ///
 /// Consumers supply graph-rewrite metadata such as virtualizable
