@@ -656,7 +656,6 @@ fn pin_referents(w_obj: PyObjectRef) {
 /// `referents.py:35-39 wrap`: app-level objects pass through, internal nodes
 /// become `W_GcRef`.  Results are rooted as they are made because constructing
 /// a later wrapper can initialize a type and allocate.
-/// Wrap the raw nodes rooted at `first..last`, leaving the wrappers pinned.
 ///
 /// Returns the first shadow-stack slot of the wrapped range, which runs to the
 /// stack top on return. A slot range rather than a `Vec<PyObjectRef>` because
