@@ -635,11 +635,12 @@ pub(crate) fn fbw_bridge_iter_journal_clear() {
 /// body runs, nothing to deliver).  The stack mirrors loop nesting: a consume
 /// of a DIFFERENT (deeper) FOR_ITER pushes a new entry on top of the loops
 /// that enclose it, while a re-consume of a FOR_ITER ALREADY on the stack is
-/// that loop advancing to its next iteration — every entry above it belongs
-/// to nested loops that have run to completion inside the prior body, so they
-/// are popped, and the loop's own entry is replaced (a fresh body-effect
-/// window).  The outer loop's in-flight item is thus no longer destroyed by an
-/// inner consume, and a completed inner loop leaves no stale entry.
+/// that exact JitCode/opcode advancing to its next iteration — every entry
+/// above it belongs to nested loops that have run to completion inside the
+/// prior body, so they are popped, and the loop's own entry is replaced (a
+/// fresh body-effect window).  The outer loop's in-flight item is thus no
+/// longer destroyed by an inner consume, and a completed inner loop leaves no
+/// stale entry.
 pub(crate) fn fbw_foriter_inflight_capture(
     item: pyre_object::PyObjectRef,
     body: InflightForiterBody,
@@ -655,17 +656,14 @@ pub(crate) fn fbw_foriter_inflight_capture(
             body_effect_since_consume: false,
             body_completed: false,
         };
-        let Some(body_pc) = inflight_foriter_body_pc(body) else {
+        let Some(_body_pc) = inflight_foriter_body_pc(body) else {
             // An unresolvable native coordinate cannot identify an existing
             // loop. Keep this item as a distinct entry; later consumers also
             // refuse it conservatively instead of guessing a Python pc.
             stack.push(entry);
             return;
         };
-        match stack
-            .iter()
-            .position(|e| inflight_foriter_body_pc(e.body) == Some(body_pc))
-        {
+        match stack.iter().position(|e| e.body == body) {
             Some(at) => {
                 stack.truncate(at + 1);
                 stack[at] = entry;
@@ -692,14 +690,10 @@ pub(crate) fn fbw_foriter_inflight_active() -> bool {
 /// entry with a fresh one anyway ([`fbw_foriter_inflight_capture`]).
 pub(crate) fn fbw_foriter_inflight_mark_attempt(body: InflightForiterBody) {
     FBW_FORITER_INFLIGHT.with(|c| {
-        let Some(body_pc) = inflight_foriter_body_pc(body) else {
+        let Some(_body_pc) = inflight_foriter_body_pc(body) else {
             return;
         };
-        if let Some(entry) = c
-            .borrow_mut()
-            .iter_mut()
-            .find(|e| inflight_foriter_body_pc(e.body) == Some(body_pc))
-        {
+        if let Some(entry) = c.borrow_mut().iter_mut().find(|e| e.body == body) {
             entry.body_completed = true;
         }
     });
@@ -748,7 +742,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
         let stack = c.borrow();
         let at = stack
             .iter()
-            .position(|e| inflight_foriter_body_pc(e.body) == Some(body_pc))?;
+            .position(|e| foriter_body_matches_frame(e.body, frame, body_pc))?;
         // R1 never-double guard (cross-checks #33): an irreversible body effect
         // committed since this consume means re-running the body on delivery
         // would double it — refuse delivery.  A body-COMPLETED entry (the walk
@@ -789,7 +783,7 @@ pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usiz
         let stack = c.borrow();
         let Some(at) = stack
             .iter()
-            .position(|e| inflight_foriter_body_pc(e.body) == Some(body_pc))
+            .position(|e| foriter_body_matches_frame(e.body, frame, body_pc))
         else {
             return false;
         };

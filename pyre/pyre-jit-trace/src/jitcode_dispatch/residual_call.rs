@@ -1616,28 +1616,43 @@ fn flush_with_latched_stack_inner(
         // remove the need for it: `LOAD_ATTR` already emits the push mirror
         // via `emit_pushvalue_ref!` and its slot still reads NULL, because the
         // pop follows the push.
-        if fbw_debug_abort_enabled() {
-            let base = ctx
-                .virtualizable_info()
-                .map_or(usize::MAX, |info| info.num_static_extra_boxes);
-            let nlocals = crate::state::concrete_nlocals(frame).unwrap_or(usize::MAX);
-            for (rel, &obj) in stack.iter().enumerate() {
-                let entry =
-                    ctx.virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel));
-                let shadow = entry.map(|(_opref, value)| value);
-                let agrees =
-                    matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == obj as usize);
-                if !agrees {
-                    // Report the OpRef too: a live box with a NULL value means
-                    // the symbolic write landed and only the concrete mirror is
-                    // absent, which is a different defect from no write at all.
+        let base = ctx
+            .virtualizable_info()
+            .map_or(usize::MAX, |info| info.num_static_extra_boxes);
+        let nlocals = crate::state::concrete_nlocals(frame).unwrap_or(usize::MAX);
+        for (rel, &obj) in stack.iter().enumerate() {
+            let entry =
+                ctx.virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel));
+            let shadow = entry.map(|(_opref, value)| value);
+            let agrees =
+                matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == obj as usize);
+            if !agrees && fbw_debug_abort_enabled() {
+                // Report the OpRef too: a live box with a NULL value means
+                // the symbolic write landed and only the concrete mirror is
+                // absent, which is a different defect from no write at all.
+                eprintln!(
+                    "[r6-latch] slot {rel}/{} latched=0x{:x} shadow={shadow:?} box={:?} (DISAGREES)",
+                    stack.len(),
+                    obj as usize,
+                    entry.map(|(opref, _)| opref),
+                );
+            }
+            // The only orthodox disagreement is the operand the in-progress
+            // opcode popped from TOS: the vable slot is NULL while the MIFrame
+            // register image still carries the consumed object.  A mismatch
+            // below TOS means the latch is not this frame's continuation.
+            let consumed_tos = rel + 1 == stack.len()
+                && obj as usize != 0
+                && matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0);
+            if !agrees && !consumed_tos {
+                if fbw_debug_abort_enabled() {
                     eprintln!(
-                        "[r6-latch] slot {rel}/{} latched=0x{:x} shadow={shadow:?} box={:?} (DISAGREES)",
+                        "[fbw-latched-flush] DECLINE at py_pc={py_pc}: slot {rel}/{} \
+                         is not the consumed TOS",
                         stack.len(),
-                        obj as usize,
-                        entry.map(|(opref, _)| opref),
                     );
                 }
+                return false;
             }
         }
         // The flush's Int/Float local boxing can trigger a minor collection;
