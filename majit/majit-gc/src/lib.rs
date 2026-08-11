@@ -2889,6 +2889,11 @@ pub fn gc_set_enabled(enabled: bool) {
 /// major-progress path returns early while it is clear, and an explicit
 /// `gc.collect()` passes `force_enabled` to get past it.
 pub fn gc_isenabled() -> bool {
+    // Before `store_singleton` there is no collector to suppress, and nothing
+    // could have disabled automatic collection yet.
+    if !gc_sync::is_initialized() {
+        return true;
+    }
     gc_sync::gc_query_reentrant(|gc| gc.isenabled())
 }
 
