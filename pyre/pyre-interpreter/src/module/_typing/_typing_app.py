@@ -71,6 +71,59 @@ class _NoDefaultType(metaclass=_NoDefaultMeta):
 NoDefault = _NoDefaultType()
 
 
+_MISSING = object()
+
+
+def _typing_type_repr(value):
+    """CPython 3.14 `_Py_typing_type_repr`, for constant evaluators."""
+    if value is Ellipsis:
+        return "..."
+    if value is type(None):
+        return "None"
+    if hasattr(value, "__origin__") and hasattr(value, "__args__"):
+        return repr(value)
+    qualname = getattr(value, "__qualname__", None)
+    module = getattr(value, "__module__", None)
+    if qualname is None or module is None:
+        return repr(value)
+    if module == "builtins":
+        return qualname
+    return f"{module}.{qualname}"
+
+
+class _ConstEvaluatorMeta(type):
+    def __setattr__(cls, name, value):
+        raise TypeError(
+            f"cannot set '{name}' attribute of immutable type "
+            "'_typing._ConstEvaluator'"
+        )
+
+
+class _ConstEvaluator(metaclass=_ConstEvaluatorMeta):
+    """CPython 3.14 `constevaluatorobject`."""
+
+    __slots__ = ("_value",)
+
+    def __new__(cls):
+        raise TypeError("cannot create '_typing._ConstEvaluator' instances")
+
+    def __call__(self, format, /):
+        if format == 4:  # annotationlib.Format.STRING
+            if isinstance(self._value, tuple):
+                return "(" + ", ".join(map(_typing_type_repr, self._value)) + ")"
+            return _typing_type_repr(self._value)
+        return self._value
+
+    def __repr__(self):
+        return f"<constevaluator {self._value!r}>"
+
+
+def _const_evaluator(value):
+    evaluator = object.__new__(_ConstEvaluator)
+    evaluator._value = value
+    return evaluator
+
+
 def _variance_prefix(infer_variance, covariant, contravariant):
     if infer_variance:
         return ''
@@ -94,7 +147,8 @@ class TypeVar:
         self.__covariant__ = bool(covariant)
         self.__contravariant__ = bool(contravariant)
         self.__infer_variance__ = bool(infer_variance)
-        self.__default__ = default
+        self._default_value = default
+        self._evaluate_default = None
         if constraints and bound is not None:
             raise TypeError("Constraints cannot be combined with bound=...")
         if len(constraints) == 1:
@@ -127,28 +181,57 @@ class TypeVar:
         self.__name__ = name
         self.__covariant__ = False
         self.__contravariant__ = False
-        self.__infer_variance__ = False
-        self.__default__ = NoDefault
-        self._constraints = ()
+        # CPython 3.14 `_Py_make_typevar`: type parameters created by the
+        # compiler infer variance, unlike an ordinary `TypeVar(...)` call.
+        self.__infer_variance__ = True
+        self._default_value = NoDefault
+        self._evaluate_default = None
+        self._constraints = _MISSING if evaluate_constraints is not None else ()
         self._evaluate_constraints = evaluate_constraints
-        self._bound = None
+        self._bound = _MISSING if evaluate_bound is not None else None
         self._evaluate_bound = evaluate_bound
         self.__module__ = _caller_module()
         return self
 
     @property
     def __bound__(self):
-        if self._evaluate_bound is not None:
+        if self._bound is _MISSING:
             self._bound = _evaluate_typeparam(self._evaluate_bound)
-            self._evaluate_bound = None
         return self._bound
 
     @property
     def __constraints__(self):
-        if self._evaluate_constraints is not None:
+        if self._constraints is _MISSING:
             self._constraints = tuple(_evaluate_typeparam(self._evaluate_constraints))
-            self._evaluate_constraints = None
         return self._constraints
+
+    @property
+    def __default__(self):
+        if self._default_value is _MISSING:
+            self._default_value = _evaluate_typeparam(self._evaluate_default)
+        return self._default_value
+
+    @property
+    def evaluate_bound(self):
+        if self._evaluate_bound is not None:
+            return self._evaluate_bound
+        if self._bound is not None:
+            return _const_evaluator(self._bound)
+        return None
+
+    @property
+    def evaluate_constraints(self):
+        if self._evaluate_constraints is not None:
+            return self._evaluate_constraints
+        if self._constraints:
+            return _const_evaluator(self._constraints)
+        return None
+
+    @property
+    def evaluate_default(self):
+        if self._evaluate_default is not None:
+            return self._evaluate_default
+        return _const_evaluator(self._default_value)
 
     def __typing_subst__(self, arg):
         import typing
@@ -167,7 +250,7 @@ class TypeVar:
         return args
 
     def has_default(self):
-        return self.__default__ is not NoDefault
+        return self._evaluate_default is not None or self._default_value is not NoDefault
 
     def __reduce__(self):
         return self.__name__
@@ -204,7 +287,8 @@ class ParamSpec:
         self.__covariant__ = bool(covariant)
         self.__contravariant__ = bool(contravariant)
         self.__infer_variance__ = bool(infer_variance)
-        self.__default__ = default
+        self._default_value = default
+        self._evaluate_default = None
         self.__bound__ = bound
         self.__module__ = _caller_module()
 
@@ -225,7 +309,19 @@ class ParamSpec:
         return typing._paramspec_prepare_subst(self, alias, args)
 
     def has_default(self):
-        return self.__default__ is not NoDefault
+        return self._evaluate_default is not None or self._default_value is not NoDefault
+
+    @property
+    def __default__(self):
+        if self._default_value is _MISSING:
+            self._default_value = _evaluate_typeparam(self._evaluate_default)
+        return self._default_value
+
+    @property
+    def evaluate_default(self):
+        if self._evaluate_default is not None:
+            return self._evaluate_default
+        return _const_evaluator(self._default_value)
 
     def __reduce__(self):
         return self.__name__
@@ -300,7 +396,8 @@ class TypeVarTuple:
 
     def __init__(self, name, *, default=NoDefault):
         self.__name__ = name
-        self.__default__ = default
+        self._default_value = default
+        self._evaluate_default = None
         self.__module__ = _caller_module()
 
     def __iter__(self):
@@ -315,7 +412,19 @@ class TypeVarTuple:
         return typing._typevartuple_prepare_subst(self, alias, args)
 
     def has_default(self):
-        return self.__default__ is not NoDefault
+        return self._evaluate_default is not None or self._default_value is not NoDefault
+
+    @property
+    def __default__(self):
+        if self._default_value is _MISSING:
+            self._default_value = _evaluate_typeparam(self._evaluate_default)
+        return self._default_value
+
+    @property
+    def evaluate_default(self):
+        if self._evaluate_default is not None:
+            return self._evaluate_default
+        return _const_evaluator(self._default_value)
 
     def __reduce__(self):
         return self.__name__
@@ -342,10 +451,15 @@ class TypeAliasType:
 
     @property
     def __value__(self):
-        if self._evaluate_value is not None:
-            self._value = self._evaluate_value()
-            self._evaluate_value = None
+        if self._value is _MISSING:
+            self._value = _evaluate_typeparam(self._evaluate_value)
         return self._value
+
+    @property
+    def evaluate_value(self):
+        if self._evaluate_value is not None:
+            return self._evaluate_value
+        return _const_evaluator(self._value)
 
     @property
     def __parameters__(self):
@@ -389,11 +503,13 @@ class Generic:
 # call a single positional helper per intrinsic.
 
 def _intrinsic_typevar(name):
-    return TypeVar(name)
+    # CPython 3.14 `_Py_make_typevar` passes `infer_variance=true`.
+    return TypeVar(name, infer_variance=True)
 
 
 def _intrinsic_paramspec(name):
-    return ParamSpec(name)
+    # CPython 3.14 `_Py_make_paramspec` passes `infer_variance=true`.
+    return ParamSpec(name, infer_variance=True)
 
 
 def _intrinsic_typevartuple(name):
@@ -409,7 +525,10 @@ def _intrinsic_typevar_with_constraints(name, evaluate_constraints):
 
 
 def _intrinsic_set_typeparam_default(typeparam, default):
-    typeparam.__default__ = default
+    # CPython 3.14 `_Py_set_typeparam_default` stores the evaluator, not its
+    # result.  `__default__` evaluates and caches it on first access.
+    typeparam._default_value = _MISSING
+    typeparam._evaluate_default = default
     return typeparam
 
 
@@ -426,6 +545,14 @@ def _intrinsic_typealias(args):
     name, type_params, value = args
     if type_params is None:
         type_params = ()
-    return TypeAliasType(
-        name, None, type_params=type_params, _evaluate_value=value
+    alias = TypeAliasType(
+        name, _MISSING, type_params=type_params, _evaluate_value=value
     )
+    # The constructor is called through this intrinsic helper, so its ordinary
+    # two-frame caller lookup sees the helper's private ``typing`` globals.
+    # CPython records the namespace executing the TYPEALIAS intrinsic instead.
+    try:
+        alias.__module__ = sys._getframe(1).f_globals.get('__name__')
+    except (AttributeError, ValueError):
+        alias.__module__ = None
+    return alias
