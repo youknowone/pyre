@@ -4537,13 +4537,13 @@ fn run_perfn_walk<Sym: WalkSym>(
                 crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
                     pc,
                 },
-            ) => Some((*pc, false)),
+            ) => Some(*pc),
             Err(crate::jitcode_dispatch::DispatchError::BranchGuardKeptStackUnsupported { pc }) => {
-                Some((*pc, true))
+                Some(*pc)
             }
             _ => None,
         };
-        if let Some((pc, is_unsupported)) = kept_stack_abort_pc {
+        if let Some(pc) = kept_stack_abort_pc {
             let abort_jit_pc = pc;
             if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) {
                 // A walk commits at most ONE leg.  The gh#467 CALL-forward block
@@ -4571,10 +4571,15 @@ fn run_perfn_walk<Sym: WalkSym>(
                 let mirror = crate::jitcode_dispatch::fbw_branch_abort_stack_take()
                     .filter(|(py_pc, _)| *py_pc == resume_py_pc)
                     .map(|(_, stack)| stack);
-                // Two kept-stack branch aborts reach this leg (`is_unsupported`
-                // came from the `kept_stack_abort_pc` match).  Both resume at a
-                // FOR_ITER header whose walk already advanced the iterator; they
-                // differ in whether the consumed item's body ran.
+                // RPython resumes a mid-expression abort from the complete
+                // MIFrame register image.  Without that image, the vable
+                // shadow is only authoritative at a merge point: delivering
+                // an in-flight FOR_ITER item onto it can discard the list and
+                // iterator operands below that item (for example an inlined
+                // comprehension reached through a branch bridge).  Therefore
+                // only the exact-coordinate mirror may commit this leg.  A
+                // missing mirror leaves the established safe-point replay in
+                // place.
                 let committed = if let Some(ref stack) = mirror {
                     // RPython converts the current MIFrame — including its
                     // register-held mid-expression operands — directly into a
@@ -4583,60 +4588,34 @@ fn run_perfn_walk<Sym: WalkSym>(
                     // exact-coordinate walk mirror here.  Resolution and GC
                     // rooting are shared with the established escape/qmut
                     // mid-expression handoff.
-                    crate::jitcode_dispatch::flush_with_latched_stack(
-                        ctx,
-                        cf_addr,
-                        resume_py_pc,
-                        stack,
-                    )
-                } else if is_unsupported {
                     if crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
                         cf_addr,
                         resume_py_pc,
                     ) {
-                        // The consumed item's body already ran, so resume at
-                        // the FOR_ITER header without re-delivering it.
-                        crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc)
-                    } else {
-                        // A nested inner FOR_ITER can carry the enclosing
-                        // iterator as its kept stack before the consumed
-                        // item's body runs.  Mirror Shape A and deliver that
-                        // in-flight item exactly once.
-                        let push = crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
-                            cf_addr,
-                            resume_py_pc,
-                        );
-                        push.is_some()
-                            && crate::state::flush_walk_end_state_to_frame_with_item(
-                                ctx,
-                                cf_addr,
-                                resume_py_pc,
-                                push,
-                            )
-                    }
-                } else {
-                    // Shape A — a `BranchGuardUnrestorableKeptStackPermanent`
-                    // abort resumes AT a FOR_ITER header whose consumed item is
-                    // in flight (`body_pc == resume_py_pc + 1`, the opcode
-                    // there really is a FOR_ITER): the walk advanced the
-                    // iterator but the item is not yet on the flushed (header)
-                    // stack, so deliver it (push + reposition to the body) so
-                    // the body runs once.  Commit ONLY when an item is
-                    // delivered — a Permanent abort not at such a header keeps
-                    // the legacy drop byte-identically (the residual S3 case),
-                    // so every other abort shape (and the whole flag-OFF path)
-                    // is untouched.
-                    let push = crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
-                        cf_addr,
-                        resume_py_pc,
-                    );
-                    push.is_some()
-                        && crate::state::flush_walk_end_state_to_frame_with_item(
+                        crate::jitcode_dispatch::flush_with_latched_stack(
                             ctx,
                             cf_addr,
                             resume_py_pc,
+                            stack,
+                        )
+                    } else if let Some(push) =
+                        crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
+                            cf_addr,
+                            resume_py_pc,
+                        )
+                    {
+                        crate::jitcode_dispatch::flush_with_latched_stack_and_item(
+                            ctx,
+                            cf_addr,
+                            resume_py_pc,
+                            stack,
                             push,
                         )
+                    } else {
+                        false
+                    }
+                } else {
+                    false
                 };
                 if committed {
                     // The flush owns the iteration count; drop any remaining

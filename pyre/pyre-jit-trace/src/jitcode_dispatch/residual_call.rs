@@ -1541,8 +1541,33 @@ pub(crate) fn flush_with_latched_stack(
     py_pc: usize,
     oprefs: &[OpRef],
 ) -> bool {
+    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None)
+}
+
+/// Resume a FOR_ITER body from the complete header stack plus the item the
+/// authoritative walk already consumed.  RPython keeps both pieces in the
+/// live MIFrame register image; pyre records the item in the FOR_ITER carrier
+/// separately from the operand-stack mirror, so they must be reunited before
+/// converting the frame to interpreter state.
+pub(crate) fn flush_with_latched_stack_and_item(
+    ctx: &TraceCtx,
+    frame: usize,
+    header_py_pc: usize,
+    oprefs: &[OpRef],
+    push: (pyre_object::PyObjectRef, usize),
+) -> bool {
+    flush_with_latched_stack_inner(ctx, frame, header_py_pc, oprefs, Some(push))
+}
+
+fn flush_with_latched_stack_inner(
+    ctx: &TraceCtx,
+    frame: usize,
+    py_pc: usize,
+    oprefs: &[OpRef],
+    push: Option<(pyre_object::PyObjectRef, usize)>,
+) -> bool {
     {
-        let mut stack = Vec::with_capacity(oprefs.len());
+        let mut stack = Vec::with_capacity(oprefs.len() + usize::from(push.is_some()));
         for &opref in oprefs.iter() {
             match ctx.concrete_of_opref(opref) {
                 Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
@@ -1568,6 +1593,12 @@ pub(crate) fn flush_with_latched_stack(
                 }
             }
         }
+        let resume_py_pc = if let Some((item, body_pc)) = push {
+            stack.push(item);
+            body_pc
+        } else {
+            py_pc
+        };
         // Why this latch exists, checkable at runtime.  Measured over
         // pyre/bench/synth, the only slot that ever disagrees with the vable
         // shadow is the in-progress opcode's TOS, and it holds a compile-time
@@ -1619,8 +1650,12 @@ pub(crate) fn flush_with_latched_stack(
                 stack.len(),
             ));
         }
-        let committed =
-            crate::state::flush_walk_end_state_to_frame_with_full_stack(ctx, frame, py_pc, &stack);
+        let committed = crate::state::flush_walk_end_state_to_frame_with_full_stack(
+            ctx,
+            frame,
+            resume_py_pc,
+            &stack,
+        );
         majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
         committed
     }
