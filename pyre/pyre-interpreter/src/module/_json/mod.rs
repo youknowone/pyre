@@ -98,9 +98,9 @@ fn json_decode_error(msg: String, doc: PyObjectRef, pos: usize) -> PyError {
 
 fn encode_basestring_impl(obj: PyObjectRef, ascii_only: bool) -> PyResult {
     let value = require_string(obj)?;
-    Ok(pyre_object::w_str_from_wtf8(machinery::encode_string(
-        value, ascii_only,
-    )))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        machinery::encode_string(value, ascii_only),
+    ))
 }
 
 fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyResult {
