@@ -7,6 +7,7 @@
 //! `GILReleaseAction` is that hand-off — an action registered on the ticker
 //! which yields the GIL every `sys.getcheckinterval()` bytecodes.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::executioncontext::{
@@ -52,41 +53,36 @@ impl AsyncActionOps for GilReleaseAction {
 
 impl PeriodicAsyncActionOps for GilReleaseAction {}
 
+static GIL_RELEASE_ACTION: OnceLock<usize> = OnceLock::new();
+
 /// gil.py:20-23 `GILThreadLocals.initialize` — "add the GIL-releasing callback
 /// as an action on the space".
 ///
 /// `use_bytecode_counter=True` is what puts it at the end of the periodic list
 /// (executioncontext.py:503-504: "hack to put the release-the-GIL one at the
 /// end of the list"), behind the signal check. Idempotent; the actionflag
-/// holds the action's heap address, so ownership stays with the execution
-/// context until [`shutdown`] gives it back.
+/// holds the action's heap address, so the process-owned flag retains it for
+/// the runtime lifetime.
 pub fn initialize(ec: &mut ExecutionContext) {
-    if ec.gil_release_action.is_some() {
-        return;
-    }
-    let action: &'static mut GilReleaseAction = Box::leak(GilReleaseAction::new(ec.space));
-    let async_ptr: *mut dyn AsyncActionOps = &mut *action;
-    action.register_periodic_action(&mut ec.actionflag, true);
-    ec.gil_release_action = Some(async_ptr);
+    GIL_RELEASE_ACTION.get_or_init(|| {
+        let action: &'static mut GilReleaseAction = Box::leak(GilReleaseAction::new(ec.space));
+        action.register_periodic_action(ec.actionflag.shared_mut(), true);
+        action as *mut GilReleaseAction as usize
+    });
 }
 
-/// Reclaim what [`initialize`] registered.
-///
-/// Upstream has nothing to reclaim: one `GILReleaseAction` is registered on
-/// `space.actionflag` for the process. pyre gives each execution context its
-/// own ticker, so each one also allocates its own action, and a thread which
-/// leaves without giving it back leaks it.
-///
-/// The caller's execution context, and with it the actionflag that still names
-/// this action, is dropped immediately afterwards without running any Python
-/// in between.
-pub fn shutdown(ec: &mut ExecutionContext) {
-    let Some(action) = ec.gil_release_action.take() else {
+/// Trace the process-owned periodic action's object-space reference.  The
+/// action is a translated object-space child in PyPy; pyre's leaked Rust box
+/// needs the corresponding explicit non-stack root.
+pub(super) fn walk_action_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let Some(&addr) = GIL_RELEASE_ACTION.get() else {
         return;
     };
-    // SAFETY: the pointer is the one `initialize` leaked out of a `Box`, and
-    // this is the only place that takes it back.
-    drop(unsafe { Box::from_raw(action) });
+    let action = unsafe { &mut *(addr as *mut GilReleaseAction) };
+    let slot = &mut action.base.base.space;
+    if !slot.is_null() {
+        visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+    }
 }
 
 /// gil.py:17-18 `GILThreadLocals.gil_ready`, quasi-immutable and "changed (to
@@ -111,8 +107,6 @@ pub fn setup_threads(ec: &mut ExecutionContext) -> bool {
         majit_gc::rgil::allocate();
         GIL_READY.store(true, Ordering::Release);
     }
-    // Registering the action is per-execution-context, unlike upstream's
-    // once-per-space `initialize`, because the ticker it hangs on is too.
     initialize(ec);
     first
 }

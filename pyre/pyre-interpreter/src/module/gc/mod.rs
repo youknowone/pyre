@@ -704,11 +704,7 @@ fn list_from_roots(first: usize) -> PyObjectRef {
 }
 
 fn user_del_action() -> Option<&'static mut crate::executioncontext::UserDelAction> {
-    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-    if ec.is_null() {
-        return None;
-    }
-    let action = unsafe { (*ec).user_del_action };
+    let action = crate::executioncontext::space_user_del_action();
     if action.is_null() {
         None
     } else {

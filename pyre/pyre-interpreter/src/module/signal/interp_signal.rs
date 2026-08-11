@@ -451,7 +451,7 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
     // into it for the whole run), so it is leaked deliberately.
     let action: &'static mut CheckSignalAction = Box::leak(CheckSignalAction::new(ec.space));
     let async_ptr: *mut dyn AsyncActionOps = &mut *action;
-    action.register_periodic_action(&mut ec.actionflag, false);
+    action.register_periodic_action(ec.actionflag.shared_mut(), false);
     ec.check_signal_action = Some(async_ptr);
 
     // Hand the ticker cell address to the OS handler so it can force the

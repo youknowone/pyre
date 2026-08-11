@@ -953,17 +953,6 @@ pub unsafe fn walk_pyframe_roots_area(
             } {
                 visitor(unsafe { &mut *(hook as *mut majit_ir::GcRef) });
             }
-            // pending_with_disabled_del is a GC-visible list upstream
-            // (executioncontext.py:652); pyre's Vec lives in the boxed
-            // UserDelAction, so its element slots are visited here.
-            let action = unsafe { (*ec).user_del_action };
-            if !action.is_null()
-                && let Some(list) = unsafe { (*action).pending_with_disabled_del.as_mut() }
-            {
-                for slot in list.iter_mut() {
-                    visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
-                }
-            }
         };
         visit_ec_slots(frame_ec);
         if ambient_ec != frame_ec {
@@ -1177,6 +1166,7 @@ pub unsafe fn walk_pyframe_roots_area(
 /// faulthandler's — so it registers once for the process.
 fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_global_prebuilt_roots(visitor);
+    crate::executioncontext::walk_space_user_del_action_roots(visitor);
     crate::module::gc::hook::walk_hook_roots(visitor);
     crate::module::thread::walk_thread_roots(visitor);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]

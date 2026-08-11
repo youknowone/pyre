@@ -214,14 +214,52 @@ impl WRootFinalizerQueue {
 }
 
 fn finalizer_queue_trigger() {
-    let ec = crate::call::getexecutioncontext() as *mut ExecutionContext;
-    if ec.is_null() {
+    let action = space_user_del_action();
+    if !action.is_null() {
+        unsafe { (*action).fire() };
+    }
+}
+
+// `baseobjspace.py:450` / `executioncontext.py:724`: both the action flag and
+// the user-finalizer action belong to the object space, not to an individual
+// execution context.  Pyre does not yet expose a typed Rust `ObjSpace`, so the
+// process-global runtime instance is its storage owner.  ECs carry a thin
+// reference to the flag, while finalizer users resolve the action here just as
+// PyPy reaches `self.space.user_del_action`.
+static SPACE_USER_DEL_ACTION: OnceLock<usize> = OnceLock::new();
+
+fn install_space_user_del_action(
+    space: PyObjectRef,
+    actionflag: &mut (dyn ActionFlagOps + 'static),
+) -> *mut UserDelAction {
+    *SPACE_USER_DEL_ACTION
+        .get_or_init(|| Box::into_raw(UserDelAction::new(space, actionflag)) as usize)
+        as *mut UserDelAction
+}
+
+pub fn space_user_del_action() -> *mut UserDelAction {
+    SPACE_USER_DEL_ACTION.get().copied().unwrap_or(0) as *mut UserDelAction
+}
+
+/// Trace the object-space-owned finalizer action exactly once as a non-stack
+/// root.  In translated PyPy this happens through the object-space graph; the
+/// leaked Rust allocation is outside that graph, so its managed slots must be
+/// forwarded explicitly.
+pub(crate) fn walk_space_user_del_action_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let action = space_user_del_action();
+    if action.is_null() {
         return;
     }
-    unsafe {
-        let action = (*ec).user_del_action;
-        if !action.is_null() {
-            (*action).fire();
+    let action = unsafe { &mut *action };
+    let mut forward = |slot: &mut PyObjectRef| {
+        if !slot.is_null() {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        }
+    };
+    forward(&mut action.base.space);
+    if let Some(pending) = action.pending_with_disabled_del.as_mut() {
+        for obj in pending {
+            forward(obj);
         }
     }
 }
@@ -281,10 +319,9 @@ pub struct ExecutionContext {
     /// `os_local.py:ExecutionContext._thread_local_objs`: weak references to
     /// `_thread._local` objects which own a dictionary for this EC.
     pub thread_local_refs: Vec<PyObjectRef>,
-    pub actionflag: ActionFlag,
-    /// `space.user_del_action`, allocated after the ExecutionContext reaches
-    /// its stable process-lifetime address.
-    pub user_del_action: *mut UserDelAction,
+    /// Cached access to process-owned `space.actionflag`.  Every EC points to
+    /// the same flag, matching `baseobjspace.py:450`.
+    pub actionflag: SpaceActionFlag,
     /// `pypy/objspace/std/dictmultiobject.py:60-69
     /// allocate_and_init_instance(module=True)` parity — the builtins
     /// module's `w_dict` is a `W_ModuleDictObject` backed by
@@ -307,14 +344,6 @@ pub struct ExecutionContext {
     /// pointer into the leaked action owned by `module::_signal`
     /// (`install_signal_handling`); `None` until installed.
     pub check_signal_action: Option<*mut dyn AsyncActionOps>,
-    /// `gil.py:20-23 GILThreadLocals.initialize` — the `GILReleaseAction`
-    /// registered on the ticker, which yields the GIL every
-    /// `sys.getcheckinterval()` bytecodes. There is one per execution context,
-    /// because the ticker it is registered on is too, so unlike the
-    /// process-global signal action it is owned rather than leaked: the
-    /// pointer is the box `module::thread::gil::shutdown` gives back. `None`
-    /// until installed.
-    pub gil_release_action: Option<*mut dyn AsyncActionOps>,
     /// `executioncontext.py sys_exc_operror` — the active exception for
     /// `sys.exc_info()` / bare `raise`, saved/restored across handler
     /// regions by PUSH_EXC_INFO / POP_EXCEPT.  Single source of truth
@@ -400,12 +429,10 @@ impl ExecutionContext {
             trace_all_generation: 0,
             profile_all_generation: 0,
             thread_local_refs: Vec::new(),
-            actionflag: ActionFlag::new(),
-            user_del_action: std::ptr::null_mut(),
+            actionflag: SpaceActionFlag::new(),
             builtins_module,
             builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
-            gil_release_action: None,
             sys_exc_value: pyre_object::PY_NULL,
             coroutine_origin_tracking_depth: 0,
             current_gen_or_coroutine: pyre_object::PY_NULL,
@@ -418,9 +445,9 @@ impl ExecutionContext {
 
     /// `OSThreadLocals.enter_thread()` / `ExecutionContext(space)` parity.
     ///
-    /// Interpreter-wide objects (the object space and builtins module) remain
-    /// shared, while frame, exception, tracing, profiling, generator, and
-    /// action state starts fresh for each OS thread.
+    /// Interpreter-wide objects (the object space, action flag, finalizer
+    /// action, and builtins module) remain shared, while frame, exception,
+    /// tracing, profiling, and generator state starts fresh for each OS thread.
     pub fn clone_for_thread(&self) -> Self {
         let mut ec = self.clone();
         ec.topframeref = std::ptr::null_mut();
@@ -437,11 +464,7 @@ impl ExecutionContext {
         ec.trace_all_generation = 0;
         ec.profile_all_generation = 0;
         ec.thread_local_refs.clear();
-        ec.actionflag = ActionFlag::new();
-        // The periodic actions are registered on the actionflag just replaced,
-        // so the new thread registers its own.
-        ec.gil_release_action = None;
-        ec.user_del_action = std::ptr::null_mut();
+        ec.actionflag = SpaceActionFlag::new();
         // The cached Module wrapper is execution-context-owned and movable.
         // A new thread lazily builds its own wrapper over the shared
         // builtins_module, matching a fresh PyPy ExecutionContext.
@@ -482,11 +505,9 @@ impl ExecutionContext {
     }
 
     pub fn install_user_del_action(&mut self) {
-        if self.user_del_action.is_null() {
-            let action = UserDelAction::new(self.space, &mut self.actionflag);
-            self.user_del_action = Box::into_raw(action);
-        }
-        crate::module::gc::hook::initialize(self.space, &mut self.actionflag);
+        let actionflag = self.actionflag.shared_mut();
+        install_space_user_del_action(self.space, actionflag);
+        crate::module::gc::hook::initialize(self.space, actionflag);
         pyre_object::gc_hook::register_maybe_finalizer_hook(maybe_register_user_finalizer);
     }
 
@@ -821,8 +842,9 @@ impl ExecutionContext {
     }
 
     pub fn _run_finalizers_now(&mut self) {
-        if !self.user_del_action.is_null() {
-            unsafe { (*self.user_del_action)._run_finalizers() };
+        let action = space_user_del_action();
+        if !action.is_null() {
+            unsafe { (*action)._run_finalizers() };
         }
     }
 
@@ -842,8 +864,9 @@ impl ExecutionContext {
     /// coroutine's frame.  The action runs before the next opcode, after the
     /// attribute receiver has left the value stack.
     pub fn finalize_discarded_coroutine_after_frame_get(&mut self) {
-        if !self.user_del_action.is_null() {
-            unsafe { (*self.user_del_action).collect_oldgen_and_fire() };
+        let action = space_user_del_action();
+        if !action.is_null() {
+            unsafe { (*action).collect_oldgen_and_fire() };
         }
     }
 
@@ -1927,6 +1950,85 @@ impl ActionFlagOps for ActionFlag {
     }
 }
 
+/// Stable reference to the process-owned `space.actionflag`.
+///
+/// PyPy stores one `ActionFlag` on `ObjSpace` and every execution context
+/// reaches it through `self.space.actionflag` (`executioncontext.py:163-165`).
+/// Pyre's opaque `PyObjectRef` space has no typed Rust fields yet, so the
+/// process runtime owns the equivalent allocation and each EC carries this
+/// thin reference.  The GIL serializes interpreter access just as it does for
+/// PyPy's plain Python fields; the OS signal handler is the only asynchronous
+/// writer and already uses the registered ticker address.
+#[derive(Clone, Copy)]
+pub struct SpaceActionFlag {
+    ptr: *mut ActionFlag,
+}
+
+static SPACE_ACTIONFLAG: OnceLock<usize> = OnceLock::new();
+
+impl Default for SpaceActionFlag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpaceActionFlag {
+    pub fn new() -> Self {
+        let ptr = *SPACE_ACTIONFLAG
+            .get_or_init(|| Box::into_raw(Box::new(ActionFlag::new())) as usize)
+            as *mut ActionFlag;
+        Self { ptr }
+    }
+
+    fn inner(&self) -> &ActionFlag {
+        // SAFETY: SPACE_ACTIONFLAG owns one leaked process-lifetime value.
+        // Interpreter calls are serialized by the GIL; shared signal writes
+        // touch only `_ticker` through its registered raw address.
+        unsafe { &*self.ptr }
+    }
+
+    fn inner_mut(&mut self) -> &mut ActionFlag {
+        // SAFETY: see `inner`; callers hold the GIL while mutating the flag.
+        unsafe { &mut *self.ptr }
+    }
+
+    /// The stable object-space allocation used when an action caches its
+    /// `space.actionflag` back-reference.  Returning the shared allocation,
+    /// rather than this EC's thin wrapper, keeps the pointer valid even if an
+    /// embedding drops the EC that first registered the action.
+    pub fn shared_mut(&mut self) -> &'static mut ActionFlag {
+        // SAFETY: SPACE_ACTIONFLAG owns one leaked process-lifetime value.
+        // Registration and action dispatch are serialized by the GIL.
+        unsafe { &mut *self.ptr }
+    }
+
+    pub fn ticker_addr(&mut self) -> *mut isize {
+        self.inner_mut().ticker_addr()
+    }
+}
+
+impl ActionFlagOps for SpaceActionFlag {
+    fn abstract_flag(&self) -> &AbstractActionFlag {
+        self.inner().abstract_flag()
+    }
+
+    fn abstract_flag_mut(&mut self) -> &mut AbstractActionFlag {
+        self.inner_mut().abstract_flag_mut()
+    }
+
+    fn get_ticker(&self) -> isize {
+        self.inner().get_ticker()
+    }
+
+    fn reset_ticker(&mut self, value: isize) {
+        self.inner_mut().reset_ticker(value);
+    }
+
+    fn decrement_ticker(&mut self, by: isize) -> isize {
+        self.inner_mut().decrement_ticker(by)
+    }
+}
+
 pub struct AsyncAction {
     pub space: PyObjectRef,
     _action_index: isize,
@@ -1938,12 +2040,11 @@ pub struct AsyncAction {
     /// uses `self.space.actionflag` — a constant lookup once the action
     /// is constructed because PyPy's `space.actionflag` is set once at
     /// `pypy/interpreter/baseobjspace.py:447` and never replaced.
-    /// Pyre keeps the actionflag on `ExecutionContext` rather than on
-    /// `space`, so we cache the back-reference at registration time
-    /// (`AsyncAction::new` / `UserDelAction::new` /
-    /// `AsyncActionOps::register_periodic_action`).  The pointer is
-    /// stable for the process lifetime because pyrex owns the EC for
-    /// the entire run.  `fire()` dereferences this slot directly,
+    /// Pyre's EC stores a thin reference to the process-owned flag, so we cache
+    /// the registering reference here (`AsyncAction::new` /
+    /// `UserDelAction::new` / `AsyncActionOps::register_periodic_action`).
+    /// The process-owned flag outlives every action. `fire()` dereferences
+    /// this slot directly,
     /// matching PyPy's `self.space.actionflag.fire(self)` 1:1 without
     /// the TLS detour.  `null` means the action has not been registered
     /// yet — calling `fire` in that state is a programmer error

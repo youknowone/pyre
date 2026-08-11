@@ -197,15 +197,6 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 forward(&mut frame);
                 ec.topframeref = frame as *mut crate::PyFrame;
             }
-            if !ec.user_del_action.is_null() {
-                let action = unsafe { &mut *ec.user_del_action };
-                forward(&mut action.base.space);
-                if let Some(pending) = action.pending_with_disabled_del.as_mut() {
-                    for obj in pending {
-                        forward(obj);
-                    }
-                }
-            }
             // `builtins_module` / `builtin_dict_cache` / `thread_local_refs`.
             // `clone_for_thread` copies the builtins reference into the child
             // EC, so each copy is its own slot: forwarding only the parent's
@@ -214,6 +205,7 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             ec.walk_builtin_roots(visitor);
         }
     }
+    gil::walk_action_roots(visitor);
     let mut forwarded = Vec::new();
     for handle in SHUTDOWN_HANDLES.lock().iter_mut() {
         let old = *handle;
@@ -1408,9 +1400,6 @@ fn thread_is_stopping(ec: &mut crate::PyExecutionContext) {
             local.thread_is_stopping(ident);
         }
     }
-    // Last: nothing above runs bytecode, so nothing can reach the ticker this
-    // action is registered on after it is gone.
-    gil::shutdown(ec);
 }
 
 /// The calling thread's identity.
@@ -1639,13 +1628,12 @@ fn spawn_thread(
             });
             let ec_ptr = &*ec as *const crate::PyExecutionContext;
             crate::call::set_last_exec_ctx(ec_ptr);
-            // `install_user_del_action` can allocate.  Publish the fresh EC
-            // first, matching OSThreadLocals.enter_thread() installing the
-            // ExecutionContext before thread bootstrap invokes Python code.
+            // Publish the fresh EC first, matching
+            // OSThreadLocals.enter_thread() installing the ExecutionContext
+            // before thread bootstrap invokes Python code.
             ec.install_user_del_action();
-            // Each mutator owns its ticker, so the GIL-releasing action has to
-            // be registered on this thread's own actionflag; without it a
-            // worker would hold the GIL until its next external call.
+            // The space-owned GIL action is already registered on the shared
+            // actionflag; this is an idempotent bootstrap guard.
             gil::initialize(&mut ec);
             let ident = current_ident();
             if has_handle {
